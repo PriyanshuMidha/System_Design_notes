@@ -22,7 +22,42 @@ updated: 2026-11-13
 > - Client-side rate limiting keeps you under your own configured budget, which is cheaper to reason about than reacting to `429`s after the fact.
 > - This note is the mechanics layer: what to put *in* the prompt is [[Prompt Engineering]]; what the provider is doing conceptually is [[LLM Fundamentals]]; Go's general HTTP client patterns (timeouts, context, connection pooling) live in [[Calling External APIs]] and apply here unchanged.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your Go server sends a question to an AI model over the internet and waits for the reply. It is just an HTTP call, like any other outside API.
+
+But this outside service is busy and sometimes says "slow down" (**429**) or "I'm having trouble" (**5xx**). A good client waits a bit and tries again, instead of failing.
+
+```mermaid
+flowchart LR
+    G["Go server"] -- "POST question" --> P["AI provider"]
+    P -- "429: slow down" --> W["Wait a bit,<br/>try again"] --> P
+    P -- "200: answer" --> G
+```
+
+Long answers can take seconds. **Streaming** sends the answer in small bits as it is written, so the user sees words right away.
+
+```mermaid
+flowchart LR
+    P["AI provider"] -- "'Hello'" --> U["User screen"]
+    P -- "' there'" --> U
+    P -- "'!' + done" --> U
+```
+
+You also pay per token, so you count and budget them before you send.
+
+The rest of this note is just these 3 questions:
+1. What does one request and reply look like?
+2. Which errors do you retry, and how long do you wait?
+3. How do you stream, rate-limit and count tokens in real Go code?
+
 
 **The problem in one story.**
 Your Go server needs an answer from an LLM to reply to a user.
@@ -68,7 +103,7 @@ Where it breaks: a restaurant never tells you the exact cost of each word; the A
 > [!tip] Remember
 > An LLM call is just HTTP, but wrap it in timeouts, retries for `429`/`5xx`, a rate limiter and token counting.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A naive integration is `http.Post` plus `json.Unmarshal`, and it works — right up until your traffic hits the provider's rate limit, a transient `503` arrives during a deploy on their side, or a user asks a question your service answers by streaming to a web client that should not wait 8 seconds staring at a spinner.
 
@@ -78,7 +113,7 @@ Handling all three (and counting tokens before you ever make the call, so you ca
 
 Concretely: without a retry policy, a transient `429` becomes a user-visible error for no reason; without a client-side rate limiter, your service pushes past its own quota and gets more `429`s than it needs to; without streaming, a 10-second answer feels like a hang instead of a conversation.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Treat the LLM API exactly like any other rate-limited, occasionally-flaky external HTTP dependency (see [[Calling External APIs]] for the general pattern) — because that is what it is.
 
@@ -86,9 +121,11 @@ The LLM-specific parts are: the request/response shape (a `messages` array, not 
 
 Everything else — context deadlines, retries, backoff, connection reuse — is the same discipline you'd apply to a payments API or a shipping-rates API.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The request/response shape
+
+**In plain words:** You send: which model, max reply length, and the messages. You get back: the reply text, why it stopped, and how many tokens it used.
 
 A non-streaming call to the Messages API looks like this (the shape used by Anthropic's API as of 2026; other providers' documented APIs use an analogous shape with different field names — always check the provider's current docs rather than assuming field names port across providers):
 
@@ -103,6 +140,8 @@ sequenceDiagram
 ```
 
 ### Retrying the right errors, the right way
+
+**In plain words:** Retry only "try later" errors (429, 5xx, timeouts). Wait longer each time, with some randomness, and obey the server's Retry-After.
 
 ```mermaid
 flowchart TD
@@ -122,6 +161,8 @@ The rule that matters:
 When the server sends a `Retry-After` header (common on `429`), honour it instead of your own backoff schedule; it reflects the provider's actual rate-limit reset time.
 
 ### Streaming via Server-Sent Events
+
+**In plain words:** Instead of one big reply at the end, you get many tiny pieces, each tagged with what it is.
 
 Setting `"stream": true` changes the response from one JSON body to a sequence of SSE events, each a small, named delta:
 
@@ -150,13 +191,24 @@ A connection that drops mid-stream should be treated like any partial response: 
 
 ### Token counting before you call
 
+**In plain words:** Check the size of your request before sending it, so you don't blow the budget or the size limit.
+
 Before sending a request, you often want to know roughly or exactly how many tokens it will cost — to decide whether to trim history, to budget a per-tenant quota, or to pick a cheaper model for a short task.
 
 Providers expose a documented count-tokens endpoint that runs the real tokeniser; a local character-based estimate is faster but is, at best, an estimate (see [[LLM Fundamentals]] on tokenisation).
 
-## 4. Worked example
+```mermaid
+flowchart LR
+    R["Build request"] --> C["Count tokens"] --> Q{"Too big or<br/>over budget?"}
+    Q -- "yes" --> T["Trim old history"] --> C
+    Q -- "no" --> S["Send"]
+```
+
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** The smallest working call: one POST, read the JSON, done. No retries yet.
 
 The bare minimum: one call, no retries, no streaming, no rate limiting. It compiles and passes `go vet` and a test against `net/http/httptest` on Go 1.24.
 
@@ -261,6 +313,8 @@ func TestAskHappyPath(t *testing.T) {
 This has no retries, no rate limiting, and blocks fully on `io.ReadAll` — fine for a script, wrong for a backend under real traffic. The full version below adds exactly those three things, plus streaming and token counting.
 
 ### Full version: retries, rate limiting, streaming, token counting
+
+**In plain words:** The same call, made ready for real traffic: it retries, slows itself down, streams, and counts tokens.
 
 A production-shaped client. It compiles and passes `go vet` and `go test -race` on Go 1.24.
 
@@ -666,7 +720,9 @@ func TestNoRetryOn400(t *testing.T) {
 
 **Measured (representative, this package, Go 1.24, 2026-11-07):** `go test -race ./...` — 8 tests, all pass, package total 2.4s (two tests deliberately sleep through a short backoff/limiter window). `go vet ./...` reports no issues.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
+
+**In plain words:** Your choices: the official SDK, your own net/http client, or a gateway in between.
 
 | Approach | How it works | Use when | Cost |
 |---|---|---|---|
@@ -678,14 +734,14 @@ func TestNoRetryOn400(t *testing.T) {
 > [!warning] Interview trap
 > "Just use the SDK, it handles retries for you" is true until your team needs a single retry/timeout/rate-limit policy shared across several different providers or internal APIs — at that point, wrapping the SDK behind your own small interface (as `Client` does above) usually pays off, because it keeps the policy in one place instead of duplicated per-SDK.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Writing your own `net/http` client (as above) means you own keeping up with API changes the official SDK would track for you — reasonable for a single well-understood endpoint, questionable if you're reimplementing a large surface area the SDK already covers well.
 - A client-side rate limiter adds a small amount of latency to every call (the time spent waiting for a token) even when the provider isn't actually close to throttling you — tune its rate to your actual approved quota, not an arbitrary guess.
 - Full-jitter exponential backoff trades a slightly longer worst-case latency for much better behaviour under load (it spreads retries out instead of causing a thundering herd back onto a recovering provider) — don't replace it with fixed-delay retries "to keep latency predictable"; that's the pattern that causes synchronized retry storms.
 - Streaming adds code complexity (a line-based decoder, partial-failure handling) that a background batch job gains nothing from — reserve it for user-facing, interactive calls.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** chat UIs and coding assistants stream almost universally, for perceived latency; backend extraction/classification pipelines almost always use non-streaming calls since nothing is watching live; most production backends sit behind a small internal wrapper client (exactly the shape above) so that retry/timeout/observability policy lives in one place regardless of which team calls the LLM.
 - **Failure modes → fixes:**
@@ -695,7 +751,7 @@ func TestNoRetryOn400(t *testing.T) {
   - Silent cost blow-up from retrying a request that was never going to succeed (a 400) → the retryable/non-retryable split above, tested explicitly.
 - **What to monitor:** retries per request (a rising average signals provider trouble or too-aggressive a local rate limit); 429 rate and whether your limiter is actually keeping you under the provider's; TTFT for streaming calls; total call latency p50/p99; input/output token counts per call, aggregated into cost.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why full jitter, specifically.** Plain exponential backoff (no jitter) synchronizes retries from many concurrent callers that all failed at the same moment (e.g. because the provider returned a wave of `429`s during a burst) — they all wait the same delay and all retry at once, recreating the burst. Full jitter (`random(0, min(cap, base*2^attempt))`) spreads those retries across the whole window, which empirically clears a backlog faster than fixed or even "equal jitter" backoff.
 - **Why Retry-After overrides your own schedule.** The server's `Retry-After` reflects its actual rate-limit reset window; your own backoff is a guess tuned for the general case. When the server tells you the real answer, use it — it is both more correct and typically shorter than guessing conservatively.
@@ -703,7 +759,13 @@ func TestNoRetryOn400(t *testing.T) {
 - **Token counting's role before the call, not just after.** `usage` on a response tells you the true cost after the fact; a documented count-tokens endpoint (or, for a cheap rough check, the character-based estimate from [[LLM Fundamentals]]) lets you decide *before* sending — trim history, switch to a smaller model, or reject the request — which matters for per-tenant budgets and for avoiding a context-window overflow error on a call you're about to pay the input-token cost for regardless of whether it succeeds.
 - **The official SDK vs. hand-rolled client, revisited.** `github.com/anthropics/anthropic-sdk-go` (and equivalents from other providers) already implements retries, backoff, and streaming helpers, typically more thoroughly than a first pass at hand-rolling it; reach for the SDK by default for a single-provider backend, and treat a hand-rolled client like the one above as the right call specifically when you need one retry/rate-limit/observability policy shared across multiple different provider APIs, or want zero SDK dependency surface.
 
-## 9. Interview questions
+```mermaid
+flowchart LR
+    F["100 callers fail<br/>at the same moment"] --> N["No jitter:<br/>all retry together, fail again"]
+    F --> J["Full jitter:<br/>retries spread out, succeed"]
+```
+
+## 9. Interview questions 🔴
 
 > [!question]- Which HTTP status codes should a retry loop retry, and which must it never retry?
 > Retry transport-level errors, `408` (request timeout), `429` (rate limited), and `5xx` (server-side trouble) — these are plausibly transient. Never retry other `4xx` codes like `400` or `401`: the request itself is wrong or the credentials are bad, and it will fail identically on every attempt, so retrying only adds latency and wastes the retry budget.
@@ -723,7 +785,7 @@ func TestNoRetryOn400(t *testing.T) {
 > [!question]- Why does a client-side rate limiter help even though the provider already enforces its own limit and returns 429?
 > Letting every request go straight to the provider and reacting to `429`s after the fact means your service regularly eats avoidable retries and latency spikes right at your own configured ceiling. A client-side limiter tuned to (slightly under) your approved quota smooths request timing proactively, so you rarely hit `429` at all, and the ones you do hit are provider-side surprises worth alerting on, not routine noise from your own normal traffic.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - One call = `POST` + JSON body + API key header; response includes `content`, `stop_reason`, and exact `usage` token counts.
 - Retry `408`/`429`/`5xx` with full-jitter exponential backoff, honouring `Retry-After` when present; never retry other `4xx`.
@@ -734,7 +796,7 @@ func TestNoRetryOn400(t *testing.T) {
 - Default to the official SDK for a single provider; hand-roll a thin `net/http` client when you need one shared policy across multiple providers or zero SDK dependencies.
 - Streaming cuts perceived latency (time-to-first-token), not total latency — measure both.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[LLM Fundamentals]], [[Calling External APIs]]
 - **Next:** [[Prompt Engineering]], [[Structured Outputs and Tool Calling]]

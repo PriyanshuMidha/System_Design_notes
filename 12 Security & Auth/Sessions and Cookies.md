@@ -46,7 +46,38 @@ sequenceDiagram
     S-->>B: Set-Cookie session cleared, Max-Age=0
 ```
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A web server forgets you after every request. Each click arrives like a stranger.
+So after you log in, the server hands your browser a random number to show next time. That number is the **session ID**.
+The browser keeps it in a **cookie**: a small note the browser sends back to the same site on every request, by itself.
+
+```mermaid
+flowchart LR
+    L["You log in"] --> S["Server saves: id 7f3a = user 42"] --> C["Browser keeps cookie: 7f3a"]
+```
+
+The number means nothing on its own. The real facts (who you are, when it ends) stay on the server.
+
+```mermaid
+flowchart LR
+    B["Next click + cookie 7f3a"] --> S["Server looks up 7f3a"] --> U["Ah, user 42"]
+```
+
+Log out, and the server just deletes that row. The cookie becomes useless.
+
+The rest of this note is just these 3 questions:
+1. Which cookie settings keep the ID from leaking?
+2. How does a session start, stay alive and end?
+3. How do attackers steal or plant session IDs, and how do you stop them?
+
 
 **The problem in one story.**
 You log into a shop, then click to another page.
@@ -90,7 +121,7 @@ Where it breaks: a coat ticket is hard to copy; a cookie can be stolen and repla
 > [!tip] Remember
 > The cookie holds only a random ticket; the real login state lives on the server and can be deleted instantly.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 HTTP has no memory: every request arrives as if the server had never seen that browser before. A shopping cart, a "logged in as Priya" banner, and an authorization decision on the next request all need *some* state to persist across requests from the same browser.
 
@@ -102,15 +133,17 @@ The server's lookup on each request (`GET session:<id>` from Redis, typically su
 
 The alternative — a JWT the client holds and the server never stores — trades that lookup away for statelessness, at the cost of harder revocation (see [[JWT - Structure, Validation and Pitfalls]] and the comparison table below). Sessions and JWTs solve the same problem with opposite trade-offs; neither is simply "the modern one".
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A cookie is a coat-check ticket. The ticket itself (the session ID) means nothing — it's just a random number. The coat (your actual identity and permissions) stays at the coat check (the server's session store).
 
 Anyone holding the ticket gets the coat, which is exactly why the ticket must be unguessable (random, high entropy) and must never be readable by a stranger glancing at your pocket (`HttpOnly` keeps it out of reach of page JavaScript, including injected XSS scripts) or usable from across the street (`SameSite` and `Secure` limit which sites and which connections can present it).
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Cookie attributes
+
+**In plain words:** each cookie comes with a few switches: "only over HTTPS", "JavaScript may not read me", "don't send me from other sites". Turn all of them on for a login cookie.
 
 | Attribute | What it does | Why it matters |
 | --- | --- | --- |
@@ -126,6 +159,8 @@ Anyone holding the ticket gets the coat, which is exactly why the ticket must be
 | 4 KB limit | Browsers cap total cookie size per cookie (and often per domain) | A reason to store only an opaque ID in the cookie, never the full session payload |
 
 ### Session lifecycle
+
+**In plain words:** a session is born at login, gets a little longer each time you use it, and dies at logout, after idle time, or at a hard maximum age.
 
 ```mermaid
 stateDiagram-v2
@@ -144,6 +179,13 @@ Logout must delete the server-side record — not merely tell the browser to dro
 
 ### Session fixation and ID rotation
 
+**In plain words:** an attacker can plant a known ID in your browser before you log in. The fix is simple: give a brand-new ID the moment login succeeds.
+
+```mermaid
+flowchart LR
+    A["Old ID before login"] --> L["Login succeeds"] --> N["Throw old ID away,<br/>issue a new random ID"]
+```
+
 Session fixation is an attack where the attacker *sets* a victim's session ID before they log in (for example, by sending a link containing a pre-chosen session ID, if the server accepts a client-supplied ID at all, or by planting it via a subdomain that shares the cookie's `Domain`).
 
 If the server keeps using that same ID after the victim authenticates, the attacker — who already knows the ID — is now authenticated as the victim too.
@@ -160,9 +202,11 @@ flowchart LR
 
 The fix: **rotate the session ID on every privilege change** — most importantly right after successful login, and again on any role/permission elevation — issuing a fresh random ID and deleting the old record, never just updating the data behind the old ID.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Go: a session store with rotation, timeouts, and correct cookie attributes
+
+**In plain words:** this code stores sessions on the server, swaps the ID at login, and expires old ones. Read the comments, not every line.
 
 ```go
 // Package sessions is a minimal server-side session store: random opaque
@@ -475,7 +519,7 @@ func TestClearCookie(t *testing.T) {
 
 **Measured:** all 8 tests in this module (round-trip create/get, unknown-ID lookup, fixation rotation, idle expiry, idle-window sliding, idempotent delete, cookie attributes, clear-cookie) pass under `go test -race` on Go 1.24.4.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | Where state lives | Revocation | Scaling | Good for |
 | --- | --- | --- | --- | --- |
@@ -483,13 +527,13 @@ func TestClearCookie(t *testing.T) {
 | Signed/encrypted cookie session | Entirely in the cookie, integrity-protected (HMAC) or encrypted | Hard: the cookie is self-contained and valid until it expires, unless you also track a server-side denylist | No shared store needed, so it's the simplest model to scale horizontally | Low-stakes state (a signed "cart ID") where instant revocation doesn't matter |
 | JWT access token | Entirely in the token, signed | Hard for the same reason — same trade-off as above, discussed fully in [[JWT - Structure, Validation and Pitfalls]] | No lookup needed to validate the signature, so it scales without a shared store | APIs and mobile clients where a short expiry (minutes) makes "hard to revoke early" an acceptable risk |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A server-side session needs a shared store (Redis) reachable from every replica; without one, sticky sessions (routing a user back to the same instance) become necessary, which complicates load balancing and loses all in-flight sessions on that instance's restart.
 - Sessions do not fit mobile or cross-domain API clients as naturally as a bearer token: cookies are browser-and-origin-scoped by design, so a native mobile app has no cookie jar tied to your API's origin in the same way a browser does. Token-based auth (JWT or an opaque API token in an `Authorization` header) is the more natural fit there.
 - "JWT for APIs/mobile, sessions for browser apps" is a reasonable default, not a law: nothing stops a browser app from using short-lived JWTs with a refresh flow, and nothing stops a mobile app from calling a session-cookie-based API if it manages its own cookie jar. The real decision driver is whether instant revocation matters more than avoiding a shared server-side store.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Django, Rails and most traditional server-rendered frameworks default to server-side sessions. Go has no stdlib session package; `alexedwards/scs` and `gorilla/sessions` are the common choices, both pluggable with a Redis store.
 - **Failure modes → fixes:**
@@ -500,7 +544,7 @@ func TestClearCookie(t *testing.T) {
   - One Redis node holding all sessions with no replication → a single point of failure that logs out the entire user base on a crash; run Redis with replication/Sentinel ([[Redis Replication, Sentinel and Cluster]]) for session stores at any real scale.
 - **What to monitor:** active session count, session creation rate (a spike can mean a credential-stuffing campaign producing many successful logins, or a bug double-creating sessions), average and p99 session-store lookup latency (every authenticated request pays this), session-store error rate (a Redis blip here locks out every logged-in user at once).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Idle vs absolute timeout, chosen independently.** Idle timeout protects against "walked away from an unlocked laptop"; absolute timeout caps how long a stolen cookie (via a sync backup, a shared machine, a browser extension bug) stays useful even with continuous activity. Banking applications commonly set idle timeouts in single-digit minutes and absolute timeouts in hours; a low-stakes app might use 30 minutes idle and multi-day absolute.
 - **Sticky sessions vs a shared store, at scale.** Sticky sessions (the load balancer routes a client back to the instance that created their session, usually via a cookie or consistent hashing) avoid needing a shared store but couple the user's session lifetime to one instance's uptime and complicate autoscaling (new instances start with zero sessions, a terminated instance strands its sessions). A shared Redis store decouples session data from any one instance entirely, at the cost of a network hop on every request and a new single point of failure to make highly available.
@@ -508,7 +552,7 @@ func TestClearCookie(t *testing.T) {
 - **XSS vs cookie theft, precisely.** `HttpOnly` stops `document.cookie` from reading the session ID — it does not stop an XSS payload from issuing `fetch('/api/transfer', {credentials: 'include', ...})` from within the victim's browser, which rides the cookie automatically because the browser (not the script) attaches it. This is why XSS is a serious vulnerability even against fully `HttpOnly` cookies: the attacker doesn't need to *read* the cookie if they can make authenticated requests through it directly.
 - **Session storage format choice.** A session record can hold just a `userID` (minimal; every other field is re-fetched from the primary database on each request) or a fuller cached profile (fewer database round trips per request, at the cost of staleness — a role change doesn't take effect until the session is refreshed or expires). Most systems start minimal and add caching only where the extra database round trip is measured to matter.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What exactly is stored in the cookie, and what is stored on the server?
 > The cookie holds only a random, meaningless session ID. All actual data — which user, when the session was created, when it was last active — lives server-side in a session store (Redis or a database), looked up by that ID on every request.
@@ -531,7 +575,7 @@ func TestClearCookie(t *testing.T) {
 > [!question]- How do idle timeout and absolute timeout differ, and why have both?
 > Idle timeout expires a session after a period of no activity, protecting an unattended logged-in session. Absolute timeout expires a session after a fixed span regardless of activity, capping how long a stolen cookie stays useful even if it's used continuously. A session needs both: idle timeout alone never bounds a continuously-active attacker; absolute timeout alone doesn't help an abandoned-but-not-yet-expired tab.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - A session cookie carries only a random opaque ID; the actual state lives server-side, looked up on every request.
 - Required cookie attributes: `HttpOnly`, `Secure`, `SameSite` (Lax by default, Strict for the most sensitive flows), `Path=/`, and prefer the `__Host-` prefix.

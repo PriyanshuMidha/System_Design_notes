@@ -24,7 +24,35 @@ updated: 2026-11-13
 > - The one rule: the tree must really be a tree. Guard against cycles and very deep input before recursing.
 > - Classic mistake: recomputing a whole subtree on every page view (for example product counts) instead of caching or precomputing it.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then the rest of this "Start here" section, sections 1, 2 and the cheat sheet (10). Skip the big code blocks on a first pass. Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works, with the small whiteboard code), section 4 (the full worked example) and sections 5 and 6 (variants and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Lots of data is shaped like a tree: folders hold files and other folders; categories hold products and other categories.
+You often want to ask the same question of any part of the tree, like "how many products are in here?"
+A **leaf** is a single item (one product). A **composite** is a group (a category) that holds other items.
+The trick: both answer the same question in the same way, so your code never has to check which one it has.
+A group answers by asking each child and adding up the answers.
+
+```mermaid
+flowchart TD
+    E["Electronics (group)"] --> P["Phones (group)"]
+    E --> T["TV (item)"]
+    P --> A["iPhone (item)"]
+    P --> S["Galaxy (item)"]
+```
+
+The Go code in this note builds exactly this kind of tree. Look at the picture first; the code is the same tree.
+The rest of this note is just these 3 questions:
+1. How do a single item and a group share one interface?
+2. How do you keep the tree safe (no loops, not too deep)?
+3. How do you store and load the tree in a database?
+
 
 **The problem in one story.**
 An online shop has categories like Electronics, which holds Phones, which holds actual products.
@@ -67,7 +95,7 @@ Where it breaks: a real disk cannot put a folder inside itself, but buggy data c
 > [!tip] Remember
 > Leaf and group share one interface; the group answers by asking its children, and the tree must really be a tree.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A grocery catalog has 3 levels of categories and about 20,000 products (an estimate for a mid-size store). The home page needs "Dairy (124)", the admin needs the stock value of "Beverages", and search needs every product under "Fruits".
 
@@ -80,7 +108,7 @@ Trees also bring two failure modes:
 
 The code below refuses both when a child is added, so every later walk can trust the shape.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A **box of boxes**. A box can hold items or smaller boxes. To weigh any box you weigh what is inside; an item just reports its own weight. You never need to know in advance how deep the boxes go.
 
@@ -90,7 +118,7 @@ The pattern has three roles:
 - **Leaf**: has no children and answers directly (`*Product`).
 - **Composite**: holds children of type `Node` and answers by combining their answers (`*Category`).
 
-## 3. How it works
+## 3. How it works 🟡
 
 ```mermaid
 classDiagram
@@ -139,6 +167,8 @@ Step by step:
 
 ### Whiteboard version
 
+**In plain words:** One interface, an item that answers directly, and a group that sums its children. That is the whole pattern.
+
 The bare idea: one interface, a leaf that answers directly, and a group that sums its children. The full version in section 4 adds the production concerns.
 
 ```go
@@ -174,7 +204,9 @@ func main() {
 }
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
+
+**In plain words:** One program that builds a product catalog tree, adds safety checks, walks it and searches it. The core is the shared interface and the loop over children.
 
 One `package main` with the catalog tree, the guards, an iterator, search, validation and `io.MultiWriter`. It compiles with Go 1.24 and passes `go vet` and `go test -race`, using only the standard library.
 
@@ -422,6 +454,9 @@ report bytes: 154
 
 The tests are table-driven and cover the aggregates on every kind of node, every guard in `Add`, the depth limit, iteration order with early `break`, search, and validation that reports all bad leaves:
 
+
+**In plain words:** These are the tests. They check counts on every kind of node and that loops or too-deep trees are refused.
+
 ```go
 package main
 
@@ -570,6 +605,8 @@ func TestValidateReportsEveryBadLeaf(t *testing.T) {
 
 ### Persisting the tree (PostgreSQL 17)
 
+**In plain words:** A tree has to live in database rows somehow. Here are three common ways to store it, and what each makes easy or hard.
+
 The in-memory tree is usually loaded from a table. Three common schemas:
 
 | Schema | How a subtree is read | Moving a subtree | Cost |
@@ -639,7 +676,7 @@ FROM category_closure
 WHERE ancestor_id = 1 AND depth > 0;
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Variant | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -650,7 +687,7 @@ WHERE ancestor_id = 1 AND depth > 0;
 
 **Composite vs Decorator.** Both build a recursive structure of one interface. A decorator wraps **one** object and adds behaviour to its calls; a composite holds **many** children and combines their results. See [[Decorator and Middleware]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 **When not to use it in Go:**
 
@@ -667,7 +704,7 @@ WHERE ancestor_id = 1 AND depth > 0;
 - **Concurrent mutation.** The tree is not safe for concurrent `Add` and reads. Build it once and share it read-only, guard the whole tree with one `sync.RWMutex`, or swap in a new immutable tree through an `atomic.Pointer`.
 - **Typed nil children.** A nil `*Product` stored in a `Node` is a non-nil interface; calling a method on it panics if the method reads a field. `Add` rejects both a nil interface and a typed nil.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- `go/ast`: `ast.Node` is the component, and `ast.Inspect` walks the tree of declarations, statements and expressions. `text/template/parse` has a `ListNode` holding `[]Node`.
@@ -681,7 +718,7 @@ WHERE ancestor_id = 1 AND depth > 0;
 	- A product appears twice in a count → it was placed in two categories; count distinct product ids.
 - **What to monitor:** maximum depth and node count per tree, time to load and build the tree, rejected `Add` calls by reason, and the latency of subtree queries.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Transparency vs safety.** GoF discusses putting `Add` and `Remove` on the component (transparent: any node can be edited the same way) or only on the composite (safe: a leaf cannot be given children). Go's small interfaces push you to the safe side; when generic code needs the children, a type assertion or a small `interface{ Children() []Node }` does it.
 - **Why an explicit stack.** Go grows goroutine stacks on demand, so recursion is fine for a 6-level catalog. The explicit stack matters for untrusted or very deep input, and as a Go 1.23 iterator it gives callers early exit (`break`) and lets the same walk feed search, printing and export.
@@ -689,7 +726,7 @@ WHERE ancestor_id = 1 AND depth > 0;
 - **Guard cost.** The cycle check walks up the parent chain (`O(depth)`), and `height(child)` walks the child's subtree once. Both are cheap at write time and remove whole classes of bugs from every read.
 - **Comment threads in SQL.** A materialized path such as `0001.0007.0003` sorted with `ORDER BY path` returns a thread in display order without recursion; zero-padding keeps text sorting correct.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What problem does Composite solve?
 > It lets callers treat a single item and a group of items through one interface. A composite answers by combining its children's answers, so code that asks the root works for any depth and any mix of leaves and groups.
@@ -712,7 +749,7 @@ WHERE ancestor_id = 1 AND depth > 0;
 > [!question]- How is Composite different from Decorator?
 > Both are recursive structures over one interface. A decorator wraps exactly one object and adds behaviour to its calls. A composite holds many children and aggregates their results.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - One interface for leaf and composite; the composite combines its children's answers.
 - `Add` only on the composite (safe design); reject nil, cycles, second parents and excess depth.
@@ -722,7 +759,7 @@ WHERE ancestor_id = 1 AND depth > 0;
 - In PostgreSQL: adjacency list + `WITH RECURSIVE ... CYCLE`, closure table, or `ltree` path.
 - Cache aggregates for big trees; share built trees read-only.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Interfaces]], [[Trees, BSTs and Balanced Trees]], [[Design Patterns Overview and Chooser]]
 - **Next:** [[Observer and Event Bus]], [[Iterator and range-over-func]], [[File Search (Unix find)]]

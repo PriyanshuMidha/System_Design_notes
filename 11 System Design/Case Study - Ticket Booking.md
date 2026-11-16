@@ -25,7 +25,40 @@ updated: 2026-11-13
 > - Payment confirmation is **idempotent**, and a payment that arrives after the hold expired is refunded, not forced through.
 > - On-sales are protected by a waiting room that admits buyers at the rate the booking path can serve.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A ticket site like BookMyShow sells seats for a show, and each seat can be sold only once.
+When a big concert opens, thousands of people click the same seat in the same second.
+The database settles it with one "take this seat only if it is still free" step. Only one click wins. This is a **conditional update**.
+The winner gets a short **hold**: the seat is theirs for about 10 minutes while they pay.
+
+```mermaid
+flowchart LR
+    C["1,000 clicks on seat F7"] --> U["Take F7 only if free"]
+    U -- "1 wins" --> H["Held for 10 min"]
+    U -- "999 lose" --> L["Pick another seat"]
+```
+
+If they pay, the seat is sold. If not, the hold runs out and the seat is free again.
+
+```mermaid
+flowchart LR
+    F["Free"] --> H["Held (10 min)"]
+    H -- "paid" --> S["Sold"]
+    H -- "time ran out" --> F
+```
+
+So the rest of this note is just these 3 questions:
+1. How do you make sure only one person gets a seat?
+2. How do holds expire and give seats back?
+3. How do you survive the rush when a big show goes on sale?
 
 **The problem in one story.**
 A popular concert goes on sale at 10 am.
@@ -70,7 +103,7 @@ Where it breaks: a real attendant cannot judge thousands of hooks in the same mi
 > [!tip] Remember
 > Take seats with one conditional update and let holds expire by time, so a seat is never sold twice.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 Two people click seat F7 for the same 9 pm show within the same millisecond. The naive code reads the seat, sees it free, and writes "booked":
 
@@ -100,7 +133,7 @@ A second problem appears when a popular concert opens: 1 million people arrive i
 
 **Out of scope:** pricing rules, dynamic pricing, theatre-side box-office integration details.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a **cloakroom with numbered hooks**. To claim a hook you hang your coat on it; if someone's coat is already there, you cannot.
 
@@ -126,7 +159,7 @@ stateDiagram-v2
     BOOKED --> [*]: show starts
 ```
 
-## 3. How it works - high-level design
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart LR
@@ -210,7 +243,7 @@ sequenceDiagram
     S-->>U: availability bitmap
 ```
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -224,6 +257,8 @@ sequenceDiagram
 Say the invariant first: "a seat row can only change from free to held in one atomic conditional update, so two buyers can never both succeed." Then the numbers.
 
 ### Estimates
+
+**In plain words:** rough sums: seat clicks per second during a big on-sale, and bookings per day.
 
 All inputs are **estimates** for this exercise.
 
@@ -243,6 +278,8 @@ All inputs are **estimates** for this exercise.
 The headline: steady state is tiny (12 bookings per second fits on one PostgreSQL primary). The whole difficulty is the on-sale spike and the correctness rule. Admitting 500 buyers per second sells out a 50,000-seat concert in under a minute of admission, so most queued buyers should be told "sold out" by the waiting room, not by the database.
 
 ### API
+
+**In plain words:** see the seat map, hold seats, pay, and get the booking.
 
 ```http
 GET  /v1/shows/501/availability            -> {"seats_free_bitmap": "base64...", "as_of": "2026-11-04T18:00:03Z"}
@@ -265,6 +302,8 @@ GET  /v1/bookings/b901                      -> {"status": "CONFIRMED", "tickets"
 The amount is in the currency's minor unit (paise), as an integer, never a float.
 
 ### Data model
+
+**In plain words:** shows, one row per seat per show with its state and hold time, and bookings.
 
 ```mermaid
 erDiagram
@@ -382,6 +421,8 @@ UPDATE 2
 ```
 
 ### The same rules in Go
+
+**In plain words:** the code takes a seat only if it is free or its hold ran out, and confirms only if the hold is still yours.
 
 An in-memory model of the inventory rules, with an injected clock so expiry is tested without sleeping. In production these rules live in the SQL above; the Go version makes them executable and testable. It compiles and passes `go vet` and `go test -race` on Go 1.24.
 
@@ -573,7 +614,7 @@ func TestConfirmIsIdempotent(t *testing.T) {
 }
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach to "who gets the seat" | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -585,7 +626,7 @@ func TestConfirmIsIdempotent(t *testing.T) {
 | Distributed lock per seat | Lock service grants a lease per seat | Rarely justified here | Extra system; needs fencing tokens to be safe, see [[Distributed Locks and Fencing Tokens]] |
 | General-admission counter | `UPDATE sections SET sold = sold + $n WHERE sold + $n <= capacity` | Standing areas, no seat numbers | One very hot row; split into sub-counters |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Hold duration is a business trade-off.** Long holds (15 minutes) give slow payers time but keep seats unsellable while abandoned. Short holds (5 minutes) cause more expired-hold refunds. Pick it from payment-time data; 8 to 10 minutes is common.
 - **The seat map is always slightly stale.** Do not try to make it exact; the hold step is the source of truth, and a 409 with "pick another seat" is an acceptable experience.
@@ -593,7 +634,13 @@ func TestConfirmIsIdempotent(t *testing.T) {
 - **Redis holds add speed and risk.** A Redis failover between the hold and its replication can lose the hold and let a second buyer take the seat in Redis; the database `UPDATE ... WHERE free` still prevents a double sale. Keep the database as the judge.
 - **Do not use distributed transactions** across the booking database and the payment provider. Use the hold as the first step of a saga: hold, pay, confirm or compensate by refund. See [[Saga Pattern]].
 
-## 7. In production
+```mermaid
+flowchart LR
+    S["Short hold (5 min)"] --> S1["Seats come back fast,<br/>slow payers lose out"]
+    L["Long hold (15 min)"] --> L1["Time to pay,<br/>seats stuck if people leave"]
+```
+
+## 7. In production 🔴
 
 - **Failure modes → fixes:**
 	- Payment succeeds after the hold expired → confirmation fails the `held_until > now()` check; refund automatically and tell the user. Never extend a hold silently after another buyer may have taken the seat.
@@ -609,7 +656,7 @@ func TestConfirmIsIdempotent(t *testing.T) {
 	- Lock wait time and deadlock count on `show_seats`.
 	- Waiting-room queue length and admission rate.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why no sweeper is needed, and why you still run one.** Correctness comes from the `held_until <= now()` clause in the hold statement: an expired hold is just a free seat. A sweeper that resets expired rows to `AVAILABLE` every minute is still useful so the availability cache and analytics see the right state, but if it stops, nothing breaks.
 
@@ -623,7 +670,7 @@ func TestConfirmIsIdempotent(t *testing.T) {
 
 **Twin at class level.** The object model (Show, Seat, SeatLock, Booking, strategies for pricing) is designed in [[Movie Ticket Booking]]; this note owns the distributed parts.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How do you guarantee a seat is never sold twice?
 > Make "claim if free" one atomic database operation: `UPDATE show_seats SET HELD ... WHERE show_id, seat_id AND (AVAILABLE or hold expired)` and check the row count. One row per `(show_id, seat_id)` as the primary key means there is nowhere for a second booking to go.
@@ -646,7 +693,7 @@ func TestConfirmIsIdempotent(t *testing.T) {
 > [!question]- How is the booking flow kept consistent with the payment provider without 2PC?
 > As a saga: hold (local transaction) → pay (provider call with idempotency key = hold ID) → confirm (local transaction) or compensate (release the hold, refund). Events leave through an outbox.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 A 45-minute script:
 

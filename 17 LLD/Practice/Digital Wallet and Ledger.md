@@ -31,7 +31,28 @@ updated: 2026-11-13
 > - A reversal is a new transaction with every leg negated and a link to the original.
 > - Classic mistakes: `balance -= amount` without a check under concurrency, `float64` money, deleting a wrong entry, and an idempotency check that is not atomic with the write.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A wallet app holds money for you, like Paytm. The app never just edits a "balance" number. Instead it writes every money move into a **ledger**, which is a notebook that is only ever added to. Each move writes at least two lines: money leaves one account and enters another. The lines of one move always add up to zero. This is called **double entry**. Your balance is just the sum of your lines, so you can always check that no money appeared or vanished.
+
+```mermaid
+flowchart LR
+    A["Alice: -₹100"] --> T["One transfer"]
+    B["Bob: +₹100"] --> T
+    T --> S["Sum = 0, always"]
+```
+
+Everything else in this note is just these 3 questions:
+1. How is a transfer written so the lines always sum to zero?
+2. How do you stop a retry from moving money twice?
+3. How do you prove the books are correct?
 
 **The problem in one story.**
 You send 500 rupees to a friend in a wallet app.
@@ -77,7 +98,7 @@ Where it breaks: a passbook has one writer at a time; a wallet has many concurre
 > [!tip] Remember
 > Entries are append-only and sum to zero; check and debit in one atomic step; one key, one effect.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design a digital wallet. Users can top up from a bank, pay another user, and see their balance
@@ -97,7 +118,7 @@ Support refunds of a past payment.
 5. Wrap it in `Wallet.Transfer` with the idempotency envelope (acquire lease, post with key as transaction ID, complete).
 6. Add `Reverse`, then test replay, key reuse, lease expiry, crash after post, reversal rules, and 100 concurrent debits.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 ### Questions to ask (with assumed answers)
 
@@ -132,7 +153,7 @@ Support refunds of a past payment.
 - Currency conversion and interest.
 - The system-level payment architecture: see [[Case Study - Payment System]].
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 |---|---|
@@ -144,7 +165,7 @@ Support refunds of a past payment.
 
 The hardest use case is **Transfer under retries and concurrency**: the same key arriving twice at once, a worker that dies after posting, and many different transfers draining one account. Code that first.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
@@ -160,7 +181,7 @@ The hardest use case is **Transfer under retries and concurrency**: the same key
 
 Sign convention: this note uses signed amounts from the account owner's view, `+` adds to the balance and `-` removes it. Accountants say debit and credit, and for a liability account like a user wallet a credit increases it; the signed form avoids that confusion in code while keeping the double-entry rule "sum of legs = 0".
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -212,7 +233,7 @@ classDiagram
     Tx ..> Tx : ReversalOf
 ```
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 ```text
 POST /wallets/transfers      header: Idempotency-Key: <uuid>
@@ -238,11 +259,13 @@ type WalletService interface {
 var _ WalletService = (*Wallet)(nil) // compile-time check
 ```
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
 
 In production the ledger is in PostgreSQL 17, and the database enforces most invariants, not only the Go code: unique transaction IDs, at most one reversal, non-zero entries and no negative user balance.
 
 The rule that a transaction's entries sum to zero is not expressible as a plain `CHECK`; the posting code enforces it, and a deferred constraint trigger or the reconciliation query catches any violation.
+
+**In plain words:** The tables: accounts, transactions and entries. Entries are never changed or deleted, only added.
 
 ```sql
 CREATE TABLE accounts (
@@ -331,7 +354,7 @@ type IdempotencyRepo interface {
 }
 ```
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 |---|---|---|
@@ -346,7 +369,7 @@ Patterns not used, and why:
 - No [[State Machines in Go]] for transactions in the code: a posted transaction is final. Holds (authorised, captured, voided) do need one; see Step 10.
 - No per-account mutexes: one ledger mutex is simplest and correct. Per-account locks raise throughput but must be taken in sorted order (see [[Concurrency for LLD]]).
 
-## Folder structure
+## Folder structure 🟡
 
 ```text
 wallet/
@@ -359,7 +382,7 @@ wallet/
 
 The code below is printed as one file so it reads top to bottom.
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > Aim for about 180 lines in the room.
@@ -397,6 +420,8 @@ Alice tops up 1000 paise, pays Bob 400, and the payment is reversed.
 | rev-1 (reversal of k1) | bob: -400, alice: +400 | 0 | 1000 | 0 | -1000 |
 
 All six entries stay in the ledger. The sum over every entry is 0, and each balance equals the sum of that account's entries. If Bob had spent 300 before the reversal, `rev-1` would fail with insufficient funds: a reversal follows the same no-negative rule (the product decides whether to allow a negative balance, recover the money, or absorb it).
+
+**In plain words:** The full in-memory ledger. Read `Transfer` first: it checks the key, checks the balance and writes all the lines together.
 
 ```go
 package wallet
@@ -783,9 +808,11 @@ type WalletService interface {
 var _ WalletService = (*Wallet)(nil) // compile-time check
 ```
 
-## Test cases
+## Test cases 🟡
 
 `newEnv` opens alice, bob and the `bank-settlement` system account, and tops alice up with 1000 paise. The clock is a pointer that tests move forward to expire leases. `bal` asserts on every read that the cached balance equals the balance from entries.
+
+**In plain words:** Tests that move money around, retry with the same key, and then check that every balance matches its lines.
 
 ```go
 package wallet
@@ -1085,7 +1112,7 @@ What the tests prove:
 - **Reversals:** the original stays, balances are restored, a second reversal is rejected, a reversal retry replays, and a reversal cannot push the receiver negative.
 - **Concurrency under `-race`:** 100 goroutines each send 30 from an account holding 1000; exactly 33 succeed, 67 get insufficient funds, and the balance ends at 10, never negative. 50 goroutines with the same key post exactly once.
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | What happens | How the design handles it |
 |---|---|---|
@@ -1111,7 +1138,7 @@ What the tests prove:
 - Saving the receipt before the ledger write commits.
 - Using `float64` for money.
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 |---|---|
@@ -1131,7 +1158,7 @@ Tradeoffs chosen:
 - **Release the key on a business rejection.** Lets a user retry the same payment after topping up. The alternative, saving the 409 as the final answer, is stricter: the client must use a new key. Both are valid; state which one you choose.
 - **Lease TTL.** Too short and a slow but alive worker loses its lease (safe here, because the ledger key blocks a second post, but the response is lost); too long and a crashed request blocks retries. 30 seconds in the tests is an example value, not a recommendation.
 
-## Drawing
+## Drawing 🟢
 
 A transfer with a retry that arrives while the first attempt is still running:
 
@@ -1171,7 +1198,7 @@ stateDiagram-v2
     Done --> Done: different fingerprint is rejected (ErrKeyReused)
 ```
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- Why double entry instead of just a balance column?
 > A balance column only says where you are, not how you got there. Entries that sum to zero per transaction make every paisa traceable: money moves between accounts, it is never created by an `UPDATE`. They also let you detect bugs, because the cached balance must equal the sum of entries and the ledger must sum to zero.
@@ -1198,13 +1225,13 @@ stateDiagram-v2
 > [!question]- How do you avoid deadlocks when transfers lock two user accounts?
 > Lock the accounts in a fixed global order, for example by account ID, regardless of transfer direction. Then A to B and B to A both lock A first, so neither can hold one lock while waiting for the other.
 
-## Interview explanation
+## Interview explanation 🔴
 
 ```text
 I model money as a double-entry ledger: a transaction is two or more immutable entries that sum to zero, and a top-up comes from a system account that is allowed to go negative. Amounts are int64 paise. Posting checks every account's resulting balance and only then appends entries and updates cached balances, all under one lock, or in Postgres in one transaction with a conditional UPDATE that only debits if the balance is enough. Each request has an idempotency key: a lease while it runs, a saved receipt when done, and the key is also the ledger transaction ID with a unique constraint, so a stale or crashed worker can never post twice. Refunds are reversals, new transactions with negated legs linked to the original, never deletes. A reconciliation job checks that cached balances equal the sum of entries.
 ```
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - Every transaction: >= 2 legs, sum = 0. System accounts may go negative; user accounts never.
 - Entries are append-only; balance = sum of entries; cached balance is reconciled.
@@ -1214,7 +1241,7 @@ I model money as a double-entry ledger: a transaction is two or more immutable e
 - Reversal = new negated transaction, unique `reversal_of`, same no-negative rule.
 - Lock two accounts in ID order; `int64` paise; injected clock.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[LLD Interview Method]], [[Concurrency for LLD]], [[Idempotency and Idempotency Keys]]
 - **Next:** [[LLD Problem Cheat Sheet]]

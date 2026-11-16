@@ -26,7 +26,29 @@ updated: 2026-11-13
 > - A **generation counter** drops results of calls admitted in an earlier state, so a slow call from before the trip cannot close or re-open the breaker.
 > - Classic mistakes: one breaker for the whole process, counting the caller's own cancellation as a dependency failure, and letting unlimited traffic through in half-open.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs) and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your service calls another service, say a payment provider. One day that provider gets slow or keeps failing. If you keep calling it, your own service waits, piles up work and falls over too. A **circuit breaker** watches the calls. When too many recent calls fail, it "opens" and stops calling for a short while, failing fast instead. After a cool-down it lets a few test calls through. If they work, it goes back to normal. This is the same idea as the fuse box in your house.
+
+```mermaid
+flowchart LR
+    A["Closed: calls go through"] -- "too many failures" --> B["Open: fail fast"]
+    B -- "after cool-down" --> C["Half-open: try a few"]
+    C -- "they work" --> A
+    C -- "they fail" --> B
+```
+
+Everything else in this note is just these 3 questions:
+1. How does it count recent failures fairly?
+2. When exactly does it switch between closed, open and half-open?
+3. How do you test it without waiting real seconds?
 
 **The problem in one story.**
 Your app calls a payment service, and that service goes down.
@@ -71,7 +93,7 @@ Where it breaks: a fuse stays off until a human resets it; a circuit breaker tes
 > [!tip] Remember
 > Closed counts failures, open fails fast, half-open lets a few probes decide.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design a circuit breaker library that wraps calls to a remote dependency.
@@ -91,7 +113,7 @@ if they succeed. It must be safe for concurrent use and testable without sleepin
 5. Add the generation counter, the error classifier and panic handling.
 6. Test every transition with a fake clock, then 100 goroutines in half-open under `-race`.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 ### Questions to ask (with assumed answers)
 
@@ -120,7 +142,7 @@ if they succeed. It must be safe for concurrent use and testable without sleepin
 - Sharing breaker state across instances (each instance decides for itself; Step 10 explains why that is usually right).
 - Fallback responses: the caller decides what to do with `ErrOpen`.
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 |---|---|
@@ -131,7 +153,7 @@ if they succeed. It must be safe for concurrent use and testable without sleepin
 
 The hardest use case is **half-open under concurrency**: when the cool-down ends, hundreds of goroutines arrive at once, and exactly N may pass.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
@@ -143,7 +165,7 @@ The hardest use case is **half-open under concurrency**: when the cool-down ends
 
 Modelling insight: **admission and recording are two steps**. `Allow` decides whether a call may start; `done` records how it ended, possibly seconds later and after the state has changed. The generation captured at admission ties the two together.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -207,7 +229,7 @@ stateDiagram-v2
 - **Composition** (breaker to buckets and settings): owned, never shared.
 - **Usage**: an HTTP client, gRPC interceptor or repository wraps each call with `Execute`; the breaker knows nothing about the transport.
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 A breaker is a library, not a service, so there is no HTTP API. It surfaces in two places: the error a caller maps to a response, and an admin or metrics endpoint.
 
@@ -229,7 +251,7 @@ type CircuitBreaker interface {
 var _ CircuitBreaker = (*Breaker)(nil) // compile-time check
 ```
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
 
 None. Breaker state is per process and in memory on purpose: it reflects what *this* instance sees, and it must answer in microseconds.
 
@@ -237,7 +259,7 @@ Persisting it, or sharing it through Redis, adds a network call to the very path
 
 The only things that leave the process are metrics and the `OnStateChange` events.
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 |---|---|---|
@@ -254,7 +276,7 @@ Patterns not used, and why:
 - No state objects with one struct per state: three states with a few lines each read better as a `switch` on an enum.
 - No timer goroutine for open to half-open: the lazy check costs one time comparison per call and removes start and stop lifecycle.
 
-## Folder structure
+## Folder structure 🟡
 
 ```text
 breaker/
@@ -267,7 +289,7 @@ transport/
   roundtripper.go -> http.RoundTripper decorator: 5xx and timeouts count as failures
 ```
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > Aim for about 140 lines in the room.
@@ -293,6 +315,8 @@ transport/
 The window has `Buckets` slots of `Window/Buckets` each. A time maps to `epoch = unixNanos / bucketLen` and slot `epoch % Buckets`. A slot with an old epoch is reset before use, and `windowCounts` sums only slots whose epoch is within the last `Buckets` epochs, so old outcomes fall out with no goroutine.
 
 Integer arithmetic for the rate (`fails*100 >= pct*total`) avoids float rounding at the boundary: 5 failures out of 10 at 50% trips exactly.
+
+**In plain words:** The whole breaker. It keeps failure counts in small time buckets, and `Execute` checks the state before every call.
 
 ```go
 package breaker
@@ -532,7 +556,7 @@ func (b *Breaker) transition(to State, now time.Time) {
 }
 ```
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 |---|---|
@@ -551,6 +575,8 @@ All tests pass under `go test -race -count=50` (Go 1.24.4).
 The mixed-traffic test does not assert "stays closed at 20% failures". Such an assertion would be flaky: goroutine order is random, so 5 of the first 10 calls can be failures, and then the breaker correctly opens.
 
 The test checks accounting instead. The same thing happens in production right after a deploy, which is why `MinRequests` should be large enough to make an early burst unlikely.
+
+**In plain words:** A fake clock you can move forward by hand, so the tests can jump past the cool-down instantly and check each state change.
 
 ```go
 package breaker
@@ -814,7 +840,7 @@ func TestConcurrentMixedTraffic(t *testing.T) {
 }
 ```
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | What happens | How the design handles it |
 |---|---|---|
@@ -838,7 +864,7 @@ func TestConcurrentMixedTraffic(t *testing.T) {
 - Running the call while holding the breaker's mutex: the breaker becomes a global lock around the dependency.
 - Retrying inside the breaker so one logical call counts as five failures; retries go outside, and stop on `ErrOpen`.
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 |---|---|
@@ -858,7 +884,7 @@ Tradeoffs chosen:
 - **All probes must succeed.** Conservative: it closes later but avoids flapping. A threshold (2 of 3) closes sooner.
 - **One mutex.** The critical sections are a few comparisons; an atomics version is possible but hard to keep correct across the generation, probe count and window together.
 
-## Drawing
+## Drawing 🟢
 
 ```mermaid
 sequenceDiagram
@@ -888,7 +914,7 @@ Redraw it from memory:
 - [ ] Admission (`Allow`) and recording (`done`) as two steps joined by the generation
 - [ ] Half-open with 100 arrivals, 3 admitted
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- Why a failure rate with a minimum number of calls instead of "N consecutive failures"?
 > Consecutive counts reset on any success, so a dependency failing 90% of the time may never trip, and a quiet service trips on two unlucky calls. A rate over a window with `MinRequests` reflects how healthy the dependency is right now and needs enough evidence before acting.
@@ -911,7 +937,7 @@ Redraw it from memory:
 > [!question]- How do the breaker, retries and timeouts fit together on one call?
 > Timeout on each attempt, retries with backoff around the breaker, and the breaker around each attempt. A retry loop must stop on `ErrOpen` instead of retrying it. Concurrency limits ([[Bulkheads and Concurrency Limits]]) sit next to the breaker, because a slow dependency fills goroutines before it produces errors.
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - Closed, open, half-open; trip on failure rate >= threshold once calls >= `MinRequests` in the window.
 - Time-bucket ring: slot = epoch % buckets, reset stale slots, sum only live epochs; no goroutine.
@@ -921,7 +947,7 @@ Redraw it from memory:
 - `context.Canceled` is not a failure; timeouts are.
 - One breaker per dependency or endpoint, per instance; never hold the lock during the call.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[LLD Interview Method]], [[State Machines in Go]], [[Concurrency for LLD]]
 - **Next:** [[Pub-Sub Message Queue]]

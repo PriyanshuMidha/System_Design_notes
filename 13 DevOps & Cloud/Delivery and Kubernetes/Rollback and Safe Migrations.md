@@ -23,7 +23,36 @@ updated: 2026-11-13
 > - Automate the trigger (error-rate and latency alarms, SLO burn rate) — a human watching a dashboard is slower than the alarm that pages them.
 > - A rollback is itself a deploy. It needs the same health checks, canary and monitoring as a forward deploy, or it just trades one bad version for a different kind of surprise.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A bad deploy goes out. The fastest fix is often to go back to the last good version. That is a **rollback**.
+Code is easy to roll back. Data is not. If the new version changed the database, the old code may no longer understand it.
+
+```mermaid
+flowchart LR
+    N["New code renames a column"] --> R["Roll back code"] --> X["Old code can't find the column: still broken"]
+```
+
+So you change the database in small safe steps, where both old and new code work at every moment.
+This is called **expand, migrate, contract**: add the new thing, move data over, remove the old thing later.
+
+```mermaid
+flowchart LR
+    E["Expand: add new column"] --> M["Migrate: write both, copy data"] --> C["Contract: drop old column"]
+```
+
+The rest of this note is just these 3 questions:
+1. When should you roll back, and when roll forward with a fix?
+2. What can be undone and what can't?
+3. How do you change a database without breaking a rollback?
+
 
 **The problem in one story.**
 You ship version 2 of your app on Friday evening.
@@ -67,7 +96,7 @@ Where it breaks: with careful design (expand/contract migrations) you *can* make
 > [!tip] Remember
 > Code can always go back; data usually cannot, so make every schema change safe for both versions.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A team ships a new pricing-calculation path to production at 2 p.m. By 2:05 p.m., the error-rate dashboard for that service jumps from 0.1% to 9%. Checkout requests are failing.
 
@@ -88,7 +117,7 @@ If the bad deploy also changed something that doesn't roll back with it — a da
 
 This note is about designing deploys so the rollback path is actually safe to take.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a release as **two independent axes that must stay compatible with each other**: the **code** axis (which version of the binary is running) and the **data/contract** axis (the schema, event format, and config that code reads).
 
@@ -100,9 +129,11 @@ Change the data axis in small, reversible-feeling steps (expand, then migrate, t
 
 Then a rollback of the code axis is always safe, because the data axis never moved out from under it.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Roll back vs. roll forward
+
+**In plain words:** going back is usually faster and safer. Going forward (a quick fix) only makes sense when going back is impossible or riskier.
 
 ```mermaid
 flowchart TD
@@ -122,6 +153,8 @@ Roll back by default. Roll forward only when the fix is already written, reviewe
 
 ### What rolls back, and what doesn't
 
+**In plain words:** code and config can go back. Sent emails, charged cards and changed data cannot.
+
 | Rolls back | Why | Doesn't roll back | Why not |
 | ---------- | --- | ------------------ | -------- |
 | Application code (redeploy the previous image digest) | The old binary still exists and is immutable | Emails, SMS, push notifications already sent | The message already left the building |
@@ -134,6 +167,8 @@ The second column is why **expand/contract** exists: it turns "rolls back" into 
 
 ### Mechanisms, by layer
 
+**In plain words:** each layer (Kubernetes, feature flags, load balancer, database) has its own "undo" button. Know which one to press.
+
 - **Kubernetes Deployment:** `kubectl rollout undo deployment/api` reverts to the previous ReplicaSet recorded in rollout history (`kubectl rollout history`). It is itself a rolling update in reverse — old pods come up, new pods terminate, readiness gates the traffic switch. See [[Kubernetes Fundamentals]] for how the Deployment–ReplicaSet–Pod chain drives this.
 - **ECS:** the deployment circuit breaker watches the new task set's health and, past a failure threshold, automatically stops the rollout and rolls the service back to the previous task definition — no human in the loop required.
 - **Blue-green:** switch the load balancer's target group (or the DNS record) back to the environment that was serving before, which is still warm and running. Fastest rollback there is, at the cost of running two full environments during the switch.
@@ -141,7 +176,7 @@ The second column is why **expand/contract** exists: it turns "rolls back" into 
 - **Feature flag kill switch:** flip the flag off in the flag service. No deploy at all — propagation is as fast as the SDK's streaming update, typically sub-second. This is the fastest rollback that exists and the reason risky logic should ship behind a flag even when the deploy mechanism is a plain rolling update.
 - **Config and Terraform:** redeploy the previous rendered config, or `terraform apply` against the prior committed plan. Config rollback needs the same version pinning as code — "what config was live two hours ago" has to be answerable from source control, not guessed.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -156,6 +191,8 @@ if canaryErrorRate > baselineErrorRate*2 || canaryErrorRate > absoluteCeiling {
 The full version below adds a minimum sample size (so three unlucky requests don't trip the alarm) and a "hold" state for when there isn't enough data yet.
 
 ### Automatic rollback trigger: canary analysis
+
+**In plain words:** a robot compares the new version's errors with the old one. If they are clearly worse, it rolls back by itself.
 
 A deploy pipeline runs a canary at 5% of traffic for 10 minutes, compares it against the baseline (the other 95%, still on the old version), and must decide: promote, hold and keep watching, or abort and trigger rollback.
 
@@ -270,6 +307,8 @@ Both pass (`go vet` clean, `go test -race` green). A fuller suite should also co
 
 ### Expand, migrate, contract across three deploys
 
+**In plain words:** renaming a column, done safely, takes three separate deploys. At no point does any running code see a column it doesn't expect.
+
 A column rename (`email` → `email_address`) is the simplest case that breaks naively: if you rename the column and deploy new code in the same step, every pod still running the old code (there are always some, mid-rollout) breaks instantly.
 
 ```mermaid
@@ -296,7 +335,7 @@ The same shape applies to **event schemas**: add a new field as optional, have p
 
 An event consumed by a service you don't control (a partner's webhook) may never let you remove the old field at all — you carry it forever or version the event type.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Mechanism | Speed | What it actually reverts | Needs |
 | --------- | ----- | ------------------------- | ----- |
@@ -307,14 +346,14 @@ An event consumed by a service you don't control (a partner's webhook) may never
 | Roll-forward fix | As fast as CI/CD builds and deploys the new artifact | Only the specific bug, not the whole deploy | The fix is already known and reviewed |
 | Data repair / replay | Minutes to hours | Side effects already applied (replays events, recomputes derived data) | An idempotent consumer and an event log or audit trail to replay from |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Expand/contract triples the number of deploys for one schema change and keeps old columns around longer, which costs storage and code complexity (dual-write, dual-read branches). For an internal tool with a five-minute maintenance window, a single blocking migration is simpler and the trade-off isn't worth it.
 - Automatic rollback triggers can themselves cause incidents: a flaky health check or a transient network blip can trigger a flood of unnecessary rollbacks. Require a minimum sample size and a sustained breach, not a single bad data point (see `Analyze`'s `minSamples` above).
 - Keeping a previous environment warm for instant blue-green rollback doubles infrastructure cost for as long as it's kept. Most teams tear it down after a bake period, trading rollback speed for cost once the new version is trusted.
 - Rolling back doesn't help when the previous version is *also* broken by something external — an expired certificate, a third-party API that changed — because the "known-good" artifact isn't actually good against today's environment.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Kubernetes stores a bounded rollout history per Deployment (`revisionHistoryLimit`, default 10) specifically so `rollout undo` has something to go back to. AWS CodeDeploy and ECS's deployment circuit breaker automate the abort-and-rollback decision from CloudWatch alarms. Argo Rollouts and Flagger run the canary-analysis loop in this note as a Kubernetes controller, querying Prometheus for the metrics.
 - **Failure modes → fixes:**
@@ -324,7 +363,7 @@ An event consumed by a service you don't control (a partner's webhook) may never
   - Rollback itself fails health checks because the "old" image was already deleted from the registry to save space. Fix: retain the last N image digests and the Deployment's rollout history together; never garbage-collect one without the other.
 - **What to monitor:** error rate and latency by version (not just service-wide), rollback count and mean time to rollback, canary analysis holds vs. aborts vs. promotes, and config/schema version drift between what's deployed and what the database actually has.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Rollback is not idempotent across migrations.** If deploy N added a NOT NULL column with no default and deploy N+1's rollback target is N-1, the rolled-back code doesn't know that column exists — which is fine, it just won't write to it — but any trigger or constraint that now requires it will reject inserts from the old code. This is the sharpest edge of expand/contract: the *database* must always tolerate the *oldest* code version still permitted to run, not just the newest.
 - **SLO burn-rate triggers** are a better automatic-rollback signal than a raw error-rate threshold, because they account for how fast the error budget is being consumed, not just whether it's currently breached. A burn rate of 14.4x (consuming a 30-day budget in ~2 hours) pages immediately; a burn rate of 1x just needs a ticket. See [[SLIs, SLOs, SLAs and Error Budgets]] for the formula and multi-window burn-rate alerting.
@@ -332,7 +371,7 @@ An event consumed by a service you don't control (a partner's webhook) may never
 - **Runbooks and drills.** A rollback procedure that's only ever been read, never executed, is unverified. Game-day drills that intentionally trigger a rollback in a non-production (or carefully scoped production) environment catch the gaps: a Terraform state lock nobody remembered to release, a database migration that silently can't be reversed because deploy 3's "contract" step already ran, an on-call engineer who's never actually typed `kubectl rollout undo`.
 - **Versioned artifacts, not "latest."** Rollback requires a previous artifact to exist and be addressable by an immutable identifier — an image digest, not a mutable tag like `:latest` that may have already been overwritten by a newer build. The same applies to Terraform state and rendered config: pin and keep history, or there's nothing to roll back *to*.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- When would you roll forward instead of rolling back?
 > When the fix is already known, small, and reviewed, and rolling back would be slower or riskier than shipping it — for example, a rollback would re-trigger an expensive migration, or the previous version has its own known issue. Default to rollback; only roll forward with a specific reason.
@@ -355,7 +394,7 @@ An event consumed by a service you don't control (a partner's webhook) may never
 > [!question]- A shipped mobile app already expects the new API contract. Can you still roll the API back?
 > Only if the API was versioned (a new field was additive, or a new endpoint version exists) so the old API version keeps serving the app that hasn't updated yet. If the change was a breaking rewrite with no version split, rolling back the API breaks every client still on the new mobile release — which is why mobile-facing API changes need stricter backward compatibility than purely internal ones.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Default to rollback; roll forward only with a known, smaller, already-reviewed fix.
 - Code, config, flags and infra-as-code roll back. Sent messages, captured payments and dropped columns don't.

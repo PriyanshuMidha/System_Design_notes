@@ -23,7 +23,37 @@ updated: 2026-11-13
 > - Conway's law means service boundaries tend to mirror team boundaries whether or not anyone plans it that way.
 > - Fowler's MonolithFirst: start with a monolith (ideally a modular one) and split out a service only when a concrete, measured need (independent scaling, independent deploys, a genuinely separate team) appears.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A **monolith** is one app with all the features, deployed as one piece, usually with one database.
+**Microservices** split those features into many small apps. Each has its own database and they talk over the network.
+Microservices let teams ship on their own and scale parts on their own.
+But every function call becomes a network call that can be slow or fail. You also need much more tooling to run them.
+So microservices are not "better". They trade code tangle for network and ops pain.
+Most teams should start with a well-split monolith and break off a service only when there is a clear reason.
+
+```mermaid
+flowchart LR
+    subgraph Monolith
+      A["Orders"] --> B["Billing"]
+    end
+    subgraph Microservices
+      C["Orders service"] -- "network call" --> D["Billing service"]
+    end
+```
+
+The rest of this note is just these 3 questions:
+1. What really changes when you split an app?
+2. What extra costs come with the split?
+3. When should you split, and how do you do it without a rewrite?
+
 
 **The problem in one story.**
 A small team ships one app that does everything: invoices, payments, reports.
@@ -72,7 +102,7 @@ Where it breaks: stalls in a food hall rarely need each other's food, but servic
 > [!tip] Remember
 > Split only when deployment, data and team ownership can all become independent, not just the code.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps starts as one Go binary: an HTTP layer, invoice and payment logic, and one Postgres database, deployed as a single container. One engineer can run the whole thing locally with `docker compose up` and one `go run`.
 
@@ -86,7 +116,12 @@ A split that keeps one shared Postgres database and one team touching every "ser
 
 That half-measure has a name: the **distributed monolith**, and it is strictly worse than the monolith it replaced, because it has a monolith's coupling and a microservices architecture's operational cost at the same time.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    G["Team grows to 50 people"] --> C["Everyone deploys one app"] --> Q["Deploy queue, merge pain"] --> S["Split into services per team"]
+```
+
+## 2. Mental model 🟢
 
 Four questions decide where a system sits on the monolith-to-microservices spectrum, and they can move independently of each other:
 
@@ -103,7 +138,7 @@ A **modular monolith** is the useful middle ground: still one deployment and one
 
 A kitchen that is internally organized into clean stations that never touch each other's ingredients, but still shares one walk-in and one lease (modular monolith) is the easiest of the three to later split into stalls.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The spectrum, as deployment units and data ownership
 
@@ -151,6 +186,8 @@ The modular monolith already has the data-ownership and code-boundary discipline
 
 ### What actually splits, and what does not have to
 
+**In plain words: splitting code, data, deploys and teams are separate choices. You do not have to do all of them at once.**
+
 | Axis | Monolith | Modular monolith | Microservices |
 | --- | --- | --- | --- |
 | Deployment artifacts | 1 | 1 | N |
@@ -188,11 +225,15 @@ This trades immediate consistency (the client cannot be told "paid" synchronousl
 
 ### Operational cost that a split adds, independent of the code
 
+**In plain words: every new service needs its own deploys, logs, alerts and on-call. That is real work.**
+
 Splitting into services adds work that has nothing to do with business logic: each service needs its own CI/CD pipeline, its own on-call rotation and dashboards, a way to find the other services at runtime (service discovery or a fixed gateway registry), and distributed tracing to reconstruct a single user request across several services' logs.
 
 None of this is optional once a split happens — it is the fixed operational tax that buys independent scaling and deployment, and it is exactly the tax a distributed monolith pays without getting the benefit.
 
 ### Conway's law as a decision input, not just an observation
+
+**In plain words: split along team lines, or the services will drift back together.**
 
 A split that does not match team boundaries tends to drift back toward a distributed monolith: two services "owned" by the same team, reviewed in the same PRs and deployed together in practice, behave like one deployment unit no matter what the architecture diagram says.
 
@@ -200,11 +241,13 @@ Conversely, deliberately drawing service boundaries to match (or reshape) team b
 
 ### Migrating without a rewrite
 
+**In plain words: move one feature at a time behind a router, not the whole app in one go.**
+
 The practical path from monolith to microservices is almost never "rewrite it as services"; it is extracting one module at a time behind a routing facade while the rest keeps running, covered in full in [[Strangler Fig Pattern and Legacy Migration]].
 
 The decision of *which* module to extract first, and whether to extract at all, is this note's job; the mechanics of extracting it safely are that note's.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -422,7 +465,7 @@ flowchart LR
 
 Each arrow is a decision with evidence behind it, not a default next step: move from monolith to modular monolith once a boundary is drawn and enforced by code review, not before; move from modular monolith to an extracted service once one module has a measured, independent scaling, deployment or team need the others do not share.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Style | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -432,14 +475,22 @@ Each arrow is a decision with evidence behind it, not a default next step: move 
 | Distributed monolith (anti-pattern) | Many deployables that share a database or deploy in lockstep | Never intentionally — it is what a premature or incomplete split produces | All of microservices' operational cost, none of its isolation benefits |
 | Serverless functions | Many small, independently deployed functions, usually event-triggered, with the platform owning scaling | Spiky or infrequent workloads where paying per-invocation beats running idle servers | Cold starts, vendor-specific triggers and limits, harder local development and tracing |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A monolith (or better, a modular monolith) is the right starting point for almost every new system: Fowler's MonolithFirst observation is that you cannot yet know where the real scaling and ownership seams are until the system has been built and used, and the cost of guessing wrong and splitting along the wrong seam is high.
 - Microservices add real, fixed operational cost (service discovery, per-service pipelines, distributed tracing, a platform team to run all of it) that must be paid whether or not the split buys you anything yet — do not take on that cost for a system with one team and no scaling asymmetry.
 - Splitting the deployment unit without splitting data ownership produces a distributed monolith: strictly worse than either pure style, because every write still needs cross-service coordination, but now over a network and across separate deploy pipelines.
 - Prime Video's 2023 move of part of its monitoring pipeline from a serverless/microservices design back to a monolith, and Segment's well-known 2018 "Goodbye Microservices" post, are both documented cases where a team found their specific service boundaries were adding coordination cost (and, for Prime Video, cost at scale) without a matching benefit — not a general argument against microservices, but evidence that the trade-off has to be re-checked against real operating data, not assumed once and left alone.
 
-## 7. In production
+```mermaid
+flowchart TD
+    Q{"Many teams that block each other?"} -- "no" --> M["Stay a (modular) monolith"]
+    Q -- "yes" --> Q2{"Can you run many services: CI, tracing, on-call?"}
+    Q2 -- "no" --> M
+    Q2 -- "yes" --> MS["Split, one service at a time"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:** Amazon and Netflix are the canonical large-scale microservices adopters, each with thousands of independently deployed services and dedicated platform teams to run the shared infrastructure that makes that possible. Shopify runs a large, deliberately modular monolith (their own public engineering writing calls out the choice) rather than microservices, specifically to avoid paying distributed-systems cost for a codebase where team ownership, not technical scaling limits, was the actual driver. Prime Video's monitoring team publicly documented moving a specific pipeline from a distributed, serverless design to a monolith after measuring it was cheaper and simpler at their scale — a single, well-reported case, not a blanket recommendation either way.
 - **Failure modes → fixes:**
@@ -449,7 +500,7 @@ Each arrow is a decision with evidence behind it, not a default next step: move 
   - A split that outpaces the team that owns it (two people running twelve services) → consolidate back toward a modular monolith rather than adding a platform team the organization cannot yet staff.
 - **What to monitor:** request latency and error rate per hop in a call chain (to catch cascading-failure risk before it pages someone), deploy frequency and lead time per module/service (the actual evidence that a split is buying independence), and cross-service consistency lag for anything eventually consistent (outbox backlog, event-processing delay).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **The distributed monolith, precisely.** It is not "microservices done badly" in a vague sense; it has a specific, checkable cause: at least one piece of data or one deploy decision that two or more services still depend on jointly.
 
@@ -467,7 +518,7 @@ The same data-ownership and chatty-call risks from the microservices section app
 
 A bounded context (see [[Domain-Driven Design - Strategic Design]]) is already a boundary where a model is internally consistent and a word like "Invoice" has one meaning; splitting along an existing bounded context means the new service's data ownership and its domain model boundary are the same line, which is why DDD and microservices are so often discussed together even though, as [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]] notes, DDD is orthogonal to the deployment decision itself.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the real difference between a monolith and microservices, beyond "one app vs many"?
 > Four things that usually move together: how many units deploy independently, whether each part owns its own data, whether a team owns each part end to end, and whether parts talk in-process or over the network. A split that only changes the first without the second and third is a distributed monolith, not a real microservices architecture.
@@ -490,7 +541,7 @@ A bounded context (see [[Domain-Driven Design - Strategic Design]]) is already a
 > [!question]- Why does Conway's law matter when deciding where to split?
 > A service boundary that does not match a team boundary tends to drift back toward a distributed monolith in practice, because the people who would need to coordinate a clean boundary are the same people already blocked by slow cross-team communication. Deliberately aligning (or reshaping) team boundaries before or during a split tends to produce boundaries that actually hold.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - The real axes: independent deployment, independent data ownership, independent team ownership, in-process vs network calls — not just "how many repos".
 - Modular monolith = microservices' data/code discipline, monolith's deploy and transaction simplicity; the easiest state to split from later.
@@ -500,7 +551,7 @@ A bounded context (see [[Domain-Driven Design - Strategic Design]]) is already a
 - Conway's law: boundaries that do not match team boundaries tend to erode back toward a distributed monolith.
 - Start with a (modular) monolith; split a specific module only when a measured scaling, deployment or ownership need appears. Revisit the decision with real operating data — Prime Video and Segment both did, in opposite directions from the industry default assumption.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]
 - **Next:** [[Modular Monolith]], [[Strangler Fig Pattern and Legacy Migration]]

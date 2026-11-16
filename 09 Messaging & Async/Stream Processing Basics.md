@@ -26,7 +26,39 @@ updated: 2026-11-13
 > - A **watermark** says "no events older than T should still arrive"; a window is emitted when the watermark passes its end. Later events are **late data**: dropped, sent to a side output, or used to update the result.
 > - Checkpoints snapshot state together with input offsets, so a restart rewinds both and the state is exactly-once even though input is replayed.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (pipeline, event time, windows, checkpoints), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9, plus "Joins" in 5. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Some answers are needed right now, not tomorrow: "has this ad spent its budget yet?"
+So instead of crunching yesterday's files, you count events as they flow in.
+That is **stream processing**.
+You group events into time buckets, called **windows**, like "clicks per minute".
+Events can arrive late, for example from a phone in a tunnel.
+So you need a rule for "this minute is now complete". That rule is the **watermark**.
+And you save your counts every few seconds, so a crash does not lose or double them.
+
+```mermaid
+flowchart LR
+    F["Yesterday's files"] --> B["Nightly batch job"] --> R["Answer tomorrow"]
+```
+
+```mermaid
+flowchart LR
+    E["Live clicks"] --> W["Count per 1-min window"]
+    W -- "watermark says minute is done" --> R["Answer in seconds"]
+```
+
+The rest of this note is just these 3 questions:
+1. Which time do you use: when it happened, or when it arrived?
+2. How do you know a window is finished?
+3. How do you survive a crash without losing or double counting?
+
 
 **The problem in one story**
 A shop wants to show "orders in the last minute" on a live screen.
@@ -72,7 +104,7 @@ Where it breaks: a real clerk is one person; a stream processor splits the tally
 > [!tip] Remember
 > Bucket by when it happened (event time), close buckets with a watermark, and checkpoint state together with input position.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An ad platform charges advertisers per click and must stop a campaign the minute its budget is spent. Clicks arrive at 200,000 per second from phones around the world.
 
@@ -84,7 +116,16 @@ An ad platform charges advertisers per click and must stop a campaign the minute
 
 A stream processor partitions the state by key across many workers, buckets events by their own timestamps, decides when a bucket is complete with a watermark, and checkpoints state and offsets together.
 
-## 2. Mental model
+**Why naive counting breaks:**
+
+```mermaid
+flowchart TB
+    C["Counter per message"] --> L["Late phone clicks<br/>counted in the wrong minute"]
+    C --> D["Crash and replay<br/>=> counted twice or lost"]
+    C --> S["One process can't hold<br/>2 million campaigns"]
+```
+
+## 2. Mental model 🟢
 
 A **toll plaza with a counting clerk per lane**. Cars (events) carry a ticket stamped with the time they entered the motorway (event time). Every minute the clerk must report how many cars entered in each minute.
 
@@ -93,9 +134,20 @@ A **toll plaza with a counting clerk per lane**. Cars (events) carry a ticket st
 - A truck stamped 10:00:20 that turns up at 10:05 is **late**. The clerk notes it in a separate book (the side output) rather than reopening a report that has already been sent.
 - Every few minutes the clerk photocopies all tallies along with "the last car I counted was number 81,233" (a **checkpoint**). After a coffee spill they restore the photocopy and recount from car 81,234.
 
-## 3. How it works
+**The toll clerk, drawn:**
+
+```mermaid
+flowchart LR
+    Car["Car stamped 10:00:58<br/>arrives 10:01:07"] --> T["10:00 tally still open"]
+    WM["Watermark passes 10:01"] --> C["10:00 tally closed, reported"]
+    Late["Car stamped 10:00:20<br/>arrives 10:05"] --> S["Side book (late data)"]
+```
+
+## 3. How it works 🟡
 
 ### The pipeline
+
+**In plain words:** events flow in from Kafka, get grouped by key and time, get counted, and the results flow out; each stage runs on many workers at once.
 
 ```mermaid
 flowchart LR
@@ -114,6 +166,8 @@ flowchart LR
 
 ### Event time, processing time and watermarks
 
+**In plain words:** event time is when it happened, processing time is when you saw it. The watermark is your best guess of "nothing older is still coming".
+
 | Time | Meaning | Use for |
 | --- | --- | --- |
 | Event time | Timestamp inside the event: when it happened | Correct, repeatable results; billing; analytics |
@@ -130,6 +184,8 @@ The common heuristic is **bounded out-of-orderness**: `W = max event time seen �
 With several input partitions, an operator's watermark is the **minimum** across its inputs, so one idle or slow partition holds everything back (Flink's `withIdleness` marks idle sources so they do not).
 
 ### Windows
+
+**In plain words:** a window is a time bucket. Fixed buckets don't overlap, sliding buckets do, and session buckets grow while a user stays active.
 
 ```mermaid
 flowchart TB
@@ -151,6 +207,8 @@ flowchart TB
 
 ### Window lifecycle
 
+**In plain words:** a window opens with its first event, fills up, closes when the watermark passes its end, and is then cleaned away.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Open: first event with timestamp in the window
@@ -166,6 +224,8 @@ stateDiagram-v2
 
 ### Checkpoints and exactly-once state
 
+**In plain words:** every so often the engine takes a photo of all counts plus "where I was in the input". After a crash it loads the photo and carries on from there.
+
 Flink's checkpoint, step by step:
 
 1. Flink injects **checkpoint barriers** into each source partition.
@@ -179,9 +239,11 @@ Kafka Streams keeps each state store in local RocksDB, backed by a compacted **c
 
 Exactly-once applies to the state inside the processor. Output to an external system is exactly-once only if the sink is transactional (two-phase commit with the checkpoint) or idempotent (upserts keyed by window and key); see [[Delivery Semantics and Exactly-Once]].
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** a table you can follow line by line: each event moves the watermark, and a window is reported once the watermark passes its end.
 
 ```text
 tumbling window 1 min, watermark = max event time - 10 s
@@ -196,6 +258,8 @@ processing-time counting would have put the delayed click in 10:01: wrong minute
 ```
 
 ### Go: an event-time tumbling window with a watermark
+
+**In plain words:** a small Go program that counts events in 1-minute buckets by their own time, and closes a bucket when the watermark passes it.
 
 A single-instance, in-memory operator. Real engines add parallelism, checkpointing and allowed lateness; the windowing logic is the same.
 
@@ -352,6 +416,8 @@ func TestProcessingOrderDoesNotChangeEventTimeResult(t *testing.T) {
 
 ### The same job in Flink SQL
 
+**In plain words:** the same counting job in a few lines of SQL, where you just declare the watermark and the window.
+
 Flink SQL declares the watermark on the table and the window as a table-valued function (Flink 1.13+ syntax; shown for comparison, not run for this note):
 
 ```sql
@@ -375,7 +441,7 @@ ad-2         2026-11-04 10:00:00   2026-11-04 10:01:00   41
 ad-3         2026-11-04 10:00:00   2026-11-04 10:01:00   7
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -392,13 +458,15 @@ ad-3         2026-11-04 10:00:00   2026-11-04 10:01:00   7
 
 ### Joins
 
+**In plain words:** joining two streams means keeping recent events from both sides in memory, so you can match them when the partner arrives.
+
 | Join | State kept | Example |
 | --- | --- | --- |
 | Stream-stream (windowed) | Both sides within the join window | Match `ad_impression` with `ad_click` within 10 minutes |
 | Stream-table | Latest row per key of the table (from a compacted topic or CDC) | Enrich each order with the customer's current tier |
 | Table-table | Both tables, updated as either changes | Materialised view joining two CDC streams |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Completeness vs latency.** Every watermark delay is a trade: shorter means faster but more late data; longer means more complete but slower. No setting gives both.
 - **State is the cost driver.** Session windows, long hopping windows and stream-stream joins hold state for every key; a misconfigured join can grow without bound. Set state TTLs.
@@ -409,7 +477,15 @@ ad-3         2026-11-04 10:00:00   2026-11-04 10:01:00   7
 	- Per-event actions with no aggregation: a plain consumer is enough.
 	- Small data that fits one database: a materialised view or a periodic `GROUP BY` wins.
 
-## 7. In production
+**The one knob you can't escape:**
+
+```mermaid
+flowchart LR
+    W{"Watermark delay"} -- "short" --> F["Fast answers,<br/>more late events dropped"]
+    W -- "long" --> C["Complete answers,<br/>but slower"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:** fraud scoring on payment streams, real-time ad budget pacing, IoT telemetry aggregation, live leaderboards ([[Case Study - Leaderboard and Top-K]]), metric roll-ups ([[Case Study - Metrics and Logging Platform]]), and keeping read models current for [[CQRS]].
 - **Failure modes → fixes:**
@@ -421,7 +497,7 @@ ad-3         2026-11-04 10:00:00   2026-11-04 10:01:00   7
 	- *Upgrading a stateful job breaks state.* Changed operator IDs or state schema. Fix: stable operator UIDs, savepoints, and state schema evolution ([[Event Schemas and Schema Registry]]).
 - **What to monitor:** consumer lag of the source, watermark lag (wall-clock time minus current watermark), late events per minute, checkpoint duration and size, backpressure per operator, state size per key group, end-to-end latency from event time to output.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Watermarks are a heuristic.** They can be too fast (dropping valid data) or too slow (delaying results). Perfect watermarks exist only when the source knows its order (for example, a single ordered log of server-generated timestamps).
 - **Triggers vs watermarks.** The Dataflow model separates *what* is computed (windows), *where in event time* (windowing), *when in processing time* to emit (triggers: on watermark, early every 10 s, on each late event) and *how* refinements relate (discarding vs accumulating). Flink and Beam expose this; Kafka Streams has `suppress` to emit only final results.
@@ -431,7 +507,7 @@ ad-3         2026-11-04 10:00:00   2026-11-04 10:01:00   7
 - **Session windows merge.** A late event can bridge two sessions, merging two windows into one; engines implement this with mergeable window state.
 - **Clock skew.** Event time comes from producers' clocks. A phone with its clock set a year ahead can push the watermark far into the future and make every later event late. Clamp event times to a sane range around ingestion time; see [[Clocks and Ordering]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Event time or processing time for billing clicks, and why?
 > Event time. Billing must assign each click to the minute it happened, regardless of network delays or replays. Processing time changes the result every time you replay or a device reconnects late.
@@ -454,7 +530,7 @@ ad-3         2026-11-04 10:00:00   2026-11-04 10:01:00   7
 > [!question]- How does a stateful operator recover after a crash without double counting?
 > It restores the last checkpoint, which contains both its state and the source offsets taken at the same barrier, and resumes reading from those offsets. Events after the checkpoint are reprocessed into state that has not seen them yet, so each event affects the state once.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Stateless (filter, map) vs stateful (count, join, dedupe); state is partitioned by key.
 - Use event time; watermark = max event time − allowed delay; min across inputs.

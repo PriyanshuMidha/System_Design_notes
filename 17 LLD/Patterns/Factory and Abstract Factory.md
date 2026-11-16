@@ -26,7 +26,33 @@ updated: 2026-11-13
 > - The rule that matters: the choice of concrete type is made in exactly one place, usually from config.
 > - Classic mistake: returning a typed nil pointer as an interface, which makes `err != nil` or `n != nil` true when you expected false.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then the rest of this "Start here" section, sections 1, 2 and the cheat sheet (10). Skip the big code blocks on a first pass. Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works, with the small whiteboard code), section 4 (the full worked example) and sections 5 and 6 (variants and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your code needs a "notifier", but which one: email, SMS or push?
+You do not want that choice spread across the code in many `if` statements.
+A **factory** is one function that makes the choice and hands back the right object.
+Callers just say "give me a notifier" and use it, without knowing which kind it is.
+An **abstract factory** goes one step further: it hands back a whole matching set, like all the parts for one payment provider, so you cannot mix parts from two providers.
+
+```mermaid
+flowchart LR
+    C["Config says: sms"] --> F["Factory"] --> N["SMS notifier"]
+    N --> U["Your code uses it<br/>as just 'a notifier'"]
+```
+
+The code is long, but it is mostly one `switch` and a few small types. Read the idea first.
+The rest of this note is just these 3 questions:
+1. Where should the "which type?" choice live?
+2. When do you need a whole family instead of one object?
+3. What is the Go "typed nil" trap, and how do you avoid it?
+
 
 **The problem in one story.**
 A coffee shop has one order counter. You say "latte"; you never walk into the back and assemble the machine yourself.
@@ -70,7 +96,7 @@ Where it breaks: a menu can mix cuisines on request; an abstract factory deliber
 > [!tip] Remember
 > Decide the concrete type in one place, return an interface, and never return a typed nil.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An order service notifies users on four events: placed, shipped, delivered and refunded. Each user picks a channel: email, SMS, push or WhatsApp.
 
@@ -81,14 +107,14 @@ Payments show the second problem. Checkout charges through Razorpay. Months late
 
 An **abstract factory** removes the possibility: the service receives one `ProviderFactory`, and every product it gets (payments, refunds, webhook verification) comes from the same provider.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 - **Factory: an order counter.** You ask for "a coffee"; the kitchen decides the machine, beans and cup. You get something that behaves like a coffee and never touch the kitchen. In Go: `NewNotifier("sms", ...)` returns a `Notifier`.
 - **Abstract factory: a furniture collection.** You choose the "Oslo" collection and receive a table, chairs and a lamp that match. You cannot get an Oslo table with a Milano chair. In Go: `NewProviderFactory(cfg)` returns a `ProviderFactory`, and its `Payments()`, `Refunds()` and `Webhooks()` all belong to one provider.
 
 The point of both is that **the choice of concrete type is made in one place**, usually from config, and everything else depends on interfaces.
 
-## 3. How it works
+## 3. How it works 🟡
 
 Go has four common forms, from lightest to heaviest:
 
@@ -166,6 +192,8 @@ sequenceDiagram
 
 ### Whiteboard version
 
+**In plain words:** One `switch` turns a config word into the right type and hands it back as the interface.
+
 The factory is one `switch` that maps a config string to a concrete type and returns it as the interface. This is the bare idea you can draw in two minutes; the full version below adds production concerns.
 
 ```go
@@ -203,7 +231,9 @@ func main() {
 }
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
+
+**In plain words:** One program with a notifier factory, a registry of makers, the typed-nil trap, and two payment-provider families. Read the `switch` first; everything else grows from it.
 
 One `package main` with a notifier factory, a typed error, the typed-nil trap, a registry and the Razorpay and Stripe families. The provider calls are in-memory stand-ins for the SDKs; the webhook checks use each provider's documented HMAC-SHA256 scheme, simplified for Stripe (no timestamp tolerance check). Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
 
@@ -513,6 +543,9 @@ func main() {
 
 The tests cover each kind, the typed error, the trap, a registry that is isolated per test, both families, the mixed-family failure and a fake family:
 
+
+**In plain words:** These are the tests. They check each kind of notifier, the error for an unknown kind, the typed-nil trap, and that one family's parts never mix with another's.
+
 ```go
 package main
 
@@ -667,7 +700,7 @@ What to notice:
 - `bad == nil is false`: `BuggyNotifier` returned a nil `*SMSNotifier` inside a non-nil `Notifier`. Calling `Send` on it would panic with a nil pointer dereference when `Send` reads `n.w`.
 - `TestMixingFamiliesFails` shows the bug the abstract factory prevents: a Razorpay refund of a Stripe payment.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -684,7 +717,7 @@ The textbook abstract factory is a UI toolkit: a `LightTheme` factory makes a li
 
 A factory is the exception: its whole job is to choose among types, so it must return the interface. If a "factory" always returns the same type, it is a constructor and should return that type.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **One concrete type:** call its constructor. A factory that can only return one thing is ceremony.
 - **The caller already knows the type:** `NewSMSNotifier(...)` is clearer than `NewNotifier("sms", ...)`, and the compiler checks it.
@@ -693,7 +726,7 @@ A factory is the exception: its whole job is to choose among types, so it must r
 - **Every new product edits every family.** Adding `Payouts()` to `ProviderFactory` forces Razorpay, Stripe and every test fake to implement it. Keep the family small, or add capabilities as optional interfaces (see section 8).
 - **Factories must not run business logic.** A factory builds and validates; it does not charge, send or decide pricing.
 
-## 7. In production
+## 7. In production 🔴
 
 **Real systems:**
 
@@ -718,7 +751,7 @@ A factory is the exception: its whole job is to choose among types, so it must r
 
 **What to monitor:** log the chosen kind at startup (provider, channel set), count `UnknownKindError`s if names come from requests, and alert when a provider's error rate diverges from the others after a config change.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **The typed-nil trap, mechanically.** An interface value is a pair: (dynamic type, dynamic value). `return sms` where `sms` is a nil `*SMSNotifier` stores the pair `(*SMSNotifier, nil)`. An interface is `nil` only when both halves are nil, so the comparison `n == nil` is false.
 
@@ -739,7 +772,7 @@ Apply the same trick to a payment family: keep `ProviderFactory` small and let a
 
 **Factories and dependency injection.** In a service, the composition root (`main`) is the natural factory: it reads config, builds the family once and passes products into the services. If you find factories called deep inside request handlers, the construction is probably happening too late and too often.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the difference between a constructor, a factory and an abstract factory?
 > A constructor (`NewSMSNotifier`) builds one known type and returns it as that type. A factory chooses among several types from input such as a config name and returns an interface. An abstract factory is an interface with several factory methods that build a matching family of products, such as payments, refunds and webhook verification for one provider.
@@ -762,7 +795,7 @@ Apply the same trick to a payment family: keep `ProviderFactory` small and let a
 > [!question]- When is `map[string]func() Notifier` enough?
 > When every kind lives in your own package and nobody outside needs to add kinds. Build the map in `main` or a constructor and pass it in; it is easy to test and has no global state. Reach for an `init()` registry only for real plug-ins, such as drivers in other modules.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Constructor returns a concrete type; a factory chooses among types and returns an interface.
 - Unknown kind: return a typed error (`*UnknownKindError`), not a string error.
@@ -773,7 +806,7 @@ Apply the same trick to a payment family: keep `ProviderFactory` small and let a
 - Grow a family with optional interfaces checked by type assertion, like `database/sql/driver`.
 - Test with a fake family; validate configured names at startup.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Interfaces]], [[Error Handling]], [[Strategy and Template Method]]
 - **Next:** [[Builder and Functional Options]]

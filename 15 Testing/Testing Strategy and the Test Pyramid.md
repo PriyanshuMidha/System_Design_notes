@@ -23,7 +23,38 @@ updated: 2026-11-13
 > - Coverage percentage tells you what ran, not what was checked; a suite can hit 100% coverage and still miss every real bug.
 > - What to test is a risk decision: money, data loss and the critical user journey get tested first and hardest.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A **test** is a small program that runs your code and checks the answer is right.
+Some tests check one tiny piece, like one function. They run in a blink.
+Some tests check the whole app, like a robot clicking through a website. They are slow and break easily.
+You cannot write every kind of test for everything, so you need a plan.
+That plan is your **test strategy**: which kind of test, for which change, run when.
+The classic plan is the **test pyramid**: lots of small tests at the bottom, a few big ones at the top.
+
+```mermaid
+flowchart LR
+    A["Small test<br/>one function"] -- "fast, cheap" --> R["Quick answer"]
+    B["Big test<br/>whole app"] -- "slow, breaks often" --> R2["Late answer"]
+```
+
+```mermaid
+flowchart TB
+    T["Top: a few whole-app tests"] --- M["Middle: some tests with a real DB"] --- B["Bottom: many tiny tests"]
+```
+
+The rest of this note is just these 3 questions:
+1. Which kind of test catches which kind of bug?
+2. How many of each should you write?
+3. When does each kind run (every save, every PR, every night)?
+
 
 **The problem in one story.**
 You have time to write only a few tests before release.
@@ -66,7 +97,7 @@ Where it breaks: some software is mostly "wiring" with little logic of its own, 
 > [!tip] Remember
 > Catch each bug at the cheapest test layer that can see it, and test money and critical journeys hardest.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps (the running example used across this folder) has one core rule: an invoice can only be marked paid once, and only after a successful charge. Say a bug lets `Pay` run twice concurrently on the same invoice, double-charging a customer.
 
@@ -78,7 +109,15 @@ The cost of a bug roughly multiplies by 10 at each stage it survives: free to ca
 
 A test strategy is the plan for catching as much as possible as early as possible, without paying for exhaustive testing at every layer.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    C["You change code"] --> Q{"Which test would catch a bug here?"}
+    Q -- "logic bug" --> U["Unit test, seconds"]
+    Q -- "wiring bug" --> I["Integration test, minutes"]
+    Q -- "user journey bug" --> E["E2E test, long"]
+```
+
+## 2. Mental model 🟢
 
 Think of a change moving through concentric rings of confidence. The innermost ring — a single function or type — is cheap to test exhaustively: hundreds of cases, pure logic, no I/O, no network.
 
@@ -88,9 +127,11 @@ The test pyramid names three of those rings and recommends a **count**, not a ha
 
 The shape is a consequence of cost and flakiness, not dogma — a service that is 90% "call these other six services correctly" and 10% business logic should look more like a **trophy** (integration-heavy) than a pyramid.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The classic pyramid, with real numbers
+
+**In plain words: how many tests sit at each level, and how long each level takes to run.**
 
 ```mermaid
 flowchart TB
@@ -115,6 +156,8 @@ The arrows in the old InvoiceOps note implied E2E tests "flow down into" integra
 | E2E | The deployed (or near-deployed) stack, through the real API | Nothing, except maybe third-party payment/SMS sandboxes | minutes | Journey bugs: a correct service composed incorrectly, config drift, an environment-only bug |
 
 ### Alternatives to the pyramid
+
+**In plain words: the pyramid is not the only shape. Some apps are mostly glue code, so they need more middle tests.**
 
 ```mermaid
 flowchart LR
@@ -142,6 +185,8 @@ flowchart LR
 
 ### Mapping test sizes to architecture
 
+**In plain words: each layer of your service gets the kind of test that fits it best.**
+
 A hexagonal/clean-style Go service (see `16 Software Architecture`) maps directly onto the pyramid:
 
 - **Domain/use-case layer** (pure Go, no I/O) → unit tests, one fake per port (see [[Test Doubles and Mocking in Go]]).
@@ -149,6 +194,8 @@ A hexagonal/clean-style Go service (see `16 Software Architecture`) maps directl
 - **Composition root / whole binary** → E2E, exercised through the real HTTP API.
 
 ### Risk-based selection: what to test, and how hard
+
+**In plain words: test the scary stuff first: money, lost data, and the main user journey.**
 
 Not everything deserves equal test investment. Order of priority for InvoiceOps:
 
@@ -158,6 +205,8 @@ Not everything deserves equal test investment. Order of priority for InvoiceOps:
 4. **Everything else** (display formatting, non-critical admin screens): unit tests only, light integration, no dedicated E2E.
 
 ### CI placement
+
+**In plain words: cheap tests run on every change; slow tests run less often.**
 
 ```mermaid
 flowchart LR
@@ -171,7 +220,7 @@ flowchart LR
 
 Fast feedback loops close to the developer (PR stage) catch the most bugs per minute spent waiting; slow, expensive suites move to merge/nightly/pre-release so they gate the risky step (a production deploy) without blocking every commit.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 InvoiceOps's `Pay(ctx, invoiceID)` method (defined fully in [[Test Doubles and Mocking in Go]]) loads the invoice, charges the payment provider, and marks the invoice paid. Its test plan, by layer:
 
@@ -204,7 +253,7 @@ row lock" are different mechanisms — the fake can't prove the DB
 actually serializes the two updates.
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Shape | Best for | Trade-off |
 |---|---|---|
@@ -213,13 +262,18 @@ actually serializes the two updates.
 | Honeycomb | Microservice meshes with many small services | Needs contract testing to replace cross-service E2E, or integration confidence drops |
 | Ice-cream cone | Nobody should choose this; it's what you get by defaulting to manual QA | Slow, flaky, diagnosis-hostile, blocks refactoring |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A pure pyramid shape is the wrong target for a service whose job is almost entirely "call out to three other services and combine the results" — most of its real risk lives at the boundaries, so forcing a pyramid shape there under-tests exactly the part that breaks in production.
 - Chasing a pyramid **ratio** (e.g., "70/20/10") as a KPI encourages padding with low-value unit tests to hit a number. The ratio is a description of a healthy suite, not a target to engineer toward.
 - 100% unit coverage with zero integration tests gives false confidence: every line ran, but the real SQL, the real HTTP client, the real serialization format were never exercised.
 
-## 7. In production
+```mermaid
+flowchart LR
+    P["Pyramid<br/>lots of logic"] --- TR["Trophy<br/>mostly glue code"] --- IC["Ice-cream cone<br/>mostly E2E = avoid"]
+```
+
+## 7. In production 🔴
 
 - **Real systems**: Google's internal size classification (small/medium/large, roughly unit/integration/E2E) gates which machines a test is allowed to run on and how long it may take.
 
@@ -230,9 +284,11 @@ actually serializes the two updates.
   - *High coverage, bugs still escape* → check whether coverage is measuring assertions or just execution; add mutation testing (e.g., `go-mutesting`) as a periodic (not per-PR) signal.
 - **What to monitor**: suite duration trend per layer, flake rate (tests that fail then pass on rerun with no code change), and escaped-defect rate (bugs found in production that a test *could* have caught) as the real measure of whether the strategy is working.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Flaky-test smells
+
+**In plain words: a flaky test passes sometimes and fails sometimes on the same code. These are the usual causes.**
 
 A flaky test passes and fails on the same code, nondeterministically. Common causes, in order of frequency:
 
@@ -246,18 +302,22 @@ The fix for a flaky test is never "run it three times and take majority vote" in
 
 ### Coverage as a signal, not a target
 
+**In plain words: coverage tells you which lines ran, not whether the test checked anything.**
+
 Line coverage says a line executed at least once; it says nothing about whether the test actually asserted the right thing. A test that calls `svc.Pay()` and asserts nothing about the result can produce 100% coverage of `Pay` and catch zero bugs.
 
 Use coverage to find **untested branches** ("the `amount <= 0` branch never ran in any test — that's a gap"), not as a merge gate with a hard percentage, and prefer mutation testing or a documented list of required cases (the Must-cover style used in this very note) as the stronger signal.
 
 ### "What runs on every PR" — the shared checklist this folder keeps once
 
+**In plain words: the short list of checks every pull request must pass.**
+
 - `go vet ./...` and `gofmt -l .` (or equivalent linter) — free, catches a class of bugs before any test runs.
 - `go test -race ./...` for the unit layer — the race detector is cheap insurance against exactly the kind of concurrency bug in the worked example above.
 - Consumer-side contract verification (fast, no network) — see [[Contract Testing]].
 - Anything slower (integration, E2E, load, chaos) moves to merge/nightly/pre-release, per the CI diagram above.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Design the test strategy for a payments service like InvoiceOps.
 > Start from risk: money-moving logic gets the heaviest unit coverage (every branch of charge/refund/idempotency) plus an integration test against a real Postgres for the row-locking behavior, plus one E2E happy path and one E2E "provider down" path.
@@ -284,7 +344,7 @@ Use coverage to find **untested branches** ("the `amount <= 0` branch never ran 
 > [!question]- How would you test that a webhook handler correctly rejects a replayed or forged payment-provider request?
 > Unit test the signature-verification function directly with a valid signature, a tampered body (invalid signature), and a replayed timestamp outside the allowed window — each as a table-driven case. Add one integration test posting a real HTTP request with a captured-but-expired signature to the actual handler to confirm the wiring (header parsing, status code) matches the unit-level logic.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Pyramid = shape (many unit, some integration, few E2E), not a pipeline — layers run independently.
 - Pick the shape that matches where the risk actually lives: pyramid for logic-heavy, trophy for integration-heavy, honeycomb + contracts for microservice meshes.
@@ -294,7 +354,7 @@ Use coverage to find **untested branches** ("the `amount <= 0` branch never ran 
 - Coverage shows what ran, not what was verified; use it to find gaps, not as a quality score.
 - "What hurts users or money" gets tested first and at every layer; low-risk code gets unit tests only.
 
-## Links
+## Links 🟢
 - **Before this:** none — this is the entry point for `15 Testing`.
 - **Next:** [[Unit, Integration and E2E Tests]]
 - **Compare with:** [[Test Doubles and Mocking in Go]] for how each layer fakes its dependencies; `Testing in Go` (04 Go Language) for the `testing` package mechanics this strategy runs on top of.

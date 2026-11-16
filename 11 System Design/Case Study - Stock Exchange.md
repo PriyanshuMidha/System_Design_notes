@@ -27,7 +27,31 @@ updated: 2026-11-13
 > - High availability comes from **hot-warm replicas** that replay the same sequenced log, not from locks or distributed transactions in the hot path.
 > - Everything else (market data, clearing, reporting, risk dashboards) is downstream and can be eventually consistent.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A stock exchange matches people who want to buy with people who want to sell.
+For each stock it keeps an **order book**: a list of buy prices and sell prices, best first.
+When a buy price meets a sell price, a trade happens.
+Fairness rule: same price, the earlier order wins. So every order gets a number in strict arrival order, from one place called the **sequencer**.
+
+```mermaid
+flowchart LR
+    O["Orders"] --> S["Sequencer:<br/>number them"] --> E["Matching engine:<br/>one at a time"] --> T["Trades + price updates"]
+```
+
+The numbered list of orders is saved first. If the engine crashes, a backup replays the same list and gets the exact same book.
+
+So the rest of this note is just these 3 questions:
+1. How do you decide a fair order for orders that arrive at the same moment?
+2. How do you match orders fast and the same way every time?
+3. How does a backup take over without losing a single trade?
 
 **The problem in one story.**
 You want to buy 10 shares at ₹100; someone else wants to sell 10 at ₹100.
@@ -71,7 +95,7 @@ Where it breaks: a human clerk takes seconds; the real engine handles each order
 > [!tip] Remember
 > Put every order in one numbered log, and let a single-threaded engine replay it in order.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 Picture a vegetable market with one rule: the highest buyer and the lowest seller deal first, and if two people offer the same price, whoever shouted first wins. Now make it electronic, with millions of shouts a day, where being 50 microseconds late can cost money and nobody may ever argue about who was first.
 
@@ -98,7 +122,7 @@ A stock exchange exists to be that fair referee, at machine speed.
 > [!tip] Remember
 > Say this first: "correctness and fairness beat raw throughput; one ordered log and one thread per symbol is the simplest way to get both."
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of an old trading pit with a very strict clerk standing at each stock's window. All orders for that stock go through that one clerk, who writes them in a numbered ledger (1, 2, 3, ...) and then matches them one at a time.
 
@@ -129,7 +153,7 @@ flowchart LR
     O --> RP["Reporting, audit,<br/>analytics"]
 ```
 
-## 3. How it works - high-level design
+## 3. How it works - high-level design 🟡
 
 Read the diagram above left to right, then follow one order through these steps.
 
@@ -184,6 +208,8 @@ Numbers (estimates): 1B orders/day ~ 43K/s avg over 6.5 h, 5x peak ~ 210K/s,
 
 ### Estimation (every input is a labelled estimate)
 
+**In plain words:** rough sums: orders per second, trades per second, and how much the event log grows.
+
 | Quantity | Arithmetic | Result |
 | --- | --- | --- |
 | Orders per day (estimate) | given | 1,000,000,000 |
@@ -210,9 +236,11 @@ flowchart TD
     G -->|"yes, by roughly 280x"| H["single thread per symbol<br/>no locks needed"]
 ```
 
-## 4. Worked example - API, data model and a matching trace
+## 4. Worked example - API, data model and a matching trace 🟡
 
 ### API
+
+**In plain words:** traders keep a connection open and send small binary messages: new order, cancel, and reports back.
 
 Participants do not use REST. They use a persistent session so there is no connection setup in the hot path. See [[Choosing an API and Communication Style - Decision Guide]] for the general choice.
 
@@ -227,6 +255,8 @@ Participants do not use REST. They use a persistent session so there is no conne
 Participants send a unique `clOrdId` per order. If a session drops and the client resends, the gateway recognises the id and does not double-submit. This is the same idea as an idempotency key in [[Idempotency and Idempotency Keys]], enforced at the session level.
 
 ### Data model
+
+**In plain words:** the main data is just the numbered order log and the book in memory; databases come later for reports.
 
 The hot path has no database. The "data model" is the event log and the in-memory book. A relational or columnar store sits downstream for reports (see [[Choosing a Database - Decision Guide]]).
 
@@ -304,7 +334,17 @@ If the buy had been `BUY 500 @ 50.10`, the last 100 shares would rest in the boo
 > [!warning] Common mistake
 > Do not say "I will store the order book in a SQL table and `SELECT ... ORDER BY price, created_at LIMIT 1` to match". A database round trip is hundreds of microseconds to milliseconds and takes locks. The book lives in memory inside the matching engine; the database only receives results afterwards.
 
+```mermaid
+flowchart LR
+    B["Buy at ₹100<br/>(highest bid)"] --> M{"Bid ≥ lowest ask?"}
+    A["Sell at ₹100<br/>(lowest ask)"] --> M
+    M -- "yes" --> T["Trade at ₹100"]
+    M -- "no" --> W["Both wait in the book"]
+```
+
 ### Order book data structures
+
+**In plain words:** what each book operation needs to be fast, and which data structure gives it.
 
 | Operation | Needs | Structure choice |
 | --- | --- | --- |
@@ -329,7 +369,7 @@ flowchart LR
     BP["best price pointer"] -.-> L1
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 Real exchanges differ in how they pair orders and how they build the ordered log.
 
@@ -353,7 +393,7 @@ flowchart TD
     Q3 -->|"yes"| E4["Warm replicas replay the same log<br/>(hot-warm)"]
 ```
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Single thread per symbol** gives determinism and no locking, but a hot symbol cannot use more than one core. The workaround is a faster thread (cache-friendly data, no allocation, no GC pauses), not more threads.
 - **Synchronous log replication** before the ack protects against loss but adds a network round trip, around tens to hundreds of microseconds inside one data centre (an estimate). Asynchronous replication is faster and can lose the last few orders on a crash. Exchanges choose durability.
@@ -364,7 +404,14 @@ flowchart TD
 > [!tip] Remember
 > Name the trade-off in one sentence: "I give up multi-core matching per symbol and accept sync replication latency, to get determinism and zero lost orders."
 
-## 7. In production
+```mermaid
+flowchart LR
+    P["Primary engine"] -- "same numbered log" --> S["Standby engine,<br/>replaying"]
+    P -. "dies" .-> S
+    S --> N["Takes over with<br/>the identical book"]
+```
+
+## 7. In production 🔴
 
 - **Real-life example, LMAX.** LMAX Exchange (a London retail FX trading venue) published its architecture: business logic on one thread, input and output through a ring buffer (the **Disruptor**), and the whole state rebuilt by replaying events. Fowler reports about 6 million orders per second on one thread. This is the canonical public reference for the single-thread design.
 - **Kernel-bypass networking and pinned cores.** Matching hosts run on bare metal with the thread pinned to a CPU core, no other work on that core, and often kernel-bypass network cards, so the OS scheduler never interrupts matching.
@@ -373,7 +420,7 @@ flowchart TD
 - **Circuit breakers.** The exchange halts trading in a symbol when price moves too fast. This is a business rule inside the matching engine, enforced by an event in the log.
 - **Observability.** The key metrics are tail latency (p99, p99.99) of gateway to ack, sequencer log write time, queue depth at each stage, replication lag to the warm engine, and number of rejected orders by reason.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Deep dive 1: the sequencer and the event log
 
@@ -460,6 +507,8 @@ stateDiagram-v2
 
 ### Deep dive 4: pre-trade risk and the money side
 
+**In plain words:** before an order enters, check that the buyer has the cash and the seller has the shares.
+
 Sell-side orders need shares; buy-side orders need cash. The check must be fast but it must also be consistent with what the participant already has outstanding. Two common designs:
 
 1. **Reserve at the gateway.** A risk service in front of the sequencer keeps a per-participant in-memory view of cash and positions, applies each order against it (reduce available cash by qty × price), and rejects if negative.
@@ -470,6 +519,8 @@ It is updated by the same outbound events (fills) so it converges. Because it is
 The authoritative cash and share balances live in a ledger outside the hot path (see [[Case Study - Digital Wallet and Ledger]] and [[Case Study - Payment System]]). Fills become ledger postings through clearing, with exactly-once effect via event ids and an outbox.
 
 ### Scaling and bottlenecks
+
+**In plain words:** what slows down first as volume grows, and the fix for each.
 
 ```mermaid
 flowchart TD
@@ -487,6 +538,8 @@ flowchart TD
 
 ### Failure handling
 
+**In plain words:** for each part that can fail, what happens and how it recovers.
+
 | Failure | What happens | Recovery |
 | --- | --- | --- |
 | Gateway dies | Client sessions drop | Client reconnects, sends a resend request; `clOrdId` dedupe prevents double orders |
@@ -498,6 +551,8 @@ flowchart TD
 
 ### Trade-off table: the main decisions
 
+**In plain words:** the big choices in one table, with the pick and the reason.
+
 | Decision | Alternatives | Choice | Why | Guide |
 | --- | --- | --- | --- | --- |
 | Order of events | timestamps, vector clocks, sequencer | sequencer | total order, simple, audit-friendly | [[Choosing Consistency, Replication and Partitioning - Decision Guide]] |
@@ -507,7 +562,7 @@ flowchart TD
 | Runtime | cloud VMs, containers, bare metal | bare metal for matching | jitter control | [[Choosing Compute, Scaling and Deployment - Decision Guide]] |
 | Read models | query the engine, projections | projections via events | engine stays pure | [[CQRS]] |
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does a stock exchange match on a single thread? Is that not a scaling bottleneck?
 > One thread per symbol gives determinism and removes locking, which costs more than the matching itself. The numbers show it is enough: about 21,000 orders per second for a hot symbol (an estimate) against about 6 million per second reported for the LMAX single thread. Scaling is by symbol: more symbols, more engine threads and hosts.
@@ -533,7 +588,7 @@ flowchart TD
 > [!question]- What do you do if the replica is unreachable and you cannot get durability for new orders?
 > Fail closed: stop acknowledging new orders, or halt trading, rather than accept orders that could be lost. Fairness and correctness beat availability here, which is the CP side of CAP (see [[CAP and PACELC]]).
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Correctness and fairness first. One total order via a sequencer, durable before ack.
 - One single-threaded, deterministic matching engine per symbol, in memory, fed by the log.

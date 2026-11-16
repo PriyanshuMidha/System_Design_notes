@@ -26,7 +26,29 @@ updated: 2026-11-13
 > - The one rule: check and consume the coupon in the same critical section, before payment.
 > - Classic mistake: holding a mutex during the slow payment call, or incrementing coupon use only after payment.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You fill a shopping cart and press "Pay". Before you pay, the shop works out the real price from its own price list, not from what your phone says. Then it checks your coupon, keeps the items aside for you, and charges your card. Each of these steps can fail. If step 4 fails, the steps before it must be undone, like putting the items back on the shelf. A chain of steps where each one has an undo is called a **saga**. And if you tap "Pay" twice, a unique **idempotency key** makes sure you are charged only once.
+
+```mermaid
+flowchart LR
+    A["Price the cart"] --> B["Check coupon"]
+    B --> C["Hold stock"]
+    C --> D["Charge card"]
+    D -- "fails" --> E["Undo: release stock and coupon"]
+```
+
+Everything else in this note is just these 3 questions:
+1. How is the final price worked out, with coupons and rounding?
+2. How do you hold stock for many items all-or-nothing?
+3. How do you undo steps and make a double tap safe?
 
 **The problem in one story.**
 You fill a shopping cart, apply a coupon "SAVE100" and press Pay.
@@ -71,7 +93,7 @@ Where it breaks: some undos can fail too (a refund can fail), so the system need
 > [!tip] Remember
 > Price from the catalog, use the coupon before payment, give every side effect an undo, and key every checkout so a retry never charges twice.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design the cart and checkout of a Zepto / Swiggy Instamart style app.
@@ -92,7 +114,7 @@ It tests a pricing pipeline (Strategy plus Chain of Responsibility), atomic stoc
 5. Add the undo for each step that has a side effect.
 6. Test payment failure, save failure, retries and the coupon cap.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 - **Reserve when?** *At checkout, with a 10-minute TTL so abandoned holds come back.*
 - **Prices:** *Recompute at checkout; any change stops with `ErrPriceChanged` and the client shows the new total.*
@@ -105,13 +127,13 @@ It tests a pricing pipeline (Strategy plus Chain of Responsibility), atomic stoc
 
 **Out of scope:** delivery fee, tax, coupon stacking, cart CRUD, async payment.
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 The **customer** edits the cart, previews a coupon and checks out (and may double tap). The **payment gateway** charges and refunds. **Inventory** reserves, commits and releases stock. A **sweeper** releases expired holds after crashes.
 
 **Ops** reconcile "paid but no order" cases. The hardest use case, and the one to code: **Checkout**, because it touches four systems and each failure point needs a different undo.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
@@ -125,7 +147,7 @@ The **customer** edits the cart, previews a coupon and checks out (and may doubl
 
 Modelling insight: **separate "how much" from "may I"**. A coupon's `DiscountStrategy` computes the amount; the validator chain decides whether it may be used. And a **reservation is an entity with a lifecycle**, not a number: you need its ID to commit or release exactly that hold, and its expiry to clean up after crashes.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -187,7 +209,7 @@ stateDiagram-v2
 
 An in-progress claim carries a **lease** (15 minutes, from the injected clock): if the process crashes after claiming, the key would otherwise stay in progress forever and every retry would get 409. A retry that finds an expired lease **takes the key over** with a higher attempt number, and the crashed or late attempt can no longer write a result.
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 ```text
 GET    /cart                                     -> items and the priced breakdown
@@ -207,7 +229,9 @@ The 409 for a key still in flight and the 422 for a key reused with a different 
 
 In Go: `func (s *Service) Checkout(ctx context.Context, idemKey string, cart Cart, code string) (Order, error)`. The cart is passed in so the logic is testable; production loads it by user.
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
+
+**In plain words:** Tables for products, stock, coupons, how often each coupon was used, and orders. The coupon-use table is what stops one coupon being used too many times.
 
 ```sql
 CREATE TABLE inventory (
@@ -295,7 +319,7 @@ Each statement numbers its own placeholders from `$1`: PostgreSQL rejects a prep
 
 The conditional `WHERE` clauses are the real guards in production: a row lock taken by `UPDATE` serialises concurrent checkouts on the same SKU or coupon (see [[Locking - Optimistic vs Pessimistic]]). The in-memory version below uses one mutex to show the same idea.
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 |---|---|---|
@@ -309,7 +333,7 @@ The conditional `WHERE` clauses are the real guards in production: a row lock ta
 
 Not used: State-pattern objects for Reservation (four states, a status field with conditional updates is enough) and 2PC across payment and DB (the gateway cannot join it).
 
-## Folder structure
+## Folder structure 🟡
 
 ```text
 checkout/
@@ -325,7 +349,7 @@ cmd/demo/main.go  -> wiring: real catalog, PostgreSQL repositories, the gateway 
 
 One file per concern, so a new coupon type touches only `pricing.go` and a new rule only `validator.go`. Below, `checkout.go` merges everything except the tests and `CouponRepository`, which has its own small `ports.go` block; together they compile as shown.
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > Aim for about 150 lines in the room.
@@ -374,6 +398,8 @@ sequenceDiagram
         end
     end
 ```
+
+**In plain words:** The full checkout package. Start with `Cart`, then the discount types, then `Checkout`, which runs the steps in order and undoes them on failure.
 
 ```go
 // File: checkout.go
@@ -896,7 +922,7 @@ type CouponRepository interface {
 }
 ```
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 |---|---|
@@ -912,6 +938,8 @@ type CouponRepository interface {
 Measured: `go test -race -cover` on Go 1.24.4 passes all 8 test functions with 96.1% statement coverage, and `go test -race -count=3` passes on every run. The uncovered lines are the two rare lease-lost branches (lost the key while the save failed, or just before the final write).
 
 The gateway fake now calls its `onCharge` hook before taking its own lock, so a hook can run a second checkout.
+
+**In plain words:** Fake payment, stock and order stores so the tests can make any step fail and check that everything was undone.
 
 ```go
 // File: checkout_test.go
@@ -1300,7 +1328,7 @@ func TestLateOriginalCannotOverwriteTakeover(t *testing.T) {
 }
 ```
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | Handling |
 |---|---|
@@ -1337,7 +1365,7 @@ Common mistakes:
 - One giant `switch couponType`
 - Wrapping the gateway error with `%v`, which drops it from `errors.Is`
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 - **Reserve at checkout, not at add-to-cart:** abandoned carts would block other buyers; the cost is that an item can sell out before payment.
 - **Saga vs one transaction:** the gateway cannot join a DB transaction, so each step has an undo.
@@ -1357,7 +1385,7 @@ Common mistakes:
 | Flash sale on one hot SKU | Count the stock in Redis with a Lua script that decrements only when enough is left (a bare `DECRBY` can go negative unless you check the result and add it back) and write to the database asynchronously, or queue orders per SKU |
 | Notify delivery and email | Publish `OrderPlaced` through a [[Transactional Outbox and CDC]] in the same transaction as the order |
 
-## Drawing
+## Drawing 🟢
 
 ![[Cart Checkout LLD Drawing.excalidraw]]
 
@@ -1367,7 +1395,7 @@ The drawing predates three changes: add the global cap link after the per-user l
 
 Redraw it from memory: the checkout steps in order and the undo each failure runs; Strategy (how much) vs chain (may I); the reservation state machine with the sweeper; `UPDATE ... WHERE available >= qty` and `UNIQUE (user_id, idempotency_key)`; the "paid but the save failed" path and what happens when the refund fails too.
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- Why consume the coupon before payment instead of after?
 > Checking `used < limit` and incrementing after payment lets two parallel checkouts both pass. Consuming in the same critical section (or the same SQL statement) as the check closes the race; a failed checkout gives the use back as compensation.
@@ -1390,13 +1418,13 @@ Redraw it from memory: the checkout steps in order and the undo each failure run
 > [!question]- Why wrap with two `%w` verbs?
 > `fmt.Errorf("%w: %w", ErrPaymentFailed, err)` (Go 1.20+) keeps both errors in the chain, so the API layer maps `ErrPaymentFailed` to 402 and the payment layer can still match a gateway error such as a timeout. With `%v` the gateway error becomes plain text.
 
-## Interview explanation
+## Interview explanation 🔴
 
 ```text
 Checkout is a Facade that runs a pricing pipeline and a small saga. First I look up the idempotency key and replay the stored result if the key was used before; an in-progress claim has a 15-minute lease, so if the process that claimed it crashed, a retry takes it over with a higher attempt number that fences the old attempt out; then I reprice from the catalog and stop with price-changed if anything differs. Under one lock I check the key again, run the coupon validator chain, compute the discount with the coupon's strategy in int64 paise, rounded down and clamped to the subtotal, and consume the per-user and global coupon uses atomically. Then I reserve all SKUs all-or-nothing with a TTL, charge with the same idempotency key, commit the reservation and save the order. If payment fails I release the reservation and give the coupon back; if payment succeeded but the commit or save fails I refund, release and give the coupon back; if even the refund fails I keep the key stuck so a retry can never charge twice, and reconciliation finishes it. In SQL the guards are UPDATE ... WHERE available >= qty with rows affected checked, a conditional upsert for the per-user limit, UPDATE ... WHERE used < max_uses for the global cap, UNIQUE (user_id, idempotency_key), and a sweeper for expired holds.
 ```
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - Replay a used idempotency key first (an in-progress claim with an expired lease is taken over, fenced by an attempt number), then reprice, then coupon (check plus consume atomically), reserve, charge, commit, save.
 - Every step after a side effect has an undo; refund failure means stuck, never a second charge.
@@ -1405,7 +1433,7 @@ Checkout is a Facade that runs a pricing pipeline and a small saga. First I look
 - Same idempotency key to the gateway makes lost responses safe to retry.
 - SQL guards: `WHERE available >= qty`, conditional upserts, `UNIQUE (user_id, idempotency_key)`.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Strategy and Template Method]], [[Chain of Responsibility and Pipelines]], [[Concurrency for LLD]], [[Idempotency and Idempotency Keys]]
 - **Next:** [[Inventory Order Assignment (Dark Store)]], [[Food Ordering System]]

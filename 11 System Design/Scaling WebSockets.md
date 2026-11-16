@@ -33,7 +33,40 @@ updated: 2026-11-13
 
 This note is about running WebSockets at scale. The protocol itself (handshake, frames, ping/pong, SSE and long polling) is in [[Real-time APIs - WebSocket, SSE and Long Polling]], and the Go server code is in [[WebSockets and SSE in Go]].
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (architecture, routing, lifecycle), 4 (capacity estimate and code) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Normal web requests are like letters: you ask, you get one reply, done.
+A chat app needs a phone call instead: a line that stays open so messages can arrive any time.
+That always-open line is a **WebSocket**.
+One server can hold only so many open lines, maybe 50,000. Millions of users need hundreds of servers.
+Now Alice may be on server 17 and Bob on server 142. Server 17 cannot reach Bob directly.
+
+```mermaid
+flowchart LR
+    A["Alice"] --- G1["Server 17"]
+    B["Bob"] --- G2["Server 142"]
+    G1 -. "how does the message get here?" .-> G2
+```
+
+So we add a phone book ("Bob is on server 142") and a shared message pipe between servers, called a **pub/sub bus**.
+
+```mermaid
+flowchart LR
+    A["Alice"] --> G1["Server 17"] --> P["Pub/sub bus"] --> G2["Server 142"] --> B["Bob"]
+    G1 -. "who has Bob?" .-> R["Phone book (registry)"]
+```
+
+The rest of this note is just these 3 questions:
+1. How does a message find the server that holds the other user?
+2. How many servers and how much memory do you need?
+3. What happens when a server restarts or a phone loses signal (reconnect, missed messages)?
 
 **The problem in one story.**
 A normal web page is like sending letters: ask, get one reply, done.
@@ -78,7 +111,7 @@ Where it breaks: hotel guests do not all check out and back in at the same secon
 > [!tip] Remember
 > Each socket lives on one server, so you need a registry to find it, a bus to reach it, and resume to survive drops.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A chat app has **10 million users online at peak**. Each user keeps one WebSocket open so messages arrive instantly.
 
@@ -89,7 +122,7 @@ A chat app has **10 million users online at peak**. Each user keeps one WebSocke
 
 A stateless HTTP API has none of these problems: any server can answer any request. WebSockets need extra parts, and this note is about those parts.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a telephone switchboard building with 200 operators. Each caller is connected to one operator's desk and stays there for the whole call.
 
@@ -105,9 +138,11 @@ Terms used below:
 - **Presence:** whether a user is online, usually derived from connection heartbeats.
 - **Sticky session:** a load-balancer setting that keeps a client on one server. WebSockets are sticky by nature: the TCP connection itself pins the client.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 The architecture
+
+**In plain words:** gateways hold the open lines, a registry remembers who is on which gateway, and a bus carries messages between gateways. The diagram shows all of it.
 
 ```mermaid
 flowchart LR
@@ -148,6 +183,14 @@ If Bob is offline (no registry entry), step 4 is replaced by a mobile push notif
 
 ### 3.2 Two ways to route between gateways
 
+**In plain words:** either send to "the server that has Bob" (good for 1-to-1 chat), or send to "everyone listening to room 7" (good for group chats and live scores).
+
+```mermaid
+flowchart LR
+    M["Message"] --> U["Per-user: look up Bob's server,<br/>send to gw:142"]
+    M --> T["Per-topic: publish to room:7,<br/>every server with a member gets it"]
+```
+
 | Routing | How it works | Good for | Cost |
 | --- | --- | --- | --- |
 | **Per-gateway channel** | Registry maps user → gateway; publish to `gw:{id}` | 1:1 chat, notifications to a user | A registry lookup per recipient; registry must be accurate |
@@ -156,6 +199,8 @@ If Bob is offline (no registry entry), step 4 is replaced by a mobile push notif
 Large systems mix them: per-user routing for direct messages, per-topic subscriptions for rooms and broadcasts.
 
 ### 3.3 The connection lifecycle
+
+**In plain words:** connect, prove who you are, register in the phone book, send pings to stay alive, and clean up when you leave.
 
 ```mermaid
 stateDiagram-v2
@@ -171,7 +216,7 @@ stateDiagram-v2
     Rejected --> [*]
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -189,6 +234,8 @@ stateDiagram-v2
 ```
 
 ### Capacity estimate for 10 million concurrent users
+
+**In plain words:** each open line costs about 30 KB of memory. 50,000 lines per server means about 200 servers for 10 million users, plus some spare.
 
 All figures below are **estimates** to show the method.
 
@@ -208,6 +255,8 @@ All figures below are **estimates** to show the method.
   An L7 proxy holding 50,000 WebSockets to one backend address runs out. Fixes: more backend IPs or ports, more proxy source IPs, or L4 pass-through.
 
 ### Go code: the gateway's hub, resume buffer, registry and reconnect delay
+
+**In plain words:** the code builds the core of one gateway: a list of connected users, a short memory of recent messages for resume, the phone book, and a "wait a random bit before reconnecting" helper.
 
 The code is transport-agnostic: `Conn.Out` is the queue a writer goroutine would drain into the real socket. The clock and the random source are injected so the tests are deterministic. It passes `go vet` and `go test -race` on Go 1.24.
 
@@ -526,6 +575,8 @@ func TestReconnectDelayFullJitter(t *testing.T) {
 
 ### Reconnect with resume
 
+**In plain words:** when your phone comes back, it says "the last message I got was 41". The server sends 42 onward, so nothing is lost.
+
 ```mermaid
 sequenceDiagram
     participant C as Bob's client
@@ -554,9 +605,11 @@ sequenceDiagram
     C->>G2: ack seq 43
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Cross-gateway bus
+
+**In plain words:** the pipe between servers can be Redis, NATS or Kafka. They differ in speed and in whether missed messages are kept.
 
 | Bus | Delivery | Use when | Cost |
 | --- | --- | --- | --- |
@@ -567,6 +620,8 @@ sequenceDiagram
 
 ### Ways to run real-time connections
 
+**In plain words:** you can run your own gateways, or pay a managed service to hold the open lines for you.
+
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
 | Self-hosted gateways (goroutine per connection) | `net/http` + a WebSocket library, 1-2 goroutines per socket | Up to hundreds of thousands of sockets per node; simplest code | About 10-30 KiB per connection (estimate) |
@@ -575,7 +630,14 @@ sequenceDiagram
 | AWS API Gateway WebSockets | AWS holds sockets; your backend gets HTTP callbacks and posts back to `@connections` | Spiky or small workloads; no gateway fleet to run | 10-minute idle timeout and 2-hour max connection; per-message pricing |
 | Pusher, Ably and similar | Managed pub/sub with client SDKs | Fast time to market | Vendor lock-in; cost at high message volume |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
+
+```mermaid
+flowchart TD
+    Q{"Who sends updates?"} -- "only the server" --> SSE["Use SSE (simpler)"]
+    Q -- "both sides, often" --> WS["Use WebSockets"]
+    Q -- "rarely, once a minute" --> LP["Long polling or push notification"]
+```
 
 - **Do not use WebSockets for one-way updates.** If the server only pushes (notifications, progress bars, live scores), SSE is plain HTTP, reconnects with `Last-Event-ID` built in, and passes through proxies more easily.
 - **Do not use them for rare updates.** If a user gets one update per minute, long polling or a mobile push notification costs far less than a socket per user.
@@ -585,7 +647,7 @@ sequenceDiagram
   L7 can route `/ws` to the gateway fleet and terminate TLS, but must support the `Upgrade` handshake and must have an idle timeout longer than your ping interval (ALB default 60 s, so ping every 30 s).
 - **Imbalance after scale-out:** a new gateway starts with zero connections, and the old ones keep theirs until clients reconnect. Least-connections balancing helps only for *new* connections. To rebalance, ask a fraction of clients on overloaded nodes to reconnect.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Authentication:**
 	- Authenticate at the handshake with a **short-lived token** (for example a 60 s ticket fetched over REST), passed in a header or a subprotocol, or as a query parameter only if your logs redact it. Browsers cannot set arbitrary headers on WebSocket requests, which is why tickets in the URL are common.
@@ -608,7 +670,7 @@ sequenceDiagram
 	- One huge room (a live stream with 1 million viewers) makes its topic hot → a tree of fan-out (the message service publishes once per gateway, not per user) and sampling or aggregating reactions. See [[Hot Keys and Hot Partitions]].
 - **What to monitor:** connections per gateway (and max/average across the fleet), handshake rate and failures, reconnect rate, delivery latency from send to client ack (p99), send-queue drops (slow-client closes), bus lag, registry ops per second, file descriptors in use.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why epoll-based servers hold more sockets.** In the goroutine-per-connection design each socket owns at least one blocked goroutine and its read buffer even when idle.
 
@@ -622,7 +684,7 @@ sequenceDiagram
 - **Connection rebalancing.** After scaling out, overloaded gateways can send `reconnect` hints to a small random fraction of clients per minute until load evens out. Without this, the new nodes stay idle until normal churn moves clients.
 - **Multi-region.** Users connect to the nearest region; the bus is per region, and cross-region messages go through a replicated log (for example Kafka with MirrorMaker or a managed equivalent). Registry lookups become "which region, then which gateway". See [[Multi-Region Architecture]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How does a message from a user on server A reach a user on server B?
 > A connection registry maps user → gateway (Redis with a TTL refreshed by heartbeats). The message service stores the message, looks up the recipient's gateway and publishes to that gateway's channel on a pub/sub bus. Gateway B pushes it down the socket. For rooms, gateways subscribe to room topics instead.
@@ -645,7 +707,7 @@ sequenceDiagram
 > [!question]- When would you pick SSE or a managed service instead?
 > SSE when updates only flow server to client: it is plain HTTP and has `Last-Event-ID` resume built in. A managed service (API Gateway WebSockets, Pusher, Ably) when the fleet is small or spiky and you do not want to run gateways, accepting its limits (API Gateway: 10-minute idle, 2-hour max connection).
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Gateways are stateful; a socket stays on one node until it closes.
 - Registry (user → gateway, TTL) + bus (per-gateway or per-topic channels) + message service with per-conversation `seq`.

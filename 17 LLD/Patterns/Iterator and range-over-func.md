@@ -24,7 +24,17 @@ updated: 2026-11-13
 > - The one rule: when `yield` returns `false` (the caller broke out of the loop), stop immediately and clean up.
 > - Classic mistake: a channel fed by a goroutine as an iterator. If the caller stops early, the goroutine blocks forever and leaks.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+An **iterator** lets you walk through items one by one without knowing how they are stored: a slice, a tree, or pages from an API. Since Go 1.23, you can write iterators as functions that work with a plain `for range` loop, called **range-over-func**. This note shows the four Go styles of iterators and builds one that fetches pages from an API as you loop. Read the plain-words line above each code block first.
+
 
 **The problem in one story.**
 You read a long book one page at a time. You do not photocopy the whole book first.
@@ -67,7 +77,7 @@ Where it breaks: a real kitchen may already have cooked the next dish; a correct
 > [!tip] Remember
 > Hand out one item at a time, and stop the instant `yield` returns `false`.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An admin tool must find the first order above ₹500 in an `orders` table that may hold millions of rows. Three bad options:
 
@@ -81,7 +91,7 @@ An iterator gives the caller a plain loop and keeps three things inside it:
 - **Evaluation is lazy.** Nothing is fetched until the loop asks for it. In the worked example, finding the sixth order with a page size of 4 costs **2** page fetches out of 3.
 - **Paging and cleanup live in one place.** The iterator knows the keyset (the last ID seen, used as `WHERE id > $last` for the next page), the page size and when to release the cursor.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A card dealer. You do not get the deck; you get one card each time you ask, and you can say "stop" at any point. The dealer knows whether the cards come from one deck or six, and puts the shoe away when you stop.
 
@@ -90,9 +100,13 @@ Go has two ways to hold that conversation:
 - **Push** (`iter.Seq`, callbacks): the dealer drives. It calls your code (`yield`) once per card; you answer `true` for "keep going" or `false` for "stop". A `for range` loop over a function is written like a normal loop, but the loop body is the `yield` function.
 - **Pull** (`Next`/`Err`/`Close`, `iter.Pull`): you drive. You call `Next()` whenever you want the next card. That is what you need to walk two sequences in step, such as merging two sorted streams.
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words: a function that hands out items one at a time, and stops when the loop stops.**
 
 ### The four Go styles
+
+**In plain words: four ways Go code walks through items, from old to new.**
 
 | Style | Shape | Stops early by | Errors | Standard library examples |
 | --- | --- | --- | --- | --- |
@@ -109,6 +123,8 @@ The language rules for range-over-func belong to [[Generics and Iterators]]. The
 - Because the iterator function returns (or unwinds), its `defer` statements run on every exit: the last item, a `break`, an error, a panic.
 
 ### Structure
+
+**In plain words: the iterator owns the "where am I" state; the loop just asks for the next item.**
 
 ```mermaid
 classDiagram
@@ -148,6 +164,8 @@ classDiagram
 ```
 
 ### A paginated iterator, step by step
+
+**In plain words: fetch one page, hand out its items, then fetch the next page only when needed.**
 
 ```mermaid
 sequenceDiagram
@@ -211,7 +229,9 @@ func main() {
 }
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
+
+**In plain words: a paginated API iterator and a tree walker, with tests.**
 
 `Store.All` is the paginated iterator, `Cursor` adapts it to the `sql.Rows` style with `iter.Pull2`, `Filter` and `Map` compose iterators, and `ChanOrders` is the channel style kept only to show its leak.
 
@@ -636,7 +656,7 @@ The tests check every way out of a loop, because that is where iterators break:
 
 A push iterator is a function call per item. `iter.Pull` switches between two stacks on every item, and a channel adds a goroutine handoff on top. For a database iterator these costs vanish next to the query; for an in-memory hot loop they do not.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -649,7 +669,7 @@ A push iterator is a function call per item. `iter.Pull` switches between two st
 
 **Composing.** `slices.Values`, `slices.All`, `maps.Keys` and `maps.Values` produce iterators; `slices.Collect`, `slices.Sorted` and `maps.Collect` consume them. Generic adapters such as `Filter` and `Map` (about 10 lines each) sit in between and stay lazy: `slices.Collect(Map(Filter(seq, keep), f))` touches each item once and builds only the final slice.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **A small, bounded result should be a slice.** A function returning 20 config entries as `[]Entry` is simpler to call, test and print than an iterator. Use an iterator when the result is large, unbounded, lazily fetched, or likely to be cut short.
 - **A range loop hides I/O.** `for o := range store.All(ctx, 100)` looks as cheap as a slice loop but runs queries. Ranging over it twice runs the queries twice. Name such iterators clearly and document whether a sequence can be ranged more than once.
@@ -657,7 +677,7 @@ A push iterator is a function call per item. `iter.Pull` switches between two st
 - **Do not use channels as iterators.** Use a channel only when producer and consumer really should run concurrently, and then pass a `ctx` so the producer can stop ([[Goroutines and Channels]]).
 - **Iterators are not goroutine-safe.** A sequence is driven by one loop. Two goroutines ranging over the same `Store.All` would race on its counters, and `yield` must never be called from another goroutine without synchronisation.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- `database/sql.Rows`: `for rows.Next() { rows.Scan(…) }`, then `rows.Err()`, with `defer rows.Close()`. An unclosed `Rows` holds a pooled connection.
@@ -673,7 +693,7 @@ A push iterator is a function call per item. `iter.Pull` switches between two st
 	- Channel iterator abandoned after `break` → one leaked goroutine per call. Switch to `iter.Seq`, or select on `ctx.Done()` in the producer.
 - **What to monitor:** connections in use (`sql.DB.Stats().InUse`), goroutine count over time (a slow climb points at abandoned producers), and queries per request for iterator-backed endpoints.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why the channel iterator leaks.** `ChanOrders` starts a goroutine that sends each order on an unbuffered channel. When the consumer breaks out after order 2, nobody will ever receive order 3, so the goroutine blocks on that send forever.
 
@@ -708,7 +728,7 @@ If the export must be consistent, run all pages inside one `REPEATABLE READ` tra
 
 **Testing the exits.** Most iterator bugs sit on the exits that the happy path never takes. Test three paths for every iterator: run to the end, `break` early, and fail midway. In each case assert that the cleanup ran, as the `open` counter does here. Run them with `-race`.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why not return a channel from a goroutine as an iterator? (trap)
 > If the consumer stops early, the producer blocks on its next send forever: a goroutine leak per call. It is also slow: in the measurement above it cost roughly 70 times more per item than range-over-func (absolute numbers depend on the machine). Use `iter.Seq`; use a channel only for real concurrency, with a `ctx` to stop the producer.
@@ -728,7 +748,7 @@ If the export must be consistent, run all pages inside one `REPEATABLE READ` tra
 > [!question]- Is it safe to share one iterator between goroutines?
 > No. A sequence is driven by a single loop, its state is unsynchronised, and `yield` must not be called concurrently. Give each goroutine its own sequence, or fan the items out through a channel deliberately.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Iterators hide storage, evaluate lazily and own paging and cleanup.
 - `iter.Seq[V]` = `func(yield func(V) bool)`; `iter.Seq2[K, V]` for pairs or `(T, error)`.
@@ -739,7 +759,7 @@ If the export must be consistent, run all pages inside one `REPEATABLE READ` tra
 - Channel iterators leak on early stop; keyset paging beats `OFFSET`.
 - Test full run, early break and error, and assert the cleanup.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Generics and Iterators]], [[Interfaces]], [[Error Handling]]
 - **Next:** [[Repository and Unit of Work]]

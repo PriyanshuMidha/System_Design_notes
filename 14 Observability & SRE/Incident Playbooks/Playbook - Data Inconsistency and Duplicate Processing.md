@@ -24,7 +24,42 @@ updated: 2026-11-13
 > - **Inconsistency has a finite list of causes:** retries, redelivery, race conditions, replica lag, dual writes, partial failures, bad migrations, clock problems.
 > - **Repair is a data change in production.** Snapshot first, dry-run, run in small batches, reconcile afterward.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (15). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3, the on-call steps (4, 5, 6), fixes (7), the worked example (8), and 9-10.
+> - 🔴 **Interview / SDE-3 prep?** Add 11, 12 and 13. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Computers talk over networks, and networks sometimes lose replies.
+When a sender gets no reply, it sends the message again. That is a **retry**.
+But maybe the first message did arrive. Only the reply got lost.
+Now the receiver gets the same message twice, and may charge the customer twice.
+
+```mermaid
+flowchart LR
+    S["Sender: charge 50"] --> R["Receiver charges 50"]
+    R -. "reply lost" .-> S
+    S -- "retry: charge 50" --> R2["Receiver charges 50 again"]
+```
+
+The fix is to give each message a unique ID and remember which IDs you already did. Doing the same message twice then has no extra effect. That is called **idempotent**.
+
+```mermaid
+flowchart LR
+    M["Message ID 77"] --> C{"Seen ID 77<br/>before?"}
+    C -- "no" --> D["Do it, save ID"]
+    C -- "yes" --> K["Skip, reply OK"]
+```
+
+A related problem: two systems that should agree (say, orders and payments) slowly drift apart. That is **data inconsistency**.
+
+The rest of this note is just these 3 questions:
+1. Where did the duplicate or mismatch come from?
+2. How do you stop more damage right now?
+3. How do you repair the bad data safely?
 
 **The problem in one story**
 
@@ -76,7 +111,7 @@ Where it breaks: letters are physical and rarely duplicate; in software, retries
 > [!tip] Remember
 > Assume every message can arrive twice; make handlers idempotent and keep one source of truth.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Symptoms and user impact:
 
@@ -93,7 +128,7 @@ Data incidents are slower and more dangerous than outages: bad data keeps spread
 > [!tip] Remember
 > Code rollback fixes behaviour; it does not fix the bad rows already written.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Imagine a bank teller who receives a withdrawal slip, pays out cash, but the receipt printer jams. The customer, unsure, submits the slip again.
 
@@ -122,7 +157,7 @@ flowchart TD
     G --> X
 ```
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Where duplicates are born
 
@@ -146,6 +181,8 @@ Fixed version: the handler first records `evt_42` in a unique-keyed table, in th
 
 ### Types of inconsistency
 
+**In plain words:** "the data is wrong" comes in a few shapes: doubles, missing rows, old values, or two systems that disagree. Each shape has a usual cause.
+
 | Type | How it looks | Typical cause |
 | --- | --- | --- |
 | Duplicate | Same logical event twice | Retry or redelivery without idempotency |
@@ -156,6 +193,8 @@ Fixed version: the handler first records `evt_42` in a unique-keyed table, in th
 | Out-of-order | Older update overwrites newer | Unordered consumer, retries, clock skew |
 
 ### Dual write: the classic source of drift
+
+**In plain words:** the app saves to the database and then sends a message. If it crashes in between, one happened and the other didn't. Now they disagree.
 
 ```mermaid
 sequenceDiagram
@@ -174,7 +213,7 @@ The fix is the **transactional outbox**: write the event to an `outbox` table in
 > [!warning] Common mistake
 > "We will just retry the publish." If the process crashes between the commit and the retry, the event is lost, and nothing retries it. The outbox survives the crash.
 
-## 4. First 5 minutes
+## 4. First 5 minutes 🟡
 
 1. **Confirm and size it.** Pick two or three concrete examples (order IDs, invoice IDs). Count affected rows with a read-only query. Is it still growing? Which tenants, regions or time window?
 2. **Check what changed.** Deploys, migrations, backfills, config, broker rebalances, consumer lag or restarts, replica failover, provider incidents, feature flags in the last 24 hours.
@@ -186,7 +225,7 @@ The fix is the **transactional outbox**: write the event to an `outbox` table in
    5. Do **not** start fixing data yet.
 4. **Communicate.** Declare severity per [[Incident Response]]. Money, privacy or legal exposure usually raises severity. Inform support with the exact customer-facing wording and tell finance if money moved.
 
-## 5. Diagnosis flowchart
+## 5. Diagnosis flowchart 🟡
 
 ```mermaid
 flowchart TD
@@ -205,9 +244,11 @@ flowchart TD
     Q6 -->|No| C7["Bad transform or migration: diff before and after, check recent backfills"]
 ```
 
-## 6. Investigation steps by cause
+## 6. Investigation steps by cause 🟡
 
 ### 6.1 Quantify and sample (all causes)
+
+**In plain words:** first count how many records are bad and pull a few real examples. Numbers and examples beat guessing.
 
 ```sql
 -- Duplicates by business key (adjust table and key)
@@ -230,6 +271,8 @@ What it means: if the duplicated rows cluster in one window, correlate with depl
 
 ### 6.2 Retry-driven duplicates
 
+**In plain words:** if your handler is slow, the caller gives up and sends again, while the first one is still running. Both finish.
+
 Check provider and gateway retry behaviour and handler latency.
 
 ```promql
@@ -248,6 +291,8 @@ grep -o '"event_id":"[^"]*"' app.log | sort | uniq -c | sort -rn | head
 What it means: a handler p99 above the caller timeout guarantees retries. The fix is to acknowledge fast (store, then process asynchronously) and be idempotent.
 
 ### 6.3 Consumer redelivery (Kafka example)
+
+**In plain words:** a queue reader that crashes before saying "done" gets the same messages again after restart.
 
 ```bash
 kafka-consumer-groups.sh --bootstrap-server broker:9092 --describe --group payments-consumer
@@ -271,6 +316,8 @@ What it means:
 For SQS the equivalent is a visibility timeout shorter than processing time; see [[AWS SQS, SNS and EventBridge]].
 
 ### 6.4 Races and lost updates
+
+**In plain words:** two requests read the same value, both change it, and the second save wipes out the first.
 
 ```sql
 -- PostgreSQL: are transactions waiting on locks?
@@ -303,6 +350,8 @@ kubectl get cronjob billing -o jsonpath='{.spec.concurrencyPolicy}'   # Allow, F
 
 ### 6.5 Replica lag and cache staleness
 
+**In plain words:** copies of the database or cache can be a few seconds behind. Reading from them can show old data.
+
 ```sql
 -- On the primary: replication lag per replica
 SELECT application_name, state, replay_lag, write_lag, flush_lag
@@ -320,6 +369,8 @@ redis-cli TTL user:42:profile          # stale cache TTL
 What it means: a replay lag of seconds explains "I saved but I still see the old value" if the read goes to a replica. Fixes include read-your-writes routing (read from the primary for a short time after a write), version tokens, or cache invalidation on write. See [[Replication]] and [[Cache Invalidation, TTL and Consistency]].
 
 ### 6.6 Lost events and divergence between systems
+
+**In plain words:** one system wrote something but the message to the other system never arrived. Compare the two to find the gap.
 
 ```sql
 -- Outbox rows stuck unpublished
@@ -343,6 +394,8 @@ FROM payments WHERE created_at >= now() - interval '24 hours' GROUP BY 1 ORDER B
 
 ### 6.7 Bad deploy or migration
 
+**In plain words:** new code or a database change can start writing wrong data. Check what changed when the problem began.
+
 ```bash
 git log --since="2 days ago" --oneline -- migrations/ internal/payments/
 kubectl rollout history deploy/payments
@@ -350,9 +403,11 @@ kubectl rollout history deploy/payments
 
 Diff the shape of data before and after the deploy time. A transform bug (wrong rounding, timezone, unit) usually affects a deterministic subset: look for what the affected rows have in common.
 
-## 7. Fixes
+## 7. Fixes 🟡
 
 ### Immediate: stop and contain
+
+**In plain words:** stop the bleeding first: pause the job, turn off the feature, or stop the reader. Repair comes after.
 
 | Cause | Containment |
 | --- | --- |
@@ -364,6 +419,8 @@ Diff the shape of data before and after the deploy time. A transform bug (wrong 
 | Bad deploy | Roll back; stop the backfill job. |
 
 ### Repair the data (a controlled production change)
+
+**In plain words:** fixing live data is risky. Take a backup, test the fix on a few rows, then run it in small batches.
 
 1. **Snapshot** the affected tables (or copy the affected rows to an archive table).
 2. **Write the repair as SQL or a reviewed script** with a dry-run mode that prints what it would change.
@@ -391,6 +448,8 @@ For financial systems, prefer adding a **reversing entry** over deleting rows, s
 
 ### Proper fix
 
+**In plain words:** make every write safe to repeat (unique IDs), and save the message together with the data so they can't drift.
+
 - **Idempotency keys** on every write endpoint and consumer: store the event or request ID with a unique constraint, in the same transaction as the effect. See [[Idempotency and Idempotency Keys]].
 
 ```sql
@@ -416,7 +475,7 @@ INSERT INTO processed_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING;
 - Metrics: `duplicate_events_total`, consumer lag, outbox age, DLQ depth, replica lag.
 - Chaos and failure-injection tests: kill the consumer mid-message, drop the response, replay the same event twice. The test must show one effect.
 
-## 8. Worked example: InvoiceOps double credits
+## 8. Worked example: InvoiceOps double credits 🟡
 
 Times are illustrative.
 
@@ -452,7 +511,7 @@ sequenceDiagram
     end
 ```
 
-## 9. Variants and comparison
+## 9. Variants and comparison 🟡
 
 | Approach | Guarantees | Cost | Use when |
 | --- | --- | --- | --- |
@@ -464,7 +523,7 @@ sequenceDiagram
 | Reconciliation job | Detects drift after the fact | Compute, a source of truth | All multi-store systems |
 | Saga | Eventual consistency with compensation | Complex state handling | Multi-service workflows |
 
-## 10. Trade-offs
+## 10. Trade-offs 🟡
 
 - **Idempotency tables** grow; expire old keys after the longest retry window.
 - **Strict dedupe** can drop legitimate repeats if the key is chosen badly (use the provider's event ID, not "amount + user").
@@ -472,7 +531,7 @@ sequenceDiagram
 - **Deleting duplicates** is simple but destroys audit history; reversing entries are safer for money.
 - **Exactly-once** across systems is not achievable in general; you build at-least-once plus idempotence.
 
-## 11. In production
+## 11. In production 🔴
 
 - Alert on `duplicate_events_total`, consumer lag, outbox oldest age, DLQ depth, replica lag, reconciliation diffs.
 - Log the idempotency key and event ID on every write path so you can trace one event across systems.
@@ -489,13 +548,23 @@ flowchart LR
     D --> E["Idempotency, outbox, constraints, reconciliation job"]
 ```
 
-## 12. Deep dive
+## 12. Deep dive 🔴
 
 ### Why exactly-once delivery is a myth, and exactly-once effect is not
+
+**In plain words:** you can't stop a message from arriving twice. You can make the second arrival do nothing.
 
 A network cannot tell "the request was lost" from "the response was lost", so a sender that wants reliability must retry, which means at-least-once. The receiver recovers an exactly-once **effect** by recognising repeats. See [[Delivery Semantics and Exactly-Once]].
 
 ### Commit ordering in consumers
+
+**In plain words:** whether you say "done" before or after doing the work decides if a crash gives you a duplicate or a lost message.
+
+```mermaid
+flowchart TD
+    A["Do the work, then say done"] --> A1["Crash in between:<br/>message comes again = duplicate"]
+    B["Say done, then do the work"] --> B1["Crash in between:<br/>message is gone = lost"]
+```
 
 | Order | Crash between steps | Result |
 | --- | --- | --- |
@@ -507,17 +576,30 @@ The third row is why some systems store consumer offsets in the same database as
 
 ### Read-your-writes with replicas
 
+**In plain words:** after you save something, read it back from the main database, not a copy that may still be behind.
+
 A common pattern is to record the write's log position (such as a PostgreSQL LSN) and route the next read to a replica only if its replay position has passed that value, otherwise read from the primary. A simpler approximation is to pin the session to the primary for a few seconds after a write.
 
 ### Out-of-order updates
+
+**In plain words:** an old message can arrive after a new one and overwrite it. Keep a version number and ignore older ones.
+
+```mermaid
+flowchart LR
+    N["Update v2 arrives first"] --> DB[("Row at v2")]
+    O["Update v1 arrives late"] --> C{"v1 older than v2?"}
+    C -- "yes" --> I["Ignore it"]
+```
 
 If events for the same entity can arrive out of order (two partitions, retries), an older event can overwrite a newer one. Store a version or sequence number on the row and apply updates only when the incoming version is greater. Partition by entity key to preserve per-key order; see [[Message Ordering and Partition Keys]].
 
 ### Cron and singleton jobs
 
+**In plain words:** a scheduled job running on 3 servers runs 3 times unless only one is allowed to run it.
+
 A job scheduled on N replicas runs N times unless one acquires a lock. Use the scheduler's `concurrencyPolicy: Forbid`, a database advisory lock, or leader election; see [[Leader Election]].
 
-## 13. Interview questions
+## 13. Interview questions 🔴
 
 > [!question]- Customers are being double charged. What do you do?
 > Contain first: stop the source (pause the consumer or webhook, flag off the feature) and block further side effects. Size it with a query on a business key, find the cause (retry, redelivery, race), roll back if a deploy introduced it, then repair with a snapshotted, reviewed, batched script that issues refunds or reversing entries. Finally add idempotency keys and a reconciliation job.
@@ -534,7 +616,7 @@ A job scheduled on N replicas runs N times unless one acquires a lock. Use the s
 > [!question]- A user saves a profile but sees the old value after refresh. Why?
 > Likely reading from a lagging replica or a stale cache. Check replication lag and cache TTL. Fix with read-your-writes routing, invalidate or update the cache on write, or return the new value from the write response.
 
-## 14. Post-incident checklist
+## 14. Post-incident checklist 🟡
 
 - [ ] All side effects accounted for: money, emails, notifications, downstream systems, warehouse.
 - [ ] Repair script, backup table and reconciliation results stored with the incident record.
@@ -544,7 +626,7 @@ A job scheduled on N replicas runs N times unless one acquires a lock. Use the s
 - [ ] Reconciliation job and alerts in place for this class of drift.
 - [ ] Failure-injection test (duplicate delivery, crash between steps) added to CI or game days.
 
-## 15. Cheat sheet
+## 15. Cheat sheet 🟢
 
 - Stop side effects first; repair data second.
 - Causes: retries, redelivery, races, lag, dual writes, partial failures, bad deploys.

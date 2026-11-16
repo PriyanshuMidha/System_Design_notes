@@ -28,7 +28,39 @@ updated: 2026-11-13
 > - A proximity query always has two steps: **coarse filter** (scan the cell plus its neighbours) then **exact filter** (true distance on the candidates).
 > - Classic mistake: searching only the cell that contains the point. A driver 50 m away across the cell edge is missed; always include the neighbouring cells.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (geohash, quadtree, S2, H3), 4 (worked example) and 5-6 (comparison and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You open a cab app. The app must show cabs close to you.
+There are a million cabs on the map. Checking how far each one is, every time, is far too slow.
+So the app cuts the map into small squares, like a grid. Each square gets a short name, called a **cell ID**.
+Every cab is filed under the square it is in right now.
+To find cabs near you, the app looks only in your square and the 8 squares around it.
+
+```mermaid
+flowchart LR
+    A["Check all 1,000,000 cabs"] -- "slow" --> X["Answer"]
+    B["Check only 9 nearby squares<br/>(about 2,000 cabs)"] -- "fast" --> X
+```
+
+Then it measures the real distance to those few cabs and keeps the close ones.
+A list that tells you "which things are in which square" is a **geospatial index**.
+
+```mermaid
+flowchart LR
+    Y["You"] --> S["Your square + 8 around it"] --> C["Cabs in those squares"] --> D["Measure real distance"] --> R["Closest cabs"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you cut the map into squares and name them (geohash, quadtree, S2, H3)?
+2. How big should a square be?
+3. What breaks at scale (busy squares, square edges, many updates)?
 
 **The problem in one story**
 
@@ -75,7 +107,7 @@ Where it breaks: postal codes have uneven, odd shapes, while geohash cells are r
 > [!tip] Remember
 > Turn 2-D points into cell IDs, search your cell plus its neighbours, then check true distance.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A ride-hailing app has **1,000,000 online drivers**. Each sends its location every **4 seconds**. A rider in Bengaluru asks, "show drivers within 500 m".
 
@@ -85,7 +117,7 @@ A ride-hailing app has **1,000,000 online drivers**. Each sends its location eve
 
 With a cell index at roughly 1 km cells, the query reads 9 cells. If a busy city cell holds about 200 drivers (estimate), the query computes 9 × 200 = 1,800 distances instead of 1,000,000, about **550 times less work**.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a city map with a grid printed on it. Every square has a label. To find cafés near you, you look in your square and the eight squares around it, then measure only those cafés with a ruler.
 
@@ -100,9 +132,11 @@ Terms used below:
 - **Haversine distance:** the great-circle distance between two points on a sphere.
 - **KNN (k nearest neighbours):** "the 5 closest drivers", as opposed to "all drivers within 500 m" (a radius query).
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Geohash
+
+**In plain words:** keep cutting the world in half, left or right, then top or bottom, and write down a 0 or 1 each time. Those bits, turned into letters, are the name of the square. Longer name = smaller square.
 
 1. Start with the whole world: longitude −180 to 180, latitude −90 to 90.
 2. Halve the longitude range: if the point is in the upper half, write bit 1, otherwise 0.
@@ -138,6 +172,17 @@ flowchart TD
 
 ### 3.2 Quadtree
 
+**In plain words:** start with one big square. If too many points sit in it, cut it into 4. Keep cutting only where it is crowded. Busy city = many tiny squares, ocean = one big square.
+
+```mermaid
+flowchart TD
+    W["Whole map: too many points"] --> NW["NW: few points, stop"]
+    W --> NE["NE: crowded, split again"]
+    W --> SW["SW: few points, stop"]
+    W --> SE["SE: few points, stop"]
+    NE --> A["4 smaller squares"]
+```
+
 A quadtree starts with one square for the whole map. When a square holds more than **K points** (for example 100), it splits into 4 children (NW, NE, SW, SE). Dense downtowns become deep trees with small squares; oceans stay one big square.
 
 - **Query:** walk down the tree, visiting only squares that intersect the search circle.
@@ -146,14 +191,18 @@ A quadtree starts with one square for the whole map. When a square holds more th
 
 ### 3.3 S2 and H3
 
+**In plain words:** two ready-made map grids from Google (S2, square-ish cells) and Uber (H3, six-sided cells). Same idea as geohash, just smarter shapes with fewer edge problems.
+
 - **S2 (Google):** project the sphere onto the 6 faces of a cube, subdivide each face as a quadtree, and number the cells along a **Hilbert curve**. 31 levels (0 to 30); a cell ID is a 64-bit integer, and level-30 cells are about 1 cm². A **region coverer** approximates a circle or polygon with a handful of cells of mixed levels, which become a few integer **range scans**. Used inside Google and by MongoDB's `2dsphere` index.
 - **H3 (Uber):** an icosahedron-based grid of **hexagons**, 16 resolutions (0 to 15), each resolution's cells about 7 times smaller in area than the one above. Hexagons have one kind of neighbour (all 6 share an edge and are equally far from the centre), which makes "rings" of neighbours (`gridDisk(cell, k)`) and smoothing of demand and supply clean. Each resolution has exactly 12 pentagons, which code must tolerate. Children do not nest exactly inside parents.
 
 ### 3.4 R-tree and GiST
 
+**In plain words:** instead of a fixed grid, draw a box around each group of nearby things, then bigger boxes around those boxes. Good for shapes like delivery zones, not just dots.
+
 An **R-tree** groups nearby objects into minimum bounding rectangles, and those rectangles into bigger rectangles, like a B-tree of boxes. It indexes **shapes** (polygons, lines), not just points. PostGIS uses R-tree-style indexing through PostgreSQL's **GiST** framework: `CREATE INDEX ... USING gist (geom)`. The `<->` operator lets GiST return rows in distance order for KNN queries.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -170,6 +219,8 @@ neighbour: centre ± one cell width/height, re-encode (wrap lon at ±180)
 ```
 
 ### Go code: geohash, neighbours, haversine and an in-memory driver index
+
+**In plain words:** the code below keeps a simple "square name to list of drivers" map. When a driver moves, it is taken out of the old square and put in the new one. A search reads 9 squares and checks real distance.
 
 `Index` keeps `cell → driver → position` and `driver → cell`, so a location update is a move between two map entries. It passes `go vet` and `go test -race` on Go 1.24.
 
@@ -502,6 +553,8 @@ Measured from this code: the Bengaluru point `12.9716, 77.5946` encodes to `tdr1
 
 ### The same query in Redis
 
+**In plain words:** Redis already has this built in. You add points with one command and ask "who is within 500 m" with another.
+
 Redis stores GEO members in a **sorted set** whose score is a 52-bit interleaved geohash, so `GEOSEARCH` is a set of score-range scans plus a distance filter, the same two-step idea.
 
 ```bash
@@ -512,6 +565,8 @@ GEOSEARCH drivers:blr FROMLONLAT 77.5946 12.9716 BYRADIUS 500 m ASC COUNT 5 WITH
 Note the argument order: **longitude first**. `GEOSEARCH` exists since Redis 6.2 and replaces the deprecated `GEORADIUS`. Removing a driver is `ZREM drivers:blr d-101`, since a GEO set is a sorted set.
 
 ### The same query in PostgreSQL 17 with PostGIS
+
+**In plain words:** if your data already lives in Postgres, the PostGIS add-on gives you the same "who is near" search in plain SQL.
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS postgis;
@@ -574,7 +629,7 @@ sequenceDiagram
     Note over Q,S: A query near a shard boundary fans out to 2-4 shards and merges
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Index | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -588,7 +643,13 @@ sequenceDiagram
 > [!warning] Interview trap
 > "Same geohash prefix" means "same cell", not "close together", and "close together" does not mean "same prefix". A query that only scans the rider's own cell misses nearby drivers across the edge. Always scan the cell **and its 8 neighbours** (or a ring in H3, or a covering in S2), then filter by true distance.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
+
+```mermaid
+flowchart LR
+    T["Square too big<br/>(precision 5)"] -- "thousands of candidates" --> M["Pick the size where<br/>smallest side >= radius<br/>(precision 6 for 500 m)"]
+    F["Square too small<br/>(precision 8)"] -- "hundreds of squares to read" --> M
+```
 
 - **Precision choice is a trade-off.** Too coarse (precision 5, about 4.9 km) and each query filters thousands of candidates; too fine (precision 8, about 38 m × 19 m) and a 500 m radius needs about 1,000 m ÷ 38 m × 1,000 m ÷ 19 m ≈ 26 × 53 ≈ 1,400 cells. Pick the precision whose smallest cell side is at least the search radius, so 9 cells always cover the circle. For radius queries that vary widely, store several precisions or use S2 coverings.
 - **Hotspots follow people.** Cells over an airport or a stadium after a match hold far more drivers and queries than the median cell. Sharding by cell turns them into hot partitions; split dense cells to a finer precision or shard by finer prefixes there. See [[Hot Keys and Hot Partitions]].
@@ -596,7 +657,7 @@ sequenceDiagram
 - **When not to use a spatial index:** a few thousand points (a store locator for 300 branches) fit in one array; scan it. Data that is only ever filtered by city or postcode needs a normal B-tree index on that column.
 - **Spherical vs planar maths.** PostGIS `geometry` in SRID 4326 measures in **degrees**, not metres; use `geography` (or a projected SRID) for metre distances. Redis assumes a sphere, with up to 0.5% error.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Redis GEO (`GEOADD`, `GEOSEARCH`) for live locations in many delivery and ride apps.
@@ -611,7 +672,7 @@ sequenceDiagram
 	- Wrong argument order (latitude where longitude is expected) → points land in the ocean; Redis, PostGIS `ST_MakePoint` and GeoJSON are all **longitude first**. Add validation: latitude in [−90, 90], longitude in [−180, 180].
 - **What to monitor:** query p99, candidates scanned per query (coarse-filter efficiency), points per cell (max and p99), update rate per shard, age of the oldest position returned.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why the neighbour trick needs radius ≤ smallest cell side.** The 3 × 3 block around the centre cell extends at least one full cell in every direction. If the radius is larger than the cell's smallest side, the circle can reach the second ring of cells, and results are silently incomplete. At precision 6 the smallest side is about 0.61 km, so the Go `Nearby` is correct only for radii up to about 600 m.
 - **Z-order vs Hilbert locality.** A Z-order curve jumps across the map at quadrant boundaries, so cells that are neighbours in space can be far apart in the 1-D order. A Hilbert curve never jumps: consecutive positions are always adjacent cells. That is why S2 coverings turn into fewer, longer ID ranges than geohash prefixes for the same region.
@@ -620,7 +681,7 @@ sequenceDiagram
 - **Write-heavy vs read-heavy structures.** A geohash map or Redis sorted set makes an update `O(1)` or `O(log n)` with no rebalancing, which suits 250,000 updates per second. R-trees and k-d trees are better for read-mostly data (points of interest, zones), where expensive rebalancing happens rarely.
 - **KNN without a radius.** "Nearest 5 drivers, wherever they are": start with the 9 cells; if fewer than 5 results, widen to the next ring of neighbours (or one precision coarser) and repeat. PostGIS `ORDER BY pos <-> point LIMIT 5` does this inside the GiST index.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why not just index latitude and longitude with two B-tree indexes?
 > Each index can only narrow one dimension: a latitude range is a strip around the world. The database must scan and intersect two large strips. A spatial index (cells, GiST, S2) narrows both dimensions at once, so the candidate set is close to the actual circle.
@@ -643,7 +704,7 @@ sequenceDiagram
 > [!question]- When does the "cell plus 8 neighbours" method return wrong results?
 > When the radius is larger than the smallest cell side, the circle can reach beyond the 3 × 3 block. Pick a coarser precision, or compute a covering of the circle (S2 region coverer, H3 `gridDisk` with a larger k).
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Two-step query: coarse filter by cells (cell + neighbours) → exact haversine filter → sort.
 - Geohash: interleave lon/lat bits (lon first), base32; prefix = parent cell; precision 6 ≈ 1.22 × 0.61 km, 7 ≈ 153 m.

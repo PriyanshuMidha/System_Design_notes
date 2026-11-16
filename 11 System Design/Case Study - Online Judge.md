@@ -31,7 +31,33 @@ updated: 2026-11-13
 > - Run a worker's jobs on a **quiet, pinned CPU** with measured limits, so time limits are fair and repeatable.
 > - Verdicts are written once, idempotently, and shown through polling or push.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (11). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example) and 8 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 5 (deep dives), 6, 7, 9 and 10. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+An online judge, like LeetCode, runs your code against hidden tests and says "accepted" or "wrong answer".
+Running code takes seconds, so the site does not make you wait on the request. It gives you a ticket and puts your code in a **queue**.
+Judge machines take submissions from the queue one at a time.
+Your code is a stranger's code, so it runs inside a locked box with no network, little memory and a time limit. That box is a **sandbox**.
+
+```mermaid
+flowchart LR
+    S["Submit code"] --> Q["Queue"] --> J["Judge worker"]
+    J --> SB["Sandbox:<br/>run hidden tests"] --> V["Verdict saved"]
+    V --> U["Your screen updates"]
+```
+
+During a contest, many more people submit at once, so more judge machines are added.
+
+So the rest of this note is just these 3 questions:
+1. How do you run hostile code safely?
+2. How do you keep timing fair, so the same code gets the same result?
+3. How do you survive a contest rush?
 
 **The problem in one story.**
 You submit a solution on LeetCode during a contest, along with 20,000 other people.
@@ -77,7 +103,7 @@ Where it breaks: exam papers do not try to set the room on fire; submitted code 
 > [!tip] Remember
 > Accept fast, queue, judge slowly in a sandbox, and treat every submission as hostile.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 A coding-practice site has one unusual job: it runs code written by strangers on your own servers.
 
@@ -114,7 +140,7 @@ A **checker** is a program that decides whether the output is right (needed when
 > [!tip] Remember
 > Fast acknowledge, slow judge, strong sandbox. Everything else in this design supports those three ideas.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture a **restaurant with a kitchen behind a window**. The front desk (web tier) takes your order slip and gives you a ticket number in a second. The slip goes onto a rail (queue).
 
@@ -137,9 +163,18 @@ flowchart LR
 > [!tip] Remember
 > The user never waits on the judge inside the HTTP request. They wait on a ticket number.
 
-## 3. How it works - high-level design
+```mermaid
+flowchart LR
+    D["Front desk:<br/>take slip, give ticket"] --> R["Order rail (queue)"]
+    R --> C["Cook in a closed station<br/>(sandbox + timer)"]
+    C --> B["Result on the board"]
+```
+
+## 3. How it works - high-level design 🟡
 
 ### Step by step: one submission
+
+**In plain words:** follow one submission from "submit" through the queue and the sandbox to the verdict on your screen.
 
 1. **Submit.** The client sends `POST /submissions` with `problem_id`, `language` and the source. The API checks size (for example 64 KB max), rate limits the user and checks the contest window.
 2. **Persist.** The API writes the source to a database row with `status = queued` and stores large sources in object storage if needed. This commit is the durable point.
@@ -184,7 +219,7 @@ sequenceDiagram
 > [!tip] Remember
 > The database row is the truth. The queue is just a to-do list that can be rebuilt from rows stuck in `queued`.
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -199,6 +234,8 @@ Scale: judge fleet autoscaled on queue depth/age. Estimates: peak ~100 submissio
 ```
 
 ### Estimates
+
+**In plain words:** rough sums: submissions per second at a contest peak, and how many judge machines that needs.
 
 All numbers are estimates. State them as assumptions.
 
@@ -218,6 +255,8 @@ The conclusion to say out loud: **CPU for judging dominates cost**, the database
 
 ### API
 
+**In plain words:** submit code, then check (or get pushed) the result.
+
 ```http
 POST /v1/submissions
 Idempotency-Key: 7f3a...
@@ -236,6 +275,8 @@ GET  /v1/problems/two-sum    # statement, limits, public examples only
 The `Idempotency-Key` stops a double click or a retry from creating two submissions (see [[Idempotency and Idempotency Keys]]). Hidden test data is never returned by any API.
 
 ### Data model
+
+**In plain words:** problems, hidden tests, and submissions with their verdicts.
 
 ```mermaid
 erDiagram
@@ -286,6 +327,8 @@ erDiagram
 
 ### Verdict state machine
 
+**In plain words:** a submission moves through a few states, from queued to running to a final verdict.
+
 ```mermaid
 stateDiagram-v2
     [*] --> queued
@@ -301,7 +344,7 @@ stateDiagram-v2
 > [!tip] Remember
 > Estimate CPU-seconds per submission, not requests per second. That single number sizes the fleet.
 
-## 5. Deep dives
+## 5. Deep dives 🔴
 
 ### 5.1 The sandbox: how to run hostile code safely
 
@@ -368,6 +411,8 @@ The supervisor reads the exit status, sees the cgroup `pids` limit event, and re
 One escape equals a breach of the host, which holds worker credentials and, in a bad design, other people's code and the hidden tests.
 
 ### 5.2 Which isolation technology? (alternatives and choice)
+
+**In plain words:** different kinds of locked boxes: stronger ones start slower and cost more.
 
 | Option | Isolation strength | Start time | Overhead | Notes |
 | --- | --- | --- | --- | --- |
@@ -501,7 +546,7 @@ flowchart LR
 > [!tip] Remember
 > Derived data (the leaderboard) is rebuilt from truth (the submissions table). Never make the cache the only copy.
 
-## 6. Bottlenecks and scaling
+## 6. Bottlenecks and scaling 🔴
 
 ```mermaid
 flowchart TD
@@ -525,7 +570,7 @@ flowchart TD
 - **Rate limits:** per-user submissions (for example 1 every 5 s in a contest), so one script cannot flood the queue. See [[Rate Limiting - Algorithms and Distributed Design]].
 - **DB:** one primary with read replicas for history pages is enough at this scale. Partition `submissions` by month for cheap retention.
 
-## 7. Failure handling
+## 7. Failure handling 🔴
 
 | Failure | Effect | Handling |
 | --- | --- | --- |
@@ -541,7 +586,7 @@ flowchart TD
 > [!warning] Common mistake
 > Giving the judge worker broad cloud credentials "to fetch tests". If code ever escapes, the attacker owns the account. Use a narrow, read-only token for one test-data bucket, or a pre-signed URL per problem.
 
-## 8. Trade-offs
+## 8. Trade-offs 🟡
 
 | Decision | Option A | Option B | Our pick and why |
 | --- | --- | --- | --- |
@@ -554,7 +599,13 @@ flowchart TD
 | Compile | Per run | Cache by hash | **Cache** where code is identical. |
 | Queue | Kafka | Work queue (SQS / RabbitMQ) | **Work queue**, see the broker guide. |
 
-## 9. In production
+```mermaid
+flowchart LR
+    C["Container"] --> C1["Starts fast,<br/>weaker walls"]
+    V["Micro-VM"] --> V1["Stronger walls,<br/>a bit slower"]
+```
+
+## 9. In production 🔴
 
 - **Real examples:** Codeforces, LeetCode and HackerRank run contests with spiky load. Judge0 and the IOI's `isolate` are open source and show the layered-sandbox approach. AWS Lambda and Fargate use Firecracker microVMs for hostile multi-tenant code (Firecracker paper, NSDI 2020). Exact internals of the commercial sites are not public, so treat their numbers as unknown.
 - **Metrics to watch:** queue depth and oldest-message age, verdict latency p50/p95 per language, sandbox failures, `system_error` rate, worker utilisation, compile cache hit rate, test-data cache hit rate.
@@ -562,7 +613,7 @@ flowchart TD
 - **Operations:** immutable worker images per language, rolled out with canaries and a rejudge plan if a compiler update changes behaviour. Keep compiler and runtime versions pinned and show them on the site.
 - **Security posture:** egress denied on worker subnets, no instance profile permissions beyond one bucket read, logs of unexpected seccomp kills as security events.
 
-## 10. Interview questions
+## 10. Interview questions 🔴
 
 > [!question]- How do you run untrusted code safely?
 > Layer defences: separate namespaces (PID, mount, empty net, user), cgroup limits (memory, pids, cpu), a seccomp allow list, rlimits, a read-only filesystem with a tiny tmpfs, unprivileged user with no capabilities, an output cap and an outside wall-clock timer.
@@ -592,7 +643,7 @@ flowchart TD
 > [!question]- Follow-up: what if a problem needs a special checker (many valid answers)?
 > Run the checker as another sandboxed program with its own limits, feeding it input, the user's output and the jury answer. A buggy checker must give a "system error" and trigger a rejudge, not blame the user.
 
-## 11. Cheat sheet
+## 11. Cheat sheet 🟢
 
 - Accept fast, queue, judge in sandboxes, notify.
 - Sandbox = namespaces + cgroups + seccomp + rlimits + read-only FS + no network + no privileges + output cap + outside timer.

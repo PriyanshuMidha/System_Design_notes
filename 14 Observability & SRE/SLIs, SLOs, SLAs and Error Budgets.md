@@ -25,7 +25,42 @@ updated: 2026-11-13
 > - Error budget = `1 − SLO`; spend it on risky launches, and freeze them when it runs out.
 > - Burn rate turns the slow, 30-day budget into a number you can alert on in minutes (covered fully in [[Alerting and On-Call]]).
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+No service is up 100% of the time. So the real question is: how reliable is reliable enough?
+An **SLI** is what you measure, like "share of requests that worked".
+An **SLO** is your goal for it, like "99.9% over 30 days". An SLA is a promise to customers, with money back if you miss.
+
+```mermaid
+flowchart LR
+    I["SLI: 99.95% worked"] --> O{"SLO: at least 99.9%?"}
+    O -- "yes" --> G["Healthy"]
+    O -- "no" --> B["Over budget"]
+```
+
+The gap between 100% and the SLO is the **error budget**: how much failure you are allowed. 99.9% over 30 days is about 43 minutes.
+Budget left? Ship features. Budget gone? Slow down and fix reliability.
+
+```mermaid
+flowchart LR
+    F["Budget: 43 min / month"] --> S["Spent on outages and bad deploys"]
+    S --> D{"Any left?"}
+    D -- "yes" --> Sh["Keep shipping"]
+    D -- "no" --> Fx["Freeze, fix reliability"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you choose a good SLI and where do you measure it?
+2. How do you pick a target and do the budget math?
+3. How do dependencies and background jobs change the picture?
+
 
 **The problem in one story.**
 You run a food-delivery app. Some orders fail now and then.
@@ -80,7 +115,7 @@ flowchart LR
 
 The SLI is what you measure every minute. The SLO is the line you manage against day to day. The SLA is what legal and sales promised the customer — and it is deliberately looser than the SLO so a brief SLO miss never triggers a contractual penalty.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A team ships a checkout API with no explicit target. One engineer thinks "it should basically never be down." Another thinks "a few minutes a week is fine, we're not a bank." A product manager wants to ship a risky caching change Friday afternoon; an SRE wants to block it.
 
@@ -88,15 +123,17 @@ Nobody can settle the argument because there's no number to check it against.
 
 With an SLO, the question becomes mechanical: **99.9% availability over 30 days means 1,000,000 requests can tolerate 1,000 failures.** If the team has only used 200 of that budget this month, the Friday deploy is fine. If they've used 950, it waits. The SLO converts a reliability argument into arithmetic.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the error budget as a bank account funded monthly with a fixed amount of "allowed failure." Every bad request withdraws from it. Shipping features, taking risks, doing maintenance — all of that spends budget, same as an outage does.
 
 The account resets each window (commonly a rolling 28 or 30 days). When the balance goes negative, the team's job shifts from "ship features" to "pay down reliability debt," because the budget — not someone's opinion — says reliability is the bottleneck right now.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Choosing the SLI
+
+**In plain words:** always a ratio: good events divided by all valid events. Pick what users actually feel, like success and speed.
 
 An SLI is always a ratio: **good events ÷ valid events**, expressed as a percentage, measured over a rolling window. Good SLIs are chosen per user journey, not per machine:
 
@@ -111,6 +148,8 @@ An SLI is always a ratio: **good events ÷ valid events**, expressed as a percen
 **Valid events** matters: a request that never reached your load balancer (client-side network failure) usually shouldn't count against you, and a request a client cancelled isn't "bad" the way a 500 is. Define valid events precisely, in writing, or the SLI's meaning drifts.
 
 ### Where to measure
+
+**In plain words:** the closer to the user, the more honest. Measuring inside your app misses failures at the load balancer.
 
 ```mermaid
 flowchart LR
@@ -127,12 +166,16 @@ Measuring at the **client** (real-user monitoring or synthetic probes) is the mo
 
 ### SLO target and window
 
+**In plain words:** a goal is a number plus a time window. "99.9% over the last 30 days" moves forward every day.
+
 An SLO states a target **and** a window: "99.9% of requests succeed, measured over a rolling 30-day window." Two window shapes exist:
 
 - **Rolling window** (e.g. "last 30 days, recalculated every minute"): the budget never resets to full on a fixed calendar date, so there's no "free" burn at the start of a new month. This is the Google SRE default.
 - **Calendar window** (e.g. "this quarter"): simpler to reason about for business reporting, but creates a cliff — budget fully refills on day 1 regardless of how bad day -1 was.
 
 ### Error-budget math, worked
+
+**In plain words:** take the minutes in the window, multiply by the allowed failure share. 30 days at 99.9% gives about 43 minutes.
 
 For a **30-day window** (`30 × 24 × 60 = 43,200` minutes):
 
@@ -149,6 +192,8 @@ If 500 requests have failed so far this window, **50% of the budget is spent** �
 
 ### Dependency math
 
+**In plain words:** if you need several services in a row, multiply their uptimes. Three services at 99.9% give you only about 99.7%.
+
 Availabilities of serial dependencies **multiply**, so a chain is never more reliable than its weakest-but-one link once you compose several 99.9%-ish services:
 
 ```text
@@ -162,9 +207,11 @@ Three services each individually hitting their own 99.9% SLO can still compose i
 
 A background job queue doesn't have a per-request latency the way an API does, so its SLIs are usually: **"N% of jobs complete within T minutes of enqueue"** (a freshness-shaped SLI) and **"queue age stays under T minutes for N% of the window."** The event here is the job, and "good" means "finished within the deadline," not "returned 200."
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Go: error-budget calculator
+
+**In plain words:** the same math as Go code, handy for a dashboard or a "safe to deploy?" check.
 
 The calculations above as tested Go, used to drive a dashboard or a CLI check before a risky deploy. It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
 
@@ -273,7 +320,7 @@ The plateau that follows (day 18 to day 21, holding at 55%) means the service re
 
 This shape, not a single "are we up" boolean, is what an error-budget policy reacts to.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Concept | Measures | Audience | Consequence of miss |
 | --- | --- | --- | --- |
@@ -282,14 +329,14 @@ This shape, not a single "are we up" boolean, is what an error-budget policy rea
 | SLA | A looser, contractual target | Customers, legal, sales | Service credits, contractual penalty |
 | Error budget | `1 − SLO`, consumed by bad events | Engineering + product, jointly | Decides whether risky launches proceed |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - An SLO with no error-budget **policy** behind it is decoration: the number only changes behavior if everyone has agreed in advance what happens when it's breached (freeze launches, mandatory postmortem, reliability sprint).
 - Too many SLOs per service dilutes attention; Google's guidance is to pick the handful of SLIs that represent what users actually care about, not one per endpoint.
 - 100% is never the right target: it has no error budget at all, which means zero room for planned maintenance, canary rollouts, or any experimentation — and it's unachievable regardless, so it just produces permanent, ignored breach alerts.
 - For a brand-new, low-traffic service, a tight SLO measured over a short window is statistically meaningless — 3 failed requests out of 40 looks catastrophic but is noise. Widen the window or wait for volume.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Google's internal SLO culture (the origin of this chapter, SRE book ch. 4); Sloth and Pyrra generate Prometheus recording rules and alerts from an SLO spec; OpenSLO is a vendor-neutral YAML format for defining SLOs portably across tooling.
 - **Failure modes → fixes:**
@@ -298,7 +345,7 @@ This shape, not a single "are we up" boolean, is what an error-budget policy rea
   - Teams game the SLI (narrow the definition of "valid request" until almost nothing counts against them) → review SLI definitions in the same forum that reviews the SLO target, not unilaterally.
 - **What to monitor:** budget-remaining percentage per service, burn rate over multiple windows, and the count of launches delayed or allowed by the error-budget policy (this is a leading indicator the policy is actually being followed, not just written down).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Request-based vs window-based SLIs.** A request-based SLI (`good/valid` over all requests in the window) weights every request equally. A window-based SLI (e.g.
 
@@ -311,7 +358,7 @@ This shape, not a single "are we up" boolean, is what an error-budget policy rea
   If SLA == SLO, every SLO miss becomes a legal event, which pressures teams to hide or dispute misses instead of using the budget as intended.
 - **SLOs and chaos engineering.** A chaos experiment's abort condition should be tied to the error budget, not a vague "stop if it looks bad" — see [[Chaos Engineering]] for blast-radius control that uses exactly this number.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Define SLI, SLO and SLA in one sentence each, with a concrete number.
 > SLI: a measured ratio, e.g. "99.95% of requests returned non-5xx in the last 5 minutes." SLO: an internal target for that SLI over a window, e.g. "99.9% over a rolling 30 days." SLA: a contractual, customer-facing promise looser than the SLO, e.g. "99.5%, with service credits below that."
@@ -333,7 +380,7 @@ This shape, not a single "are we up" boolean, is what an error-budget policy rea
 >
 > Interviewers use this to check you understand the SLO/SLA gap is deliberate, not interchangeable.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - SLI = good events ÷ valid events, measured continuously, as a ratio not a count.
 - SLO = target + window (commonly rolling 30 days); SLA = looser, contractual, with a penalty.

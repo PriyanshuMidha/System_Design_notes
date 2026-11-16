@@ -24,7 +24,17 @@ updated: 2026-11-13
 > - The rule that matters: the caller cannot tell a proxy from the real thing, so it is added at wiring time without changing callers.
 > - Classic mistake: a cache proxy that lets many concurrent misses all hit the backend at once (a cache stampede).
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A **proxy** is a stand-in that has the same interface as the real object but controls access to it. It might cache answers, check permissions, load the real thing only when first needed, or call a remote server for you. The caller cannot tell the difference. It looks like a decorator, but its goal is controlling access, not adding features. Read the plain-words line above each code block first.
+
 
 **The problem in one story.**
 You call a busy doctor's office. A receptionist answers in the doctor's place.
@@ -67,7 +77,7 @@ Where it breaks: you can see a receptionist; in code the caller must truly be un
 > [!tip] Remember
 > Same interface, different control: a proxy decides whether, when and how the call reaches the real thing.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A cart service shows 8 products per cart and calls the catalog service for each one. At an estimated 2,000 cart views per second that is 16,000 catalog calls per second, each about 40 ms over the network (estimate). The catalog data changes a few times a day, so almost all of those calls fetch the same answers again.
 
@@ -79,7 +89,7 @@ You want three controls without touching either service's business code:
 
 The cart code depends on a `Catalog` interface. If every control implements that same interface, the cart code never changes: the composition root decides what sits in front of the real client.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A proxy is a **receptionist in front of an expert**. You ask the receptionist exactly the question you would ask the expert.
 
@@ -92,7 +102,9 @@ Two rules define it:
 1. **Same interface as the subject.** The caller cannot tell the proxy from the real thing.
 2. **The proxy controls access to the subject.** It does not add new features to the answer; that is a decorator's job (see section 5).
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words: a stand-in with the same methods that decides if, when and how the real object is called.**
 
 ```mermaid
 classDiagram
@@ -207,7 +219,9 @@ func main() {
 }
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
+
+**In plain words: a caching proxy and a protection proxy, with tests.**
 
 One `package main` with three proxies over one subject: protection (scope check from the context), caching (RWMutex, TTL, negative caching, which also caches "not found" for a short time, singleflight, invalidation, hit and miss counters) and virtual (lazy creation with `sync.OnceValues`, Go 1.21+).
 
@@ -606,7 +620,7 @@ func TestLazyProxyBuildsOnce(t *testing.T) {
 
 `go test -race -count=1 -v` passes all six tests. `TestConcurrentMissesShareOneBackendCall` is the measurement quoted in section 1: 100 goroutines, 1 backend call.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 **Kinds of proxy:**
 
@@ -629,7 +643,7 @@ func TestLazyProxyBuildsOnce(t *testing.T) {
 
 The line between Proxy and Decorator is blurry in real code. A logging wrapper is a decorator; a wrapper that may skip the call (cache hit, access denied) is a proxy.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 **When not to use it in Go:**
 
@@ -647,7 +661,7 @@ The line between Proxy and Decorator is blurry in real code. A logging wrapper i
 - **Unbounded cache.** A map that only grows is a memory leak with a hit rate. Bound it with an LRU (see [[LRU Cache with TTL]]).
 - **Hidden latency.** A proxy that looks like a local call but goes over the network surprises callers. Make every method take a `ctx` so deadlines flow through.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- `net/http/httputil.ReverseProxy` is an `http.Handler` that forwards each request to another server: the network form of a remote proxy. Since Go 1.20 its `Rewrite` hook is the recommended way to change the outbound request; `Director` is the older hook. The network-level picture is in [[Forward and Reverse Proxies - L4 vs L7]].
@@ -661,7 +675,7 @@ The line between Proxy and Decorator is blurry in real code. A logging wrapper i
 	- Backend hangs → the proxy's own timeout bounds the flight; callers' deadlines bound their wait.
 - **What to monitor:** hit ratio (`hits / (hits + misses)`), backend calls per second, the share of results with `Shared == true` from singleflight, backend latency and timeout rate, cache size, and denied calls from the auth proxy.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **What singleflight does and does not do.** `Do` and `DoChan` deduplicate only calls that **overlap in time** for the same key. Once a flight returns, the key is forgotten and the next miss starts a new flight. That is why the flight re-checks the cache first: a caller that missed just before the previous flight stored its value would otherwise trigger a second backend call.
 - **`Forget(key)`.** It makes the next call for the key start a fresh flight even if one is still running. `Invalidate` calls it so that readers after an update do not join a flight that is fetching pre-update data.
@@ -670,7 +684,7 @@ The line between Proxy and Decorator is blurry in real code. A logging wrapper i
 - **Lazy proxy details.** `sync.OnceValues` runs `build` once even under concurrent first calls, and every later call returns the same `(Catalog, error)`. If `build` fails, the error is cached for the life of the process. When a retry is needed, write the lazy proxy with a mutex and a nil check instead of `OnceValues`.
 - **Proxy and context values.** The protection proxy reads the principal from `ctx` (set by authentication middleware). Use an unexported key type such as `principalKey{}` so no other package can collide with or forge the key. Context mechanics are in [[Context Package]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What makes something a Proxy rather than a Decorator, when both wrap the same interface in Go?
 > Intent. A proxy controls access to the subject: it may skip the call (cache hit, denied), delay creating it (lazy) or send it elsewhere (remote). A decorator always calls through and adds behaviour such as logging or retries. In GoF terms, a proxy often manages its subject's life cycle, while decorators are given an existing object and stacked by the caller.
@@ -693,7 +707,7 @@ The line between Proxy and Decorator is blurry in real code. A logging wrapper i
 > [!question]- How do you build a lazy proxy in Go 1.24?
 > Store `sync.OnceValues(build)` and call it at the top of every method. It runs `build` exactly once even when many goroutines call at the same time. The catch: an error from `build` is also remembered forever, so use a mutex and retry logic when the dependency can come back.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Proxy = same interface as the subject + control over whether, when or where the call happens.
 - Kinds: caching, protection, remote, virtual (lazy), rate or concurrency limited.
@@ -704,7 +718,7 @@ The line between Proxy and Decorator is blurry in real code. A logging wrapper i
 - Lazy proxy: `sync.OnceValues` (Go 1.21+); it caches the build error too.
 - Proxy controls access, Decorator adds behaviour, Adapter changes the interface.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Interfaces]], [[Design Patterns Overview and Chooser]], [[Decorator and Middleware]]
 - **Next:** [[Facade (vs Mediator)]], [[Caching Patterns]], [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]

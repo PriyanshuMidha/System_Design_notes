@@ -28,7 +28,32 @@ updated: 2026-11-13
 > - "Exactly once" is built from at-least-once delivery plus an idempotent write, such as saving the counter delta and the Kafka offset in the same transaction.
 > - Users do not need the exact current number. They need their own like to show up instantly and the total to look sane and never go backwards.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A like count looks like one simple number under a post.
+But a famous post can get 50,000 likes in one second.
+If every like changes the same database row, they wait in line, one by one. That row becomes a **hot key**: one spot getting far too much traffic.
+The fix: write each like as a small event into a queue, and let a helper add them up every second.
+
+```mermaid
+flowchart LR
+    L["50,000 likes"] --> Q["Queue of like events"] --> A["Adder: +50,000 once"] --> N["Count shown"]
+```
+
+For very hot posts, the count is split into many small counters, and the total is their sum. This is a **sharded counter**.
+Views are even more common, so they are counted roughly, with a tiny memory trick.
+
+So the rest of this note is just these 3 questions:
+1. How do you stop everyone fighting over one number?
+2. How do you make sure a retried like is not counted twice?
+3. When is a rough count good enough?
 
 **The problem in one story.**
 A celebrity posts a photo.
@@ -72,7 +97,7 @@ Where it breaks: real booths never double-count a fan, but network retries can, 
 > [!tip] Remember
 > Count in many places, add up later; never make everyone fight over one row.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 Open any social app. Under each post you see a heart with a number, and a view count. It looks trivial, so teams build it as `UPDATE posts SET likes = likes + 1 WHERE id = ?`. That works at ten likes per second.
 
@@ -121,7 +146,7 @@ flowchart TB
     HLL --> READ
 ```
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a **stadium scoreboard with ticket booths**. Every fan who enters buys a ticket at one of many booths. Each booth keeps its own tally on a clipboard. Nobody asks a single clerk to write on one shared sheet, because 50,000 people would queue.
 
@@ -140,7 +165,15 @@ Terms:
 > [!tip] Remember
 > Store the facts (events and per-user state). Keep the count as a fast, rebuildable summary.
 
-## 3. How it works - high-level design
+```mermaid
+flowchart LR
+    B1["Booth 1 clipboard"] --> OP["Scoreboard operator<br/>adds every few seconds"]
+    B2["Booth 2 clipboard"] --> OP
+    B3["Booth 3 clipboard"] --> OP
+    OP --> SB["Big scoreboard"]
+```
+
+## 3. How it works - high-level design 🟡
 
 ### Why not just `count + 1` in the database
 
@@ -169,6 +202,8 @@ sequenceDiagram
 **Why it matters.** Hot-row contention does not slow only the hot post. It exhausts the shared connection pool and takes the whole database with it.
 
 ### The architecture
+
+**In plain words:** likes become events in a queue; a helper sums them per post every second and writes one update; readers see a cached total.
 
 ```mermaid
 flowchart LR
@@ -200,7 +235,7 @@ Read the diagram left to right:
 > [!tip] Remember
 > Fact first, delta second, count last. If the last step is lost, the first step lets you rebuild it.
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -215,6 +250,8 @@ nightly: recount likes table vs counter, fix drift
 Say aloud: 6k likes/s average, 17k/s peak overall; 46k views/s average, about 140k/s peak; one viral post can take 50k/s alone, so the shard count for hot posts is 16 or more.
 
 ### Estimates
+
+**In plain words:** rough sums: likes and views per second, and how much batching cuts the writes.
 
 All inputs are **estimates** for this exercise. Check each against real data in a real design.
 
@@ -237,6 +274,8 @@ The totals are small. Counting is not a storage problem; it is a concurrency and
 
 ### API
 
+**In plain words:** one call to like or unlike, and one to read the counts.
+
 ```http
 PUT    /v1/posts/{post_id}/like        -> 204   (idempotent; repeating is harmless)
 DELETE /v1/posts/{post_id}/like        -> 204   (idempotent)
@@ -253,6 +292,8 @@ Notes:
 - The `likers` list is a scatter-gather across likes shards, because `likes` is sharded by `hash(post_id, user_id)` to spread a viral post. That is acceptable for a rarely used call; if it matters, keep a separate `post_likers` table keyed by `post_id` (bucketed for hot posts).
 
 ### Data model
+
+**In plain words:** one table remembers who liked what (the facts); another holds the running totals (the fast summary).
 
 ```sql
 -- Likes: the durable fact. Sharded by hash(post_id, user_id) so one viral post spreads across shards.
@@ -301,6 +342,8 @@ The `{post}` hash tag keeps all shards of a post in the same Redis Cluster slot 
 
 ### One like traced
 
+**In plain words:** follow a single tap from the phone, through the queue and the adder, to the number everyone sees.
+
 1. User 42 taps the heart on post 7. The app updates the heart immediately (optimistic UI) and sends `PUT /v1/posts/7/like`.
 2. The like service runs `INSERT INTO likes ... ON CONFLICT DO NOTHING` and checks the affected row count.
 3. Row count 1 means a new like: emit `{post:7, delta:+1, event_id}` to Kafka. Row count 0 means a duplicate tap: emit nothing.
@@ -329,7 +372,7 @@ sequenceDiagram
 > [!tip] Remember
 > The client sees success when the fact is stored. The count catches up a second later. That gap is invisible, and it is what buys the throughput.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Choosing a counting technique
 
@@ -371,7 +414,7 @@ These are public, documented patterns, not guesses about private designs.
 
 See [[Choosing a Database - Decision Guide]] for where to keep the likes fact, [[Choosing a Caching Strategy - Decision Guide]] for the count cache, [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]] for the event pipe, and [[Choosing Consistency, Replication and Partitioning - Decision Guide]] for the convergence promise.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Freshness vs cost.** A one-second aggregation window cuts writes by orders of magnitude. The price is a total that lags by about a second. Do not use this pattern when the exact current total triggers an action (inventory, a seat count, a rate limit).
 - **Sharded counters trade write speed for read cost.** 16 shards means 16 reads per count read. Cache the sum for 1-2 seconds and only shard posts that are actually hot.
@@ -380,7 +423,14 @@ See [[Choosing a Database - Decision Guide]] for where to keep the likes fact, [
 - **Do not store a likes list inside the post row.** The row grows without bound and one hot post makes one hot row.
 - **Do not use this design for money.** Balances need transactions and a ledger. See [[Case Study - Payment System]].
 
-## 7. In production
+```mermaid
+flowchart TD
+    Q{"What are you counting?"} -- "money" --> L["Use a ledger, not this"]
+    Q -- "likes" --> E["Exact: events + batching"]
+    Q -- "views / unique viewers" --> A["Approximate: HyperLogLog"]
+```
+
+## 7. In production 🔴
 
 - **Failure modes and fixes:**
 	- Hot post saturates one Redis node. Fix: automatic shard promotion (section 8.1) and salted Kafka keys.
@@ -416,7 +466,7 @@ flowchart LR
     end
 ```
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### 8.1 Hot keys: sharded counters that grow on demand
 
@@ -581,6 +631,8 @@ flowchart TD
 
 ### 8.5 Multi-region and CRDT counters
 
+**In plain words:** each region keeps its own count and they swap numbers; the total is the sum of every region's own count, so nothing is lost.
+
 If users in the US and EU both like the same post and each region writes locally, the regions need a merge rule that needs no coordination. A **PN-Counter** (see [[CRDTs and Conflict Resolution]]) works like this:
 
 - Each region keeps two numbers, `P` (likes added) and `N` (likes removed).
@@ -607,7 +659,7 @@ flowchart LR
 > [!tip] Remember
 > The hard parts are the hot key, the replay, and the proof of correctness. Each has a named answer: sharded counter, transactional offset, reconciler.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- A celebrity post gets 50,000 likes per second. Why does `UPDATE likes = likes + 1` fail and what do you do?
 > All updates serialize on one row lock, and waiting statements drain the connection pool for every other query. Store the like as a row keyed by `(post_id, user_id)`, emit a delta only on a real change, aggregate for about a second in a stream consumer, and write the sum to one of `N` Redis shards chosen at random. Readers sum the shards and cache the result for 1-2 seconds.
@@ -633,7 +685,7 @@ flowchart LR
 > [!question]- What changes if you must support active-active writes in two regions?
 > Use a conflict-free counter (PN-Counter): each region increments its own slot, replicas merge by taking the max per slot, so no cross-region coordination is needed. The per-user like fact must also converge (last-writer-wins on `(post,user)` with a timestamp, or a CRDT set), and the count is eventually consistent across regions.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 A 45-minute script:
 

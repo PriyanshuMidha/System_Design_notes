@@ -30,7 +30,40 @@ updated: 2026-11-13
 > - Make consumers order-tolerant anyway: carry a per-entity version and ignore anything older than what you have.
 > - Pick the key for even load: a key that is too coarse (`tenant_id` of a huge tenant) creates a hot partition.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (keys, broker ordering, retries), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Events for one order happen in a set order: created, paid, shipped.
+To go fast, a broker splits messages across many lanes, called **partitions**, read in parallel.
+If "shipped" and "paid" land in different lanes, they can be handled in the wrong order.
+The fix is to give each message a **key**, such as the order id.
+Same key always goes to the same lane, and one lane is read in order.
+So you keep order for each order, and still run many orders in parallel.
+
+```mermaid
+flowchart LR
+    A["paid"] --> L1["Lane 9 (slow)"]
+    B["shipped"] --> L2["Lane 4 (fast)"]
+    L1 & L2 --> V["View says 'paid'<br/>after 'shipped' (wrong)"]
+```
+
+```mermaid
+flowchart LR
+    A["created, paid, shipped<br/>key = order o-881"] --> L["Always lane 4"]
+    L --> V["Handled in order"]
+```
+
+The rest of this note is just these 3 questions:
+1. How does a key pick a lane, and how do lanes map to readers?
+2. What breaks the order even with keys (retries, adding lanes)?
+3. What do you do when order is broken anyway?
+
 
 **The problem in one story.**
 You deposit 100 and then withdraw 80 from your bank account.
@@ -73,7 +106,7 @@ Where it breaks: a teller who steps away (a rebalance) or a customer sent to the
 > [!tip] Remember
 > Ask "in order relative to what?": key by that entity, and get order per key with parallelism across keys.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An order service publishes three events for order `o-881`: `OrderCreated` (v1), `OrderPaid` (v2), `OrderShipped` (v3). A projection consumer keeps an `orders_view` table for the customer app.
 
@@ -85,7 +118,18 @@ The topic has 12 partitions and the producer sends messages **without a key**, s
 
 The fix is to key by `order_id`: every event for `o-881` goes to one partition, is read by one consumer, in the order it was written. Twelve partitions still give twelve-way parallelism across different orders.
 
-## 2. Mental model
+**Why the view went wrong, step by step:**
+
+```mermaid
+sequenceDiagram
+    participant P4 as partition 4 (fast)
+    participant P9 as partition 9 (2 s behind)
+    participant V as orders_view
+    P4->>V: OrderShipped v3 => "shipped"
+    P9->>V: OrderPaid v2 => "paid" (overwrites!)
+```
+
+## 2. Mental model 🟢
 
 A bank has 12 tellers. If customers join any queue at random, two deposits from the same person can be handled out of order by different tellers.
 
@@ -103,9 +147,22 @@ Terms:
 - **Per-key ordering:** messages with the same key are processed in send order; messages with different keys have no defined order relative to each other.
 - **Sequence number / version:** a counter carried in each message so a consumer can detect gaps, duplicates and reordering.
 
-## 3. How it works
+**The bank tellers, drawn:**
+
+```mermaid
+flowchart LR
+    A1["Account ...81 deposit 1"] --> T9["Teller 9"]
+    A2["Account ...81 deposit 2"] --> T9
+    B1["Account ...14 deposit"] --> T2["Teller 2"]
+    T9 --> R["...81 handled in order"]
+    T2 --> R2["Runs in parallel"]
+```
+
+## 3. How it works 🟡
 
 ### Keys map entities to partitions, partitions map to consumers
+
+**In plain words:** a key is turned into a lane number, and each lane is read by one reader in a group. So one entity always goes to one reader.
 
 ```mermaid
 flowchart LR
@@ -135,6 +192,8 @@ Within one consumer group, each partition is read by exactly one consumer, so `o
 
 ### How each broker offers ordering
 
+**In plain words:** every broker keeps order only inside some small unit: a partition, a message group, or a single queue. The table names that unit for each one.
+
 | Broker | Ordering unit | How you choose it | Parallelism limit |
 | --- | --- | --- | --- |
 | Kafka | Partition | Message key; `murmur2(key) % partitions` by default | At most one consumer per partition per group |
@@ -145,6 +204,8 @@ Within one consumer group, each partition is read by exactly one consumer, so `o
 | RabbitMQ | Queue | Routing; one consumer (or Single Active Consumer) for strict order | Several consumers or requeues break order |
 
 ### How retries break order
+
+**In plain words:** if message 1 fails and goes off to be retried later, message 2 gets handled first. Order is gone unless you block or check versions.
 
 ```mermaid
 sequenceDiagram
@@ -165,9 +226,11 @@ sequenceDiagram
 
 Non-blocking retries (see [[Dead Letter Queues and Poison Messages]]) trade order for throughput. The version check in the consumer is what makes that trade safe.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the whole recipe in a few lines: key by entity id, one worker per lane, and skip anything older than what you already have.
 
 ```text
 producer:  key = order_id                     -> same partition for one order
@@ -179,6 +242,8 @@ apply:     UPDATE orders_view
 ```
 
 ### Full version in Go
+
+**In plain words:** Go code for two tools: one that runs more workers without mixing up a key's order, and one that drops old or repeated events using version numbers.
 
 Two pieces, both compiled and passing `go vet` and `go test -race` on Go 1.24:
 
@@ -348,7 +413,7 @@ SET status = EXCLUDED.status, version = EXCLUDED.version
 WHERE orders_view.version < EXCLUDED.version;   -- stale or duplicate: 0 rows affected
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -359,7 +424,7 @@ WHERE orders_view.version < EXCLUDED.version;   -- stale or duplicate: 0 rows af
 | Resequencing buffer | Consumer holds events until the gap is filled (v2 before v3) | Every event must be applied, in order (ledger deltas, not state snapshots) | Memory, a timeout for gaps that never fill |
 | Commutative design | Make operations order-independent (sets, counters, CRDTs) | You can redesign the data | Not every business rule commutes |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Order vs parallelism.** Parallelism is capped at the number of ordering units. A topic with 12 partitions cannot be processed by more than 12 consumers in one group. Choose the partition count for the peak throughput you expect, because changing it later remaps keys.
 - **Key choice decides load balance.** `customer_id` with one customer producing 30% of traffic puts 30% on one partition (see [[Hot Keys and Hot Partitions]]). Choose the narrowest key whose order you need: usually `order_id`, not `customer_id`, and never a constant.
@@ -367,7 +432,7 @@ WHERE orders_view.version < EXCLUDED.version;   -- stale or duplicate: 0 rows af
 - **Strict order means blocking on failure.** If one message for a key cannot be processed, either everything behind it waits (head-of-line blocking) or you skip it and break order. Decide per stream.
 - **When not to care:** independent commands (send this email), idempotent snapshots where the latest wins anyway, and analytics aggregated by time windows. Using a key there only creates hot spots.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Kafka topics keyed by entity ID (order, account, device), with consumers that check entity versions.
@@ -386,7 +451,7 @@ WHERE orders_view.version < EXCLUDED.version;   -- stale or duplicate: 0 rows af
 	- Count of stale events ignored by the version check (a spike means reordering upstream).
 	- Gaps detected by resequencing consumers and how long they wait.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Where versions come from.** The best source is the database row that changed: a `version` column incremented on each update (also used for optimistic locking), or the outbox table's sequence per aggregate. Wall-clock timestamps from different machines are not safe for ordering because clocks drift (see [[Clocks and Ordering]]).
 - **State events vs delta events.** If each event carries the full new state ("status = shipped, version 3"), consumers can skip stale ones: the latest wins.
@@ -398,7 +463,17 @@ WHERE orders_view.version < EXCLUDED.version;   -- stale or duplicate: 0 rows af
 - **Hot partitions with skewed keys.** If one key is 30% of traffic, adding partitions does not help, since one key always maps to one partition. Options: split the key (`account-42#shard-3`) when per-key order can be relaxed for sub-entities, or give the hot entity its own topic and consumer.
 - **Global order when you really need it.** Use a single partition, or a single writer that stamps a sequence (a log, a ledger table with a sequence). Accept the throughput ceiling, and scale by splitting the domain (one ledger per currency or region) rather than by parallelising one ledger.
 
-## 9. Interview questions
+**Version check on a consumer** (state events, latest wins):
+
+```mermaid
+flowchart LR
+    E["Event v = 3"] --> C{"v > stored version?"}
+    C -- "yes" --> A["Apply and store v"]
+    C -- "no" --> S["Skip as stale"]
+    C -- "gap (have 7, got 9)" --> H["Hold 9 until 8 arrives,<br/>or fetch current state"]
+```
+
+## 9. Interview questions 🔴
 
 > [!question]- Does Kafka guarantee message order?
 > Only within a partition. Messages with the same key go to the same partition and are read in offset order by one consumer of a group. There is no order between partitions, so a topic with keyless records has no useful ordering.
@@ -421,7 +496,7 @@ WHERE orders_view.version < EXCLUDED.version;   -- stale or duplicate: 0 rows af
 > [!question]- How do you pick a partition key?
 > The narrowest entity whose events must stay ordered (order ID, account ID), with high cardinality and no dominant value. Check the traffic share of the top keys; if one key is a large fraction of traffic, split it or isolate it.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Order exists only per partition / message group / single-consumer queue.
 - Key by entity ID: same key → same partition → in order; different keys → parallel.

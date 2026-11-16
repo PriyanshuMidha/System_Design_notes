@@ -22,7 +22,37 @@ updated: 2026-11-13
 > - **VPC endpoints** let traffic reach an AWS service without leaving AWS's network or going through a NAT gateway: **Gateway endpoints** (S3, DynamoDB only, free, via route table entries) and **Interface endpoints** (most other services, priced per hour and per GB, powered by AWS PrivateLink, an ENI with a private IP in your subnet).
 > - **VPC Flow Logs** record accepted and rejected traffic metadata (not payloads) per ENI, subnet, or VPC — the primary tool for diagnosing "why can't this reach that."
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A **VPC** is your own private network inside AWS. Your servers and databases live in it.
+It has two kinds of guards on traffic.
+A **security group** sits on each server like a personal bouncer. A **network ACL** sits at the edge of each subnet like a street gate.
+
+```mermaid
+flowchart LR
+    I["Traffic"] --> N["Network ACL<br/>(subnet gate)"] --> S["Security group<br/>(server bouncer)"] --> E["EC2 / RDS"]
+```
+
+You also need ways to connect: VPC to VPC, and VPC to AWS services like S3, without going over the public internet.
+
+```mermaid
+flowchart LR
+    V["Your VPC"] -- "endpoint (private)" --> S3["S3"]
+    V -- "peering / Transit Gateway" --> V2["Other VPC"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do security groups and network ACLs differ?
+2. How do you connect VPCs to each other?
+3. How do you reach AWS services privately, and log traffic?
+
 
 **The problem in one story.**
 You rent servers in AWS for a web app and its database.
@@ -69,7 +99,7 @@ Where it breaks: a real office park cannot be cloned or re-addressed in minutes,
 > [!tip] Remember
 > Security groups = stateful, allow-only, per resource; NACLs = stateless, ordered, per subnet; endpoints keep AWS traffic off the internet.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 [[IP Addressing, Subnets, NAT and VPC Basics]] explains why a VPC is sliced into subnets with route tables deciding public vs private.
 
@@ -96,7 +126,7 @@ flowchart LR
     App -- "with a gateway endpoint:<br/>never leaves AWS's network" --> S3GW --> S3
 ```
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a VPC's two firewall layers as a building's two checkpoints.
 
@@ -110,9 +140,11 @@ The **network ACL** is the guard at the building's main entrance checking a numb
 
 A **VPC endpoint** is a private service elevator that goes straight from your floor to a specific AWS service's floor, bypassing the building's public front doors (the internet gateway) entirely.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Security groups vs network ACLs
+
+**In plain words:** security groups remember a conversation, so replies are let back in automatically. ACLs don't remember, so you must allow both directions.
 
 | | Security group | Network ACL |
 | --- | --- | --- |
@@ -140,6 +172,8 @@ Security groups have no such ordering concern, since there are no deny rules to 
 
 ### VPC peering vs Transit Gateway
 
+**In plain words:** peering is a direct cable between two VPCs. Transit Gateway is a central hub when you have many VPCs.
+
 **VPC peering** connects exactly two VPCs: each side adds a route pointing the other VPC's CIDR at the peering connection.
 
 It is **not transitive** — if VPC A peers with B, and B peers with C, A cannot reach C through B; A needs its own direct peering connection to C.
@@ -165,6 +199,8 @@ flowchart LR
 ```
 
 ### VPC endpoints and PrivateLink
+
+**In plain words:** endpoints let your private servers reach S3 or other services without going out to the internet.
 
 A **Gateway endpoint** only works for Amazon S3 and DynamoDB.
 
@@ -192,13 +228,15 @@ flowchart TB
 
 ### VPC Flow Logs
 
+**In plain words:** a log of who talked to whom, on which port, and whether it was allowed. Great for "why can't A reach B?".
+
 Flow Logs capture metadata for IP traffic at the ENI, subnet, or VPC level — source/destination IP and port, protocol, byte/packet counts, and whether the traffic was `ACCEPT` or `REJECT` — without capturing payloads.
 
 Sent to CloudWatch Logs or S3, they're the primary tool for answering "is this security group or NACL actually blocking the traffic I think it is."
 
 A `REJECT` record with the identifying 5-tuple tells you exactly what was denied, even though it doesn't say *which* rule denied it (you still have to check the SG/NACL rules by hand, or use AWS's Reachability Analyzer / Network Access Analyzer for that).
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -360,7 +398,7 @@ PASS
 ok  	aws03	1.474s
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Connectivity option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -370,14 +408,14 @@ ok  	aws03	1.474s
 | Interface VPC endpoint (PrivateLink) | An ENI with a private IP in your subnet, DNS-transparent | Most other AWS services, or your own published services | Hourly per endpoint, plus per-GB processed |
 | NAT gateway (fallback) | Outbound-only internet access via PAT | Any destination without a dedicated endpoint | Hourly plus per-GB processed, and higher per-GB than most endpoints |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Security groups and NACLs overlap in purpose; adding strict NACL rules on top of already-correct security groups mostly adds operational complexity and a second place to debug a denial — many teams run with the default "allow all" NACL and do all their filtering in security groups, reserving custom NACLs for subnet-wide guardrails (e.g., blocking a known-bad CIDR range entirely).
 - Transit Gateway is overkill for two or three VPCs that will never grow much — direct peering is simpler to reason about and has fewer moving parts for a small, static topology.
 - Interface endpoints cost money per hour per endpoint per AZ; adding one for every AWS service "just in case" adds a real, recurring bill — add them for services your private subnets actually call without a NAT path, not speculatively.
 - VPC Flow Logs at full verbosity (every ENI, every connection) generate large volumes of log data and CloudWatch Logs ingestion costs; scope them to what you're actually debugging or a security-relevant subset, not blanket-enabled everywhere by default.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** large AWS deployments nearly universally use Transit Gateway once they exceed a handful of VPCs; AWS's own documentation positions Gateway endpoints for S3/DynamoDB as a default cost-saving recommendation for any private subnet that talks to either service; GuardDuty's foundational threat detection explicitly consumes VPC Flow Logs as one of its core data sources.
 - **Failure modes → fixes:**
@@ -387,14 +425,14 @@ ok  	aws03	1.474s
   - VPC peering across accounts fails silently → confirm both the peering connection's acceptance and DNS resolution settings (`allowDnsResolutionFromRemoteVpc`) are both configured, not just the route tables.
 - **What to monitor:** VPC Flow Logs `REJECT` rate per ENI/subnet as a signal of misconfigured rules or active scanning; Transit Gateway attachment and route table changes via CloudTrail; Interface endpoint hourly cost accumulation across AZs (each AZ you attach one in bills separately).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why Gateway endpoints are free but Interface endpoints aren't.** A Gateway endpoint is purely a route table entry — AWS adds no new network interface or compute to process your traffic differently, it just directs traffic that would have gone to the internet gateway toward S3/DynamoDB's internal network instead. An Interface endpoint provisions an actual ENI (with its own private IP, subject to ENI limits per subnet) and runs it through AWS PrivateLink's infrastructure, which is real provisioned capacity AWS bills for.
 - **Why NACLs must be stateless by their nature as a subnet-wide guard.** If NACLs tracked connection state, they'd need to track state for every flow through the subnet at once, for every ENI in it — a much larger state-tracking burden than a security group tracking state for the handful of connections to one instance. Keeping NACLs stateless (checking inbound and outbound rules independently every time) is what makes them a cheap, simple, subnet-wide backstop rather than a second full connection-tracking firewall.
 - **VPC endpoint policies as IAM resource policies, not network rules.** A VPC endpoint can have an IAM resource policy attached (like an S3 bucket policy) that further restricts which principals or actions are allowed to use *that specific endpoint* — a VPC-level restriction independent of the IAM identity policy the caller otherwise has, giving you a way to say "even an identity with full S3 access can only use S3 through this endpoint for these specific buckets."
 - **Transit Gateway route tables are not automatically shared.** Each attachment to a Transit Gateway associates with one of the Transit Gateway's own route tables (you can have several), and propagation between attachments is explicit — two VPCs attached to the same Transit Gateway do *not* automatically reach each other unless their attachments are associated with route tables that propagate each other's routes, which is what lets Transit Gateway enforce network segmentation (e.g., a "prod" route table that production VPCs use, separate from a "dev" route table) even though everything shares one hub.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's the practical difference between a security group and a network ACL?
 > A security group is stateful, allow-only, and attaches to individual resources (ENIs) — any matching allow rule is enough, and return traffic for an allowed connection is automatically permitted. A network ACL is stateless, supports explicit deny, applies to an entire subnet, and evaluates numbered rules in order, with the first match (allow or deny) deciding — including separately checking inbound and outbound traffic.
@@ -414,7 +452,7 @@ ok  	aws03	1.474s
 > [!question]- What does a VPC Flow Log actually capture, and what can't it tell you?
 > It captures connection metadata — source/destination IP and port, protocol, packet/byte counts, and whether the traffic was accepted or rejected — per ENI, subnet, or VPC, without capturing the packet payload. A `REJECT` entry tells you exactly which flow was blocked, but not which specific security group or NACL rule blocked it; you still have to check the rules directly, or use a tool like Reachability Analyzer to trace the exact path and rule.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Security groups: stateful, allow-only, per-resource, no rule order. NACLs: stateless, allow+deny, per-subnet, numbered rules, first match wins.
 - A low-numbered NACL deny rule blocks traffic even if a higher-numbered allow rule would otherwise have matched it.

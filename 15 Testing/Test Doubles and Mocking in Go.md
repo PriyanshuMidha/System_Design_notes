@@ -26,7 +26,34 @@ updated: 2026-11-13
 > - `httptest` fakes an HTTP boundary; sqlmock fakes a SQL boundary without a real database; a real Postgres via testcontainers-go is the ground truth both approximate.
 > - A fake beats a mock whenever the test cares about *behaviour across several calls* (state that persists, like "mark paid and then the amount reads back as zero").
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your code often calls something slow or risky, like a payment company.
+In a test you do not want to charge a real card.
+So you swap the real thing for a stand-in. That stand-in is a **test double**, like a stunt double in a film.
+People call all of them "mocks", but there are five kinds: dummy, stub, fake, spy and mock.
+They differ in what they do: return a fixed answer, really work in memory, or record what was called.
+In Go, swapping is easy when your code depends on a small **interface** (a list of methods) instead of a concrete type.
+
+```mermaid
+flowchart LR
+    S["Your service"] --> I["PaymentProvider interface"]
+    I --> R["Real payment API<br/>(in production)"]
+    I --> D["Test double<br/>(in tests)"]
+```
+
+The rest of this note is just these 3 questions:
+1. What are the five kinds of doubles, and when do you use each?
+2. How do you make Go code easy to swap?
+3. When should you skip doubles and use the real thing?
+
 
 **The problem in one story.**
 Your code charges a customer's card and then emails a receipt.
@@ -69,7 +96,7 @@ Where it breaks: a simulator only behaves the way its builders programmed it, so
 > [!tip] Remember
 > Declare a small interface where you use it, then plug in the simplest double that proves what your test cares about.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 `InvoiceService.Pay` (the running InvoiceOps example) needs to charge a payment provider and notify the customer.
 
@@ -82,7 +109,7 @@ In a test, actually calling a payment provider is unacceptable:
 
 Test doubles solve this: replace `PaymentProvider` with something that behaves predictably, in-process, for free, in under a millisecond — while still letting the test prove `Pay` handles a decline, a timeout, and a success correctly.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture a stage play.
 
@@ -94,9 +121,17 @@ Picture a stage play.
 
 All five let the play (the test) go ahead without the real other actor (the real dependency). Which one to use depends on what the test needs to check.
 
-## 3. How it works
+```mermaid
+flowchart LR
+    DU["Dummy<br/>just fills a slot"] --> ST["Stub<br/>fixed answer"] --> FA["Fake<br/>works, in memory"]
+    FA --> SP["Spy<br/>records calls"] --> MO["Mock<br/>expects calls"]
+```
+
+## 3. How it works 🟡
 
 ### The vocabulary, on one interface
+
+**In plain words: the same interface, replaced five different ways, so you can see the difference side by side.**
 
 Every example below replaces this consumer-declared interface from InvoiceOps (full service in [[Unit, Integration and E2E Tests]]):
 
@@ -166,6 +201,8 @@ sequenceDiagram
 
 ### Consumer-side interfaces: what makes a type fakeable
 
+**In plain words: the package that uses a dependency declares the small interface it needs. That makes it easy to fake.**
+
 `PaymentProvider` is declared inside the package that **uses** it (the invoice service), not inside a payment-provider SDK package:
 
 ```go
@@ -181,6 +218,8 @@ Because the interface lives on the consumer side and lists only the one method `
 This is the Go idiom usually summarized as "accept interfaces, return structs," and it's also why Go interfaces are satisfied implicitly: the real `HTTPPaymentProvider` never needs to import or know about this interface at all.
 
 ### Table-driven tests over the fakes
+
+**In plain words: a list of cases, each using a fake set up a bit differently.**
 
 ```go
 func TestInvoiceService_Pay(t *testing.T) {
@@ -223,9 +262,13 @@ The full, tested five-case version — plus a separate test using `spyNotifier` 
 
 ### `httptest` for the HTTP boundary
 
+**In plain words: httptest is a fake web server you start inside the test.**
+
 Covered in depth in [[Unit, Integration and E2E Tests]]; in double terms, `httptest.NewServer` running a hand-written stub handler is itself a **stub** for the external payment API, just one that happens to run over a real socket so the client code under test (`HTTPPaymentProvider.Charge`) is exercised faithfully.
 
 ### sqlmock vs a real test database
+
+**In plain words: sqlmock checks the SQL text; a real database checks the SQL actually works.**
 
 `sqlmock` replaces `*sql.DB`'s driver with one that matches query text against a regex and returns programmed rows — a **stub** at the SQL level:
 
@@ -248,6 +291,8 @@ It does **not** prove the query is valid against the real schema — a renamed c
 The real-database alternative (testcontainers-go, detailed in [[Unit, Integration and E2E Tests]]) is the only one of the two that's a true integration test; sqlmock is better understood as a fast unit test of the Go code *around* the query.
 
 ### gomock / mockery codegen vs hand-written fakes
+
+**In plain words: tools can write mocks for you, but a small hand-written fake is often simpler.**
 
 Generated mocks (`mockgen` for gomock, `mockery` or `moq` for a similar style) read an interface and emit a type with an `EXPECT()` builder:
 
@@ -278,7 +323,7 @@ svc.Pay(context.Background(), "inv-7")
 
 **Hand-written fakes win when**: the interface is small (as in this InvoiceOps example — one or two methods), the test benefits from *real* behavior across a sequence of calls (a fake map that actually tracks state), or the team wants zero extra tooling and maximum readability for a newcomer reading the test.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -310,9 +355,11 @@ Which double for which test?
 
 ### Full tested code
 
+**In plain words: the full service with its tests. Read the comments first, then the code.**
+
 The service, four double kinds, table-driven tests, an `httptest` example for both directions (handler and client), and an sqlmock test all live together, compiled and tested, in a scratch Go module at `/private/tmp/claude-502/-Users-priyanshumidha-Documents-OBZEDIAN/00fc1435-48e1-42f0-9888-340e4e0fbca2/scratchpad/work/15-g1/testdoubles/` (`invoice.go`, `fakes.go`, `handler.go`, `sqlstore.go`, and their `_test.go` files). `go vet ./...` and `go test -race ./...` both pass (13 tests).
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Double | Behavior | Verified how | Use when |
 |---|---|---|---|
@@ -322,14 +369,22 @@ The service, four double kinds, table-driven tests, an `httptest` example for bo
 | Spy | Canned answer + records calls | Checked by inspecting the double after the call | Asserting an interaction happened, discovered *after* the call |
 | Mock | Pre-declared expectations | Verifies itself (fails the test on mismatch) | The interaction itself (call count, argument shape) is the thing under test |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Over-using generated mocks for small interfaces adds a build step (`go generate`), a new dependency, and a layer of indirection a newcomer has to learn, for interfaces a 10-line hand-written fake would cover just as well.
 - A fake that gets too clever (reimplementing constraint checking, transactions, concurrency control) turns into a second database to maintain and debug — at that point, switch to a real test database (testcontainers-go) instead of growing the fake further.
 - Mocks that assert on call count and argument shape couple the test tightly to the exact sequence of calls; a harmless refactor (combining two calls into one, reordering independent calls) breaks the test even though behavior didn't change.
   Prefer asserting on *outcome* (a fake's final state, a spy's recorded summary) over *process* (a mock's exact call sequence) unless the sequence itself is the contract.
 
-## 7. In production
+```mermaid
+flowchart TD
+    Q{"Is the real thing fast and safe to run?"} -- "yes" --> R["Use the real thing"]
+    Q -- "no" --> Q2{"Do you care about the result or the exact call?"}
+    Q2 -- "result" --> F["Use a fake or stub"]
+    Q2 -- "exact call" --> M["Use a spy or mock"]
+```
+
+## 7. In production 🔴
 
 - **Real systems**: gomock (`go.uber.org/mock`, the maintained fork of `golang/mock`) and `vektra/mockery` are the two most common Go mocking-codegen tools in production codebases; `DATA-DOG/go-sqlmock` is near-universal for a fast SQL-adjacent unit test layered on top of a slower testcontainers-go integration suite.
 - **Failure modes → fixes**:
@@ -337,9 +392,11 @@ The service, four double kinds, table-driven tests, an `httptest` example for bo
   - *A hand-written fake silently drifts from the real implementation's behavior* (e.g., the real store enforces "can't mark an already-paid invoice paid again," the fake doesn't) → add that same invariant to the fake deliberately, and add one integration test against the real store specifically for that invariant.
 - **What to monitor**: how often a test breaks on an unrelated refactor (a proxy for over-specified mocks) and whether the fake's assumptions have ever diverged from a bug found only against the real dependency.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Why "mock" became the catch-all word, and why the distinction still matters
+
+**In plain words: everyone says "mock", but knowing the exact kind tells you what the test really checks.**
 
 Colloquially, "mock the database" usually means "replace the database with anything that isn't the database" — any of the five kinds.
 
@@ -353,13 +410,15 @@ Reaching for the wrong one either under-tests (a stub where a spy was needed to 
 
 ### When a fake beats a mock, concretely
 
+**In plain words: a fake checks the end result; a mock checks the exact calls. Results break less often.**
+
 The clearest case in this note's own example: testing that `Pay` correctly leaves the invoice no longer "owing" after a successful charge needs the store to behave like a real data store across two calls (`AmountCents` then, implicitly, whatever reads the state afterward).
 
 A stub returning the same canned `AmountCents` forever can't model "this invoice is now paid," but `fakeStore.MarkPaid` deleting the entry from its map can.
 
 Any test whose assertion is "state X holds *after* a sequence of operations," rather than "call Y happened," is a fake's job.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's the difference between a stub and a mock, precisely?
 > A stub returns a fixed answer and is inspected (if at all) through the caller's own return value — the test checks what the *code under test* did with the stub's answer.
@@ -393,7 +452,7 @@ Any test whose assertion is "state X holds *after* a sequence of operations," ra
 >
 > Use both: sqlmock for fast coverage of many query-shape variants, a real database for the handful of queries where correctness against the real schema matters most.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Five kinds: dummy (unused), stub (canned answer), fake (working simplified version), spy (records calls), mock (pre-declared expectations, self-verifying).
 - Declare interfaces on the consumer side, sized to exactly what's called — that's what makes a type fakeable in Go.
@@ -404,7 +463,7 @@ Any test whose assertion is "state X holds *after* a sequence of operations," ra
 - Prefer asserting outcome (a fake's final state) over process (a mock's exact call sequence) unless the sequence itself is the contract.
 - Never mock the dependency a given test's whole job is to verify.
 
-## Links
+## Links 🟢
 - **Before this:** [[Unit, Integration and E2E Tests]]
 - **Next:** [[Test Data Strategy]]
 - **Compare with:** [[Testing Strategy and the Test Pyramid]] for where unit tests (and their doubles) fit among the layers; [[Contract Testing]] for verifying a double's assumptions against the real dependency's actual behavior.

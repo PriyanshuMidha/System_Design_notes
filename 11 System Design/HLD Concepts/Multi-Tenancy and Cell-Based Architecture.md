@@ -31,7 +31,39 @@ updated: 2026-11-13
 > - Stop **noisy neighbours** with per-tenant quotas, concurrency limits and fair queueing.
 > - Limit the **blast radius** with cells and **shuffle sharding**, so a bad tenant or a bad deploy touches a small, known set of customers.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (payroll example) and 5 (variants).
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Many companies use your app. Each customer company is a **tenant**.
+Giving every tenant its own servers is safe but very expensive. Sharing everything is cheap but risky.
+Risk one: a tenant sees another tenant's data. Risk two: one busy tenant slows everyone down.
+So you share, but you tag every row and every request with the tenant's id, and you limit how much each tenant can use.
+Then you go one step further. You split the whole system into a few full copies, each serving a slice of tenants. Each copy is a **cell**.
+If one cell breaks, only its tenants feel it.
+
+```mermaid
+flowchart LR
+    A["Before: one big shared system"] --> B["One bug or one busy tenant<br/>hurts everyone"]
+```
+
+```mermaid
+flowchart LR
+    R["Router: tenant to cell"] --> C1["Cell 1"]
+    R --> C2["Cell 2 (broken)"]
+    R --> C3["Cell 3"]
+    C2 --> X["Only cell 2's tenants hurt"]
+```
+
+The rest of this note is just these 3 questions:
+1. How much do tenants share, and how do you keep their data apart?
+2. How do you stop one tenant from slowing the rest?
+3. How do cells shrink the damage when something breaks?
 
 **The problem in one story.**
 You build an app that 5,000 small companies use to run payroll.
@@ -77,7 +109,7 @@ Where it breaks: apartment walls are physical, while software isolation exists o
 > [!tip] Remember
 > Tag everything with a tenant id, limit each tenant, and split the platform into cells so one failure hurts only a slice.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 You build an invoicing SaaS. Customer 1 is a corner shop with 20 invoices a day. Customer 2 is a retail chain that imports 4 million invoices on the first of every month.
 
@@ -94,7 +126,7 @@ Separate stacks per tenant solve all of it but cost too much when you have 10,00
 > [!tip] Remember
 > Sharing makes it cheap. Isolation makes it safe. Every decision moves the dial between them.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of **housing**.
 
@@ -120,7 +152,7 @@ flowchart LR
     end
 ```
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The three isolation models
 
@@ -314,9 +346,11 @@ AWS's Route 53 uses 2,048 virtual name servers with 4 per domain, which gives C(
 > [!tip] Remember
 > Cells cap the blast radius to a slice. Shuffle sharding makes the slice different for every tenant.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Scenario: a payroll SaaS for 5,000 companies
+
+**In plain words:** We take the payroll app from the story and walk through every choice: how data is split, how busy tenants are limited, and how cells limit damage.
 
 Requirements: companies must never see each other's data; one company's month-end run must not slow others; a bad release must not stop all payrolls; two banks demand a dedicated database; one customer wants EU-only storage.
 
@@ -364,7 +398,7 @@ flowchart LR
 - Inside a cell: per-tenant rate and concurrency limits, tenant_id leading every key, RLS.
 - Mention: bridge model, whale gets own cell, deploy cell by cell, shuffle sharding in shared worker pools.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Pattern | Isolates | Cost | Complexity | Use when |
 | --- | --- | --- | --- | --- |
@@ -386,7 +420,7 @@ flowchart TD
     Q -->|"yes"| CE["Cells plus shuffle sharding inside each"]
 ```
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Cells cost money and effort.** Each cell has a baseline of capacity. 20 cells running at 30 percent use more total hardware than one shared stack at 60 percent. They are worth it when downtime cost is high.
 - **Cross-tenant queries are hard.** Admin dashboards, global search and analytics must read from many cells. Build them as an asynchronous pipeline into a separate analytics store.
@@ -398,7 +432,7 @@ flowchart TD
 > [!tip] Remember
 > Isolation is bought with money and operations. Buy only as much as the failure cost justifies.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems.**
   - AWS recommends cell-based architecture to reduce the scope of impact in its Well-Architected guidance, and Route 53 uses shuffle sharding in its Infima library, as described in the Builders' Library.
@@ -414,33 +448,63 @@ flowchart TD
   - *Wrong tenant in cache keys* → include the tenant id in every cache key and queue name.
 - **What to monitor.** Per-tenant request rate, error rate, p99 latency and resource use (top 10 tenants), rejection counts from quotas, cell health and saturation, tenant count and utilisation per cell, tenant-move duration, and cross-cell call count (which should be zero).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Choosing the cell count and size
 
+**In plain words:** Many small cells means small damage when one breaks, but more things to run. Few big cells is cheaper but each failure hurts more people.
+
 More, smaller cells give a smaller blast radius (1/N) and cheaper canaries, but more fixed overhead and more operations. Fewer, larger cells are cheaper but each failure hurts more. Pick a maximum cell size you can load-test and rebuild quickly, and let the count grow. Starting at 5 to 10 cells is common (estimate, depends on the business).
 
+```mermaid
+flowchart LR
+    A["2 big cells<br/>one failure hits 50%<br/>little to run"] --> B["10 cells<br/>one failure hits 10%"]
+    B --> C["50 small cells<br/>one failure hits 2%<br/>lots to run"]
+```
+
 ### Placing tenants in cells
+
+**In plain words:** Decide which cell a new customer goes into. Simple rules fill unevenly; smarter rules balance the load.
 
 Strategies: fill one cell to its cap then open the next (simple, uneven), assign the new tenant to the least-loaded cell (balanced), or place by region and plan (compliance). Keep some headroom in every cell for a tenant's growth. The mapping lives in a replicated store that the router caches.
 
 ### Evacuating a cell
 
+**In plain words:** If a cell gets sick, move its tenants to healthy cells. That only works if their data is already copied somewhere.
+
 If a cell is unhealthy, you can move its tenants into other cells or a standby cell. This needs data replication per cell (for example, asynchronous replicas elsewhere) and capacity headroom. Many teams skip evacuation and instead rely on fast cell recovery, accepting a partial outage for a small share of tenants.
 
+```mermaid
+flowchart LR
+    S["Cell 3 unhealthy"] --> D["Router points cell 3's<br/>tenants elsewhere"]
+    D --> H["Healthy cell or<br/>standby cell<br/>(has copy of their data)"]
+```
+
 ### Fairness details
+
+**In plain words:** Fair sharing is like a queue at a counter where each tenant gets a turn. Paying more can buy you a bigger share of turns.
 
 Round-robin per tenant is equal sharing. **Weighted fair queueing** gives bigger plans proportionally more. **Dominant resource fairness** is useful when tenants use different mixes of CPU and memory. Also add **admission control** that rejects work from a tenant over quota early and cheaply, before it reaches shared resources (see [[Load Shedding and Graceful Degradation]]).
 
 ### Tenant-aware observability
 
+**In plain words:** Put the tenant id in logs and traces so you can debug one customer. But do not make one graph line per tenant, or your metrics system will choke.
+
 Add `tenant_id` to logs and traces but be careful with metrics: one label per tenant for 10,000 tenants explodes the metric cardinality. Record per-tenant metrics for the top N and for plan classes, and use logs or traces to dig into a specific tenant.
 
 ### Security details
 
+**In plain words:** Give each tenant its own encryption key. Delete the key and that tenant's data becomes unreadable junk, which is a clean way to erase it.
+
 Per-tenant encryption keys (one key per tenant in a KMS) allow "crypto-shredding": deleting the key makes that tenant's data unreadable. It supports erasure promises and limits the damage of a leaked database dump.
 
-## 9. Interview questions
+```mermaid
+flowchart LR
+    T["Tenant A data<br/>(encrypted)"] --> K["Tenant A key in KMS"]
+    K -- "delete the key" --> X["Data now unreadable<br/>(crypto-shredding)"]
+```
+
+## 9. Interview questions 🔴
 
 > [!question]- Design a multi-tenant SaaS. How do you keep tenants isolated?
 > Put the tenant id in the authenticated token and carry it in context to every layer.
@@ -471,7 +535,7 @@ Per-tenant encryption keys (one key per tenant in a KMS) allow "crypto-shredding
 > [!question]- How do you handle a customer who demands data residency in the EU?
 > Place that tenant in a cell located in an EU region, keep its data, backups and logs there, and make the router send it only to that cell. Avoid cross-region dependencies for personal data. See [[Multi-Region Architecture]].
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Tenant = customer. Models: silo (stack each), pool (shared), bridge (mix, most common).
 - Tenant id comes from the token, travels in context, leads every key. Add RLS so the database enforces it.
@@ -481,7 +545,7 @@ Per-tenant encryption keys (one key per tenant in a KMS) allow "crypto-shredding
 - Shuffle sharding: each tenant gets a random worker subset. 8 workers, 2 each: 28 combos. Needs client retry.
 - Cost: extra capacity, router and directory, hard cross-tenant queries. Do not over-build for 30 tenants.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Partitioning and Sharding]], [[Rate Limiting - Algorithms and Distributed Design]], [[Bulkheads and Concurrency Limits]]
 - **Next:** [[Multi-Region Architecture]], [[Load Shedding and Graceful Degradation]]

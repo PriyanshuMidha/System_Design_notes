@@ -22,7 +22,38 @@ updated: 2026-11-13
 > - Fargate vs EC2 launch type is the same compute-choice trade-off as the rest of 13: who patches the host.
 > - Rolling deployments and the deployment circuit breaker are what make `ecs update-service` safe to run without a human watching it.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You have a container image. Now you need a place to keep it and a place to run it.
+**ECR** is AWS's image store. **ECS** is AWS's container runner.
+In ECS, a **task definition** is the recipe (which image, how much CPU and memory). A task is one running copy. A service keeps N tasks alive.
+
+```mermaid
+flowchart LR
+    B["Build image"] --> R["Push to ECR"] --> S["ECS service: keep 3 tasks"] --> T["Tasks running"]
+```
+
+**Fargate** means you don't even see the servers. You just say how big each task is.
+When you deploy, ECS starts new tasks, waits until they are healthy, then stops old ones.
+
+```mermaid
+flowchart LR
+    N["Start new task"] --> H{"Healthy?"} -- "yes" --> O["Drain + stop an old task"]
+    H -- "no" --> X["Stop deploy"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do ECR, task definitions, tasks and services fit together?
+2. How does ECS pull images and roll out a new version?
+3. What must your Go app do so deploys don't drop requests?
+
 
 **The problem in one story.**
 You packed your Go API into a Docker image on your laptop, and it works.
@@ -69,7 +100,7 @@ Where it breaks: a chef can taste a dish, but ECS only knows a task is "good" th
 > [!tip] Remember
 > ECR stores the image, the task definition describes it, a task runs it, and the service keeps N healthy copies alive.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A container image sitting on your laptop does nothing for users. You need somewhere durable and access-controlled to store it (ECR).
 
@@ -79,7 +110,7 @@ Doing this by hand — SSH to a box, `docker run`, watch it, restart it when it 
 
 ECS solves the "keep N copies running" problem with a **service**, which continuously reconciles the actual running task count against the desired count — the same control-loop idea Kubernetes uses, applied through AWS's own, simpler API.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Four nested ideas, in the order AWS introduces them:
 
@@ -88,7 +119,9 @@ Four nested ideas, in the order AWS introduces them:
 - A **task** is one running copy of a task definition — and, importantly, a task can hold **several containers** (an app container plus sidecars for logging or a service-mesh proxy), all scheduled together on the same host or Fargate slot.
 - A **service** wraps a task definition with a desired count and keeps that many tasks running, replacing any that stop, and (if attached to a load balancer) only registering tasks that pass their health check.
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words:** four boxes inside each other: cluster holds services, services keep tasks running, tasks are built from task definitions.
 
 ```mermaid
 flowchart TB
@@ -121,6 +154,8 @@ That is what lets the ALB target group use **ip** target type (routing straight 
 
 ### Pulling the image
 
+**In plain words:** log in to ECR first, then pull. People often forget that the login token only lasts 12 hours.
+
 Logging in to ECR is a two-step process; the common mistake is running only the first step:
 
 ```bash
@@ -139,6 +174,8 @@ docker push 123456789012.dkr.ecr.ap-south-1.amazonaws.com/my-api:$(git rev-parse
 Running `get-login-password` alone prints a token to your terminal; it does not log Docker in. Forgetting the pipe into `docker login` is the single most common reason a first-time ECR push fails with "no basic auth credentials."
 
 ### Rolling deployment
+
+**In plain words:** ECS swaps tasks a few at a time and only removes old ones when new ones pass health checks.
 
 ```mermaid
 sequenceDiagram
@@ -168,7 +205,7 @@ sequenceDiagram
 
 The **deployment circuit breaker** watches for new tasks repeatedly failing to reach a healthy state and automatically rolls the service back to the last working task definition instead of looping forever.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -182,6 +219,8 @@ func (a *App) Shutdown(ctx context.Context) error {
 ```
 
 ### Full version
+
+**In plain words:** a small Go server with two health URLs: "am I alive" and "am I ready for traffic", plus clean shutdown.
 
 A minimal ECS-ready Go HTTP service with a liveness probe (`/healthz`, always 200 while the process is alive), a readiness probe (`/readyz`, the one the ALB target-group health check polls), and a graceful `Shutdown` that flips readiness off before draining.
 
@@ -286,6 +325,8 @@ func TestShutdownDrainsInFlightRequest(t *testing.T) {
 
 ### ECS concepts (corrected)
 
+**In plain words:** a quick glossary of the ECS words, in one table.
+
 | Concept | Meaning |
 | --- | --- |
 | Cluster | Logical grouping of tasks/services; with Fargate it holds no actual EC2 capacity of its own |
@@ -307,7 +348,7 @@ The old table's "Task | running container instance" line was wrong: a task is a 
 - Log configuration (`awslogs` driver to CloudWatch Logs, or FireLens for custom routing)
 - Health check command (container-level) and, separately, the ALB target-group health check path
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost / operational trade-off |
 | --- | --- | --- | --- |
@@ -320,14 +361,14 @@ The old table's "Task | running container instance" line was wrong: a task is a 
 > [!warning] Interview trap
 > "A task is a running container" is the wrong mental model. A task is a running copy of a **task definition**, which can describe multiple containers (for example an app container plus an OpenTelemetry collector sidecar) that are scheduled and scaled together as one unit.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Fargate removes host patching but costs more per unit of CPU/memory than the EC2 launch type at scale — re-evaluate once a service is large and stable.
 - `awsvpc` networking gives each task its own ENI, which is safer (per-task security groups) but consumes one VPC IP address per task; very large clusters can exhaust a subnet's IP space faster than expected — size subnets generously or use ENI trunking.
 - The deployment circuit breaker protects against a broken new revision looping forever, but it only catches failures visible to the ECS health check; a revision that deploys healthy but silently returns wrong data needs its own smoke tests in the pipeline (see [[CI-CD Pipelines (GitHub Actions for Go)]]).
 - For a single, small, rarely-changing service with no need for per-task networking or fine-grained IAM, a single EC2 instance running `docker compose` is simpler and cheaper — ECS earns its complexity once you need zero-downtime deploys, multiple replicas, or auto scaling.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** ECS/Fargate behind an ALB is one of the most common ways to run a containerized Go API on AWS without adopting Kubernetes; EKS (see [[Kubernetes Fundamentals]]) is the alternative once a team already runs Kubernetes elsewhere.
 - **Failure modes → fixes:**
@@ -338,14 +379,14 @@ The old table's "Task | running container instance" line was wrong: a task is a 
   - Secrets Manager/SSM throttling during a large scale-out → ECS caches secret values per task start, but a burst of many simultaneous task starts can still hit API rate limits; stagger large scale-outs.
 - **What to monitor:** service desired vs. running task count (a persistent gap means something is failing to start), target-group healthy host count, task stop reason codes (CloudWatch `ECS Task State Change` events), deployment circuit-breaker trip events, and ECR image scan findings.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Capacity providers** decouple a service from a single launch type: a capacity provider strategy can mix Fargate and Fargate Spot (steeply discounted, interruptible capacity) in a ratio, so steady-state traffic runs on standard Fargate and burst capacity runs on cheaper Spot.
 - **Service auto scaling** attaches a target-tracking policy to the service's desired count — most commonly on average CPU utilization or on `ALBRequestCountPerTarget`, which scales based on load the ALB actually measures per task rather than a proxy metric like CPU (closer to real saturation for I/O-bound Go services); see [[Autoscaling]] for the general target-tracking mechanics.
 - **ECR image immutability**: marking a repository's tags immutable prevents `my-api:v1.2.0` from silently being overwritten later, which otherwise breaks the guarantee that a given task definition always pulls the same bytes — combine with lifecycle policies that expire untagged or old images to control storage cost.
 - **ECS vs EKS vs Lambda, revisited**: ECS is the simplest path to "run this container reliably" on AWS; it lacks Kubernetes's broader ecosystem (CRDs, operators, service mesh integrations) but also lacks its operational surface. See [[AWS 04 - Compute Choices - EC2, ECS-Fargate, EKS, Lambda]] for the full comparison.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the difference between a task definition, a task, and a service?
 > A task definition is a versioned blueprint (image, resources, roles, env). A task is one running copy of that blueprint, which can contain several containers scheduled together. A service keeps a target number of tasks running, replacing failures and driving rolling deployments.
@@ -365,7 +406,7 @@ The old table's "Task | running container instance" line was wrong: a task is a 
 > [!question]- Why does a Go service need both a liveness and a readiness endpoint, not just one `/health`?
 > Liveness answers "is the process alive" (restart it if not); readiness answers "can it currently serve traffic" (stop routing to it, but don't necessarily restart it). During graceful shutdown the process is still alive but should stop receiving new traffic, which only a separate readiness flip expresses correctly.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - ECR stores images; ECS runs them.
 - Task definition = blueprint; task = running copy (can hold several containers); service = keeps N tasks alive.

@@ -24,7 +24,17 @@ updated: 2026-11-13
 > - Visitor = a type switch in Go; Interpreter = parse to a tree of nodes, each with `Eval`; Mediator = colleagues talk only to a hub.
 > - Classic mistake: reaching for the full pattern when a function value or a `switch` does the job.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Some of the 23 classic patterns rarely come up in Go interviews, but you should know their names and shapes. This note covers six of them, each in plain Go: Bridge, Prototype, Flyweight, Visitor, Interpreter and Mediator. For each, it shows when it helps and the simpler Go idiom you would usually use instead. Read the plain-words line above each code block first.
+
 
 **The problem in one story.**
 A 1994 book (the "Gang of Four", GoF) named 23 design patterns, written for C++ and Smalltalk.
@@ -65,13 +75,13 @@ Where it breaks: unlike the crank, some of these patterns (Interpreter, Mediator
 > [!tip] Remember
 > In Go, try a function or a switch first; reach for the full GoF shape only when it clearly pays.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Interviewers still ask "implement Visitor in Go" or "what is Flyweight?". Writing the 1994 C++ shape in Go gives code that reviewers would reject, and declaring the pattern useless misses the case where it is the best tool. The useful answer has two halves: what Go does instead, and when the full pattern still wins.
 
 Section 5 puts the six coded patterns (plus Memento, as a table row only) side by side: the problem, the Go answer, a standard-library example, and when the full pattern still pays.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 - **Bridge:** a TV remote and the TV. Remote models and TV brands vary independently; the infrared protocol between them is the bridge.
 - **Prototype:** a photocopier. Fill in one form, then copy it instead of filling in each copy.
@@ -80,9 +90,13 @@ Section 5 puts the six coded patterns (plus Memento, as a table row only) side b
 - **Interpreter:** a calculator that reads `2 + 3 × 4`, builds a tree that respects precedence, and evaluates it.
 - **Mediator:** an air-traffic controller. Pilots talk to the tower, never to each other; the tower decides who lands.
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words: six less common patterns, each in its smallest Go form.**
 
 ### Bridge: two hierarchies joined by a field
+
+**In plain words: split "what it is" from "how it is done" and join them with one field.**
 
 **Intent:** split an abstraction (what a report contains) from its implementation (how it is written out) so that each side varies on its own. With 5 report kinds and 4 formats, combined types need 5 × 4 = 20 types; a bridge needs 5 + 4 = 9.
 
@@ -180,6 +194,8 @@ func (r StockReport) Render() string {
 
 ### Prototype: copy, then fix the shared parts
 
+**In plain words: make a new object by copying an old one, then deep-copy any shared slices or maps.**
+
 **Intent:** make new objects by copying a configured one. In Go, `c := *t` already copies every value field. A `Clone` method exists only for fields that a copy would share: slices, maps, pointers and channels.
 
 ```mermaid
@@ -228,6 +244,8 @@ func (t *InvoiceTemplate) Clone() *InvoiceTemplate {
 
 ### Flyweight: share the immutable part
 
+**In plain words: share the parts that never change across many objects to save memory.**
+
 **Intent:** keep the intrinsic state (the same for many objects, never changing) in one shared copy, and keep the extrinsic state (different per object) in each object. Since Go 1.23, `unique.Make` interns any comparable value and returns a `unique.Handle`; equal values give equal handles, and comparing handles is a pointer comparison.
 
 ```mermaid
@@ -272,6 +290,8 @@ func NewItem(sku, name, brand string, qty int) CartItem {
 - **Worth it when:** millions of objects repeat a few distinct values, such as service names on log records. For a few thousand objects, plain strings are fine.
 
 ### Visitor: a type switch first
+
+**In plain words: in Go, a type switch usually does the visitor's job in fewer lines.**
 
 **Intent:** add operations over a fixed set of types without changing them. The classic form uses double dispatch: `item.Accept(v)` calls back `v.VisitFood(item)`.
 
@@ -366,6 +386,8 @@ func CountFuncs(src string) (int, error) {
 - **Worth it when:** many operations run over a stable set of types (compilers, linters, AST tools) and each operation must handle every type.
 
 ### Interpreter: parser, AST, Eval
+
+**In plain words: turn text into a tree of nodes, then each node knows how to compute itself.**
 
 **Intent:** represent a small language as types and evaluate its sentences. The expression types are the easy half; the **parser** that turns text into a tree with the right precedence is the hard half. Here the language is the [[File Search (Unix find)]] filter: `ext=.go AND NOT size>1MB`.
 
@@ -515,6 +537,8 @@ func (p *queryParser) atom() (Expr, error) {
 
 ### Mediator: colleagues talk only to the hub
 
+**In plain words: parts never call each other; they tell the hub, and the hub decides.**
+
 **Intent:** objects (colleagues) hold a reference to a mediator and notify it; the mediator owns the rules for who hears what. No colleague references another.
 
 ```mermaid
@@ -636,7 +660,9 @@ func main() {
 }
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
+
+**In plain words: small runnable examples for each pattern, with tests.**
 
 The six files above form one package with this `main` and one test file. `main` runs the File Search query; the tests cover all six patterns.
 
@@ -795,7 +821,7 @@ notes.md false
 
 The query trace: `or` calls `and`, which calls `not`, which reads the atom `ext=.go`; `and` accepts `AND`, and `not` accepts `NOT` and reads `size>1MB` as `SizeGT(1048576)`. The tree is `And{ExtIs(".go"), Not{SizeGT(1048576)}}`, printed above. `main.go` (4 KB) matches, `vendor.go` (3 MB) fails the `NOT`, and `notes.md` fails the extension.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Pattern | Problem it solves | Go's usual answer | Standard-library example | The full pattern still pays when |
 | --- | --- | --- | --- | --- |
@@ -809,7 +835,7 @@ The query trace: `or` calls `and`, which calls `not`, which reads the atom `ext=
 
 The costs: Bridge adds two hierarchies to name; Prototype's `Clone` must be updated for every new reference field; Flyweight data must stay immutable; Visitor needs `Accept` on every type and a change to every visitor per new type; Interpreter needs a parser, error messages and limits; Mediator is a central object that can grow into a god object.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 Why each is rare in Go backends:
 
@@ -820,7 +846,7 @@ Why each is rare in Go backends:
 - **Interpreter:** most rules change with a deploy, not at run time. When they must change at run time, an embedded expression language beats a homemade one.
 - **Mediator:** request-scoped services call each other directly; the many-to-many chatter that Mediator tames is mostly a UI problem.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** `slog` handlers and `database/sql` drivers (Bridge); `http.Request.Clone` in middleware that changes a request without touching the caller's copy (Prototype); `go vet` analyzers and code generators walking `go/ast` (Visitor); CEL in Kubernetes validation rules (CRD `x-kubernetes-validations` and ValidatingAdmissionPolicy) and `text/template` in Helm charts (Interpreter).
 - **Failure modes → fixes:**
@@ -832,7 +858,7 @@ Why each is rare in Go backends:
 	- A mediator becomes the place for every rule → split it per screen, room or workflow.
 - **What to monitor:** for an interpreter, the parse error rate and the evaluation time per query; for interning, heap size before and after, with `pprof`.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **The expression problem.** Visitor makes adding an operation easy (one new visitor) and adding a type hard (every visitor changes). Methods on an interface do the reverse. Choose by which side grows; a type switch sits with Visitor, minus the compile-time check.
 - **How `unique` avoids leaks.** Interned values are held weakly: once no `Handle` refers to a value, the runtime can drop it from the intern table. A handwritten `map[string]*ProductData` cache keeps every entry forever unless you evict.
@@ -840,7 +866,7 @@ Why each is rare in Go backends:
 - **Parser design.** One function per precedence level (`or`, `and`, `not`, `atom`) is recursive descent; precedence comes from which function calls which. `ext=.md OR ext=.go AND size>1KB` parses as `Or{.md, And{.go, size}}` (tested). Add a tokenizer when values can contain spaces.
 - **Deep copies through reflection or JSON** copy only what they can see: JSON drops unexported fields and turns pointers into new values. Prefer an explicit `Clone` per type, with a test.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How would you implement Visitor in Go? (trap)
 > Usually with a type switch over a closed set of types, which is shorter and keeps the operation in one place. Use the double-dispatch form (`Accept` plus a `Visitor` interface) when there are many operations and each must handle every type, because then a missing method is a compile error. `go/ast` offers both: `ast.Walk` with a `Visitor`, `ast.Inspect` with a callback.
@@ -860,7 +886,7 @@ Why each is rare in Go backends:
 > [!question]- When would you write an interpreter instead of hard-coding rules?
 > When people outside the deploy cycle write the rules: search filters, coupon conditions, alert expressions. Keep the language tiny, write a real parser with precedence and limits, and prefer embedding CEL or expr-lang once you need more than a handful of operators.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - These patterns are rare in Go because functions, type switches, value copies and implicit interfaces cover most of their cases.
 - Bridge = two axes joined by an interface field: `slog.Logger` → `slog.Handler`.
@@ -870,7 +896,7 @@ Why each is rare in Go backends:
 - Interpreter = parser + AST + `Eval`; embed CEL or expr-lang for real rule engines.
 - Mediator = colleagues talk only to the hub, which owns the rules; watch for god objects.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Design Patterns Overview and Chooser]], [[Strategy and Template Method]], [[Interfaces]]
 - **Next:** [[Concurrency for LLD]], [[Testing LLD Code]]

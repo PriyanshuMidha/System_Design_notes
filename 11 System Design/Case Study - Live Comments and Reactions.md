@@ -31,7 +31,34 @@ updated: 2026-11-13
 > - Reactions are not messages, they are **counters**. Aggregate per second, send totals, animate on the client.
 > - Delivery is **best effort** for the live view (loss is fine). Durability is only needed for the stored copy used for replay.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (11). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example) and 8 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 5 (deep dives), 6, 7, 9 and 10. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+During a live match, a million people watch and post comments at the same time.
+Each viewer's app keeps an always-open line to a server, so new comments can be pushed to it instantly.
+The servers that hold these open lines are called **gateways**. Each one holds tens of thousands of viewers.
+A new comment is published once to a channel for that stream. Every gateway listening on that channel passes it to its own viewers. This copying out is **fan-out**.
+
+```mermaid
+flowchart LR
+    C["New comment"] --> CH["Stream channel"]
+    CH --> G1["Gateway 1"] --> V1["50k viewers"]
+    CH --> G2["Gateway 2"] --> V2["50k viewers"]
+```
+
+When comments pour in faster than anyone can read, the system shows only a sample.
+Hearts are not sent one by one. They are counted, and the screen shows a total every second or so.
+
+So the rest of this note is just these 3 questions:
+1. How does one comment reach a million screens fast?
+2. What do you do when there are far too many comments to show?
+3. How do you keep huge streams and reconnect storms from breaking things?
 
 **The problem in one story.**
 A cricket match is streaming live to a million people.
@@ -76,7 +103,7 @@ Where it breaks: the announcer is one person, while the system has many gateways
 > [!tip] Remember
 > Publish each comment once per stream, let gateways fan it out locally, and sample, batch and count so no one is flooded.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 Imagine a cricket final with 5 million people watching a live stream. People type "WHAT A SHOT!" and tap heart buttons. The comment section feels alive only if new comments appear within a second or two.
 
@@ -110,7 +137,7 @@ A **hot stream** is a stream with so many viewers or events that it overwhelms o
 > [!tip] Remember
 > One comment is tiny. The problem is the number of recipients, and the fix is to fan out as late as possible, near the viewer.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a **radio network**. A studio (the comment service) produces one programme. It sends it once to many relay towers (gateways). Each tower broadcasts to the radios in its area (viewer connections). The studio does not know about individual radios. The towers do not need to know about each other. Adding listeners means adding towers.
 
@@ -133,9 +160,19 @@ flowchart LR
 > [!tip] Remember
 > Publish once to the channel, let each gateway fan out to its own connections.
 
-## 3. How it works - high-level design
+```mermaid
+flowchart LR
+    S["Studio<br/>(comment service)"] --> T1["Relay tower 1<br/>(gateway)"]
+    S --> T2["Relay tower 2<br/>(gateway)"]
+    T1 --> R1["Radios nearby"]
+    T2 --> R2["Radios nearby"]
+```
+
+## 3. How it works - high-level design 🟡
 
 ### Step by step: one comment
+
+**In plain words:** follow one comment from the phone that posts it, through the channel, out to every gateway and screen.
 
 1. **Post.** The viewer sends `POST /streams/{id}/comments` (or sends a WebSocket frame). The request carries a client-generated id for deduplication.
 2. **Gate.** The API authenticates the user, checks stream rules (comments on, slow mode, followers-only) and applies a per-user rate limit.
@@ -192,7 +229,7 @@ A gateway subscribes to a stream's channel **only while it has at least one loca
 > [!tip] Remember
 > The origin publishes one message per stream. The number of deliveries equals the number of gateways, not the number of viewers.
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -207,6 +244,8 @@ Numbers: 1M viewers, 50k comments/s in, ~10M deliveries/s out after sampling, ~1
 ```
 
 ### Estimates
+
+**In plain words:** rough sums: viewers, open connections per gateway, and how many messages per second go out.
 
 All numbers are estimates and assumptions.
 
@@ -227,6 +266,8 @@ All numbers are estimates and assumptions.
 Two key messages. First: **fan-out multiplication is the cost**, so reduce recipients per message and messages per recipient. Second: **storage is tiny**, so do not spend the interview on the database.
 
 ### API
+
+**In plain words:** post a comment, send a reaction, and an open line that streams new comments down.
 
 ```http
 POST /v1/streams/{stream_id}/comments
@@ -253,6 +294,8 @@ POST /v1/streams/{stream_id}/reactions    # or a WS frame
 LinkedIn's engineering write-up on real-time likes on live video used SSE-style long-lived connections for the same reason. See [[Choosing an API and Communication Style - Decision Guide]].
 
 ### Data model
+
+**In plain words:** comments are saved for replay later, but the live path does not wait for the database.
 
 ```mermaid
 erDiagram
@@ -287,7 +330,7 @@ erDiagram
 > [!tip] Remember
 > Live path in memory and pub/sub; durable path in a log and a time-bucketed store. Never put the live path through the database.
 
-## 5. Deep dives
+## 5. Deep dives 🔴
 
 ### 5.1 Fan-out: push, pull or hybrid
 
@@ -465,7 +508,7 @@ flowchart LR
 > [!tip] Remember
 > Fast cheap checks before publish, smart slow checks after, with a retract event to fix mistakes.
 
-## 6. Bottlenecks and scaling
+## 6. Bottlenecks and scaling 🔴
 
 ```mermaid
 flowchart TD
@@ -489,7 +532,7 @@ flowchart TD
 - **Cross-region:** put gateways near viewers (regional fleets), and replicate the stream channel across regions through a backbone relay. A comment from Mumbai should reach Delhi viewers without going through the US. Regional fan-out keeps latency low. See [[Multi-Region Architecture]].
 - **Rate limits** at three levels: per user (slow mode), per IP or device (bots), per stream (global cap before publish). See [[Rate Limiting - Algorithms and Distributed Design]].
 
-## 7. Failure handling
+## 7. Failure handling 🔴
 
 | Failure | Effect | Handling |
 | --- | --- | --- |
@@ -503,7 +546,14 @@ flowchart TD
 
 **Delivery guarantee:** the live path is **at most once, best effort**. The durable log is **at least once with idempotent writes** (key `comment_id`). Say this out loud, it is a deliberate design choice.
 
-## 8. Trade-offs
+```mermaid
+flowchart LR
+    G["Gateway dies"] --> R["50k clients reconnect"]
+    R --> B["Each waits a random,<br/>growing delay"]
+    B --> S["Spread over other gateways,<br/>catch up from last comment ID"]
+```
+
+## 8. Trade-offs 🟡
 
 | Decision | Option A | Option B | Pick and why |
 | --- | --- | --- | --- |
@@ -517,7 +567,7 @@ flowchart TD
 | Overload | Reject comments | Degrade (sample, slow mode) | **Degrade gracefully.** |
 | Extreme streams | Push only | CDN-cached polling fallback | **Offer both** for the largest broadcasts. |
 
-## 9. In production
+## 9. In production 🔴
 
 - **Real examples:** LinkedIn engineers described real-time likes and comments on live video using long-lived connections and a subscription layer, with the aim of delivering to many concurrent viewers per video (see sources).
   - Twitch chat is built on IRC and uses slow mode, follower-only mode and rate limits to keep rooms readable, which show the same sampling-and-throttling ideas.
@@ -527,7 +577,7 @@ flowchart TD
 - **Deploys:** drain gateways gradually (stop accepting new, close with "go away" and a jittered reconnect delay). Never restart a whole fleet at once during an event. Freeze deploys during major events.
 - **Load testing:** simulate a million idle connections plus a spike of 50,000 posts per second before any big event. Test the failure of a gateway at peak.
 
-## 10. Interview questions
+## 10. Interview questions 🔴
 
 > [!question]- A comment is posted on a stream with 1 million viewers. How does it reach them?
 > The API validates, moderates and appends it to a durable log, then publishes once to the stream's channel. Gateways subscribed to that channel receive it once each and write it to their local connections, batched and sampled. Origin work is proportional to the number of gateways, not viewers.
@@ -556,7 +606,7 @@ flowchart TD
 > [!question]- Follow-up: traffic grows 10 times. What changes?
 > Add gateways horizontally, shard the hot channel more, add a relay tree and regional fleets, lower the sampling budget, and consider a CDN-cached polling mode for the largest stream. The durable path barely changes because comment storage volume is small.
 
-## 11. Cheat sheet
+## 11. Cheat sheet 🟢
 
 - Gateways hold SSE/WebSocket connections; subscribe to stream channels only while they have viewers.
 - Publish once per comment; each gateway fans out locally. Origin cost = number of gateways.

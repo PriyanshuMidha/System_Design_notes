@@ -27,7 +27,41 @@ updated: 2026-11-13
 > - Configure `maxmemory` and `maxmemory-policy` on day one; the default `noeviction` makes writes fail when memory is full.
 > - Decide per feature what happens when Redis is down: a cache falls back to the database, an OTP check fails closed.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2, 3.1, 3.2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3.3 to 3.5 (redis-cli, memory and security settings), section 4 (the OTP service in Go), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This note is the "set it up properly" guide for Redis with Go.
+You run Redis (on your laptop with Docker, or as a managed service), and your Go app talks to it through a **client** library, go-redis.
+Getting it working takes five minutes; most trouble comes from three settings people skip.
+One: **timeouts**, so your app gives up fast instead of hanging when Redis is slow.
+Two: a memory limit, so Redis does not grow until it crashes.
+Three: a password and a private network, so strangers cannot reach it.
+
+```mermaid
+flowchart LR
+    G["Go app<br/>(go-redis client)"] -- "private network,<br/>password, timeouts" --> R["Redis<br/>(memory limit set)"]
+```
+
+Then the note builds one real feature: a login code (OTP) that expires after a few minutes and can only be used once.
+
+```mermaid
+flowchart LR
+    S["send code: SET otp:42 EX 300"] --> V["user types code"]
+    V --> C{"matches?"}
+    C -- "yes" --> D["delete key, log in"]
+    C -- "no" --> T["count tries; too many,<br/>code is thrown away"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you start Redis and poke at it?
+2. Which settings must you set on day one?
+3. How do you build a small, safe feature on top of it in Go?
 
 **The problem in one story.**
 You want your Go app to remember things fast, like a login code sent by SMS.
@@ -71,7 +105,7 @@ Where it breaks: a full safe just refuses new items; Redis can instead throw out
 > [!tip] Remember
 > Timeouts, `maxmemory` with a policy, and no public port: set all three on day one.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A new backend engineer adds Redis to a Go service. Three things usually go wrong in the first month:
 
@@ -83,7 +117,7 @@ A new backend engineer adds Redis to a Go service. Three things usually go wrong
 
 This note sets Redis up so none of these happen, and then builds one real feature end to end.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of Redis as a **shared whiteboard in a locked room**.
 
@@ -92,9 +126,19 @@ Think of Redis as a **shared whiteboard in a locked room**.
 - The board has a fixed size (`maxmemory`). When it is full, you choose: refuse new writing (`noeviction`) or erase the least recently used notes (`allkeys-lru`, an approximate LRU).
 - Your Go client is a **team of runners** (the connection pool) carrying notes to the board. Each runner gives up after a set time (timeouts) instead of waiting forever.
 
-## 3. How it works
+**What a missing timeout does, as a picture.**
+
+```mermaid
+flowchart LR
+    R["Redis stalls 2 s<br/>(failover)"] --> N["no timeout:<br/>every request waits 2 s"]
+    R --> T["100 ms timeout:<br/>request fails fast,<br/>app falls back"]
+```
+
+## 3. How it works 🟡
 
 ### 3.1 The pieces
+
+**In plain words:** the parts in play: Redis itself, the command-line tool, your Go app, and the pool of connections between them.
 
 ```mermaid
 flowchart LR
@@ -110,6 +154,8 @@ flowchart LR
 ```
 
 ### 3.2 Start Redis locally
+
+**In plain words:** the exact commands to run Redis on your laptop, reachable only from your own machine.
 
 With Docker (commands not run for this note; the official image passes extra arguments to `redis-server`):
 
@@ -166,6 +212,8 @@ redis-cli -p 6392 shutdown nosave
 
 ### 3.3 redis-cli essentials
 
+**In plain words:** the handful of terminal commands you will use every day to look inside Redis, and the ones that can freeze it.
+
 Measured on Redis 8.2 (`redis-cli -p 6392`):
 
 ```text
@@ -210,6 +258,8 @@ A real `SCAN` call on 40 keys (measured): `SCAN 0 MATCH 'user:*' COUNT 10` retur
 
 ### 3.4 Memory config you set on day one
 
+**In plain words:** tell Redis how much memory it may use, and what to do when full: drop old keys (a cache) or refuse writes (data you must keep).
+
 | Setting | Meaning | For a cache | For durable state |
 | --- | --- | --- | --- |
 | `maxmemory` | Memory limit for data | ~70–80% of the box or container limit (an estimate that leaves room for fork copy-on-write and buffers) | same |
@@ -223,6 +273,8 @@ Measured on Redis 8.2 with `maxmemory 8mb` and 30,000 writes of 300-byte values:
 How the policies work is in [[Cache Eviction Policies - LRU, LFU, TTL]]; persistence trade-offs are in [[Redis Persistence - RDB and AOF]].
 
 ### 3.5 Security basics
+
+**In plain words:** keep Redis off the internet, set a password, and give each app its own login that can only touch its own keys.
 
 - **Protected mode** (on by default, measured `protected-mode yes`): if no password is set and Redis is bound to all interfaces, it refuses connections from non-loopback addresses.
 - **Never expose 6379** to the internet. Use a private subnet and security groups; publish to `127.0.0.1` only on a laptop.
@@ -246,9 +298,11 @@ NOPERM User app has no permissions to run the 'keys' command
 
 More (renaming commands, audit, secrets rotation) is in [[Redis in Production - Memory, Latency, Security]].
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the login-code feature as a few Redis commands: save the code with a timer, check it, count wrong tries.
 
 ```text
 Feature: login with a 6-digit code sent by SMS.
@@ -320,6 +374,8 @@ stateDiagram-v2
 
 ### The client (Go 1.24, go-redis v9)
 
+**In plain words:** make one shared Redis client per app, with clear timeouts and pool size.
+
 ```go
 // Package setup builds a production-shaped go-redis client and an OTP service.
 package setup
@@ -369,6 +425,8 @@ func Healthy(ctx context.Context, rdb *redis.Client) error {
 - The `context` you pass to each command also bounds it; cancelling the HTTP request cancels the Redis call.
 
 ### The OTP service
+
+**In plain words:** the full login-code feature in Go: random codes, a time limit, a cap on wrong tries, and only one successful use.
 
 ```go
 package setup
@@ -486,6 +544,8 @@ Why each choice:
 - Limiting how often `/otp/send` can be called per phone number and per IP belongs to a rate limiter; see [[Rate Limiting - Algorithms and Distributed Design]].
 
 ### Tests
+
+**In plain words:** tests that ran against a real Redis, including 20 people entering the right code at once, where exactly one wins.
 
 ```go
 package setup
@@ -614,7 +674,7 @@ func TestHealthy(t *testing.T) {
 
 Measured: `REDIS_URL=redis://localhost:6392/0 go test -race ./setup/` against Redis 8.2 passed all five tests, including 20 parallel correct verifications of which exactly one succeeded.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 Where to run Redis:
 
@@ -635,14 +695,14 @@ How a feature should behave when Redis is unavailable:
 | Rate limiter | Usually fail open with a local in-process limiter | Do not take the whole API down with Redis |
 | Idempotency keys | Fail closed for payments | A duplicate charge is worse than a retry later |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Short timeouts vs false errors:** a 500 ms read timeout protects your p99, but a too-short timeout (say 5 ms) turns normal jitter into errors. Set it above Redis's p99.9 and below your database query time.
 - **Large pools hide problems:** a pool of 500 per pod lets a slow Redis absorb thousands of waiting connections. A modest pool plus `PoolTimeout` fails fast instead.
 - **`MONITOR` and `--bigkeys` in production:** both have real cost; run `--bigkeys` on a replica and `MONITOR` for seconds only.
 - **When a simpler option wins:** if only one instance needs the data and losing it on restart is fine, an in-process cache needs no setup at all. For OTPs at small scale, a database row with an expiry column also works; Redis wins when you need TTL cleanup and atomic counters at high request rates.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** managed Redis/Valkey in a private subnet, one ACL user per service, TLS in transit, `REDIS_URL` from a secret manager.
 - **Failure modes and fixes:**
@@ -652,7 +712,7 @@ How a feature should behave when Redis is unavailable:
 	- Accidental `FLUSHALL` from a script: ACL `-@dangerous` for application users.
 - **What to monitor:** `PoolStats()` from go-redis (hits, misses, timeouts, total and idle connections), Redis `connected_clients`, `used_memory`, `evicted_keys`, `rejected_connections`, `SLOWLOG` length, and your own error rate per Redis command.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why OTP verification must be one script.** If the API did `GET`, compared in Go, then `DEL`, two requests carrying the right code could both pass the `GET` before either `DEL` ran, and the code would be used twice. The test `TestParallelCorrectVerifySucceedsOnce` runs 20 such requests and requires exactly one success.
 - **Comparing hashes in Lua.** Lua string equality is not constant-time, but the values compared are HMAC outputs keyed with a server secret, so timing reveals nothing useful about the code.
@@ -660,7 +720,7 @@ How a feature should behave when Redis is unavailable:
 - **`SCAN` guarantees.** A full iteration returns every key that existed for the whole scan at least once; keys may appear twice, and keys added or removed during the scan may or may not appear.
 - **Database numbers.** `SELECT 3` works on a single node, but Redis Cluster supports only database 0. Use key prefixes instead of database numbers from the start.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How do you configure a Go Redis client for production?
 > One shared `*redis.Client`, URL from secrets, explicit `DialTimeout`, `ReadTimeout`/`WriteTimeout` below the database's latency, a bounded `PoolSize` with `PoolTimeout`, a `context` with deadline on every call, TLS and an ACL user. Then decide per feature whether a Redis error fails open or closed.
@@ -680,7 +740,7 @@ How a feature should behave when Redis is unavailable:
 > [!question]- How do you secure a Redis instance?
 > Private network only, never publish 6379; protected mode on; ACL users with key patterns and no dangerous commands; TLS between hosts; strong secrets from a secret manager; disable or lock down the `default` user.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Docker: named volume `/data`, `--requirepass`, publish only to `127.0.0.1`; Compose waits on a `healthcheck`.
 - Daily commands: `SET k v EX n NX`, `TTL`, `SCAN`, `INFO`, `SLOWLOG GET`, `MEMORY USAGE`, `UNLINK`.
@@ -690,7 +750,7 @@ How a feature should behave when Redis is unavailable:
 - OTP: `crypto/rand`, store an HMAC, `EX 300 NX`, attempt counter in the same script, delete on success, never return the code.
 - Redis down: caches fail open, auth checks fail closed.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Redis Fundamentals]]
 - **Next:** [[Redis Data Structures and When to Use Each]], [[Redis Use Cases]], [[Redis in Go]]

@@ -34,7 +34,35 @@ flowchart LR
 
 The handler calls the core; the core calls two ports it declared itself. Swap `sandboxpay.Client` for a Razorpay client, or `memory.InvoiceRepo` for a Postgres one, and `core.Service` does not change one line, because it never imported either concrete type.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Put your business logic in the middle of a box.
+Everything outside, like the web, the database or a payment company, plugs in from the sides.
+Each socket on the box is a **port**: an interface the core defines, like "I need to save an invoice".
+Each plug is an **adapter**: real code that fits the socket, like a Postgres saver.
+Some adapters call into the core (a web handler, a test). Some are called by the core (the database).
+Because the core only knows sockets, you can plug in a fake for tests or swap Postgres for something else.
+
+```mermaid
+flowchart LR
+    H["HTTP handler"] --> CORE["Core logic"]
+    T["Test"] --> CORE
+    CORE --> PG["Postgres adapter"]
+    CORE --> PAY["Payment adapter"]
+```
+
+The rest of this note is just these 3 questions:
+1. What are ports and adapters, really?
+2. Which side drives and which side is driven?
+3. Where does each piece go in a Go project?
+
 
 **The problem in one story.**
 Your app charges customers through one payment company.
@@ -79,7 +107,7 @@ Where it breaks: real sockets are fixed by a standards body, while in code the c
 > [!tip] Remember
 > The core declares the sockets; everything outside is a plug that imports the core, never the other way round.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps's payment webhook handler, written without ports, ends up with Razorpay's signature-verification function call, its SDK's error types, and its specific status-code mapping scattered across the handler, the service, and a few helper functions — because nothing forced "talk to Razorpay" to live in one place.
 
@@ -89,7 +117,13 @@ Hexagonal architecture's fix: declare a `PaymentProvider` port inside the core �
 
 Swapping providers becomes "write a new adapter package, change one line in the composition root," with the core untouched and every existing test against the core still valid.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    B["Business logic mixed with SQL"] --> X["Cannot test without a DB"]
+    H["Business logic behind a port"] --> Y["Test with a fake in milliseconds"]
+```
+
+## 2. Mental model 🟢
 
 Picture the application core as a hexagon (the shape is arbitrary — it just has more than two sides, so you stop thinking "top" and "bottom"). Every side has a port: a socket of a specific shape, declared by the core itself, saying exactly what it needs or offers.
 
@@ -99,7 +133,7 @@ Both plugs look the same from the hexagon's point of view — an interface call 
 
 The test suite is just another plug. Nothing about the core's ports says "and this socket is only for production adapters" — an in-memory fake implementing `InvoiceRepo` is exactly as valid a plug as a real Postgres repository, which is precisely why the core can be tested with zero infrastructure running.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ```mermaid
 flowchart TD
@@ -134,6 +168,8 @@ That is the one fact that makes this hexagonal rather than just "a service with 
 
 ### Driving vs. driven, concretely
 
+**In plain words: driving adapters call your app (web, CLI, tests); driven adapters are called by your app (DB, email).**
+
 | | Driving (primary) | Driven (secondary) |
 | --- | --- | --- |
 | Who calls whom | Adapter calls the core | Core calls the adapter (through a port) |
@@ -153,6 +189,8 @@ The core's tests never need that infrastructure; the adapter's tests are the onl
 
 ### Go: where each piece lives
 
+**In plain words: which folder holds the core, the ports and each adapter.**
+
 ```text
 hexagonal/
   core/
@@ -166,7 +204,7 @@ hexagonal/
 
 `core` has no subdirectory called `adapters` inside it, and it imports nothing under `adapters/` — that import rule is the whole architecture. This is the same "consumer owns the interface" rule [[Service Project Layout and Wiring]] uses for an ordinary Go service's packages; hexagonal architecture is that rule applied deliberately to every external dependency, not just the database.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 **The core** — domain type, both ports, and the one use case this slice implements (`Pay`). No import outside the standard library:
 
@@ -527,7 +565,7 @@ func TestPay_Concurrent(t *testing.T) {
 
 **Measured:** `go test -race ./...` across `core`, `adapters/httpapi` and `adapters/cli` in a scratch module (Go 1.24.4, darwin/arm64, 2026-11-07): all tests pass, including a concurrency test that pays two different invoices from two goroutines simultaneously, confirming `memory.InvoiceRepo`'s locking is race-free.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -538,14 +576,19 @@ func TestPay_Concurrent(t *testing.T) {
 > [!warning] Interview trap
 > The diagram "Core → OutPort → DBAdapter" drawn with a left-to-right arrow looks like the database depends on the core. That arrow is the **call** direction. The **dependency** (import) direction is the opposite: `DBAdapter` imports the core's port type to implement it; the core never imports `DBAdapter`. Confusing the two is the single most common mistake in explaining this pattern.
 
-## 6. Trade-offs and when not to use
+```mermaid
+flowchart LR
+    L["Layered<br/>top to bottom"] --- HX["Hexagonal<br/>inside vs outside"] --- CL["Clean<br/>rings, inward only"]
+```
+
+## 6. Trade-offs and when not to use 🟡
 
 - More interfaces and more files than a direct call would need — a `PaymentProvider` port plus a `sandboxpay` adapter is two types where a layered service might have had one concrete client.
 - Someone has to wire adapters to ports by hand (or with a DI tool); there is no framework magic doing it for you, by design — see [[Service Project Layout and Wiring]] for the composition-root pattern this relies on.
 - For a service with exactly one storage engine and exactly one entry point (one HTTP API, nothing else), the extra ports buy you optionality you may never use. [[Layered Architecture]] is simpler for that case and you can evolve into hexagonal later, at the exact point a second adapter kind appears.
 - A port shaped around one specific adapter's needs (`SaveToPostgres(ctx, pgxTx, row)`) isn't really a port — it's an adapter-shaped interface with extra steps. A port's method names and parameter types should read as business operations (`Save(ctx, Invoice)`), never as "whatever Postgres happens to need."
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Cockburn's original write-up; it is also the structural idea behind Spring's `@Repository`/`@Service` separation when done well, and it is the default advice in most "Go web service structure" blog posts once they reach the "how do I swap my database" question. InvoiceOps's own payment and notification adapters follow this shape (see [[Capstone - InvoiceOps]]).
 - **Failure modes → fixes:**
@@ -555,7 +598,7 @@ func TestPay_Concurrent(t *testing.T) {
   - Swapping Razorpay for Stripe touches more than the adapter package → the port leaked a Razorpay-specific concept (a particular webhook field, a particular error code) into its contract; redesign the port around the business operation, not the vendor's API shape.
 - **What to monitor:** per-adapter latency and error rate (a `sandboxpay` adapter timing out is a different alert than the core having a bug); how many concrete types a new test needs to construct (rising sharply suggests a port is in the wrong place); time to add a second adapter for an existing port (should be "write the type," not "also touch the core").
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Swap Razorpay for Stripe: what actually changes.** Nothing in `core` changes, because `core.PaymentProvider` was never shaped around Razorpay. A new `adapters/stripe` package is written, implementing `Charge(ctx, amount, currency, token) (string, error)` against Stripe's SDK, mapping Stripe's own error types onto `core.ErrDeclined` the same way `sandboxpay` does above.
 
@@ -577,7 +620,7 @@ See [[Clean Architecture]] for exactly how that differs in Go code.
 
 This is the exact same manual-DI pattern [[Service Project Layout and Wiring]] covers for Go services generally — hexagonal architecture doesn't add a new wiring mechanism, it just makes the wiring step unavoidable, because the core genuinely cannot construct its own dependencies without knowing their concrete types.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is Cockburn's actual intent behind hexagonal architecture?
 > Not just "isolate the database" — the application must be equally drivable by its real UI, by an automated test suite, and by a batch script or CLI, with no code path privileged over another. Symmetry between driving adapters is as much the point as isolating driven ones.
@@ -600,7 +643,7 @@ This is the exact same manual-DI pattern [[Service Project Layout and Wiring]] c
 > [!question]- When would you prefer layered architecture over hexagonal?
 > When the service has exactly one kind of backing store and exactly one kind of entry point, and you don't anticipate adding a second of either soon. The extra ports and composition-root wiring hexagonal needs buy you an optionality that, in that case, you're unlikely to spend.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Port = interface the core declares. Adapter = concrete type that satisfies it. The core imports zero adapters.
 - Driving adapters call the core (HTTP, CLI, gRPC, consumers). Driven adapters are called by the core through a port (DB, payment provider, email).
@@ -611,7 +654,7 @@ This is the exact same manual-DI pattern [[Service Project Layout and Wiring]] c
 - The composition root (`main.go`) is the only place allowed to know every concrete adapter type.
 - Evolve from layered to hexagonal the moment a second kind of external dependency needs isolating.
 
-## Links
+## Links 🟢
 - **Before this:** [[Layered Architecture]]
 - **Next:** [[Clean Architecture]]
 - **Compare with:** [[SOLID in Go]] (dependency inversion at the class/interface level; hexagonal is the same idea at the service's architectural boundary), [[Capstone - InvoiceOps]] (the running example this note's ports mirror), [[API Gateway and BFF]] (a different kind of driving-adapter concern: shaping the entry point itself, not isolating the core)

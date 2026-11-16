@@ -24,7 +24,42 @@ updated: 2026-11-13
 > - Hallucination (confident, wrong output) is a structural property of next-token prediction, not a bug you can fully prompt away. You reduce it; you do not eliminate it.
 > - Everything you build in `18 AI Engineering` — prompting, tool calling, RAG, agents — is scaffolding around this one primitive: a stateless function from (messages) to (more text).
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+An LLM (large language model) is a very big autocomplete. It reads your text and guesses the next small piece, again and again.
+
+Each small piece is a **token**, roughly 3/4 of an English word. You pay per token, both for what you send and for what comes back.
+
+```mermaid
+flowchart LR
+    A["'The sky is'"] --> M["Model"] --> B["'blue'"]
+    B -. "add it, guess again" .-> M
+```
+
+The model has a size limit on how much text it can read at once. That limit is the **context window**.
+
+The model also has no memory. Every call, your app must send the whole chat again.
+
+```mermaid
+flowchart LR
+    S["Your app stores<br/>the chat history"] -- "send all of it<br/>every call" --> M["Model (forgets<br/>after each call)"]
+    M -- "next reply" --> S
+```
+
+It sounds smart, but it only predicts likely text. So it can state wrong things with full confidence.
+
+The rest of this note is just these 3 questions:
+1. How is a model trained, and how does it pick each next word?
+2. What are tokens, the context window and statelessness, and why do they cost you money?
+3. When should a backend use an LLM at all, and what goes wrong in production?
+
 
 **The problem in one story.**
 You type a question into a chatbot and a fluent answer appears word by word.
@@ -71,7 +106,7 @@ Where it breaks: autocomplete only suggests and you choose, while the LLM picks 
 > [!tip] Remember
 > An LLM is a stateless next-token guesser: you resend the context every call, you pay per token, and you never fully trust its output.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A classic autocomplete suggests the next word from a small, fixed set of patterns. An LLM does the same job — predict the next piece of text — but trained on a huge amount of text with a huge model, so the "patterns" it has learned include grammar, facts, code, reasoning chains, and conversational structure.
 
@@ -79,7 +114,7 @@ Concretely: you send an API request with a `model` name, a `max_tokens` budget, 
 
 A backend that ignores this — for example, resending a growing chat transcript every turn without ever trimming it — pays for the whole history on every single call and gets slower as the conversation grows, because the model must process every input token before it emits the first output token.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture the model as a function:
 
@@ -95,9 +130,11 @@ The analogy that holds up under interview questions: an LLM is a very well-read,
 
 It has no memory between tasks — every time you hand it a new task, you must re-hand it everything it needs to know.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Training, in three stages
+
+**In plain words:** First it reads the internet to learn language, then it learns to follow instructions, then people teach it which answers are better.
 
 ```mermaid
 flowchart LR
@@ -112,6 +149,8 @@ None of these stages give the model a live connection to your data or today's da
 
 ### Tokenisation
 
+**In plain words:** The model chops text into small pieces before reading. Pieces, not letters or words, are what you pay for.
+
 The model does not see characters or whole words; it sees **tokens**, the units produced by its tokeniser (a byte-pair-encoding, BPE, variant in most current frontier models). A rough estimate for English text is **about 4 characters per token** — `"hello world"` is 2 tokens, but `"supercalifragilisticexpialidocious"` might be 8–10.
 
 Other scripts (Hindi, Chinese, Japanese, Arabic) and code tend to tokenise less efficiently, often 2–3x more tokens for the same apparent amount of content; this is an **estimate**, not a documented constant, and it varies by tokeniser and language.
@@ -120,7 +159,16 @@ For an exact count, call the documented count-tokens endpoint or read the `usage
 
 Every number you reason about — cost, latency, context budget — is a token count, not a character or word count. This is the single idea that explains why chat history trimming, document chunking (see [[Document Ingestion and Chunking]]) and prompt caching (see [[LLM Cost, Latency and Caching]]) all exist.
 
+```mermaid
+flowchart LR
+    T["'unbelievable'"] --> A["'un'"]
+    T --> B["'believ'"]
+    T --> C["'able'"]
+```
+
 ### Context window and "lost in the middle"
+
+**In plain words:** The window is the model's desk: only so much paper fits. And it reads the top and bottom of the pile better than the middle.
 
 The **context window** is the maximum number of tokens the model can attend to in one call. A common mistake is to think of it as an input-only budget: it is actually **input tokens + output tokens combined**, as of 2026 for essentially all frontier providers — so a large `max_tokens` setting shrinks how much input history actually fits.
 
@@ -130,7 +178,15 @@ A separate, well-documented effect is that a long context window does not mean u
 
 Put your most important instructions and facts at the start or end of the prompt, not deep in the middle of a long document dump.
 
+```mermaid
+flowchart LR
+    W["Context window = input + output"] --> I["Your prompt + history"]
+    W --> O["Room left for the reply"]
+```
+
 ### Sampling: logits, temperature, top-p
+
+**In plain words:** The model scores every possible next word, then picks one. Temperature is the "how adventurous" knob.
 
 ```mermaid
 flowchart LR
@@ -149,6 +205,8 @@ The model does not output one deterministic "best" token; it outputs a probabili
 Even at temperature 0 (always pick the top token), floating-point non-associativity in how GPUs batch requests, provider-side load balancing across replicas, and backend non-determinism can produce different output across two calls with an identical prompt. Reasoning models in particular may ignore or fix some sampling parameters entirely and expose a separate "reasoning effort" control instead (verify per provider and model). If your backend logic depends on getting the literal same string back for the same input, do not rely on sampling settings alone — cache the first response and reuse it, or use structured outputs with strict validation (see [[Structured Outputs and Tool Calling]]).
 
 ### Statelessness and multi-turn conversation
+
+**In plain words:** Like talking to someone with no memory: you repeat the whole chat each time you speak.
 
 ```mermaid
 sequenceDiagram
@@ -174,15 +232,19 @@ This is also why every added turn costs more: you are re-billed for the entire v
 
 ### Reasoning models and multimodal input
 
+**In plain words:** Some models "think out loud" before answering (better but slower and pricier). Many can also read images and PDFs.
+
 As of 2026, a separate family of **reasoning models** (sometimes exposed as a "thinking" or "extended reasoning" mode on general-purpose models) spend extra generated tokens working through a problem step by step before producing a final answer, controlled by an "effort" or "thinking budget" setting rather than by prompting techniques like "think step by step" (which mattered more for earlier non-reasoning models; see [[Prompt Engineering]]).
 
 This extra reasoning is itself billed as output tokens, so it trades latency and cost for accuracy on harder problems, and is usually unnecessary for simple classification or extraction tasks.
 
 Most frontier models as of 2026 also accept **multimodal input** — images and PDFs alongside text, encoded in the same `messages` structure as a typed content block — which matters for AI engineering because a scanned document or a screenshot can go straight into a prompt instead of through a separate OCR step, though dedicated OCR is still often more accurate and cheaper for high-volume document pipelines (see [[Document Ingestion and Chunking]]).
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** Every LLM call has the same shape: model name, a max length, and the list of messages.
 
 The shape of every LLM call, reduced to its essentials — this is what [[Calling LLM APIs from Go]] builds into a production client:
 
@@ -216,6 +278,8 @@ A backend that doesn't check `stop_reason` can silently ship truncated answers a
 
 ### Deciding when an LLM call is even the right tool
 
+**In plain words:** If plain code can do the job, use plain code. LLMs are slow, cost money and can be wrong.
+
 | Question | If yes |
 |---|---|
 | Is the task a fixed rule you can write down? | Write the rule in Go; skip the LLM call entirely — it will be faster, cheaper, and more predictable. |
@@ -224,7 +288,9 @@ A backend that doesn't check `stop_reason` can silently ship truncated answers a
 | Is "mostly right, occasionally wrong" acceptable for this use case? | An LLM call is a reasonable fit, with validation on the output. |
 | Must it be exactly correct every time (billing math, auth decisions)? | Don't let the LLM make the final call; have it draft, and verify with code. |
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
+
+**In plain words:** When the model does not know something, you can: prompt better, give it the facts (RAG), let it call tools, or retrain it.
 
 | Approach to "the model doesn't know X" | How it works | Use when | Cost |
 |---|---|---|---|
@@ -234,14 +300,22 @@ A backend that doesn't check `stop_reason` can silently ship truncated answers a
 | Long context | Stuff the whole document set directly into the prompt | The corpus is small enough to fit and doesn't change per-request | Most expensive per call; "lost in the middle" risk |
 | Fine-tuning | Retrain (part of) the model on your examples | X is a *style* or *format* you need very consistently, at high volume | Training cost + ongoing maintenance of a custom model; rarely the first thing to reach for in 2026 |
 
-## 6. Trade-offs and when not to use
+```mermaid
+flowchart LR
+    Q["Model does not know X"] --> P["Prompt better<br/>cheapest"]
+    Q --> R["Give it the facts (RAG)"]
+    Q --> T["Let it call tools"]
+    Q --> F["Fine-tune<br/>costliest"]
+```
+
+## 6. Trade-offs and when not to use 🟡
 
 - An LLM call is non-deterministic, slow (hundreds of milliseconds to seconds) and metered per token — never use one where a lookup table, a regex, or a SQL query answers the question deterministically and instantly.
 - Every call is a dependency on a third-party service: it can be rate-limited, degraded, or down (see [[Calling LLM APIs from Go]] for the retry/timeout handling this requires).
 - Output is a string (or structured JSON you asked for) that must still be validated — treat it as untrusted input to the rest of your system, never as trusted application logic.
 - Long conversations get expensive and slower by design (full history resent every turn); real applications actively manage context size rather than letting it grow unbounded.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** customer-support copilots that draft replies for a human to approve; code-review and code-generation assistants; semantic search and document Q&A backends (see [[Case Study - Chat with PDFs and Websites]]); structured-extraction pipelines that turn unstructured text (emails, PDFs, support tickets) into typed JSON rows for a database.
 - **Failure modes → fixes:**
@@ -251,7 +325,7 @@ A backend that doesn't check `stop_reason` can silently ship truncated answers a
   - Inconsistent output breaking a downstream parser → use the API's structured-output mode, not prose parsing (see [[Structured Outputs and Tool Calling]]).
 - **What to monitor:** input/output token counts and $ cost per request; p50/p99 latency, split into time-to-first-token and total time; error rate by status code (429 vs 5xx vs 4xx); `stop_reason` distribution (a rising share of `max_tokens` truncations is a budget bug, not a model problem).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why hallucination is structural, not incidental.** The model is trained to produce the statistically most plausible continuation of the prompt, not to consult a ground-truth fact store. When it has not seen a fact often enough (or at all) in training, the most "plausible-sounding" continuation can still be fluent and wrong — the training objective never distinguishes "confidently correct" from "confidently fluent."
 
@@ -268,7 +342,7 @@ A backend that doesn't check `stop_reason` can silently ship truncated answers a
 
   Streaming (see [[Calling LLM APIs from Go]]) does not reduce total latency, but it reduces *perceived* latency by showing the user the first tokens as soon as TTFT elapses instead of waiting for the entire response.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What exactly does "stateless API" mean for an LLM, and what does it imply for your backend?
 > The provider keeps no memory of your conversation between calls. Your backend must store the conversation and resend the relevant history (or a summary of it) as the `messages` array on every request.
@@ -301,7 +375,7 @@ A backend that doesn't check `stop_reason` can silently ship truncated answers a
 > [!question]- A teammate says "the model output is JSON 95% of the time, so let's just regex it out." What's wrong with that?
 > It optimises for the common case and ignores the other 5%, which will fail unpredictably in production and is exactly the kind of inconsistency structured outputs exist to remove: the API can constrain generation to match a JSON Schema (or route through a tool call), which you then still validate, rather than hoping a regex on free-form prose holds up (see [[Structured Outputs and Tool Calling]]).
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - LLM = repeatedly predict the next token; trained via pretraining → instruction tuning → preference tuning.
 - Tokens, not characters or words, are the unit of cost, latency and the context window (~4 chars/token in English, worse for other scripts — an estimate, not exact).
@@ -312,7 +386,7 @@ A backend that doesn't check `stop_reason` can silently ship truncated answers a
 - Pick the mechanism by the failure mode: prompting (reasoning/format), RAG (missing facts), tool calling (precise live data/actions), fine-tuning (consistent style at volume, rarely first).
 - Reasoning models spend extra output tokens "thinking"; multimodal models accept images/PDFs as typed content blocks.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Calling External APIs]] (06, general HTTP client basics this topic builds on)
 - **Next:** [[Calling LLM APIs from Go]], [[Prompt Engineering]]

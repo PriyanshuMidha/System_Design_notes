@@ -24,7 +24,43 @@ updated: 2026-11-13
 > - Reranking takes the fused top 50–100 candidates and reorders them with a cross-encoder, which reads query and document jointly instead of comparing two independent vectors.
 > - The question "is hybrid search worth it?" is answered with precision@k / recall@k / MRR / nDCG on your own queries, not intuition.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+There are two main ways to search text. One matches exact words. The other matches meaning.
+
+**Keyword search** finds documents that contain your exact words. It is great for codes like "E1234" or an order ID. It fails when you use different words, like "money back" vs "refund".
+
+**Semantic search** turns text into numbers that capture meaning (embeddings). It finds "refund" for "money back". But it can miss exact codes and IDs.
+
+```mermaid
+flowchart LR
+    Q1["'error E1234'"] --> K["Keyword: finds it"]
+    Q2["'get my money back'"] --> S["Semantic: finds<br/>'Refund policy'"]
+```
+
+**Hybrid search** runs both and merges the two result lists. Then a careful second model can re-sort the top few.
+
+```mermaid
+flowchart LR
+    Q["Question"] --> K["Keyword list"]
+    Q --> S["Semantic list"]
+    K --> M["Merge by rank"]
+    S --> M
+    M --> R["Re-sort top 50"] --> T["Top 5"]
+```
+
+The rest of this note is just these 3 questions:
+1. How does each kind of search work, and where does it fail?
+2. How do you merge two lists that use different scores?
+3. How do you run it fast and measure it in production?
+
 
 **The problem in one story.**
 A user types "error E1234 when paying" into your help search.
@@ -71,7 +107,7 @@ Where it breaks: a librarian can explain why they chose a book, while an embeddi
 > [!tip] Remember
 > Keyword search finds exact words, semantic search finds meaning; hybrid runs both, merges by rank, and lets measurements on your own queries decide.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A user searching a support knowledge base types `INV-20451 refund status`. Semantic search alone can fail here: an embedding model was trained to cluster meaning, and an invoice code is meaningless to it — it may retrieve documents about "refund policy" in general and miss the one document that literally contains `INV-20451`.
 
@@ -79,14 +115,16 @@ Now the same system gets the query `how do I get my money back`. Pure keyword (B
 
 Neither retriever is strictly better — they fail on different, overlapping query shapes. Running both and combining the rankings catches both cases, which is why almost every production search system (web search, e-commerce, enterprise knowledge bases, RAG) is hybrid by default rather than picking one.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 - **Keyword search** is a librarian who only recognizes the exact words you say. Say "car insurance" and they find every book with those words. Say "vehicle protection plan" and, unless that exact phrase is in a book, they shrug.
 - **Semantic search** is a librarian who understands what you mean but sometimes mishears specific names and numbers. Say "vehicle protection plan" and they correctly bring you the car insurance book. Say "invoice INV-20451" and they might bring you ten unrelated invoices, because the specific code didn't register as meaningfully different from any other.
 - **Hybrid search** asks both librarians, then a third person (fusion) merges their two lists into one, favoring anything both librarians agreed was relevant.
 - **Reranking** is a final expert who actually reads the top candidates against the question, rather than skimming by title — slower, so only run it on the shortlist, not the whole library.
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words:** Both searches run side by side, their lists get merged, and a slower but smarter model picks the final order.
 
 ```mermaid
 flowchart LR
@@ -99,6 +137,8 @@ flowchart LR
 ```
 
 ### Keyword search: inverted index + BM25
+
+**In plain words:** Like the index at the back of a book: each word points to the pages it appears on. BM25 decides which page ranks first.
 
 Documents are **analyzed** before indexing: lowercased, tokenized, usually stemmed (`running` → `run`) and sometimes expanded with synonyms. The analyzed tokens populate an **inverted index** (term → list of documents containing it) — see [[Search Engines and Inverted Indexes]] for the index structure itself.
 
@@ -113,7 +153,17 @@ BM25(D, q) = Σ over query terms t:  idf(t) · f(t,D)·(k1+1) / (f(t,D) + k1·(1
 
 where `f(t,D)` is how many times term `t` appears in document `D`, and `avgdl` is the average document length in the corpus.
 
+```mermaid
+flowchart LR
+    W1["'refund'"] --> D1["doc 3, doc 7"]
+    W2["'policy'"] --> D2["doc 3, doc 9"]
+    D1 --> B["BM25 scores:<br/>doc 3 ranks first"]
+    D2 --> B
+```
+
 ### Dense (semantic) retrieval
+
+**In plain words:** Turn the question and every document into points on a meaning map, then grab the nearest points.
 
 The query and every document are embedded into the same vector space (same model and version — see [[Embeddings]] for why mixing models breaks this), and ranked by cosine similarity.
 
@@ -125,6 +175,8 @@ It keeps the exact-match strength of lexical search while picking up some of den
 
 ### Fusion: Reciprocal Rank Fusion (RRF)
 
+**In plain words:** The two scores can't be compared, so ignore scores and use positions. Being near the top of both lists wins.
+
 BM25 scores and cosine similarities live on different, incomparable scales (BM25 is unbounded and corpus-dependent; cosine is bounded `[-1, 1]`), so you cannot just add them together. RRF sidesteps the problem by fusing **ranks**, not scores:
 
 ```text
@@ -135,7 +187,16 @@ RRF_score(doc) = Σ over each ranked list:  1 / (k + rank(doc))
 
 A document ranked 1st in one list and 3rd in another beats one ranked 2nd in both only if the specific numbers work out — RRF rewards consistently-good ranking across retrievers, not an extreme result in just one.
 
+```mermaid
+flowchart LR
+    K["Keyword list:<br/>1. doc A  2. doc B"] --> F["RRF: points = 1 / (60 + rank)"]
+    S["Semantic list:<br/>1. doc B  2. doc C"] --> F
+    F --> O["doc B wins:<br/>high in both"]
+```
+
 ### Reranking: bi-encoder recall, cross-encoder precision
+
+**In plain words:** A fast search finds 50 maybe-good results. A slow, careful model reads each one with the question and picks the best.
 
 A **cross-encoder** reranker takes the query and one candidate document **together** as input to a single model, and outputs a relevance score directly — it can notice that a candidate contains the exact phrase, or a negation, or a subtle mismatch, because it reads both texts jointly instead of comparing two independently-computed vectors.
 
@@ -143,7 +204,14 @@ This makes it more accurate than a bi-encoder, but too slow to run over a whole 
 
 **Late interaction** (ColBERT and successors) is a third design point between bi-encoders and cross-encoders: it embeds each token of the query and document separately (like a bi-encoder, so document vectors are still precomputable), but scores a pair by matching individual token vectors against each other (closer to what a cross-encoder does), trading some speed for better accuracy than a plain bi-encoder without paying the full cross-encoder cost.
 
+```mermaid
+flowchart LR
+    A["Millions of docs"] -- "fast bi-encoder" --> B["Top 50"] -- "slow cross-encoder" --> C["Best 5"]
+```
+
 ### Query understanding
+
+**In plain words:** Clean up the question first: fix spelling, add synonyms, pull out filters like dates or brands.
 
 Before retrieval even runs, real systems apply spelling correction, synonym expansion, and filter extraction (pulling a date range, category or brand out of free text into a structured filter) — these live in a query-understanding layer upstream of both retrievers and reduce the burden on BM25 and the embedding model alike.
 
@@ -170,9 +238,11 @@ sequenceDiagram
     App-->>User: final results
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** The merge formula in a few lines: each document gets points for how high it sits in each list.
 
 Fusing two already-ranked lists with RRF is the one formula worth knowing cold:
 
@@ -598,7 +668,9 @@ func TestEndToEndHybridPipeline(t *testing.T) {
 PASS
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
+
+**In plain words:** Keyword only, semantic only, or both. Plus whether to add a reranker.
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -609,7 +681,7 @@ PASS
 | + Reranking (cross-encoder) | Fused top 50–100 candidates rescored by a model reading query+doc jointly | Final-stage precision matters (top 5–10 shown to a user or an LLM) | Latency cost per candidate; only run on a shortlist |
 | + Late interaction (ColBERT) | Per-token embeddings, matched token-to-token at query time | Want cross-encoder-like precision with bi-encoder-like precomputability | More storage (per-token vectors) and a specialized scoring step |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Running two retrievers doubles the infrastructure to build, monitor and keep in sync (reindex both on every document change).
 - Reranking adds real latency — budget it like any other stage (a cross-encoder pass over 100 candidates is not free), and only rerank the shortlist, never the whole corpus.
@@ -617,7 +689,7 @@ PASS
 - If your corpus is small and purely natural-language (a handful of FAQ entries), semantic search alone can be enough, and skipping fusion avoids its added complexity.
 - RRF's damping constant `k=60` is a reasonable default, not a universal law — validate it (or a weighted-score alternative) against your own relevance judgments before assuming it transfers.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- PostgreSQL 17's full-text search (`tsvector`, `ts_rank`) combined with `pgvector` is a common single-database hybrid setup for teams already on Postgres.
@@ -634,7 +706,7 @@ PASS
 	- Per-stage latency (BM25, dense, fusion, rerank) so you know which stage to optimize first.
 	- Empty-result rate, separately for each retriever, to catch analyzer or embedding regressions early.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why RRF instead of weighted score averaging.** BM25 scores are corpus-dependent and unbounded; cosine similarities are bounded but compressed near 1.0 for related text. Weighted averaging requires calibrating weights per corpus and re-tuning as data changes.
 
@@ -650,7 +722,7 @@ PASS
 - **Query understanding is a separate layer.** Spelling correction, synonym expansion and structured-filter extraction (pulling `price < 50` or `brand: Nike` out of free text) happen before either retriever runs, and both BM25 and dense retrieval benefit from the cleaned-up query — this logic is often underrated compared to the retrieval algorithms themselves.
 - **Hybrid search is not free at index time either**: every document needs both an inverted-index entry and an embedding, kept in sync on every write, update and delete — a consistency problem in its own right, not just a query-time one.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- A user searches for an invoice number and gets no results from your "AI search." What's the likely cause and fix?
 > The system is probably pure semantic (dense) search: embedding models generalize over meaning and don't treat a specific alphanumeric code as distinctively important, so it dilutes into "something about invoices." Add BM25 (lexical) retrieval alongside it — exact tokens are BM25's strength — and fuse the two with RRF.
@@ -675,7 +747,7 @@ PASS
 > [!question]- Why does reranking only operate on a shortlist, and how big should that shortlist be?
 > A cross-encoder needs one forward pass per query-document pair, so scoring the whole corpus per query is too slow. Retrieve cheaply with BM25/dense/fusion down to 50–100 candidates first, then rerank just those down to the 5–10 that actually reach the user or the LLM prompt.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - BM25: exact tokens, term-frequency saturation (`k1`) + length normalization (`b`); strong on IDs/codes, blind to paraphrase.
 - Dense retrieval: same-model embeddings + cosine/dot similarity; strong on paraphrase, weak on exact identifiers and negation.
@@ -686,7 +758,7 @@ PASS
 - Evaluate with precision@k, recall@k, MRR, nDCG on real or sampled relevance judgments — not by eye.
 - Hybrid is the production default because keyword and semantic search fail on different query shapes.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Embeddings]], [[Search Engines and Inverted Indexes]], [[Vector Databases and ANN Indexes]]
 - **Next:** [[RAG Pipeline]]

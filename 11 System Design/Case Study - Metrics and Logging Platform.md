@@ -28,7 +28,34 @@ updated: 2026-11-13
 > - Protect the platform from its tenants: per-tenant limits on series, ingest rate and query cost.
 > - Alerting runs as queries on a timer, close to the data, and must keep working when other parts are degraded.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+When a company runs hundreds of services, people need to see what is going on inside them.
+**Metrics** are numbers measured over time, like "errors per second". They are small and easy to graph.
+**Logs** are text lines each program writes, like "card service timed out". They are big but full of detail.
+Both are collected from every service, stored, and shown on dashboards. Rules watch the numbers and wake someone up when they go bad.
+
+```mermaid
+flowchart LR
+    S["500 services"] --> M["Metrics store<br/>(numbers)"]
+    S --> L["Log store<br/>(text)"]
+    M --> D["Graphs + alerts"]
+    L --> Q["Search"]
+```
+
+The cost trap: each different label combination makes a new line on a graph. Too many combinations and the system runs out of memory.
+
+So the rest of this note is just these 3 questions:
+1. How do you store billions of numbers cheaply?
+2. How do you search mountains of log text without paying a fortune?
+3. How do you alert the right person without false alarms?
 
 **The problem in one story.**
 Your company runs 500 small services.
@@ -76,7 +103,7 @@ Where it breaks: real meters are few and fixed, but a careless label (like a use
 > [!tip] Remember
 > Metrics cost grows with the number of distinct series, logs cost grows with how much you index.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 A company runs 5,000 services on 20,000 pods. Every team ships its own Prometheus and its own log stack, and on-call engineers jump between ten tools during an incident. Disks fill up, a single team's new `user_id` label takes down their Prometheus, and nobody can search logs older than three days. The company wants one platform.
 
@@ -98,7 +125,7 @@ A company runs 5,000 services on 20,000 pods. Every team ships its own Prometheu
 
 **Downsampling** replaces raw samples with per-interval aggregates (min, max, sum, count). A **log stream** in label-indexed systems is all lines sharing a label set.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Metrics are like electricity meters: every 15 seconds each meter reports one number, and the numbers barely change, so you can store them in about one byte each. The expensive part is the **number of meters**.
 
@@ -106,7 +133,13 @@ Logs are like a diary from every machine: lots of free text.
 
 You either build a full index at the back of every diary (fast lookup, the index can be as large as the diary) or you just label each diary by owner and date and read the relevant pages when someone asks (cheap to store, slower to search).
 
-## 3. How it works - high-level design
+```mermaid
+flowchart LR
+    F["Full-text index"] --> F1["Fast search,<br/>index as big as the logs"]
+    LB["Index labels only"] --> L1["Cheap storage,<br/>slower search (scan)"]
+```
+
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart LR
@@ -173,7 +206,7 @@ sequenceDiagram
     Note over O: compactor later merges and dedupes the 3 copies
 ```
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -189,6 +222,8 @@ Numbers: 20M series, 1.33M samples/s, ~1.37 B/sample -> ~158 GB/day metrics
 ```
 
 ### Estimates
+
+**In plain words:** rough sums: how many number samples and log bytes arrive per second, and how much storage that means.
 
 All inputs are estimates for a company of this size; the bytes per sample is from the Gorilla paper.
 
@@ -211,11 +246,15 @@ What the numbers decide:
 
 ### The cardinality trap in one line
 
+**In plain words:** every different mix of labels is its own series. Multiply the label values together and you see how fast it explodes.
+
 `http_requests_total` with labels `method` (5 values) × `route` (200) × `code` (10) × `pod` (500) is 5 × 200 × 10 × 500 = **5,000,000 series** for one metric. Adding `user_id` with 1 M users multiplies it by up to a million.
 
 That is why the distributor enforces per-tenant series limits and why IDs belong in logs and traces, not in metric labels.
 
 ### API
+
+**In plain words:** services send numbers and log lines in; people query them out with a small query language.
 
 ```http
 POST /api/v1/push                      (Prometheus remote write: snappy-compressed protobuf)
@@ -231,6 +270,8 @@ GET /loki/api/v1/query_range?query={service="checkout",env="prod"} |= "timeout" 
 The LogQL query first selects streams by labels (index lookup), then scans only those streams' chunks for the word `timeout`, parses JSON, and filters by a field. Narrow labels make it fast; a query on `{env="prod"}` alone has to scan everything.
 
 ### Data model
+
+**In plain words:** a number series is a name plus labels plus (time, value) pairs; logs are grouped by labels and stored as compressed chunks.
 
 ```mermaid
 erDiagram
@@ -265,6 +306,8 @@ A metrics query like `{service="checkout", code="500"}` intersects two **posting
 
 ### Alert lifecycle
 
+**In plain words:** a rule checks a number; if it stays bad for a while the alert fires, gets grouped, and is sent to the on-call person.
+
 ```mermaid
 stateDiagram-v2
     [*] --> inactive
@@ -278,6 +321,8 @@ stateDiagram-v2
 Alertmanager then groups related alerts (one page for 40 pods failing the same check), suppresses lower-priority alerts while a higher one fires (inhibition), honours silences during maintenance, and routes by labels to the right team (see [[Alerting and On-Call]]).
 
 ### Go: series identity, cardinality guard and downsampling
+
+**In plain words:** the code builds one ID per label mix, refuses new series past a limit, and squashes old data into coarser points.
 
 Three pieces of the write and compaction path: building a canonical series key, a per-tenant cardinality limiter that drops only *new* series once the limit is hit (existing dashboards keep working), and a downsampler that keeps min, max, sum and count per bucket.
 
@@ -539,7 +584,7 @@ func TestDeltaOfDeltasMostlyZero(t *testing.T) {
 
 Keeping `sum` and `count` instead of a stored average matters: averaging two 5-minute averages with different sample counts gives the wrong hourly average, while `sum ÷ count` over merged buckets is always right.
 
-## 5. Variants
+## 5. Variants 🟡
 
 | Decision | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- | --- |
@@ -553,7 +598,7 @@ Keeping `sum` and `count` instead of a stored average matters: averaging two 5-m
 | Buffering | Kafka between agents and indexers | durable buffer, replay, many consumers | large scale, multiple sinks (SIEM, archive) | another cluster to run; adds seconds of latency |
 | | Direct agent → backend | agents retry with a disk buffer | smaller scale | backend outages fill agent disks |
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 - **Index everything vs index labels.** Full-text indexing makes "find this request ID across all services in 30 days" instant, at a cost of index storage and indexing CPU on 69 TB/day.
 
@@ -563,7 +608,14 @@ Keeping `sum` and `count` instead of a stored average matters: averaging two 5-m
 - **Raw vs downsampled.** Downsampled data makes year-long dashboards cheap but loses spikes shorter than the step, unless you keep `max` as well as `avg`, as the rollup above does.
 - **When a simpler design wins:** one Prometheus pair per cluster plus Loki in single-binary mode covers a startup with a few hundred pods. Build the distributed platform only when retention, multi-tenancy or global queries require it.
 
-## 7. In production
+```mermaid
+flowchart TD
+    O["Overloaded"] --> Q{"Which data?"}
+    Q -- "metrics, debug logs" --> D["Sample or drop"]
+    Q -- "audit logs" --> K["Never drop:<br/>separate safe path"]
+```
+
+## 7. In production 🔴
 
 - **Real systems.** Prometheus (single-node TSDB), Grafana Mimir and Cortex (horizontally scaled, multi-tenant Prometheus-compatible), Thanos (sidecar + object storage + compactor), VictoriaMetrics, Grafana Loki, Elasticsearch/OpenSearch, ClickHouse for logs, and the OpenTelemetry Collector as the common agent. Facebook's Gorilla paper introduced the delta-of-delta and XOR scheme that Prometheus and many other TSDBs adapted.
 - **Failure: cardinality explosion.** A deploy adds a label with unbounded values; series double in minutes and ingesters run out of memory. Fix: per-tenant and per-metric series limits at the distributor, a "top series by metric" dashboard, and relabelling rules that drop the label at the agent.
@@ -572,7 +624,7 @@ Keeping `sum` and `count` instead of a stored average matters: averaging two 5-m
 - **Failure: log burst from a crash loop.** One service logs a stack trace 10,000 times a second. Fix: per-stream rate limits at the agent and ingester, dropped-line counters per tenant, Kafka buffer to absorb the rest.
 - **What to monitor (the platform itself):** samples and log bytes ingested per tenant; samples rejected by reason (rate, series limit, out of order); active series per ingester; WAL replay time after restart; block upload lag; compactor backlog; query p99 by tenant; rule evaluation duration and missed evaluations; Alertmanager notification failures.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Gorilla compression.** Timestamps are stored as the difference of differences. With a fixed 15 s scrape, consecutive deltas are 15, 15, 15, so the delta-of-delta is 0 and costs one bit; the Gorilla paper reports about 96% of timestamps compressed to a single bit.
 
@@ -598,7 +650,7 @@ The price is query-time work: a search for a string reads and decompresses every
 
 That is cheap for "checkout errors in the last hour" and expensive for "this UUID anywhere in 30 days", which is exactly the case to route to traces (look up by trace ID) or to a small full-text index.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What drives the cost of a metrics platform: request traffic or something else?
 > The number of active series. Traffic only changes counter values, which compress to about a byte per sample; each new label value creates a new series with its own memory, index entries and chunks. So limits and dashboards watch series counts per tenant and per metric.
@@ -623,7 +675,7 @@ That is cheap for "checkout errors in the last hour" and expensive for "this UUI
 > [!question]- What happens to alerts if the metrics pipeline itself is broken?
 > Rules see no data and stop firing, which looks like "all healthy". Guard against it with an always-firing watchdog alert that must keep arriving at the pager provider (a dead-man's switch) and a separate meta-monitoring stack for the platform.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Series = name + sorted labels; cost tracks series count, not traffic.
 - 20 M series @ 15 s = 1.33 M samples/s × ~1.37 B ≈ 158 GB/day per copy.

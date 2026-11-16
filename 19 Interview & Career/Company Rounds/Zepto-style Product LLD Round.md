@@ -28,7 +28,44 @@ updated: 2026-11-13
 > [!warning] What this note is based on
 > The round shape below comes from candidate-shared, public interview write-ups and from the owner's own prep notes. It is **anecdotal**: companies change their loops, and nothing here is an official description of any company's process. Read "Zepto-style" as "quick-commerce product LLD", and confirm the format with your recruiter.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This note covers one kind of interview round: design a small part of a quick-delivery grocery app, like placing an order.
+
+The big danger is **overselling**. One carton of milk is left, three people tap "order" at once, and all three get a "yes".
+
+```mermaid
+flowchart LR
+    A["Buyer 1: milk left? yes"] --> X["All three subtract 1"]
+    B["Buyer 2: milk left? yes"] --> X
+    C["Buyer 3: milk left? yes"] --> X
+    X --> O["Stock = -2"]
+```
+
+This happens because "check" and "subtract" are two separate steps. Many app servers run at once, so a lock inside one Go program does not help.
+
+The fix is to let the database do both in one step: "subtract 1 only if at least 1 is left". Only one buyer wins. The others get a clear "out of stock" (**409**).
+
+```mermaid
+flowchart LR
+    R["UPDATE stock = stock - 1<br/>WHERE stock >= 1"] --> W["1 row changed: you got it"]
+    R --> L["0 rows changed: out of stock"]
+```
+
+So in this round you design the API and database table first, then the Go code on top.
+
+The rest of this note is just these 3 questions:
+1. What does the round look like, and why do API and schema come first?
+2. How do you build the order flow without overselling?
+3. What do senior candidates add: retries, cancels, partial stock?
+
 
 **The problem in one story.**
 A small grocery store has one carton of milk left.
@@ -73,7 +110,7 @@ Where it breaks: an inspector checks a finished building; in this round you must
 > [!tip] Remember
 > Name the invariant, put it in one atomic database step, and make retries safe.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Classic LLD questions (Parking Lot, Vending Machine) test object modelling. A product company's backend work is different: most bugs are not "wrong class hierarchy" but "two requests sold the same last unit" or "the retry created a second order". A product LLD round tests those skills directly in 45–60 minutes.
 
@@ -81,7 +118,7 @@ A concrete scenario: a dark store has 1 carton of milk left and, at 8:00 pm, 3 u
 
 A design that reads `available_qty`, checks it in Go, and then writes `available_qty - 1` can sell 3 cartons it does not have. The interviewer is waiting to see if you notice this before they ask.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the round as **a design review of one pull request** for a real service:
 
@@ -92,9 +129,11 @@ Think of the round as **a design review of one pull request** for a real service
 
 Analogy: a building inspector does not care how pretty the floor plan is; they check the load-bearing walls. In this round the load-bearing walls are the invariants (stock never negative, one rider per order, one order per retry).
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Round formats
+
+**In plain words:** The same question can be asked as talk-only, code-only, or a mix. Know which one you're in.
 
 | Format | What you produce | How it is scored | Prep note |
 | --- | --- | --- | --- |
@@ -103,6 +142,8 @@ Analogy: a building inspector does not care how pretty the floor plan is; they c
 | Hybrid (most common for product LLD) | API + schema on the board, then one core method in an editor | Both of the above, in less time | This note |
 
 ### Flow of a hybrid round
+
+**In plain words:** Scope, then API, then table design, then Go code for one hard method, then a test, then follow-up questions.
 
 ```mermaid
 flowchart TD
@@ -116,6 +157,8 @@ flowchart TD
 
 ### Why API and schema come first in product rounds
 
+**In plain words:** The data lives in a shared database, not in one program's memory. So the database rules are where safety really lives.
+
 In a puzzle LLD the state lives in memory, so classes come first. In a product LLD the state lives in a database shared by many service instances, so:
 
 1. The API fixes the contract: what a retry looks like (`Idempotency-Key` header), what errors the client sees (409 when out of stock).
@@ -124,7 +167,16 @@ In a puzzle LLD the state lives in memory, so classes come first. In a product L
 
 The general 10-step order is in [[LLD Interview Method]]; this round just pulls steps 5–6 (APIs, storage) earlier.
 
+```mermaid
+flowchart LR
+    S1["App server 1"] --> DB["Shared database:<br/>CHECK stock >= 0"]
+    S2["App server 2"] --> DB
+    S3["App server 3"] --> DB
+```
+
 ### Typical problems and where to practise them
+
+**In plain words:** A short list of common questions, what each one really tests, and where to practise.
 
 | Problem as asked | What it probes | Practise with |
 | --- | --- | --- |
@@ -140,11 +192,13 @@ The general 10-step order is in [[LLD Interview Method]]; this round just pulls 
 
 Each practice note has its own Excalidraw drawing; redraw it from memory as a warm-up instead of drawing new diagrams here.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 **Question:** "A user orders milk, bread and chips. Pick a dark store that has all items, reserve stock, create the order. Assume many app servers."
 
 ### Opening script (first 60 seconds)
+
+**In plain words:** What to say in your first minute so the interviewer knows your plan.
 
 ```text
 Let me confirm scope: one user places an order of several items, we choose one
@@ -157,6 +211,8 @@ PlaceOrder and test the last-unit race. Does that match what you want?
 
 ### API
 
+**In plain words:** The endpoints: what the app sends, what it gets back, and what a retry looks like.
+
 ```text
 POST /v1/orders                 Idempotency-Key: <uuid>
   body: { "items": [{ "product_id": "milk", "qty": 1 }, ...] }
@@ -166,7 +222,14 @@ GET  /v1/orders/{id}
 POST /v1/orders/{id}/cancel     releases the reservation if not yet packed
 ```
 
+```mermaid
+flowchart LR
+    C["App retries the same order"] -- "same Idempotency-Key" --> S["Server"] --> R["Returns the first result,<br/>no second order"]
+```
+
 ### Schema (PostgreSQL 17)
+
+**In plain words:** The tables, with a rule built in so stock can never go below zero.
 
 ```sql
 CREATE TABLE inventory (
@@ -215,6 +278,8 @@ To avoid deadlocks between two multi-item orders, update items in a fixed order 
 
 ### The race you must name
 
+**In plain words:** Say the danger out loud: two buyers, one item, same moment.
+
 ```mermaid
 sequenceDiagram
     participant A as Order A
@@ -234,6 +299,8 @@ sequenceDiagram
 ```
 
 ### Go: the core method, tested
+
+**In plain words:** The order method in Go: reserve stock, save the order, and undo the reservation if saving fails.
 
 The old version of this code reserved stock, then saved the order, and returned on a save error without releasing the stock, so every DB hiccup leaked inventory. It also used a raw `"reserved"` string.
 
@@ -521,7 +588,9 @@ Measured: `go vet ./...` is clean and `go test -race -count=1 ./...` passes on G
 
 One honest gap to say out loud: `ByIdemKey` followed by `Save` is check-then-act, so two concurrent requests with the same key could both pass the check. In PostgreSQL the `UNIQUE (user_id, idempotency_key)` constraint closes that gap: the second insert fails, and the handler then reads and returns the first order. See [[Idempotency and Idempotency Keys]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
+
+**In plain words:** Six ways to stop overselling, from a simple Go lock (one server only) to Redis for huge sales.
 
 | Approach to "no oversell" | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -532,7 +601,7 @@ One honest gap to say out loud: `ByIdemKey` followed by `Save` is check-then-act
 | Redis `DECRBY` + Lua check | Atomic in Redis, DB updated async | Flash sales, extreme QPS | Two sources of truth; needs reconciliation |
 | Reservation rows with TTL | Insert a hold that expires if unpaid | Payment happens later | Sweeper job; must be idempotent |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Do not lead with patterns.** Strategy for store selection is worth one sentence; a Factory for one implementation is noise. See [[Design Patterns Overview and Chooser]].
 - **Do not over-scale.** Sharding inventory by store is a good follow-up answer, not an opening move in a 60-minute round.
@@ -540,7 +609,7 @@ One honest gap to say out loud: `ByIdemKey` followed by `Save` is check-then-act
 - **Saga talk can eat the clock.** Mention compensation for payment failure, show it in code once (the `Release` call), and move on. The full pattern is in [[Saga Pattern]].
 - **When this prep is the wrong prep:** if the recruiter says "machine coding, 90 minutes, runnable", spend more time on [[Testing LLD Code]] and typing speed than on schema.
 
-## 7. In production
+## 7. In production 🔴
 
 What an SDE-3 adds after the core method works. Bring one or two of these up yourself; that is the level signal.
 
@@ -552,17 +621,23 @@ What an SDE-3 adds after the core method works. Bring one or two of these up you
 - **Observability:** count `reserve_conflicts_total` by store, `reservation_leaks` found by the sweeper, p99 of `PlaceOrder`; trace one order across order, inventory and payment ([[Observability Fundamentals]]).
 - **Rollout:** new selection strategy behind a flag, compared in shadow mode first ([[Feature Flags]]).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Partial stock
+
+**In plain words:** When no single store has everything: say no, split the order, or offer swaps.
 
 If no single store has all items, options are: reject (simplest, say it first), split the order across stores (two riders, two deliveries; a product decision), or substitute. Ask which one the interviewer wants; never silently pick split.
 
 ### Stale inventory cache
 
+**In plain words:** A cache can show "in stock", but the real reservation must always check the database.
+
 Showing "in stock" from a cache is fine; reserving from it is not. The reserve always hits the source of truth, and a 409 at checkout is the accepted cost. Say how the cache is refreshed (on write, or a short TTL) and link [[Cache Invalidation, TTL and Consistency]].
 
 ### Cancellation after reservation
+
+**In plain words:** Cancel must change the order and give the stock back exactly once, even if called twice.
 
 Cancel is a state transition (`reserved → cancelled`) plus a release, and both must happen once. Model it as a conditional update on `orders.status` and release only if that update affected one row. The lifecycle is in [[State Machines in Go]].
 
@@ -577,7 +652,15 @@ stateDiagram-v2
     cancelled --> [*]
 ```
 
+```mermaid
+flowchart LR
+    R["reserved"] -- "cancel (once only)" --> C["cancelled + stock returned"]
+    C -- "cancel again" --> N["No change"]
+```
+
 ### Post-round self-review checklist
+
+**In plain words:** Write down within an hour what went well and what to fix next time.
 
 Write this down within an hour of the round:
 
@@ -588,7 +671,7 @@ Write this down within an hour of the round:
 5. Which follow-up did I fumble, and which vault note covers it?
 6. How many minutes did I spend before the first line of code? (Target: about 20 in a 60-minute hybrid, matching the [[LLD Round Playbook]] time boxes.)
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Two users order the last unit at the same time. What happens in your design?
 > Each reserve is `UPDATE ... WHERE available_qty >= qty`. The row lock serialises them; the second re-checks after the first commits, affects 0 rows, and gets out-of-stock (or falls back to the next store). The `CHECK (available_qty >= 0)` is a second safety net.
@@ -611,7 +694,7 @@ Write this down within an hour of the round:
 > [!question]- What would you change for an SDE-3 level answer?
 > Name the invariants first, put them in the DB, show the failure path in code, add idempotency, and close with what you would monitor (conflicts, leaks found by the sweeper, latency) and how you would roll out a new selection rule safely.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Opening: scope → API → schema → Go types → one hard method → test → follow-ups.
 - Invariant lives in the DB: `CHECK (available_qty >= 0)` + conditional `UPDATE`, 0 rows = out of stock.
@@ -622,7 +705,7 @@ Write this down within an hour of the round:
 - Prove it: N goroutines, one winner, `go test -race`.
 - SDE-3 extras: multi-instance, failure paths, observability, rollout.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[LLD Round Playbook]], [[LLD Interview Method]], [[Concurrency for LLD]]
 - **Next:** [[Inventory Order Assignment (Dark Store)]], [[Delivery Partner Assignment]], [[Cart Checkout with Coupons]]

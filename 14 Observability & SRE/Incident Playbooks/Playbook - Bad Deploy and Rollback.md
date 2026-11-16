@@ -43,7 +43,42 @@ flowchart TD
     F --> G
 ```
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the five steps), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your team ships new code to the live website. That is a **deploy**.
+Minutes later, errors jump up. Users can't pay.
+You don't know why yet. That is fine.
+You put the old, working code back first. That is a **rollback**.
+Users are happy again in about 2 minutes.
+Now, calmly, you find the bug in the new code.
+
+```mermaid
+flowchart LR
+    A["New code goes live"] --> B["Errors jump up"]
+    B --> C["Put old code back"]
+    C --> D["Users OK again"]
+    D --> E["Find the bug calmly"]
+```
+
+One catch: if the new code already changed saved data (like the database layout), the old code may not understand it. Then "just go back" is not safe.
+
+```mermaid
+flowchart LR
+    N["New code"] -- "wrote data in a new shape" --> DB[("Database")]
+    O["Old code put back"] -- "can it read that shape?" --> DB
+```
+
+The rest of this note is just these 3 questions:
+1. Is the deploy really the cause?
+2. What is the fastest safe way to undo it?
+3. How do you make undo safe *before* the next deploy?
 
 **The problem in one story.**
 At 14:02 your team ships a new version of the checkout service.
@@ -89,7 +124,7 @@ Where it breaks: food already served can't be un-served; data already written by
 > [!tip] Remember
 > If it broke right after a change, undo the change first and ask why later.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Every deploy is a bet that the new code behaves better than the old code in a place you cannot fully test: production traffic, production data, production dependencies. Most of the time the bet pays. Sometimes it does not.
 
@@ -108,7 +143,7 @@ If detection takes 6 minutes and the rollback takes 4, the incident costs about 
 > [!tip] Remember
 > The cost of a bad deploy is (users affected) x (minutes until mitigation). Both factors shrink with canaries, fast alerts and one-command rollback.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 **Analogy: replacing a part in a running machine.** You swap one gear and the machine starts to rattle. The first response is to put the old gear back, not to study the rattle while the machine keeps running.
 
@@ -137,9 +172,11 @@ flowchart LR
 > [!tip] Remember
 > Ask "what state did v2 write?" before you press undo. Code undoes cleanly. State does not.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The first 5 minutes
+
+**In plain words:** a short checklist so you don't panic. Look at what changed, undo it, then check that things got better.
 
 Follow this checklist in order. Do not skip step 1 even if you "know" what it is.
 
@@ -153,6 +190,8 @@ Follow this checklist in order. Do not skip step 1 even if you "know" what it is
 > Spending the first 20 minutes reading code to find the bug while errors continue. The bug can be found after users are safe. Mitigation and diagnosis are two separate jobs, and mitigation comes first.
 
 ### The diagnosis flowchart
+
+**In plain words:** not every problem after a deploy is caused by the deploy. This map helps you tell "it was our new code" from "something else broke at the same time".
 
 Not every post-deploy problem is the deploy. This flowchart separates "bad deploy" from look-alikes.
 
@@ -170,6 +209,15 @@ flowchart TD
 ```
 
 ### Step 1: Prove the deploy is guilty
+
+**In plain words:** if the new version fails and the old version, running at the same time, does not, the new version is guilty. The queries below just compare the two.
+
+```mermaid
+flowchart LR
+    T["Same traffic"] --> V1["Old version v41<br/>errors 0.1%"]
+    T --> V2["New version v42<br/>errors 9%"]
+    V2 --> G["Only new is bad:<br/>the deploy is guilty"]
+```
 
 The strongest evidence is a comparison between versions running at the same time. This needs a `version` label (or the image tag) on your metrics, which is a strong reason to add it.
 
@@ -206,6 +254,8 @@ kubectl get pods -n prod -l app=orders-api \
 
 ### Step 2: Check the rollout itself
 
+**In plain words:** sometimes the new code never even started properly. These commands show whether the new copies came up healthy.
+
 ```bash
 kubectl rollout status deployment/orders-api -n prod
 kubectl rollout history deployment/orders-api -n prod
@@ -229,6 +279,8 @@ increase(kube_pod_container_status_restarts_total{pod=~"orders-api-.*"}[10m]) > 
 ```
 
 ### Step 3: Read the new pod's evidence
+
+**In plain words:** look at the new copy's logs and crash reasons. They often name the bug directly.
 
 ```bash
 kubectl get pods -n prod -l app=orders-api
@@ -260,6 +312,8 @@ kube_pod_container_resource_limits{resource="memory", pod=~"orders-api-.*", cont
 A ratio near 1.0 means the container is close to being killed. See [[Debugging Memory Leaks and OOMs in Go]].
 
 ### Step 4: Mitigate
+
+**In plain words:** pick the quickest safe way to stop the pain: undo the deploy, flip a switch off, or move traffic away.
 
 Pick the fastest option that is safe:
 
@@ -302,12 +356,14 @@ helm rollback orders-api 12 -n prod --wait
 
 ### Step 5: Confirm recovery
 
+**In plain words:** don't trust the undo button. Watch the graphs go back to normal before you say "fixed".
+
 - The same error and latency graphs return to baseline (give them at least 2 to 3 full rate windows, so 10 to 15 minutes for a `[5m]` window).
 - Readiness is green: `kube_deployment_status_replicas_available == kube_deployment_spec_replicas`.
 - Business metric recovers (orders per minute back to normal).
 - Queues drained: retries and backlog created during the incident are processed.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### A real-world-style incident: the null discount
 
@@ -359,9 +415,11 @@ sequenceDiagram
 > [!tip] Remember
 > The rollback itself needs a compatibility check. "Can the previous version still run against the current database?" is the single most important question before undo.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Ways to undo a bad release
+
+**In plain words:** there are several "undo" buttons. Some are instant (a feature switch), some take minutes (redeploy old code). The table compares them.
 
 | Method | Speed | Needs | Best for | Watch out for |
 | --- | --- | --- | --- | --- |
@@ -374,6 +432,8 @@ sequenceDiagram
 | Roll forward with hotfix | 15+ minutes | A fix you trust | Irreversible state changes | Tempting but risky under pressure |
 
 ### Rollback versus roll forward
+
+**In plain words:** going back to old code vs shipping a quick fix on top. Go back when you can; fix forward only when going back would break saved data.
 
 ```mermaid
 flowchart TD
@@ -388,7 +448,7 @@ flowchart TD
 
 **Default to rollback.** Roll forward only when rollback is impossible or provably riskier.
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 - **Fast rollback needs discipline up front.** Keeping every migration backward compatible for one release costs extra releases (expand, then contract). That is the price of safe undo.
 - **Canaries delay full rollout.** A 30-minute bake time slows delivery, but it limits blast radius to a few percent of users.
@@ -399,7 +459,7 @@ flowchart TD
 > [!warning] Common mistake
 > Assuming "rollback" is always safe. It is safe for stateless code. It is dangerous when v2 has written messages, rows or cache entries that v1 cannot parse.
 
-## 7. In production
+## 7. In production 🔴
 
 ### What to check for rollback readiness (before you need it)
 
@@ -420,6 +480,8 @@ go version -m ./app | grep -E "vcs.revision|vcs.time"
 Since Go 1.18, the toolchain embeds `vcs.revision` and `vcs.time` when built inside a Git checkout (the default `-buildvcs=auto`; it is skipped in builds without `.git`, such as some Docker builds that do not copy it, so check yours). Expose them via `/version` or a metric.
 
 ### Failure modes of the rollback itself
+
+**In plain words:** even the undo can fail. These are the common ways it goes wrong and how to avoid them.
 
 | Failure | Why | Fix |
 | --- | --- | --- |
@@ -443,9 +505,11 @@ flowchart LR
     D -. "abort on SLO breach" .-> G["Automatic rollback"]
 ```
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### How `kubectl rollout undo` works
+
+**In plain words:** Kubernetes keeps a list of old versions. "Undo" just tells it to run the previous one again.
 
 A Deployment owns ReplicaSets. Each Pod template change creates a new ReplicaSet and a new revision number. `undo` copies the Pod template of the target revision into the Deployment spec, which creates (or scales up) the matching ReplicaSet and scales down the current one under the rolling update rules.
 
@@ -455,17 +519,32 @@ Only Pod template changes create revisions. Changing `replicas` alone does not, 
 
 ### Why a green rollout can still be wrong
 
+**In plain words:** Kubernetes says "done" when the new copies start. It does not check that they give correct answers.
+
 Kubernetes reports success when new pods pass readiness. A readiness probe that only checks "process is up" will pass while the code is broken on real requests. Make readiness check real dependencies (carefully; a shared dependency in a readiness probe can take down every pod at once) and rely on SLO-based canary analysis for correctness.
 
 ### Config and secret changes are deploys
+
+**In plain words:** changing a setting is just as risky as changing code. Treat it the same way.
 
 A ConfigMap edit does not trigger a rollout unless you hash it into the Pod template (a common pattern is a checksum annotation in Helm). Pods that read the config at start keep the old value until restarted, so config problems can appear hours after the "change", on the next restart. Always log config version at startup.
 
 ### Mixed-version windows
 
+**In plain words:** during a rollout, old and new code run side by side for a while. Both must work with the same data.
+
+```mermaid
+flowchart LR
+    O["Old code v1"] --> S[("Shared DB, queue, cache")]
+    N["New code v2"] --> S
+    S --> R["Both must read what<br/>the other wrote"]
+```
+
 During a rolling update both versions serve traffic at once. Anything the two versions share (database schema, message formats, cache keys, API responses seen by one client across two requests) must work with both. This is why breaking changes are shipped in two steps.
 
 ### Metrics that need a `version` label
+
+**In plain words:** tag your graphs with the version name so you can see old vs new side by side. Keep the tag short so it doesn't blow up storage.
 
 Adding a high-cardinality label such as a commit SHA to every series multiplies series count. Use a small label (release tag), keep it on a few core metrics, or expose a separate `build_info{version="..."} 1` gauge and join:
 
@@ -475,7 +554,7 @@ sum by (version) (rate(http_requests_total{status=~"5.."}[5m]) * on (pod) group_
 
 This join works only if `build_info` carries a `pod` label matching the request metric; check your label names.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Production errors spike right after a deploy. What do you do in the first five minutes?
 > Confirm impact and blast radius on the dashboard. Check what changed in the last hour. Compare error rate by version. If the new version is guilty and there is no irreversible migration, roll back (`kubectl rollout undo`) or flip the flag. Post an update, then verify the graphs recover. Root cause comes after mitigation.
@@ -495,7 +574,7 @@ This join works only if `build_info` carries a `pod` label matching the request 
 > [!question]- What does a canary give you that a rolling update does not?
 > A rolling update replaces pods as they become Ready and judges only by probes. A canary sends a small share of traffic to the new version, compares its error and latency against stable, and aborts automatically. It limits the blast radius to that share.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Problem after a change: **roll back first, investigate after.**
 - Prove it: error ratio and p99 **by version**; deploy marker before first error.

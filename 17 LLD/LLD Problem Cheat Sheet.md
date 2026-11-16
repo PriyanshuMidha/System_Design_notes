@@ -14,7 +14,25 @@ updated: 2026-11-13
 > [!summary] TL;DR
 > One table for all 26 practice problems in this folder: the core entities, the patterns each one uses, the part that trips people up, the race you must name, and what to actually code in a 60-minute round. Use it the night before an interview, then open the linked note for the full design, code and tests.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then scan the table for 3-4 problems you know. Stop there.
+> - 🟡 **Know the basics?** Read the whole table, row by row, and open the full note for any row that feels unclear.
+> - 🔴 **Interview / SDE-3 prep?** Use "How to pick your first 5 minutes" and say the "race" column out loud for each problem. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This note is one big table, one row per practice problem in this folder.
+Each row lists the main things to model (the **entities**), the patterns used, and the trap most people fall into.
+It also names the **race**: the spot where two users at the same time can break the data, like two people booking one seat.
+Use it the night before an interview to refresh, not to learn a problem for the first time.
+
+```mermaid
+flowchart LR
+    T["Read one row"] --> R["Say entities, pattern, race out loud"] --> N["Unsure? Open the full note"]
+```
+
 
 **The problem in one story.**
 Tomorrow you have an LLD interview and 26 practice problems in this folder.
@@ -56,7 +74,7 @@ Where it breaks: a card cannot teach the topic; if a row makes no sense, open th
 > [!tip] Remember
 > For every problem: name the nouns, what varies, what two callers fight over, and the one method you will code.
 
-## The table
+## The table 🟡
 
 | Problem | Core entities | Patterns used | The tricky part | Concurrency hazard | What to code in 60 min |
 |---|---|---|---|---|---|
@@ -87,7 +105,7 @@ Where it breaks: a card cannot teach the topic; if a row makes no sense, open th
 | [[Order Book Matching Engine]] | Order, PriceLevel, Book, Trade | Command, single writer | Price-time priority; trade at the resting price; market remainder cancelled | Concurrent submissions, solved by one owning goroutine | Bid and ask books, match loop, sequenced trade events |
 | [[Digital Wallet and Ledger]] | Account, Transaction, Entry | Command, Repository | Double entry summing to zero; reversals instead of edits | Concurrent transfers overdrawing one account | Atomic transfer with balance check, idempotency key, reconcile |
 
-## How to pick your first 5 minutes
+## How to pick your first 5 minutes 🔴
 
 1. **Restate the problem and cut scope.** Name the three to five use cases you will code and say out loud what you are leaving out ([[LLD Interview Method]]).
 2. **Find the scarce resource.** Almost every problem above has one thing two callers fight over: a spot, a seat, a rider, a coupon, a balance. Name it and say how you make the claim atomic ([[Concurrency for LLD]]).
@@ -95,7 +113,7 @@ Where it breaks: a card cannot teach the topic; if a row makes no sense, open th
 4. **Sketch entities, not classes for everything.** Four to six nouns with their key fields, then the relationships ([[UML for LLD]]).
 5. **Decide the test you will show.** One happy path and one race or edge case, with an injected clock if time matters ([[Testing LLD Code]]).
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Digital Wallet and Ledger]], [[LLD Interview Method]]
 - **Next:** [[17 LLD MOC]], [[LLD Round Playbook]]

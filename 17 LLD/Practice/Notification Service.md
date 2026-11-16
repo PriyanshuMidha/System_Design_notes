@@ -24,7 +24,29 @@ updated: 2026-11-13
 > - The one rule: retry only retryable failures (network errors, 408, 429, 5xx) with capped, jittered backoff; any other 4xx is permanent.
 > - Classic mistakes: retrying an invalid phone number, rendering SMS with `html/template` (users see `&amp;`), and dropping queued messages on deploy.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code) and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs) and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+When you place an order, the app sends you an SMS, an email or a push message. A notification service turns one event, like "order placed", into one message per channel. Workers pick messages from a queue and send them through outside providers. Some failures are worth trying again, like a timeout. Others are not, like a wrong phone number. Trying again with growing gaps is called **backoff**. Urgent messages, like a login code, skip ahead of marketing.
+
+```mermaid
+flowchart LR
+    A["Event: order placed"] --> B["Queue"]
+    B --> C["Worker"]
+    C --> D["SMS / email / push"]
+    D -- "temporary fail" --> B
+```
+
+Everything else in this note is just these 3 questions:
+1. How does one event become messages on several channels?
+2. Which failures are retried, and how?
+3. How do priority, rate limits and clean shutdown work?
 
 **The problem in one story.** You order food. The app should send you an email, an SMS and a push message saying "order placed". The order page must not wait for the SMS company. If the SMS company is down, the message should be retried later, and it must never arrive twice.
 
@@ -66,7 +88,7 @@ flowchart LR
 > [!tip] Remember
 > Send asynchronously, claim a key once, retry only retryable errors with jittered backoff.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design a notification system that sends email, SMS, push and WhatsApp messages when
@@ -88,7 +110,7 @@ Design the classes, APIs and DB schema, and code the send path.
 
 What it really tests: Factory and Adapter for many providers behind one interface, a worker pool on channels, idempotency under concurrent duplicates, rate limiting as a decorator, and **error classification**: retrying every error would make an invalid phone number burn four provider calls and quota for nothing.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 Questions to ask, with the assumptions this design makes:
 
@@ -106,7 +128,7 @@ Questions to ask, with the assumptions this design makes:
 
 **Out of scope:** template authoring UI, localisation, campaign targeting, in-app inbox, delivery receipts (a follow-up through webhooks).
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 | --- | --- |
@@ -119,7 +141,7 @@ Questions to ask, with the assumptions this design makes:
 
 The use case to code: **process one notification in a worker**, from the idempotency claim to a sent, skipped or failed message.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 | --- | --- | --- |
@@ -134,7 +156,7 @@ The use case to code: **process one notification in a worker**, from the idempot
 
 Modelling insight: **a channel is not a provider.** The channel (SMS) is what the user sees; the provider (vendor A, vendor B) is who sends it. `Service` knows only channels and `Sender`; which vendors sit behind a channel, with what limits and in what failover order, is wiring. That is why failover and rate limiting never touch `Service`.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -200,7 +222,7 @@ stateDiagram-v2
   Sent --> [*]
 ```
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 ```text
 POST /notifications
@@ -225,7 +247,9 @@ POST /webhooks/providers/{provider}    delivery receipts (verify the signature)
 | `Process(ctx, n) error` | One message end to end; `ErrDuplicate`, `ErrOptedOut`, `ErrNoContact` or the send error |
 | `Permanent(err) error`, `IsPermanent(err) bool` | How adapters mark, and the loop detects, non-retryable failures |
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
+
+**In plain words:** Tables for notifications, templates and user settings. A unique key on each notification stops it from being sent twice.
 
 ```sql
 CREATE TABLE user_preferences (
@@ -321,7 +345,7 @@ cmd/demo/main.go    -> wiring: SDK clients -> adapters -> RateLimitedSender per 
 - `ratelimit.go` and `store.go` hold the only mutable state shared by workers, each behind its own mutex.
 - `service.go` knows the order of steps and never names a provider.
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 | --- | --- | --- |
@@ -336,7 +360,7 @@ cmd/demo/main.go    -> wiring: SDK clients -> adapters -> RateLimitedSender per 
 
 Not used: a Builder for `Notification` (six plain fields, a struct literal is clearer).
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > **Write in the room (about 150 lines):** `Channel`, `Priority`, `Notification`; `Permanent`, `IsPermanent`, `classify`; `Sender` and `SMSAdapter`; `SenderFactory`; `IdemStore` (`Claim`, `Release`); `PrefStore`; `Service` with `AddTemplate`, `Enqueue`, `Start`, `worker`, `Process`, `deliver` and `backoff`.
@@ -351,6 +375,8 @@ Not used: a Builder for `Notification` (six plain fields, a struct literal is cl
 > - **Calls with side effects are not chained in one boolean expression.** staticcheck SA4000 flags `!b.Allow() || !b.Allow() || b.Allow()`, so the test stores the three calls in three named variables.
 
 Complete package, Go 1.24, standard library only:
+
+**In plain words:** The complete package. Start with `Send`, then the worker loop, then the retry and provider failover code.
 
 ```go
 package notification
@@ -841,7 +867,7 @@ sequenceDiagram
   end
 ```
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 | --- | --- |
@@ -859,6 +885,8 @@ sequenceDiagram
 | `TestProcessRetriesAfterRateLimit` | a rate-limited send is retried and goes out once after the refill |
 
 All pass with `go vet` and `go test -race` on Go 1.24.4, also with `-count=10` (measured: 86–87% statement coverage; the figure moves slightly between runs because goroutine scheduling decides which `select` branches the workers take).
+
+**In plain words:** Fake senders that fail on demand, so tests can check retries, priority order and that nothing is lost on shutdown.
 
 ```go
 package notification
@@ -1196,7 +1224,7 @@ func TestProcessRetriesAfterRateLimit(t *testing.T) {
 }
 ```
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | Risk | Handling |
 | --- | --- | --- |
@@ -1216,7 +1244,7 @@ func TestProcessRetriesAfterRateLimit(t *testing.T) {
 | WhatsApp without opt-in | Policy violation, number banned | No contact unless opted in → `ErrNoContact` |
 | `IdemStore` grows forever | Memory leak | TTL in production (`SET NX EX 86400`) |
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 | --- | --- |
@@ -1252,7 +1280,7 @@ Common mistakes:
 
 See [[Case Study - Notification System]] for the system-level design (fan-out to millions, provider routing, analytics).
 
-## Drawing
+## Drawing 🟢
 
 ![[Notification System LLD Drawing.excalidraw]]
 
@@ -1266,7 +1294,7 @@ Redraw it from memory, then add what it predates: the high and low lanes, the fa
 - [ ] The permanent-error branch that skips both retry and failover
 - [ ] The `notifications` table with `UNIQUE (idempotency_key)`
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- Which errors do you retry, and how does the code know?
 > Only errors a later attempt can fix: timeouts (including HTTP 408), connection resets, 429 and 5xx. The adapter is the only code that sees the vendor's status, so it classifies there and wraps the rest with `Permanent`; `deliver` checks `IsPermanent` with `errors.As` and stops after one call.
@@ -1289,7 +1317,7 @@ Redraw it from memory, then add what it predates: the high and low lanes, the fa
 > [!question]- How do primary and secondary SMS providers fit without changing `Service`?
 > `FailoverSender` is itself a `Sender` holding the providers in order, each wrapped in its own rate limiter. A retryable error moves to the next provider; a permanent one stops, because an invalid number is invalid everywhere.
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - Event → one `Notification` per channel with key `order:<id>:<type>:<channel>`.
 - Worker: claim key → preferences → template (HTML only for email) → factory → send → classify.
@@ -1299,7 +1327,7 @@ Redraw it from memory, then add what it predates: the high and low lanes, the fa
 - Two lanes, high read first; `Close` = stop intake, drain, deadline.
 - Production: outbox table, Kafka, Redis bucket, DLQ.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Factory and Abstract Factory]], [[Adapter]], [[Decorator and Middleware]], [[Delivery Partner Assignment]]
 - **Next:** [[Rate Limiter]], [[Circuit Breaker]]

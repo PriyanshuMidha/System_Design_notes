@@ -28,7 +28,38 @@ updated: 2026-11-13
 > - Synchronous chains multiply failure and latency. Break them with events where the business allows.
 > - Numbers here are estimates unless a source is named.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the five steps), 4 (worked example), 5, 6 and the scenario drills.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 9 and "How to say it in the interview". Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Programs talk to each other all the time. The question is how.
+Sometimes the caller asks and waits for the answer, like a phone call. That is **synchronous** (sync).
+Sometimes the caller drops a note and moves on, and someone handles it later, like a text message. That is **asynchronous** (async).
+Sometimes the server needs to push news to the phone without being asked, like "your rider is near".
+REST, gRPC, GraphQL, WebSocket, webhooks and events are just different tools for these three kinds of talk.
+
+```mermaid
+flowchart LR
+    A["Ask and wait<br/>(REST, gRPC)"] --> X["Caller needs the answer now"]
+    B["Drop a note<br/>(events, queues)"] --> Y["Caller does not wait"]
+    C["Server pushes<br/>(WebSocket, SSE, webhook)"] --> Z["News without asking"]
+```
+
+```mermaid
+flowchart LR
+    Q{"Does the caller need<br/>the answer right now?"} -- "yes" --> S["Sync call"]
+    Q -- "no" --> E["Event or queue"]
+```
+
+The rest of this note is just these 3 questions:
+1. Who is calling, and must they wait?
+2. Which way does the data flow (ask, push, or broadcast)?
+3. How do you keep it safe when calls fail, retry or arrive twice?
 
 **The problem in one story**
 
@@ -76,7 +107,7 @@ Where it breaks: a text can be lost silently, but a well-built queue keeps the m
 > [!tip] Remember
 > Ask "does the caller need the answer now?" If no, use an event.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Take a food delivery app. The customer places an order and sees live courier location. The restaurant tablet gets the order. The payment provider calls back when the charge settles. The email service sends a receipt. The analytics team wants every event.
 
@@ -92,7 +123,7 @@ Choosing wrong shows up as slow screens, fragile call chains, and outages that s
 > [!tip] Remember
 > The style follows the conversation: who talks, which direction, how long they can wait.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Compare ways of getting a pizza and its updates.
 
@@ -122,7 +153,7 @@ flowchart LR
     end
 ```
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Step 1: who is the caller?
 
@@ -143,6 +174,8 @@ flowchart TD
 ```
 
 ### Step 2: which direction does data flow?
+
+**In plain words:** Does the client ask, does the server push, or do both talk freely? The answer narrows the choice a lot.
 
 ```mermaid
 flowchart TD
@@ -184,6 +217,8 @@ The user waits only for what must be true before the order exists (payment). The
 
 ### The comparison table
 
+**In plain words:** Every style side by side. Read one row (like "browser support") across to see which styles fit.
+
 | Dimension | REST | gRPC | GraphQL | WebSocket | SSE | Webhook | Async events |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Transport | HTTP/1.1 to 3 | HTTP/2, Protocol Buffers | HTTP POST (usually) | TCP upgrade from HTTP | HTTP, long-lived response | HTTP POST to the receiver | Broker protocol (Kafka, AMQP, SQS API) |
@@ -202,6 +237,8 @@ Related deep notes: [[Choosing an API Style]], [[REST and HTTP API Design]], [[g
 
 ### Step 4: pick the real-time option
 
+**In plain words:** For live updates: server-to-client only means SSE; both ways means WebSocket; rare updates can just poll.
+
 ```mermaid
 flowchart TD
     RT{"Real-time need"}
@@ -216,6 +253,8 @@ flowchart TD
 
 ### Step 5: pick the style for events
 
+**In plain words:** Match the need to the tool: a work queue for jobs, a log like Kafka for replayable history, a webhook for outside partners.
+
 | Need | Choice |
 | --- | --- |
 | Simple job to run once, retry on failure | Queue (SQS, RabbitMQ) |
@@ -225,7 +264,7 @@ flowchart TD
 
 See [[Queues vs Streams and Broker Comparison]], [[Kafka and Event Streaming]], [[Delivery Semantics and Exactly-Once]] and [[Saga Pattern]].
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 **Problem:** the API surface for the food delivery app. Pick a style per conversation.
 
@@ -270,9 +309,11 @@ flowchart TD
 > [!tip] Remember
 > One system uses many styles. Choose per conversation, not per company.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Sync versus async
+
+**In plain words:** Sync is simple but ties the caller to the other service's speed and health. Async frees the caller but adds a queue to run and watch.
 
 | Dimension | Synchronous | Asynchronous |
 | --- | --- | --- |
@@ -286,6 +327,8 @@ flowchart TD
 
 ### Polling, long polling, SSE, WebSocket
 
+**In plain words:** Four ways to get fresh news to a screen, from "keep asking" to "keep a line open".
+
 | Style | Round trips | Server cost | Works through old proxies | Best for |
 | --- | --- | --- | --- | --- |
 | Polling | One per interval | Low per request, wasteful | Yes | Slow updates |
@@ -295,9 +338,11 @@ flowchart TD
 
 ### Putting a gateway in front
 
+**In plain words:** One front door handles login, limits and routing for every style, so each service does not have to.
+
 An API gateway can terminate TLS, authenticate, rate limit, and route REST, gRPC and WebSocket traffic. A BFF shapes responses per client. See [[API Gateway and BFF]].
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 - **REST** is universal but can be chatty and over-fetch.
 - **gRPC** is fast and typed but awkward for browsers and for caching. Long-lived HTTP/2 connections can pin traffic to a few backends behind a connection-level balancer ([[Load Balancing]]).
@@ -310,7 +355,7 @@ An API gateway can terminate TLS, authenticate, rate limit, and route REST, gRPC
 > [!warning] Common mistake
 > Calling REST "stateless so it scales" and WebSocket "does not scale". Both scale; WebSocket just needs more care because the server holds state per connection.
 
-## 7. In production
+## 7. In production 🔴
 
 Public, documented examples:
 
@@ -334,9 +379,11 @@ What to watch:
 
 See [[Circuit Breaker]], [[Backpressure and Flow Control]], [[Dead Letter Queues and Poison Messages]].
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Why gRPC streams can overload one pod
+
+**In plain words:** gRPC keeps one long connection open. A simple balancer picks a server once per connection, so all of that client's calls pile onto one server.
 
 gRPC multiplexes many calls over one long-lived HTTP/2 connection. A layer 4 load balancer picks a backend once per connection, so one client can send all its calls to one pod. Use a layer 7 balancer, client-side balancing or a mesh to spread per-call traffic.
 
@@ -356,24 +403,55 @@ sequenceDiagram
 
 ### Webhook delivery guarantees
 
+**In plain words:** The sender keeps retrying until you say "got it", so you may get the same event twice. Check the event id and ignore repeats.
+
 A webhook sender retries until it gets `2xx`, so delivery is at least once and may reorder. Receivers verify a signature, record the event ID, return `2xx` quickly, and process in the background. Always offer a way to re-fetch the object by ID.
+
+```mermaid
+flowchart LR
+    S["Sender"] -- "event id 77" --> R["Your endpoint"]
+    R --> C{"Seen id 77 before?"}
+    C -- "yes" --> OK["Reply 2xx, do nothing"]
+    C -- "no" --> P["Save id, reply 2xx,<br/>process in background"]
+```
 
 ### Events versus commands
 
+**In plain words:** A command says "please do this". An event says "this happened". Commands have one receiver; events can have many listeners.
+
 A **command** asks one service to do something ("charge this card"), so it is a request and usually sync. An **event** states that something happened ("OrderPlaced"), so the producer does not know who listens. Mixing them leads to hidden coupling.
+
+```mermaid
+flowchart LR
+    O["Order service"] -- "command: charge card" --> P["Payment service"]
+    O -- "event: OrderPlaced" --> Q["Log / queue"]
+    Q --> N["Notifier"]
+    Q --> A["Analytics"]
+```
 
 ### The dual write trap
 
+**In plain words:** Saving to the database and then sending a message are two steps. A crash between them loses the message. Save both in one step instead (the outbox).
+
 If a service writes to its database and then publishes an event, a crash between the two loses the event. The [[Transactional Outbox and CDC]] pattern writes the event in the same transaction and publishes it from there.
 
+```mermaid
+flowchart LR
+    A["One DB transaction:<br/>save order + outbox row"] --> B["Relay reads outbox"]
+    B --> C["Publishes event"]
+    C --> D["Crash anywhere?<br/>Relay just retries"]
+```
+
 ### Timeouts everywhere
+
+**In plain words:** Every call must give up at some point, and inner calls must give up sooner than outer ones.
 
 Every sync call needs a deadline shorter than its caller's deadline, or the chain of waiting requests exhausts threads and connections. Propagate deadlines (gRPC does this natively with `context`).
 
 > [!tip] Remember
 > Sync needs deadlines and circuit breakers. Async needs idempotent consumers and a dead-letter queue.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- REST, gRPC or GraphQL for a new service?
 > Public or partner callers: REST with OpenAPI, since it is simple, cacheable and universal. Internal service to service: gRPC for speed, strict contracts and deadlines. Many client apps needing different shapes of the same data: GraphQL or a BFF. I pick by caller, then by data shape.
@@ -396,7 +474,7 @@ Every sync call needs a deadline shorter than its caller's deadline, or the chai
 > [!question]- Why not use GraphQL everywhere?
 > HTTP caching is weak, nested queries can be expensive, authorisation is per field, and the server needs cost limits. For simple CRUD or public cacheable data, REST is cheaper to run.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - External developers: REST. Internal services: gRPC. Many shapes for many clients: GraphQL or BFF.
 - Server to client only: SSE. Two-way: WebSocket. Tell another company: webhook.
@@ -407,7 +485,7 @@ Every sync call needs a deadline shorter than its caller's deadline, or the chai
 - Use the outbox pattern to avoid dual-write loss.
 - Pick per conversation; real systems mix styles.
 
-## Real-life scenario drills
+## Real-life scenario drills 🟡
 
 | Scenario | Choice | Why | What you say in the interview |
 | --- | --- | --- | --- |
@@ -422,7 +500,7 @@ Every sync call needs a deadline shorter than its caller's deadline, or the chai
 | Stock price ticker to browsers | WebSocket or SSE with fan-out | Many subscribers, push | "Fan-out through pub/sub behind the connection servers." |
 | Long business flow (booking) | Saga or workflow engine | Several steps and compensations | "Orchestrate with events and compensating actions, not one distributed transaction." |
 
-## How to say it in the interview
+## How to say it in the interview 🔴
 
 - "I choose the style per conversation. For partners, REST. Between our services, gRPC with deadlines. For the mobile app, a BFF."
 - "The user waits only for what must be true before the order exists: payment. Everything else is an event."
@@ -431,7 +509,7 @@ Every sync call needs a deadline shorter than its caller's deadline, or the chai
 - "The cost of async is eventual consistency and harder debugging, so I add tracing across the broker and a dead-letter queue."
 - Trade-off line: "gRPC gives me speed and contracts but costs browser support, so I keep REST at the edge."
 
-## Links
+## Links 🟢
 
 - Before this: [[Choosing an API Style]], [[Event-Driven Architecture Basics]]
 - APIs: [[REST and HTTP API Design]], [[gRPC]], [[GraphQL]], [[Real-time APIs - WebSocket, SSE and Long Polling]], [[Webhooks - Sending and Receiving]], [[API Gateway and BFF]], [[Idempotency and Idempotency Keys]], [[Protocol Buffers and Schema Evolution]], [[API Versioning and Backward Compatibility]]

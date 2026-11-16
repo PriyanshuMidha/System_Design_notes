@@ -36,7 +36,32 @@ flowchart LR
 
 The controller calls the use case; the use case calls the entity to enforce invariants, calls `Repo` to persist, and reports the outcome through a presenter port — never returning raw domain data to the controller directly.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Picture your code as rings, like an onion.
+The center holds the business rules, like "an invoice total cannot be negative". These are the **entities**.
+The next ring holds the **use cases**: the actions the app does, like "create invoice".
+Outer rings hold the web handlers, the database code and the frameworks.
+The one rule: code only points inward. The center never imports the database or the web framework.
+So you can swap the database or test the rules without starting anything.
+
+```mermaid
+flowchart LR
+    F["Frameworks + DB"] --> AD["Adapters"] --> UC["Use cases"] --> E["Entities"]
+```
+
+The rest of this note is just these 3 questions:
+1. What lives in each ring?
+2. How does data cross a ring without breaking the inward rule?
+3. When is all this worth it, and when is it too much?
+
 
 **The problem in one story.**
 Your invoice rules live inside an HTTP handler.
@@ -80,7 +105,7 @@ Where it breaks: onion layers do not talk; here outer rings call inward and inne
 > [!tip] Remember
 > Dependencies only point inward; the business rules never know about HTTP or SQL.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A `CreateInvoice` handler that builds a `*sql.Invoice` struct straight from `r.Body`, inserts it, and serializes the same struct back as JSON works fine until three things happen at once, which they eventually do: the API needs a field the database doesn't have yet (a computed due-date label), a second entry point (an internal gRPC call from the reminders worker) needs to create invoices too, and the business rule "an invoice amount must be positive" needs to be enforced regardless of which entry point created it.
 
@@ -88,7 +113,7 @@ Without a boundary, that rule either gets duplicated in both entry points or get
 
 Clean Architecture's answer is structural: put the rule inside an **entity** that cannot be constructed in an invalid state (`domain.NewInvoice` returns an error instead of letting a bad `Invoice` exist), put the operation inside a **use case** that any entry point can call the same way, and make every entry point (HTTP, gRPC, a test) talk to the use case through the same input and output boundary — never by reaching into the entity's internals or the database row's shape directly.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Four rings, drawn as circles, not a stack: **entities** in the center, **use cases** around them, **interface adapters** around that, **frameworks & drivers** on the outside. The rule is not "upper calls lower" (that's [[Layered Architecture]]'s mental model) — it's "nothing inside may know an outside ring exists."
 
@@ -98,7 +123,18 @@ An interface adapter (a controller, a presenter, a repository implementation) ha
 
 Where this differs from hexagonal's single core/port/adapter split: Clean Architecture subdivides "the inside" into two named rings (entities and use cases) specifically so that enterprise-wide rules (an invoice can't have a negative amount, true in any application that has invoices) are separated from application-specific rules (an invoice becomes payment_failed after a declined charge — specific to this app's workflow, not a universal fact about invoices).
 
-## 3. How it works
+```mermaid
+flowchart TB
+    subgraph Outer["Frameworks and drivers"]
+      subgraph Adapters["Interface adapters"]
+        subgraph UseCases["Use cases"]
+          E["Entities"]
+        end
+      end
+    end
+```
+
+## 3. How it works 🟡
 
 ```mermaid
 flowchart TD
@@ -135,6 +171,8 @@ The dashed "implements" arrows are the Dependency Rule made visible: `adapter/po
 
 ### Crossing a boundary: input ports, output ports, DTOs
 
+**In plain words: the use case says what it needs as interfaces, and data crosses rings as plain structs.**
+
 A use case is called through an **input port** — in Go, simply its exported `Execute` method, taking a plain input struct with no JSON tags and no framework type in sight.
 
 It reports its result through an **output port** — an interface the use case declares (`CreateInvoicePresenter` below), implemented by whichever adapter actually needs the result (a JSON presenter, a template renderer, a test's recording fake).
@@ -143,11 +181,15 @@ The use case never returns a `domain.Invoice` directly to its caller, and never 
 
 ### Error mapping across the boundary
 
+**In plain words: inner rings return business errors; the outer ring turns them into HTTP codes.**
+
 A `domain.ErrInvalidAmount` means nothing to an HTTP client; it needs to become a 400. A `postgres.ErrNotFound` needs to become a 404. That translation happens in exactly one place — the presenter, in `adapter/http` — using `errors.Is` against the domain and adapter packages' exported sentinel errors.
 
 The use case itself never imports `net/http`, so it cannot (and must not) decide what status code anything maps to; it only ever calls `PresentError(err)` and lets the ring outside it decide what that means in that ring's vocabulary.
 
 ### Go layout
+
+**In plain words: which folder each ring goes into.**
 
 ```text
 clean/
@@ -163,7 +205,7 @@ Each folder is one ring. `domain` imports nothing in this module. `usecase` impo
 
 `adapter/*` imports `usecase` (and `domain`'s exported errors, for mapping) but never each other. `cmd` is the only package that imports every concrete type and wires them together — the same composition-root role [[Service Project Layout and Wiring]] gives `main.go` for an ordinary layered or hexagonal service.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 **Ring 1 — entities.** `domain.Invoice` cannot exist in an invalid state, and `MarkPaid` is a business rule, not a setter:
 
@@ -670,7 +712,7 @@ func TestCreateInvoice_Concurrent(t *testing.T) {
 
 **Measured:** `go test -race ./...` across `usecase` and `cmd` in a scratch module (Go 1.24.4, darwin/arm64, 2026-11-07): all tests pass, including a 50-goroutine concurrent-create test against `postgres.Repo` and the full `cmd.Wire()` end-to-end test above (create then pay through the real `net/http.ServeMux`), with no data race reported.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -679,14 +721,20 @@ func TestCreateInvoice_Concurrent(t *testing.T) {
 | Clean Architecture | Four named rings, mandatory boundary DTOs, input/output ports per use case | Larger codebases/teams where "which ring does this belong in" needs a shared, enforceable vocabulary | More mapping boilerplate (input DTO, output DTO, presenter) per use case than hexagonal typically needs |
 | Onion Architecture (Palermo, 2008) | Concentric rings very close to Clean Architecture's, domain model at the center, often paired with domain services and infrastructure rings | Interchangeable with Clean Architecture in practice; some teams prefer its naming | Same costs as Clean Architecture; the difference is largely vocabulary, not mechanics |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Mapping boilerplate compounds: an input DTO, a domain call, an output DTO, and a presenter implementation exist for every single use case, even a trivial one. A `GetInvoice` read-only lookup pays nearly the same ceremony tax as `PayInvoice`.
 - Over-engineering a small CRUD service is the single most common misuse: a two-endpoint internal tool rarely needs four named rings and a presenter interface per operation — [[Layered Architecture]] or even a flat package does the same job with far less code.
 - Go-idiom tension: Go favors small, locally-defined interfaces and direct returns (`(Invoice, error)`), while Clean Architecture as originally described (in a Java/C# world) favors an explicit presenter callback instead of a return value. Go code following this pattern often feels more ceremonial than idiomatic Go elsewhere in the same codebase — a deliberate trade for the isolation this buys, not a sign something's wrong.
 - Letting an ORM model or a request struct leak into `usecase` or `domain` — even "just this once," even just as a method parameter type — defeats the entire pattern. The Dependency Rule has no partial-credit version.
 
-## 7. In production
+```mermaid
+flowchart TD
+    Q{"Lots of business rules, long life?"} -- "yes" --> C["Clean rings pay off"]
+    Q -- "no, mostly CRUD" --> S["Simple layers are enough"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:** this is the standard reference architecture cited across the Go, Java, and .NET ecosystems whenever a team wants to isolate business logic from a specific framework version or ORM; InvoiceOps uses the same ring structure for its payment and invoicing core (see [[Capstone - InvoiceOps]]).
 - **Failure modes → fixes:**
@@ -696,7 +744,7 @@ func TestCreateInvoice_Concurrent(t *testing.T) {
   - Overengineering: a small internal tool gets a full four-ring structure for two endpoints, adding more files than the problem has ever needed → start with [[Layered Architecture]] and introduce rings only once a second use case or second adapter actually demands the isolation.
 - **What to monitor:** import-direction violations are a static-analysis problem, not a runtime one — a lint rule or `go vet`-adjacent check that fails the build on an inward-ring package importing an outer one (several Go linters support "layer" or "boundary" import rules) catches drift long before a review does; also watch how much boilerplate a typical PR for "add one field to a use case" generates, as a proxy for whether the ceremony is earning its cost here.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Is Clean Architecture worth it in Go?** For a service with one or two use cases and one storage engine, no — the input/output DTOs and presenter interfaces for `CreateInvoice` alone are already more code than a layered equivalent, for isolation the team isn't yet spending. It earns its cost once at least two of the following are true: multiple teams own different use cases in the same codebase and need an enforceable boundary vocabulary, the domain rules are complex enough that "enterprise-wide" (entity) and "this workflow" (use case) genuinely need to be told apart, or the service expects to swap its delivery mechanism (REST today, gRPC or an event consumer added later) without touching business logic.
 
@@ -708,7 +756,7 @@ func TestCreateInvoice_Concurrent(t *testing.T) {
 
 **Error mapping across layers, in full.** A `domain.ErrInvalidAmount` crosses two boundaries before it becomes an HTTP response: `usecase.CreateInvoice.Execute` calls `out.PresentError(err)` without inspecting it (the use case doesn't know or care what an HTTP status is), and `adapter/http.jsonPresenter.PresentError` is the one function in the whole codebase allowed to have an `errors.Is` chain mapping domain and adapter sentinel errors onto `http.StatusBadRequest`, `http.StatusNotFound`, and so on. If a second driving adapter (gRPC) is added later, it gets its own presenter with its own mapping to gRPC status codes — the use case and the domain never change.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- State the Dependency Rule in one sentence.
 > Source-code dependencies can only point inward, toward higher-level policy: an inner ring (entities, then use cases) must never import, reference, or know the existence of anything in an outer ring (interface adapters, then frameworks and drivers).
@@ -731,7 +779,7 @@ func TestCreateInvoice_Concurrent(t *testing.T) {
 > [!question]- What specifically breaks if an ORM-generated struct is returned from a Repo port method?
 > The use-case ring now has a compile-time dependency on the ORM package (to even name the struct's type), which violates the Dependency Rule outright — the use case has stopped being swappable or testable without that ORM present, regardless of whether a real database is actually hit in a given test.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Four rings, inside to outside: entities → use cases → interface adapters → frameworks & drivers.
 - The Dependency Rule: source-code dependencies only point inward, no exceptions, not even for a "convenient" type.
@@ -742,7 +790,7 @@ func TestCreateInvoice_Concurrent(t *testing.T) {
 - Same mechanics as hexagonal and onion; Clean Architecture is the most prescriptive about naming and boundary DTOs.
 - Don't reach for it below one or two use cases and one storage engine — start layered, grow into rings when a second use case or delivery mechanism actually shows up.
 
-## Links
+## Links 🟢
 - **Before this:** [[Hexagonal Architecture (Ports and Adapters)]]
 - **Next:** [[SOLID in Go]]
 - **Compare with:** [[Layered Architecture]] (the simpler default this pattern is an evolution of), [[Service Project Layout and Wiring]] (the composition-root pattern `cmd.Wire` follows), [[Capstone - InvoiceOps]] (the running example whose payment core uses this ring structure)

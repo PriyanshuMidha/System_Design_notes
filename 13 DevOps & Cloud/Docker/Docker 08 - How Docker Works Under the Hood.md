@@ -23,7 +23,37 @@ updated: 2026-11-13
 > - The filesystem a container sees is **overlay2**: read-only image layers stacked under one writable layer, merged into a single view.
 > - Classic mistake: thinking a container is a lightweight VM. It is one Linux process tree with restricted visibility — there is no second kernel underneath it.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A container is just a normal Linux program with blinders on.
+Linux has a feature called **namespaces**: it can make a program see only its own files, its own network and its own process list.
+Another feature, **cgroups**, puts a cap on how much CPU and memory that program may use.
+
+```mermaid
+flowchart LR
+    P["Normal process"] --> N["+ namespaces<br/>(what it can see)"] --> G["+ cgroups<br/>(what it can use)"] --> C["= a container"]
+```
+
+The files it sees come from the image layers stacked on top of each other.
+Docker itself is mostly a friendly front end. It passes the job down to smaller tools that do the real work.
+
+```mermaid
+flowchart LR
+    CLI["docker CLI"] --> D["dockerd"] --> CD["containerd"] --> R["runc: sets up namespaces + cgroups"]
+```
+
+The rest of this note is just these 3 questions:
+1. What happens when you type docker run?
+2. What do namespaces, cgroups and overlay files each do?
+3. Why does a container get OOM-killed, and how do builds cache steps?
+
 
 **The problem in one story**
 
@@ -70,7 +100,7 @@ Where it breaks: every cubicle sits in the same building on the same foundations
 > [!tip] Remember
 > A container is one Linux process with a restricted view (namespaces) and a budget (cgroups) on a shared kernel.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A VM needs a hypervisor, a full guest kernel, and minutes to boot because it virtualizes hardware.
 
@@ -80,7 +110,7 @@ Linux has had the primitives for that lie since kernel 2.6.24 introduced cgroups
 
 That is the entire reason containers start in milliseconds and VMs take seconds to minutes: a container skips boot, kernel init, and guest-OS overhead entirely, because there is no guest OS.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture one Linux host with one running kernel. Each container is a normal process tree that the kernel has been told to show a restricted view of reality:
 
@@ -91,9 +121,11 @@ Picture one Linux host with one running kernel. Each container is a normal proce
 
 Nothing here is an emulated CPU or a second kernel — a container escape is dangerous precisely because the kernel really is shared.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The call chain for `docker run`
+
+**In plain words:** your command passes through four programs. The last one, runc, actually asks Linux to build the walls and then steps aside.
 
 ```mermaid
 sequenceDiagram
@@ -120,6 +152,8 @@ sequenceDiagram
 `containerd-shim` is the long-lived process per container: it keeps stdin/stdout/stderr open, reports exit status, and crucially lets `dockerd` (or even the whole Docker Engine) restart without killing running containers, since the shim — not dockerd — is the container's actual parent.
 
 ### Namespaces: what the process can see
+
+**In plain words:** each namespace hides one kind of thing: other processes, other network cards, other files, other users.
 
 ```mermaid
 flowchart TB
@@ -156,6 +190,8 @@ A container is **all seven namespaces plus a cgroup**, applied to one process be
 
 ### cgroups v2: what the process can use
 
+**In plain words:** cgroups are limits. Go over the memory limit and Linux kills the process; go over CPU and it just gets slowed down.
+
 cgroups v2 (the unified hierarchy, default since Docker Engine switched over around 20.10 on cgroup-v2 hosts) exposes controllers as files under `/sys/fs/cgroup/<path>`:
 
 - `memory.max` — a hard ceiling; crossing it invokes the kernel OOM killer *inside that cgroup*, killing the container's process instead of some unrelated host process.
@@ -164,6 +200,8 @@ cgroups v2 (the unified hierarchy, default since Docker Engine switched over aro
 - `pids.max` — caps the number of processes/threads, the standard defense against a fork bomb inside one container.
 
 ### overlay2: what filesystem the process sees
+
+**In plain words:** Linux lays the read-only image layers on top of each other and puts one writable layer on top. The container sees one normal folder.
 
 ```mermaid
 flowchart TB
@@ -186,7 +224,7 @@ Writing triggers **copy-up**: the file is copied into `upperdir` first, then mod
 
 That is what makes one image shareable as the read-only base for many running containers at once, and what "the writable layer is ephemeral" (`docker rm` discards `upperdir`) actually means mechanically.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -200,6 +238,8 @@ if pct >= 100 {
 ```
 
 ### Full example: reading cgroup v2 memory accounting
+
+**In plain words:** Go code that reads the container's own memory limit and usage straight from Linux files.
 
 ```go
 // Package cgroup parses cgroup v2 memory accounting files, the same
@@ -298,6 +338,8 @@ func TestUsagePercentNoLimit(t *testing.T) {
 
 ### BuildKit's cache invalidation, traced
 
+**In plain words:** each build step gets a fingerprint. If the fingerprint matches last time, the step is skipped. Change one input and every later step reruns.
+
 BuildKit (the default `docker build` backend since Docker Engine 23.0, replacing the legacy builder) hashes each instruction together with its inputs.
 
 The **first instruction whose hash changes invalidates every layer below it**, regardless of which lines changed:
@@ -313,7 +355,7 @@ RUN go build -o app .   # always reruns once COPY . . misses
 
 Reordering `COPY go.mod go.sum ./` before `COPY . .` means an application-code change only invalidates the last two steps, not a 30-second `go mod download` — the mechanism behind the cache-friendly instruction order in [[Docker 04 - Writing a Production Dockerfile for Go]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -323,14 +365,14 @@ Reordering `COPY go.mod go.sum ./` before `COPY . .` means an application-code c
 | gVisor (`runsc`) | User-space kernel intercepts syscalls instead of using the host kernel directly | Running less-trusted workloads with stronger isolation | Syscall interception overhead; some syscalls unsupported |
 | Kata Containers | Each container gets a lightweight VM (its own kernel) via a container-shaped API | Strong isolation needed, e.g. multi-tenant untrusted code | VM-level boot/memory overhead, closer to a VM than a container |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - The kernel is shared: a kernel vulnerability or a container running as root with the right capability can affect the host. Containers isolate much less than a VM by default (see [[Docker 09 - Container Security and Hardening]]).
 - cgroup limits cap resource *use*, not resource *contention side effects* — two containers can still contend for the same disk I/O or network bandwidth unless those are also limited.
 - Overlay2's copy-up means the first write to a large untouched file (e.g. modifying one byte of a big binary that lives in a lower layer) copies the whole file into `upperdir` before writing — expensive for large files written in place.
 - For workloads needing kernel-level isolation from other tenants, a namespace-only container is the wrong boundary — reach for a microVM (Kata, Firecracker) or gVisor instead.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Kubernetes nodes run containerd (or CRI-O) directly, with no Docker daemon in the loop at all, even when the images are still built with `docker build`; AWS Fargate runs each task inside its own Firecracker microVM, and Google Cloud Run sandboxes each instance with gVisor — both give a stronger tenant-isolation boundary than bare namespaces, by the two different mechanisms this note's §5 comparison lists (microVM vs user-space kernel); Docker Desktop on macOS/Windows runs a lightweight Linux VM and all containers' namespaces live inside that one VM's kernel, not the host OS's.
 - **Failure modes → fixes:**
@@ -340,14 +382,14 @@ Reordering `COPY go.mod go.sum ./` before `COPY . .` means an application-code c
   - dockerd restarts kill running containers unexpectedly → check that `containerd` and its shims are actually surviving the restart (`live-restore` should be enabled); if shims are also dying, something is cleaning up PIDs that shouldn't be.
 - **What to monitor:** per-container cgroup memory/CPU usage vs limits (`docker stats`, or scrape `/sys/fs/cgroup/.../memory.current` via cAdvisor/Prometheus); OOM-kill events (`dmesg`, kernel `oom_kill` counter); image pull and layer-cache hit rate in CI.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **The OCI specs are what make this interoperable.** The **OCI Image Specification** defines a content-addressed manifest + config + layer tarballs format — any OCI-compliant image (built by `docker build`, `buildah`, or `nerdctl`) can run on any OCI-compliant runtime. The **OCI Runtime Specification** defines `config.json`: the namespaces, cgroup paths, mounts, and the entrypoint a conforming runtime (runc, crun, gVisor's runsc, Kata) must set up. Docker, containerd, Podman and Kubernetes all consume the same two specs, which is why an image built once runs unmodified across all of them.
 - **Why the shim exists.** Before containerd's shim architecture, a single long-lived daemon process (`dockerd`) was the direct parent of every container, so restarting or upgrading the daemon killed every running container with it. The shim is the actual parent process (and PID 1's reaper for zombies), so `containerd` and `dockerd` can be upgraded and restarted — with `live-restore` enabled — without touching running workloads.
 - **Rootless Docker** runs `dockerd` itself as an unprivileged user, using user namespaces to remap container "root" (UID 0 inside) to an unprivileged UID on the host. It needs `slirp4netns` or similar for networking (since an unprivileged user can't create arbitrary bridges), which costs some network throughput versus the default root-daemon setup.
 - **Why `docker run --privileged` is so dangerous:** it disables most of this chapter's protections at once — it grants all Linux capabilities, disables the seccomp and AppArmor profiles, and mounts host devices, effectively handing the container the same reach as a root process on the host.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Is a container a lightweight virtual machine?
 > No. A VM virtualizes hardware and runs its own kernel under a hypervisor. A container is an ordinary host process restricted by Linux namespaces (what it can see) and cgroups (what it can use), running on the one shared host kernel — there is no second kernel.
@@ -367,7 +409,7 @@ Reordering `COPY go.mod go.sum ./` before `COPY . .` means an application-code c
 > [!question]- Why do Kubernetes nodes typically run containerd directly, with no `dockerd`?
 > The Kubernetes kubelet talks to a container runtime through the CRI (Container Runtime Interface); containerd implements CRI natively, so dockerd — which adds the Docker-specific REST API, build, and CLI UX nobody on a node needs — is an unnecessary extra hop. Images are still built with `docker build` (or `buildx`/`buildah`) and pushed to a registry that containerd pulls from directly.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Chain: CLI → dockerd (REST) → containerd (gRPC) → shim (per container, long-lived) → runc (builds the container, then exits).
 - Isolation = namespaces (pid, net, mnt, uts, ipc, user, cgroup) for visibility + cgroups v2 (memory.max, cpu.max, pids.max) for resource limits.

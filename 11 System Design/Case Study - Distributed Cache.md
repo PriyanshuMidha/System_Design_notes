@@ -26,7 +26,33 @@ updated: 2026-11-13
 > - Clients are either **smart** (they know the node map, like Redis Cluster clients) or go through a **proxy** (like twemproxy or mcrouter).
 > - The cache is not the source of truth. Design every failure mode (node down, hot key, stampede, stale data) around protecting the database behind it.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A **cache** is a fast memory store that keeps answers you asked for recently.
+Reading from memory takes well under a millisecond. Reading from a database can take ten or more.
+One cache machine runs out of memory and becomes a single point of failure.
+So you spread the data over many machines. A simple rule, called **hashing**, turns each key's name into "which machine owns it".
+
+```mermaid
+flowchart LR
+    K["key: user:42"] --> H["hash rule"] --> N2["Machine 2"]
+    K2["key: item:9"] --> H --> N1["Machine 1"]
+```
+
+Each machine also has a backup copy on another machine, so a crash does not lose everything.
+The database always stays the real truth. The cache can forget anything at any time.
+
+So the rest of this note is just these 3 questions:
+1. How does every app server agree which machine holds a key?
+2. What happens when a machine dies or a new one is added?
+3. What goes wrong when one key gets very popular or expires under heavy traffic?
 
 **The problem in one story.**
 Your app shows a product page.
@@ -72,7 +98,7 @@ Where it breaks: a notebook never loses pages on its own, while a cache node can
 > [!tip] Remember
 > A distributed cache is fast, forgetful memory spread over many nodes; the database stays the source of truth.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 A single Redis or Memcached server can hold maybe tens of gigabytes and serve on the order of 100,000 simple operations per second (an assumption, not a promise; it depends on value size and CPU).
 
@@ -99,7 +125,7 @@ A big product needs terabytes and millions of operations per second. You cannot 
 > [!tip] Remember
 > The first question to ask in an interview: "Is this a cache (can lose data) or a datastore (cannot)?" The answer decides replication, persistence and consistency. This note designs a cache.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the cluster as a **hotel with numbered rooms and a front desk**.
 
@@ -129,7 +155,7 @@ Three ideas carry the whole design:
 > [!tip] Remember
 > A cache is a bet that "the future looks like the recent past". Everything else (hashing, replication, eviction) exists to make that bet cheap and safe.
 
-## 3. How it works - high-level design
+## 3. How it works - high-level design 🟡
 
 ### Cluster layout and request flow
 
@@ -173,6 +199,8 @@ flowchart TB
 
 ### Step-by-step: a read that hits and a read that misses
 
+**In plain words:** first check the cache. If it has the answer, done. If not, read the database and save a copy in the cache for next time.
+
 1. The client takes the key `user:42:profile` and computes the hash (CRC16 in Redis Cluster, a ring hash in Memcached clients).
 2. It looks up which node owns that hash in its local map.
 3. It sends `GET` straight to that node. One network round trip.
@@ -203,6 +231,8 @@ sequenceDiagram
 
 ### Partitioning: three ways to decide the owner
 
+**In plain words:** three different rules for "which machine owns this key", and how many keys each rule moves when you add a machine.
+
 | Approach | How the owner is found | Resize cost | Used by |
 | --- | --- | --- | --- |
 | `hash(key) mod N` | N is the node count | Changing N from N to N+1 remaps about `N/(N+1)` of keys (almost all), so the cache goes nearly cold | Toy designs only |
@@ -211,7 +241,7 @@ sequenceDiagram
 
 Decision guide: [[Choosing Consistency, Replication and Partitioning - Decision Guide]]. Background theory: [[Consistent Hashing]].
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -229,6 +259,8 @@ miss -> [DB] -> SET with TTL (jittered)
 
 ### Estimates (every input is an assumption, so every result is an estimate)
 
+**In plain words:** rough sums: how much memory you need and how many machines that means.
+
 | Quantity | Arithmetic | Result |
 | --- | --- | --- |
 | Keys | given | 1.5 billion |
@@ -243,6 +275,8 @@ miss -> [DB] -> SET with TTL (jittered)
 **What the numbers decide.** The fleet is **memory bound, not CPU bound**. We add nodes for capacity, and throughput comes for free. If the numbers were reversed (small data, huge request rate), you would add replicas for read throughput instead of shards.
 
 ### API
+
+**In plain words:** basically get, set with an expiry time, and delete.
 
 The cache's client API is tiny. The server speaks a text or binary protocol (RESP for Redis, the memcached protocol for Memcached).
 
@@ -279,6 +313,8 @@ flowchart LR
 
 ### One request traced through a failover
 
+**In plain words:** a machine crashes; for a few seconds its keys fail, then its backup takes over and things work again.
+
 1. Node B (slots 5461-10922) crashes at 10:00:00.
 2. Other nodes stop hearing B's gossip pings. After a timeout (Redis `cluster-node-timeout`, often 15 s by default; an assumed setting), a majority of primaries mark B as failed.
 3. B's replica B' is promoted to primary and takes ownership of the same slots.
@@ -286,9 +322,11 @@ flowchart LR
 5. Writes made to B in the last milliseconds and not yet replicated are lost. That is acceptable for a cache. The database still has the truth.
 6. Cache misses for those lost keys go to the database. Because only the lost writes (not the whole slice) are missing, the database sees a small bump, not a flood.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Where does the routing logic live?
+
+**In plain words:** someone must know which machine owns a key: the app's library, a middle proxy, or the cache servers themselves.
 
 | Model | How it works | Strengths | Weaknesses |
 | --- | --- | --- | --- |
@@ -297,6 +335,8 @@ flowchart LR
 | Proxy tier (twemproxy, mcrouter, Envoy) | Clients talk to a proxy that shards | Thin clients, central place for routing policy, pooling, and failover | Extra network hop (about 0.1-0.5 ms, an estimate); proxy becomes a fleet to scale |
 
 ### Which engine?
+
+**In plain words:** Memcached is a plain, very fast key-value store; Redis adds data types, backups and a built-in cluster.
 
 | Dimension | Memcached | Redis (Cluster) |
 | --- | --- | --- |
@@ -312,6 +352,8 @@ Decision guide: [[Choosing a Caching Strategy - Decision Guide]]. Server-side de
 
 ### Eviction policy
 
+**In plain words:** when memory is full, the cache must throw something out. These are the rules for choosing what.
+
 | Policy | Evicts | Good for | Weakness |
 | --- | --- | --- | --- |
 | LRU | Least recently used | Most workloads with recency | A one-time big scan flushes the hot set |
@@ -323,6 +365,8 @@ Details: [[Cache Eviction Policies - LRU, LFU, TTL]].
 
 ### Write strategy
 
+**In plain words:** when data changes, do you update the cache, the database, or both, and in which order?
+
 | Strategy | Flow | Consistency | Risk |
 | --- | --- | --- | --- |
 | Cache-aside (lazy loading) | App reads cache, on miss loads DB and fills | Stale until TTL or invalidation | Stampede on a cold or expired key |
@@ -330,7 +374,14 @@ Details: [[Cache Eviction Policies - LRU, LFU, TTL]].
 | Write-through | Write goes to cache and DB together | Stronger | Slower writes; cache full of rarely read data |
 | Write-behind | Write cache, flush to DB later | Fast writes | Data loss if the cache node dies; avoid unless you accept it |
 
-## 6. Trade-offs and when not to use
+```mermaid
+flowchart LR
+    W["Data changes"] --> DB["1. Update database"]
+    DB --> DEL["2. Delete cache key"]
+    DEL --> R["Next read misses,<br/>loads fresh value"]
+```
+
+## 6. Trade-offs and when not to use 🟡
 
 - **Consistent hashing over modulo because** a node change moves only about `1/N` of keys. Price: you need virtual nodes to even out load, and the ring or slot map must be distributed to all clients.
 - **Asynchronous replication over synchronous because** cache writes must stay sub-millisecond. Price: a crash can lose the last few writes, so the cache is never the source of truth.
@@ -342,7 +393,15 @@ Details: [[Cache Eviction Policies - LRU, LFU, TTL]].
 > [!warning] Common mistake
 > Treating the cache as a database. If the application breaks when the cache is empty, you have built a distributed datastore with the guarantees of a cache. Always test a "cold cache" scenario before launch.
 
-## 7. In production
+```mermaid
+flowchart TD
+    Q{"Hit rate above ~50%?"} -- "no" --> N["Skip the cache"]
+    Q -- "yes" --> S{"Can the app live<br/>with stale data for the TTL?"}
+    S -- "yes" --> Y["Cache with TTL"]
+    S -- "no" --> I["Cache + delete on write,<br/>or no cache"]
+```
+
+## 7. In production 🔴
 
 - **Facebook (public paper):** *Scaling Memcache at Facebook* describes memcached clusters in each region, a proxy called mcrouter that does routing and connection pooling, and **leases** to prevent stale sets and thundering herds. A **gutter pool** of spare servers takes traffic when a primary memcached server fails so the database is shielded. Invalidations were sent by tailing the database commit log (the paper calls the daemon McSqueal).
 - **Redis Cluster (documented):** 16,384 hash slots, nodes exchange state through a gossip cluster bus, clients follow `MOVED` and `ASK` redirections, and a replica is promoted when a majority of primaries agree the primary has failed.
@@ -357,7 +416,7 @@ Details: [[Cache Eviction Policies - LRU, LFU, TTL]].
 	- *Big keys:* a 50 MB value blocks the single thread of a Redis node for milliseconds. Cap value size and split large objects.
 - **What to monitor (targets are estimates):** hit ratio above 90%, p99 latency per node, evictions per second (a rising number means memory is too small), memory fragmentation ratio, replication lag, connections per node, keys per slot, and the top keys by traffic. See [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]] and [[Hot Keys and Hot Partitions]].
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### 8.1 Consistent hashing with virtual nodes, step by step
 
@@ -403,6 +462,8 @@ sequenceDiagram
 
 ### 8.2 Hot keys and hot partitions
 
+**In plain words:** one super popular key sends all its traffic to one machine. The fix is to keep extra copies of that key in more places.
+
 A celebrity profile or a flash-sale product can send 200,000 reads per second to one key. Consistent hashing sends all of them to one node, which saturates its CPU or NIC while the other 32 nodes idle.
 
 ```mermaid
@@ -424,6 +485,8 @@ Options and when to pick each:
 See [[Hot Keys and Hot Partitions]].
 
 ### 8.3 Stampede protection with leases
+
+**In plain words:** when a popular key expires, thousands of requests rush to the database at once. A lease lets only one of them refill it; the rest wait a moment.
 
 When a hot key expires, thousands of callers miss at once. Facebook's paper describes a **lease**:
 
@@ -454,6 +517,8 @@ Cheaper alternatives in the app: **single-flight** (one in-process call per key,
 
 ### 8.4 Keeping the cache and the database consistent
 
+**In plain words:** change the database first, then delete the cached copy, so the next reader fetches the fresh value.
+
 There is no free consistency. The common safe sequence for updates is: **write the database first, then delete the cache key** (not update it). Deleting avoids the race where two writers set the cache in the wrong order.
 
 ```mermaid
@@ -475,6 +540,8 @@ A small race remains: a reader that loaded the old value just before the update 
 
 ### 8.5 Failure detection and failover
 
+**In plain words:** machines check on each other; when one stops answering, its backup is promoted to take its place.
+
 ```mermaid
 flowchart LR
     P[Primary B] -->|ping every second| G[Peer nodes]
@@ -491,6 +558,8 @@ flowchart LR
 
 ### 8.6 Resharding without a cold cache
 
+**In plain words:** when you add a machine, move keys over slowly while both machines serve, so the cache never starts empty.
+
 1. Add the new node to the cluster. It owns no slots yet, so it takes no traffic.
 2. Pick slots to move (about `16384/(N+1)` in total).
 3. For each slot, migrate keys in small batches while both nodes serve requests.
@@ -501,7 +570,7 @@ flowchart LR
 > [!tip] Remember
 > Fixed slots turn "rebalance the cluster" into "move these few hundred labelled boxes", which is easier to plan, throttle, and resume than moving arbitrary key ranges.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why consistent hashing and not `hash(key) mod N`?
 > With modulo, going from N to N+1 nodes remaps about `N/(N+1)` of the keys, which empties the cache and sends the whole read load to the database. Consistent hashing moves about `1/N` of the keys on a node change. Virtual nodes even out the load and spread a failed node's share across all survivors.
@@ -527,7 +596,7 @@ flowchart LR
 > [!question]- Would you ever make the cache strongly consistent with the database?
 > Rarely. It needs distributed transactions or synchronous invalidation, which costs latency and availability. Prefer short TTLs plus invalidation from the change stream, and bypass the cache for the few reads that must be exact (for example a balance check inside a payment).
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 A 45-minute script:
 

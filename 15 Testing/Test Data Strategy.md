@@ -22,7 +22,33 @@ updated: 2026-11-13
 > - Never put raw production PII in a lower environment; mask or synthesize instead.
 > - "Passes locally, fails in CI" is almost always test data leaking between tests or two tests racing on shared rows.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Most tests need some data first, like a user or an order in the database.
+If every test makes that data by hand, the setup code gets long and breaks often.
+If tests share data, one test can mess up another.
+A **builder** is a small helper that makes a valid test object with sane defaults, so you only set what you care about.
+**Isolation** means each test gets its own clean data and cleans up after itself.
+Good test data is fast to make, always the same, and never leaks into the next test.
+
+```mermaid
+flowchart LR
+    T1["Test A"] --> DB1["Its own clean data"]
+    T2["Test B"] --> DB2["Its own clean data"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you create test data without long setup code?
+2. How do you keep each test's data apart?
+3. How do you make data the same every run (no random clocks or IDs)?
+
 
 **The problem in one story.**
 Test A creates a customer called "alice@example.com" and never deletes her.
@@ -67,7 +93,7 @@ Where it breaks: real kitchens are expensive to copy, but a Postgres template cl
 > [!tip] Remember
 > Every test creates exactly the data it needs, in its own isolated space, and leaves nothing behind.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A test for "place an order" needs a customer, a product, a price, and a timestamp. Four ways to get that row show four different failure modes:
 
@@ -78,7 +104,14 @@ A test for "place an order" needs a customer, a product, a price, and a timestam
 
 The fix is a **builder** for shape, **isolation** for independence, and **fixed inputs** for determinism, chosen separately because they solve three different problems.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    A["Test A adds user 'bob'"] --> DB[("Shared DB")]
+    B["Test B expects no users"] --> DB
+    DB --> X["Test B fails at random"]
+```
+
+## 2. Mental model 🟢
 
 Think of test data as having three independent knobs, and most "my tests are flaky" bugs are one knob left on the wrong setting:
 
@@ -86,9 +119,16 @@ Think of test data as having three independent knobs, and most "my tests are fla
 2. **Isolation** — can two tests touch this table at the same time without seeing each other's rows? (transactions, template databases, schema-per-test)
 3. **Determinism** — given the same code, does the test produce the same data every run? (fixed clock, seeded RNG, sequential IDs)
 
-## 3. How it works
+```mermaid
+flowchart LR
+    B["Builder with defaults"] -- "set only what matters" --> O["Valid test object"] --> T["Test"] --> C["Clean up / roll back"]
+```
+
+## 3. How it works 🟡
 
 ### Fixtures vs factories vs builders
+
+**In plain words: three ways to make test data: a fixed file, a function, or a builder with defaults you can change.**
 
 | Term | What it is | Problem it has |
 | --- | --- | --- |
@@ -97,6 +137,8 @@ Think of test data as having three independent knobs, and most "my tests are fla
 | Builder (functional options) | A function with defaults, plus one small option function per field you might want to override | The pattern used below; each test reads as "an order, except its amount is 500" |
 
 ### Per-test isolation on PostgreSQL 17
+
+**In plain words: give each test its own clean database, or roll its changes back at the end.**
 
 ```mermaid
 flowchart TB
@@ -119,11 +161,13 @@ Template cloning is usually the best default once a suite runs in parallel: each
 
 ### Determinism
 
+**In plain words: remove anything random, like the clock or random IDs, so tests give the same answer every run.**
+
 - **Clock:** inject `func() time.Time` (or an interface) instead of calling `time.Now()` inside logic under test; tests pass a fixed `time.Date(...)`.
 - **Randomness:** seed the RNG explicitly (`rand.New(rand.NewSource(1))`) so a failing run can be replayed with the same sequence.
 - **IDs:** a sequential counter in tests, not `uuid.New()`, so assertions and golden files stay stable across runs.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -150,6 +194,8 @@ func NewOrder(opts ...OrderOption) Order {
 Call sites read as intent: `NewOrder(WithAmount(500))` is "an order, except it costs ₹5" — every other field keeps a default a reader doesn't have to think about.
 
 ### Full builder with deterministic IDs
+
+**In plain words: a builder that fills in defaults and makes IDs in a fixed order.**
 
 This is the exact code tested below (Go 1.24, `go vet` and `go test -race` clean):
 
@@ -251,6 +297,8 @@ Run: `go vet ./... && go test -race ./...` → 3 tests pass (measured, Go 1.24.4
 
 ### Edge-case data to include on purpose
 
+**In plain words: add the weird cases on purpose: empty names, huge amounts, odd dates.**
+
 A builder's defaults should be boring, but your test *suite* must also exercise:
 
 - **Unicode:** customer names with combining characters, emoji, right-to-left text — a column with a byte-length limit can silently truncate a multi-byte character mid-codepoint.
@@ -259,6 +307,8 @@ A builder's defaults should be boring, but your test *suite* must also exercise:
 - **Large payloads:** the biggest row your API accepts (max description length, max line items) to catch truncation and timeout bugs before customers do.
 
 ### Synthetic data and provider states
+
+**In plain words: fake but realistic-looking data, made by a tool.**
 
 - **Synthetic data (gofakeit):** generates realistic-looking names, addresses and emails from a seeded RNG, so a seed-data script for a demo environment or a load test doesn't need real customer rows:
   ```go
@@ -279,6 +329,8 @@ flowchart LR
 
 ### Production data: never raw, always reduced
 
+**In plain words: never copy real customer data into tests as-is. Hide or cut it down first.**
+
 | Need | Technique | Rule |
 | --- | --- | --- |
 | Realistic distribution for load tests | Subsetting: copy a slice of real tables (e.g. last 30 days), at close to production row counts, not a handful of rows | Still contains PII — mask before it leaves the production network boundary |
@@ -288,14 +340,18 @@ flowchart LR
 
 ### Multi-tenant isolation and golden datasets
 
+**In plain words: always test with at least two customers, so you catch data leaking between them.**
+
 - **Multi-tenant fixtures:** always build at least two tenants in any fixture set that touches tenant-scoped tables, and assert that tenant A's test never reads tenant B's row — a single-tenant fixture hides the most common SaaS bug (a missing `WHERE tenant_id = ?`).
 - **Golden datasets:** a fixed, version-controlled input set used for regression — "does this model/pipeline still produce the same output for this known input?" The same idea that AI evaluation suites use for LLM outputs (golden prompts and expected shapes), applied to deterministic pipelines like pricing or search ranking.
 
 ### Shared environments: namespacing and TTL
 
+**In plain words: when many test runs share one server, tag each run's data and delete it after a while.**
+
 A staging environment shared by many CI runs needs row-level isolation too: prefix every created row's natural key with the CI run ID (`ord_run42_1`), and run a scheduled cleanup job that deletes anything older than a TTL (say 24h) so leaked rows from a crashed run don't accumulate forever.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -306,14 +362,14 @@ A staging environment shared by many CI runs needs row-level isolation too: pref
 | Template DB clone | Clone a migrated template DB per test/worker | Parallel integration suites needing real commits | A few ms per clone, disk space for N clones |
 | Masked production subset | Real data shape, real-looking distribution, PII removed | Load testing, data-skew-sensitive bugs | Pipeline to build and refresh the mask |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Builders add a layer of indirection a one-off script doesn't need; for throwaway debugging, literal values are fine.
 - Template-database cloning only pays off once you parallelize; for a small serial suite, transaction rollback is simpler and just as correct.
 - Masked production data is more realistic than synthetic data but costs a pipeline to build, run, and keep in sync with schema changes — don't build one until synthetic data has demonstrably missed a bug class.
 - Golden datasets lock in today's correct output; forgetting to regenerate them after an intentional behaviour change turns them into false failures.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Rails' fixtures/factory_bot and Go's `go-faker/gofakeit` popularized factory-style test data; PostgreSQL's `CREATE DATABASE ... TEMPLATE` is the standard way Postgres-backed Go suites (e.g. using `testcontainers-go` or a local instance) get cheap per-test databases.
 - **Failure modes → fixes:**
@@ -322,7 +378,7 @@ A staging environment shared by many CI runs needs row-level isolation too: pref
   - Suite slows down over months → fixture or seed script grown without bound; prefer builders that create only what a test needs.
 - **What to monitor:** suite wall-clock time (template cloning should keep it roughly flat as the suite grows, since clones are cheap and parallel), flake rate per test, and disk usage from undropped clone databases after a crashed run.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why `TEMPLATE` cloning is fast in Postgres:** `CREATE DATABASE ... TEMPLATE tmpl` uses the filesystem-level file copy Postgres already does for template databases, not a logical replay of DDL; it is close to a file copy, not a migration re-run, so timing scales with data size, not schema complexity.
 - **Transaction rollback's blind spot:** code that relies on `pg_notify`, `AFTER COMMIT` triggers, or `SERIALIZABLE` retry logic only runs its real path after a commit.
@@ -331,7 +387,7 @@ A staging environment shared by many CI runs needs row-level isolation too: pref
 - **Why sequential test IDs, not UUIDs:** a UUID per test run makes `t.Fatalf` output ("expected customer 8f2a19e3-...") useless to compare across runs; a sequential counter reset per test makes failure output diffable and makes golden files for regression tests stable.
 - **Masking and referential integrity:** naive per-column masking (independently randomizing each name column) breaks joins — the same customer must mask to the same fake name in every table. Deterministic masking (`fake_name = hash(real_id) -> lookup table`) keeps foreign keys meaningful while still removing the real PII.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Your tests pass locally but fail intermittently in CI. What do you check first?
 > Shared, un-isolated state: two tests racing on the same table row (fix with transaction rollback or a cloned DB per test), or a test depending on wall-clock time or row order with no explicit sort. Ask whether the suite runs in parallel in CI but serially on your machine — that difference alone explains most of these failures.
@@ -351,7 +407,7 @@ A staging environment shared by many CI runs needs row-level isolation too: pref
 > [!question]- What's wrong with one shared fixture file loaded once for the whole suite?
 > Tests become coupled through that shared data: one test's insert or update changes what another test sees, so test order starts to matter and a failure in test B might really be caused by test A. It also can't parallelize safely. Prefer data built per test, isolated per test.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Builder (functional options) for shape: each test names only the fields it overrides.
 - Isolate per test: transaction rollback (cheap, no commit-dependent logic) or template-DB clone (real commits, parallel-safe).
@@ -362,7 +418,7 @@ A staging environment shared by many CI runs needs row-level isolation too: pref
 - Golden datasets pin known-good output for regression; regenerate deliberately when behaviour legitimately changes.
 - "Passes locally, fails in CI" → check isolation and determinism first.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Testing Strategy and the Test Pyramid]], [[Unit, Integration and E2E Tests]]
 - **Next:** [[Contract Testing]], [[Load and Performance Testing]]

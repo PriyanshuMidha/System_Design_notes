@@ -30,7 +30,42 @@ updated: 2026-11-13
 > - A participant that voted yes is **in doubt** and cannot decide alone: 2PC is a **blocking** protocol.
 > - Classic mistake: thinking 2PC is a consensus algorithm. It needs *every* participant, not a majority, and stalls when the coordinator is down.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You move 100 rupees from an account in one database to an account in another.
+The debit and the credit must both happen, or neither.
+If one database saves and the other crashes, money disappears or appears from nowhere.
+
+```mermaid
+flowchart LR
+    A["Database A: minus 100, saved"] --> X["Database B crashes before plus 100"]
+    X --> L["100 rupees lost"]
+```
+
+**Two-phase commit** fixes this with a **coordinator** who asks first and acts second.
+Phase 1: it asks every database "can you commit?". Each one gets ready and answers yes or no.
+Phase 2: only if all said yes, it tells everyone "commit". Otherwise it tells everyone "cancel".
+The weak spot: if the coordinator dies after the yes votes, the databases must wait, holding their locks.
+
+```mermaid
+flowchart LR
+    C["Coordinator"] -- "1. ready?" --> A["DB A: yes"]
+    C -- "1. ready?" --> B["DB B: yes"]
+    A --> D["2. all yes: commit"]
+    B --> D
+```
+
+The rest of this note is just these 3 questions:
+1. What exactly happens in the two phases?
+2. What happens when the coordinator or a database crashes?
+3. Why do most microservices avoid 2PC and use sagas instead?
 
 **The problem in one story.** You move 100 rupees from your account in Bank A to your account in Bank B.
 Bank A must take the money out and Bank B must put it in.
@@ -79,13 +114,13 @@ Where it breaks: guests can change their minds, but a participant that voted yes
 > [!tip] Remember
 > 2PC is "everyone votes yes, then commit"; one no aborts all, and a crashed coordinator leaves yes-voters stuck holding locks.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An order moves money between two shards: debit account 17 on shard A, credit account 92 on shard B. Each shard has its own local transactions. Commit A first and crash before B, and money disappears; commit B first and crash before A, and money is created. Local transactions cannot fix this because no single database sees both writes.
 
 **Atomic commit** is the requirement: all participants commit, or all abort, even if some crash in the middle. 2PC (Gray, 1978) is the standard protocol for it inside databases that span several nodes or several resource managers (a database plus a message queue, for example).
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 **A wedding ceremony.** The officiant (coordinator) asks each partner "do you?" (prepare). Each may say no.
 
@@ -100,7 +135,7 @@ If the officiant faints right after both said yes, the couple is in limbo: neith
 - **Prepared / in doubt:** a participant that voted yes and has not yet heard the outcome.
 - **Commit point:** the moment the coordinator durably records "commit".
 
-## 3. How it works
+## 3. How it works 🟡
 
 ```mermaid
 sequenceDiagram
@@ -131,6 +166,8 @@ sequenceDiagram
 
 ### Participant states
 
+**In plain words:** each database goes from working, to prepared (promised to commit), to committed or aborted. Once prepared, it cannot decide alone.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Working
@@ -151,12 +188,24 @@ It cannot commit on its own either, because another participant may have voted n
 
 ### Recovery rules
 
+**In plain words:** after a crash, the coordinator resends its saved decision; a prepared database keeps asking until it hears the answer.
+
 - **Coordinator restarts:** for each transaction in its log, resend the logged decision. A transaction with no decision record is aborted (**presumed abort**).
 - **Participant restarts:** for each prepared transaction in its log, ask the coordinator for the outcome. Until it gets one, the transaction stays prepared and its locks stay held, even across the restart.
 
-## 4. Worked example
+```mermaid
+flowchart TB
+    R["Coordinator restarts"] --> Q{"Decision in its log?"}
+    Q -- "yes" --> S["Resend commit or abort"]
+    Q -- "no" --> A["Abort (presumed abort)"]
+    P["Prepared database restarts"] --> K["Ask coordinator, keep locks until answered"]
+```
+
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** ask everyone, write the decision to your log, then tell everyone.
 
 ```text
 coordinator(tx, participants):
@@ -171,6 +220,8 @@ coordinator.recover(tx):  d = log.read(tx) or ABORT; resend d to everyone
 ```
 
 ### Go simulation
+
+**In plain words:** a small simulation of the protocol, with crashes you can turn on to watch databases get stuck.
 
 The simulation keeps the protocol and drops the networking: participants vote in parallel, the coordinator logs the decision before phase 2, and a `crashAfterLog` switch reproduces the blocking case. It passes `go vet` and `go test -race` on Go 1.24.
 
@@ -438,6 +489,8 @@ func TestFinishIsIdempotent(t *testing.T) {
 
 ### The same protocol in PostgreSQL 17
 
+**In plain words:** PostgreSQL has PREPARE TRANSACTION and COMMIT PREPARED, so your app can play the coordinator.
+
 PostgreSQL exposes the participant side of 2PC. The application, or a transaction manager, plays coordinator. `max_prepared_transactions` defaults to `0`, which disables the feature; set it to at least `max_connections` on servers that participate, and restart.
 
 ```sql
@@ -477,7 +530,7 @@ A forgotten prepared transaction also holds back the xmin horizon, so `VACUUM` c
 
 Alert on any row in `pg_prepared_xacts` older than a few minutes.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -490,7 +543,7 @@ Alert on any row in `pg_prepared_xacts` older than a few minutes.
 | [[Saga Pattern]] | Sequence of local transactions with compensating actions, no global locks | Microservices, long-running business flows | No isolation: others see intermediate states; compensations must be designed |
 | [[Transactional Outbox and CDC]] | Write the event in the same local transaction as the state change; relay it later | "Update my DB and publish an event" | Eventual consistency; consumers must be idempotent |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Blocking.** Prepared participants hold locks until the coordinator recovers. A coordinator lost for 10 minutes means 10 minutes of blocked rows.
 - **Availability is the product of all participants.** Every participant must be up to commit: five services at 99.9% each give at most about 99.5% for the combined operation (0.999⁵).
@@ -498,7 +551,14 @@ Alert on any row in `pg_prepared_xacts` older than a few minutes.
 - **Across microservices, prefer sagas or an outbox.** Each service owns its database, and most managed services (SaaS APIs, many cloud databases) cannot take part in 2PC at all. Coupling every service's availability to a coordinator defeats the point of splitting them.
 - **Use 2PC inside one system you control:** a sharded database's own cross-shard commits, a distributed SQL engine, Kafka's transactional producer writing to several partitions.
 
-## 7. In production
+```mermaid
+flowchart LR
+    V["All voted yes"] --> C["Coordinator crashes"]
+    C --> L["Databases hold locks"]
+    L --> W["Other requests wait until it returns"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:**
 	- **Spanner** runs 2PC across Paxos groups; the coordinator is the leader of one participant group, so its log is replicated (see [[Distributed SQL]]).
@@ -512,7 +572,7 @@ Alert on any row in `pg_prepared_xacts` older than a few minutes.
 	- Lost phase-2 messages → retries with idempotent handlers keyed by transaction ID.
 - **What to monitor:** number and age of prepared (in-doubt) transactions, prepare-to-commit latency, abort rate by reason, coordinator recovery backlog, lock waits on rows held by prepared transactions.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **2PC vs consensus.** Consensus needs a majority and tolerates minority failures; it agrees on *some* proposed value.
   - Atomic commit needs *every* participant to vote yes and must abort if any says no; one unreachable participant stops it.
@@ -524,7 +584,7 @@ Alert on any row in `pg_prepared_xacts` older than a few minutes.
 - **Isolation still matters.** 2PC gives atomicity across nodes; isolation comes from each participant's locks or MVCC. Distributed SQL engines also need a global timestamp order (TrueTime or hybrid logical clocks; see [[Clocks and Ordering]]) so cross-shard reads see a consistent snapshot.
 - **Read-only participants** can vote "read-only" and drop out of phase 2, a common optimization.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Walk me through 2PC.
 > Coordinator sends prepare; each participant persists its changes and a prepare record, keeps locks and votes. If all vote yes, the coordinator durably logs commit (the commit point) and sends commit to all, retrying until acknowledged; otherwise it sends abort. Participants apply the decision and release locks.
@@ -547,7 +607,7 @@ Alert on any row in `pg_prepared_xacts` older than a few minutes.
 > [!question]- What happens if you forget a `PREPARE TRANSACTION` in PostgreSQL?
 > It survives restarts, keeps its row locks, and holds back the xmin horizon so `VACUUM` cannot remove dead rows, causing bloat. Monitor `pg_prepared_xacts` and resolve old entries from the coordinator's log.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Phase 1: prepare, persist, keep locks, vote. Phase 2: log decision, then commit or abort everywhere.
 - Commit point = coordinator's decision durably logged.

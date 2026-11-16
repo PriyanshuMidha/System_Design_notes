@@ -25,7 +25,42 @@ updated: 2026-11-13
 > - Paginate with a cursor (the last post ID seen), never with an offset, so new posts never shift the next page.
 > - The hard parts are the celebrity write storm, cache memory, and undoing a post (delete, block, privacy change) everywhere it was copied.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your feed shows new posts from people you follow, newest or best first.
+Asking 300 friends "anything new?" each time you open the app is too slow.
+So each user gets a ready-made list of post IDs, like a mailbox.
+When someone posts, the post ID is dropped into each follower's list. This copying is called **fan-out**.
+
+```mermaid
+flowchart LR
+    P["You post"] --> F["Fan-out"]
+    F --> A["Friend A's list"]
+    F --> B["Friend B's list"]
+    F --> C["Friend C's list"]
+```
+
+A celebrity with 50 million followers would need 50 million copies per post. So their posts are not copied. They are fetched and mixed in when you open your feed.
+
+```mermaid
+flowchart LR
+    O["Open feed"] --> L["Your ready list"]
+    O --> CE["Fetch celebrity posts now"]
+    L --> M["Merge, newest first"]
+    CE --> M
+```
+
+So the rest of this note is just these 3 questions:
+1. When do you copy posts ahead of time, and when do you fetch them at read time?
+2. How do you turn a list of IDs into full posts fast?
+3. How do you page through the feed without gaps or repeats?
 
 **The problem in one story.**
 You follow 300 friends. You open the app and expect their newest posts in under a second.
@@ -71,7 +106,7 @@ Where it breaks: no newspaper has 100 million subscribers who all need delivery 
 > [!tip] Remember
 > Store post IDs per user, push for normal authors, pull for celebrities, paginate with a cursor.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 A user opens the app and expects to see the latest posts from the 200 accounts they follow within a few hundred milliseconds. The naive way is one query at read time:
 
@@ -103,7 +138,7 @@ The query cost grows with the number of followees, and the work is repeated on e
 
 **Out of scope** for this note: search, direct messages ([[Case Study - Chat System]]), notifications about likes ([[Case Study - Notification System]]), ads.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of each user as having a **mailbox**. When you post, a mail carrier walks your post's ID to every follower's mailbox. Opening the feed is just reading your own mailbox, which is fast.
 
@@ -114,7 +149,7 @@ This breaks for a celebrity with 50 million followers: the carrier would need 50
 - **Fan-out on read (pull):** gather at read time. Cheap writes, expensive reads.
 - **Hydration:** turning a list of IDs into full posts (author name, text, media URLs, like counts) with batched lookups.
 
-## 3. How it works - high-level design
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart LR
@@ -200,7 +235,7 @@ sequenceDiagram
     FS-->>C: 200 {items, next_cursor}
 ```
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -215,6 +250,8 @@ Five boxes and two arrows tell the whole story:
 Say three numbers: 140k feed inserts per second, 35k feed reads per second, about 2.4 TB of feed cache. Then go deep on the celebrity problem.
 
 ### Estimates
+
+**In plain words:** rough sums: posts per second, feed reads per second, and how many list writes fan-out causes.
 
 All inputs are **estimates** chosen for this exercise; the arithmetic shows the units.
 
@@ -234,6 +271,8 @@ All inputs are **estimates** chosen for this exercise; the arithmetic shows the 
 Two conclusions follow. First, the push path multiplies writes by 200, so it must be asynchronous and batched. Second, one celebrity post with 50 million followers alone equals 50 M inserts, which is 6 minutes of the whole system's average fan-out capacity (50 M ÷ 139k/s ≈ 360 s). That is why celebrities are pulled.
 
 ### API
+
+**In plain words:** create a post, and read the feed one page at a time with a bookmark (cursor).
 
 ```http
 POST /v1/posts
@@ -265,6 +304,8 @@ GET /v1/feed?limit=20&cursor=1849203948572811264
 - `POST /v1/users/{id}/follow` and `DELETE /v1/users/{id}/follow` manage the graph.
 
 ### Data model
+
+**In plain words:** posts are stored once; each user's feed is just a short list of post IDs in a cache.
 
 ```mermaid
 erDiagram
@@ -325,6 +366,8 @@ The feed itself is not a table. It is a Redis list per user, `feed:{user_id}`, h
 If the list is lost (eviction, node failure), the feed service rebuilds it with a pull query over the user's followees, then writes it back. The cache is a derived copy, not a source of truth.
 
 ### The merge step in Go
+
+**In plain words:** the code combines your ready list with fresh celebrity posts, removes repeats, sorts newest first and cuts one page.
 
 The read path's key logic merges the pushed list with pulled celebrity posts, drops anything at or newer than the cursor, removes duplicates and cuts a page. It compiles and passes `go vet` and `go test -race` on Go 1.24.
 
@@ -408,7 +451,7 @@ func TestNewPostDoesNotShiftNextPage(t *testing.T) {
 
 The second test is the reason for cursor pagination: a post that lands between two page requests does not push an already-seen post onto page 2.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Strategy | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -419,7 +462,7 @@ The second test is the reason for cursor pagination: a post that lands between t
 | Chronological | Sort by post ID | Simple, predictable, easy to cache | Engagement may be lower than a ranked feed |
 | Ranked | Candidates → features → model score → re-rank for diversity | Engagement-driven products | A ranking service on the read path, feature stores, harder to cache and debug |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Push wastes work on readers who never read.** If most users open the app once a week, pushing every post to them costs more than computing their feed on demand. Skipping inactive followers is the usual fix.
 - **Pull is simpler and fresher.** For a small product (thousands of users, few followees each), a single indexed query per read is cheaper than running Kafka, workers and a Redis fleet.
@@ -427,7 +470,15 @@ The second test is the reason for cursor pagination: a post that lands between t
 - **Copies are hard to take back.** A deleted post's ID sits in millions of lists. Rather than chasing every copy, filter at hydration time: a deleted or now-private post hydrates to nothing and is dropped.
 - **Ranking makes caching harder.** A ranked page depends on time and on the viewer's recent behaviour, so the page itself is rarely cacheable; cache candidates and features instead.
 
-## 7. In production
+```mermaid
+flowchart TD
+    Q{"Author has huge<br/>follower count?"} -- "yes" --> PULL["Pull at read time"]
+    Q -- "no" --> A{"Follower active recently?"}
+    A -- "yes" --> PUSH["Push to their list"]
+    A -- "no" --> SKIP["Skip; rebuild if they return"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:**
 	- Twitter described its home timeline in "Timelines at Scale" (2012): Redis lists of about 800 entries per user, filled by fan-out on write, with accounts that have very large follower counts handled at read time.
@@ -444,7 +495,7 @@ The second test is the reason for cursor pagination: a post that lands between t
 	- Hydration cache hit rate and MGET batch size.
 	- Feed cache memory per node and eviction count.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Choosing the celebrity threshold.** Pushing a post costs one cache insert per follower, paid once, and the last follower sees the post only after all inserts finish.
 
@@ -472,7 +523,7 @@ Keep the chronological path as a fallback when the ranking service is slow, by s
 
 **Sharding.** Feed lists shard by `user_id`; post objects by `post_id`; the follower graph by the first column of each copy. See [[Partitioning and Sharding]] and [[Consistent Hashing]]. Each Redis list key lives on one node, so a single user's read is one round trip.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Push or pull: which do you choose?
 > Hybrid. Push post IDs to followers' cached lists for normal authors because reads outnumber writes. Pull for authors above a follower threshold because pushing 50 M copies takes minutes and starves other fan-out. Merge both at read time and dedupe.
@@ -495,7 +546,7 @@ Keep the chronological path as a fallback when the ranking service is slow, by s
 > [!question]- How would you add ranking without hurting p99?
 > Rank a bounded candidate set (about 800 IDs), fetch features in batch, set a tight timeout on the ranking call, and fall back to chronological order on timeout.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 A 45-minute script:
 

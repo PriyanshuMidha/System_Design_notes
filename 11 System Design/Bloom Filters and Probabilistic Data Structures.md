@@ -29,7 +29,35 @@ updated: 2026-11-13
 > - Put it in front of an expensive lookup (disk, database, network) to skip the lookups that would find nothing.
 > - HyperLogLog: count unique items in 12 KB with about 0.81% error. Count-Min Sketch: frequencies that are never under, only over, the truth.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (cousins like HyperLogLog and Count-Min Sketch) and 6 (when not to use).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You often need to ask "have I seen this before?" about millions of things.
+Keeping the full list in memory is too big. Asking the database every time is too slow.
+A **Bloom filter** is a tiny row of on/off bits that answers this question very cheaply.
+When it says "no", it is always right. When it says "yes", it is *probably* right, so you go and double-check.
+That wrong "yes" is called a **false positive**. You choose how rare it is, for example 1 in 100.
+
+```mermaid
+flowchart LR
+    Q["Seen 'alice'?"] --> F["Bloom filter<br/>(tiny, in memory)"]
+    F -- "no (always true)" --> A["Skip the database"]
+    F -- "maybe yes" --> DB["Ask the database"]
+```
+
+Its cousins answer other "roughly" questions with tiny memory: "how many different users?" and "how often did this show up?".
+
+So the rest of this note is just these 3 questions:
+1. How do bits and hashes give a fast "no"?
+2. How big must the filter be for the error you can accept?
+3. Which cousin fits which question, and when is "roughly" not good enough?
+
 
 **The problem in one story.**
 You sign up for a site and type a username. The site must say "taken" or "free" instantly.
@@ -72,7 +100,7 @@ Where it breaks: a real guest list can cross a name off; a basic Bloom filter ca
 > [!tip] Remember
 > "No" from a Bloom filter is always true; "yes" only means "go check".
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A signup form checks "is this username taken?" on every keystroke. There are 1 billion usernames averaging 12 bytes. Some options:
 
@@ -84,7 +112,7 @@ A signup form checks "is this username taken?" on every keystroke. There are 1 b
 
 The same pattern appears all over backend systems: skip a disk read for a key that is not in this file, skip a cache-miss query for an ID that does not exist, skip a URL the crawler has already fetched.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture a wall of 1,000 light switches, all off.
 
@@ -93,7 +121,15 @@ Picture a wall of 1,000 light switches, all off.
 
 The wall never stores the names, only switches, which is why it is small. And you cannot remove a name, because turning off its switches might turn off switches other names also need.
 
-## 3. How it works
+```mermaid
+flowchart LR
+    A["add 'alice'"] --> H["7 hashes"] --> S["turn 7 switches ON"]
+    B["check 'bob'"] --> H2["same 7 hashes"] --> C{"any switch OFF?"}
+    C -- "yes" --> N["bob never added"]
+    C -- "no" --> M["bob maybe added"]
+```
+
+## 3. How it works 🟡
 
 ### Add and query
 
@@ -126,6 +162,8 @@ The steps:
 
 ### The math, with units
 
+**In plain words:** more items or fewer bits means more wrong "yes" answers. These formulas just tell you how many bits to buy for the error rate you want. About 10 bits per item gives roughly 1 wrong "yes" in 100.
+
 With `n` items added, `m` bits and `k` hash functions:
 
 - The chance that one particular bit is still 0 after all inserts is about `e^(−kn/m)`.
@@ -146,6 +184,8 @@ At the optimal `k`, about half the bits end up set. That fill ratio is a useful 
 
 ### What happens when you add too many items
 
+**In plain words:** a filter is sized for a fixed number of items. Overfill it and almost every switch is on, so it starts saying "yes" to everything.
+
 Sized for `n` at 1% (9.585 bits per item, k = 7), then filled past `n`:
 
 | Items actually added | False-positive rate |
@@ -157,7 +197,7 @@ Sized for `n` at 1% (9.585 bits per item, k = 7), then filled past `n`:
 
 (Computed from the formula above.) An overfilled filter degrades fast, so size it for the peak, or use a scalable Bloom filter, which adds a new, larger filter whenever the current one is full and checks all of them on a query.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -200,6 +240,8 @@ func (b *Bloom) MayContain(key string) bool {
 This uses one byte per bit and runs `k` full hashes per call. The full version below packs 64 bits per word and computes only two hashes.
 
 ### A production-shaped Bloom filter in Go
+
+**In plain words:** same idea as the whiteboard version, but it picks its own size from "how many items" and "how much error", and fakes many hash functions from just two.
 
 It sizes itself from `n` and `p` using the formulas above, and uses **double hashing**: `position_i = h1 + i × h2 (mod m)`. Kirsch and Mitzenmacher (2006) showed that two hashes combined this way give the same false-positive rate as `k` independent ones, so each call does two hash computations instead of seven.
 
@@ -262,6 +304,8 @@ func (f *Filter) Params() (m, k uint64) { return f.m, f.k }
 ```
 
 ### Count-Min Sketch in Go
+
+**In plain words:** a small grid of counters that answers "how many times did I see X?". It can count too high, never too low.
 
 A Count-Min Sketch is a `d × w` grid of counters. Each row has its own hash.
 
@@ -394,6 +438,8 @@ In the Count-Min test, `ε = 0.001` and `δ = 0.01` give a 2,719 × 5 grid (13,5
 
 ### Sizing a real one: crawler URL dedupe
 
+**In plain words:** a quick real-world sum: how many bits do you need to remember 5 billion web addresses with a tiny error.
+
 A crawler expects to see 5 billion URLs and can tolerate re-skipping 0.1% of new URLs (a false positive means "already seen", so the URL is wrongly skipped).
 
 Bits = 5 × 10^9 × 14.38 = 7.19 × 10^10 bits ÷ 8 = **9.0 GB**, with k = 10.
@@ -402,7 +448,7 @@ That is too big for one machine's comfort, so partition the filter by host hash 
 
 Storing the URLs themselves (average 80 bytes, an estimate) would be 400 GB before any index overhead.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Structure | Question it answers | Memory | Error | Deletes? | Use when |
 | --- | --- | --- | --- | --- | --- |
@@ -434,7 +480,7 @@ flowchart LR
     R --> E["PFCOUNT: harmonic mean of 2^-register<br/>over all 16,384 registers, scaled,<br/>with small-range correction"]
 ```
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Only for "skip work" decisions.** A false positive must be harmless: it costs one extra lookup. Never use a Bloom filter as the source of truth for something like "this username is taken, reject the signup"; a false positive would wrongly reject a free name.
 - **No deletes, no listing.** You cannot remove items from a plain Bloom filter or list what is in it. If items expire (sessions, cached keys), you need a counting Bloom or cuckoo filter, or rebuild periodically.
@@ -443,7 +489,17 @@ flowchart LR
 - **Hash choice matters.** Fast non-cryptographic hashes are fine, but for a filter that is persisted or shared between services, every reader must use the same hash and seed. Go's `hash/maphash` uses a random seed per process, so it is unsuitable for a filter you save to disk.
 - **HLL and CMS give estimates.** Fine for dashboards and top-K; not for billing or anything that needs an exact count.
 
-## 7. In production
+```mermaid
+flowchart TD
+    Q["Is a wrong 'yes' harmless?<br/>(just one extra lookup)"] -- "no" --> X["Do not use a Bloom filter"]
+    Q -- "yes" --> F{"Does the set fit in a normal map?"}
+    F -- "yes" --> MAP["Use a map: zero error"]
+    F -- "no" --> D{"Need deletes?"}
+    D -- "yes" --> CU["Counting Bloom or cuckoo filter"]
+    D -- "no" --> BF["Plain Bloom filter"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:**
 	- **LSM-tree databases** keep a Bloom filter per SSTable file, so a read for a key skips every file that does not contain it (see [[Storage Engines - B-tree vs LSM and WAL]]). RocksDB's filters are commonly configured at about 10 bits per key, which gives roughly a 1% false-positive rate. Cassandra exposes the target as the table option `bloom_filter_fp_chance`.
@@ -458,9 +514,11 @@ flowchart LR
 	- *Counting Bloom counter overflow* → 4-bit counters saturate at 15; never decrement a saturated counter.
 - **What to monitor:** the fill ratio (fraction of bits set; about 50% at the design load), the measured false-positive rate (the share of "probably yes" answers that the database then says no to), the item count against the design `n`, and the filter's memory.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Where the formula comes from
+
+**In plain words:** this is just the probability that a switch stays off after many random flips. You do not need it for interviews beyond the final rule of thumb.
 
 After `n` inserts with `k` hashes, `kn` bits have been set, chosen at random among `m`. The chance that a given bit was never chosen is `(1 − 1/m)^(kn) ≈ e^(−kn/m)`.
 
@@ -470,6 +528,8 @@ Minimising over `k` gives `k = (m/n) ln 2`, at which point exactly half the bits
 
 ### Cache-friendly (blocked) Bloom filters
 
+**In plain words:** jumping around a huge array is slow for the CPU. Blocked filters keep all of one item's bits close together, so one memory read is enough.
+
 A query with k = 7 touches 7 random bits spread over a large array, so for a 1 GB filter it can cause up to 7 cache misses.
 
 A **blocked Bloom filter** first hashes the item to one 64-byte block (one CPU cache line) and puts all `k` bits inside it, so each query costs one cache miss.
@@ -477,6 +537,8 @@ A **blocked Bloom filter** first hashes the item to one 64-byte block (one CPU c
 The price is a slightly higher false-positive rate for the same memory, because blocks fill unevenly. RocksDB's newer filter formats use this idea.
 
 ### Set operations
+
+**In plain words:** two filters built the same way can be merged with simple bit math, like combining two guest lists.
 
 Two Bloom filters with the same `m`, `k` and hashes can be combined: bitwise **OR** gives a filter of the union (exactly what you would get by adding both sets).
 
@@ -492,11 +554,13 @@ HyperLogLogs merge by taking the per-register maximum, which is exact for the un
 
 ### HyperLogLog at the edges
 
+**In plain words:** the "count unique things" trick is a little off when very few or very many items are seen, so real code patches those two ends.
+
 Raw HLL is biased when few items have been seen, because most registers are still zero; implementations switch to a different estimate (linear counting) for small cardinalities.
 
 Redis also stores small HLLs in a compact **sparse** encoding and converts to the 12 KB **dense** form as they grow, so a key with a handful of items uses far less than 12 KB.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What can a Bloom filter tell you for certain?
 > Only that an item is **not** in the set: if any of its `k` bits is 0, it was never added. "All bits set" means probably present, with the false-positive rate you sized for. It never stores the items, so it cannot list or delete them.
@@ -523,7 +587,7 @@ Redis also stores small HLLs in a compact **sparse** encoding and converts to th
 >
 > Memory is fixed by `ε` and `δ`, not by the number of distinct terms. Keep one sketch per time bucket to get "top in the last hour".
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Bloom: "definitely not" or "probably yes"; no false negatives, no deletes, no listing.
 - `m/n = −ln p / (ln 2)^2`, `k = (m/n) ln 2`: 9.59 bits and 7 hashes for 1%; +4.79 bits per 10× better.

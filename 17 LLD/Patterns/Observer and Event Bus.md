@@ -22,7 +22,17 @@ updated: 2026-11-13
 > - One failing or panicking handler must not stop the others.
 > - Classic mistake: publishing an event inside a database transaction that later rolls back. Publish after commit, through the **transactional outbox** (an event row saved in the same transaction and sent later by a relay; see [[Transactional Outbox and CDC]]).
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+When something happens, like "order placed", several other parts may care: email, stock, analytics. With the **observer** pattern, those parts subscribe, and the order code just announces the event without knowing who listens. An **event bus** is a shared hub for this. If the listeners are in other services, you save the event in an **outbox** table in the same database transaction, so it is never lost. Read the plain-words line above each code block first.
+
 
 **The problem in one story.**
 A shop gets a new order. Email, SMS, analytics and the cache all need to know.
@@ -65,7 +75,7 @@ Where it breaks: YouTube retries and stores notifications for you; an in-process
 > [!tip] Remember
 > Publish once, let subscribers react on their own, and only publish after the commit.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 `CreateOrder` saves an order and then must send an email, send an SMS, update analytics and warm a cache.
 
@@ -79,7 +89,7 @@ The obvious first version, a plain map from topic to handlers with `Subscribe` a
 - **`Publish` returns on the first error.** When SMS fails, analytics never hears about the order.
 - **No unsubscribe, no async delivery.** A handler can never be removed, and one slow handler slows every publisher.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A **newsletter**. The publisher keeps a mailing list (the subscriptions). When an issue is out, it is sent to everyone on the list. The publisher does not know or care what readers do with it, readers can unsubscribe, and one reader's full mailbox must not stop delivery to the others.
 
@@ -89,7 +99,9 @@ The roles:
 - **Observer (subscriber):** reacts to an event. Here, anything with `Handle(ctx, Event) error`.
 - **Event:** a fact that already happened, named in the past tense (`order.created`), with an ID so consumers can spot duplicates.
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words: listeners sign up; the subject calls each one when the event happens.**
 
 ```mermaid
 classDiagram
@@ -212,7 +224,9 @@ func main() {
 }
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
+
+**In plain words: an in-process event bus and an outbox, with tests.**
 
 One `package main`: the bus with a guarded subscription map, error and panic isolation, unsubscribe, an async subscriber with Block and DropNewest policies, and an idempotent-consumer wrapper. It compiles with Go 1.24 and passes `go vet` and `go test -race`, using only the standard library.
 
@@ -664,6 +678,8 @@ Against that version the test fails with "Close did not release the blocked send
 
 ### The outbox rows (PostgreSQL 17)
 
+**In plain words: save the event in the same transaction as the order, then a worker sends it later.**
+
 The outbox itself is explained in [[Transactional Outbox and CDC]]; this is only the part the bus depends on:
 
 ```sql
@@ -689,7 +705,7 @@ COMMIT;
 
 The row locks taken by `FOR UPDATE SKIP LOCKED` last only until the transaction ends, so the claim, the publishing and the `UPDATE` must share one transaction; in autocommit mode another relay could claim the same rows at once. `$1` is the array of ids whose `Publish` returned `nil`; the rest stay unpublished and are retried.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Delivery style | How it works | Ordering | Use when | Cost |
 | --- | --- | --- | --- | --- |
@@ -710,7 +726,7 @@ The row locks taken by `FOR UPDATE SKIP LOCKED` last only until the transaction 
 
 **Observer vs Mediator:** an event bus routes by topic and knows nothing about the events. A mediator owns a coordination rule. See [[Facade (vs Mediator)]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 **When not to use it in Go:**
 
@@ -729,7 +745,7 @@ The row locks taken by `FOR UPDATE SKIP LOCKED` last only until the transaction 
 - **Leaking subscribers.** A request-scoped object that subscribes and never unsubscribes stays reachable from the bus forever, along with everything it references. Call `unsubscribe` with `defer`, or tie it to a context with `context.AfterFunc`.
 - **Goroutine per event.** It looks asynchronous and free, but it has no ordering, no limit and no place for errors to go.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- `os/signal.Notify(c, os.Interrupt)` subscribes a channel to signals, and `signal.Stop(c)` unsubscribes it. The package **does not block** when `c` is full, so it drops signals: a drop policy, which is why the docs ask for a buffered channel.
@@ -744,7 +760,7 @@ The row locks taken by `FOR UPDATE SKIP LOCKED` last only until the transaction 
 	- Events lost on crash or announced before commit → transactional outbox and idempotent consumers.
 - **What to monitor:** publish latency, handler errors and panics by handler, queue length and dropped events per async subscriber, subscriber count per topic (a count that only grows is a leak), outbox lag (age of the oldest unpublished row).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why copy the slice, not just read it.** `slices.DeleteFunc` shifts elements inside the same backing array (and, since Go 1.22, zeroes the tail). If `Publish` ranged over the shared slice after unlocking, an unsubscribe could rewrite it mid-loop. `slices.Clone` under the read lock gives `Publish` a private snapshot. The cost is one small allocation per publish; copy-on-write (build a new slice on every subscribe or unsubscribe and swap it) moves that cost to the rare writes.
 - **Snapshot semantics.** A handler that unsubscribes during a publish still receives the event in flight, because the snapshot was taken before. A handler subscribed during a publish receives only later events. State this guarantee; tests rely on it.
@@ -753,7 +769,7 @@ The row locks taken by `FOR UPDATE SKIP LOCKED` last only until the transaction 
 - **Idempotency belongs to the consumer.** The outbox guarantees at-least-once delivery, not exactly-once. The `Idempotent` wrapper keeps the seen set in memory; in production it is a `processed_events` table with a unique key, written in the same transaction as the handler's side effect. See [[Idempotency and Idempotency Keys]].
 - **Typed events.** Topics as strings are flexible but unchecked. A generic `Bus[T any]` per event type catches a handler of the wrong event type at compile time. A `switch e := ev.(type)` over event structs is the weaker option: it replaces string topics with types, but a mismatch shows up only at run time. Generics are covered in [[Generics and Iterators]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- When should an order service publish `order.created`?
 > After the transaction commits, never inside it. The reliable way is the transactional outbox: insert the event row in the same transaction as the order, and let a relay publish committed rows. Delivery is then at-least-once, so consumers must be idempotent.
@@ -776,7 +792,7 @@ The row locks taken by `FOR UPDATE SKIP LOCKED` last only until the transaction 
 > [!question]- Name observer-style APIs in the Go standard library.
 > `signal.Notify` and `signal.Stop` subscribe and unsubscribe a channel to OS signals, dropping signals when the channel is full. `context.AfterFunc` registers a callback for when a context ends and returns a `stop` function.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Subject keeps observers; publishes facts in the past tense, each with a unique ID.
 - Guard the map with `sync.RWMutex`; clone the slice, then call handlers outside the lock.
@@ -786,7 +802,7 @@ The row locks taken by `FOR UPDATE SKIP LOCKED` last only until the transaction 
 - Order: per subscriber at best; never across goroutines or subscribers.
 - Publish after commit through the transactional outbox; consumers de-duplicate on event ID.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Interfaces]], [[Goroutines and Channels]], [[sync Primitives and Atomics]]
 - **Next:** [[State Machines in Go]] (emit an event on every transition), [[Transactional Outbox and CDC]], [[Pub-Sub Message Queue]]

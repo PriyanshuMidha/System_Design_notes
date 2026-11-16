@@ -28,7 +28,41 @@ updated: 2026-11-13
 > - A DLQ is useless without an owner, an alert on depth and age, and a safe replay path into idempotent consumers.
 > - Skipping a message breaks per-key ordering; decide what happens to the later messages for that key.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the retry decision and broker mechanics), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (with the triage runbook), 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A worker reads messages from a queue, one after another.
+Sometimes one message is broken, so the worker fails on it every single time.
+That broken message is called a **poison message**.
+If you keep retrying it, it wastes effort forever, or blocks all the messages behind it.
+So after a few tries you move it to a side queue called the **dead letter queue (DLQ)**.
+The main queue keeps flowing, and a person looks at the side queue later.
+
+```mermaid
+flowchart LR
+    M["Broken message"] --> W["Worker fails"] --> M
+    W -. "forever, others stuck behind it" .-> X["Queue stuck"]
+```
+
+```mermaid
+flowchart LR
+    M["Broken message"] --> W["Worker fails 5 times"]
+    W --> D[("Side queue (DLQ)")]
+    W --> N["Next messages flow on"]
+    D --> H["Human fixes and replays"]
+```
+
+The rest of this note is just these 3 questions:
+1. Should this failure be retried, or is it hopeless?
+2. How do the big brokers (SQS, RabbitMQ, Kafka) move a message aside?
+3. How do you safely put fixed messages back?
+
 
 **The problem in one story.**
 A mail sorter gets a letter with an unreadable address.
@@ -74,7 +108,7 @@ Where it breaks: a letter on the shelf never blocks the next letter to the same 
 > [!tip] Remember
 > Retry what might pass, dead-letter what never will, and give the DLQ an owner, an alert and a replay path.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An `orders` consumer handles 500 messages per second. A producer bug ships one event with `"currency": "XYZ"`, which the consumer rejects.
 
@@ -84,7 +118,16 @@ An `orders` consumer handles 500 messages per second. A producer bug ships one e
 
 A DLQ caps the damage: after N attempts the message is moved aside, the queue keeps flowing, and an alert tells the owning team there is something to look at.
 
-## 2. Mental model
+**Same bad message, three brokers, no DLQ:**
+
+```mermaid
+flowchart TB
+    B["One bad message"] --> S["SQS: retried every 30 s<br/>for 4 days (~11,500 tries)"]
+    B --> K["Kafka: partition stuck,<br/>lag keeps growing"]
+    B --> R["RabbitMQ requeue: tight loop,<br/>one CPU core burned"]
+```
+
+## 2. Mental model 🟢
 
 A post office sorting room has a shelf labelled "undeliverable". A letter with an unreadable address is tried a couple of times, then put on the shelf instead of being sent round the building forever. The rest of the mail keeps moving.
 
@@ -98,9 +141,21 @@ Terms:
 - **Redrive:** moving messages from one queue to another, either into the DLQ (after max attempts) or back out of it (replay).
 - **Receive count:** how many times a broker has handed out a message. SQS exposes it as `ApproximateReceiveCount`.
 
-## 3. How it works
+**The post office shelf, drawn:**
+
+```mermaid
+flowchart LR
+    L["Letter"] --> T{"Address readable?"}
+    T -- "yes" --> D["Delivered"]
+    T -- "no, after 2 tries" --> S[("Undeliverable shelf")]
+    S -- "clerk fixes it" --> L
+```
+
+## 3. How it works 🟡
 
 ### The decision a consumer makes on every failure
+
+**In plain words:** every time a message fails, the worker asks one thing: "could this work if I try again later?" If yes, retry with a wait; if no, put it aside now.
 
 ```mermaid
 flowchart LR
@@ -121,6 +176,8 @@ flowchart LR
 The main consumer never sleeps. A failed message is republished to a retry topic with a "not before" timestamp, and the main partition keeps moving. This is called **non-blocking retry**.
 
 ### Broker mechanics
+
+**In plain words:** each broker has its own way to count tries and move a bad message aside; SQS and RabbitMQ do it for you, Kafka makes you build it with extra topics.
 
 **AWS SQS.** A queue gets a **redrive policy**: `{"deadLetterTargetArn": "...orders-dlq", "maxReceiveCount": 5}`. Each receive increments the message's receive count. When a receive would exceed `maxReceiveCount`, SQS moves the message to the DLQ instead. The DLQ must be the same type as the source (FIFO with FIFO, standard with standard). **DLQ redrive** (console or the `StartMessageMoveTask` API) moves messages back to the source queue or another queue, with an optional rate limit.
 
@@ -159,9 +216,11 @@ The dead-lettered message gets an `x-death` header recording the queue, the reas
 - Retry topics with fixed delays (`orders.retry.1m`, `orders.retry.10m`) and a dead-letter topic (`orders.dlt`; Spring Kafka uses the `-dlt` suffix).
 - Kafka Connect sink connectors have built-in dead-letter support: `errors.tolerance=all` with `errors.deadletterqueue.topic.name`.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the whole rule fits in a few lines: hopeless error goes straight to the side queue, other errors go to the next retry step, and the last step goes to the side queue.
 
 The routing decision fits on a whiteboard:
 
@@ -175,6 +234,8 @@ dead letter = original payload + headers + error + attempts + timestamps + consu
 ```
 
 ### Full version in Go
+
+**In plain words:** a Go router that sends failed messages to retry topics with longer waits, and to the dead letter topic at the end, with tests.
 
 A router for Kafka-style retry tiers. It compiles and passes `go vet` and `go test -race` on Go 1.24. The handler wraps errors it knows are hopeless in `Permanent`, so they skip the retry tiers.
 
@@ -336,6 +397,8 @@ An order with currency `"XYZ"` goes straight to `orders.dlt` on the first failur
 
 ### What a dead letter must carry
 
+**In plain words:** a dead letter is only useful if it carries enough facts to fix and replay it: the exact original bytes, where it came from, and why it failed.
+
 | Field | Why |
 | --- | --- |
 | Original payload, byte for byte | Replay must send exactly what the producer sent |
@@ -344,7 +407,7 @@ An order with currency `"XYZ"` goes straight to `orders.dlt` on the first failur
 | Attempt count, first-failure and last-failure timestamps | Tells "flapped for an hour" from "failed instantly" |
 | Consumer name and version (git SHA) | Tells whether a later deploy already fixed it |
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -354,7 +417,7 @@ An order with currency `"XYZ"` goes straight to `orders.dlt` on the first failur
 | Park the key | On failure, store the message and hold all later messages for that key in a side table until it is resolved | Per-entity order must hold (ledger entries, state machines) | Extra state and logic; one stuck key waits for a human |
 | Drop and log | Ack and log the failure | Data that has no value once stale (metrics, presence) | Silent loss |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Every retry reorders.** A message sent to `orders.retry.1m` is processed after later messages for the same order. If the consumer applies state changes ("paid" then "shipped"), a retried "paid" can land after "shipped". Use version checks (see [[Message Ordering and Partition Keys]]) or park the key.
 - **Do not retry permanent errors.** Sending a schema error through both retry tiers wastes 11 minutes of delay and puts the same stack trace in the logs three times (one per attempt). Classify first.
@@ -362,7 +425,16 @@ An order with currency `"XYZ"` goes straight to `orders.dlt` on the first failur
 - **Retention is short.** SQS keeps messages at most 14 days, Kafka topics follow their `retention.ms`. Archive dead letters to object storage (S3) if they may be needed later.
 - **When not to use one:** if the handler cannot fail per message (a pure transformation with validated input), or if the data loses value instantly, a DLQ only adds operational load.
 
-## 7. In production
+**Why a retry can break order** (same order id):
+
+```mermaid
+flowchart LR
+    P["'paid' fails"] --> R["retry topic, waits 1 min"]
+    S["'shipped' arrives"] --> A["applied now"]
+    R --> L["'paid' applied after 'shipped'<br/>=> wrong final state"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:**
 	- SQS redrive policy plus a CloudWatch alarm on the DLQ's `ApproximateNumberOfMessagesVisible` and `ApproximateAgeOfOldestMessage`; replay with DLQ redrive.
@@ -384,13 +456,15 @@ An order with currency `"XYZ"` goes straight to `orders.dlt` on the first failur
 
 ### Triage runbook
 
+**In plain words:** a short checklist for the person on call: group the failures, fix the cause, then replay slowly or throw away on purpose.
+
 1. Group the dead letters by error message and consumer version.
 2. If a later consumer version already fixed the bug, redrive.
 3. If the payload is bad, fix the producer, then decide per message: repair and replay, or archive and discard.
 4. Replay in small batches, watch error rate and lag, and stop at the first spike.
 5. Record what happened, including counts, in the incident notes.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Where the attempt count lives.** SQS and RabbitMQ count on the broker side.
 
@@ -405,7 +479,7 @@ An order with currency `"XYZ"` goes straight to `orders.dlt` on the first failur
 - **Replay safety checklist.** Idempotent consumer; replay preserves the original key; rate limit; a way to tag replayed messages (header `x-replayed-from: orders.dlt`) so metrics and audits can tell them apart.
 - **Choosing the attempt limit.** It should cover the longest transient outage you want to ride out. Tiers of 1 minute and 10 minutes ride out about 11 minutes. If a dependency's typical incident lasts 30 minutes, add a 30-minute tier instead of raising a single tier's count.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is a poison message, and what does it do to a queue without a DLQ?
 > A message that fails every time, usually because its content is invalid. With in-place retries it blocks everything behind it (Kafka partition, FIFO group). With requeue it loops forever, burning CPU and logs, until retention expires.
@@ -425,7 +499,7 @@ An order with currency `"XYZ"` goes straight to `orders.dlt` on the first failur
 > [!question]- How do retries interact with ordering, and what can you do about it?
 > A retried message is processed after later messages for the same key. Either make the consumer order-tolerant with per-entity version checks, or park the key: hold all later messages for that key until the failed one is resolved.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Poison message = fails deterministically; without a DLQ it blocks or loops.
 - Classify: transient → retry with backoff; permanent → DLQ at once.

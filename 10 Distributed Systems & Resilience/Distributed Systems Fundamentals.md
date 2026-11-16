@@ -28,7 +28,40 @@ updated: 2026-11-13
 > - You design against a **system model**: which failures you assume can happen (crash, restart, lies) and how slow things can get.
 > - Classic mistake: treating a remote call like a local function call that either returns or throws.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A **distributed system** is a set of programs on different machines that work together by sending messages.
+On one machine, a function call either returns or the program crashes.
+Across a network, a third thing can happen: you send a request and hear nothing back.
+
+```mermaid
+flowchart LR
+    C["Caller"] -- "request" --> S["Server"]
+    S -. "reply lost?" .-> C
+```
+
+Silence does not tell you what went wrong.
+Maybe the request was lost. Maybe the server is slow. Maybe it did the work and only the reply got lost.
+So a **timeout** does not mean "failed". It means "I do not know".
+
+```mermaid
+flowchart TB
+    T["Timeout"] --> A["Request never arrived"]
+    T --> B["Server still working"]
+    T --> D["Work done, reply lost"]
+```
+
+The rest of this note is just these 3 questions:
+1. What can go wrong between machines?
+2. What can a caller safely conclude after silence?
+3. How do we design around "I do not know"?
 
 **The problem in one story.**
 You text a friend "please pay the electricity bill" and get no reply.
@@ -74,7 +107,7 @@ Where it breaks: post rarely duplicates letters, but networks and retries can de
 > [!tip] Remember
 > A timeout means "I stopped waiting", not "it failed"; design every remote write to be safely repeatable.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A single process either works or crashes as a whole. Spread the same program over machines and a new kind of failure appears: **partial failure**, where some parts work and some do not, and nobody has a complete view.
 
@@ -92,7 +125,7 @@ The numbers make it worse as systems grow:
 - **Fan-out amplifies tails.** If one server is slow (over 1 s) on 1% of requests, a request that fans out to 100 servers is slow `1 − 0.99^100 ≈ 63%` of the time. This is the example from *The Tail at Scale*.
 - **The network is slow compared with memory.** A round trip inside one data centre is about 0.5 ms, and California to the Netherlands and back is about 150 ms (Jeff Dean's "numbers everyone should know"; treat them as orders of magnitude). A chatty design that makes 50 sequential cross-region calls spends 7.5 s on the wire.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the network as a **postal service with no tracking**. You post a letter and wait for a reply.
 
@@ -106,7 +139,16 @@ Three ideas follow from this picture and run through the whole folder:
 2. **Make repeats harmless** with idempotency keys, so "maybe" can be resolved by retrying ([[Idempotency and Idempotency Keys]]).
 3. **Suspect, do not know.** A node that stays silent is *suspected* dead. You never get proof.
 
+```mermaid
+flowchart LR
+    Y["You post a letter"] --> P["Post office, no tracking"]
+    P --> F["Friend"]
+    F -. "reply may never come" .-> Y
+```
+
 ### The eight fallacies
+
+**In plain words:** eight things newcomers assume about networks (it is reliable, fast, free...) that are all false.
 
 Peter Deutsch (with an eighth added by James Gosling) listed the assumptions that newcomers make and that fail in production. Each one maps to a concrete design rule.
 
@@ -121,9 +163,11 @@ Peter Deutsch (with an eighth added by James Gosling) listed the assumptions tha
 | 7. Transport cost is zero | Serialization CPU and egress fees are real | Efficient encodings (Protobuf), co-location |
 | 8. The network is homogeneous | Mixed hardware, kernels, languages and middleboxes | Standard protocols, explicit timeouts at every hop |
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### What the caller can conclude
+
+**In plain words:** you get yes, no, or silence. Silence is "maybe", so plan for the work having happened.
 
 Every remote call ends in one of three states for the caller: **succeeded** (a reply said so), **failed** (a reply said nothing was done), or **unknown** (no reply). The sequence below shows how the unknown state arises even though the server did its job.
 
@@ -146,6 +190,8 @@ sequenceDiagram
 ```
 
 ### System models: what can go wrong
+
+**In plain words:** before you design anything, write down which failures you expect: crashes, lost messages, slow clocks.
 
 Before reasoning about an algorithm you fix a **system model**: an explicit list of the failures you assume are possible. There are two independent axes.
 
@@ -179,14 +225,29 @@ stateDiagram-v2
 
 ### Partitions, gray failures and suspicion
 
+**In plain words:** sometimes machines cannot reach each other, or a machine is half broken. Other machines can only suspect, never be sure.
+
 - **Network partition:** some nodes can talk to each other but not to the others. A partition need not be a cut cable: a full queue, a misconfigured firewall rule or a long GC pause produces the same symptoms. How systems choose between consistency and availability during a partition is [[CAP and PACELC]].
 - **Gray failure:** a component is broken for its users but looks healthy to its monitor. Huang et al. (HotOS 2017) call this *differential observability*. Example: a server answers health checks on a separate thread while every real request times out because its disk is failing.
 - **Failure detection is suspicion.** A detector marks a node "suspected" after a silence longer than a timeout. Short timeouts declare slow nodes dead (false positives that trigger needless failovers). Long timeouts leave users waiting on dead nodes. Adaptive detectors, gossip and membership are in [[Failure Detection, Gossip and Membership]].
 - **No shared clock.** Each machine's clock drifts and can jump. Ordering events across machines needs logical clocks or bounded-uncertainty clocks, covered in [[Clocks and Ordering]].
 
-## 4. Worked example
+```mermaid
+flowchart LR
+    subgraph Side1["Group 1"]
+        A["A"] --- B["B"]
+    end
+    subgraph Side2["Group 2"]
+        C["C"]
+    end
+    B x--x|"cannot reach"| C
+```
+
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** a remote call has three results, not two, and the timeout case must be handled as "maybe it happened".
 
 The core rule in code: a remote call has three outcomes, and the timeout case must be treated as "maybe".
 
@@ -216,6 +277,8 @@ func CallPayment(ctx context.Context, pay func(context.Context) error) string {
 ```
 
 ### The full example: a lost reply and a fooled detector
+
+**In plain words:** a small simulation where a reply is lost and a slow server is wrongly called dead.
 
 The package below models the two facts this note is about:
 
@@ -474,7 +537,7 @@ Trace of `TestLostReplyWithoutKeyDoubleCharges`:
 
 With the key `order-42` the second call finds the key already recorded and leaves the ledger at ₹500. That is the whole reason [[Idempotency and Idempotency Keys]] exists.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 How the main system models compare, and which real systems assume which:
 
@@ -496,7 +559,7 @@ And the failure types a backend engineer meets weekly:
 | Gray failure | Failing disk, half-broken dependency | Health checks pass, users fail | Health checks that exercise the real path; client-side outlier detection |
 | Byzantine | Memory corruption, bad deploy, attacker | Wrong data | Checksums, validation, authentication |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 Distribution is a cost you pay for something specific: scale beyond one machine, fault tolerance, or being close to users. Do not distribute without one of those reasons.
 
@@ -506,7 +569,7 @@ Distribution is a cost you pay for something specific: scale beyond one machine,
 - **Byzantine tolerance** costs 3f + 1 replicas and much more messaging; inside one company, authentication and checksums are cheaper answers to corruption.
 - **Failure detection timeouts** trade speed for accuracy: there is no setting that is both fast and never wrong.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Kubernetes liveness and readiness probes are timeout-based failure detectors. A liveness probe that is too strict restarts pods during GC pauses or load spikes.
@@ -525,7 +588,7 @@ Distribution is a cost you pay for something specific: scale beyond one machine,
 	- Unknown-outcome counts (timeouts on writes) and how many were later reconciled.
 	- Failure-detector flaps: how often a node is marked down and then up again.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why a timeout cannot be "correct".** In an asynchronous network no finite timeout separates "slow" from "dead". Any value you choose is a bet on the latency distribution. A common starting point is the dependency's measured p99.9 plus margin, revisited when the distribution changes. [[Timeouts, Retries and Backoff]] covers budgets and deadline propagation.
 - **FLP in practice.** FLP says a deterministic protocol cannot guarantee that consensus *terminates* in a fully asynchronous system with one crash. Raft and Paxos escape it by never risking safety and only needing timing to behave eventually for liveness: during long instability they may elect leaders repeatedly and make no progress, but they never decide two different values.
@@ -535,7 +598,7 @@ Distribution is a cost you pay for something specific: scale beyond one machine,
 - **Tail at scale.** When one user request fans out to many servers, the slowest server sets the response time. Engineering for the tail (hedged requests, tied requests, micro-partitioning) matters more than lowering the median.
 - **The end-to-end argument.** Reliability in a lower layer (TCP's retransmission) does not remove the need for checks at the application ends (did the payment get recorded exactly once?). Only the endpoints know what "done" means.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Your call to a payment API timed out. Did the payment fail?
 > You do not know. The request may have been lost, processed with the reply lost, or still running. Treat the outcome as unknown: retry with the same idempotency key, or query the provider by that key, and reconcile later if neither answers.
@@ -558,7 +621,7 @@ Distribution is a cost you pay for something specific: scale beyond one machine,
 > [!question]- A request fans out to 100 backends, each slow 1% of the time. How often is the request slow?
 > About `1 − 0.99^100 ≈ 63%`. Fan-out turns rare per-server slowness into the common case, which is why tail latency (p99, p99.9) and hedged requests matter more than averages.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Partial failure is the default: parts fail while the rest runs.
 - A remote call ends in succeeded, failed, or **unknown**. A timeout means unknown.

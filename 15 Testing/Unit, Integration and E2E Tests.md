@@ -22,7 +22,32 @@ updated: 2026-11-13
 > - In Go, table-driven tests plus `t.Run`/`t.Parallel`/`t.Helper`/`t.Cleanup` are the backbone of all three levels.
 > - Never mock a dependency inside its own repository test — an integration test exists specifically to use the real thing.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your code talks to other things: a database, another service, a browser.
+A test has to decide which of those things are **real** and which are fake.
+A **unit test** fakes everything around the code. It is fast and very focused.
+An **integration test** makes one thing real, like a real database. It catches wiring bugs.
+An **E2E test** (end to end) runs the whole system like a real user. It is slow but proves the full path works.
+So the three kinds differ in one thing: how much is real.
+
+```mermaid
+flowchart LR
+    U["Unit: your code + fakes"] --> I["Integration: your code + 1 real thing"] --> E["E2E: everything real"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you write each kind in Go?
+2. What does each kind catch that the others miss?
+3. How do you keep the slow ones few and fast?
+
 
 **The problem in one story.**
 You write a function that saves an order to the database.
@@ -63,7 +88,7 @@ Where it breaks: a meal is served once, but E2E tests run again on every change,
 > [!tip] Remember
 > Unit tests catch logic bugs, integration tests catch wiring bugs, E2E tests catch journey bugs; use each for its own job.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 `SQLInvoiceStore.MarkPaid` (from [[Test Doubles and Mocking in Go]]) builds this query:
 
@@ -77,7 +102,14 @@ Only a test that runs this exact query against a real (or real-enough) Postgres 
 
 E2E tests close a further gap: that the HTTP handler, the service, and the database are wired together correctly as one deployed binary, which no amount of testing any one piece in isolation proves.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    B1["Bug in a math rule"] --> U["Caught by unit test"]
+    B2["Bug in SQL query"] --> I["Caught by integration test"]
+    B3["Bug in login + pay flow"] --> E["Caught by E2E test"]
+```
+
+## 2. Mental model 🟢
 
 Three tests, same bug surface, different question each asks:
 
@@ -85,7 +117,20 @@ Three tests, same bug surface, different question each asks:
 - Integration: "does this component actually work with the real thing it depends on?" (assumes the rest of the system is fine — only this one boundary is real)
 - E2E: "does the whole system, deployed, do the right thing from a client's point of view?" (nothing is faked, but you can't practically test every input)
 
-## 3. How it works
+```mermaid
+flowchart TB
+    subgraph Unit
+      C1["Code"] --> F1["Fake DB"]
+    end
+    subgraph Integration
+      C2["Code"] --> R2["Real Postgres"]
+    end
+    subgraph E2E
+      UI["User / browser"] --> API["Real API"] --> R3["Real DB"]
+    end
+```
+
+## 3. How it works 🟡
 
 ```mermaid
 flowchart TB
@@ -120,6 +165,8 @@ sequenceDiagram
 
 ### Unit: table-driven tests and the standard helpers
 
+**In plain words: one test function, a list of cases, and a loop that checks each case.**
+
 Go's idiom is one test function per behaviour, driving a table of cases through `t.Run` subtests:
 
 ```go
@@ -153,6 +200,8 @@ The full table-driven suite for `InvoiceService.Pay`, exercising five cases thro
 
 ### Integration: `net/http/httptest` for the HTTP boundary
 
+**In plain words: httptest gives you a fake web server or a fake request, so you can test HTTP code without a real network.**
+
 `httptest` gives two different things real, for two different directions:
 
 - **Testing a handler you own**: `httptest.NewRecorder()` plus `httptest.NewRequest` drives `http.Handler.ServeHTTP` in-process — no socket, no goroutine, just a fake `http.ResponseWriter` you inspect afterwards. This is usually still *called* a unit test of the handler, since nothing crosses a process boundary.
@@ -171,6 +220,8 @@ result, err := provider.Charge(ctx, "inv-1", 500)
 ```
 
 ### Integration: a real Postgres via testcontainers-go, vs sqlmock
+
+**In plain words: start a real database in a throwaway container, or fake the database driver. Each answers a different question.**
 
 Two different tools answer two different questions about `SQLInvoiceStore`:
 
@@ -201,11 +252,15 @@ Use sqlmock for a fast smoke test of simple, stable queries; use testcontainers-
 
 ### E2E: the full stack, sparingly
 
+**In plain words: run the real app and real database together, but only for the few journeys that matter most.**
+
 An E2E test for InvoiceOps starts the real API binary against a docker-compose stack (Postgres + a stubbed payment sandbox), sends a real `POST /invoices/{id}/pay` over HTTP, and asserts the invoice ends up paid and a receipt event was published.
 
 It is the only layer that proves the handler, service, repository, and database are wired together correctly as deployed — and the slowest and most failure-ambiguous layer (a failure could be the business logic, the wiring, or the environment), so it's reserved for the handful of journeys that matter most (see [[Testing Strategy and the Test Pyramid]] for the risk-based selection).
 
 ### `go test -race` and `testing/synctest`
+
+**In plain words: the race flag catches two goroutines touching the same data; synctest lets you test timing code without real waiting.**
 
 `go test -race ./...` instruments every test with the race detector, catching concurrent unsynchronized access to shared memory — exactly the class of bug in "two goroutines call `Pay` on the same invoice concurrently." It should run at the unit layer, on every PR, because it's cheap and catches bugs that are otherwise nearly impossible to reproduce reliably.
 
@@ -215,9 +270,11 @@ It replaces the older pattern of injecting a fake clock interface everywhere pur
 
 ### Coverage profiles
 
+**In plain words: Go can show you, line by line, which code your tests ran.**
+
 `go test -coverprofile=cover.out ./...` followed by `go tool cover -html=cover.out` shows line-by-line coverage. As covered in [[Testing Strategy and the Test Pyramid]], treat this as a gap-finder ("this error branch never ran"), not a merge gate with a hard percentage — 100% coverage is not the goal.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -247,11 +304,13 @@ Bug class -> which layer catches it, concretely:
 
 ### Suite time budgets
 
+**In plain words: give each kind of test a time limit so the suite stays fast.**
+
 A practical target for InvoiceOps: unit suite under 1 minute, integration suite under 10 minutes, E2E under 10–20 minutes but run far less often (nightly, pre-release) rather than per-PR.
 
 If the unit suite creeps past a minute, the fix is almost always "something that should be a unit test accidentally does real I/O" — move it down a layer or replace the real dependency with a double.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Level | What's real | Go tools | Typical per-test time | Catches |
 |---|---|---|---|---|
@@ -260,13 +319,13 @@ If the unit suite creeps past a minute, the fix is almost always "something that
 | Integration (DB) | A real Postgres | testcontainers-go, or sqlmock for a fast partial check | 50 ms – 2 s | Schema/SQL/constraint bugs |
 | E2E | The whole deployed stack | docker-compose + a real HTTP client | 1–60 s | Composition and config bugs |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Mocking at a layer the test isn't about adds noise without adding confidence: a repository test that mocks the SQL driver proves nothing about the SQL — mock only at your own ports (`PaymentProvider`, `Notifier`), never inside the repository test whose entire job is to exercise the real database.
 - sqlmock is faster than testcontainers-go but weaker; using it everywhere and never running the real-Postgres suite leaves schema and constraint bugs uncaught until production.
 - E2E tests are the most realistic and the most expensive per assertion; writing E2E tests for cases already covered by a unit test duplicates cost for no extra confidence.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems**: testcontainers is widely used at companies running Go microservices against Postgres/Kafka/Redis in CI (the project's own adopter list includes many fintech-adjacent companies, consistent with InvoiceOps's domain); `httptest.NewServer` is the standard way the Go standard library itself tests `net/http` client code.
 - **Failure modes → fixes**:
@@ -274,13 +333,17 @@ If the unit suite creeps past a minute, the fix is almost always "something that
   - *E2E suite is the only thing that catches a class of bug repeatedly* → that's a signal the bug belongs at a lower layer; add an integration or unit test for it so the fast suite catches the next regression.
 - **What to monitor**: per-layer suite duration over time (catches a slow test sneaking into the wrong layer), and which layer actually caught each production incident retroactively (if integration never catches anything, either it's redundant or it's testing the wrong things).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Parallel-safe DB tests
+
+**In plain words: tests that run at the same time must not share or step on each other's rows.**
 
 Running integration tests with `t.Parallel()` against a shared Postgres container needs each test to own disjoint data — the two usual techniques (detailed further in [[Test Data Strategy]]) are: wrap each test in a transaction and roll it back in `t.Cleanup`, or give each test a unique ID namespace (`invoiceID = "inv-" + t.Name()`) so concurrent tests can't collide on the same row even without a transaction boundary.
 
 ### Mock only at your own ports
+
+**In plain words: fake the edges you own, not the library you are trying to test.**
 
 The temptation in an integration test is to mock the thing you're supposedly testing integration *with*.
 
@@ -288,7 +351,7 @@ A test named "integration test for SQLInvoiceStore" that mocks `database/sql` is
 
 The rule: in a test at layer N, only fake the things layer N doesn't own — InvoiceService (layer "unit") fakes its ports; SQLInvoiceStore's integration test fakes nothing except maybe the payment provider, which isn't Postgres's job to verify.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How would you test the payment webhook handler end to end, and which parts would you not re-test at the E2E layer?
 > Unit-test signature verification and payload parsing exhaustively (valid, tampered, replayed, malformed cases) since those are pure logic. Integration-test the handler with `httptest` to confirm status codes and that a valid webhook actually calls the service.
@@ -311,7 +374,7 @@ The rule: in a test at layer N, only fake the things layer N doesn't own — Inv
 >
 > It belongs at the unit layer because concurrency bugs in business logic (like two goroutines racing to pay the same invoice) are cheapest to reproduce with fakes and no real I/O latency masking or exposing the race non-deterministically.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Unit = fake everything, catches logic bugs, milliseconds, every PR.
 - Integration = one real boundary (DB, HTTP), catches wiring bugs, seconds, merge-time.
@@ -322,7 +385,7 @@ The rule: in a test at layer N, only fake the things layer N doesn't own — Inv
 - Never mock the thing an integration test exists to verify — mock only at your own ports.
 - `go test -race` belongs in the unit-layer PR gate; it's cheap and catches a whole class of bug other layers can't reliably reproduce.
 
-## Links
+## Links 🟢
 - **Before this:** [[Testing Strategy and the Test Pyramid]]
 - **Next:** [[Test Doubles and Mocking in Go]]
 - **Compare with:** `Testing in Go` (04 Go Language) for `testing` package mechanics this note builds on; `Testing LLD Code in Go` (17 LLD) for how these same three levels show up inside one LLD-round solution.

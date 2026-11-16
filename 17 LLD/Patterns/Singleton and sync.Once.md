@@ -25,7 +25,17 @@ updated: 2026-11-13
 > - When creation must be lazy, `sync.Once` / `sync.OnceValues` runs it exactly once, even under many goroutines.
 > - Classic mistake: `if cfg == nil { cfg = load() }`, which is a data race; a second mistake is a hidden global that tests cannot replace.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Sometimes you want exactly one of something, like one database pool or one config loader. A **singleton** gives you that one shared instance. In Go, the safe way to create it once, even when many goroutines ask at the same time, is `sync.Once`. But a global singleton makes tests harder, so often it is better to create the object once in `main()` and pass it around. Read the plain-words line above each code block first.
+
 
 **The problem in one story.**
 Your server reads a config file and opens a database pool.
@@ -69,7 +79,7 @@ Where it breaks: in an office two people might both flip the switch, which is ha
 > [!tip] Remember
 > Prefer building one instance in `main` and passing it in; when it must be lazy, let `sync.Once` do the "only once".
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A checkout service reads its config (database URL, worker count) and opens one connection pool. Two problems appear without a plan for "exactly one":
 
@@ -80,7 +90,7 @@ The GoF Singleton answers both with a class that controls its own single instanc
 
 So the Go answer has two parts: **create once** with `sync.Once` when laziness is really needed, and **share by passing the instance** rather than by reaching for a global.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A building has one main water tank. You could let every flat install a pipe to "the tank" hidden in the walls (a global): it works until someone needs to test a flat with a different tank, or replace the tank, and has to find every hidden pipe.
 
@@ -88,9 +98,13 @@ Or the plumber connects each flat to the tank at construction time with a visibl
 
 `sync.Once` is the rule "the first person to arrive fills the tank; everyone else waits at the door until it is full, then uses the same water". Nobody fills it twice, and nobody drinks from a half-filled tank.
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words: the ways to get one instance, and how sync.Once makes the first creation safe.**
 
 ### The four ways to get "one instance"
+
+**In plain words: four options, from a package variable to passing one instance in.**
 
 1. **Package variable**, initialized when the package is initialized: `var digits = regexp.MustCompile("[0-9]+")`. Eager, cheap, cannot return an error.
 2. **`init()` function**: runs after all package variables of that package are initialized, before `main`. Cannot take parameters or return an error, so failures can only panic or be stored.
@@ -100,6 +114,8 @@ Or the plumber connects each flat to the tank at construction time with a visibl
 And the option that usually wins: **build it in `main` and inject it** (the composition root). Nothing is global; tests build their own instance.
 
 ### What happens when three goroutines arrive first
+
+**In plain words: only one runs the setup; the others wait, then all get the same object.**
 
 `sync.Once` keeps an atomic "done" flag and a mutex. The fast path is a single atomic load; only callers that arrive before `f` has finished touch the mutex.
 
@@ -125,6 +141,8 @@ sequenceDiagram
 The memory model guarantees that the writes made inside `f` are visible to every caller after its `Do` returns, so the callers can read `cfg` without another lock. A caller arriving after `done = 1` never touches the mutex.
 
 ### Choosing the form
+
+**In plain words: prefer creating it in main and passing it in; use a global only when you must.**
 
 ```mermaid
 flowchart TD
@@ -173,7 +191,9 @@ func main() {
 }
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
+
+**In plain words: a lazy config loader with sync.Once, and the same thing done by passing it in, with tests.**
 
 One `package main` with `GetConfig` on `sync.Once` (returning its error instead of a silent `nil`), `sync.OnceValues`, a retrying `Lazy[T]`, the panic rules, a mutable shared `Flags` with its own lock, and a composition-root service. Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
 
@@ -496,7 +516,7 @@ What to notice:
 - **`Once.Do ran f again after the panic: false`**: after a panic, `Once` counts `f` as done and later calls do nothing, so a value that `f` should have set stays at its zero value.
 - **`workers: 16`**: `Checkout` got its config and flags as parameters; nothing in it is global.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -508,7 +528,7 @@ What to notice:
 | Mutex + done flag (`Lazy`) | Locks, retries until the first success | Lazy, can fail, a retry may succeed | A lock on every call (add an atomic fast path if hot) |
 | Build in `main`, inject | Constructed once at startup, passed as a parameter | Almost always for services, pools, clients, config | Constructors take more parameters |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 Use a single shared instance for : config loaded once, a shared logger, a metrics registry, an expensive immutable lookup table, and a connection pool.
 
@@ -525,7 +545,7 @@ Do **not** use a singleton for:
 - **Tests cannot reset them.** A `sync.Once` cannot be reset, so the first test that triggers it fixes the value for every later test in the package, and `t.Parallel()` tests share it. `TestGetConfigGlobal` works only because it is the only test that touches `GetConfig`.
 - **Order coupling.** Code that reads a global during package initialization depends on initialization order across packages.
 
-## 7. In production
+## 7. In production 🔴
 
 **Standard library singletons and their pitfalls:**
 
@@ -550,7 +570,7 @@ Do **not** use a singleton for:
 
 **What to monitor:** log once at startup that the shared resources were created (pool size, config source); export pool statistics such as `sql.DB.Stats()` open and in-use connection counts; alert when a lazy init error is logged, because with `Once` it will not heal by itself.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Inside `sync.Once`.** `Do` first does an atomic load of the done flag. If it is set, it returns immediately: that fast path is why `Once` is cheap after initialization. Otherwise `doSlow` locks the mutex, checks the flag again (another goroutine may have finished meanwhile), runs `f`, and sets the flag with a deferred atomic store before unlocking. Because the store is deferred, it also runs when `f` panics, which is exactly why a panicking `f` counts as done. The Go memory model states the guarantee: the completion of the single call to `f` happens before any call to `Do` returns. [[sync Primitives and Atomics]] covers `Once` next to the other primitives.
 
@@ -564,7 +584,7 @@ Do **not** use a singleton for:
 
 **A singleton per key.** Sometimes you need "one per tenant" or "one client per region". A `map[string]*Client` behind a mutex, or a `sync.Map` of `sync.OnceValues` functions, gives lazy one-per-key creation. Bound the map, or it grows with every tenant ever seen.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How do you implement a thread-safe singleton in Go?
 > Prefer building the instance in `main` and passing it in. If it must be created lazily, use `sync.OnceValue` or `sync.OnceValues` (Go 1.21+), or `sync.Once` with the result stored next to it. All of them run the constructor exactly once even with many concurrent first callers, and make its writes visible to all callers.
@@ -587,7 +607,7 @@ Do **not** use a singleton for:
 > [!question]- Package variable, `init()` or `sync.Once`?
 > A package variable for cheap constants that cannot fail. `init()` only for registration side effects. `sync.Once` or `OnceValue(s)` for lazy creation that is expensive or rarely needed. For services, none of them: build in `main`.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - "One per process" in Go = build once in `main` and inject; globals are the exception.
 - Lazy and safe: `sync.OnceValue(f)` / `sync.OnceValues(f)` (Go 1.21+), or `sync.Once` + variables.
@@ -598,7 +618,7 @@ Do **not** use a singleton for:
 - Stdlib globals to avoid in services: `http.DefaultClient` (no timeout), `DefaultServeMux` (pprof handlers), `slog.SetDefault` outside `main`.
 - Tests: inject fresh instances; a global `Once` cannot be reset.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[sync Primitives and Atomics]], [[Goroutines and Channels]], [[Factory and Abstract Factory]]
 - **Next:** [[Adapter]]

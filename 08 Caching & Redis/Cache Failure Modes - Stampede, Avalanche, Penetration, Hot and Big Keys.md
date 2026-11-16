@@ -26,7 +26,41 @@ updated: 2026-11-13
 > - Penetration: cache "not found" briefly and reject impossible IDs before they reach the database.
 > - Hot and big keys: find them by measuring, then split, replicate or cache them locally; delete big keys with `UNLINK`.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (each failure and its fix), 4 (the Go code and measurements), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A cache sits in front of your database and answers most requests, so the database only sees a few.
+Because of that, the database is built small: it can only handle the few requests the cache lets through.
+So when the cache stops helping, even for a moment, the database gets flooded.
+
+```mermaid
+flowchart LR
+    U["10,000 requests"] --> C["cache answers 99%"]
+    C -- "only 100 get through" --> D["small database"]
+```
+
+There are five classic ways this happens.
+A **stampede**: one popular key expires and everyone rebuilds it at once.
+An **avalanche**: lots of keys expire together, or the cache restarts empty.
+Penetration: people ask for things that do not exist, so the cache never has them.
+Hot keys and big keys: one key is asked for too often, or is far too large.
+
+```mermaid
+flowchart LR
+    E["popular key expires"] --> M["2,000 requests miss<br/>at the same moment"]
+    M --> D["2,000 identical<br/>database queries"]
+```
+
+The rest of this note is just these 3 questions:
+1. Which of the five failures is hitting you?
+2. What is the simple fix for each one?
+3. How do you spot them in production before users do?
 
 **The problem in one story.**
 A popular dashboard is cached and the database only serves 1 in 20 requests.
@@ -71,7 +105,7 @@ Where it breaks: a shopper gives up and leaves, but software clients keep retryi
 > [!tip] Remember
 > Stampede: one loader per key. Avalanche: jitter. Penetration: cache "not found". Hot/big keys: measure, then split.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps (a Go + PostgreSQL invoicing service, the running example of this folder) caches each workspace's dashboard under `dashboard:{workspace_id}:summary:v2` with a 30-second TTL. The summary query takes about 200 ms. The database is sized for a 99% hit ratio.
 
@@ -79,7 +113,17 @@ At 10,000 requests per second on one big workspace's dashboard, the key expires.
 
 The same arithmetic applies on a larger scale when a whole cache node restarts empty (every key misses) or when a bot asks for `invoice:<random-uuid>` (every request misses, forever). The database was never sized for that traffic.
 
-## 2. Mental model
+**Why it snowballs, as a picture.**
+
+```mermaid
+flowchart LR
+    A["key expires"] --> B["many misses"]
+    B --> C["database slows down"]
+    C --> D["rebuild takes longer"]
+    D --> B
+```
+
+## 2. Mental model 🟢
 
 Think of the cache as a dam and the database as the town below it. Normal misses are a controlled spillway. The failure modes are different ways the dam leaks:
 
@@ -97,9 +141,11 @@ Terms used below:
 - **Singleflight** (request coalescing): when several callers ask for the same key at the same time, only one runs the loader and the others wait for its result.
 - **Negative caching**: caching the answer "this key does not exist" for a short time.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Stampede and its fixes
+
+**In plain words:** when a popular saved answer runs out, let one request rebuild it while the others wait or get the slightly old copy.
 
 ```mermaid
 sequenceDiagram
@@ -152,11 +198,23 @@ The tools, from local to global:
 
 ### Avalanche
 
+**In plain words:** lots of saved answers running out in the same second. Fix it by giving each a slightly different expiry time, and by warming the cache before traffic arrives.
+
 Two causes need two kinds of fix:
 - **Synchronised expiry.** A deploy or a nightly batch warms 500,000 keys with the same 1-hour TTL, so they all expire within the same second an hour later. Fix: add jitter (`TTL × (1 ± 10%)`), stagger warm-up, and use soft TTLs so expiry does not equal a miss.
 - **The cache tier is down or cold.** A Redis primary fails over, a cluster is flushed, or a new region starts empty. Jitter does nothing here. Fix: make the cache highly available ([[Redis Replication, Sentinel and Cluster]]), keep a small in-process L1 cache for the hottest keys, warm the cache before taking traffic, and protect the database with a concurrency limit, a [[Circuit Breaker]] and [[Load Shedding and Graceful Degradation]] so that during recovery some requests fail fast instead of all requests timing out.
 
+**Avalanche fix, as a picture.**
+
+```mermaid
+flowchart LR
+    S["500,000 keys,<br/>all TTL 1 hour"] --> X["all expire in the<br/>same second"]
+    J["500,000 keys,<br/>TTL 54 to 66 min"] --> Y["expiries spread<br/>over 12 minutes"]
+```
+
 ### Penetration
+
+**In plain words:** people (or bots) asking for things that do not exist. The cache never stores "nothing", so every request goes to the database. Fix: remember "not found" for a few seconds.
 
 ```mermaid
 flowchart TD
@@ -178,6 +236,8 @@ flowchart TD
 - **Rate-limit the source.** Random-ID scanning is often an attack; per-client limits ([[Rate Limiting - Algorithms and Distributed Design]]) cut it off.
 
 ### Hot keys and big keys
+
+**In plain words:** one key that everyone wants overloads the one server holding it; one huge key blocks Redis while it is read or deleted. Fix: keep a tiny local copy, and split big keys into smaller ones.
 
 ```mermaid
 flowchart LR
@@ -206,9 +266,11 @@ flowchart LR
 - A **hot key** lives in one hash slot on one node, so adding nodes does not help ([[Consistent Hashing]] balances keys, not traffic). The cache-side fixes are a short in-process L1 cache (even 1 second absorbs most reads), several copies of the value under keys with different hash tags (`dashboard:{ws#3}:summary:v2` for copy 3, written together, read at random) so they land on different slots (a suffix outside the braces, as in `dashboard:{ws}:summary:v2#3`, keeps every copy in the same slot), and replica reads. The system-wide view, including hot database partitions, is in [[Hot Keys and Hot Partitions]].
 - A **big key** is a single value with millions of elements or many megabytes. Redis executes commands on one thread, so `DEL`, `HGETALL`, `SMEMBERS` or a migration of that key blocks every other client. Split it, read it in pages, and free it in the background with `UNLINK`.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the shortest stampede-safe read: check the cache, and on a miss let only one goroutine per key go to the database.
 
 The core of a stampede-safe read in Go, before stale data, errors and negative caching:
 
@@ -594,6 +656,8 @@ All six tests pass under `go test -race -count=5`.
 
 ### Big key, measured
 
+**In plain words:** real timings: reading or deleting one giant key freezes Redis for everyone else.
+
 Two hashes of 2,000,000 fields each (`field:N` → `value:N`), measured on Redis 8.2 (Homebrew build, Apple M4, `SLOWLOG GET`):
 
 | Operation | Server-side time | Effect on other clients |
@@ -606,9 +670,11 @@ Encoding jumps also matter. A hash with 512 small fields uses the compact listpa
 
 ### Hot key, measured
 
+**In plain words:** Redis can tell you which keys are used the most, so you can find the hot one.
+
 With `maxmemory-policy allkeys-lfu`, Redis keeps a logarithmic access counter per key. After 50,000 `GET item:42` calls from `redis-benchmark`, `OBJECT FREQ item:42` returned 112, while an untouched key returned 5 (the starting value), measured on Redis 8.2. `redis-cli --hotkeys` reads the same counter for every key with `SCAN`, so it only works under an LFU policy.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Defence | Fixes | How it works | Cost |
 | --- | --- | --- | --- |
@@ -625,7 +691,7 @@ With `maxmemory-policy allkeys-lfu`, Redis keeps a logarithmic access counter pe
 | L1 cache / key copies / replica reads | Hot key | Spread reads across memory, slots or replicas | Staleness and more invalidation work |
 | Split + `UNLINK` | Big key | Smaller values; background free | Application changes to key layout |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Stale data is a product decision.** Serving a 5-minute-old dashboard during a refresh is fine; serving a stale account balance or permission set is not. Use soft TTLs only where [[Cache Invalidation, TTL and Consistency]] says bounded staleness is acceptable.
 - **Locks add latency and a new failure mode.** A rebuild lock held by a pod that died blocks rebuilds until it expires. Prefer singleflight plus stale serving; add a fleet-wide lock only when the per-pod count (pods × hot keys) still overloads the database.
@@ -633,7 +699,7 @@ With `maxmemory-policy allkeys-lfu`, Redis keeps a logarithmic access counter pe
 - **Bloom filters must be kept in sync.** A filter built at 02:00 says "absent" for an invoice created at 09:00 unless every insert also adds to the filter. For small, slow-changing key sets, negative caching alone is simpler.
 - **Do not add all of these at once.** At 100 requests per second with a 20 ms query, a stampede is 2 queries. Measure miss cost × concurrency first.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Facebook's memcache paper describes leases to stop stampedes and stale sets, and a "gutter" pool that absorbs load when a cache server fails.
@@ -651,7 +717,7 @@ With `maxmemory-policy allkeys-lfu`, Redis keeps a logarithmic access counter pe
 	- Stale responses served (count), and how old they were.
 	- Redis `SLOWLOG`, `LATENCY LATEST`, per-node CPU and network (one hot node stands out), and the size of the largest keys from a periodic SCAN (see [[Redis in Production - Memory, Latency, Security]]).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why the stampede grows.** Requests that miss = arrival rate × rebuild time. If the rebuild time itself grows with DB load, the window and the load feed each other, and the system can stay overloaded after the key is rebuilt because every queued request still runs. This is why shedding load (failing fast) recovers faster than queuing.
 - **singleflight details.** `Do` shares one result, including an error, among callers who joined while it ran. A slow or stuck loader holds every waiter, so give the loader its own timeout and let callers use `DoChan` with their context. The first caller's context controls the load; in the code above a background refresh uses `context.WithoutCancel` so a cancelled request does not abort a refresh others depend on. `Forget(key)` lets the next caller start a new load.
@@ -660,7 +726,7 @@ With `maxmemory-policy allkeys-lfu`, Redis keeps a logarithmic access counter pe
 - **Hot keys in Redis Cluster.** A key's slot is fixed by `CRC16(hash tag or key) mod 16384`, so the copies of a hot key must use different hash tags to land on different nodes. Copies under the same tag land on the same node and fix nothing.
 - **Client-side caching.** Redis 6+ supports server-assisted client-side caching (`CLIENT TRACKING`): the server sends invalidation messages for keys a client has read, which makes an L1 cache for hot keys safer than a blind 1-second TTL.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- A key gets 10,000 requests per second and its rebuild takes 200 ms. What happens when it expires, and what do you do?
 > About 2,000 requests miss during the rebuild and all query the database. Fix: singleflight per pod so each pod runs one query, a soft TTL so callers get the stale value while one refreshes, and jittered TTLs. Add a fleet-wide `SET NX PX` rebuild lock only if pods × hot keys still overloads the DB.
@@ -683,7 +749,7 @@ With `maxmemory-policy allkeys-lfu`, Redis keeps a logarithmic access counter pe
 > [!question]- What does singleflight not protect you from?
 > Coordination across processes (each pod still runs one load), a stuck loader that makes all waiters hang (needs a timeout), and errors being shared with every waiter. It also does nothing for avalanche from a cold cache.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Stampede load ≈ request rate × rebuild time (10k RPS × 0.2 s = 2,000 queries).
 - Stampede: singleflight per pod → soft TTL + background refresh → optional `SET NX PX` lock; XFetch or refresh-ahead for known hot keys.
@@ -693,7 +759,7 @@ With `maxmemory-policy allkeys-lfu`, Redis keeps a logarithmic access counter pe
 - Big key: split and page; `UNLINK` (4 µs) instead of `DEL` (349 ms for 2M fields, measured).
 - Stale is a product decision: bound it with a hard TTL.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Caching Fundamentals]], [[Caching Patterns]], [[Cache Invalidation, TTL and Consistency]], [[Cache Eviction Policies - LRU, LFU, TTL]]
 - **Next:** [[Redis Replication, Sentinel and Cluster]], [[Redis in Production - Memory, Latency, Security]], [[Hot Keys and Hot Partitions]]

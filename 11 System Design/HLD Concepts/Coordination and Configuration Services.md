@@ -29,7 +29,41 @@ updated: 2026-11-13
 > - A lock or leader role is safe only together with a **fencing token**; a lease alone is not enough, because pauses and clock drift exist.
 > - Dynamic config is code. Roll it out in stages, validate it, version it and keep a rollback.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (the five jobs) and 5 (variants).
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You run 40 copies of the same service. They need to agree on small things.
+Which copy is the boss? Who is alive? What is the retry limit today?
+If each copy decides alone, they disagree and things break.
+So you keep those small facts in one tiny, very reliable store. ZooKeeper and etcd are such stores. People call them **coordination services**.
+The store itself runs on 3 or 5 machines that vote, so it keeps working if one dies. That voting is called **consensus**.
+
+```mermaid
+flowchart LR
+    W1["Worker 1"] --> C["Coordination service<br/>(3 or 5 machines that vote)"]
+    W2["Worker 2"] --> C
+    W3["Worker 3"] --> C
+    C --> F["One shared truth:<br/>boss, who is alive, settings"]
+```
+
+Workers do not keep asking "did anything change?". They ask once and say "tell me when it changes". That is a **watch**.
+
+```mermaid
+flowchart LR
+    O["Operator sets<br/>retry_limit = 5"] --> C["Coordination service"]
+    C -- "pushes the change" --> W["All 40 workers<br/>within milliseconds"]
+```
+
+The rest of this note is just these 3 questions:
+1. How does the store know who is alive and who is the boss?
+2. How do workers hear about changes fast?
+3. When is this the wrong tool (too much data, too much traffic)?
 
 **The problem in one story**
 
@@ -78,7 +112,7 @@ Where it breaks: a real notice board is one piece of wood, while this service is
 > [!tip] Remember
 > Do not build consensus yourself; ask a small coordination cluster, and always pair locks with fencing tokens.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 You run a fleet of 40 workers that process nightly invoices. Three problems show up in the first week.
 
@@ -93,7 +127,7 @@ A coordination service solves exactly this class of problem once, correctly, and
 > [!tip] Remember
 > Coordination services exist for the few small facts a whole fleet must agree on, not for your data.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the **notice board in a village hall with a caretaker who never lies**.
 
@@ -120,7 +154,7 @@ flowchart LR
     C -->|"watch events"| W3["Dashboard"]
 ```
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### One data model: a small tree or key space with versions
 
@@ -226,19 +260,25 @@ flowchart TD
 > [!tip] Remember
 > Sessions say who is alive, watches say what changed, consensus says the order of changes.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 The five jobs a coordination service does, with a concrete scenario each.
 
 ### Job 1: Configuration
 
+**In plain words:** Put the setting in one place, and let every worker listen for changes to it.
+
 Retry limit lives at `/config/invoicer/retry_limit`. Each worker reads it at startup and watches it. An operator writes `5`. Within milliseconds, all 40 workers get the event, re-read, and apply it to new jobs. No redeploy.
 
 ### Job 2: Membership and discovery
 
+**In plain words:** Each worker signs a register that erases its name if it stops checking in. The register is the live list of who is up.
+
 Each worker puts `/workers/<id>` with a lease. The scheduler lists the prefix to see who is alive, and watches it to react to joins and leaves. This is a registry exactly like the one in [[Service Discovery]].
 
 ### Job 3: Leader election
+
+**In plain words:** Everyone takes a numbered ticket. The smallest number is the boss. When the boss leaves, the next number takes over.
 
 Step by step, with the ZooKeeper-style recipe (sequential ephemeral znodes):
 
@@ -260,6 +300,8 @@ flowchart LR
 etcd does the same with a key whose **create revision** orders candidates; Kubernetes controllers use a `Lease` object that the leader renews, and others take it over when it expires. More on roles in [[Leader Election]].
 
 ### Job 4: Distributed lock with a fencing token
+
+**In plain words:** A lock alone is not enough, because a frozen worker may wake up and think it still holds it. So each lock comes with a rising number, and storage rejects old numbers.
 
 A lock is "create this key if absent". The danger is the paused client.
 
@@ -284,6 +326,8 @@ The token is a number that only grows. ZooKeeper's transaction id (`zxid`) or et
 
 ### Job 5: Rolling out dynamic config safely
 
+**In plain words:** A bad setting can break everything at once, just like bad code. So roll it out slowly, check it, and keep an easy undo.
+
 Changing a value everywhere at once is as risky as deploying code everywhere at once. Facebook's configuration system (SOSP 2015 paper) treats config as code: it is reviewed, validated, canaried and rolled out in stages.
 
 ```mermaid
@@ -305,7 +349,7 @@ Say it in 60 seconds, drawing one box:
 - "Clients cache locally and survive a cluster outage with the last known config."
 - "Never put hot data path traffic through it."
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | System | Data model | Consensus | Liveness primitive | Watch style | Notes |
 | --- | --- | --- | --- | --- | --- |
@@ -316,6 +360,8 @@ Say it in 60 seconds, drawing one box:
 | Kubernetes API (on etcd) | Typed objects, resourceVersion | via etcd | `Lease` objects for leader election | List and watch | Operators use it instead of raw etcd |
 
 ### Which lock: etcd, Redis or a database?
+
+**In plain words:** Pick the lock by how bad a mistake would be. Money or data safety needs etcd plus fencing. A "do not run the job twice, but it is fine if it does" case can use Redis.
 
 | Option | Safety | Speed | Use when | Avoid when |
 | --- | --- | --- | --- | --- |
@@ -336,7 +382,7 @@ flowchart TD
 > [!tip] Remember
 > Lock for efficiency: Redis is fine. Lock for correctness: consensus store plus a fencing token, or let the database enforce it.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Small by design.** etcd's default storage quota is 2 GiB and its default request size limit is 1.5 MiB. ZooKeeper znodes default to a 1 MB limit. Do not store blobs, user data or high-churn counters.
 - **Writes are slow and bounded.** Every write is a majority round trip (disk fsync on each node plus network). Think thousands to low tens of thousands of writes per second at best (estimate; depends on hardware). Reads can scale with followers at the cost of staleness.
@@ -347,7 +393,7 @@ flowchart TD
 > [!tip] Remember
 > The cluster must be boring: small data, few writes, odd-sized, fast disks.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems.**
   - Kubernetes keeps all objects in etcd, and controllers read them through the API server's list-and-watch.
@@ -363,37 +409,69 @@ flowchart TD
   - *Cluster unreachable* → clients keep the last good config and last good membership list and retry with backoff.
 - **What to monitor.** Leader changes per hour, proposal commit latency and fsync latency (etcd exposes `etcd_disk_wal_fsync_duration_seconds` and `etcd_disk_backend_commit_duration_seconds`), database size against quota, number of watchers and sessions, client request latency, and "config version in use" per host so you can see a half-finished rollout.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Why 3 or 5, never 4 or 6
+
+**In plain words:** A vote needs more than half. Adding a 4th machine costs money but still survives only 1 failure, same as 3.
 
 A quorum is more than half. Three nodes need 2 (tolerate 1 loss). Four need 3 (still tolerate only 1 loss). Five need 3 (tolerate 2). Even sizes add cost without adding fault tolerance, and a 2-2 split can leave neither side with a majority.
 
 Across three availability zones, 3 or 5 nodes spread 1-1-1 or 2-2-1 keeps a majority alive if one zone goes down.
 
+```mermaid
+flowchart LR
+    A["3 machines<br/>need 2 votes<br/>survive 1 loss"] --> B["4 machines<br/>need 3 votes<br/>still survive only 1"]
+    B --> C["5 machines<br/>need 3 votes<br/>survive 2 losses"]
+```
+
 ### Reads: linearizable or fast?
+
+**In plain words:** You can ask the boss (always fresh, slower) or ask any member (fast, maybe slightly old).
 
 A linearizable read is confirmed through the leader (etcd uses a ReadIndex round with a quorum check), so it sees every committed write. A serializable read served from one follower is faster but may be behind. Config distribution tolerates staleness; lock decisions do not. Pick per call.
 
 ### Lock recipes and the thundering herd
 
+**In plain words:** If 100 waiters all watch the same lock, all 100 wake up when it frees. Better: each waiter watches only the one just ahead of it in line.
+
 A naive lock has all waiters watch the same key; when the holder leaves, everyone wakes and races. The sequential-node recipe has each waiter watch only its predecessor, so one wake-up per release. This is what separates a recipe that works for 5 clients from one that works for 5,000.
 
+```mermaid
+flowchart LR
+    H["Lock holder<br/>ticket 1"] --> W2["Waiter ticket 2<br/>watches only 1"]
+    W2 --> W3["Waiter ticket 3<br/>watches only 2"]
+    W3 --> W4["Waiter ticket 4<br/>watches only 3"]
+```
+
 ### Sessions, TTLs and clocks
+
+**In plain words:** The server decides when your session is dead, not you. After a long pause, assume you lost your locks.
 
 A session expires according to the **server's** clock and timeouts, not the client's belief. After a pause, the client must treat all its locks as lost and check, for example, that its session or lease is still valid before acting, and still rely on the fencing token for the final say.
 
 Leases bound how long a dead owner holds a role, but never prove that a live owner is still the owner at this instant.
 
+```mermaid
+flowchart LR
+    A["Client holds lock"] --> B["Long pause<br/>(GC, network)"]
+    B --> C["Server: session expired,<br/>lock given to someone else"]
+    C --> D["Client wakes up:<br/>must assume lock is lost"]
+```
+
 ### Using a database instead
+
+**In plain words:** For a small system, the database you already have can pick a leader. You do not always need a new cluster.
 
 For small systems a Postgres advisory lock is a legitimate leader election: the first process to `pg_try_advisory_lock(id)` leads, and the lock is released if its connection dies. It costs no new infrastructure. It stops being enough when the database itself is the thing you need to survive losing, or when coordination must span systems.
 
 ### Config versioning and rollback
 
+**In plain words:** Give every config a version number. Undo means "go back to the last good number", not "edit by hand and hope".
+
 Treat each config as an immutable version with an id. Servers report the version they run. A rollback is "point to version N-1", not "edit and hope". Keep schema validation at write time so a typo cannot reach production, and keep a local last-known-good copy so a process can start while the coordination service is down.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- When would you use ZooKeeper or etcd instead of a database?
 > When many machines must agree on a few small facts quickly and safely: leader, membership, lock ownership, current config. These need consensus, ephemeral entries that vanish when the owner dies, and push notifications. A normal database lacks sessions that clean up dead owners and efficient watches, and polling it does not scale. But the coordination store is not for bulk data.
@@ -416,7 +494,7 @@ Treat each config as an immutable version with an id. Servers report the version
 > [!question]- Your leader election works in tests but you see two leaders in production. Why?
 > Most likely a pause or partition let the old leader keep acting after its lease expired, because it never re-checked. Fixes: the leader must stop work when it cannot renew within its lease, downstream writes must carry and check a fencing token, and clocks should not be trusted for correctness.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Coordination service = tiny consensus cluster (3 or 5 nodes) for config, membership, locks and elections.
 - Primitives: small versioned values, leased ephemeral entries, watches, compare-and-set.
@@ -427,7 +505,7 @@ Treat each config as an immutable version with an id. Servers report the version
 - Roll config out like code: validate, canary, widen, rollback, keep last known good.
 - Clients cache so they survive a coordination outage.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Consensus - Raft and Paxos]], [[Service Discovery]], [[Failure Detection, Gossip and Membership]]
 - **Next:** [[Leader Election]], [[Distributed Locks and Fencing Tokens]], [[Feature Flags]]

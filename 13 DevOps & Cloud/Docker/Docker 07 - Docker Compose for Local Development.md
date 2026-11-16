@@ -21,7 +21,35 @@ updated: 2026-11-13
 > - Named volumes hold state (databases); bind mounts hold live source code; both outlive `down`, only `down -v` removes named volumes.
 > - Classic mistake: treating `depends_on` as a readiness gate, so the API starts before Postgres accepts connections and crashes on its first query.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A real app needs several containers: the API, a database, a cache, maybe a worker.
+Starting each by hand means long commands and the right order every time.
+**Docker Compose** lets you write all of them in one YAML file. Then one command starts everything.
+
+```mermaid
+flowchart LR
+    F["compose.yaml"] --> U["docker compose up"]
+    U --> A["API"]
+    U --> D["Postgres"]
+    U --> R["Redis"]
+```
+
+Compose also puts them on one private network, so the API can reach the database just by the name "db".
+It is meant for your laptop and CI tests, not for running production.
+
+The rest of this note is just these 3 questions:
+1. What goes in a Compose file (services, networks, volumes)?
+2. How do you make the API wait until the database is truly ready?
+3. What does a full Go + Postgres + Redis setup look like?
+
 
 **The problem in one story**
 
@@ -69,7 +97,7 @@ Where it breaks: a recipe does not keep the kitchen running if the stove fails; 
 > [!tip] Remember
 > `depends_on` orders start; only a healthcheck with `condition: service_healthy` waits for ready.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Running an API, a Postgres database, a Redis cache, and a background worker by hand means four `docker run` commands, a hand-built network so they can find each other, and remembering the right flags every time:
 
@@ -85,13 +113,22 @@ That is four commands to remember, four to tear down in the right order, and no 
 
 Compose replaces all four `docker run` invocations with one declarative file and two commands: `docker compose up -d` and `docker compose down`.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A Compose file is a **parts list for one application**, not a cluster manager. Think of it as a recipe card pinned to the project folder: every teammate who clones the repo runs `docker compose up` and gets the exact same stack — same versions, same environment variables, same network topology — without reading a setup wiki.
 
 Compose derives a **project name** from the folder (or `name:` in the file, or `-p`), and every resource it creates is prefixed with it: `myapp_postgres_1`, `myapp_devnet`. That is also the isolation boundary — two projects in two folders never collide.
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words:** a Compose file lists services (containers), plus the networks and volumes they share. Compose reads it and does all the docker run work for you.
+
+```mermaid
+flowchart LR
+    DB["db starts"] --> H{"healthcheck passes?"}
+    H -- "no, retry" --> H
+    H -- "yes" --> API["api starts (depends_on: healthy)"]
+```
 
 A Compose file has four kinds of top-level things:
 
@@ -144,7 +181,7 @@ sequenceDiagram
 
 Without the healthcheck, `api` would start as soon as the Postgres *container* exists, connect before `pg_isready` would succeed, and crash-loop until Postgres happens to catch up — the old `docker comnpose` note's `depends_on` example had exactly this gap.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -171,6 +208,8 @@ services:
 The full example below adds a database, a worker, a one-off migration job, and the `.env` file a real project needs.
 
 ### Full example: Go API + Postgres + Redis + worker
+
+**In plain words:** a complete working file. Notice the healthchecks and depends_on: they make the API start only after the database answers.
 
 `compose.yaml` (Compose v2, no `version:` key):
 
@@ -353,7 +392,7 @@ docker compose down               # stop and remove containers + default network
 docker compose down -v            # also delete named volumes (pgdata is gone)
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -363,7 +402,7 @@ docker compose down -v            # also delete named volumes (pgdata is gone)
 | `kompose` | Converts a Compose file into Kubernetes manifests | A starting point migrating from Compose to k8s | Output manifests still need hardening (resources, probes, security context) |
 | Nomad / Docker Swarm | Compose-like files, but with a scheduler across multiple hosts | Small team wanting multi-host without full Kubernetes | Smaller ecosystem than Kubernetes; Swarm is in Docker's low-maintenance mode |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Compose has no scheduler: it does not reschedule a container onto another host if the host dies, because there is only one host.
 - No rolling updates or canary support — `up -d` recreates whatever changed, with a brief gap.
@@ -371,7 +410,7 @@ docker compose down -v            # also delete named volumes (pgdata is gone)
 - For a single, stateless container with no dependencies, a bare `docker run` is simpler and Compose adds nothing.
 - Don't reach for Kubernetes just to get Compose's conveniences locally — `docker compose watch` plus bind mounts is usually a faster inner loop than a local k8s cluster.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Compose is the de facto standard for local dev stacks (most Go/Node/Rails starter templates ship a `compose.yaml`); some small teams and side projects run it directly on a single production VM with `restart: unless-stopped`; CI systems (GitHub Actions, GitLab CI) use `docker compose up -d` to spin up integration-test dependencies (a real Postgres, a real Redis) instead of mocking them.
 - **Failure modes → fixes:**
@@ -381,7 +420,7 @@ docker compose down -v            # also delete named volumes (pgdata is gone)
   - Stale image after a dependency bump → `docker compose up -d --build` (or `pull` for prebuilt images) instead of assuming `up` always rebuilds.
 - **What to monitor (locally and in CI):** `docker compose ps` health column going `unhealthy`; `docker compose logs --since` around a failing test; disk used by named volumes (`docker system df -v`) on long-lived dev machines.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Project identity.** The project name (folder name, `name:` key, or `-p`) scopes every resource Compose creates — containers, networks, volumes — so two checkouts of the same repo in different folders never collide, and `docker compose down` only ever touches its own project's resources.
 - **Override files.** Compose merges `compose.yaml` with `compose.override.yaml` automatically, and `-f base.yaml -f prod.yaml` explicitly for other combinations — the common pattern is a base file plus a local override that adds bind mounts and debug ports without touching the committed file.
@@ -389,7 +428,7 @@ docker compose down -v            # also delete named volumes (pgdata is gone)
 - **`service_completed_successfully`.** Introduced for exactly the migration-job pattern above: a dependency that is expected to exit 0 and never run again, as opposed to a long-running service whose `healthy` state means "still fine".
 - **Compose is not a production orchestrator**, but it is a correct map of the production topology at a smaller scale — the same service boundaries, environment variables and health checks typically carry over into the Kubernetes manifests in [[Kubernetes Fundamentals]], which is one reason to get the Compose file right first.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why doesn't `depends_on` alone stop the API from connecting to Postgres too early?
 > `depends_on` only orders container creation and start, not application readiness inside the container. Postgres's container can be "started" while the database is still initializing. Add a `healthcheck` to the dependency and `depends_on: <service>: condition: service_healthy` on the dependent so Compose actually waits for readiness.
@@ -409,7 +448,7 @@ docker compose down -v            # also delete named volumes (pgdata is gone)
 > [!question]- How would you give two developers isolated copies of the same stack on one laptop?
 > Run each from a different project name (`docker compose -p alice up`, `docker compose -p bob up`) or a different project folder, and parameterize the published host port through `.env` so the two projects' `ports:` don't collide.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Compose v2 = `docker compose`, no `version:` key; one file, one project network, service-name DNS.
 - `depends_on` orders start; `healthcheck` + `condition: service_healthy` orders readiness.

@@ -25,7 +25,17 @@ updated: 2026-11-13
 > - Embedding promotes the inner type's methods, but the inner type never calls back into the outer one: there is no virtual dispatch.
 > - Classic mistake: returning a nil `*MyError` as an `error`; the caller sees `err != nil`.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Most LLD advice is written for Java, which has classes and inheritance. Go has neither, but it can do the same jobs. A **struct** holds the data, methods attach behaviour to it, an **interface** is a list of methods any type can meet without saying so, and **embedding** puts one struct inside another so its methods show through. This note maps each OOP idea to its Go form, then shows a full tested example. Read the plain-words line above each code block first, then the code.
+
 
 **The problem in one story.**
 You know Java or Python, where you write `class Car extends Vehicle`.
@@ -69,7 +79,7 @@ Where it breaks: a plug fits once the shape matches, but in Go a method on a poi
 > [!tip] Remember
 > Struct plus methods is the class, a small interface is the contract, and embedding is reuse without inheritance.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Most LLD material is written in Java: abstract classes, `extends`, `@Override`, `IOrderService` with an `OrderServiceImpl`. Translating it line by line into Go produces code that compiles but behaves differently, and interviewers who write Go notice within a minute. Three concrete examples from practice problems:
 
@@ -79,7 +89,7 @@ Most LLD material is written in Java: abstract classes, `extends`, `@Override`, 
 
 Getting these right is the price of entry for writing Go in an LLD round.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Separate **data**, **behaviour contracts** and **reuse**, which Java's class bundles together:
 
@@ -89,9 +99,11 @@ Separate **data**, **behaviour contracts** and **reuse**, which Java's class bun
 
 **Analogy:** a power socket (interface) does not know which appliance you plug in; any plug with the right pins fits. Embedding is a toolbox bolted inside a van: you can reach the tools from the van, but the toolbox does not know it is in a van.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Java/OOP to Go translation
+
+**In plain words: each OOP word on the left, and how you write it in Go on the right.**
 
 | OOP idea | Go version | Note |
 | --- | --- | --- |
@@ -111,6 +123,8 @@ Separate **data**, **behaviour contracts** and **reuse**, which Java's class bun
 
 ### Value vs pointer receivers and method sets
 
+**In plain words: a pointer receiver can change the object; a value receiver gets a copy.**
+
 A method's receiver is either a value (`func (o Order) ID()`) or a pointer (`func (o *Order) Cancel()`).
 
 - A **value receiver** gets a copy. Use it for small, read-only methods.
@@ -128,6 +142,8 @@ Calling `v.Cancel()` on a plain variable `v Order` still compiles, because the v
 
 ### Interfaces: implicit, small, consumer-side
 
+**In plain words: a type meets an interface just by having the methods. No "implements" keyword.**
+
 An interface value is a pair: (dynamic type, dynamic value). Calling a method looks up the method for the dynamic type at run time. That is Go's only dynamic dispatch.
 
 Rules that interviewers check:
@@ -143,6 +159,8 @@ Rules that interviewers check:
 | Interface embedding | `type ReadWriter interface { Reader; Writer }`, as in `io.ReadWriter`. |
 
 ### Embedding: promotion, shadowing, no virtual dispatch
+
+**In plain words: embedding is not inheritance. The inner methods show through, but they never call back into the outer type.**
 
 ```mermaid
 classDiagram
@@ -209,16 +227,20 @@ Other embedding facts:
 
 ### Enums, constructors and zero values
 
+**In plain words: Go builds enums from constants, and a New function checks the rules when you make an object.**
+
 - **Enums:** `type Status int` plus `const ( StatusUnknown Status = iota; ... )`. Reserve the zero value for "unknown" so a forgotten field is detectable, add `String()` for logs, and a `Valid()` check, because `Status(9)` compiles.
 - **Constructors:** `NewOrder` validates input and returns `(*Order, error)`. Other packages cannot set unexported fields, so the constructor is the only way to build a valid `Order` from outside.
 - **Useful zero values:** design types so `var x T` works where possible, as `sync.Mutex`, `bytes.Buffer` and `strings.Builder` do. When a zero value cannot be valid (an `Order` with no ID), hide the fields and require the constructor.
 
 ### Encapsulation by package
 
+**In plain words: lower-case names are private to the package, not to the struct.**
+
 - Lower-case names are visible only inside the **package** (all files in one directory). Two types in the same package can read each other's unexported fields; that is the unit of encapsulation, not the type.
 - A directory named `internal/` limits imports to code rooted at the parent of `internal` (enforced by the go command). `myapp/internal/order` can be imported by `myapp/cmd/api` but not by another module.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -257,6 +279,8 @@ func validate() error {
 ```
 
 ### Full code (tested)
+
+**In plain words: the full example, one file at a time, with its tests.**
 
 `order.go`:
 
@@ -526,6 +550,8 @@ Measured: `go vet` is clean and `go test -race -count=1` passes on Go 1.24.4 (da
 
 ### Constructor injection and the composition root
 
+**In plain words: main() builds every object and hands each one what it needs.**
+
 The **composition root** is the one place, usually `main`, that builds concrete types and passes them into constructors. Nothing else calls `NewPostgresStore`:
 
 ```go
@@ -548,7 +574,7 @@ For a handful of services, hand wiring like this is the common Go choice: it is 
 
 Both pay off only when the dependency graph is large. Layout details are in [[Service Project Layout and Wiring]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 How to get "same call, different behaviour" in Go:
 
@@ -563,7 +589,7 @@ How to get "same call, different behaviour" in Go:
 
 Generics and interfaces combine: `func Max[T cmp.Ordered](a, b T) T` uses an interface as a constraint. More in [[Generics and Iterators]] and [[LRU Cache with TTL]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Do not create an interface per struct.** `OrderService` + `OrderServiceImpl` is Java style. Declare the interface in the consumer when a second implementation or a test fake exists.
 - **Do not embed to get "is-a".** If you want `SalesReport` to be usable where a `Report` is expected, define an interface both satisfy. Embedding does not create a subtype.
@@ -572,7 +598,7 @@ Generics and interfaces combine: `func Max[T cmp.Ordered](a, b T) T` uses an int
 - **Generics are not polymorphism.** A generic `Notifier[T]` does not let you choose email or SMS at run time; an interface does.
 - **Large producer-side interfaces** (a 12-method `Repository` declared next to the Postgres code) force every fake to implement 12 methods. Split by consumer.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** the standard library is the model. `io.Reader`/`io.Writer` are one-method consumer-friendly interfaces; `http.Handler` is one method; `bufio.ReadWriter` embeds `*bufio.Reader` and `*bufio.Writer` to promote both method sets; `sync.Mutex` and `bytes.Buffer` have useful zero values.
 - **Failure modes → fixes:**
@@ -588,7 +614,7 @@ Generics and interfaces combine: `func Max[T cmp.Ordered](a, b T) T` uses an int
 
 - **What to monitor:** in code review, `go vet` (copylocks, printf), `staticcheck`, and the race detector in CI (`go test -race`). Compile-time `var _ I = (*T)(nil)` assertions catch interface drift before deploy.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why typed nil happens.** An `error` is an interface value: (type, value). `return ve` where `ve` is a nil `*ValidationError` produces (`*ValidationError`, nil). An interface equals `nil` only when both parts are nil, so the result is not nil (Go FAQ). Calling `err.Error()` would then call the method with a nil receiver, which works or panics depending on whether the method dereferences it. The same trap applies to any interface, such as a nil `*MemStore` passed as a `Saver`.
 
@@ -600,7 +626,7 @@ Generics and interfaces combine: `func Max[T cmp.Ordered](a, b T) T` uses an int
 
 **Errors are values.** The domain error package, wrapping with `%w`, `errors.Is`/`errors.As`/`errors.Join` and the mapping to HTTP status at the edge belong to [[Error Handling]]; this note only covers the interface-shaped trap.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does `*T` satisfy an interface but `T` does not?
 > Methods with pointer receivers are in the method set of `*T` only. If the interface needs one of them, only a `*T` has it. You can still call such a method on an addressable `T` variable because Go takes its address for you, but that rewrite does not apply to interface satisfaction.
@@ -623,7 +649,7 @@ Generics and interfaces combine: `func Max[T cmp.Ordered](a, b T) T` uses an int
 > [!question]- How do you model an enum safely?
 > A named integer type with `iota` constants, the zero value reserved for "unknown", a `String()` method, and a `Valid()` check at the boundary, because any integer converts to the type.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Struct + methods = class; `NewX` = constructor; lower-case = package-private.
 - Mutating or large or contains a mutex → pointer receiver; only `*T` then satisfies the interface.
@@ -633,7 +659,7 @@ Generics and interfaces combine: `func Max[T cmp.Ordered](a, b T) T` uses an int
 - Enums: `iota`, zero = unknown, `String()`, `Valid()`.
 - Wire concrete types in `main` (composition root); everything else takes interfaces.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Structs, Methods and Embedding]], [[Interfaces]], [[Pointers, Values and Escape Analysis]]
 - **Next:** [[Design Principles - DRY, KISS, YAGNI, Coupling and Cohesion]], [[SOLID in Go]], [[LLD Interview Method]]

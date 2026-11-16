@@ -26,7 +26,40 @@ updated: 2026-11-13
 > - Your backend executes the call, wraps the result in a `tool_result`, and sends the whole turn back — the model never touches your systems directly.
 > - Schema-valid does not mean safe or correct: validate semantics and authorization in your own code regardless of how the output was produced.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+An AI model writes text, one small piece at a time. Your code wants clean data it can read, not a friendly sentence.
+
+```mermaid
+flowchart LR
+    A["Model reply:<br/>'Sure! It is $1,204'"] --> B["Your parser"] --> C["Crash"]
+```
+
+A **structured output** means the model is forced to answer in an exact shape, like a form with fixed boxes. The shape is written as a **JSON Schema**, which is just a rulebook: "amount must be a number".
+
+A **tool call** is the same trick used for actions. The model fills a form that says "please run `get_weather` for Pune". Your code runs it and hands the answer back.
+
+```mermaid
+flowchart LR
+    M["Model"] -- "form: get_weather(Pune)" --> G["Your Go code runs it"]
+    G -- "result: 31 C" --> M
+    M --> R["Final answer to user"]
+```
+
+The model never runs anything itself. It only writes the form.
+
+The rest of this note is just these 3 questions:
+1. How do you force the shape of a reply?
+2. How does one tool call go from request to answer?
+3. What breaks in production, and how do you guard it?
+
 
 **The problem in one story.**
 Your app asks an AI model: "read this invoice and tell me the amount".
@@ -69,7 +102,7 @@ Where it breaks: a form only checks the shape of the answer; a box can still hol
 > [!tip] Remember
 > The model only writes structured text; a schema fixes its shape, and your code does the running and the checking.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Say you are building a backend endpoint that asks an LLM to extract an invoice's vendor, amount, and due date as JSON your downstream code will `json.Unmarshal`. The naive approach is a prompt: *"Respond with only JSON: `{"vendor": ..., "amount": ..., "due_date": ...}`."*
 
@@ -85,7 +118,7 @@ For ten thousand invoices a day parsed by `encoding/json`, a 1% unparseable rate
 
 Structured outputs and tool calling close most of that gap. The provider's inference server restricts what tokens are even legal at each step, so the output is guaranteed to parse as JSON and to match your schema's required fields and types — turning a parsing problem into a (much smaller) semantic-correctness problem.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture a text editor with autocomplete so aggressive it refuses to let you type a character that would make the file invalid.
 
@@ -99,9 +132,11 @@ The model cannot emit `amount": "abc"` if `amount` is typed `number`, because `"
 
 The model's job changes from "answer the question" to "decide whether to answer directly or to request `get_weather(location="Bengaluru, IN")` first" — and your code is what actually calls the weather service.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Whiteboard version
+
+**In plain words:** The model writes a request, your code does the work, and the model turns the result into an answer.
 
 One request, one tool, no back-and-forth: you want the model to decide if a tool is needed, nothing more.
 
@@ -115,6 +150,8 @@ flowchart LR
 The full version below adds the part every real integration needs: executing the call and sending the result back so the model can finish its answer.
 
 ### The full request-response loop
+
+**In plain words:** One tool call costs two trips to the model: one to ask for the tool, one to read the result.
 
 A tool-using turn is always at least two round trips to the API, because the model cannot call the tool itself — your process is the only thing with network access, database credentials, or filesystem permissions:
 
@@ -143,6 +180,8 @@ Three rules fall out of this diagram directly:
 
 ### The lifecycle of one tool call
 
+**In plain words:** Think of a waiter: takes the order (tool_use), the kitchen cooks (your code), the waiter brings the plate back (tool_result).
+
 ```mermaid
 stateDiagram-v2
     [*] --> Requested: model emits tool_use
@@ -163,6 +202,8 @@ stateDiagram-v2
 
 ### Designing a tool
 
+**In plain words:** A tool is a mini job ad for the model: a clear name, when to use it, and exactly what inputs it needs.
+
 A tool definition is four things, and all four affect whether the model calls it correctly:
 
 - **Name**: a short, unambiguous verb-noun pair (`get_weather`, not `weather` or `doStuff`).
@@ -178,7 +219,15 @@ A tool definition is four things, and all four affect whether the model calls it
 | Output | returns raw provider JSON | returns a short, model-readable summary string |
 | Errors | throws, call vanishes | returns `tool_result` with `is_error: true` and a one-line reason |
 
-## 4. Worked example
+```mermaid
+flowchart LR
+    N["Name<br/>get_weather"] --> T["Tool the model can pick well"]
+    D["Description<br/>when to use it"] --> T
+    S["Input schema<br/>typed fields"] --> T
+    X["Strict mode<br/>shape enforced"] --> T
+```
+
+## 4. Worked example 🟡
 
 The code below defines one tool (`get_weather`), runs the two-request loop from the sequence diagram, and is tested against an `httptest` fake standing in for the Messages API — there is no API key in this environment, so the "live" output below is representative, not a captured response.
 
@@ -441,7 +490,7 @@ PASS
 ok  	weather	1.56s
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -452,7 +501,12 @@ ok  	weather	1.56s
 | Tool calling (multiple tools, parallel) | Model can emit several `tool_use` blocks in one turn | Independent actions in one step (e.g., check weather *and* check calendar) | Must execute (and often parallelize) all calls before replying; one `tool_result` per `tool_use` |
 | Full agent loop | Repeated tool-calling turns until the model stops asking | Open-ended, multi-step tasks | See [[AI Agents and Agentic Workflows]] for stop conditions, memory, and cost control |
 
-## 6. Trade-offs and when not to use
+```mermaid
+flowchart LR
+    A["Prompted JSON<br/>no guarantee"] --> B["JSON mode<br/>valid JSON only"] --> C["Structured outputs<br/>exact schema"] --> D["Tool calling<br/>model asks for actions"] --> E["Agent loop<br/>many tool calls"]
+```
+
+## 6. Trade-offs and when not to use 🟡
 
 - **Schema-valid is not correct.** Constrained decoding guarantees shape, not truth: a `get_weather` call with `location: "Atlantis"` is perfectly valid JSON for a place that doesn't exist. Validate business meaning and authorization yourself.
 - **Strict mode narrows the schema language.** Deeply nested `oneOf`/`anyOf`, recursive schemas, or very large enums may not be supported in strict mode; check the current docs and fall back to best-effort mode plus your own validation if your schema needs them.
@@ -462,7 +516,14 @@ ok  	weather	1.56s
   A tool that shells out or hits a payment API carries the same blast radius as any other code path that an untrusted caller (here, the model, steered by untrusted user and retrieved content) can trigger. Treat tool input as adversarial input, same as any other API request (see [[OWASP API Security Top 10]]).
 - **Simpler alternative:** for a fixed, small set of fields with no real decision to make, plain prompted output you validate with a Go struct and `json.Unmarshal` plus manual checks is sometimes less code than wiring up strict schemas and tool loops — reach for structured outputs when the parse-failure rate actually hurts.
 
-## 7. In production
+```mermaid
+flowchart LR
+    A["Reply matches schema"] --> B{"Is the value true<br/>and allowed?"}
+    B -- "check in your code" --> C["Act on it"]
+    B -- "no" --> D["Reject or ask again"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:** Anthropic's Messages API (`tool_use`/`tool_result` blocks, `strict`), OpenAI's function calling and Structured Outputs (`response_format: json_schema`, `strict`), Google's Gemini function calling.
   Agent frameworks (LangGraph, the Go agent SDKs) build their tool loops on exactly this primitive — see [[LangChain and LangGraph]] and [[Model Context Protocol (MCP)]] for the transport that standardizes tool discovery across servers.
@@ -477,7 +538,7 @@ ok  	weather	1.56s
   - End-to-end latency split into "before first tool call" vs "after tool_result" (link [[Distributed Tracing with OpenTelemetry]] — trace each tool execution as its own span).
   - Schema-validation rejection rate (a rising rate often means your description or schema is ambiguous, not that the model got worse).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **How constrained decoding actually works.** Your JSON Schema is compiled into a grammar (conceptually a finite-state or pushdown automaton over JSON syntax plus your field constraints).
   1. At each decoding step, the inference server computes the model's normal next-token logits.
@@ -507,7 +568,7 @@ _ = g.Wait()
 - **Forced and disabled tool choice.** `tool_choice: {type: "tool", name: "..."}` forces a specific tool on the very next turn (useful for the first turn of a classification pipeline where you always want the same function called); `tool_choice: {type: "none"}` or simply omitting `tools` disables calling entirely, even if tools are defined elsewhere in a conversation history you are replaying.
 - **Interleaved thinking with tool use.** Reasoning-capable models can emit a `thinking` block between tool calls in the same turn, reasoning about one tool's result before deciding on the next action — treat this as the model's visible scratch space, not a user-facing explanation, and strip it before displaying a transcript.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's the difference between a structured output and a tool call?
 > Both use the same schema-constrained decoding mechanism. A structured output constrains the entire final answer to match a schema; a tool call constrains one content block that represents a request for your code to run a named function, with the final answer coming in a later turn after you return a result.
@@ -530,7 +591,7 @@ _ = g.Wait()
 > [!question]- How is tool calling different from giving the model a sandbox to execute code in?
 > Tool calling never executes anything — it only produces a structured request. Your backend process is what runs code, and it decides what is safe to run, with what permissions, and against which systems. A code-execution sandbox is a different, additional capability some platforms offer, with its own isolation and resource limits.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Prompting cannot force valid JSON; schema-constrained decoding (structured outputs, tool input schemas) can.
 - A tool = name + description ("when to use it") + strict input schema + predictable, model-readable output.
@@ -541,7 +602,7 @@ _ = g.Wait()
 - Strict mode guarantees shape at generation time, at the cost of a narrower supported schema language.
 - Treat tool_result content from the outside world (fetched pages, user files) as untrusted data, same as RAG context.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[LLM Fundamentals]], [[Prompt Engineering]], [[Calling LLM APIs from Go]]
 - **Next:** [[AI Agents and Agentic Workflows]], [[Model Context Protocol (MCP)]]

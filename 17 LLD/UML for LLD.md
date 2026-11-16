@@ -28,7 +28,32 @@ updated: 2026-11-13
 > - Go has no inheritance arrow: draw interface realization (dotted) for "implements" and a plain association labelled "embeds" for embedding.
 > - Time-box it: about 5 minutes of diagrams in a 45-minute round, then code.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Before you code a design, it helps to draw it.
+**UML** is a standard way to draw software, so everyone reads the same boxes and arrows the same way.
+In an LLD round you only need three kinds of drawing.
+A **class diagram** shows the things (classes or Go structs) and how they link.
+A **sequence diagram** shows who calls whom, in time order, for one action.
+A **state diagram** shows the stages one object moves through, like booked, paid, cancelled.
+
+```mermaid
+flowchart LR
+    CL["Class diagram: what exists"] --- SQ["Sequence diagram: who calls whom"] --- ST["State diagram: which stage next"]
+```
+
+The rest of this note is just these 3 questions:
+1. Which drawing answers which question?
+2. What do the arrows mean, and how do they map to Go?
+3. How do you turn a drawing into Go files?
+
 
 **The problem in one story.**
 You start coding a movie-booking system straight away.
@@ -71,7 +96,7 @@ Where it breaks: a building is built once from the plan; your diagrams are rough
 > [!tip] Remember
 > Class, sequence, state: three quick sketches, each turning directly into Go.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 In a 45-minute LLD round on movie booking, a candidate who jumps straight into code usually discovers at minute 30 that `Seat` needs to know its `Screen`, that two users can hold the same seat, and that a `Booking` can be cancelled after it expired.
 
@@ -85,7 +110,13 @@ Five minutes of diagrams expose those questions early and cheaply:
 
 The interviewer also gets a shared picture to argue about, which is cheaper than arguing about code.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    T["Talk only"] --> M["Interviewer loses the thread"]
+    D["Quick drawing"] --> S["Both see the same design, fix it early"]
+```
+
+## 2. Mental model 🟢
 
 UML is a building's floor plan, wiring diagram and lift-status panel. The floor plan (class diagram) shows rooms and doors, the wiring diagram (sequence) shows what happens when you flip one switch, and the lift panel (state) shows which floors it may go to next.
 
@@ -98,9 +129,11 @@ Terms used below:
 - **Guard:** a condition in square brackets on a transition, such as `[age < 10 min]`; the transition fires only if it is true.
 - **Terminal state:** a state with no outgoing transitions except to the end marker `[*]`.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Which diagram answers which question
+
+**In plain words: pick the drawing by the question you need to answer.**
 
 | Diagram | Answers | Draw when |
 | --- | --- | --- |
@@ -111,6 +144,8 @@ Terms used below:
 | Use-case diagram | Which actor does what | Almost never: a bullet list of use cases is clearer |
 
 ### Class diagram notation
+
+**In plain words: a box has three parts: the name, the fields, and the methods.**
 
 A class box has three parts: name, fields, methods. Stereotypes in `<<...>>` mark special kinds such as `<<interface>>` or `<<enumeration>>`.
 
@@ -129,6 +164,8 @@ A class box has three parts: name, fields, methods. Stereotypes in `<<...>>` mar
 | `1..*` | at least one | a Booking has 1..* seats |
 
 ### The six relationships and their Go form
+
+**In plain words: six kinds of arrows, and what each one looks like in Go code.**
 
 | Relationship | Meaning | Mermaid | Go form |
 | --- | --- | --- | --- |
@@ -207,6 +244,8 @@ classDiagram
 
 ### Embedding versus realization: the Go-specific picture
 
+**In plain words: Go has no inheritance. It has embedding (one struct inside another) and interfaces met by methods.**
+
 Java UML habits draw `Booking --|> Auditable` (inheritance). Go has two different tools, and they draw differently:
 
 ```mermaid
@@ -237,6 +276,8 @@ classDiagram
 - **Realization** is the only "is-a" in Go: any type with the right methods satisfies the interface. See [[Interfaces]].
 
 ### Sequence diagrams: alt, opt, loop, par
+
+**In plain words: boxes for if/else, optional steps, loops and parallel steps.**
 
 Draw the hardest flow, and always draw its failure path. The four fragments you need:
 
@@ -292,6 +333,8 @@ The `-)` arrows are asynchronous messages (fire and forget). The compensating `R
 
 ### State diagrams: guards, timeouts, terminal states
 
+**In plain words: a guard is a condition on an arrow; a terminal state is an end you cannot leave.**
+
 ```mermaid
 stateDiagram-v2
     [*] --> Held: seats held
@@ -310,9 +353,11 @@ stateDiagram-v2
 
 ### When an activity diagram earns its place
 
+**In plain words: use a flowchart only when steps run in parallel or branch a lot.**
+
 For a multi-step workflow with parallel branches (order fulfilment: pick, pack and invoice in parallel, then dispatch), a `flowchart` with fork and join nodes is quicker than a sequence diagram. For a single request it adds nothing.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 The movie-booking class and state diagrams above, turned into Go. Each relationship becomes a specific code shape.
 
@@ -332,6 +377,8 @@ Guard [age < 10 min]  -> if b.Age(now) >= HoldTTL { Expired }
 ```
 
 ### The tested code
+
+**In plain words: the Go code that matches the drawings above.**
 
 ```go
 package booking
@@ -597,6 +644,8 @@ The numbers in `TestPricing` follow from the code: a premium seat adds 50% (20,0
 
 ### From diagram to files
 
+**In plain words: each box and arrow in the drawing lands in a specific Go file.**
+
 | Diagram element | Go file |
 | --- | --- |
 | Entities (Theater, Screen, Seat, Movie, Show, Booking) | `booking/model.go` |
@@ -605,7 +654,7 @@ The numbers in `TestPricing` follow from the code: a premium seat adds 50% (20,0
 | State diagram | `booking/status.go` with the transition methods |
 | Sequence diagram's service lifeline | `booking/service.go` (one method per flow) |
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -628,14 +677,20 @@ Java-flavoured UML translated to Go:
 
 If subclasses differ only in data (a car spot versus a bike spot), do not draw inheritance. Draw one `Spot` with a `Type` field, as in [[Parking Lot]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Diagrams cost interview time.** Budget about 5 minutes. Twenty minutes of perfect diagrams with no code fails the round.
 - **Do not draw getters, setters or every field.** Show the fields that drive behaviour (status, IDs, amounts).
 - **Skip the state diagram** when nothing has a status field, and skip the sequence diagram for CRUD-only flows.
 - **Diagrams drift from code.** In a real code base keep only the diagrams people update: one class overview per service and state diagrams for lifecycles, stored as Mermaid next to the code.
 
-## 7. In production
+```mermaid
+flowchart TD
+    Q{"Short on time?"} -- "yes" --> C["Draw one class diagram + one sequence"]
+    Q -- "no" --> F["Add a state diagram for the main object"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:** Design documents commonly embed Mermaid, which GitHub and GitLab render natively in Markdown. State diagrams double as the spec for order and payment lifecycles, and their transition tables often become a database `CHECK` or a transition table enforced in code.
 - **Failure modes and fixes:**
@@ -644,7 +699,7 @@ If subclasses differ only in data (a car spot versus a bike spot), do not draw i
 	- *Inheritance trees copied from Java:* they become deep embedding chains in Go that do not dispatch the way the diagram suggests. Fix: interfaces for behaviour, one struct with a type field for data-only variants.
 - **What to monitor:** in production the state diagram becomes measurable: count transitions per edge and alert on the "impossible" ones (any `ErrIllegalTransition` logged).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Navigability and direction.** An arrowhead on an association means "A can reach B" (A has a field for B).
 
@@ -669,7 +724,7 @@ Prefer one direction plus a lookup by ID.
 5. A sequence diagram for the single hardest flow, with its failure path.
 6. A state diagram for every entity with a status field.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the difference between aggregation and composition, and how do you decide it in Go?
 > Composition means the whole owns the part's lifecycle: it creates the part and the part dies with it (Theater and Screen). Aggregation means the part exists independently (Booking and Seat). In Go decide by who creates the part and whether it outlives the whole, not by `[]B` versus `[]*B`.
@@ -689,7 +744,7 @@ Prefer one direction plus a lookup by ID.
 > [!question]- When would you draw an activity diagram instead of a sequence diagram?
 > For a multi-step workflow with branches and parallel steps where the order of activities matters more than which object performs them, such as fulfilment (pick, pack and invoice in parallel, then dispatch). For one request through a few services, a sequence diagram is clearer.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Three diagrams: class (always), sequence (hardest flow plus failure), state (anything with status).
 - Relationships: `-->` association, `o--` aggregation, `*--` composition, `<|..` realization, `..>` dependency; no inheritance in Go.
@@ -699,7 +754,7 @@ Prefer one direction plus a lookup by ID.
 - Every undrawn state transition must return an error in code.
 - Budget about 5 minutes, then code.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[OOP in Go - Structs, Interfaces, Embedding]], [[SOLID in Go]]
 - **Next:** [[Design Patterns Overview and Chooser]], [[LLD Interview Method]]

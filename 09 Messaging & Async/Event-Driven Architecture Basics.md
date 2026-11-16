@@ -24,7 +24,44 @@ updated: 2026-11-13
 > - Events arrive late, twice or out of order. Consumers must cope, and publishers must publish reliably (outbox).
 > - Classic mistake: an "event" that is really a command in disguise (`SendWelcomeEmail`), which couples the publisher to one consumer.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (commands vs events, choreography, event styles), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Normally one service calls the others directly: "charge the card", "send the email".
+If one of them is down, the whole action can fail.
+In an event-driven design, a service just announces what happened: "order placed".
+That announcement is an **event**.
+Any service that cares listens and does its own part.
+The sender doesn't know or care who is listening.
+The catch: the other parts finish a bit later, not at the same instant. This is called **eventual consistency**.
+
+```mermaid
+flowchart LR
+    O["Orders"] --> P["Payments"]
+    O --> E["Email"]
+    O --> L["Loyalty"]
+    E -. "down => checkout fails" .-> O
+```
+
+```mermaid
+flowchart LR
+    O["Orders"] -- "order placed" --> B[("Event bus")]
+    B --> P["Payments"]
+    B --> E["Email"]
+    B --> L["Loyalty"]
+```
+
+The rest of this note is just these 3 questions:
+1. What is the difference between an event and a command?
+2. How much data should an event carry?
+3. How do you keep many services that react to events from turning into a mess?
+
 
 **The problem in one story.**
 You buy shoes online. The shop must charge your card, email a receipt, add loyalty points and update stock.
@@ -68,7 +105,7 @@ Where it breaks: a paper notice is read once and in order; real events can arriv
 > [!tip] Remember
 > An event says "this happened" to anyone listening; a command says "do this" to one receiver.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An orders service in a monolith-turned-microservices system calls, on every checkout: payments, inventory, email, loyalty, analytics and fraud. That is 6 synchronous calls.
 
@@ -82,7 +119,15 @@ The orders service no longer changes when the 7th consumer arrives, and an email
 
 The cost: the business process "place order" now lives in six codebases, and its state is **eventually consistent** (the loyalty balance is updated a few hundred milliseconds or minutes later, not inside the checkout transaction).
 
-## 2. Mental model
+**Why the chain of calls is fragile** (rounded, assumes failures are independent):
+
+```mermaid
+flowchart LR
+    A["6 direct calls,<br/>each 99.9% up"] --> B["Whole checkout<br/>~99.4% up"]
+    B --> C["~6 in 1,000<br/>checkouts fail"]
+```
+
+## 2. Mental model 🟢
 
 A town notice board. The bakery pins "Fresh bread at 7 am". It does not phone each customer, and it does not know who reads the board. Anyone interested acts on the notice. Compare a phone call to the baker saying "bake 20 loaves for me": that is a command, addressed to one party, who can say no.
 
@@ -92,9 +137,24 @@ Three words to keep straight:
 - **Command:** "ChargeCard". Imperative, addressed to one receiver who owns the decision, may be rejected. Often sent through a queue, which is fine, but it is still a command.
 - **Query:** "GetOrder". Asks for data; no side effects.
 
-## 3. How it works
+**Notice board vs phone call:**
+
+```mermaid
+flowchart LR
+    subgraph Event["Event: notice board"]
+        B1["Bakery pins<br/>'fresh bread at 7'"] --> N[("Board")]
+        N --> R1["Anyone who cares"]
+    end
+    subgraph Command["Command: phone call"]
+        C1["Customer"] -- "bake 20 loaves" --> C2["Baker (can say no)"]
+    end
+```
+
+## 3. How it works 🟡
 
 ### Commands vs events
+
+**In plain words:** a command is "please do X", sent to one service that can say no. An event is "X happened", and anyone may listen.
 
 ```mermaid
 flowchart LR
@@ -115,6 +175,8 @@ flowchart LR
 In the command style the orders service knows every receiver; the dependency arrows point out of it. In the event style the arrows point into the bus, and the dependency is reversed: consumers depend on the event's contract, not the publisher's code.
 
 ### Choreography: a checkout as a chain of reactions
+
+**In plain words:** there is no boss here. Each service hears an event, does its job, and announces its own event, like dancers reacting to each other.
 
 ```mermaid
 sequenceDiagram
@@ -146,6 +208,8 @@ Steps:
 
 ### Two event styles
 
+**In plain words:** an event can be a short ping ("order 42 changed, ask me for details") or a full copy of the data, so readers never need to call back.
+
 ```mermaid
 sequenceDiagram
     participant O as orders
@@ -166,9 +230,11 @@ sequenceDiagram
 
 A third style, **event sourcing**, uses events as the publisher's own source of truth. It is a storage pattern, not a messaging style, and is covered in [[Event Sourcing]].
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the whole idea in a few lines: wrap each event in a standard envelope, and let many handlers subscribe to one event type.
 
 ```text
 envelope = {id, source, type, version, time, data}     <- CloudEvents-like
@@ -186,6 +252,8 @@ publish(e):
 ```
 
 ### Code: an in-process bus with both event styles
+
+**In plain words:** a tiny event bus in Go that gives each event to every subscriber, so you can watch both event styles work.
 
 The bus below is the in-memory version of what a broker does for a topic: deliver to every subscriber of a type, independently. The envelope follows the CloudEvents core attribute names (`id`, `source`, `type`, `time`) plus a version number.
 
@@ -374,7 +442,7 @@ Run with `go test -race ./eda` (Go 1.24): all 4 tests pass. They show:
 - A failing loyalty subscriber did not stop the email subscriber, and the returned error names which subscriber failed, so only that one is retried. With a real broker each subscriber has its own queue, so this isolation is automatic.
 - Publishing an event nobody listens to is not an error. Events are facts, not requests.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -386,7 +454,7 @@ Run with `go test -race ./eda` (Go 1.24): all 4 tests pass. They show:
 | Choreography | Services react to each other's events | Few steps, independent teams, flow rarely changes | Flow is implicit; hard to answer "where is order 42?" |
 | Orchestration | A coordinator sends commands and waits for replies | Many steps, compensation logic, need visibility | Central component to build and run ([[Workflow Engines and Durable Execution]]) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Eventual consistency is user-visible.** After checkout the "My points" page may lag. Design the UI for it ("points arrive within a minute") or keep that read synchronous.
 - **Hidden coupling.** Consumers depend on field names, meanings and timing of events they do not own. Renaming `total` to `amount` silently breaks three teams. Treat events as public APIs with versioning and a registry ([[Event Schemas and Schema Registry]]).
@@ -395,7 +463,7 @@ Run with `go test -race ./eda` (Go 1.24): all 4 tests pass. They show:
 - **Duplicates and reordering are normal.** At-least-once delivery means every consumer must be idempotent ([[Delivery Semantics and Exactly-Once]]), and must handle `order.cancelled` arriving before `order.placed` ([[Message Ordering and Partition Keys]]).
 - **Do not use events** for a request that needs an answer to continue, inside a single small service, or as a way to avoid deciding which team owns a process.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** event buses are usually Kafka, SNS + SQS, EventBridge, or Pulsar ([[Queues vs Streams and Broker Comparison]]). Debezium turns database changes into events without touching application code. AWS EventBridge routes events by content with rules, and its schema registry can discover event shapes.
 - **Naming conventions that age well:**
@@ -411,7 +479,7 @@ Run with `go test -race ./eda` (Go 1.24): all 4 tests pass. They show:
 	- Slow consumer backlog → per-consumer queues and lag alerts, so one slow consumer does not slow the others.
 - **What to monitor:** publish rate and errors per event type, consumer lag or oldest-message age per subscriber, DLQ depth, end-to-end latency from `time` in the envelope to processing, and outbox backlog.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Where to draw event boundaries.** Events are most stable when they cross a bounded context boundary ([[Domain-Driven Design - Strategic Design]]). Inside one context, use domain events in-process; at the edge, publish **integration events** with a deliberately smaller, stable schema. Publishing internal domain events directly leaks your model and freezes it.
 
@@ -429,7 +497,16 @@ Prefer either a thin notification or a full snapshot of the fields consumers nee
 
 **Request/reply over events** (send a command, wait for a reply event on a reply topic with a correlation id) is possible but brings back temporal coupling with extra moving parts. Use it for long-running steps where an orchestrator persists its state, not to fake a synchronous API.
 
-## 9. Interview questions
+**Using version numbers, not clocks, to handle out-of-order events:**
+
+```mermaid
+flowchart LR
+    E["Event for order 42<br/>version 3"] --> C{"3 > stored version?"}
+    C -- "yes" --> A["Apply, store 3"]
+    C -- "no (old or repeat)" --> S["Skip"]
+```
+
+## 9. Interview questions 🔴
 
 > [!question]- What is the difference between an event and a command?
 > An event states a past fact (`order.placed`), is owned by the publisher, and may have zero or many consumers who decide what to do. A command (`ChargeCard`) asks one specific receiver to act and can be rejected. Both can travel through a broker; the difference is who owns the decision and who knows whom.
@@ -449,7 +526,7 @@ Prefer either a thin notification or a full snapshot of the fields consumers nee
 > [!question]- A consumer receives `order.cancelled` before `order.placed`. What do you do?
 > Key both events by order id so the broker keeps them in one partition or group. Still defend against it: store a per-order version and ignore older events, or park the early event and apply it after the missing one arrives. Never assume global order.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Event = past-tense fact, many consumers, no reply expected. Command = one receiver, may be rejected.
 - Name events `entity.past_tense_verb`; never name the reaction.

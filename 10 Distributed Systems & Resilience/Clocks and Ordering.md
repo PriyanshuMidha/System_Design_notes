@@ -30,7 +30,40 @@ updated: 2026-11-13
 > - Hybrid logical clocks stay close to real time while keeping causality; TrueTime waits out the uncertainty instead.
 > - Classic mistake: last-writer-wins with wall-clock timestamps. It silently drops writes whenever clocks are skewed.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Every computer has its own clock, and no two clocks agree exactly.
+One can be a few milliseconds fast, another a bit slow.
+So if two machines stamp events with their own time, the stamps can lie about which came first.
+
+```mermaid
+flowchart LR
+    A["Server A, clock fast: edit at 10:00:00.120"] --> Q{"Which came first?"}
+    B["Server B, correct clock: edit at 10:00:00.050"] --> Q
+    Q --> W["Wrong answer: B looks earlier"]
+```
+
+The fix is to stop trusting clock time for ordering.
+A **logical clock** is just a counter. Each machine adds 1 per event and sends its counter with every message.
+The receiver jumps its own counter past the one it got. Now "cause" always gets a smaller number than "effect".
+
+```mermaid
+flowchart LR
+    A["A: event, counter 1"] -- "message carries 1" --> B["B: receives, counter 2"]
+    B --> C["B: next event, counter 3"]
+```
+
+The rest of this note is just these 3 questions:
+1. Why can't we just use real clock time?
+2. How do counters (Lamport, vector, hybrid) put events in order?
+3. When do you need real time anyway, like Google Spanner does?
 
 **The problem in one story.** Two people in different cities write in a shared diary and stamp each entry with their own watch. One watch is 5 seconds fast. Later, reading the diary, you see a reply stamped *before* the question it answers. Watches cannot tell you what really happened first.
 
@@ -70,7 +103,7 @@ sequenceDiagram
 > [!tip] Remember
 > Use counters, not wall clocks, to decide order across machines; use the monotonic clock to measure time on one.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Two app servers handle edits to the same document title. Server A's clock is 120 ms fast.
 
@@ -95,7 +128,7 @@ sequenceDiagram
     Note over DB: Stored: "Draft". The later write "Final" is silently lost
 ```
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 - **Wall clock (time-of-day)**: what `date` prints. It can be stepped backwards or forwards by NTP or an operator.
 - **Monotonic clock**: a counter that only moves forward, used to measure elapsed time on one machine. Its absolute value means nothing.
@@ -105,9 +138,18 @@ sequenceDiagram
 
 **Analogy.** Letters between pen-pals in different time zones with unreliable watches. You cannot order letters by the time written on them. But if a letter says "replying to your letter #7", you know it came after #7. Logical clocks are that "replying to" number.
 
-## 3. How it works
+```mermaid
+flowchart LR
+    W["Wall clock: time of day"] -- "can jump back" --> X["Bad for measuring how long"]
+    M["Monotonic clock: only goes up"] --> Y["Good for timeouts on one machine"]
+    L["Logical clock: a counter"] --> Z["Good for order across machines"]
+```
+
+## 3. How it works 🟡
 
 ### Physical clocks and their limits
+
+**In plain words:** real clocks drift and get corrected in jumps, so two machines can be off by many milliseconds.
 
 - **Drift**: commodity quartz oscillators drift by tens of ppm and change with temperature (an estimate; Spanner's TrueTime assumes a worst case of 200 ppm).
 - **NTP**: synchronises to time servers. Typical accuracy is tens of milliseconds over the public internet and well under a millisecond inside a data centre with a nearby server (estimates; both depend on network jitter and asymmetry). PTP and cloud services such as Amazon Time Sync can do better.
@@ -117,6 +159,8 @@ sequenceDiagram
 
 ### Lamport clocks
 
+**In plain words:** one counter per machine. Bump it on every event, and on receive jump past the sender's number.
+
 Each process keeps a counter `L`:
 
 1. Before each local event or send: `L = L + 1`; attach `L` to the message.
@@ -124,7 +168,19 @@ Each process keeps a counter `L`:
 
 Guarantee: if A → B then `L(A) < L(B)`. The converse does not hold: `L(A) < L(B)` does not mean A happened before B. To get a total order (for example for a mutual-exclusion queue), break ties with the process id: compare `(L, pid)`.
 
+```mermaid
+sequenceDiagram
+    participant A
+    participant B
+    Note over A: event, L=1
+    A->>B: send, carries 1
+    Note over B: L = max(0,1)+1 = 2
+    Note over B: next event, L=3
+```
+
 ### Vector clocks
+
+**In plain words:** each machine keeps a small list of counters, one per machine. It can tell "happened before" apart from "happened at the same time".
 
 Each process keeps a vector with one counter per process:
 
@@ -153,17 +209,23 @@ Cost: one entry per process (or per replica that wrote the key). With many clien
 
 ### Hybrid logical clocks (HLC)
 
+**In plain words:** a real clock time plus a small counter, so the stamps stay close to real time and still keep cause before effect.
+
 An HLC timestamp is `(wall, logical)`: `wall` is the largest physical time this node has seen (its own or in a message), and `logical` counts events while `wall` does not move.
 
 It respects happens-before like a Lamport clock, stays within the clock skew of real time, and fits in 64 bits. CockroachDB orders transactions with HLC timestamps, and MongoDB's cluster time (since 3.6) is a hybrid logical clock used for causally consistent sessions.
 
 ### TrueTime and commit-wait (Spanner)
 
+**In plain words:** Spanner knows its clock error, say up to 7 ms, and simply waits out that error before saying a write is done.
+
 Spanner's `TT.now()` returns an interval `[earliest, latest]` guaranteed to contain true time, using GPS receivers and atomic clocks in each data centre. The uncertainty ε was typically 1 to 7 ms in the 2012 paper.
 
 A transaction picks commit timestamp `s = TT.now().latest` and then **waits** until `TT.now().earliest > s` before making the commit visible. After that wait, any transaction that starts later in real time gets a larger timestamp, which gives external consistency (strict serializability). The cost is about 2ε of latency per read-write commit.
 
 ### Sequence numbers as ordering
+
+**In plain words:** if one owner hands out the numbers, the numbers are the order. No clocks needed.
 
 When one owner assigns order, you do not need clocks at all:
 
@@ -173,7 +235,7 @@ When one owner assigns order, you do not need clocks at all:
 
 The price is that every ordered event goes through the owner.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -198,6 +260,8 @@ HLC (pt = physical clock):
 ```
 
 ### Go: Lamport, vector and hybrid logical clocks
+
+**In plain words:** working code for all three counters, with tests. Read the type names and comments first.
 
 This compiles and passes `go vet` and `go test -race` on Go 1.24. The HLC takes its physical clock as a function, so the test controls skew exactly.
 
@@ -399,7 +463,7 @@ What the HLC test shows: B's own clock says 900, but after hearing from A it sta
 
 Once B's physical clock passes 1000, the logical part resets to 0 and timestamps track real time again. A plain wall clock would have stamped B's receive at 900, *before* the send.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Mechanism | Size | Respects causality? | Detects concurrency? | Close to real time? | Used by |
 | --- | --- | --- | --- | --- | --- |
@@ -410,7 +474,7 @@ Once B's physical clock passes 1000, the logical part resets to 0 and timestamps
 | TrueTime | interval | yes, via commit-wait | no | yes, bounded by ε | Spanner |
 | Single-owner sequence | 8 bytes | yes, for events through that owner | n/a | no | Kafka offsets, DB sequences, Raft log index |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Logical clocks cannot answer "what happened at 3 pm?"** Use wall time for display and audit, and logical or sequence ordering for correctness.
 - **Vector clocks grow with the number of writers** and need pruning, which can turn concurrent versions into false "before" relations.
@@ -419,7 +483,7 @@ Once B's physical clock passes 1000, the logical part resets to 0 and timestamps
 - **Sequences need one owner**, which is a throughput and availability bottleneck; partition the sequence (Kafka partitions) and accept no order across partitions.
 - **When a simpler answer wins:** if all writes for a key go through one leader, the leader's log order is the order. Do not add vector clocks to a single-leader database.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Rules of thumb:**
   - Store timestamps in UTC (`timestamptz` in PostgreSQL 17, `time.Time` in UTC in Go) and convert only for display.
@@ -434,7 +498,7 @@ Once B's physical clock passes 1000, the logical part resets to 0 and timestamps
   - Certificate or token validation fails on a node with a wrong clock → alert on NTP offset and refuse to serve when it exceeds a threshold.
 - **What to monitor:** NTP or chrony offset and sync status per host, stratum, clock step events, and HLC "max offset" warnings in CockroachDB-style systems.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why Lamport ordering is not enough for conflicts.** A total order from `(L, pid)` always picks a winner, even for concurrent writes, so it behaves like LWW: deterministic, but it still discards one of two concurrent updates. Detecting concurrency requires vectors or explicit dependency tracking.
 - **Version vectors vs vector clocks.** Vector clocks track events per process; version vectors track versions per replica of one data item. Riak's dotted version vectors add a "dot" (replica, counter) per write so that concurrent writes through the same replica are not mistaken for ordered ones.
@@ -442,7 +506,7 @@ Once B's physical clock passes 1000, the logical part resets to 0 and timestamps
 - **CockroachDB uncertainty intervals.** Without TrueTime, a CockroachDB transaction that reads a value with a timestamp slightly above its own, but within `max-offset`, cannot tell whether that write happened before it in real time. It restarts at a higher timestamp ("uncertainty restart"). That is the price of getting serializability without atomic clocks (see [[Distributed SQL]]).
 - **Kafka ordering.** Ordering per partition holds only if the producer does not reorder retries. With `max.in.flight.requests.per.connection > 1` and retries, ordering requires the idempotent producer (default since Kafka 3.0). See [[Delivery Semantics and Exactly-Once]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why can't you order events across servers by timestamp?
 > Each server's clock drifts and is corrected independently, so offsets of milliseconds to seconds are normal, and a clock can even step backwards. An event stamped later on one server may have happened earlier in real time, so timestamp order is not happens-before order.
@@ -465,7 +529,7 @@ Once B's physical clock passes 1000, the logical part resets to 0 and timestamps
 > [!question]- A lock service gives a 10 s lease. Why can the holder still corrupt data?
 > The holder can pause (GC, VM migration) or its clock can run slow, so it acts after the lease expired and another holder got it. The resource must check a fencing token that increases with each grant and reject older tokens.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Wall clocks drift (ppm) and jump; NTP gives ms over the internet, sub-ms in a DC (estimates).
 - Measure durations with monotonic time (`time.Since` in Go).

@@ -33,7 +33,29 @@ updated: 2026-11-13
 > - Always tell the client **when** to retry (`Retry-After`), and delete idle keys so memory stays bounded.
 > - Classic mistakes: `INCR` then `EXPIRE` as two Redis calls (a crash between them leaves a key that never expires), and a fixed window that lets 2N requests through around the window edge.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code) and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs) and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A rate limiter is a bouncer for your API. It lets each user make, say, 100 requests a minute. Extra requests get a polite "slow down" answer, HTTP **429**. There are a few ways to count. The popular one is a **token bucket**: a bucket fills with tokens at a steady speed, and each request takes one. If the bucket is empty, the request waits or is refused. With many servers, the count lives in Redis so they all share it.
+
+```mermaid
+flowchart LR
+    A["Request"] --> B{"Token left?"}
+    B -- "yes" --> C["Allow, take token"]
+    B -- "no" --> D["429: slow down"]
+    E["Refill over time"] --> B
+```
+
+Everything else in this note is just these 3 questions:
+1. Which counting methods exist, and how do they differ?
+2. How do you share the count across many servers?
+3. How do you keep memory small with millions of users?
 
 **The problem in one story.** A ticket site opens sales for a big concert.
 One script sends 5,000 requests a second while real fans send one or two.
@@ -77,7 +99,7 @@ It breaks down because real stamps are physical, while here "refill" is just ari
 > [!tip] Remember
 > Each request does one atomic "refill, check, spend" on its key's state, and every "no" tells the client when to retry.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design a rate limiter. It allows at most N requests per key (user, IP or API key)
@@ -100,7 +122,7 @@ What it really tests: algorithm choice, the Strategy pattern, an atomic read-ref
 
 Three details interviewers probe: a janitor that really deletes idle keys (otherwise per-IP keys leak memory), a `Retry-After` computed by the algorithm instead of hard-coded, and an honest answer about lock granularity (this code uses one mutex per limiter).
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 Questions to ask, with the assumptions this design makes:
 
@@ -117,7 +139,7 @@ Questions to ask, with the assumptions this design makes:
 
 **Out of scope:** concurrency limits (max in-flight requests: a semaphore), DDoS at the network edge (CDN or WAF), monthly quotas and billing (metering).
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 | --- | --- |
@@ -129,7 +151,7 @@ Questions to ask, with the assumptions this design makes:
 
 The use case to code: `Allow(ctx, key)` under concurrency, where refill or window reset, check and decrement are one atomic step.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 | --- | --- | --- |
@@ -149,7 +171,7 @@ One policy has millions of per-key states, so the rule lives in SQL and the stat
 
 The second insight: state is **deletable when it equals a fresh key** (a full bucket, a past window), and that is exactly the janitor's rule.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -197,7 +219,7 @@ classDiagram
 - **Composition:** each limiter owns its per-key map; the state has no life outside it. One mutex per limiter guards the whole map (not one per bucket); sharding by `hash(key)` is the fix if that lock becomes hot.
 - **Association:** limiters use an injected `Clock`; the middleware uses a `Limiter` and never knows which algorithm.
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 The limiter is middleware, so clients see it only in responses:
 
@@ -232,7 +254,7 @@ Many public APIs use their own `X-RateLimit-*` set instead; GitHub, for example,
 
 Every constructor returns `ErrInvalidConfig` for a zero limit, rate or window, or a nil clock.
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
 
 Only configuration goes in SQL; a SQL write per request would be far too slow.
 
@@ -329,7 +351,7 @@ cmd/demo/main.go      -> wiring: build limiters, start one janitor per limiter, 
 - Each algorithm file owns its per-key state and its mutex.
 - `middleware.go` holds the HTTP concerns only: the key, status codes and headers.
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 | --- | --- | --- |
@@ -341,7 +363,7 @@ cmd/demo/main.go      -> wiring: build limiters, start one janitor per limiter, 
 
 Not used: a Singleton limiter (created in `main` and injected, so tests do not share state), and a refill goroutine per key (lazy refill on `Allow` gives the same numbers with zero goroutines).
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > **Write in the room (about 150 lines):** `Clock` + `RealClock`, `Decision`, `Limiter`; `TokenBucket` with `NewTokenBucket`, `Allow` and `Sweep`; `Middleware` returning 429 with `Retry-After`; `ceilSeconds`; a `fakeClock` and one table test.
@@ -354,6 +376,8 @@ Not used: a Singleton limiter (created in `main` and injected, so tests do not s
 > - **Lock granularity:** the code uses one mutex per limiter, not one per bucket. Per-key locks or sharded maps are an extension when one lock becomes a bottleneck.
 
 Complete package, Go 1.24, standard library only:
+
+**In plain words:** The full package with several limiters behind one interface. Start with the token bucket, then the window-based ones.
 
 ```go
 package ratelimiter
@@ -844,7 +868,7 @@ The two leaky buckets are different things: **as a meter** it rejects what would
 
 Use `x/time/rate` for client-side throttling (calling a vendor at 50 requests per second with `Wait`) and for a few fixed keys; use a per-key strategy package with a janitor, or Redis, for a server facing millions of IPs.
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 | --- | --- |
@@ -857,6 +881,8 @@ Use `x/time/rate` for client-side throttling (calling a vendor at 50 requests pe
 | `TestCeilSeconds` | 1 ms rounds up to 1 s, 1.5 s to 2 s |
 
 All pass with `go vet` and `go test -race` on Go 1.24.4, also with `-count=5` (measured: 99.5% statement coverage).
+
+**In plain words:** Table-driven tests with a fake clock, stepping time forward and checking allow or deny for each request.
 
 ```go
 package ratelimiter
@@ -1088,7 +1114,7 @@ func TestCeilSeconds(t *testing.T) {
 }
 ```
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | Risk | Handling |
 | --- | --- | --- |
@@ -1105,7 +1131,7 @@ func TestCeilSeconds(t *testing.T) {
 | Signed payment-provider webhooks | Legitimate events rejected | Do not limit authenticated provider traffic; limit unauthenticated traffic |
 | Clients retry at once after 429 | Retry storm | Computed `Retry-After`; clients add jittered backoff |
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 | --- | --- |
@@ -1127,7 +1153,7 @@ Tradeoffs chosen:
 
 See [[Rate Limiting - Algorithms and Distributed Design]] for the system-level view: where limits live (gateway, service, edge), global versus local limits, and multi-region counters.
 
-## Drawing
+## Drawing 🟢
 
 ![[Rate Limiter LLD Drawing.excalidraw]]
 
@@ -1141,7 +1167,7 @@ Redraw it from memory, then add what it predates: GCRA, the sliding counter, the
 - [ ] The policy table in SQL, the counters in Redis, and why they are split
 - [ ] The janitor beside the in-memory maps, and the TTL that replaces it in Redis
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- Your limiter keeps a map per key. What stops it from eating all memory?
 > A janitor that deletes state equal to a fresh key: a bucket that has refilled to capacity, a counter from a past window, a GCRA key whose TAT has passed, a log whose newest entry left the window. Deleting such a key changes no future decision. In Redis the same job is done by a TTL on every key.
@@ -1164,7 +1190,7 @@ Redraw it from memory, then add what it predates: GCRA, the sliding counter, the
 > [!question]- How does the sliding window counter avoid the fixed window's edge burst?
 > It weights the previous window by how much of it still overlaps the rolling window: `prev × (1 − elapsed/size) + curr`. Right after a boundary the previous window still counts almost fully, so the 2× burst is gone, at the cost of a small error from assuming the previous window's requests were evenly spread.
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - `Allow(ctx, key) (Decision, error)`: allowed, limit, remaining, retry-after, reset.
 - Token bucket: lazy refill `min(cap, tokens + Δt·rate)`; GCRA: one TAT, `allow if now ≥ TAT − (burst−1)·T`.
@@ -1174,7 +1200,7 @@ Redraw it from memory, then add what it predates: GCRA, the sliding counter, the
 - `Retry-After` is computed and rounded up; quota headers on every response (draft -06 `RateLimit-Limit/-Remaining/-Reset` here; from -07 the draft uses `RateLimit` plus `RateLimit-Policy`).
 - Fail open by default, fail closed for login, OTP and payments.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Strategy and Template Method]], [[Decorator and Middleware]], [[Notification Service]]
 - **Next:** [[Logging Library]], [[Circuit Breaker]]

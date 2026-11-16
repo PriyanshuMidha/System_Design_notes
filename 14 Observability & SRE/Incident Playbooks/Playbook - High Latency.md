@@ -25,7 +25,41 @@ updated: 2026-11-13
 > - Slow is usually "waiting", not "working": queues, locks, exhausted connection pools, retries and timeouts cause more latency than slow code.
 > - Mitigate before you diagnose. Rolling back a bad deploy in two minutes beats a perfect root-cause analysis in two hours.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (first 5 minutes, flowchart and causes A to F), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+**Latency** is how long a user waits for an answer.
+A request passes through many steps: network, a waiting line, your code, the database, other services.
+Each step adds a little time. "High latency" means one of the steps got slower.
+Usually most users are still fast, and only the slowest few wait a long time.
+So we don't look at the average. We look at the slowest 1 in 100 requests, called **p99**.
+
+```mermaid
+flowchart LR
+    U["User"] --> N["Network"]
+    N --> Q["Waiting line"]
+    Q --> A["Your code"]
+    A --> D[("Database")]
+```
+
+Your whole job in this playbook: find the step whose time grew.
+
+```mermaid
+flowchart LR
+    B["Before: 200 ms<br/>DB took 50 ms"] --> A2["Now: 2,000 ms<br/>DB takes 1,850 ms"]
+    A2 --> F["The DB step grew:<br/>look there"]
+```
+
+The rest of this note is just these 3 questions:
+1. Is it really slower, for whom, and since when?
+2. Which step of the request got slower?
+3. How do you make users fast again now, then fix the cause?
 
 **The problem in one story**
 
@@ -76,7 +110,7 @@ Where it breaks: in a shop you can see the queue; in software you need percentil
 > [!tip] Remember
 > Look at p99, not the average, and find where requests wait.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Symptoms you will see:
 
@@ -94,7 +128,7 @@ Only 1 request in 100 is slow, but a page that makes 20 API calls hits at least 
 > [!tip] Remember
 > A small slow tail becomes a large share of user-visible pain once one page makes many calls.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a restaurant. A meal takes long if the kitchen is slow (CPU), if you wait for a table (queueing), if the kitchen waits for a supplier (a downstream service or database), or if the waiter walks far (network). Different problem, same complaint: "the food is slow."
 
@@ -115,7 +149,7 @@ flowchart LR
 
 Each box adds time. The playbook's job is to find the box whose time grew.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 First 5 minutes
 
@@ -484,6 +518,8 @@ Deeper: [[Network Debugging Toolkit - dig, curl, ss, tcpdump]].
 
 ### 3.10 Fix, proper fix, prevention
 
+**In plain words:** for each cause: the quick fix today, the real fix this week, and the guard so it doesn't come back.
+
 | Cause | Immediate fix | Proper fix | Prevention |
 | --- | --- | --- | --- |
 | Bad deploy | Roll back | Fix and re-release with canary | Canary and automatic rollback on SLO burn, see [[Deployment Strategies - Rolling, Blue-Green, Canary]] |
@@ -496,7 +532,7 @@ Deeper: [[Network Debugging Toolkit - dig, curl, ss, tcpdump]].
 | Retry storm | Disable or cap retries, shed load | Retry budgets | Retry budget metric |
 | Network or DNS | Switch resolver, restart affected component | Fix root path issue | Synthetic probes per region |
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 **Incident: checkout latency after a "small" release (an illustrative walkthrough, not a real company's log).**
 
@@ -544,7 +580,7 @@ flowchart LR
 
 Say: "Latency is a sum, so I find which piece grew. I mitigate first, usually by rolling back, then use a trace to see whether the extra time is CPU, the database, the cache, a downstream call, or the network."
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Symptom pattern | Most likely cause | First check |
 | --- | --- | --- |
@@ -560,7 +596,7 @@ Say: "Latency is a sum, so I find which piece grew. I mitigate first, usually by
 
 Related playbooks in this folder cover the neighbouring problems: [[Playbook - Error Rate Spike (5xx)]], [[Playbook - Database Overload and Connection Exhaustion]], [[Playbook - CPU Saturation]], [[Playbook - Memory Leak and OOMKilled]], [[Playbook - Queue and Kafka Consumer Lag]], and [[Playbook - Cache Outage and Stampede]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Rollback vs roll forward.** Rolling back is fastest, but not safe if the release included an irreversible database migration. Check migration compatibility first, see [[Rollback and Safe Migrations]].
 - **Scaling out as a mitigation.** It works for stateless CPU or queue problems. It makes things worse if the bottleneck is the database or a lock, because more instances add more load on it.
@@ -572,7 +608,7 @@ Related playbooks in this folder cover the neighbouring problems: [[Playbook - E
 > [!tip] Remember
 > The safest first action is the one you can undo in minutes: roll back, flip a flag, or scale out.
 
-## 7. In production
+## 7. In production 🔴
 
 Dashboards and alerts that make this playbook faster:
 
@@ -602,13 +638,17 @@ groups:
 
 Common production pitfalls: dashboards that show averages only, no per-route breakdown, no traces for the slow path, timeouts set longer than the caller's own timeout (so the work continues after the user is gone), and a pool size that was never tuned after the instance count grew.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### 8.1 Why averages lie and percentiles must be computed from histograms
+
+**In plain words:** you can't average the "slowest 1%" of ten servers to get the total. You must combine the raw counts first, then compute it.
 
 You cannot average percentiles across instances. The correct approach is to export histogram buckets, sum the buckets across instances (`sum by (le)`), then compute `histogram_quantile`. The quantile is an estimate whose accuracy depends on bucket boundaries: if your buckets jump from 1 s to 5 s, a reported p99 of "somewhere between" is only as precise as that gap. Choose buckets around your SLO threshold.
 
 ### 8.2 Queueing theory in one paragraph
+
+**In plain words:** a server that is 50% busy has short waits. At 90% busy, waits are many times longer. Near 100%, they explode.
 
 As utilization of a server approaches 100%, waiting time grows sharply, not linearly. For a simple single-queue model the wait grows roughly like utilization divided by (1 minus utilization) (a standard M/M/1 result).
 
@@ -616,9 +656,20 @@ Going from 50% to 90% busy makes the queue about nine times longer, and from 90%
 
 ### 8.3 Coordinated omission
 
+**In plain words:** if a test waits for each answer before sending the next request, it never sees the requests that would have waited during a stall. The test looks better than real life.
+
+```mermaid
+flowchart LR
+    T["Test sends 1, waits"] --> S["Server stalls 5 s"]
+    S --> M["Test sent nothing<br/>during the stall"]
+    M --> W["Report hides<br/>the slow 5 s"]
+```
+
 If your load test waits for each response before sending the next request, a stall hides the requests that would have been sent during the stall, and the measured tail looks better than reality. Use load tools that send at a fixed rate (open-loop), and record latency from the intended send time.
 
 ### 8.4 Little's law for finding pool sizes
+
+**In plain words:** how many requests are in progress = requests per second x seconds each takes. Use it to size worker pools.
 
 In-flight requests = arrival rate x average time in system. If you receive 500 requests per second and each holds a database connection for 40 ms, the average number of busy connections is 500 x 0.04 = 20.
 
@@ -626,15 +677,26 @@ A pool of 20 has no margin, and any slowdown in the query time makes requests qu
 
 ### 8.5 The retry amplification problem
 
+**In plain words:** if every layer retries 3 times, one user click can become 27 calls at the bottom. Retry in one place only.
+
+```mermaid
+flowchart LR
+    U["1 user click"] --> A["Layer A: 3 tries"]
+    A --> B["Layer B: 3 x 3 = 9"]
+    B --> C["Layer C: 9 x 3 = 27 calls"]
+```
+
 If each of 3 layers makes up to 3 attempts, one user request can become 27 requests to the bottom layer. Fix it with retries only at one layer, a retry budget (for example no more than 10% extra requests), exponential backoff with jitter, and idempotency so retries are safe. See [[Timeouts, Retries and Backoff]].
 
 ### 8.6 GC and the tail in Go
+
+**In plain words:** Go's memory cleaner sometimes makes busy requests help clean up. That adds small pauses to the slowest requests.
 
 A Go GC cycle runs mostly concurrently, but allocation-heavy services can see assists (goroutines forced to help the GC) that add latency to individual requests. Symptoms: p99 rises while p50 stays flat, and `gctrace` shows frequent cycles.
 
 Remedies: reduce allocations (reuse buffers with `sync.Pool`, avoid needless conversions), and set a soft memory limit with `GOMEMLIMIT` to avoid both OOM and over-aggressive collection.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Your API's p99 doubled ten minutes ago. Walk me through what you do.
 > Confirm with percentiles and find the blast radius (which routes, regions, customers). Check what changed: deploy, config, flag, traffic, dependencies. Mitigate before diagnosing: roll back the recent deploy, scale out if load-driven, shed load or open a circuit breaker if a dependency is slow.
@@ -667,7 +729,7 @@ Remedies: reduce allocations (reuse buffers with `sync.Pool`, avoid needless con
 >
 > Add the missing alert (for example outbound calls per inbound request), a load test that reproduces the pattern, and a code-review rule such as "every outbound call has a timeout". Record the actions in the postmortem and track them to completion.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Four steps first: confirm and scope, check what changed, mitigate (rollback, scale, shed, flag, fail over), communicate.
 - Latency is a sum: network, queue, CPU, database, cache, downstream. Find which piece grew.
@@ -681,7 +743,7 @@ Remedies: reduce allocations (reuse buffers with `sync.Pool`, avoid needless con
 - Scaling out does not help a database or lock bottleneck, and can hurt it.
 - After the incident: postmortem, a new alert, a reproducing load test, and tracked actions.
 
-## 11. Post-incident checklist
+## 11. Post-incident checklist 🟡
 
 - [ ] Timeline written with exact times (detection, mitigation, recovery) and the time to detect and time to mitigate measured.
 - [ ] Root cause and contributing factors identified, such as missing timeouts, missing alerts, or missing load tests.

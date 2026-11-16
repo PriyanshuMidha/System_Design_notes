@@ -25,7 +25,40 @@ updated: 2026-11-13
 > - When updates are asynchronous, reads lag writes, so the UI must handle "I just saved it but don't see it yet".
 > - Classic mistake: thinking CQRS requires events, a message broker or event sourcing. It requires none of them.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Most apps use one set of tables to both save data and show data.
+Saving wants clean, strict tables. Showing wants ready-made, screen-shaped data.
+Those two wishes fight each other.
+
+```mermaid
+flowchart LR
+    W["Save an invoice"] --> T["One set of tables"]
+    R["Show the dashboard"] --> T
+```
+
+**CQRS** splits them. You keep one model for changes (called **commands**) and a separate model for reads (called **queries**).
+The read model is copied from the write model, sometimes at once, often a moment later.
+So a screen can read one fast, simple table instead of joining ten.
+
+```mermaid
+flowchart LR
+    C["Command: save"] --> WM["Write model"]
+    WM -- "copy changes" --> RM["Read model"]
+    Q["Query: show"] --> RM
+```
+
+The rest of this note is just these 3 questions:
+1. How do changes flow from the write side to the read side?
+2. What happens when a user saves and the read side is not updated yet?
+3. When is all this extra work worth it?
 
 **The problem in one story.** A library keeps one big ledger of every book borrowed and returned. Librarians write in it all day. Visitors keep asking "which books are popular this month?", and each answer means reading the whole ledger. So the library keeps a separate notice board with the answer already worked out, updated as the ledger changes.
 
@@ -64,7 +97,7 @@ flowchart LR
 > [!tip] Remember
 > CQRS means writes and reads use different models; events and brokers are optional extras.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps (the billing app built in [[Capstone - InvoiceOps]]) has a normalized PostgreSQL schema: `customers`, `invoices`, `invoice_lines`, `payments`. Writes are simple: issue an invoice, record a payment.
 
@@ -76,7 +109,15 @@ The finance dashboard is not simple. For each of 20,000 customers it shows open 
 
 One model is being asked to be good at two opposite jobs. CQRS splits them: the write model stays normalized and strict, and each screen gets a read model that is precomputed for it.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    S["Dashboard screen"] --> J["Join 5 tables every time"]
+    J --> SLOW["Slow page"]
+    S2["Dashboard screen"] --> RT["One ready-made table"]
+    RT --> FAST["Fast page"]
+```
+
+## 2. Mental model 🟢
 
 Start from **CQS** (Command-Query Separation, Bertrand Meyer): a method either changes state (a command) or returns a value (a query), never both. CQRS applies that rule to the whole data model: separate **models**, not just separate methods.
 
@@ -91,9 +132,11 @@ Terms used below:
 - **Projector:** the code that turns write-side changes into read-model updates.
 - **Projection lag:** how far the read model is behind the write model.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The two paths
+
+**In plain words:** writes go one way, reads go another way, and a small worker copies changes from the first to the second.
 
 ```mermaid
 flowchart LR
@@ -112,6 +155,8 @@ Nothing in this picture needs a broker or event sourcing. The arrow from the tra
 
 ### Three levels of separation
 
+**In plain words:** you can split just the tables, or the whole database, or use a totally different store for reads. More split means more lag and more work.
+
 | Level | Read model lives in | Updated by | Lag |
 | --- | --- | --- | --- |
 | 1. Separate code paths | The same tables, or a read table in the same database | The same transaction as the write | None |
@@ -120,7 +165,16 @@ Nothing in this picture needs a broker or event sourcing. The arrow from the tra
 
 Most teams should start at level 1 and move up only when a specific query forces them to.
 
+```mermaid
+flowchart LR
+    L1["Level 1: same DB, extra table"] --> L2["Level 2: separate read DB"]
+    L2 --> L3["Level 3: different kind of store, like search"]
+    L3 -. "more lag, more work" .-> L3
+```
+
 ### Write, then read: where lag bites
+
+**In plain words:** the user clicks save, the page reloads, and the old data shows up because the copy is not done yet.
 
 With an asynchronous projector, a user can save something and not see it:
 
@@ -150,7 +204,7 @@ Other ways to hide lag:
 - **Read from the write side for the writer:** for a few seconds after a write, that user's queries go to the write model.
 - **Return the new state from the command:** fine for the object just changed, not for aggregates such as totals.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -176,6 +230,8 @@ COMMIT;
 Cost: every payment now also locks the customer's dashboard row, so two payments for the same big customer serialize on it. When that becomes the bottleneck, move to level 2 or 3 with an asynchronous projector, as below.
 
 ### Go: asynchronous projector with version tokens
+
+**In plain words:** the write side records changes in a list; a background worker reads that list and updates the read table. A version number tells the reader how fresh its copy must be.
 
 The write model validates commands and appends events to an outbox under one lock (standing in for one database transaction). The projector applies events strictly in order and skips duplicates, so at-least-once delivery is safe.
 
@@ -521,9 +577,11 @@ UPDATE projector_position SET position = 1042 WHERE projector = 'dashboard';
 COMMIT;
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Ways to update a read model
+
+**In plain words:** you can update the read copy in the same transaction, right after, or later from an event stream.
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -543,7 +601,7 @@ COMMIT;
 | CQRS | The model itself: different schemas, maybe different stores | Synchronous or eventually consistent, by design |
 | Event sourcing | How state is stored (as events) | Not about reads at all; often paired with CQRS |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **It is two models to maintain.** Every new field touches the command side, the event or outbox format, the projector and the read model.
 - **Eventual consistency leaks into the product.** Somebody must decide what a user sees during lag, and support must know why "the dashboard was wrong for two seconds".
@@ -552,7 +610,7 @@ COMMIT;
 - **Never validate commands against a read model.** It may be stale; "is this username free?" must be checked on the write side, typically with a unique constraint.
 - **Do use it** when read and write loads differ greatly, when there are many query shapes (search, analytics, dashboards), or when different teams own the reads and the writes.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Search: products are written to PostgreSQL and projected into Elasticsearch or OpenSearch for full-text queries (see [[Search Engines and Inverted Indexes]]).
@@ -570,9 +628,11 @@ COMMIT;
 	- Rebuild duration: if a full replay takes 9 hours, recovery from a bug takes 9 hours.
 	- Rate of "not caught up" answers to version-token queries.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Outbox positions are not commit order
+
+**In plain words:** numbers handed out early do not finish in order, so a reader can skip a row that commits late.
 
 In PostgreSQL a `bigserial` value is taken when the row is inserted, not when the transaction commits. Transaction A can take id 101, transaction B take 102 and commit first. A poller that reads "after 101" sees 102, advances its position, and never sees 101 when A commits. Fixes:
 
@@ -596,7 +656,7 @@ Total order across all events makes a projector simple but single-threaded. Most
 
 "Reject an invoice if the customer's outstanding total exceeds the credit limit" reads an aggregate. Keep that aggregate on the write side (a `credit_used` column updated in the same transaction) rather than reading the dashboard. The read model is for people; the write model is for decisions.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is CQRS, in one sentence, and how does it differ from CQS?
 > CQS says each method is either a command (changes state) or a query (returns data). CQRS lifts that to architecture: separate models, and often separate storage, for writes and for reads. The write model enforces invariants; read models are denormalized for specific queries.
@@ -619,7 +679,7 @@ Total order across all events makes a projector simple but single-threaded. Most
 > [!question]- What do you monitor for a CQRS system?
 > Projection lag in events and in seconds, projector errors and skipped events, rebuild time, and the rate at which version-token reads are refused. Add a reconciliation job that compares read-side totals with the write side.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Commands change state; queries return data; CQRS gives each its own model.
 - Levels: same transaction → separate read tables → separate read store.

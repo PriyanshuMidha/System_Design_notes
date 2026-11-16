@@ -43,7 +43,39 @@ flowchart LR
     Y --> Z["Retries add more load<br/>cascading failure"]
 ```
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3, then the on-call part (First 5 minutes, Diagnosis flowchart, Investigation steps, Fixes), then 4, 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Reading from the main **database** is slow and costly.
+So apps keep copies of popular data in a fast memory store. That store is the **cache**.
+Normally 95 out of 100 reads are answered by the cache. Only 5 reach the database.
+If the cache dies or forgets everything, all 100 reach the database.
+That is 20 times the normal load. The database chokes.
+
+```mermaid
+flowchart LR
+    U["100 reads"] --> C["Cache answers 95"]
+    C -- "only 5 go on" --> DB[("Database: fine")]
+```
+
+```mermaid
+flowchart LR
+    U["100 reads"] --> X["Cache is down"]
+    X -- "all 100 go on" --> DB[("Database: overloaded")]
+```
+
+A **stampede** is a small version of this. One very popular item expires, and hundreds of requests rush to the database for it in the same second.
+
+The rest of this note is just these 3 questions:
+1. Why did the cache stop answering (down, full, or empty)?
+2. How do you protect the database right now?
+3. How do you refill the cache without a second crash?
 
 **The problem in one story**
 
@@ -94,7 +126,7 @@ Where it breaks: real customers do not automatically retry, but software clients
 > [!tip] Remember
 > When the cache fails, protect the database first, then refill the cache slowly.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Imagine a shop with a front counter that keeps the 100 most asked-for items within arm's reach, and a warehouse behind a long corridor. Almost every customer is served at the counter.
 
@@ -115,7 +147,7 @@ The analogy breaks down because in software the jam also causes retries, which a
 > [!tip] Remember
 > The cache is not the failing system you must fix first. The database behind it is the one that breaks.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 The key quantity is **database read load = request rate x miss ratio**. Small changes in miss ratio near 0 have huge effects.
 
@@ -154,7 +186,7 @@ flowchart TD
 > [!tip] Remember
 > Different triggers, same failure path: misses go to the database. Fix the trigger, but always protect the database.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The stampede, step by step
 
@@ -185,6 +217,8 @@ If the query slows to 2 s under load, the window is 2 s and about 1,600 requests
 
 ### The avalanche
 
+**In plain words:** if you save many items with the same expiry time, they all expire at the same moment. The database gets hit by all of them at once.
+
 Keys written together with the same TTL expire together. A job that warmed 500,000 keys at 03:00 with a fixed 1 hour TTL creates a cliff at exactly 04:00.
 
 ```mermaid
@@ -199,11 +233,15 @@ flowchart LR
 
 ### Eviction when memory is full
 
+**In plain words:** when the cache runs out of room, it throws old items away to make space. Thrown-away items become misses.
+
 When used memory reaches `maxmemory`, Redis applies the `maxmemory-policy`. With `noeviction`, writes fail with `OOM command not allowed`. With `allkeys-lru` or `allkeys-lfu`, Redis deletes keys to make room, which lowers the hit ratio, and `evicted_keys` climbs.
 
 With `volatile-*` policies, only keys that have a TTL are candidates, so if keys have no TTL, nothing can be evicted and writes fail. See [[Cache Eviction Policies - LRU, LFU, TTL]].
 
 ### Failover pauses
+
+**In plain words:** when the main cache server dies, a backup takes over. That swap takes a few seconds, and every read in those seconds misses.
 
 During a Sentinel or Cluster failover the primary is unreachable for a few seconds to tens of seconds. Clients that time out slowly pile up. After failover, a promoted replica can lag behind, so some recent writes are missing: a miss that looks like data loss. See [[Redis Replication, Sentinel and Cluster]].
 
@@ -227,7 +265,7 @@ stateDiagram-v2
 > [!tip] Remember
 > Read load on the database is request rate times miss ratio. Anything that raises the miss ratio, or the request rate (retries), is a threat.
 
-## First 5 minutes
+## First 5 minutes 🟡
 
 1. **Confirm and scope.** Is the hit ratio down, the cache unreachable, or only the database slow? Look at cache hit ratio, `redis_up`, database load, and error rate side by side. Which endpoints and tenants? Which keys?
 2. **Check what changed.** Deploy that changed keys, TTLs or serialization (new key prefix means a cold cache by design), a Redis restart or failover, a flush (`FLUSHALL` by mistake), a memory increase from a new feature, a traffic spike, a cron job that bulk-expires or bulk-loads, infrastructure events (node replaced, network partition).
@@ -238,7 +276,7 @@ stateDiagram-v2
    - **Do not** restart everything at once. Bring traffic back in steps so the cache refills while the database stays healthy.
 4. **Communicate.** "Elevated latency on product and search pages since 10:42, cause is cache failure, database protected by rate limiting, next update 10:55."
 
-## Diagnosis flowchart
+## Diagnosis flowchart 🟡
 
 ```mermaid
 flowchart TD
@@ -257,9 +295,11 @@ flowchart TD
     Q6 -->|"no"| A7["Cause 7: Redis slow, not down<br/>big key, slow command, CPU"]
 ```
 
-## Investigation steps
+## Investigation steps 🟡
 
 ### Step 0: dashboards and PromQL
+
+**In plain words:** before guessing, look at four graphs: is the cache up, how often it answers, how full it is, and how busy the database is.
 
 These use `redis_exporter` metric names. Verify against your exporter.
 
@@ -307,6 +347,8 @@ How to read the result: a sudden spike in `calls` for one or two queries that ar
 
 ### Cause 1: cache outage
 
+**In plain words:** the cache server is down or can't be reached. Every read falls through to the database.
+
 ```bash
 redis-cli -h redis-host -p 6379 ping                      # PONG expected
 kubectl get pods -l app=redis -o wide
@@ -332,6 +374,8 @@ What results mean:
 
 ### Cause 2: memory pressure and eviction
 
+**In plain words:** the cache is full and keeps throwing items away, so it answers less often.
+
 ```bash
 redis-cli INFO memory | grep -E "used_memory_human|maxmemory_human|maxmemory_policy|mem_fragmentation_ratio"
 redis-cli INFO stats  | grep -E "evicted_keys|expired_keys|keyspace_hits|keyspace_misses"
@@ -351,6 +395,8 @@ What results mean:
 
 ### Cause 3: cold cache after a restart, flush or key change
 
+**In plain words:** the cache is up but empty. It has to be filled again, and until then reads go to the database.
+
 ```bash
 redis-cli DBSIZE                                   # far below normal?
 redis-cli INFO server | grep uptime_in_seconds     # just restarted?
@@ -361,6 +407,15 @@ redis-cli INFO commandstats | grep -iE "flush"     # was FLUSHALL or FLUSHDB cal
 What results mean: low `uptime_in_seconds` plus low `DBSIZE` means a restart without persistence (or `loading:1` while reading it). `cmdstat_flushall` with calls above 0 means someone flushed. A deploy that changed a key prefix or serialization version makes every old key unreachable: effectively a flush by design. Roll the deploy back or warm gradually.
 
 ### Cause 4: hot key stampede
+
+**In plain words:** one very popular item expired. Hundreds of requests try to rebuild it at the same time.
+
+```mermaid
+flowchart LR
+    K["Hot item expires"] --> R["500 requests miss<br/>in the same second"]
+    R --> DB[("500 identical<br/>DB queries")]
+    DB --> S["DB slows, item stays<br/>missing longer"]
+```
 
 ```bash
 # Needs maxmemory-policy to be an LFU policy for --hotkeys to work
@@ -375,6 +430,8 @@ What results mean: one key with a large share of commands and a matching burst o
 
 ### Cause 5: avalanche from the same TTL
 
+**In plain words:** many items were saved together with the same expiry, so they all ran out together.
+
 ```bash
 # Sample TTLs of keys to see if they cluster
 redis-cli --scan --pattern 'product:*' | head -200 | while read k; do redis-cli TTL "$k"; done | sort -n | uniq -c | head
@@ -388,6 +445,8 @@ What results mean: many keys with nearly identical remaining TTL, and an `expire
 
 ### Cause 6: cache penetration
 
+**In plain words:** people keep asking for things that don't exist. The cache never has them, so every request goes to the database.
+
 Look for a high miss ratio with the DB returning empty results.
 
 ```bash
@@ -397,6 +456,8 @@ kubectl logs deploy/api --since=10m | grep -E "cache miss" | awk '{print $NF}' |
 If the missing keys are random or sequential IDs that do not exist, a bot or a client bug is scanning. Negative caching (store "not found" for a short TTL), a bloom filter, input validation, and rate limiting on that client fix it.
 
 ### Cause 7: Redis is up but slow
+
+**In plain words:** the cache is alive but slow, often because one big command blocks everything else.
 
 ```bash
 redis-cli --latency -h redis-host                  # round trip ms, running min/avg/max. Ctrl-C to stop
@@ -426,7 +487,7 @@ kubectl exec deploy/api -- curl -s -o /dev/null -w "ttfb=%{time_starttransfer} t
 go tool pprof -http=:8081 "http://api-pod:6060/debug/pprof/profile?seconds=30"   # is the app waiting on Redis or DB?
 ```
 
-## Fixes
+## Fixes 🟡
 
 | Cause | Immediate fix | Proper fix | Prevention |
 |---|---|---|---|
@@ -439,6 +500,15 @@ go tool pprof -http=:8081 "http://api-pod:6060/debug/pprof/profile?seconds=30"  
 | Slow Redis | Kill or rename the blocking command, scan with `SCAN` instead of `KEYS` | Split big keys, pipeline, avoid O(N) commands, tune persistence | `rename-command KEYS ""` or ACLs, review slowlog regularly |
 
 ### Fix: request collapsing and jitter in Go
+
+**In plain words:** let only one request rebuild a missing item while the others wait for its answer. And add a little random time to each expiry so items don't all expire together.
+
+```mermaid
+flowchart LR
+    R["500 requests miss"] --> G["Collapse: 1 goes to DB,<br/>499 wait"]
+    G --> DB[("1 DB query")]
+    DB --> A["All 500 get<br/>the same answer"]
+```
 
 One concurrent loader per key, with randomized TTL. The `singleflight` package from `golang.org/x/sync` lets the first caller run the load while the others wait for its result.
 
@@ -471,6 +541,8 @@ With 50 pods, the database still sees up to 50 loads per hot key, which is usual
 
 ### Warm-up after recovery
 
+**In plain words:** refill the cache slowly, a bit at a time, so the database isn't flooded while it fills.
+
 ```mermaid
 flowchart LR
     R["Cache restored, empty"] --> W1["Admit 10 percent of traffic"]
@@ -484,7 +556,7 @@ flowchart LR
 
 Pre-load the top N keys (from access logs or a recent snapshot) with jittered TTLs before admitting traffic, and keep rate limiting active until the database load is back to baseline.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 **Scenario:** a catalog service serves 20,000 requests per second, 96 percent cache hit ratio, so about 800 database reads per second. The Postgres primary comfortably handles 3,000. The product detail pages are the heaviest path.
 
@@ -512,7 +584,7 @@ flowchart LR
 
 Estimated figures in this example are illustrative, not from a real system.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ```mermaid
 flowchart TD
@@ -536,7 +608,7 @@ flowchart TD
 | Avalanche | Cliff at a round time | `expired_keys` spike | Many keys |
 | Penetration | Constant high miss | DB queries returning empty | Non-existent keys |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 | Technique | Benefit | Cost |
 |---|---|---|
@@ -554,7 +626,7 @@ flowchart TD
 
 If Redis is used as a primary datastore or queue rather than a cache, an outage means data loss, which needs a different recovery plan (see [[Redis Persistence - RDB and AOF]]).
 
-## 7. In production
+## 7. In production 🔴
 
 - **Alerts:** hit ratio below baseline for 5 minutes, `redis_up == 0`, memory above 80 percent of max, eviction rate above a small threshold, p99 command latency, DB active connections above 70 percent.
 - **Client settings:** short connect and read timeouts (tens of milliseconds for a cache), a connection pool sized deliberately (see [[Connection Pooling]]), and a circuit breaker so a dead cache fails fast. See [[Circuit Breaker]].
@@ -563,7 +635,7 @@ If Redis is used as a primary datastore or queue rather than a cache, an outage 
 - **Persistence and HA:** at least one replica, tested failover, and decide on RDB or AOF based on whether a warm restart is worth the fork cost. See [[Redis in Production - Memory, Latency, Security]].
 - **Game days:** kill the cache in staging under load and measure database load and recovery time.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why stampedes are self-reinforcing.** A miss triggers a slow query. The slow query keeps the key missing for longer. More requests miss in that longer window, adding more load, which makes the query slower.
 
@@ -581,7 +653,7 @@ If the container limit has no headroom, the kernel OOM killer takes Redis, which
 
 **Multi-level caching.** A small in-process cache with a short TTL (seconds) in front of Redis protects against both hot keys and brief Redis blips, at the cost of per-pod staleness. See [[Caching Patterns]] and [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Your cache goes down in production. What happens and what do you do?
 > Every read falls through to the database, whose load becomes request rate times miss ratio, often 10 to 20 times normal. First confirm hit ratio and database health, then protect the database (rate limit, shed, serve stale, lower pool size), restore or fail over the cache, and warm it gradually with jittered TTLs before returning to full traffic. Afterwards, add timeouts, circuit breaker, replica and game day.
@@ -604,7 +676,7 @@ If the container limit has no headroom, the kernel OOM killer takes Redis, which
 > [!question]- Why can `KEYS *` or `HGETALL` on a big hash cause an outage?
 > Redis executes commands on one thread, so a command that takes 2 seconds blocks all other clients for 2 seconds. Use `SCAN` and `HSCAN`, split large keys, and review `SLOWLOG`.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - DB read load = request rate x miss ratio. Hit ratio falling from 95 percent to 0 multiplies read load by 20.
 - First five minutes: confirm hit ratio and `redis_up`, check what changed, protect the DB, restore cache gradually, communicate.
@@ -616,7 +688,7 @@ If the container limit has no headroom, the kernel OOM killer takes Redis, which
 - Give the container memory headroom for fork and buffers.
 - Test the cold-cache scenario in a game day.
 
-## Post-incident checklist
+## Post-incident checklist 🟡
 
 - [ ] Timeline with hit ratio, DB load and error rate graphs and exact times.
 - [ ] Root cause: why did the cache fail or empty, and why could the database not absorb it?

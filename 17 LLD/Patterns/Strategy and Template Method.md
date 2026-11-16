@@ -23,7 +23,17 @@ updated: 2026-11-13
 > - The rule that matters: separate what stays fixed from what changes, and pass the changing part in as a value.
 > - Classic mistake: a growing `switch city { ... }` inside the service, or (in Go) trying to fake inheritance with struct embedding, where the embedded type's method never calls your override.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+When one step can be done in different ways, like pricing by hour or by day, you hide that step behind an interface. That is the **strategy** pattern: swap the rule without changing the code that uses it. The **template method** is a cousin: the overall steps stay fixed, and only some steps are filled in by each variant. In Go, a strategy is often just an interface or a function value. Read the plain-words line above each code block first.
+
 
 **The problem in one story.**
 A parking app charges by the hour in one city and a flat fee in another.
@@ -69,7 +79,7 @@ Where it breaks: a drill bit cannot see the drill's state, while a Go strategy c
 > [!tip] Remember
 > Find what changes, make it a value (interface or func), and pass it in.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A quick-commerce backend assigns each order to a dark store. Mumbai wants the **nearest store with stock**. Bengaluru, during the evening peak, wants the **least loaded store**. Product wants to try a third rule next month.
 
@@ -83,16 +93,20 @@ Without Strategy, all of this becomes one function:
 
 Template Method fixes a different duplication. Three importers (CSV payments, JSON refunds, bank statements) each repeat "parse, then validate, then save, wrap each error with the step name". One importer forgets `Validate`, and bad rows reach the database. A single skeleton function that owns the order of the steps makes skipping a step impossible.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 - **Strategy is a pluggable decision.** A maps app offers "fastest", "shortest" and "avoid tolls". The trip, the map and the turn-by-turn screen stay the same; only the rule that picks the route is swapped. In Go the rule is a value: an interface with one method, or a function.
 - **Template Method is a recipe card with blanks.** "Make dough, add *your filling*, bake 20 minutes" fixes the order; the cook fills in one step. In Go the recipe is a plain function, and the blanks are the methods of a step interface it receives.
 
 Both patterns separate **what stays fixed** from **what varies**. Strategy keeps the caller fixed and swaps the whole algorithm. Template Method keeps the algorithm's skeleton fixed and swaps individual steps.
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words: the part that changes goes behind an interface; the rest of the code stays the same.**
 
 ### Strategy
+
+**In plain words: one interface, many rules; pick one at runtime.**
 
 1. Define the decision as a small interface, in the package that **uses** it: `StoreSelector` with one method `Select`.
 2. Write each rule as its own type (`NearestInStock`) or as a function converted to an adapter type (`SelectFunc`, the same trick as `http.HandlerFunc`; see [[Adapter]]).
@@ -151,6 +165,8 @@ sequenceDiagram
 ```
 
 ### Template Method
+
+**In plain words: the order of steps is fixed; each variant fills in a few of them.**
 
 Classic object-oriented languages put the skeleton in an abstract base class and let subclasses override the steps. Go has no inheritance, so the skeleton becomes a **function** and the steps become an **interface** it receives:
 
@@ -218,7 +234,9 @@ func main() {
 }
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
+
+**In plain words: pricing strategies and a fixed checkout flow with pluggable steps, with tests.**
 
 One `package main` with store-selection code, a function strategy, a per-call registry, a composed pricer, a generic Template Method and the embedding trap. Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
 
@@ -591,7 +609,7 @@ Reading the output:
 - `slices.SortFunc` takes a comparison function: that function is a strategy in one line.
 - `validated by base` is the embedding trap: `StrictJob.Validate` was never called.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -604,6 +622,8 @@ Reading the output:
 | Template via embedding | Base struct method calls its own "hook" methods | Never for overriding: it silently calls the base hook | Bugs that look correct in review |
 
 ### Strategy, State or Bridge?
+
+**In plain words: three patterns with the same shape; the goal tells them apart.**
 
 All three look the same in Go (a struct holding an interface field). The question is who decides which implementation runs and why.
 
@@ -626,7 +646,7 @@ flowchart TD
 
 See [[State Machines in Go]] for State and [[Rare GoF Patterns in Go]] for the full Bridge.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **One rule and no expected second rule:** write a function. An interface with one implementation is indirection with no payoff (YAGNI, see [[Design Principles - DRY, KISS, YAGNI, Coupling and Cohesion]]).
 - **Two fixed cases:** an `if` is clearer than two types and a registry.
@@ -635,7 +655,7 @@ See [[State Machines in Go]] for State and [[Rare GoF Patterns in Go]] for the f
 - **Indirect calls:** an interface or function-value call usually cannot be inlined by the compiler. That costs nanoseconds per call (an estimate) and matters only in tight loops, such as a comparator called millions of times.
 - **Hidden control flow:** a reader of `Assign` cannot see which rule runs without finding the wiring. Name strategies well and log the chosen name.
 
-## 7. In production
+## 7. In production 🔴
 
 **Real systems in the standard library:**
 
@@ -664,7 +684,7 @@ See [[State Machines in Go]] for State and [[Rare GoF Patterns in Go]] for the f
 
 **What to monitor:** record the chosen strategy name as a log field or a low-cardinality metric label (for example `assign_strategy="least-loaded"`), count unknown-name errors, and compare outcome metrics (delivery time, price paid) per strategy when you A/B test rules.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why embedding is not overriding.** A promoted method is just shorthand: `StrictJob{}.Run()` means `StrictJob{}.BaseJob.Run()`. Inside `Run`, the receiver is a `BaseJob` value. It has no pointer to the struct that contains it, so `b.Validate()` can only mean `BaseJob.Validate`. Two working alternatives:
 
@@ -686,7 +706,7 @@ The business must decide which one is right, and the wiring code must make the o
 
 **Rounding in money strategies.** The example keeps money in integer paise and uses integer division, which rounds down. With many stacked percentage rules, decide where rounding happens (per rule or once at the end) and test the boundaries, because each `p * percent / 100` truncates.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- When is a `switch` better than a Strategy?
 > When there are two or three cases that rarely change, live in one place, and need no separate tests. Strategy pays off when new rules arrive over time, when rules are chosen from config or per request, or when each rule needs its own tests. A `switch` that is copied into several functions is the signal to extract a strategy.
@@ -712,7 +732,7 @@ The business must decide which one is right, and the wiring code must make the o
 > [!question]- How do you test code that uses strategies?
 > Test each strategy alone with a table of inputs and expected choices, including the "no match" error. Test the service with a fake strategy that returns a fixed answer, so service tests do not depend on any real rule. Pass time and other inputs explicitly so cases like "Saturday" are reproducible.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Strategy: one-method interface or func type, injected; the caller never branches on the rule.
 - Pick at construction (dependency injection) or per call (registry map plus typed unknown-name error).
@@ -723,7 +743,7 @@ The business must decide which one is right, and the wiring code must make the o
 - Strategy (outside chooses) vs State (lifecycle chooses, states know the next) vs Bridge (two independent dimensions).
 - Standard library: `slices.SortFunc`, `sort.Sort`, `bufio.Scanner.Split`, `http.Client.CheckRedirect`, `http.RoundTripper`.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Interfaces]], [[Structs, Methods and Embedding]], [[Design Patterns Overview and Chooser]], [[SOLID in Go]]
 - **Next:** [[Factory and Abstract Factory]]

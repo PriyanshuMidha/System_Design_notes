@@ -39,7 +39,40 @@ updated: 2026-11-13
 > - Most systems use **polyglot persistence**: one source of truth (usually relational) plus derived stores (cache, search index, warehouse) fed from it.
 > - In an interview the winning move is to state the access pattern first, then the choice, then the cost you accept.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (12). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the five questions and family map), 4 (worked example), 5, 6 and 9 (drills).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 10 and 11. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+There is no single best database. Each kind is built for one shape of work.
+Orders and payments need tables, links between them, and safe all-or-nothing saves. That is a **relational** database, like Postgres.
+A flood of simple "get item by id" reads at huge scale fits a **key-value** store, like DynamoDB.
+Text search, giant reports, and friend-of-friend questions each have their own special kind too.
+So you first write down how the data is read and written. Then the database picks itself.
+
+```mermaid
+flowchart LR
+    A["How is the data<br/>read and written?"] --> B["Pick the family"]
+    B --> C["Pick the engine"]
+    C --> D["Say the cost you accept"]
+```
+
+```mermaid
+flowchart LR
+    O["Orders, money"] --> P["Postgres"]
+    K["Huge key lookups"] --> DY["DynamoDB"]
+    T["Text search"] --> ES["Elasticsearch"]
+    R["Big reports"] --> CH["Warehouse / ClickHouse"]
+```
+
+The rest of this note is just these 3 questions:
+1. What does the data look like, and how is it read?
+2. Which family and which engine fit that pattern?
+3. When should you stay on Postgres, and when must you move?
 
 **The problem in one story**
 
@@ -86,7 +119,7 @@ Where it breaks: you can run several databases side by side and copy data betwee
 > [!tip] Remember
 > State the access pattern first, then the database, then the cost you accept.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Imagine you are building a food delivery app. You hear four opinions in one meeting: "use MongoDB, it is flexible", "use Postgres, we know it", "use DynamoDB, it scales forever", "use Elasticsearch for restaurant search". All four are right for something, and wrong as the only database.
 
@@ -97,7 +130,7 @@ This note is a map. It tells you which family of database fits which question so
 > [!tip] Remember
 > The database choice is a one-way door. Spend ten minutes on the access pattern before you spend ten months on a migration.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of databases as **different kinds of storage rooms**.
 
@@ -124,7 +157,7 @@ flowchart LR
     E --> E1["Graph"]
 ```
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The five questions
 
@@ -139,6 +172,8 @@ flowchart LR
 **Why it matters:** the order matters. Shape and read pattern decide the family; consistency and scale decide the product inside the family.
 
 ### The decision flowchart
+
+**In plain words:** Answer one yes/no question at a time and follow the arrows. You end up at the family that fits.
 
 ```mermaid
 flowchart TD
@@ -168,6 +203,8 @@ flowchart TD
 
 ### Family map
 
+**In plain words:** Each family stores data in its own shape: tables, documents, key and value, columns, or graphs. This table maps shape to tools.
+
 | Family | Data model | Typical engines | Built for |
 | --- | --- | --- | --- |
 | Relational | Tables, foreign keys, SQL | PostgreSQL, MySQL | Transactions, joins, ad hoc queries |
@@ -182,7 +219,7 @@ Cassandra, ScyllaDB, HBase | Huge write volume, time-ordered reads per partition
 | Columnar OLAP | Columns stored together | ClickHouse, BigQuery, Snowflake | Aggregations over huge tables |
 | NewSQL | SQL on a distributed log | Spanner, CockroachDB, TiDB, YugabyteDB | SQL plus horizontal scale and multi-region |
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 **Scenario: design storage for a food delivery app (restaurants, menus, orders, live driver location, search, analytics).**
 
@@ -211,9 +248,11 @@ The point: one app, five engines, each chosen for one question. Only Postgres is
 > [!warning] Common mistake
 > Making Elasticsearch or Redis the only copy of important data. Search indexes and caches are derived views. Keep the truth in a database with durable transactions.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### The comparison table
+
+**In plain words:** The main engines side by side. Treat the numbers as rough sizes, not promises.
 
 Numbers below are rough orders of magnitude for orientation. They come from public docs or typical benchmarks and are labelled as estimates, not guarantees. Always benchmark with your own data.
 
@@ -235,6 +274,8 @@ Numbers below are rough orders of magnitude for orientation. They come from publ
 
 ### Relational: PostgreSQL vs MySQL
 
+**In plain words:** Both are safe, proven choices. Postgres has more features; MySQL is simple and very common at big web companies.
+
 Both are mature relational engines. Pick PostgreSQL for richer SQL (window functions, JSONB, partial indexes, extensions such as PostGIS) and strict correctness. Pick MySQL when the team knows it, or when you rely on its replication and tooling ecosystem (Vitess, ProxySQL).
 
 Uber publicly described moving from Postgres to MySQL in 2016 because of write amplification in Postgres indexes and replication design at their scale. That is a case where a specific scale pattern drove the choice, not a general verdict.
@@ -243,25 +284,37 @@ Deep notes: [[Relational Schema Design]], [[SQL Essentials]], [[Indexing Fundame
 
 ### Document: MongoDB vs Postgres JSONB
 
+**In plain words:** If you always load and save a whole record at once, a document store fits. But Postgres can store documents too, with transactions included.
+
 If your document is read and written as one unit and fields vary per record, a document store fits. But Postgres JSONB covers many such cases with transactions and joins included, so "we need flexible schema" alone is not enough to leave Postgres. Pick MongoDB when you want native sharding and a document-first workflow. See [[NoSQL Data Modeling]].
 
 ### Key-value and wide-column
+
+**In plain words:** These are giant, fast lookup tables. You must know your queries up front, because you cannot freely search or join later.
 
 **DynamoDB** is the choice for known access patterns at any scale with almost no operations. You design tables from the queries (single-table design) and accept no ad hoc queries. **Cassandra and ScyllaDB** give the same Dynamo-style leaderless design you run yourself, with a cheaper cost at very high volume and multi-region replication. See [[Wide-Column Stores and Cassandra]] and [[Quorums and Leaderless Replication]].
 
 ### Redis
 
+**In plain words:** Redis keeps everything in memory, so it is very fast but limited by RAM. Great for caches, counters and leaderboards; not your main record of truth.
+
 Redis is memory-first. Use it as a cache, session store, rate limiter, leaderboard or geo index. It can persist (RDB snapshots, AOF log) but you size it by RAM, so it is rarely the right home for large primary data. See [[Redis Use Cases]] and [[Redis Persistence - RDB and AOF]].
 
 ### Search and analytics
+
+**In plain words:** Search engines find text. Analytics engines add up huge tables. Neither should be your main store for orders.
 
 **Elasticsearch** answers relevance and filter queries over text. **ClickHouse** answers scan-and-aggregate queries over huge tables. Neither supports OLTP well. See [[Search Engines and Inverted Indexes]] and [[Time-Series and Columnar Storage]].
 
 ### NewSQL: Spanner and CockroachDB
 
+**In plain words:** These give you SQL and safe transactions spread over many machines and regions. You pay for it in cost and slower writes.
+
 Use them when you need SQL transactions **and** horizontal scale **and** multi-region writes. Spanner uses TrueTime (GPS and atomic clocks) for external consistency. CockroachDB runs serializable isolation by default on a Raft-replicated key space. The price is higher write latency (consensus round trips) and higher cost. See [[Distributed SQL]] and [[Consensus - Raft and Paxos]].
 
 ### Graph
+
+**In plain words:** Use a graph database only for "friend of a friend of a friend" style questions. Simple follower lists work fine in normal tables.
 
 Pick a graph database only when queries are multi-hop ("friends of friends who like X within 4 hops") and slow as joins. Many "social graph" problems are served by relational tables plus caches. Facebook's TAO is a cache layer over MySQL, not a graph database.
 
@@ -285,7 +338,7 @@ quadrantChart
 
 (The positions are a rough judgement, not measurements.)
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 | Choice | You gain | You pay |
 | --- | --- | --- |
@@ -299,6 +352,8 @@ quadrantChart
 
 ### When not to leave Postgres
 
+**In plain words:** Postgres handles far more than most people think. Do not switch until you hit a real limit you can name.
+
 - You have fewer than about 1 TB and a few thousand writes per second (an estimate, depends on hardware).
 - Your queries change often and need joins.
 - You do not yet know the access patterns. Relational is the most forgiving when you are still learning them.
@@ -306,9 +361,19 @@ quadrantChart
 > [!warning] Common mistake
 > Choosing a NoSQL store "because it scales" before measuring. A single well-indexed Postgres node often outlasts the company's growth. Notion, for example, ran on a single Postgres instance for years before sharding it in 2021.
 
-## 7. In production
+```mermaid
+flowchart LR
+    S["Postgres getting slow"] --> I["Indexes, tuning"]
+    I --> R["Read replicas + cache"]
+    R --> P["Partition tables"]
+    P --> M["Only now: shard or<br/>move some data elsewhere"]
+```
+
+## 7. In production 🔴
 
 ### Real company examples
+
+**In plain words:** Public stories of which company picked what, and why. Good proof points for an interview.
 
 | Company | What they use | Why (as publicly described) |
 | --- | --- | --- |
@@ -327,6 +392,8 @@ quadrantChart
 
 ### Failure modes and what to watch
 
+**In plain words:** Each engine has its own typical way of getting sick. This table tells you which number to watch for each.
+
 | Engine | Watch this | Why |
 | --- | --- | --- |
 | PostgreSQL | Replica lag, connection count, long transactions, autovacuum | Bloat and lag degrade everything. See [[Connection Pooling]] |
@@ -337,9 +404,11 @@ quadrantChart
 | Elasticsearch | Heap use, shard count, indexing queue | Too many small shards hurt |
 | ClickHouse | Parts count per partition, merge backlog | Many small inserts create too many parts |
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Why the engine type follows the storage engine
+
+**In plain words:** Under the hood, some databases are tuned for fast reads (B-trees) and some for fast writes (LSM trees). That one choice shapes everything else.
 
 Relational engines such as Postgres and InnoDB use **B-trees**: reads are fast, in-place updates cost random IO. Cassandra, ScyllaDB, RocksDB and many others use **LSM trees**: writes go to a memory table and an append-only log, so writes are fast, and reads may check several files.
 
@@ -364,6 +433,8 @@ flowchart LR
 
 ### Consistency choices in plain terms
 
+**In plain words:** When machines cannot talk, you choose: wait for the right answer, or give a quick answer that may be old.
+
 **CAP** says that during a network partition you pick between consistency and availability. **PACELC** adds that even without a partition you trade latency for consistency. Dynamo-style systems (DynamoDB default, Cassandra) lean to availability and low latency. Spanner, CockroachDB, and a single Postgres primary lean to consistency. See [[CAP and PACELC]] and [[Consistency Models]].
 
 ```mermaid
@@ -387,6 +458,8 @@ sequenceDiagram
 
 ### Scale thresholds (estimates)
 
+**In plain words:** Signs that tell you it is time for the next step, like adding replicas or splitting the data.
+
 | Signal | Likely next step |
 | --- | --- |
 | Reads saturate one node | Add read replicas and a cache ([[Replication]]) |
@@ -396,7 +469,17 @@ sequenceDiagram
 
 ### Migration safety
 
+**In plain words:** Moving to a new database is copy, compare, then switch. Never switch in one big jump.
+
 Whichever engine you add, move data with dual writes or CDC plus a backfill, compare, then switch reads. See [[Zero-Downtime Schema Migrations]] and [[Transactional Outbox and CDC]].
+
+```mermaid
+flowchart LR
+    A["Old DB"] -- "CDC or dual writes" --> B["New DB"]
+    A -- "backfill old rows" --> B
+    B --> C["Compare results"]
+    C --> D["Switch reads, then writes"]
+```
 
 ### Whiteboard version
 
@@ -413,7 +496,7 @@ flowchart TD
     G --> H
 ```
 
-## 9. Scenario drills (scenario, choice, why)
+## 9. Scenario drills (scenario, choice, why) 🟡
 
 | # | Scenario | Pick | Why | What to say in the interview |
 | --- | --- | --- | --- | --- |
@@ -430,7 +513,7 @@ flowchart TD
 | 11 | Session store and rate limiter | Redis | TTLs, atomic counters, sub-ms | "Redis gives atomic INCR with expiry; losing it means users log in again, not data loss." |
 | 12 | IoT sensor firehose, 1M points per second | Time-series or Cassandra plus a Kafka buffer | Append-only writes, time-partitioned | "Buffer in Kafka to absorb spikes, write time-bucketed partitions." |
 
-## 10. How to say it in the interview
+## 10. How to say it in the interview 🔴
 
 Use this four-part sentence:
 
@@ -447,7 +530,7 @@ Avoid:
 - Saying "NoSQL scales better" without saying what you give up.
 - Using one database for everything, or five databases for no stated reason.
 
-## 11. Interview questions
+## 11. Interview questions 🔴
 
 > [!question]- Why would you start with PostgreSQL for a new product?
 > It handles transactions, joins, JSON and full-text basics, so you can change queries as you learn them. One well-sized node serves most early products. You move a specific workload out only when a measured limit appears.
@@ -467,7 +550,7 @@ Avoid:
 > [!question]- How do you keep several databases consistent with each other?
 > Write to the source of truth, and publish a change event in the same transaction (transactional outbox) or read its log (CDC). Consumers update the search index, cache and warehouse idempotently. Accept that they lag by seconds.
 
-## 12. Cheat sheet
+## 12. Cheat sheet 🟢
 
 - Start relational; leave only for a named, measured reason.
 - Key lookups at huge scale: DynamoDB (managed) or Cassandra and ScyllaDB (self-run).
@@ -478,7 +561,7 @@ Avoid:
 - Polyglot is normal; one source of truth, many derived views.
 - Interview formula: access pattern, choice, reason, accepted cost.
 
-## 13. Links
+## 13. Links 🟢
 
 - Before this: [[SQL vs NoSQL]], [[Transactions and ACID]], [[System Design Interview Framework]]
 - Relational depth: [[Relational Schema Design]], [[SQL Essentials]], [[Indexing Fundamentals]], [[Index Types and Index Design]], [[Query Plans and EXPLAIN]], [[Isolation Levels and MVCC]], [[Locking - Optimistic vs Pessimistic]]
@@ -489,7 +572,7 @@ Avoid:
 - Case studies: [[Case Study - Key-Value Store]], [[Case Study - Chat System]], [[Case Study - Payment System]], [[Case Study - Leaderboard and Top-K]]
 - Next: [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]]
 
-## Links
+## Links 🟢
 
 ### Watch on YouTube
 

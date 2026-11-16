@@ -24,7 +24,32 @@ updated: 2026-11-13
 > - A control you have never tested is a guess. Restore a backup, trigger an alert, and try to log in with a revoked key before you call the item done.
 > - Hardening is a loop, not a launch task. Dependencies, people and cloud settings change every week.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Most websites are not hacked by geniuses. They are hacked by scripts that scan millions of sites for easy mistakes.
+**Hardening** means closing those easy doors, one by one, in order of how often they get used.
+Think of a house: lock the front door first, then the windows, then add a camera and an alarm.
+
+```mermaid
+flowchart LR
+    A["1. Stop common attacks<br/>(HTTPS, patches, no leaked keys)"] --> B["2. Add layers<br/>(rate limits, WAF, least access)"] --> C["3. Notice and recover<br/>(logs, alerts, backups)"]
+```
+
+No single lock is enough. Each layer catches what the one before missed.
+And you also plan for the day something gets through: backups you have tested, alerts someone reads.
+
+The rest of this note is just these 3 questions:
+1. Which items come first, and why?
+2. For each layer, what do you do and how do you check it?
+3. How do you notice a break-in and recover from it?
+
 
 **The problem in one story.**
 You launch a website and it works.
@@ -69,7 +94,7 @@ Where it breaks: a house is attacked occasionally by people; a website is attack
 > [!tip] Remember
 > Layer the defenses, close what you don't use, patch what you do, and watch the logs.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Picture a small online shop launched on a Friday. By Monday its owner sees a defaced home page and a customer email saying "I got a strange login alert." The investigation finds three facts. The admin panel used the password `admin123`.
 
@@ -82,7 +107,7 @@ The checklist exists because the mistakes are repetitive. The same ten categorie
 > [!tip] Remember
 > You are not defending against "hackers". You are defending against scripts that try the same twenty mistakes on every site.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a building. You do not rely on one lock. You have a fence (network rules), a front door (TLS and authentication), badge readers on inner doors (authorization and least privilege), cameras (logs and alerts), a safe for valuables (secrets and encryption), and a fire plan with a backup site (backups and incident response).
 
@@ -102,7 +127,7 @@ flowchart LR
     H --> I["On-call and incident response"]
 ```
 
-## 3. How it works
+## 3. How it works 🟡
 
 The checklist has ten layers. Each layer below follows the same pattern: what to do, how to check it, and why it matters. Priority tags are **P0** (do before launch), **P1** (do in the first month) and **P2** (do as the system matures).
 
@@ -452,7 +477,7 @@ Checklist:
 > [!tip] Remember
 > Fast containment depends on preparation you did when nothing was wrong.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 A small team, "ShopFast", runs a Go API and a React shop on AWS. A new engineer runs this checklist before the launch.
 
@@ -506,7 +531,7 @@ flowchart LR
 
 Say: "I would start with what causes most breaches (TLS, patched dependencies, no leaked secrets, no weak admin credentials), then add rate limits and a WAF, then least privilege, and finally monitoring and a tested recovery plan, because I assume one layer will fail."
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 How the same checklist changes by system type:
 
@@ -527,7 +552,7 @@ Where to place the WAF:
 | Load-balancer WAF (AWS WAF on ALB) | Filters at your entry point | Apps already behind an ALB | Per rule and per request |
 | In-process or Nginx module (ModSecurity) | Filters on your own server | Strict control, on-premises | Your CPU and tuning time |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Strict CSP vs developer speed.** A strict CSP breaks inline scripts and some third-party widgets. Start in report-only mode (`Content-Security-Policy-Report-Only`), collect reports, then enforce.
 - **Rate limits vs real users.** Offices and mobile carriers share IPs behind NAT. A tight per-IP limit blocks real customers. Combine IP, account and device signals.
@@ -540,7 +565,7 @@ Where to place the WAF:
 > [!tip] Remember
 > Spend security effort in proportion to what an attacker could steal or break, and always do the cheap P0 items.
 
-## 7. In production
+## 7. In production 🔴
 
 Real-world habits that separate mature teams:
 
@@ -572,7 +597,7 @@ Failure modes:
 | Backup job silently failing | No recent backup file | Alert on "no successful backup in 26 hours" |
 | Alert fatigue | On-call ignores security alerts | Tune thresholds, route only actionable alerts to pagers |
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### 8.1 Why HSTS needs a first visit, and how preload helps
 
@@ -604,7 +629,7 @@ A dependency can be malicious or taken over. Reduce risk by pinning versions, co
 
 Pick measurable indicators: percent of services behind the WAF, median time to patch critical vulnerabilities, number of long-lived keys, percent of admin accounts with MFA, time to rotate all secrets (tested), and restore time from the last drill. Track them monthly; the trend matters more than the exact value.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- You are asked to secure a new public web application before launch. What do you do, in what order?
 > Start with the P0 items that stop automated attacks: HTTPS with HSTS, no default or weak credentials and MFA for admins, parameterized queries and output encoding, no secrets in the repo and a private database, and patched dependencies. Then add rate limits, a WAF, security headers and CSP, least-privilege IAM and database roles. Then logging, alerting, tested backups and an incident runbook. Name the principle: defense in depth, because any single layer can fail.
@@ -627,7 +652,7 @@ Pick measurable indicators: percent of services behind the WAF, median time to p
 > [!question]- How do you decide how much security effort a small project needs?
 > Rank by what could be stolen or broken and how likely it is. Always do the cheap P0 items: HTTPS, patching, MFA on admin, no secrets in Git, tested backups. Add layers such as a WAF, SIEM or pen tests as the value of the data and the traffic grow. A static brochure site and a payment platform need very different amounts of work, but both need the P0 items.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Order of work: P0 (HTTPS and HSTS, strong auth and MFA, parameterized queries, no leaked secrets, patched software, private database) then P1 (rate limits, WAF, headers, least privilege, logs, backups) then P2 (CI scanning, drills, rotation, access reviews).
 - Headers to ship: `Strict-Transport-Security`, `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Permissions-Policy`.

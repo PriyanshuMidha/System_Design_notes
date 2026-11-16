@@ -24,7 +24,37 @@ updated: 2026-11-13
 > - The container's PID 1 must forward `SIGTERM` to the app, or `docker stop` always takes the full 10-second grace period and then kills it.
 > - Classic mistake: treating `EXPOSE` as if it opens a port. It is documentation; `-p` on `docker run` is what publishes a port (see [[Docker 05 - Networking and Port Publishing]]).
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A **Dockerfile** is the recipe Docker follows to build your image.
+A lazy recipe copies everything (compiler, source, tools) into the final image. It ends up huge and full of things attackers can use.
+A good recipe uses two stages: one stage to build, one tiny stage to run.
+
+```mermaid
+flowchart LR
+    B["Stage 1: builder<br/>Go compiler + source"] -- "copy only the binary" --> R["Stage 2: runtime<br/>tiny, no shell"]
+```
+
+Go is great for this because it compiles into one file that needs nothing else.
+The final image is about 10-20 MB instead of nearly 1 GB.
+
+```mermaid
+flowchart LR
+    F["Fat image ~900 MB"] --> M["Multi-stage image ~15 MB"]
+```
+
+The rest of this note is just these 3 questions:
+1. What does each Dockerfile line do?
+2. How do you order lines so rebuilds are fast?
+3. How does the app shut down cleanly when the container stops?
+
 
 **The problem in one story.**
 Your first Go Dockerfile works, but the image is 900 MB.
@@ -68,7 +98,7 @@ Where it breaks: bread does not need updates; your image still needs CA certific
 > [!tip] Remember
 > Build in a fat stage, ship only the static binary in a tiny, non-root stage.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 The old note `how to dockerize` shipped a single-stage Node Dockerfile that copies the whole repo, runs `npm install`, and starts the app in the same image used to build it.
 
@@ -83,15 +113,17 @@ A production Dockerfile fixes four separate problems at once:
 3. **Correctness under `scratch`.** `scratch` has no libc, no CA certificates, and no timezone database. A dynamically linked binary (the default when any dependency uses `cgo`, including `net` with CGO resolver, or `database/sql` drivers like `mattn/go-sqlite3`) fails to start with "no such file or directory" even though the binary is right there — the error is misleading because the *loader* is missing, not the file.
 4. **Shutdown correctness.** Without an explicit signal handler, a Go binary run as shell-form `CMD` under `/bin/sh -c` never receives `SIGTERM` directly — the shell does, and the Go process is killed only when Docker's 10-second grace period expires and sends `SIGKILL`. In-flight requests get dropped mid-response.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the Dockerfile as two separate kitchens. The first kitchen (`builder` stage) has every tool: compilers, caches, source code, test files. It cooks the dish (the binary) and nothing from that kitchen leaves except the finished plate.
 
 The second kitchen (the runtime stage) only has a plate warmer: `FROM distroless/static`, `COPY --from=builder /app/server /server`. Nobody in the second kitchen can even see a knife, because there is no shell and no package manager in it to attack.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Instruction reference
+
+**In plain words:** each Dockerfile word (FROM, COPY, RUN...) is one step in the recipe. The table says what it does and the pro tip for each.
 
 | Instruction | Purpose | Production note |
 | --- | --- | --- |
@@ -108,6 +140,8 @@ The second kitchen (the runtime stage) only has a plate warmer: `FROM distroless
 | `HEALTHCHECK` | Command Docker runs periodically to decide healthy/unhealthy | Distroless has no shell or `curl`; either skip it here and let an orchestrator probe the HTTP endpoint, or build a tiny health-check binary |
 
 ### Layer caching order
+
+**In plain words:** put things that rarely change (dependency list) first and things that change a lot (your code) last. Then most rebuilds reuse the slow steps.
 
 ```mermaid
 flowchart TD
@@ -127,6 +161,8 @@ Docker invalidates a layer, and every layer after it, the moment any input to th
 Get the order backwards — `COPY . .` before `go mod download` — and *any* source change re-downloads every module.
 
 ### Exec form vs shell form, and PID 1
+
+**In plain words:** write the start command as a list, like ["/app"]. Otherwise a shell sits in front of your app and swallows the stop signal.
 
 ```mermaid
 sequenceDiagram
@@ -152,7 +188,7 @@ Shell-form (`CMD /server` or `CMD ["sh", "-c", "/server"]`) makes `/bin/sh` PID 
 
 If a process genuinely needs PID 1 responsibilities it doesn't implement (reaping zombie children, signal forwarding to a process group), add `--init` on `docker run` (or `init: true` in Compose), which injects `tini` as PID 1 ahead of the app.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -175,6 +211,8 @@ ENTRYPOINT ["/server"]
 This already gets the two things that matter most — multi-stage separation and a static binary on a minimal base. The full version below adds BuildKit cache mounts, `.dockerignore`, build-info stamping, multi-arch support, and a health-checkable graceful-shutdown binary.
 
 ### Full production Dockerfile
+
+**In plain words:** the complete recipe. Read the comments: each one explains a choice.
 
 ```dockerfile
 # syntax=docker/dockerfile:1.9
@@ -226,6 +264,8 @@ Notes on each production concern:
 - **No `HEALTHCHECK`:** distroless has no shell, `curl`, or `wget` to run one with. In Kubernetes, the kubelet's HTTP liveness/readiness probes hit the app directly over the network and don't need a binary inside the container; see [[Docker 09 - Container Security and Hardening]] for the trade-off against a tiny static health-check binary copied in alongside `/server`.
 
 ### Graceful shutdown: the part the Dockerfile depends on
+
+**In plain words:** when Docker says "stop", your Go code should stop taking new requests, finish the current ones, and then exit.
 
 The exec-form `ENTRYPOINT` only buys a clean shutdown if the binary itself handles `SIGTERM`. This is Go code, not Dockerfile syntax, but the two are inseparable: without it, `docker stop` always burns the full grace period.
 
@@ -380,7 +420,7 @@ func TestRunShutsDownQuicklyWithNoInFlightRequests(t *testing.T) {
 | Multi-stage, `distroless/static`, no cache mounts | ~14 MB | ~36s | ~22s (dependency layer cache hit, no module cache mount) |
 | Multi-stage, `distroless/static`, cache mounts | ~14 MB | ~35s | ~4s (module + build cache both hit) |
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Base image | Size (representative) | Shell / package manager | CA certs & tzdata | Use when |
 | --- | --- | --- | --- | --- |
@@ -393,14 +433,14 @@ func TestRunShutsDownQuicklyWithNoInFlightRequests(t *testing.T) {
 > [!warning] Interview trap
 > `alpine` uses musl libc, not glibc. A `cgo`-enabled binary built and tested against glibc (e.g. on a `golang:1.24-bookworm` builder) can segfault or behave differently on `alpine` at runtime. Either build on an Alpine-based builder too, or stay with `CGO_ENABLED=0` and a `distroless/static` runtime, which sidesteps the libc question entirely.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - `scratch`/`distroless` have no shell: you cannot `docker exec -it <c> sh` to debug a running container. Use `docker run --rm -it --pid=container:<id> --network=container:<id> busybox sh` (or, with newer Docker, `docker debug <c>`) to attach a debug toolbox without rebuilding the image.
 - Multi-stage builds add Dockerfile complexity for a one-off script or a prototype; a single `golang:1.24` stage is fine when the image never leaves your laptop.
 - Cache mounts are tied to the BuildKit builder instance. A fresh CI runner with no prior builder state gets a cold cache on its first build regardless — cache mounts help repeated builds on the same runner/builder, not a brand-new one.
 - Multi-arch builds with QEMU emulation (rather than native per-arch runners) are noticeably slower to compile C dependencies; pure Go cross-compiles fast regardless because `go build` doesn't need an emulator to cross-compile.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Google's own Go services on distroless; most managed container platforms (Cloud Run, Fargate, GKE Autopilot) expect exactly this shape of image — small, non-root, no shell — because it is also what their security scanners and admission policies check for. [[Docker 09 - Container Security and Hardening]] goes further into these policies.
 - **Failure modes → fixes:**
@@ -410,7 +450,7 @@ func TestRunShutsDownQuicklyWithNoInFlightRequests(t *testing.T) {
   - Every CI build re-downloads all modules → cache mounts missing, or each CI job gets an ephemeral, unshared BuildKit instance; configure a persistent or remote build cache (`--cache-from`/`--cache-to`).
 - **What to monitor:** image size over time (a creeping base-image or dependency bloat is a slow leak), build duration (cache-hit rate degrading), and container exit codes (`137` means `SIGKILL`, i.e. the grace period was exceeded — check shutdown handling before blaming the orchestrator).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **BuildKit cache invalidation rule.** The classic Docker builder caches a layer by its instruction text and the hash of its inputs; the first instruction whose cache key changes invalidates every instruction after it in that stage, even if a later instruction's own inputs didn't change. This is exactly why instruction order matters more than instruction count.
 - **`--mount=type=cache` is not the image's layer cache.** It is a separate, named cache volume that BuildKit keeps around between builds on the same builder and mounts only during that one `RUN`; its contents never become part of any image layer. This is what lets the *module cache* survive a `go.sum` change (new dependency added) while the *layer* for `go mod download` still gets correctly invalidated and re-run — the invalidation rule and the cache mount solve two different problems together.
@@ -418,7 +458,7 @@ func TestRunShutsDownQuicklyWithNoInFlightRequests(t *testing.T) {
 - **`go build` cross-compiles without cgo.** Setting `GOOS`/`GOARCH` is enough for a `CGO_ENABLED=0` build because the Go toolchain ships its own linker and doesn't call out to a host C toolchain; the moment `CGO_ENABLED=1` is needed, cross-compiling requires a matching C cross-compiler for the target, which is why multi-arch cgo builds are far more painful than pure-Go ones.
 - **Why the Go module/build caches, specifically, benefit from `--mount=type=cache` and not just a longer-lived layer.** Normal Docker layers are immutable once built; a cache mount is explicitly a scratch space BuildKit is allowed to mutate (append to) across unrelated builds, which matches how `go build`'s local build cache (content-addressed, incremental) actually wants to be used — appended to, not replaced wholesale on every build.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does the runtime stage not need the Go toolchain at all?
 > Go compiles to a single native binary with no runtime interpreter. The builder stage's only output the runtime stage needs is that one file; copying just the binary into a minimal base is strictly correct and much smaller than shipping the compiler, source, and module cache.
@@ -441,7 +481,7 @@ func TestRunShutsDownQuicklyWithNoInFlightRequests(t *testing.T) {
 > [!question]- How does this Dockerfile relate to [[Containerizing Go Services]]?
 > This note covers the general Dockerfile mechanics — multi-stage builds, cache mounts, base-image choice, PID 1 and signals — that apply to containerizing any compiled language. [[Containerizing Go Services]] covers the Go-specific packaging decisions on top of that: `GOMAXPROCS`/`GOMEMLIMIT` under a container's cgroup limits, `ko`/`buildx` build tooling choices, and how this Dockerfile fits into a Go service's full deploy pipeline.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Multi-stage: `builder` compiles, the final `FROM` is the only stage that ships.
 - `CGO_ENABLED=0` + `distroless/static` (or `scratch` + manual certs) = smallest, most portable Go image.

@@ -29,7 +29,41 @@ updated: 2026-11-13
 > - Every durable broker (all of these except Redis Pub/Sub and NATS core, which are at most once) is "at least once" in normal use, so consumers must tolerate duplicates.
 > - Pick by use case: task queue → SQS, RabbitMQ, a Postgres or Redis queue; event bus and replay → Kafka, Pulsar, Redis Streams, NATS JetStream.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the three shapes and ack models), 4 (worked example) and 5-6, including the decision guide.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A **broker** is a middle-man program that holds messages between two services.
+The sender drops a message and moves on. The receiver picks it up when it can.
+Brokers come in three shapes.
+A **queue** is a line: each message goes to one worker, then it is gone.
+Pub/sub is a mailing list: each message is copied to every subscriber.
+A **log** (stream) is a kept history: everyone reads everything, and nothing is erased by reading.
+
+```mermaid
+flowchart LR
+    P["Sender"] --> Q[("Queue")]
+    Q --> W1["Worker 1 gets m1"]
+    Q --> W2["Worker 2 gets m2"]
+```
+
+```mermaid
+flowchart LR
+    P["Sender"] --> L[("Log: m1 m2 m3, kept")]
+    L --> A["Team A reads all"]
+    L --> B["Team B reads all,<br/>can rewind"]
+```
+
+The rest of this note is just these 3 questions:
+1. Do you have work to do once (queue) or history to be read by many (log)?
+2. How does each broker know a message is "done"?
+3. Which product fits which job?
+
 
 **The problem in one story.**
 After you pay, a shop must email a receipt, add points and tell the warehouse.
@@ -76,7 +110,7 @@ Where it breaks: real brokers mix both (SQS with SNS fan-out, Redis Streams with
 > [!tip] Remember
 > Queue: one message, one worker, deleted on ack. Stream: messages stay, every group reads them all at its own pace.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A checkout service calls three things after a payment: send a receipt email (≈400 ms at the email provider), update loyalty points (≈80 ms), and notify the warehouse (≈150 ms).
 
@@ -93,7 +127,23 @@ The email consumer can be down for 5 minutes; its messages wait in the broker an
 
 The question this note answers is *which shape of broker*: a queue, a pub/sub topic, or a log, and which product implements it.
 
-## 2. Mental model
+**Before and after a broker** (rough numbers from the example):
+
+```mermaid
+flowchart TB
+    subgraph Inline["Inline"]
+        C1["Checkout"] --> E1["Email 400 ms"] --> L1["Loyalty 80 ms"] --> W1["Warehouse 150 ms"]
+        E1 -. "email down => checkout fails" .-> C1
+    end
+    subgraph Broker["With a broker"]
+        C2["Checkout"] -- "3 small messages, few ms" --> B[("Broker")]
+        B --> E2["Email (can be down 5 min)"]
+        B --> L2["Loyalty"]
+        B --> W2["Warehouse"]
+    end
+```
+
+## 2. Mental model 🟢
 
 - A **queue** is a **ticket counter line**. Each customer (message) is served by exactly one clerk (consumer). Once served, they leave the line. Add more clerks and the line moves faster. These clerks are **competing consumers**.
 - A **log** is a **newspaper archive**. Articles are printed in order and kept for, say, seven days. Each reader (consumer group) has a bookmark (offset). Two readers do not compete; each reads everything. A new reader can start from last week's first page (**replay**).
@@ -101,9 +151,20 @@ The question this note answers is *which shape of broker*: a queue, a pub/sub to
 
 Analogy summary: queue = work to be done once; log = history to be read by many.
 
-## 3. How it works
+**Three shapes, one picture:**
+
+```mermaid
+flowchart LR
+    Q["Queue = ticket line<br/>one clerk per customer"] --> QR["Work done once"]
+    S["Pub/sub = mailing list<br/>copy to every inbox"] --> SR["Everyone notified"]
+    L["Log = newspaper archive<br/>bookmark per reader"] --> LG["History, replay"]
+```
+
+## 3. How it works 🟡
 
 ### Point-to-point queue with competing consumers
+
+**In plain words:** many workers share one line; each message is given to only one of them, so adding workers makes the line move faster.
 
 ```mermaid
 flowchart LR
@@ -122,6 +183,8 @@ flowchart LR
 
 ### Pub/sub fan-out
 
+**In plain words:** one post is copied into a separate box for each subscriber, so each team gets its own copy.
+
 ```mermaid
 flowchart LR
     P[orders service] -->|publish order.placed| T{{topic / exchange}}
@@ -136,6 +199,8 @@ flowchart LR
 The topic (SNS topic, RabbitMQ fanout or topic exchange) copies the message to each bound queue. Each queue then behaves like the point-to-point queue above, so each subscriber gets durability, retries and its own pace. Filters (SNS filter policies, RabbitMQ routing keys) decide which queues get a copy.
 
 ### Partitioned log with two consumer groups
+
+**In plain words:** the log is split into pages; each team keeps its own bookmark per page, and teams never get in each other's way.
 
 ```mermaid
 flowchart LR
@@ -158,6 +223,8 @@ flowchart LR
 
 ### Ack models side by side
 
+**In plain words:** each broker has its own way to say "done", and its own thing that happens if you never say it. The table lines them up.
+
 | Broker | How a consumer says "done" | What happens if it never does |
 | --- | --- | --- |
 | SQS | `DeleteMessage(receiptHandle)` | Message reappears when the visibility timeout (default 30 s, max 12 h) expires |
@@ -166,9 +233,11 @@ flowchart LR
 | Redis Streams | `XACK stream group id` | Entry stays in the group's pending entries list (PEL) until another consumer claims it with `XAUTOCLAIM` |
 | Redis Pub/Sub | No ack | Nothing: a message is delivered only to subscribers connected right now |
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** queue and log side by side: in a queue, reading removes the message; in a log, reading only moves your bookmark.
 
 ```text
 QUEUE                                   LOG
@@ -185,6 +254,8 @@ crash: m becomes visible after 30s        commit(group, 0)  then poll again
 ```
 
 ### Code: both shapes in Go
+
+**In plain words:** a Go model of both: a queue that hides a message while a worker has it, and a log where each group has its own bookmark, with tests.
 
 The model below is in-memory, so the semantics can be tested without a broker. The queue copies SQS's visibility timeout and receipt; the log copies a single Kafka partition with per-group offsets.
 
@@ -426,7 +497,7 @@ What the tests show:
 - **Stale receipt:** the first worker's old receipt cannot delete the message after someone else received it. Real SQS documents that you must use the most recent receipt handle, otherwise the message might not be deleted.
 - **Log:** committing does not delete; a group added later reads all history; moving the offset back replays.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | System | Model | Ordering | Retention and replay | Routing and fan-out | Ops burden | Go client |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -448,6 +519,8 @@ What the tests show:
 
 ### Decision guide by use case
 
+**In plain words:** pick by the job: background tasks want a queue, many readers or replay want a log, live fan-out wants pub/sub.
+
 | Use case | First choice | Why |
 | --- | --- | --- |
 | Background task queue (emails, PDFs, thumbnails) | SQS, or a Postgres-backed queue (River) if Postgres is already there; asynq on Redis | Per-message ack, retries, DLQ; no need for replay |
@@ -457,7 +530,7 @@ What the tests show:
 | Real-time fan-out where loss is fine (live cursors, typing indicators) | Redis Pub/Sub, NATS core | Lowest latency, no storage |
 | Tiny team, low volume, already on Redis | Redis Streams | One less system; accept memory-bound retention |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Queues lose history.** Once acked, a message is gone. If a bug corrupted 2 hours of processing, you cannot replay; you need the producer's database or an archive.
 - **Logs push work onto consumers.** The consumer must track offsets, handle rebalances and avoid head-of-line blocking within a partition. A poison record stops its partition unless you skip it into a retry topic ([[Dead Letter Queues and Poison Messages]]).
@@ -466,7 +539,7 @@ What the tests show:
 - **Do not add a broker** when the caller needs the answer now (a price quote, a login). A synchronous call with a timeout is simpler. Also skip it for 50 jobs a day in a monolith: a jobs table in Postgres is enough.
 - **Every broker hop adds failure modes:** duplicates, reordering, poison messages, schema drift. The [[Transactional Outbox and CDC]] solves the "DB committed but publish failed" gap that a naive broker integration has.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- SQS + SNS fan-out is the default AWS pattern for decoupled services ([[AWS SQS, SNS and EventBridge]]).
@@ -480,7 +553,7 @@ What the tests show:
 	- Redis Pub/Sub used for jobs → messages vanish during a deploy; use Streams or a real queue.
 - **What to monitor:** backlog (`ApproximateNumberOfMessagesVisible` in SQS, consumer lag in Kafka), age of oldest message, in-flight count, redelivery or receive count, DLQ depth, publish errors.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Push vs pull.** RabbitMQ pushes deliveries to a consumer up to its prefetch count; the broker does flow control.
 
@@ -505,7 +578,20 @@ The price is coarse-grained acks: you cannot ack record 7 while record 6 is stil
 
 **Delivery guarantees come from the ack point, not the product.** Ack before processing gives at most once; ack after gives at least once. Exactly-once claims are scoped (Kafka transactions cover Kafka-to-Kafka read-process-write). The full treatment is in [[Delivery Semantics and Exactly-Once]], and making a consumer safe to run twice is in [[Idempotency and Idempotency Keys]].
 
-## 9. Interview questions
+**Push vs pull, side by side:**
+
+```mermaid
+flowchart LR
+    subgraph Push["Push (RabbitMQ)"]
+        B1["Broker"] -- "sends up to prefetch" --> C1["Consumer"]
+    end
+    subgraph Pull["Pull (Kafka, SQS)"]
+        C2["Consumer"] -- "give me a batch" --> B2["Broker"]
+        B2 --> C2
+    end
+```
+
+## 9. Interview questions 🔴
 
 > [!question]- What is the difference between a queue and a log?
 > A queue gives each message to one consumer and deletes it after the ack; consumers compete. A log appends records and keeps them for a retention period; each consumer group tracks its own offset, so many groups read everything and can replay. Queues track per-message state; logs track one offset per partition per group.
@@ -530,7 +616,7 @@ The price is coarse-grained acks: you cannot ack record 7 while record 6 is stil
 > [!question]- When would you choose RabbitMQ over Kafka?
 > When you need routing (topic exchanges by pattern, headers), per-message ack and requeue, priorities, or low latency for moderate volume, and you do not need replay. Use quorum queues for durability. Choose Kafka for high-throughput event streams, long retention, replay and many independent consumer groups.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Queue: one consumer per message, delete on ack, competing consumers scale it.
 - Log: append and retain; consumer groups with offsets; replay; parallelism = partitions.

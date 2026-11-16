@@ -49,7 +49,44 @@ flowchart LR
     D -- "yes" --> E["Success"]
 ```
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (first 5 minutes, flowchart, investigation steps A to D, fixes), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Before a browser can talk to a website, two checks must pass.
+First, **DNS** turns the name (like `shop.com`) into the server's address. It is the internet's phone book.
+Second, the server shows an ID card called a **certificate**. This is part of **TLS**, the lock in your address bar.
+If the phone book gives a wrong or no address, the site looks "down".
+If the ID card has expired or has the wrong name, the browser refuses to connect.
+In both cases, your servers can be perfectly healthy and still nobody gets in.
+
+```mermaid
+flowchart LR
+    B["Browser"] --> D["1. DNS: find the address"]
+    D --> T["2. TLS: check the ID card"]
+    T --> H["3. Talk to the app"]
+```
+
+So the playbook is simple: find which gate is closed.
+
+```mermaid
+flowchart LR
+    S["Site looks down"] --> Q1{"Name finds the<br/>right address?"}
+    Q1 -- "no" --> FD["DNS problem"]
+    Q1 -- "yes" --> Q2{"ID card valid<br/>and not expired?"}
+    Q2 -- "no" --> FT["Certificate problem"]
+    Q2 -- "yes" --> FA["Look at the app"]
+```
+
+The rest of this note is just these 3 questions:
+1. Is it the phone book (DNS) or the ID card (certificate)?
+2. How do you fix it fast for users?
+3. Why didn't automatic renewal or monitoring catch it?
 
 **The problem in one story.**
 You type a shop's web address and the browser says "Your connection is not private".
@@ -94,7 +131,7 @@ Where it breaks: a wrong address you fix in your own book can stay wrong in othe
 > [!tip] Remember
 > Check the name first (`dig`), then the handshake (`openssl`), and only then the app.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Certificates are issued with a fixed lifetime and DNS depends on records, caches and delegations spread across many parties. Both fail in ways that are sudden, global and confusing.
 
@@ -111,7 +148,7 @@ The real-world scale of this class: in September 2021 the expiry of Let's Encryp
 > [!tip] Remember
 > If your servers look healthy but traffic fell off a cliff, check DNS and certificates before anything else.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a request as mailing a letter to a company. **DNS is the phone book**: it tells you the street address.
 
@@ -138,9 +175,11 @@ sequenceDiagram
 > [!tip] Remember
 > DNS decides where you connect. The certificate decides whether you trust what answered. Each has its own failure modes and its own clock.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### First 5 minutes
+
+**In plain words:** find out who is affected and which gate is closed, then fix the fastest thing. Don't change many things at once.
 
 1. **Confirm the problem and the blast radius.** Which hostnames? Which clients (all browsers, only mobile, only one partner, only inside the cluster)? Is it every region? Check with an external probe (a synthetic check, `curl` from your laptop and from a second network) and from inside a pod.
 2. **Check what changed.** Certificate renewed or replaced? DNS record edited, nameserver changed, domain moved registrar, Terraform apply, load balancer or ingress replaced, CDN config changed, cert-manager upgraded? Domain registration expired? Also check the system clock on affected hosts.
@@ -171,7 +210,11 @@ flowchart TD
 
 ### Investigation steps
 
+**In plain words:** check the gates in order: DNS first, then the certificate, then where the certificate lives and why it wasn't renewed.
+
 #### A. DNS: is the name resolving to the right answer?
+
+**In plain words:** ask several phone books (your own, a public one, the official one) what address they give. If they disagree, one is old or wrong.
 
 ```bash
 dig api.example.com A +noall +answer +comments   # answer, TTL, status
@@ -219,6 +262,8 @@ Symptoms such as a steady 5-second delay on some lookups often come from a connt
 
 #### B. TLS: what does the server actually present?
 
+**In plain words:** connect to the server and look at the ID card it shows: whose name, who signed it, and when it expires.
+
 ```bash
 # Show the leaf certificate dates, subject, issuer and names (SNI matters!)
 echo | openssl s_client -connect api.example.com:443 -servername api.example.com 2>/dev/null \
@@ -261,6 +306,8 @@ curl --resolve api.example.com:443:203.0.113.10 -vI https://api.example.com
 
 #### C. Where does the certificate live and why did renewal fail?
 
+**In plain words:** certificates sit on load balancers, CDNs, proxies and apps. Find which copy is old and why auto-renewal skipped it.
+
 ```bash
 # Kubernetes with cert-manager
 kubectl get certificate -A
@@ -296,6 +343,8 @@ Common renewal failures:
 
 #### D. Monitoring and the clock
 
+**In plain words:** watch expiry dates from the outside, and check machine clocks. A wrong clock makes a good certificate look expired.
+
 ```promql
 # Days until the earliest certificate in the probe chain expires (blackbox_exporter)
 (probe_ssl_earliest_cert_expiry - time()) / 86400
@@ -310,6 +359,8 @@ probe_success{job="blackbox-https"} == 0
 Also check time: `date -u`, `timedatectl status` on hosts, and `chronyc tracking` for offset. A node clock that is minutes or days off makes valid certificates look expired or not yet valid.
 
 ### Fixes
+
+**In plain words:** quick fix today, real fix this week, and the guard so it doesn't happen again, for both DNS and certificates.
 
 | Level | TLS | DNS |
 | --- | --- | --- |
@@ -334,7 +385,7 @@ gantt
 > [!tip] Remember
 > The time to undo a bad DNS change equals the old TTL. Lower it before you touch anything important.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 **An expired certificate behind a CDN origin (fictional, but a real pattern).** (The error codes below are Cloudflare's; other CDNs use other codes, often a plain 502.) `InvoiceOps` serves `api.invoiceops.example` through a CDN, with the origin behind an ALB.
 
@@ -371,7 +422,7 @@ sequenceDiagram
 > [!warning] Common mistake
 > Monitoring only the public edge certificate. Origin hops, internal mTLS certificates, database TLS, partner webhooks and client certificates expire silently on their own dates.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Failure | Typical signal | First command | Usual fix |
 | --- | --- | --- | --- |
@@ -389,7 +440,7 @@ sequenceDiagram
 
 **Certificate lifetime trend:** public TLS certificate lifetimes are shrinking. Let's Encrypt issues 90-day certificates, and the CA/Browser Forum approved a schedule (ballot SC-081v3, 2025) that cuts the maximum lifetime to 200 days from March 2026, 100 days from March 2027 and 47 days from March 2029. Manual renewal will not scale, so automation is no longer optional.
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 - **Short-lived certificates** limit damage from key compromise but demand reliable automation and monitoring; a broken pipeline fails quickly.
 - **Low DNS TTLs** make changes and failovers fast but increase query load and make you more exposed to a brief authoritative outage, since resolvers cache for less time.
@@ -399,7 +450,7 @@ sequenceDiagram
 - **Certificate pinning** (mobile apps, partners) prevents interception but makes certificate changes risky; plan pin rotation or pin to the CA/intermediate public key with backups.
 - **Terminating TLS at the load balancer** centralises certificates but leaves internal traffic unencrypted unless re-encrypted; end-to-end TLS means more certificates to manage.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Inventory everything with an expiry:** public hosts, origin hops, internal services, mTLS client and server certificates, database and Kafka TLS, SAML signing certificates, code-signing and APNs certificates, partner-provided certificates. Record owner and renewal method.
 - **Automate.** ACM for AWS endpoints, cert-manager for Kubernetes, with the DNS-01 challenge where HTTP-01 is awkward. Make renewal hooks reload the process (cert-manager mounts update, but many servers need a reload or a restart; Go servers can use `GetCertificate` to reload without restart).
@@ -410,7 +461,15 @@ sequenceDiagram
 - **Runbook:** where certs live, how to issue an emergency cert, how to reload, who owns the registrar and DNS accounts (and the 2FA recovery path), and where the status page is hosted (a separate domain and DNS provider).
 - **Time:** run chrony or the cloud provider's time service on all hosts; alert on offset.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
+
+**In plain words:** a certificate is trusted because someone the browser already trusts vouched for it, through a short chain of signatures.
+
+```mermaid
+flowchart LR
+    L["Your site's certificate"] -- "signed by" --> I["Middle certificate"]
+    I -- "signed by" --> R["Root the browser<br/>already trusts"]
+```
 
 **How certificate validation actually works.** The client builds a chain from the leaf to a trusted root: the leaf's issuer must match an intermediate, whose issuer must match a root in the client's trust store.
 
@@ -424,6 +483,16 @@ Clients with an old trust store lacked the newer root (ISRG Root X1) and failed 
 
 The lesson: trust stores in old devices, container base images and custom bundles are part of your dependency graph.
 
+**In plain words:** your app asks a nearby helper, the helper asks the official servers, and answers get saved along the way. A failure can sit at any step.
+
+```mermaid
+flowchart LR
+    A["Your app"] --> R["Helper resolver<br/>(saves answers)"]
+    R --> RT["Root servers"]
+    RT --> TLD[".com servers"]
+    TLD --> AU["shop.com's own<br/>DNS servers"]
+```
+
 **DNS resolution path and failure isolation.** A stub resolver (in your app or libc) asks a recursive resolver (CoreDNS, the VPC resolver, 8.8.8.8). The recursive walks root, TLD, then the authoritative servers for your zone and caches answers by TTL.
 
 Failures can occur at any hop: the registrar's delegation (NS and DS at the parent), authoritative servers (all down, or serving different data), the recursive resolver (overloaded, rate limited, SERVFAIL cached) or the stub.
@@ -431,6 +500,8 @@ Failures can occur at any hop: the registrar's delegation (NS and DS at the pare
 `dig +trace` from the outside and queries to individual authoritative servers separate those layers.
 
 The Meta 2021 outage is a notable example of the authoritative layer: the DNS servers were healthy but withdrew their own routes when they decided the network was unhealthy, so the world could not reach them.
+
+**In plain words:** automatic renewal has many steps. If any one fails quietly, nobody notices until the old certificate expires.
 
 **Why renewals fail silently.** Auto-renewal is a chain: schedule, challenge, issuance, deployment, reload. Each link can break without any user-visible effect until the old cert expires.
 
@@ -450,7 +521,7 @@ flowchart LR
 
 **Go specifics.** The Go `crypto/x509` verifier uses the system roots by default (on Linux it reads files like `/etc/ssl/certs/ca-certificates.crt`); a `scratch` or distroless image without a CA bundle gives `unknown authority` for every public site. Go's pure-Go resolver and cgo resolver behave differently with `/etc/resolv.conf` options; set `GODEBUG=netdns=go+1` to print which one is in use and what it queries.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Users report the site is down but your dashboards look healthy and traffic dropped. How do you find out it is TLS or DNS?
 > A traffic cliff with healthy servers means requests are not arriving. Test gate by gate: `dig +short host` from several resolvers for DNS, then `openssl s_client -connect host:443 -servername host` for expiry, chain and names, then `curl -vI`.
@@ -472,7 +543,7 @@ flowchart LR
 > [!question]- Trap: "We renewed the certificate, so we are done." What can still be wrong?
 > The running process may still serve the old cert in memory, the load balancer or CDN origin may use another cert, the chain may be incomplete, or other copies (a replica, another region, a mTLS counterpart) are untouched. Verify with `openssl s_client` against every endpoint and check the `notAfter` served.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Order of checks: DNS, then TLS handshake and certificate, then HTTP.
 - DNS: `dig host +short`, `dig @8.8.8.8 host`, `dig NS`, `dig +trace`, `dig +cd` (DNSSEC test). NXDOMAIN means missing; SERVFAIL means broken upstream or DNSSEC.

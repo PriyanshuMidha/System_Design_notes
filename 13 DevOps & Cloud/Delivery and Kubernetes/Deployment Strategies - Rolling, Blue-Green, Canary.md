@@ -23,7 +23,39 @@ updated: 2026-11-13
 > - All three assume the new and old versions can run side by side against the same database — see [[Rollback and Safe Migrations]] for how schema changes stay compatible with both.
 > - Deploying new code and releasing it to users are two different decisions; see [[Feature Flags]] for separating them.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Shipping a new version means swapping old servers for new ones while users keep using the app.
+If the new version is broken, you want few users to notice and a quick way back.
+There are three common ways to swap.
+
+```mermaid
+flowchart LR
+    R["Rolling: replace a few<br/>servers at a time"] --- B["Blue-green: build a full new copy,<br/>flip all traffic at once"] --- C["Canary: send 5% to new,<br/>watch, then grow"]
+```
+
+Rolling is cheap but slow to undo. Blue-green undoes in seconds but needs double the servers.
+Canary shows a bug to only a few users first.
+
+```mermaid
+flowchart LR
+    C1["5% new"] --> W{"Errors OK?"}
+    W -- "yes" --> C2["25% then 100%"]
+    W -- "no" --> RB["Back to 0%"]
+```
+
+The rest of this note is just these 3 questions:
+1. How does each strategy move traffic?
+2. How do you decide at each canary step: go on or roll back?
+3. Which one fits your cost and risk?
+
 
 **The problem in one story.**
 You have version 1 of your app running for all users, and version 2 is ready.
@@ -68,7 +100,7 @@ Where it breaks: diners can tell you the dish is bad; software needs automated m
 > [!tip] Remember
 > Every strategy trades blast radius, rollback speed and cost; canary limits damage best but needs automated analysis.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Say a payments service has 20 instances behind a load balancer, handling 2,000 requests per second. A new release has a bug that returns `500` for one edge case that happens on 1% of requests. Three ways to roll this out show the trade-off directly:
 
@@ -78,7 +110,7 @@ Say a payments service has 20 instances behind a load balancer, handling 2,000 r
 
 The strategy you pick is really a choice about how much of your traffic you are willing to risk before you have proof the new version is healthy.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the fleet as a dial between two positions: *all old* and *all new*. The strategies differ in how the dial moves and what proves it is safe to keep moving:
 
@@ -86,7 +118,9 @@ Think of the fleet as a dial between two positions: *all old* and *all new*. The
 - Blue-green keeps a second, fully-built dial next to the first and flips a switch to swap which one traffic points at.
 - Canary moves the dial deliberately slowly at the start, pausing to measure, before accelerating toward "all new."
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words:** all three just move a dial from "all old" to "all new". They differ in how fast the dial turns and how much spare capacity you need.
 
 ```mermaid
 flowchart TB
@@ -127,7 +161,7 @@ sequenceDiagram
     end
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -154,6 +188,8 @@ func Decide(canary Metrics, minSamples int, maxErrorRate float64) string {
 The full version below adds a baseline comparison (not just an absolute threshold) and a latency check, and ships with tests.
 
 ### Kubernetes rolling update, in YAML
+
+**In plain words:** two settings control the pace: how many extra pods you may add, and how many may be down at once.
 
 A `Deployment` with `maxSurge`/`maxUnavailable` tuned for a low-risk rolling update: never more than 25% of pods missing, and at most one extra pod above the desired count while the rollout is in progress.
 
@@ -186,6 +222,8 @@ spec:
 Kubernetes only routes traffic to a pod once its readiness probe passes, so a new pod that is up but still warming up its connection pools never receives traffic; `rollout undo` reverts the Deployment to the previous ReplicaSet if the rollout needs to be cancelled.
 
 ### Canary analysis, in Go
+
+**In plain words:** a small function that compares the canary's errors and speed with the old version and answers: wait, continue, or roll back.
 
 The decision at each canary step, as a pure, testable function: compare the canary's error rate and p95 latency against the baseline (not just an absolute number, since a baseline of 0.5% errors behaves differently from one at 0.01%), and require a minimum sample size before trusting the comparison at all.
 
@@ -315,7 +353,7 @@ func TestAnalyze(t *testing.T) {
 
 **Measured (Go 1.24, `go test -race`, 2026-11-07):** all four subtests pass: a 20-request canary holds (below the 200-sample minimum), a 0.6%-error canary promotes against a 0.5% baseline, an 8%-error canary aborts (a 7.5-point jump against a 1-point budget), and a canary at 3.3× the baseline's p95 aborts even with a normal error rate.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Strategy | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -326,7 +364,7 @@ func TestAnalyze(t *testing.T) {
 | Canary (automated analysis) | Same traffic shift, but a controller (Argo Rollouts, Flagger) queries metrics and promotes/aborts automatically | High release frequency where a human cannot babysit every rollout | Requires reliable per-version metrics and a tuned analysis config; false positives can abort healthy rollouts |
 | Shadow / dark launch | Mirror real traffic to the new version without returning its response to the user | Testing a risky rewrite's behavior and performance against real traffic with zero user-facing risk | Needs care with side effects (the shadow version must not actually charge a card or send an email) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Blue-green's instant switch-back only holds if the database schema is compatible with both versions during the overlap; a release that both changes the schema and needs blue-green must still follow [[Rollback and Safe Migrations]]'s expand/contract pattern, or "switch back" strands you on an old binary pointed at a new schema.
 - Blue-green's "instant rollback" is only as good as the smoke test run against the idle (green) environment *before* the switch — flip the load balancer or DNS record without one, and "instant rollback" just means you find out about a broken deploy from users instead of from a pre-switch check, at the same 100%-of-traffic blast radius as deploying with no strategy at all.
@@ -335,7 +373,7 @@ func TestAnalyze(t *testing.T) {
 - For a low-traffic internal tool where a few minutes of downtime costs nothing, recreate is simpler to operate than any of the gradual strategies and has no extra infrastructure to misconfigure.
 - Sticky-session canaries (same user always hits the same version) give a cleaner per-user experience than per-request splitting, but need a session-affinity mechanism at the load balancer, which recreate/rolling/blue-green don't need at all.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Kubernetes `Deployment`s default to rolling updates; AWS CodeDeploy drives blue-green deploys for ECS and Lambda; Argo Rollouts and Flagger add canary and automated analysis on top of Kubernetes; Facebook and Google are documented as using staged percentage rollouts (gradual regional/percentage ramps) for both infrastructure and mobile releases.
 - **Failure modes → fixes:**
@@ -346,7 +384,7 @@ func TestAnalyze(t *testing.T) {
   - Long-lived connections get hard-cut when an old pod is terminated → set `terminationGracePeriodSeconds` and a `preStop` hook that stops accepting new connections before the process exits.
 - **What to monitor:** error rate and p95/p99 latency broken down **by version** (not aggregated across old and new), rollout progress (percentage at new version, bake time elapsed), rollback count and cause, and the same business KPIs that matter for the service (checkout success rate, not just HTTP status codes).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Kubernetes rolling-update math.** With `replicas: 20`, `maxSurge: 1`, `maxUnavailable: 25%` (5 pods), the controller can briefly run up to `20 + 1 = 21` pods and can take down up to 5 at once, replacing them in batches until all 20 are the new ReplicaSet. `kubectl rollout status` tracks this, and `kubectl rollout undo` reverts to the previous ReplicaSet (which Kubernetes keeps around by default) without a fresh image build.
 - **Why canary needs a minimum sample size.** With a true 0.5% error rate, 20 requests can easily show 0 errors (about 90% chance) purely by chance; a canary analysis without a `minSamples` floor will confidently "pass" a broken version just because it got lucky on a tiny sample, or "abort" a healthy one on an unlucky one. The fix is standard statistics, not special deployment magic: don't trust a proportion estimate from too few trials.
@@ -354,7 +392,7 @@ func TestAnalyze(t *testing.T) {
 - **Bake time.** Between ramp steps, a canary should sit at a percentage for a minimum "bake time" (minutes, not seconds) before the next analysis — this catches delayed failures like a memory leak or a slow cache-fill regression that a one-shot check at t+10s would miss entirely.
 - **Draining vs. abrupt termination.** `maxUnavailable`/pod termination during a rolling update removes a pod from the Service's endpoints before sending it `SIGTERM`, but there is an unavoidable race window where a request can land on a pod that is already shutting down; the standard fix is a `preStop` sleep (a few seconds) so the endpoint-removal propagates before the process actually exits.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- When would you pick blue-green over canary?
 > When instant, total rollback matters more than gradual exposure — for example a release you are not confident enough to leave partially rolled out for any length of time, or a monolith that cannot easily run two versions side by side under partial traffic.
@@ -382,7 +420,7 @@ func TestAnalyze(t *testing.T) {
 >
 > Rollback must cover code, config, flags and (via expand/contract) schema compatibility together, not just the container image.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Rolling: cheap, default, but the bad version serves some traffic for the whole rollout duration.
 - Blue-green: instant switch and instant switch-back, at double the running capacity during the overlap.

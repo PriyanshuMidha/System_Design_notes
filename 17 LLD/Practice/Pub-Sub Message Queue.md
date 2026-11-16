@@ -25,7 +25,28 @@ updated: 2026-11-13
 > - **Poison messages** go to a dead-letter list after `MaxAttempts` deliveries so they cannot block the subscription forever.
 > - Classic mistakes: one Go channel per subscriber with no ack (a crash loses messages), unbounded slices (one slow consumer grows memory without limit), and deleting a message when the *first* subscriber acks it.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs) and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A publisher sends messages to a named channel called a **topic**. Many subscribers read from it, each at its own pace. The broker keeps each topic as a list that only grows, and every message gets a number, its **offset**. Each subscriber remembers which number it has finished. A subscriber must say "got it" (ack) for each message; if it does not, the message is sent again later. If the slowest reader falls too far behind, publishers are made to wait.
+
+```mermaid
+flowchart LR
+    P["Publisher"] --> T["Topic log: 0,1,2,3..."]
+    T --> S1["Subscriber A at 3"]
+    T --> S2["Subscriber B at 1"]
+```
+
+Everything else in this note is just these 3 questions:
+1. How does one log serve many independent readers?
+2. How do acks and redelivery work?
+3. How do you stop a slow reader from blowing up memory?
 
 **The problem in one story.** When an order is placed, three teams care: billing, email and analytics. The order service should announce "order placed" once and not know who listens. Each listener reads at its own speed, and if one crashes mid-way, it must get the message again, not lose it.
 
@@ -65,7 +86,7 @@ flowchart LR
 > [!tip] Remember
 > Topic is a log, subscription is a cursor; ack or it comes back.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design an in-memory publish-subscribe message queue. Producers publish messages to
@@ -86,7 +107,7 @@ topic are delivered in publish order. Memory must stay bounded when a consumer i
 5. Add redelivery on ack timeout (rewind to committed), the dead-letter list, `MaxInFlight`, and the bounded buffer with a blocking `Publish`.
 6. Test fan-out, redelivery order, poison messages, both bounds, and 4 publishers with 2 consumers under `-race`.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 ### Questions to ask (with assumed answers)
 
@@ -120,7 +141,7 @@ topic are delivered in publish order. Memory must stay bounded when a consumer i
 - Partitions and consumer groups with several members (Step 10).
 - Message filtering and priorities.
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 |---|---|
@@ -132,7 +153,7 @@ topic are delivered in publish order. Memory must stay bounded when a consumer i
 
 The hardest use case is **ack with redelivery while keeping order**: acks arrive out of order, some deliveries time out, and the subscription must still redeliver in offset order and never skip a message.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
@@ -145,7 +166,7 @@ The hardest use case is **ack with redelivery while keeping order**: acks arrive
 
 Modelling insight: **the message is stored once; consumption is just numbers**. A subscription is `committed` (everything below is done), `next` (the next offset to hand out), and the sets for the offsets in between. Fan-out to 10 subscriptions costs 10 cursors, not 10 copies. The topic can drop a message only when **every** subscription has committed past it.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -210,7 +231,7 @@ stateDiagram-v2
 
 This lifecycle is **per subscription**: the same message can be `Acked` for `email` and `InFlight` for `billing`. Only `Trimmed` is per topic.
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 ```text
 POST /topics                                body: {name}                    -> 201, 409 exists
@@ -235,9 +256,11 @@ type MessageQueue interface {
 var _ MessageQueue = (*Broker)(nil) // compile-time check
 ```
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
 
 In memory the log is a slice with a `base` offset, so trimming the front never renumbers anything. A durable single-node version maps directly onto two tables:
+
+**In plain words:** Tables for topics, messages and each subscription's saved position.
 
 ```sql
 CREATE TABLE messages (
@@ -298,7 +321,7 @@ type CursorRepo interface {
 
 Publish runs the `UPDATE topic_heads` and the `INSERT INTO messages` in one transaction. The per-topic row lock serialises publishers to one topic, which is the same trade the in-memory lock makes; partitions in Step 10 are how real systems lift it. The row-lock trade-offs are in [[Locking - Optimistic vs Pessimistic]].
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 |---|---|---|
@@ -316,7 +339,7 @@ Patterns not used, and why:
 - No goroutine per subscription pushing into a Go channel: a channel has no ack, no redelivery and no offset, and a crash loses whatever was buffered.
 - No copy of the message per subscription: offsets make fan-out free.
 
-## Folder structure
+## Folder structure 🟡
 
 ```text
 pubsub/
@@ -328,7 +351,7 @@ pubsub/
 cmd/demo/main.go -> two consumers with Changed-based waiting, SIGTERM stops them
 ```
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > Aim for about 180 lines in the room.
@@ -355,6 +378,8 @@ cmd/demo/main.go -> two consumers with Changed-based waiting, SIGTERM stops them
 1. Below `committed` or already acked: no-op (a consumer may retry its ack).
 2. No delivery attempt recorded: `ErrUnknownOffset`, it was never delivered. The check uses the attempt count, not `offset >= next`, because a rewind moves `next` back below offsets that were already delivered, and a late ack for one of them must still count.
 3. Mark acked, remove from in-flight, `advance`: move `committed` over the contiguous acked prefix, then trim the log below the minimum committed offset of all subscriptions and broadcast.
+
+**In plain words:** The full broker. Start with `Publish` and `Poll`, then `Ack` and the redelivery of un-acked messages.
 
 ```go
 package pubsub
@@ -651,7 +676,7 @@ func (b *Broker) advance(t *topic, s *subscription) {
 }
 ```
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 |---|---|
@@ -667,6 +692,8 @@ func (b *Broker) advance(t *topic, s *subscription) {
 | `TestConcurrentPublishersAndConsumers` | 4 publishers x 250 messages through a buffer of 16 to 2 subscriptions with their own consumer goroutines: each sees offsets 0 to 999 exactly once, in order |
 
 All tests pass under `go test -race -count=30` (Go 1.24.4).
+
+**In plain words:** Tests with a fake clock to check ordering, redelivery after a timeout and publishers waiting when a reader is slow.
 
 ```go
 package pubsub
@@ -983,7 +1010,7 @@ func TestConcurrentPublishersAndConsumers(t *testing.T) {
 }
 ```
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | What happens | How the design handles it |
 |---|---|---|
@@ -1009,7 +1036,7 @@ func TestConcurrentPublishersAndConsumers(t *testing.T) {
 - Holding the broker lock while calling consumer code (push model): one slow handler stops every topic.
 - Unbounded slices "for now": the first slow consumer is an out-of-memory crash.
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 |---|---|
@@ -1031,7 +1058,7 @@ Tradeoffs chosen:
 
 The system-level design (replication, partition leaders, storage segments, consumer rebalancing) is [[Case Study - Distributed Message Queue]].
 
-## Drawing
+## Drawing 🟢
 
 ```mermaid
 sequenceDiagram
@@ -1064,7 +1091,7 @@ Redraw it from memory:
 - [ ] The rewind on timeout, skipping acked offsets
 - [ ] Trim below the minimum `committed`, and the publisher blocked on a full buffer
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- Why store one log per topic with a cursor per subscription instead of a queue per subscriber?
 > Fan-out then costs one append plus N small cursors, not N copies. Replay and new subscriptions become "start at offset X". Each subscription's progress is just numbers, so it is cheap to persist. A message is deleted only when every cursor has passed it.
@@ -1087,7 +1114,7 @@ Redraw it from memory:
 > [!question]- How would you scale this to many consumers in one group and higher throughput?
 > Split each topic into partitions by `hash(key) % N`, each with its own log and lock. A consumer group assigns each partition to exactly one member and rebalances when members join or leave. Order then holds per key, throughput grows with partitions, and committed offsets become per (group, partition), as in Kafka.
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - Topic = append-only log with `base`; subscription = `committed` + `next` + acked set + in-flight deadlines.
 - Offsets assigned under one lock give per-topic order; fan-out is free.
@@ -1098,7 +1125,7 @@ Redraw it from memory:
 - Wait with a closed-and-replaced `changed` channel, taken before `Poll`.
 - Scale with partitions by key and consumer groups; order becomes per key.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[LLD Interview Method]], [[Observer and Event Bus]], [[Concurrency for LLD]], [[17 LLD/Practice/Task Scheduler (delayed and recurring jobs)|Task Scheduler (delayed and recurring jobs)]]
 - **Next:** [[Ride Sharing]]

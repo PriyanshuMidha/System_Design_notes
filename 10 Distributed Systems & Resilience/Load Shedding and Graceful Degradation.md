@@ -29,7 +29,41 @@ updated: 2026-11-13
 > - An **adaptive concurrency limit** finds the server's capacity from its latency, so you do not have to guess it.
 > - Classic mistake: queueing everything "to be safe". Long queues mean every request is late, and late answers are wasted work.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A server can handle only so many requests per second.
+When more arrive, they wait in a line. If the line gets long, every request waits too long and times out.
+Then the server is 100% busy making answers nobody is waiting for.
+
+```mermaid
+flowchart LR
+    I["1,500 requests per second"] --> Q["Line keeps growing"]
+    Q --> S["Server handles 1,000"]
+    Q --> T["Everyone times out"]
+```
+
+**Load shedding** means saying "busy, try later" to some requests at once, so the rest finish fast.
+**Graceful degradation** means: when an optional part breaks, like recommendations, show the page without it.
+Both keep the important things working instead of failing for everyone.
+
+```mermaid
+flowchart LR
+    I["1,500 requests per second"] --> G{"Door"}
+    G -- "1,000 let in" --> S["Fast answers"]
+    G -- "500 turned away fast" --> R["Busy, retry later"]
+```
+
+The rest of this note is just these 3 questions:
+1. Which features must always work, and which can drop away?
+2. How does a server decide whom to turn away?
+3. How do you keep the waiting line short?
 
 **The problem in one story.**
 A small restaurant can cook 50 meals an hour.
@@ -75,7 +109,7 @@ Where it breaks: a turned-away patient cannot just retry in one second, but soft
 > [!tip] Remember
 > When overloaded, say "no" fast to some requests so the rest stay fast, and keep the critical flow alive when optional parts fail.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Two different problems, with the same goal of keeping the important things working.
 
@@ -91,7 +125,16 @@ Throughput of *useful* answers (goodput) drops to zero while the CPU is at 100%.
 
 **Partial dependency failure.** A product page calls price, stock, reviews and recommendations. If recommendations times out and the page returns a 500, the shop loses the sale because of a widget. Customers can buy without recommendations; they cannot buy without price and stock.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    P["Product page"] --> PR["Price: must"]
+    P --> ST["Stock: must"]
+    P --> RV["Reviews: optional"]
+    P --> RC["Recommendations: optional, down"]
+    RC -. "hide it, keep page" .-> P
+```
+
+## 2. Mental model 🟢
 
 A hospital emergency room on a bad night.
 
@@ -100,9 +143,11 @@ A hospital emergency room on a bad night.
 - **Graceful degradation:** the cafeteria and the gift shop close so their staff can help; the ER stays open.
 - **Static stability:** if the hospital's central scheduling system goes down, each ward keeps working from the last printed rota instead of stopping.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Step 1: classify features and dependencies
+
+**In plain words:** sort every feature into "must work" (price, stock, pay) and "nice to have" (reviews, recommendations).
 
 The old notes' core-versus-optional decision, made concrete:
 
@@ -124,6 +169,8 @@ flowchart TD
 | Deferrable | Confirmation email, loyalty points, search indexing | Queue it and do it later, with an idempotency key |
 
 ### Step 2: give every optional call a fallback and a budget
+
+**In plain words:** each nice-to-have call gets a short time limit and a backup answer, like an empty list.
 
 Each optional dependency gets its own short timeout (inside the page's overall deadline), its own [[Bulkheads and Concurrency Limits|bulkhead]] and its own [[10 Distributed Systems & Resilience/Circuit Breaker|breaker]], plus a fallback:
 
@@ -157,6 +204,8 @@ sequenceDiagram
 
 ### Step 3: admission control and load shedding
 
+**In plain words:** check at the door, before doing any real work, and say no fast if the server is full.
+
 When the server itself is the bottleneck, it must say no early, before it parses large bodies, opens database transactions or calls other services.
 
 ```mermaid
@@ -179,14 +228,25 @@ flowchart LR
 
 ### Step 4: manage the queue, not just the door
 
+**In plain words:** a short line is fine for bursts; a line that never empties must be cut, and newest-first can save users still waiting.
+
 Some queueing absorbs bursts. Long queues create the collapse in section 1. Facebook's *Fail at Scale* describes two techniques:
 
 - **Controlled Delay (CoDel):** if the queue has not been empty at any point in the last `N` ms (100 ms in their description), requests may wait only `M` ms (5 ms) before being dropped. A short burst can queue; a standing queue cannot.
 - **Adaptive LIFO:** normally serve first in, first out; when a queue is building, switch to last in, first out. The newest requests belong to users still waiting, while the oldest have probably timed out already.
 
-## 4. Worked example
+```mermaid
+flowchart LR
+    Q{"Line empty in the last 100 ms?"}
+    Q -- "yes, just a burst" --> W["Let requests wait"]
+    Q -- "no, standing line" --> D["Drop anything waiting over 5 ms"]
+```
+
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** a fixed number of slots; if all are taken, answer 503 with "retry after" right away.
 
 The smallest useful load shedder: a fixed number of slots, and a fast 503 with `Retry-After` when they are all taken.
 
@@ -213,6 +273,8 @@ func Shed(limit int, next http.Handler) http.Handler {
 ```
 
 ### Adaptive, priority-aware shedding with fallbacks
+
+**In plain words:** the full version: the limit changes with latency, important requests win slots first, and optional calls fall back.
 
 The package below has three parts:
 
@@ -526,7 +588,7 @@ Trace of `TestShedsSheddableFirst` (limit 10, sheddable share 0.8):
 
 And `TestAIMD`: ten 50 ms calls take the limit from 10 to about 10.95; one 1 s call cuts it by 10%; a long run of failures drives it down to the floor of 2 and no lower, so the server always keeps probing for capacity.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Technique | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -540,7 +602,7 @@ And `TestAIMD`: ten 50 ms calls take the limit from 10 to about 10.95; one 1 s c
 | Static stability | Keep running on last-known-good config and pre-provisioned capacity when the control plane fails | Data planes depending on a control plane | Extra capacity held in reserve; stale config |
 | Scale out ([[Autoscaling]]) | Add instances | Load grows over minutes | Too slow for spikes of seconds; needs shedding meanwhile |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Shedding drops real users' requests.** It is the right call only when the alternative is failing *everyone*. Pair it with capacity planning so it is rare.
 - **Rejection must be cheap.** If rejecting costs nearly as much as serving (TLS handshake, auth, parsing a 5 MB body first), shedding does not save the server. Shed as early as possible: at the load balancer or gateway for whole classes, in the first middleware for the rest.
@@ -549,7 +611,7 @@ And `TestAIMD`: ten 50 ms calls take the limit from 10 to about 10.95; one 1 s c
 - **Kill switches need ownership:** who may flip them, how fast they propagate, and how they get turned back on.
 - **Not for critical writes.** Never "degrade" a payment by pretending it succeeded; reject clearly or queue it with an idempotency key and tell the user it is pending.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Google: request criticality propagated through RPCs; client-side adaptive throttling; servers reject early.
@@ -572,7 +634,7 @@ And `TestAIMD`: ten 50 ms calls take the limit from 10 to about 10.95; one 1 s c
 	- SLO burn for critical flows separately from optional ones ([[SLIs, SLOs, SLAs and Error Budgets]]).
 	- Test it: load tests past capacity, and chaos experiments that slow or kill each optional dependency ([[Chaos Engineering]]).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why latency is the right signal.** CPU utilisation lags and varies with request mix; error rate rises only after users already suffer. Queueing shows up first as rising latency at a fixed concurrency, which is what AIMD and gradient limiters watch. TCP congestion control uses the same insight (Vegas reacts to RTT growth before packets drop).
 - **AIMD dynamics.** Additive increase finds spare capacity slowly; multiplicative decrease backs off fast. Many independent servers running AIMD against a shared dependency converge towards a fair share, as TCP flows do on a shared link. Set a floor so one bad minute cannot drive the limit to zero, and a ceiling so a lucky period cannot raise it beyond what memory allows.
@@ -582,7 +644,7 @@ And `TestAIMD`: ten 50 ms calls take the limit from 10 to about 10.95; one 1 s c
 - **Brownout control.** Klein et al. proposed a controller that adjusts the share of requests receiving optional content (for example recommendations) to keep response time near a target, which makes degradation gradual rather than all-or-nothing.
 - **Static stability as design, not reaction.** A statically stable system does not need to *do* anything new when a dependency fails: no new instances, no config fetch, no DNS change. That is why AWS designs pre-provision capacity across zones and keep data planes running from cached state. The cost is capacity held idle in normal times.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- The service is at 100% CPU and p99 is 20 s, but most clients see timeouts. What is happening and what do you do?
 > Congestion collapse: the queue is so long that the server spends its time on requests whose clients already gave up. Shed early with 503 and `Retry-After`, cap time spent in the queue (CoDel or a queue deadline), drop requests whose deadline has passed, and make clients back off.
@@ -605,7 +667,7 @@ And `TestAIMD`: ten 50 ms calls take the limit from 10 to about 10.95; one 1 s c
 > [!question]- What is static stability?
 > A design where the system keeps working through a dependency failure without having to change anything: data planes run on the last known configuration when the control plane is down, and enough capacity is already running to lose a zone. Nothing new must be launched or fetched during the failure.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Classify: critical (fail clearly), degradable (stale or approximate), optional (hide or default), deferrable (queue).
 - Every optional call: own timeout, bulkhead, breaker and fallback; fallbacks must not touch the failing resource.

@@ -26,7 +26,39 @@ updated: 2026-11-13
 > - Put the timeout inside the breaker, the retry loop outside it, and never retry while it is open.
 > - Classic mistake: a breaker with no fallback just turns slow errors into fast errors; decide what the user sees.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your code calls another service, like inventory.
+One day inventory breaks. Each call now waits 10 seconds and then fails.
+Your users wait too, and your own service clogs up.
+
+```mermaid
+flowchart LR
+    U["User"] --> Y["Your service"] -- "waits 10 s, fails" --> D["Broken inventory"]
+```
+
+A **circuit breaker** sits in front of those calls and counts failures.
+When too many fail, it **opens**: it stops calling and fails at once, in a millisecond.
+After a short pause, it lets one test call through. If that works, normal calls resume.
+
+```mermaid
+flowchart LR
+    U["User"] --> Y["Your service"] --> B{"Breaker"}
+    B -- "closed" --> D["Inventory"]
+    B -- "open" --> F["Instant answer: backup data"]
+```
+
+The rest of this note is just these 3 questions:
+1. When should the breaker open?
+2. How does it test if the service is back?
+3. What does the user get while it is open?
 
 **The problem in one story.** You keep calling a friend who never picks up. Each call you wait a full minute before giving up. After five failed calls, you stop trying for an hour and do something else, then try once more. A circuit breaker does exactly this for code calling a failing service.
 
@@ -65,7 +97,7 @@ stateDiagram-v2
 > [!tip] Remember
 > Stop calling what is clearly broken, fail fast with a fallback, and probe now and then to see if it is back.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A breaker stops **cascading failure**: one slow dependency making its callers fail too.
 
@@ -79,7 +111,14 @@ The provider degrades and every call now hangs until the 10 s client timeout:
 
 The provider is clearly failing, yet every request still pays 10 s to rediscover that. A breaker learns from the first few dozen failures and rejects the rest in microseconds, so threads, connections and memory stay free for the work that can still succeed.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    I["Payment provider slow"] --> C["Checkout waits"]
+    C --> G["Gateway waits"]
+    G --> U["Every user sees errors"]
+```
+
+## 2. Mental model 🟢
 
 The name comes from the electrical breaker in a house. When a fault draws too much current, the breaker trips and cuts the circuit, so the wiring does not burn. You flip it back once the fault is fixed.
 
@@ -87,9 +126,11 @@ The software version adds a "test" step: after a cool-down it does not fully clo
 
 Another way to see it: the breaker is a **memory of recent failures shared by all callers in the process**. Without it, each request discovers the outage on its own by waiting for a timeout.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The state machine with real thresholds
+
+**In plain words:** three modes: normal (closed), blocking (open) and testing (half-open). Numbers decide when to switch.
 
 The values below are this note's example configuration. Every library has the same knobs under different names.
 
@@ -119,6 +160,8 @@ The knobs:
 
 ### What counts as a failure
 
+**In plain words:** only count errors that show the other service is sick. A user's bad input is not the other service's fault.
+
 | Counts as failure | Does not count |
 | --- | --- |
 | Timeouts (`context.DeadlineExceeded` from the per-call timeout) | 4xx client errors: 400, 404, 409, 422 (the request was bad, the dependency is fine) |
@@ -129,6 +172,8 @@ The knobs:
 If 404s counted, a burst of bad user input could open the breaker and block every good request.
 
 ### Half-open: a probe succeeding and a probe failing
+
+**In plain words:** after the pause, a few test calls go through. All good means back to normal; one bad means block again.
 
 ```mermaid
 sequenceDiagram
@@ -156,6 +201,8 @@ sequenceDiagram
 
 ### Where the breaker goes
 
+**In plain words:** keep one breaker per service you call, so one broken service does not block calls to healthy ones.
+
 - **Per dependency, often per host.** One breaker per downstream (payments, recommendations, search). If the client talks to many replicas, a breaker per host lets healthy hosts keep serving while a bad one is cut off. One breaker for "all outbound calls" would let a single bad dependency block everything.
 - **In the client library or in the mesh.** In-process (gobreaker, failsafe-go, resilience4j) knows business errors and can run fallbacks.
 
@@ -163,13 +210,22 @@ sequenceDiagram
 
 ### How it fits with timeouts and retries
 
+**In plain words:** timeout limits one wait, the breaker decides whether to call at all, and retry wraps them both.
+
 Order the wrappers from outside to inside like this: `retry( breaker( timeout( call ) ) )`.
 
 - The **timeout is inside** the breaker, so a hung call becomes a recorded failure instead of a goroutine stuck forever.
 - The **retry loop is outside**, so the breaker sees each attempt, and the loop must treat `ErrOpen` as permanent: never retry, never back off waiting for an open breaker.
 - Retries are what keep a sick dependency sick; the breaker is what stops them. See [[Timeouts, Retries and Backoff]].
 
+```mermaid
+flowchart LR
+    R["Retry"] --> B["Breaker"] --> T["Timeout"] --> C["The call"]
+```
+
 ### Fallbacks
+
+**In plain words:** the breaker says "do not call". The fallback says what the user sees instead, like cached data.
 
 The breaker decides *whether* to call. The fallback decides *what the user gets* when it does not.
 
@@ -179,7 +235,7 @@ The breaker decides *whether* to call. The fallback decides *what the user gets*
 - **Hide the feature:** remove the reviews widget from the page.
 - **A clear, fast error:** "Payments are temporarily unavailable, your cart is saved". For a core dependency with no substitute this is the honest answer, and failing in 1 ms is still far better than failing in 10 s.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -219,6 +275,8 @@ func (b *Breaker) Call(fn func() error) error {
 ```
 
 ### The full breaker
+
+**In plain words:** the same idea as the whiteboard version, plus a time window, thread safety and metrics. Skim the comments first.
 
 `Breaker` adds what production needs:
 
@@ -643,6 +701,8 @@ Trace of `TestTripsAtFailureRate` against the example configuration (window 20, 
 
 ### With a library: sony/gobreaker v2
 
+**In plain words:** the same rules, written with a popular ready-made Go library instead of by hand.
+
 The same policy expressed with `github.com/sony/gobreaker/v2` (v2.4.0). Its counters cover a time window (`Interval`, rolled in `BucketPeriod` buckets), and `ReadyToTrip` receives the counts so you can write a rate rule with a minimum volume. Its default `ReadyToTrip` trips after more than 5 consecutive failures, and the default open `Timeout` is 60 s.
 
 ```go
@@ -729,7 +789,7 @@ func TestProviderBreakerTrips(t *testing.T) {
 }
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Variant | How it decides to open | Use when | Cost |
 | --- | --- | --- | --- |
@@ -742,7 +802,7 @@ func TestProviderBreakerTrips(t *testing.T) {
 
 Compare with [[17 LLD/Practice/Circuit Breaker|the Circuit Breaker LLD practice problem]], which treats the same idea as a class-design exercise (State and Decorator patterns, interfaces, tests).
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Fast failure is still failure.** Without a fallback, an open breaker only changes a 10 s error into a 1 ms error. That protects your resources, but the user still needs a defined experience.
 - **Low-traffic endpoints** make rates meaningless: 2 failures out of 3 calls is 67%. Use a minimum call count, or a consecutive-failure rule, or no breaker.
@@ -751,7 +811,7 @@ Compare with [[17 LLD/Practice/Circuit Breaker|the Circuit Breaker LLD practice 
 - **Not for local code.** A breaker around an in-process function or a local cache adds nothing.
 - **Not a rate limiter.** A breaker reacts to the dependency's failures. Protecting a dependency from your volume is [[Rate Limiting - Algorithms and Distributed Design]] or a bulkhead.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Netflix Hystrix popularised the pattern; it has been in maintenance mode since 2018, and Netflix pointed users to resilience4j. Hystrix defaults were: a 10 s rolling window, at least 20 requests, and a 50% error threshold, with a 5 s sleep window before probing.
@@ -772,7 +832,7 @@ Compare with [[17 LLD/Practice/Circuit Breaker|the Circuit Breaker LLD practice 
 	- Fallback invocations, so degraded responses are visible ([[Observability in Go Services]]).
 	- Test it on purpose: inject latency and errors and check that the breaker opens and the fallback serves ([[Chaos Engineering]]).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Stale results and generations.** A call can start while the breaker is closed and finish after it opened and moved to half-open. If its success counted as a probe, a dependency that failed every real probe could be closed by an old result. gobreaker and the code above tag each call with the generation at admission and ignore results from older generations.
 - **Count-based vs time-based windows at the extremes.** At 10,000 calls/s, a 100-call window covers 10 ms: it reacts quickly but trips on tiny bursts. At 1 call/min, a 100-call window covers 100 minutes of history. Pick the window so it covers roughly 10–60 s of traffic, or use time-based buckets.
@@ -782,7 +842,7 @@ Compare with [[17 LLD/Practice/Circuit Breaker|the Circuit Breaker LLD practice 
 - **Lock contention.** The breaker sits on the hot path of every call. A mutex held only for counter updates (never during the call, as above) is fine at tens of thousands of calls per second; beyond that, use striped or atomic counters.
 - **Bulkheads plus breakers.** A breaker reacts after failures accumulate. A bulkhead caps concurrency from the first request, so even before the breaker trips, a slow dependency can hold only its own slots. Use both.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What problem does a circuit breaker solve that a timeout alone does not?
 > A timeout bounds each call, but every request still waits the full timeout to discover the outage, so goroutines, connections and pools fill up and the failure cascades. A breaker remembers recent failures across all requests and rejects at once, freeing those resources and giving the dependency room to recover.
@@ -805,7 +865,7 @@ Compare with [[17 LLD/Practice/Circuit Breaker|the Circuit Breaker LLD practice 
 > [!question]- Envoy has "circuit breaking" and "outlier detection". Which is the classic circuit breaker?
 > Outlier detection: it ejects a host after consecutive errors and readmits it after an ejection time, which matches the open and half-open idea per host. Envoy's "circuit breaking" settings cap connections, pending requests and retries per cluster, which is really a bulkhead.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Closed → open on failure rate ≥ threshold over a window, after a minimum number of calls; open → half-open after a cool-down; a few probes decide.
 - Failures = timeouts, 5xx, connection errors. Not 4xx, not cancellations.

@@ -27,7 +27,39 @@ updated: 2026-11-13
 > - Each device remembers the last sequence it has seen (a **sync cursor**) and asks for everything after it when it reconnects.
 > - Small groups copy each message to every member's gateway (write fan-out); huge channels let members fetch on read.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+In a chat app, a message you send should show up on your friend's phone within about a second.
+To be that fast, each phone keeps a connection to the server open all the time. This always-open line is a **WebSocket**.
+The server gives each message the next number in that chat. This number is the **sequence number**, and it keeps everyone's order the same.
+The server also saves every message, so a phone that was off can catch up later.
+
+```mermaid
+flowchart LR
+    A["Alice's phone"] -- "open line" --> S["Chat server:<br/>number + save"]
+    S -- "open line" --> B["Bob's phone"]
+```
+
+If Bob is offline, he gets a push notification. When he opens the app, it asks "give me everything after message 41".
+
+```mermaid
+flowchart LR
+    B["Bob opens app"] -- "after #41, please" --> S["Chat server"]
+    S -- "#42, #43, #44" --> B
+```
+
+So the rest of this note is just these 3 questions:
+1. How does the server find which machine Bob's phone is connected to?
+2. How do you keep order and avoid duplicates when phones retry?
+3. How do offline phones and many devices catch up?
+
 
 **The problem in one story.**
 Alice types "on my way" and hits send. Bob's phone should buzz within a second.
@@ -70,7 +102,7 @@ Where it breaks: a post office does not care about one-second delivery; chat nee
 > [!tip] Remember
 > One open socket per device, a per-conversation sequence number, a client message ID for dedupe, and a cursor to catch up.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 Polling an HTTP endpoint every 2 seconds for new messages wastes almost every request: with 20 M connected users that is 10 M requests per second that mostly return nothing, and messages still arrive up to 2 seconds late.
 
@@ -92,7 +124,7 @@ A chat system keeps a connection open so the server can push a message the momen
 
 **Out of scope:** voice and video calls, message search, media transcoding (media goes to object storage and the message carries a URL).
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a **post office with branch counters**.
 
@@ -106,7 +138,15 @@ Terms used below:
 - **Fan-out:** copying one message to every recipient device.
 - **Ack (acknowledgement):** a small message saying "I have it". The server acks the sender after storing; devices ack the server after receiving.
 
-## 3. How it works - high-level design
+```mermaid
+flowchart LR
+    U["User at a counter<br/>(gateway)"] --> PO["Post office:<br/>stamp next number, file copy"]
+    PO --> C{"Recipient at a counter?"}
+    C -- "yes" --> D["Hand it over now"]
+    C -- "no" --> P["Send a postcard<br/>(push notification)"]
+```
+
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart LR
@@ -193,7 +233,7 @@ sequenceDiagram
     Note over P,DB: Scrolling up: GET /conversations/c9/messages?before=402&limit=50
 ```
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -208,6 +248,8 @@ reconnect: sync {conv: last_seq} --> since(conv, last_seq)
 Three numbers to say aloud: about 23k messages per second on average and 100k at peak, about 200 GB per day of message data, and about 100 gateways for 20 M concurrent connections.
 
 ### Estimates
+
+**In plain words:** rough sums: how many messages per second, how many open connections, and how much storage per day.
 
 All inputs are **estimates** for this exercise.
 
@@ -227,6 +269,8 @@ All inputs are **estimates** for this exercise.
 The connection count, not the message rate, sizes the gateway fleet. A single well-tuned server can hold millions of idle TCP connections (WhatsApp reported over 2 million on one server in 2012), but planning for far fewer per box keeps memory for TLS buffers and makes a gateway's failure less disruptive: fewer clients reconnect at once.
 
 ### API
+
+**In plain words:** a few small JSON messages over the open line: send, receive, "I got it", and "give me what I missed".
 
 WebSocket events (JSON shown for readability; production systems often use a binary format such as Protocol Buffers):
 
@@ -255,6 +299,8 @@ POST /v1/conversations        {"members": ["alice", "bob", "chen"], "title": "Tr
 - Receipts are cursors (`up_to`), not one event per message, so reading 50 messages costs one update.
 
 ### Data model
+
+**In plain words:** messages are stored per chat, sorted by their number, so "give me messages after #41" is one fast read.
 
 Messages are written once and read by conversation and time range, which fits a wide-column store (see [[Wide-Column Stores and Cassandra]]). Discord used this layout in Cassandra and later moved it to ScyllaDB.
 
@@ -299,6 +345,8 @@ CREATE TABLE device_cursors (
 The session registry is in Redis: `sess:{user_id}` is a hash of `device_id → gateway_id`, refreshed by heartbeats, with a 90-second expiry so a crashed gateway's entries disappear on their own.
 
 ### Ordering and idempotent send in Go
+
+**In plain words:** the code gives each chat a counter for order, and remembers each message's client ID so a retry does not create a second copy.
 
 This models the message service's write path for one shard: a per-conversation counter gives a gapless order, and `(sender, client_msg_id)` makes resends harmless.
 
@@ -443,7 +491,7 @@ func TestSyncCursor(t *testing.T) {
 
 The gapless sequence is what lets a device detect a missed message: if it holds 401 and receives 403, it asks for `since(c9, 401)` before showing 403.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Choice | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -455,7 +503,7 @@ The gapless sequence is what lets a device detect a missed message: if it holds 
 | Server-readable messages | TLS to the server, plaintext stored and indexed | Workplace chat with search, compliance export, moderation | The operator can read messages |
 | End-to-end encryption | Devices encrypt for each recipient device (Signal protocol); the server stores ciphertext | Consumer privacy | No server-side search, no content moderation, harder multi-device history |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Stateful gateways complicate deploys.** Restarting a gateway drops up to 200k connections, which all reconnect elsewhere. Drain gateways slowly and spread restarts; see [[Scaling WebSockets]].
 - **Presence is expensive.** Telling every contact when someone goes online is a fan-out per status change. Many products only show presence for open conversations or fetch it lazily.
@@ -463,7 +511,14 @@ The gapless sequence is what lets a device detect a missed message: if it holds 
 - **If messages need not be real time** (support tickets, comments), a REST API with polling or [[Case Study - Notification System]] style push is far simpler than running a WebSocket fleet.
 - **A single sequence per conversation** serialises writes for that conversation; that is fine for a group of 1,000 people typing, but a million-member broadcast channel needs time-sortable IDs and read fan-out instead.
 
-## 7. In production
+```mermaid
+flowchart LR
+    S["Send"] --> R["Retry if no ack"] --> DUP["Maybe a duplicate"]
+    DUP --> DD["Receiver drops it:<br/>same client_msg_id"]
+    DD --> E["Feels exactly-once"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:**
 	- Discord stores messages partitioned by channel and a time bucket, ordered by Snowflake IDs, first in Cassandra and, after a migration completed in 2022 and described in a 2023 post, in ScyllaDB.
@@ -481,7 +536,7 @@ The gapless sequence is what lets a device detect a missed message: if it holds 
 	- Ratio of deduplicated sends (a spike means acks are being lost).
 	- Push provider error rates.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Where the sequence number comes from.** A single global counter would be a bottleneck, so the counter is per conversation and owned by one place: the message service instance that owns the conversation's shard (routed by `conversation_id` with [[Consistent Hashing]]), or an atomic increment in a store such as Redis `INCR conv_seq:{c9}`.
 
@@ -505,7 +560,7 @@ With end-to-end encryption, each device has its own key pair, so the sender's de
 
 **Large channels.** For a channel with 100k members, write fan-out would cost 100k deliveries per message. Instead, store the message once, notify only gateways whose users have the channel open (per-gateway subscriptions), and let other members see an unread badge computed from `latest_seq - read_seq` when they next look.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How do you guarantee that every member sees messages in the same order?
 > Assign order on the server, not the client: a per-conversation sequence number from the conversation's owner shard. Devices display by `seq`, and a gap (holding 401, receiving 403) triggers a sync for the missing range.
@@ -528,7 +583,7 @@ With end-to-end encryption, each device has its own key pair, so the sender's de
 > [!question]- What breaks when you deploy a new gateway version?
 > Every connection on a restarted gateway drops and reconnects. Drain gradually, add jitter to client reconnects, cap accepted connections per second, and keep enough spare capacity to absorb a whole zone of gateways.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 A 45-minute script:
 

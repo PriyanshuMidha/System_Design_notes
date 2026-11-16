@@ -28,7 +28,38 @@ updated: 2026-11-13
 > - The player, not the server, chooses the quality for every next segment from measured throughput and buffer level (adaptive bitrate, ABR).
 > - Classic mistake: designing a streaming server that pushes video over a custom socket. Segments over HTTP are what make CDN caching possible.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A streaming site like YouTube does not send one big video file.
+After upload, the video is converted into several qualities, from low to HD. This conversion is **transcoding**.
+Each quality is cut into small pieces of a few seconds, called **segments**.
+The segments are copied to a **CDN**: servers close to viewers, so they download fast.
+
+```mermaid
+flowchart LR
+    U["Upload"] --> T["Make 5 qualities"] --> S["Cut into 4 s pieces"] --> C["CDN near viewers"]
+```
+
+The player checks your internet speed and picks the best quality it can fetch in time, piece by piece. If your speed drops, it switches to a lower quality instead of freezing.
+
+```mermaid
+flowchart LR
+    P["Player"] --> Q{"Network fast?"}
+    Q -- "yes" --> HD["Next piece in HD"]
+    Q -- "slow" --> LO["Next piece in low quality"]
+```
+
+So the rest of this note is just these 3 questions:
+1. How do you turn one upload into many qualities, fast?
+2. How do you deliver it to millions without one server melting?
+3. How does the player avoid freezing on a bad network?
 
 **The problem in one story**
 
@@ -75,7 +106,7 @@ Where it breaks: a reader cannot switch edition halfway through a page, but a vi
 > [!tip] Remember
 > Cut the video into small files at many qualities, put them on a CDN, and let the player choose.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 A video file is huge and viewers are everywhere. A 10-minute 1080p source upload at 10 Mbps is about 750 MB.
 
@@ -103,7 +134,7 @@ If 1 million people press play in the same hour and every byte comes from one da
 - Egress cost dominates the bill, so the design must push bytes to the edge.
 - Out of scope: recommendations, comments, live streaming (covered briefly in Variants), payments.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a publisher of printed books. The author hands in one manuscript (the upload). The printing plant (transcoding) produces a large-print edition, a paperback and a pocket edition (renditions), each cut into numbered chapters (segments).
 
@@ -113,7 +144,13 @@ Two paths, very different in shape:
 - **Write path** (upload and transcode): rare, heavy on CPU, can take minutes, must never lose data.
 - **Read path** (playback): very frequent, heavy on bandwidth, must be fast, and is served almost entirely from caches.
 
-## 3. How it works - high-level design
+```mermaid
+flowchart LR
+    W["Write path: upload + convert<br/>(rare, heavy CPU)"] --> ST["Storage"]
+    ST --> R["Read path: playback<br/>(constant, from caches)"]
+```
+
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart LR
@@ -160,7 +197,7 @@ stateDiagram-v2
 
 A video can be `READY` as soon as the minimum ladder (say 360p and 720p in H.264) exists. More expensive renditions, such as AV1 or 4K, are added later without blocking publication.
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -174,6 +211,8 @@ A video can be `READY` as soon as the minimum ladder (say 360p and 720p in H.264
 Five boxes and one rule. Everything else in this note is a detail of one of them.
 
 ### Estimates
+
+**In plain words:** rough sums: uploads per day, storage for all the qualities, and the huge outgoing bandwidth.
 
 All inputs below are **estimates** chosen for the exercise, not published figures for any company.
 
@@ -210,6 +249,8 @@ All inputs below are **estimates** chosen for the exercise, not published figure
 - Heartbeats every 10 s: 100 M × 3,600 s ÷ 10 s = 3.6 × 10^10/day ≈ 417,000 events/s average. That is a stream-processing problem, not a database-write problem.
 
 ### API
+
+**In plain words:** start an upload, check processing, and get the playlist that lists all the pieces.
 
 | Call | Purpose |
 | --- | --- |
@@ -253,6 +294,8 @@ seg_00001.m4s
 `BANDWIDTH` is the peak bitrate in bits per second, including audio, which is why it is higher than the video-only ladder value.
 
 ### Data model
+
+**In plain words:** video info and processing status in a database; the video pieces themselves in object storage.
 
 ```mermaid
 erDiagram
@@ -314,6 +357,8 @@ CREATE TABLE transcode_tasks (
 Segments and playlists live in object storage, not in the database. The database stores only keys. View counts are pre-aggregated by the stream pipeline and written in batches into `video_stats`; they are never incremented row-by-row per view.
 
 ### The player's ABR rule in Go
+
+**In plain words:** the code looks at recent download speed and how much video is already buffered, then picks the quality for the next piece.
 
 The server publishes the ladder; the player decides. This is a simplified hybrid rule in the spirit of production players: estimate throughput from recent segment downloads, spend only a safety fraction of it, and let the buffer level decide how bold to be.
 
@@ -474,7 +519,7 @@ Two design points the test pins down:
 - The **harmonic mean** of 4,000, 4,000 and 40,000 kbps is about 5,714 kbps, while the arithmetic mean would be 16,000 kbps. One lucky download from a warm cache would otherwise push the player to 1080p and cause a stall.
 - **Down fast, up slow.** A collapse in throughput drops straight to the rung that fits; climbing happens one rung per segment and only with a full buffer.
 
-## 5. Variants
+## 5. Variants 🟡
 
 | Variant | How it differs | Use when | Cost |
 | --- | --- | --- | --- |
@@ -487,7 +532,7 @@ Two design points the test pins down:
 
 **HLS vs DASH vs CMAF:** HLS (RFC 8216) is the format Apple devices and Safari play natively; DASH is an ISO standard used widely on Android, smart TVs and browsers through Media Source Extensions. CMAF is a fragmented-MP4 segment format that both can reference, so one set of segment files can serve both manifest types: storage and CDN caches hold one copy of the media instead of two.
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 - **Segment length.** Short segments (2 s) let ABR react faster and cut live latency, but multiply request count and per-request overhead. Apple's authoring spec recommends a 6-second target duration for HLS; VOD services commonly use 2–6 s.
 - **Encode ahead vs just-in-time.** Encoding every rendition at upload wastes CPU on the long tail of videos that get few views. Just-in-time packaging (store one mezzanine file per rendition, package into HLS or DASH on request) or encoding rare renditions lazily saves storage, but adds first-view latency and origin CPU.
@@ -495,7 +540,13 @@ Two design points the test pins down:
 - **Own CDN vs commercial CDN.** Building ISP-embedded caches (Netflix Open Connect) only pays at very large, predictable egress. Most companies should buy CDN capacity, often from more than one vendor.
 - **When not to build this:** for a few hundred internal videos, a managed video service or plain progressive MP4 download from a CDN is simpler. ABR and a transcode farm are worth it only when viewers have varied networks and the catalogue is large.
 
-## 7. In production
+```mermaid
+flowchart LR
+    S["Short pieces (2 s)"] --> S1["Faster quality switch,<br/>many more requests"]
+    L["Long pieces (6-10 s)"] --> L1["Fewer requests,<br/>slower to react"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:**
 	- Netflix runs its own CDN, Open Connect: appliances placed inside ISP networks and at internet exchanges, filled with predicted-popular content during off-peak hours (documented on the Open Connect site).
@@ -512,9 +563,11 @@ Two design points the test pins down:
 	- CDN: hit ratio per region, origin egress, 4xx/5xx by edge.
 	- Pipeline: upload-to-ready time (p50, p99), transcode queue depth, task failure rate.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### The transcoding DAG
+
+**In plain words:** cut the film into chunks, convert all chunks at the same time on many machines, then stitch the results.
 
 Encoding a 2-hour film serially takes hours. Parallelism comes from splitting along time:
 
@@ -571,6 +624,8 @@ Starting at a low rendition is deliberate: the first segment is small, so playba
 
 ### CDN economics and the long tail
 
+**In plain words:** popular videos stay in nearby caches; rarely watched ones are fetched from the main storage.
+
 - Popularity is heavily skewed: a small share of titles accounts for most views. Those titles stay in edge caches; the long tail does not.
 - Tiered caching (edge, then regional shield, then origin) turns millions of edge misses into thousands of shield misses into a handful of origin reads.
 - Predictable catalogues (films, series) can be **pushed** to edges overnight. User-generated catalogues are mostly **pulled** on demand because popularity is hard to predict.
@@ -578,11 +633,13 @@ Starting at a low rendition is deliberate: the first segment is small, so playba
 
 ### Counting views
 
+**In plain words:** the player sends small "still watching" pings; a stream job counts a view once per session.
+
 Heartbeats flow into Kafka; a stream job deduplicates by `session_id`, applies a rule such as "a view counts after 30 s of playback" (an example rule), aggregates per video per minute and writes batched increments to `video_stats`.
 
 A real-time counter can be approximate, while billing-grade numbers (for creator payouts or ads) are reconciled by a batch job. This is the same pattern as [[Case Study - Ad Click Aggregation]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why stream over HTTP segments instead of a custom streaming protocol?
 > Segments are static files, so any HTTP cache or CDN can serve them, and they pass through firewalls and proxies. The server keeps no per-viewer state; the client drives everything with plain GETs. That is what lets egress scale to tens of Tbps.
@@ -605,7 +662,7 @@ A real-time counter can be approximate, while billing-grade numbers (for creator
 > [!question]- How do you count views without hammering the database?
 > Send heartbeats to a stream (Kafka), deduplicate per session, aggregate per video per minute in a stream processor, and write batched increments. Show an approximate live number; reconcile exact numbers in a batch job.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Upload: presigned multipart PUTs straight to object storage; API handles metadata only.
 - Transcode: probe, split at keyframes, encode chunk × rendition in parallel, join, package to CMAF with HLS and DASH manifests.

@@ -28,7 +28,41 @@ updated: 2026-11-13
 > - For efficiency (avoid doing work twice) a Redis lock is fine; for correctness (never corrupt data) use fencing plus a consensus store (etcd, ZooKeeper) or a database constraint.
 > - Classic mistake: `SET lock 1 NX` with the same value for every client, and `DEL lock` to release. A slow client then deletes someone else's lock.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Two copies of a service try to do the same job at the same time, like reserving seat A7.
+Without care, both do it and the seat is sold twice.
+A **distributed lock** is a shared "busy" sign kept in a store like Redis: only the holder may work.
+
+```mermaid
+flowchart LR
+    A["Worker A"] -- "take lock" --> L["Lock store"]
+    B["Worker B"] -- "take lock: refused" --> L
+    A --> S["Reserve seat A7"]
+```
+
+But locks expire. Worker A can freeze for a while, lose its lock without knowing, and then wake up and write anyway.
+The fix is a **fencing token**: every new lock comes with a bigger number.
+The database remembers the biggest number it has seen and rejects any write with a smaller one.
+
+```mermaid
+flowchart LR
+    A["A wakes, writes with token 33"] --> D{"Database: last seen 34"}
+    B["B writes with token 34"] --> D
+    D -- "33 is old" --> X["Reject A"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you build a lock in Redis correctly?
+2. Why is a lock alone not safe when a holder pauses?
+3. Where do fencing tokens come from, and who checks them?
 
 **The problem in one story.**
 Two cinema clerks in different branches both see seat A7 as free.
@@ -72,7 +106,7 @@ Where it breaks: a deli counter checks tickets by itself; your storage must be b
 > [!tip] Remember
 > A lock with a TTL can be lost without the holder knowing; only a fencing token checked by the storage makes it safe.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Two instances of an order service process the same "reserve seat A7" message at the same moment (a retry plus a redelivery). Each reads "A7 free", each writes "A7 held by me". One customer's booking silently disappears. Inside one process a `sync.Mutex` fixes this; across machines you need a lock that lives outside any one process.
 
@@ -83,7 +117,7 @@ Typical uses:
 - Make one worker rebuild an expensive cache entry while others wait (avoid a stampede).
 - Serialize writes to an external system that has no transactions, such as a file in object storage.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 **Efficiency vs correctness (Kleppmann's distinction).** Ask what happens if the lock fails and two processes run at once:
 
@@ -92,9 +126,18 @@ Typical uses:
 
 **Analogy.** A lock with a TTL is a hotel key card that stops working at checkout time. If you fall asleep in the lobby past checkout, the room is given to someone else, but you still *think* it is yours. A fencing token is a room number plus a booking number printed on the card: the door only opens for the newest booking number it has seen.
 
-## 3. How it works
+```mermaid
+flowchart TB
+    Q{"If two workers run at once, what breaks?"}
+    Q -- "only some wasted work" --> E["Efficiency lock: simple Redis lock is fine"]
+    Q -- "wrong data, double sale" --> C["Correctness lock: needs fencing tokens"]
+```
+
+## 3. How it works 🟡
 
 ### A single-Redis lock, done correctly
+
+**In plain words:** set the key only if it is empty, give it an expiry, store your own id, and delete it only if it still holds your id.
 
 - **Acquire:** `SET lock:seat:A7 <unique-id> NX PX 30000`. `NX` sets only if absent; `PX 30000` expires after 30 s; the value is a random ID (a UUID) unique to *this* acquisition.
 - **Release:** delete only if the value is still yours, atomically, with a Lua script:
@@ -128,6 +171,8 @@ sequenceDiagram
 
 ### The pause problem
 
+**In plain words:** the holder can freeze longer than the lock lasts. It wakes up still thinking it owns the lock.
+
 TTL, unique value and safe release are **necessary but not sufficient**. The holder can stop for longer than the TTL at any point: a stop-the-world GC pause, a VM migration, a page fault on a swapped-out page, or a network packet delayed in a queue. When it resumes it has no way to know time passed.
 
 ```mermaid
@@ -153,6 +198,8 @@ Without the token check, the last arrow succeeds and client 1 overwrites client 
 
 ### Where fencing tokens come from
 
+**In plain words:** use a number that only grows, like etcd's revision or a database sequence, and hand it out with each lock.
+
 - **etcd:** every key has a `create_revision`, a cluster-wide number that grows with every write. The lock key's create revision is a ready-made fencing token.
 - **ZooKeeper:** the sequence number of the ephemeral sequential znode, or the `zxid` of its creation.
 - **PostgreSQL:** a `bigserial` or a counter row incremented in the same transaction as the grant.
@@ -170,9 +217,11 @@ WHERE seat_id = $1
 
 Representative output (PostgreSQL 17) for the stale write with token 33 after token 34 was applied: `UPDATE 0`. The application treats zero rows as "you lost the lock" and aborts. (Use `<=` instead of `<` if the same holder may write several times with one token.)
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** take the lock and its token, send the token with every write, and let storage reject older tokens.
 
 ```text
 LockService.Acquire(owner, ttl):
@@ -186,6 +235,8 @@ Storage.Write(token, data):
 ```
 
 ### Go: lock service plus fenced storage
+
+**In plain words:** a working lock service and a storage that checks tokens, plus a test that freezes one worker on purpose.
 
 The lock service mirrors `SET NX PX` with an owner check on release and adds a token. `Storage` is the protected resource that enforces the token. The clock is injected so the 40-second pause is simulated instantly. It passes `go vet` and `go test -race` on Go 1.24.
 
@@ -358,7 +409,7 @@ func TestConcurrentAcquireOneWinner(t *testing.T) {
 }
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Lock | How it works | Fencing token | Use when | Weakness |
 | --- | --- | --- | --- | --- |
@@ -372,7 +423,7 @@ func TestConcurrentAcquireOneWinner(t *testing.T) {
 
 **Go libraries:** `github.com/go-redsync/redsync/v4` (Redis and Redlock), `go.etcd.io/etcd/client/v3/concurrency` (`NewSession`, `NewMutex`, `Lock`, `Unlock`), and plain `pgx` for advisory locks.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Try to avoid the lock first.** Most "lock" problems disappear with one of:
 	- **Idempotency:** make the operation safe to run twice (see [[Idempotency and Idempotency Keys]]).
@@ -382,7 +433,7 @@ func TestConcurrentAcquireOneWinner(t *testing.T) {
 - **Fencing needs a cooperating resource.** The storage must store and compare the token. An external API that ignores your token (a payment provider, an email sender) cannot be fenced; use idempotency keys with it instead.
 - **A lock service is a dependency.** If Redis or etcd is down, nothing can acquire. Decide whether the work should fail closed or open.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Kubernetes controllers and Patroni rely on lease locks in etcd or the API server (see [[Leader Election]]).
@@ -397,7 +448,7 @@ func TestConcurrentAcquireOneWinner(t *testing.T) {
 	- Long job outlives its TTL → watchdog renewal, and have the job check the lock (or its token) between steps.
 - **What to monitor:** acquire latency and failure rate, hold-time distribution compared with the TTL, number of expirations while held (watchdog misses), stale-token rejections at the storage (each one is a near miss), lock-service availability.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **The Redlock debate (2016).** Redlock acquires the lock on a majority of 5 independent Redis nodes and computes how much validity time remains. Kleppmann argued it is unsafe for correctness: it relies on bounded process pauses, bounded network delay and clocks that do not jump (a node whose clock jumps forward expires the key early, letting a second client get a majority), and it provides no fencing token. antirez replied that the algorithm checks elapsed time after acquiring, that clock jumps can be avoided operationally, and that fencing makes the lock almost unnecessary. Takeaway for interviews: Redlock is an efficiency lock with extra cost; for correctness, use a consensus store plus fencing.
 - **etcd lock internals.** `concurrency.NewMutex(session, "/locks/seat-A7")` creates the key `/locks/seat-A7/<leaseID>` attached to the session's lease. The holder is the key with the lowest create revision; each waiter waits for the deletion of the key just before its own. If the process dies, the lease expires and the key disappears. The mutex does not export its key's create revision directly: read it with `Get(m.Key())`, or use `m.Header().Revision` after `Lock`, which is at least as large and also grows with every new holder. For writes kept in etcd itself, `Txn().If(m.IsOwner())` (which compares the key's create revision) commits only while the lock key still exists.
@@ -405,7 +456,7 @@ func TestConcurrentAcquireOneWinner(t *testing.T) {
 - **Token monotonicity across failovers.** Tokens must keep growing even when the lock service fails over. A consensus store gives this for free (revisions are part of the replicated log). A counter on a single Redis node can go backwards after a failover with asynchronous replication, which would let an old token pass.
 - **Lock granularity.** One lock per seat scales; one lock per show serializes the whole show. Lock the smallest unit the invariant needs, and always acquire multiple locks in a fixed order to avoid deadlock.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is wrong with `SET lock 1 NX EX 30` and `DEL lock`?
 > Every client writes the same value, so a client whose lock already expired can `DEL` a lock now held by someone else. Use a unique value per acquisition and release with a Lua script that deletes only if the value matches.
@@ -425,7 +476,7 @@ func TestConcurrentAcquireOneWinner(t *testing.T) {
 > [!question]- How would you make a cron job run once across 10 instances?
 > Prefer a database guarantee: insert `(job, scheduled_for)` with a unique constraint, or claim the row with `FOR UPDATE SKIP LOCKED`. If you use a lock (Redis, etcd), make the job idempotent too, since a lock can be lost.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Efficiency lock (duplicate work is fine) vs correctness lock (must never double-write).
 - Redis: `SET key <uuid> NX PX ttl`; release with Lua compare-and-delete; watchdog to renew.

@@ -24,7 +24,37 @@ updated: 2026-11-13
 > - Prove what you're running: sign images (cosign) and enforce that signature at admission, not just at build time.
 > - Classic mistake: believing a non-root `USER` alone makes a container safe. Mounting `/var/run/docker.sock` into *any* container — root or not — hands it root on the host, because the Docker socket itself is an unauthenticated root API.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A container shares the same Linux core (kernel) with the machine it runs on.
+So if an attacker breaks out of a weak container, they may land on the host.
+Docker's defaults are loose. You must tighten them yourself.
+
+```mermaid
+flowchart LR
+    D["Default: root user,<br/>all powers, writable"] --> H["Hardened: normal user,<br/>few powers, read-only"]
+```
+
+The main moves are simple: don't run as root, remove powers the app doesn't need, make files read-only, and never bake passwords into the image.
+Also scan images for known holes and sign them, so you know what you are running.
+
+```mermaid
+flowchart LR
+    B["Build"] --> S["Scan"] --> G["Sign"] --> P["Push"] --> V["Verify signature, then run"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you keep a bad image out (scan, sign, verify)?
+2. How do you make the image itself smaller and safer?
+3. Which runtime settings take powers away from the container?
+
 
 **The problem in one story**
 
@@ -71,7 +101,7 @@ Where it breaks: a keycard cannot fix a weak wall; if the shared kernel has a bu
 > [!tip] Remember
 > Assume the process will be compromised, and take away every permission it never needed.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Because a container is a process restricted by namespaces and cgroups on a kernel it shares with the host (see [[Docker 08 - How Docker Works Under the Hood]]), the isolation is real but it is not a security perimeter by default.
 
@@ -83,7 +113,7 @@ Each of those defaults is a door left open:
 - a writable filesystem means malware dropped at runtime persists across a restart of that same container;
 - an unpinned `:latest` tag means the image you tested is not provably the image that shipped.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Treat a container like a process you don't fully trust, because its code came from a dependency tree you don't fully audit — then ask what that process should be *allowed* to do if it were compromised.
 
@@ -91,9 +121,11 @@ A compromised process with no root, no capabilities, a read-only filesystem, and
 
 Hardening is removing permissions the application never needed in the first place.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The secure supply chain, end to end
+
+**In plain words:** every image goes through checks before it runs: scanned for known bugs, signed by your build, and checked again at deploy.
 
 ```mermaid
 flowchart LR
@@ -118,11 +150,15 @@ Each stage removes one way an attacker could win:
 
 ### Hardening the image itself
 
+**In plain words:** fewer things inside means fewer things to attack. Use tiny base images, a non-root user and pinned versions.
+
 - **Minimal base images.** `distroless` (no shell, no package manager) and `scratch` (nothing but your static binary) remove the tools an attacker would use after landing a shell — there's no `sh`, `curl`, or `apt` to pivot with. Alpine is smaller than Debian/Ubuntu but still a full Linux userland with a shell and `apk`; it trades some attack surface for debuggability.
 - **Pin by digest, not by tag.** `FROM golang:1.24` can silently point at a different image tomorrow if the tag is retagged upstream; `FROM golang:1.24@sha256:<64 hex chars>` is the exact, immutable content you tested. Tags are mutable pointers; digests are content addresses.
 - **Scanning and SBOMs.** Trivy and Grype scan an image's installed packages against CVE databases and report known vulnerabilities by severity; `syft` generates a Software Bill of Materials — the full list of packages and versions in the image — which is what a scanner consumes and what an incident response team needs when a new CVE drops for a package they may or may not be running.
 
 ### Hardening the runtime
+
+**In plain words:** when you start the container, take away powers: no root, no extra Linux privileges, read-only files, limits on memory and processes.
 
 ```mermaid
 flowchart TB
@@ -155,7 +191,7 @@ flowchart TB
   - A non-root `USER` inside that container changes nothing: the socket itself is root-equivalent.
   - Use a rootless build tool (`buildx` with a rootless builder, `kaniko`, `buildah`) instead of socket-mounting when images must be built inside a pipeline container.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -167,6 +203,8 @@ USER 65532                 # not root
 ```
 
 ### Full example: a Dockerfile hardening checker
+
+**In plain words:** a small Go tool that reads a Dockerfile and flags the three common mistakes automatically.
 
 A static checker that encodes those same three checks in Go — the kind of pre-commit or CI gate a team runs before Trivy even looks at the built image.
 
@@ -343,7 +381,7 @@ securityContext:
     type: RuntimeDefault
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -354,7 +392,7 @@ securityContext:
 | Rootless Docker | The daemon itself runs unprivileged via user namespaces | Multi-tenant build hosts, shared CI runners | Some networking and privileged-port limitations |
 | gVisor / Kata (stronger isolation) | Intercept syscalls (gVisor) or run a microVM per container (Kata) | Untrusted or multi-tenant workloads needing a harder boundary than namespaces | Performance overhead; narrower syscall/feature support |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A read-only root filesystem breaks any app that writes to arbitrary paths at runtime (some logging libraries, some caches) — audit write paths first and mount `tmpfs` for the ones that are legitimate.
 - `--cap-drop ALL` can break an app that genuinely needs one capability (e.g., binding port 80 directly needs `NET_BIND_SERVICE`) — add that one back rather than running privileged or staying root.
@@ -362,7 +400,7 @@ securityContext:
 - Distroless images trade debuggability for attack surface; for a workload under active development where interactive debugging matters daily, Alpine with a locked-down runtime config can be the pragmatic middle ground.
 - None of this replaces patching: a perfectly hardened container running a base image with a six-month-old known CVE is still vulnerable to that CVE.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Google's distroless images are the base for a large share of Go and Java production images across the industry; Kubernetes' Pod Security Standards (`restricted` profile) codify almost exactly the runtime flags above as a cluster-wide policy; GitHub's own container registry and most major clouds (ECR, GCR/Artifact Registry) support cosign-verified signatures and attach vulnerability scan results to pushed images automatically.
 - **Failure modes → fixes:**
@@ -372,7 +410,7 @@ securityContext:
   - An admission controller is bypassed because signature verification was advisory, not enforced → make signature and scan-pass checks a hard admission gate (e.g., Kyverno or OPA Gatekeeper policies), not just a dashboard warning.
 - **What to monitor:** new critical/high CVEs against images currently running (not just at build time — CVEs are discovered after images ship); containers still running as root or with unexpected capabilities (via a runtime tool like Falco); unsigned or unverified images reaching production; base-image age/staleness.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why shared-kernel isolation needs defense in depth.** A container escape usually chains two things: a kernel bug reachable from inside a namespace, and enough privilege (root, a dangerous capability, a mounted host path) to exploit it. Dropping capabilities and running non-root doesn't patch the kernel bug, but it removes the privilege half of the chain, which is why hardening still matters even on a fully patched host.
 - **Rootless Docker's actual mechanism.** The daemon maps container UID 0 to an unprivileged host UID via `/etc/subuid`/`/etc/subgid` ranges and a user namespace; networking (since an unprivileged process can't create bridges or hold raw sockets for NAT) goes through a userspace network stack like `slirp4netns` or `RootlessKit`, at some throughput cost versus the default root daemon's native bridge networking.
@@ -380,7 +418,7 @@ securityContext:
 - **Admission policy is what turns scanning/signing from advisory to enforced.** Scanning a build and signing an image are no-ops for security if nothing downstream checks them before running the container — Kubernetes admission controllers (Kyverno, OPA Gatekeeper) or a registry's own policy engine are what actually reject an unsigned or critically-vulnerable image at deploy time.
 - **`securityContext` in Kubernetes is the same checklist, declaratively.** `runAsNonRoot`, `readOnlyRootFilesystem`, `capabilities.drop`, `allowPrivilegeEscalation: false`, and `seccompProfile` map one-to-one onto the `USER`, `--read-only`, `--cap-drop`, `no-new-privileges`, and seccomp flags covered above — hardening a Dockerfile and hardening a Pod spec are the same five decisions in two different syntaxes.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Does running a container as a non-root user make it safe?
 > No, by itself it only removes root's privileges inside the container. Mounting the Docker socket into that same container, for example, still hands it an unauthenticated root-equivalent API regardless of its own UID. Non-root `USER` is one layer of several (capabilities, read-only filesystem, seccomp, no socket mounts) that together reduce the blast radius of a compromise.
@@ -400,7 +438,7 @@ securityContext:
 > [!question]- Your container needs to bind port 80. Does that force it to run as root?
 > No. Add back only the `NET_BIND_SERVICE` capability (`--cap-drop ALL --cap-add NET_BIND_SERVICE`) while keeping a non-root `USER` — that's the specific permission needed to bind a privileged port, not full root.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Non-root `USER` (numeric, e.g. 65532), `--cap-drop ALL` + add back only what's needed, `no-new-privileges`, `--read-only` rootfs with `tmpfs` for required writes, seccomp.
 - Minimal base (distroless/scratch, or Alpine if a shell is genuinely needed), pinned by `@sha256:` digest.

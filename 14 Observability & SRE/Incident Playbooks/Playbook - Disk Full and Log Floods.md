@@ -46,7 +46,40 @@ flowchart TD
     E -- "containers" --> J["Prune, set log limits,<br/>ephemeral-storage limits"]
 ```
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (first 5 minutes, steps and causes), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Every server has a **disk** where it saves files: data, logs, temporary stuff.
+The disk has a fixed size. Nothing warns you while it slowly fills up.
+Apps write a diary of what they do. Those diary files are **logs**.
+If an app starts writing the same error 1,000 times a second, the logs grow very fast. That is a **log flood**.
+When the disk hits 100%, apps can't save anything. Databases crash. Even small writes fail.
+
+```mermaid
+flowchart LR
+    A["App error loop"] --> L["Logs grow fast"]
+    L --> D["Disk 100% full"]
+    D --> X["Saves fail,<br/>DB crashes"]
+```
+
+The fix is always in two steps: first free some space safely, then stop whatever is filling it.
+
+```mermaid
+flowchart LR
+    F["Disk full"] --> S["Free space safely<br/>(old logs, temp files)"]
+    S --> C["Stop the source<br/>(fix the loop, rotate logs)"]
+```
+
+The rest of this note is just these 3 questions:
+1. Which disk is full, and by what?
+2. What can you delete safely right now?
+3. How do you stop it filling again?
 
 **The problem in one story**
 
@@ -96,7 +129,7 @@ Where it breaks: a warehouse fills visibly and slowly; a disk can go from fine t
 > [!tip] Remember
 > Free space safely first, then stop whatever is filling the disk, then alert before it happens again.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Disk is the quietest resource. CPU and memory problems show up as slowness. A disk problem often shows nothing until the last minute, then everything breaks together.
 
@@ -116,7 +149,7 @@ The 120 GB of free space is gone in roughly 29 hours, with no alert, because the
 > [!tip] Remember
 > The failure is sudden, but the cause is slow. A trend alert such as "full in 4 hours" turns an outage into a ticket.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 **Analogy: a warehouse with a loading dock.** Boxes arrive faster than they leave. For weeks the warehouse looks fine. Then it is full, the dock is blocked, and trucks cannot unload even the urgent box (a database commit).
 
@@ -151,7 +184,7 @@ flowchart LR
 > [!tip] Remember
 > Disk is shared. Many unrelated things write to the same volume, so the biggest directory is not always the one that changed.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The first 5 minutes
 
@@ -162,6 +195,8 @@ flowchart LR
 5. **Then find the cause** so the space does not fill again in an hour.
 
 ### Step 1: Confirm which resource is full
+
+**In plain words:** a disk can be "full" in two ways: out of space, or out of slots for new files. Check both.
 
 ```bash
 df -h
@@ -181,6 +216,8 @@ Two more cases that confuse people:
 
 ### Step 2: Free safe space fast (the mitigation)
 
+**In plain words:** delete the safest things first, like old compressed logs and temp files. Never delete database files by hand.
+
 Choose the first action that is safe for your host. Do these in order of safety.
 
 | Action | Command | Notes |
@@ -199,6 +236,8 @@ Choose the first action that is safe for your host. Do these in order of safety.
 
 ### Step 3: Find what is big
 
+**In plain words:** walk the folders and sort by size. The biggest one is usually the culprit.
+
 ```bash
 sudo du -xh --max-depth=1 / 2>/dev/null | sort -h | tail -15
 sudo du -xh --max-depth=1 /var 2>/dev/null | sort -h | tail -10
@@ -210,6 +249,17 @@ sudo find / -xdev -type f -size +500M -exec ls -lh {} \; 2>/dev/null
 - `ncdu /var` gives an interactive view if installed.
 
 ### Step 4: Find deleted-but-open files
+
+**In plain words:** if you delete a file an app still has open, the space is NOT freed until the app lets go of it.
+
+```mermaid
+flowchart LR
+    R["rm app.log"] --> N["Name gone from folder"]
+    N --> O{"App still has<br/>it open?"}
+    O -- "yes" --> S["Space still used"]
+    O -- "no" --> F["Space freed"]
+    S --> Fix["Restart app or<br/>truncate the file"]
+```
 
 ```bash
 sudo lsof +L1
@@ -225,6 +275,8 @@ sudo truncate -s 0 /proc/<pid>/fd/<fd>
 This is the classic case where `df` says 100% and `du` shows 40%.
 
 ### Step 5: Find the rate of growth
+
+**In plain words:** how fast is it filling? That tells you whether you have minutes or days.
 
 How fast is it growing and how long do you have?
 
@@ -279,6 +331,8 @@ flowchart TD
 
 ### Cause A: Log flood
 
+**In plain words:** one app logs the same line over and over, usually an error in a loop.
+
 **What it looks like:** one log file or one service grows far faster than normal. The same message repeats thousands of times.
 
 ```bash
@@ -331,6 +385,8 @@ Important: logrotate is not a daemon. It only checks sizes when it runs (normall
 
 ### Cause B: Database WAL or binlog growth
 
+**In plain words:** databases keep a change journal. If something stops it from being cleaned up, it grows without end.
+
 **Postgres.** WAL (write-ahead log) files in `pg_wal` are removed only when they are no longer needed by checkpoints, archiving, or replication slots. A stuck consumer makes WAL pile up.
 
 ```sql
@@ -368,6 +424,8 @@ Set `max_slot_wal_keep_size` (available since PostgreSQL 13) so a dead slot cann
 
 ### Cause C: Kafka and other data stores
 
+**In plain words:** message stores keep data for a set time or size. If those limits are too big, the disk fills.
+
 ```bash
 du -sh /var/lib/kafka/data/* | sort -h | tail
 kafka-log-dirs.sh --bootstrap-server broker:9092 --describe | head
@@ -384,6 +442,8 @@ kafka-configs.sh --bootstrap-server broker:9092 --alter --entity-type topics --e
 Only shorten retention if consumers do not need older data. See [[Kafka and Event Streaming]].
 
 ### Cause D: Containers and Kubernetes
+
+**In plain words:** old container images, container logs and temp folders pile up on each machine.
 
 ```bash
 docker system df
@@ -404,7 +464,7 @@ kubectl get events -A --field-selector reason=Evicted | tail
 - Processes that failed on ENOSPC have recovered; restart those that did not. Check database health, replica lag and queue backlogs.
 - Alerts are green and logging is flowing to the central system again.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### A real-world-style incident: the retry storm
 
@@ -461,9 +521,11 @@ sequenceDiagram
 > [!tip] Remember
 > The page fired at 100%, but the signal was visible for 17 hours. A `predict_linear` alert looking 4 hours ahead would have fired around 22:00 on Monday, four hours before the outage.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### What fills the disk
+
+**In plain words:** one row per usual suspect: how it looks, what to type, and how to fix it.
 
 | Cause | Typical sign | First command | Immediate fix | Real fix |
 | --- | --- | --- | --- | --- |
@@ -478,6 +540,8 @@ sequenceDiagram
 | Backups on same disk | Large dumps | `ls -lh /backup` | Move off-box | Ship to object storage, retention |
 
 ### Logging destinations compared
+
+**In plain words:** logs can go to a file, to the screen, or straight to a log service. Each choice has a different disk risk.
 
 | Where logs go | Disk risk | Notes |
 | --- | --- | --- |
@@ -511,7 +575,7 @@ stateDiagram-v2
 
 Every state before `Full` is cheap to fix. The aim of the alerts is to act in `Growing`.
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 - **Aggressive log retention saves disk but hurts debugging.** Keep enough for your typical investigation window (often 7 to 14 days online), archive the rest cheaply.
 - **Low log levels save disk but hide context.** Use sampling and dynamic levels: INFO by default, DEBUG for one request or one tenant when needed.
@@ -523,9 +587,11 @@ Every state before `Full` is cheap to fix. The aim of the alerts is to act in `G
 > [!warning] Common mistake
 > Treating "grow the volume" as the fix. It is a valid mitigation and the right first move when no cleanup is safe. But if growth is 100 GB/day, the new space lasts a few extra days. Fix the source.
 
-## 7. In production
+## 7. In production 🔴
 
 ### Alerts to have
+
+**In plain words:** alert early, at about 80% full, and on how fast it is filling, not only when it is already full.
 
 | Alert | Rule | Severity |
 | --- | --- | --- |
@@ -552,9 +618,17 @@ Every state before `Full` is cheap to fix. The aim of the alerts is to act in `G
 - Queues: drain backlog, watch for duplicates after retries ([[Dead Letter Queues and Poison Messages]]).
 - Logs: gaps exist for the period when the disk was full; note them in the timeline.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Why df and du disagree
+
+**In plain words:** one tool asks the disk how much is used, the other adds up the files it can see. Deleted-but-open files are counted by one and not the other.
+
+```mermaid
+flowchart LR
+    DF["df: asks the disk<br/>90 GB used"] --> G["Gap of 40 GB =<br/>deleted but still open"]
+    DU["du: adds visible files<br/>50 GB"] --> G
+```
 
 `df` reads filesystem metadata (blocks allocated). `du` walks directories and adds the size of files it can reach by name. They differ when:
 
@@ -565,13 +639,19 @@ Every state before `Full` is cheap to fix. The aim of the alerts is to act in `G
 
 ### Why a full disk can break even a small write
 
+**In plain words:** at 100%, there is no room even for a tiny note, so services fail in strange ways.
+
 Creating a file or extending one needs a block and often a journal entry. At 100% there is none to give. Services that write PID files, lock files, sockets, session files or temp files fail in surprising ways. SSH can fail when it cannot write the login record or a temp file.
 
 ### Postgres behaviour at 100%
 
+**In plain words:** Postgres would rather stop than risk bad data, so it shuts itself down when it can't write its journal.
+
 When WAL cannot be written, Postgres raises a PANIC and the server crashes, rather than risk inconsistent data. On restart, after space is freed, it replays WAL from the last checkpoint. This is why the data is usually safe, and why hand-deleting `pg_wal` files is both unnecessary and dangerous.
 
 ### Synchronous logging blocks request threads
+
+**In plain words:** if writing a log line has to finish before the request continues, a slow or full disk slows every request.
 
 If the logger writes synchronously to a slow or full destination, request goroutines block on write. Latency rises and goroutines pile up before the disk is even full. Prefer logging to stdout with a buffered, non-blocking agent, and drop on overflow rather than block the request path.
 
@@ -579,7 +659,7 @@ If the logger writes synchronously to a slow or full destination, request gorout
 
 Log bytes per second per service is a good anomaly signal. A sudden 10x jump usually means a new error loop or a verbosity change. Track it as a metric from the log pipeline.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- A server shows "No space left on device". Walk me through it.
 > Run `df -h` and `df -i` to see whether space or inodes are exhausted. Free safe space quickly (journal vacuum, old logs, `truncate` on the giant file, docker prune). Use `du -xh --max-depth=1` to find the big directory and `lsof +L1` if `du` and `df` disagree. Identify the fast grower, fix the source, then add a predictive alert.
@@ -599,7 +679,7 @@ Log bytes per second per service is a good anomaly signal. A sudden 10x jump usu
 > [!question]- How do you stop container logs filling a node?
 > Set Docker `json-file` `max-size` and `max-file` (or use a runtime with log rotation), set `ephemeral-storage` limits on pods, ship logs with a node agent, and monitor `DiskPressure` plus image garbage collection.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Two ways to be full: `df -h` (blocks), `df -i` (inodes).
 - `df` high, `du` low: **`lsof +L1`** (deleted-but-open).

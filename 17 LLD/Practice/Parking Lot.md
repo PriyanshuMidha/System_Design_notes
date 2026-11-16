@@ -23,7 +23,29 @@ updated: 2026-11-13
 > - Money is `int64` paise and the clock is injected, so fees are exact and testable.
 > - Classic mistake: checking for a free spot, unlocking, then marking it taken (a race), or using `float64` for money.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A car drives into a parking lot. The gate finds a free spot that fits the car and gives a **ticket**. When the car leaves, the gate looks at the ticket, works out the fee and frees the spot. How to pick a spot and how to price are kept as swappable parts, called **strategies**. The one hard rule: two gates must never hand out the same spot, so "find a free spot and mark it taken" is one step.
+
+```mermaid
+flowchart LR
+    A["Car enters"] --> B["Pick free spot, mark taken"]
+    B --> C["Ticket"]
+    C --> D["Car exits: fee"]
+    D --> E["Spot free again"]
+```
+
+Everything else in this note is just these 3 questions:
+1. How do you model spots, tickets and vehicles?
+2. How are spot picking and pricing swappable?
+3. How do two gates avoid taking the same spot?
 
 **The problem in one story.** A mall car park has three floors and two entry gates. Two cars arrive at the two gates at the same second, and there is one free spot left. Only one car should get it. When a car leaves, the machine must charge the right fee for the time parked.
 
@@ -63,7 +85,7 @@ flowchart LR
 > [!tip] Remember
 > Pick a free spot and mark it taken under one lock; money in paise, clock injected.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design a parking lot that supports multiple floors, multiple spot types (bike, car, truck),
@@ -82,7 +104,7 @@ Handle lost tickets and many entry gates working at the same time.
 5. Add the lost-ticket flow and the injected clock.
 6. Test concurrency (many goroutines, one spot), fees and the lost ticket; then discuss the multi-instance database version.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 ### Questions to ask (with assumed answers)
 
@@ -115,7 +137,7 @@ Handle lost tickets and many entry gates working at the same time.
 - The payment gateway and number-plate camera hardware.
 - Multi-lot routing ("which lot has space").
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 |---|---|
@@ -127,7 +149,7 @@ Handle lost tickets and many entry gates working at the same time.
 
 The hardest use case is **Park** under concurrency: pick a free spot and claim it atomically. Code that first, then Exit and the lost-ticket Exit.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
@@ -142,7 +164,7 @@ The hardest use case is **Park** under concurrency: pick a free spot and claim i
 
 Modelling insight: the **ticket is the visit**, not the vehicle. Index open tickets by ID (normal exit) and by plate (duplicate-entry check and lost-ticket exit). Keep Floor as a slice index, not a class, until it needs behaviour.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -204,7 +226,7 @@ stateDiagram-v2
 - **Composition** (lot to spot): spots are created with the lot. **Aggregation** (lot to ticket): the lot tracks open tickets; closed ones live on in storage or as receipts.
 - **Association** (ticket to spot and vehicle): by ID, no ownership. **Dependency on interfaces** (lot to both strategies): injected, so rules swap without edits.
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 ```text
 POST /lots/{lotId}/entries              body: {plate, vehicleType}  -> 201 {ticketId, spotId, floor, entryAt}
@@ -230,7 +252,9 @@ type ParkingService interface {
 var _ ParkingService = (*ParkingLot)(nil) // compile-time check
 ```
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
+
+**In plain words:** Tables for spots and tickets. A spot is taken only if it is still free, which is the safe update two gates rely on.
 
 ```sql
 CREATE TABLE spots (
@@ -289,7 +313,7 @@ type TicketRepo interface {
 
 `SKIP LOCKED` lets a second gate take the next free row instead of queueing behind the first gate's row lock. The partial unique indexes are the real guarantee: even a buggy claim path cannot open two tickets on one spot or one plate. The general row-lock trade-offs live in [[Locking - Optimistic vs Pessimistic]].
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 |---|---|---|
@@ -306,7 +330,7 @@ Patterns not used, and why:
 - No State pattern for Spot or Ticket: two or three states with no per-state behaviour; a bool and an exit time are enough (YAGNI). Reach for [[State Machines in Go]] when transitions carry rules, as in the [[Vending Machine]].
 - No Floor or Gate classes: they carry no behaviour in this scope; a slice index and a parameter are enough (KISS).
 
-## Folder structure
+## Folder structure 🟡
 
 The code in Step 8 is printed as one file so it reads top to bottom. In the round, split it like this:
 
@@ -327,7 +351,7 @@ cmd/demo/main.go  -> builds floors, picks strategies, injects time.Now, runs a p
 - `service_test.go`: uses an injected clock pointer to move time.
 - `cmd/demo/main.go`: wiring only.
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > Aim for about 150 lines in the room.
@@ -359,6 +383,8 @@ cmd/demo/main.go  -> builds floors, picks strategies, injects time.Now, runs a p
 
 > [!tip] Exercise: a fallback allocation (bike in a car spot)
 > Write `FallbackAllocation` yourself before reading it below. It takes an order per vehicle type, for example `{Bike: {Bike, Car}}`, and runs the exact-match scan once per allowed spot type. The exercise exposes a hidden coupling: if `close` priced by `spot.Type`, a bike in a car spot would pay the car rate, so the ticket stores the vehicle type and the fee uses it.
+
+**In plain words:** The full parking lot. Start with `Park` and `Exit`, then the spot-picking and pricing strategies.
 
 ```go
 package parking
@@ -597,7 +623,7 @@ func (l *ParkingLot) FreeCount(t VehicleType) int {
 }
 ```
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 |---|---|
@@ -608,6 +634,8 @@ func (l *ParkingLot) FreeCount(t VehicleType) int {
 | `TestConcurrentParkNeverDoubleAssigns` | 50 goroutines, 2 car spots: exactly 2 winners on 2 different spots, 48 get `ErrNoSpot` |
 
 All five pass under `go test -race` (Go 1.24.4).
+
+**In plain words:** Tests with a fake clock to check hourly fees and the fallback when small spots run out.
 
 ```go
 package parking
@@ -819,7 +847,7 @@ func TestConcurrentParkNeverDoubleAssigns(t *testing.T) {
 }
 ```
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | What happens | How the design handles it |
 |---|---|---|
@@ -845,7 +873,7 @@ func TestConcurrentParkNeverDoubleAssigns(t *testing.T) {
 - Forgetting double exit, duplicate plate and lost ticket.
 - Storing money as `float64`.
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 |---|---|
@@ -864,7 +892,7 @@ Tradeoffs chosen:
 - **Linear scan in `LowestFloorFirst`.** O(spots), fine for a few thousand spots; a free list per type is O(1) but more code.
 - **Lost-ticket penalty as a field, not a strategy.** It is one number today; promote it to a strategy if the rules grow.
 
-## Drawing
+## Drawing 🟢
 
 ![[Parking Lot LLD Drawing.excalidraw]]
 
@@ -903,7 +931,7 @@ sequenceDiagram
     Note over Gate,Lot: lost ticket: ExitLostTicket(plate) finds the ticket by plate and adds the penalty
 ```
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- Why must "pick a free spot" and "mark it occupied" happen under the same lock?
 > If they are two critical sections, two gates can both read the spot as free between them and both claim it (check-then-act). Holding one lock across both makes them one atomic step. The test parks 50 cars concurrently into 2 spots and asserts exactly 2 winners on 2 different spots under `-race`.
@@ -920,7 +948,7 @@ sequenceDiagram
 > [!question]- When would you shard the single mutex, and what gets harder?
 > Only when profiling shows gates waiting on the lock, which one lot rarely produces. Per-type or per-floor locks raise throughput, but `FreeCount` across shards is no longer one snapshot, and the fallback strategy must take two locks in a fixed order to avoid deadlock.
 
-## Interview explanation
+## Interview explanation 🔴
 
 ```text
 I model ParkingLot as a facade that owns the spots and tracks open tickets, where a ticket is one visit linking a vehicle to a spot. Spot choice and fee calculation are two Strategy interfaces, so lowest-floor-first or nearest-to-gate, and hourly or weekend pricing, change without touching the lot.
@@ -930,7 +958,7 @@ The hard part is concurrent entry: picking a free spot and marking it occupied m
 For a lost ticket the attendant looks up the open ticket by plate and charges the normal fee plus a penalty, which also kills the old ticket ID. The ticket stores the vehicle type, so a bike that falls back to a car spot still pays the bike rate. Money is int64 paise and the clock is injected so fee tests are deterministic.
 ```
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - The ticket is the visit: index open tickets by ID (exit) and by plate (duplicates, lost ticket); both indexes and the database constraints reject double entry and double exit.
 - Pick + claim under one lock in memory; `FOR UPDATE SKIP LOCKED` plus partial unique indexes in Postgres.
@@ -939,7 +967,7 @@ For a lost ticket the attendant looks up the open ticket by plate and charges th
 - Per started hour, minimum one hour, `int64` paise, injected clock.
 - Lost ticket: find by plate, fee + flat penalty, the old ticket ID dies.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[LLD Interview Method]], [[Strategy and Template Method]], [[Concurrency for LLD]]
 - **Next:** [[Vending Machine]]

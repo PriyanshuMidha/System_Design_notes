@@ -31,7 +31,43 @@ updated: 2026-11-13
 > - You almost never implement this yourself: you use etcd, ZooKeeper, Consul or a database that embeds Raft.
 > - Classic mistake: thinking a 4-node cluster is safer than 3. It tolerates the same single failure and needs one more vote.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You run 3 copies of a server so that one crash does not stop you.
+But the copies must agree on the same list of actions, in the same order.
+If they disagree, one copy says "job ran" and another says "job never ran".
+
+```mermaid
+flowchart LR
+    C["Client: run job 7"] --> S1["Server 1"]
+    C --> S2["Server 2"]
+    C --> S3["Server 3"]
+    S1 -. "all must agree on order" .- S3
+```
+
+**Consensus** is the way a group of servers agrees on one answer, even when some crash.
+The trick is a **majority**: a decision counts only when more than half the servers have saved it.
+Any two majorities share at least one server, so nothing decided can be forgotten.
+Raft does this with one **leader** who proposes, and followers who save and say "ok".
+
+```mermaid
+flowchart LR
+    L["Leader"] -- "save entry 5" --> F1["Follower 1: ok"]
+    L -- "save entry 5" --> F2["Follower 2: slow"]
+    F1 --> D["2 of 3 saved = decided"]
+```
+
+The rest of this note is just these 3 questions:
+1. How is a leader picked?
+2. How does the leader copy entries to the others?
+3. Why does a decided entry never get lost, even after crashes?
 
 **The problem in one story.**
 Three friends keep the same shared shopping list on their own phones.
@@ -77,7 +113,7 @@ Where it breaks: real committee members do not crash and forget mid-sentence; se
 > [!tip] Remember
 > Nothing is decided until a majority has written it down, and any two majorities always share a server.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 You run a job scheduler with three replicas so it survives a crash. Every replica must agree on "which jobs exist and who owns them". Without an agreement protocol you get one of two failures:
 
@@ -88,7 +124,7 @@ Consensus sits in between. With 3 servers it needs 2 acknowledgements per write,
 
 You rarely call a consensus algorithm directly. You rely on systems built on it: etcd (all Kubernetes cluster state), ZooKeeper, Consul, Kafka's KRaft controller quorum, and databases such as CockroachDB and TiKV that run one Raft group per data range.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 **The problem, formally.** Each server proposes a value; they must decide so that:
 
@@ -104,6 +140,8 @@ Agreeing on one value is enough: agree on "command #1", then "command #2", and s
 
 ### Quorum arithmetic
 
+**In plain words:** with n servers you need more than half to agree. 3 servers survive 1 crash, 5 survive 2.
+
 | Servers `n` | Majority | Failures tolerated `f` | Note |
 | --- | --- | --- | --- |
 | 1 | 1 | 0 | no fault tolerance |
@@ -114,11 +152,20 @@ Agreeing on one value is enough: agree on "command #1", then "command #2", and s
 
 `n = 2f + 1`. Even sizes add cost without adding tolerance, and a 2–2 network split leaves neither side with a majority.
 
-## 3. How it works
+```mermaid
+flowchart LR
+    A["Majority 1: S1, S2, S3"] --> X["Shared: S3"]
+    B["Majority 2: S3, S4, S5"] --> X
+    X --> R["S3 remembers both decisions"]
+```
+
+## 3. How it works 🟡
 
 Raft (2014) splits consensus into three parts: leader election, log replication and safety.
 
 ### Roles and terms
+
+**In plain words:** each server is a leader, a follower or a candidate. Time is split into numbered terms, and each term has at most one leader.
 
 Time is divided into **terms** numbered 1, 2, 3 and so on. Each term has at most one leader.
 
@@ -138,13 +185,25 @@ stateDiagram-v2
 
 ### Leader election
 
+**In plain words:** if followers stop hearing from the leader, one of them waits a random time, then asks for votes. A majority makes it the new leader.
+
 1. Followers expect a heartbeat (an empty `AppendEntries`) from the leader. Each follower picks a **randomized election timeout**, 150–300 ms in the paper's example. etcd's defaults are a 100 ms heartbeat and a 1000 ms election timeout.
 2. A follower whose timeout fires becomes a **candidate**: it increments its term, votes for itself and sends `RequestVote(term, lastLogIndex, lastLogTerm)` to everyone.
 3. Each server grants **at most one vote per term**, first come first served, and persists that vote to disk before replying.
 4. **Election restriction:** a server refuses to vote for a candidate whose log is less up to date than its own. "More up to date" means a higher last term, or the same last term and a longer log.
 5. A candidate with votes from a majority becomes leader and starts sending heartbeats. Randomized timeouts make it unlikely that two candidates split the vote repeatedly.
 
+```mermaid
+flowchart LR
+    F["Follower: no heartbeat"] --> W["Wait random time"]
+    W --> C["Become candidate, ask for votes"]
+    C -- "majority yes" --> L["Leader"]
+    C -- "someone else won" --> F
+```
+
 ### Log replication
+
+**In plain words:** the leader adds the command to its list, sends it to the followers, and calls it done once a majority saved it.
 
 ```mermaid
 sequenceDiagram
@@ -175,13 +234,17 @@ sequenceDiagram
 
 ### Safety: why committed entries survive
 
+**In plain words:** a new leader needs a majority's votes, and that majority always includes someone with every decided entry.
+
 - **Leader completeness.** A committed entry is on a majority. A new leader needs votes from a majority. The two majorities overlap in at least one server, and that server refuses to vote for a candidate missing the entry (the election restriction). So every future leader already has every committed entry.
 - **Only current-term entries are committed by counting.** A new leader must not declare an entry from an *earlier* term committed just because it now sits on a majority. Figure 8 of the Raft paper shows how such an entry can still be overwritten by another leader. The leader instead commits an entry from its own term; everything before it then commits too. That is why a new Raft leader appends a **no-op entry** at the start of its term.
 - **Durability.** `currentTerm`, `votedFor` and the log must be fsynced before a server replies. A server that forgets its vote after a reboot could vote twice in one term.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the two rules that keep Raft safe: only vote for a candidate whose list is at least as new as yours, and only accept entries that match your list.
 
 The two rules that carry Raft's safety, as pseudo-code:
 
@@ -413,12 +476,14 @@ func TestOldTermEntryNotCommittedByCounting(t *testing.T) {
 
 ### Cost of one write
 
+**In plain words:** one write costs a disk save on the leader plus one network round trip to the fastest majority.
+
 A committed write needs: the leader's fsync, one network round trip to the followers, the fastest majority's fsyncs, then the reply. Estimates, not measurements:
 
 - One data centre (0.2–0.5 ms RTT; fsync from well under 1 ms on SSDs with power-loss protection to several ms on cheaper disks): about 2–5 ms per write, much higher throughput with batching and pipelining.
 - Three regions with 70 ms between them: at least one cross-region RTT, so roughly 70–100 ms per write. Place replicas, or the leader, close to where the writes come from.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Protocol | How it works | Used in | Notes |
 | --- | --- | --- | --- |
@@ -432,7 +497,7 @@ A committed write needs: the leader's fsync, one network round trip to the follo
 > [!warning] Interview trap
 > DynamoDB is **not** a Dynamo-style leaderless store. Each partition has a leader chosen through Multi-Paxos, and strongly consistent reads go to that leader. Leaderless quorum stores (Cassandra, Riak) are covered in [[Quorums and Leaderless Replication]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Latency:** every write waits for a majority's fsync. Throughput is bounded by one leader per group; scale out by splitting data into many groups (multi-Raft).
 - **Availability under partition:** the minority side cannot write, and cannot serve linearizable reads. That is the CP choice in [[CAP and PACELC]].
@@ -440,7 +505,7 @@ A committed write needs: the leader's fsync, one network round trip to the follo
 - **Do not build your own.** Raft has many subtle corners (Figure 8, membership changes, snapshots, disk corruption). Use etcd, ZooKeeper or Consul, or `go.etcd.io/raft` / `hashicorp/raft` if you truly need an embedded log.
 - **You may not need it:** a single primary database with synchronous replication and a managed failover (see [[High Availability and Failover]]) is enough for most services. Use consensus directly only for coordination (leaders, locks, config) or when you are building a storage system.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- **etcd** stores all Kubernetes objects; in a standard cluster only the API server talks to it.
@@ -455,7 +520,7 @@ A committed write needs: the leader's fsync, one network round trip to the follo
 	- Cluster loses its majority for good (2 of 3 disks lost) → no automatic recovery is safe. Restore from a snapshot with a forced new cluster, accepting possible loss of the last writes.
 - **What to monitor:** leader changes per hour, proposals committed vs failed, WAL fsync and backend commit latency (p99), follower lag in entries, peer round-trip time, database size against the quota.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **FLP impossibility (1985).** In a fully asynchronous system, no deterministic algorithm can guarantee consensus terminates if even one process may crash, because a slow process cannot be told apart from a dead one. Raft and Paxos never violate safety; they give up guaranteed *liveness*. Timeouts and randomization let them make progress whenever the network behaves for long enough (partial synchrony).
 - **Linearizable reads.** A leader cannot just read its local state: it may have been deposed without knowing.
@@ -467,7 +532,7 @@ A committed write needs: the leader's fsync, one network round trip to the follo
 - **Paxos in one paragraph.** Proposal numbers play the role of terms. Phase 1 (`Prepare`/`Promise`) makes the proposer learn any value that might already be chosen; Phase 2 (`Accept`/`Accepted`) asks a majority to accept it. The rule "propose the highest-numbered value already accepted" is what makes a chosen value stick, the same job Raft's election restriction does. Multi-Paxos skips Phase 1 while the leader is stable, and Raft is effectively a fully specified Multi-Paxos with a contiguous log.
 - **Why followers need the term check on every message.** A leader paused by a long GC pause can wake up and send `AppendEntries` with an old term. Followers reject it, and the reply carries the new term, so the old leader steps down. This is the same idea as the fencing token in [[Distributed Locks and Fencing Tokens]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why 3 or 5 nodes and not 4?
 > A majority of 4 is 3, so 4 nodes still tolerate only one failure, while every write needs one more ack. An even size can also split 2–2 and leave no majority. Use `2f+1`: 3 nodes for one failure, 5 for two.
@@ -490,7 +555,7 @@ A committed write needs: the leader's fsync, one network round trip to the follo
 > [!question]- Raft vs Paxos?
 > Equivalent fault tolerance and steady-state cost. Raft specifies the whole system (strong leader, contiguous log, election restriction, membership changes); Multi-Paxos leaves much of that open. Most new systems pick Raft for clarity; Chubby, Spanner and DynamoDB use Multi-Paxos.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `n = 2f + 1`; majority of 3 is 2, of 5 is 3. Never 4.
 - Raft: terms, one vote per term, randomized timeouts (150–300 ms in the paper; etcd 100 ms heartbeat, 1 s election).

@@ -26,7 +26,36 @@ updated: 2026-11-13
 > - Agentic and corrective RAG fix retrieval when you can't know ahead of time that one pass will be enough — the model inspects what came back and decides whether to retry.
 > - Every pattern here costs an extra LLM or embedding call (sometimes several) and adds latency; add one only once you've measured, with [[RAG Evaluation]], which specific failure you have.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Basic RAG takes your question, searches once, and answers from what it found. That breaks when the question is worded oddly, or needs facts from several places.
+
+```mermaid
+flowchart LR
+    Q["'cancel my subscription'"] --> S["One search"] --> X["Misses the doc titled<br/>'Close your account'"]
+```
+
+**Advanced RAG** is a set of fixes, each for one kind of failure. Reword the question several ways. Pick the right place to search. Fetch bigger context around a good match. Search again if the first try was weak.
+
+```mermaid
+flowchart LR
+    Q["Question"] --> R["Reword it 3 ways"] --> S["Search each"] --> F["Merge the result lists<br/>(rank fusion)"] --> A["Answer"]
+```
+
+Every fix adds time and cost. So you add one only after you have measured the failure it fixes.
+
+The rest of this note is just these 3 questions:
+1. Which failure does each pattern fix?
+2. How does each one work, step by step?
+3. When is the extra cost worth it?
+
 
 **The problem in one story.**
 A company bot searches its documents before answering.
@@ -70,7 +99,7 @@ Where it breaks: every extra trick costs an extra model call, so it adds latency
 > [!tip] Remember
 > Measure which retrieval failure you have first, then add the one pattern that fixes it.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 The single-pass query pipeline in [[RAG Pipeline]] has a specific failure mode built into it: it takes the user's literal question, embeds it once, and searches once. That is fine until one of these happens:
 
@@ -82,7 +111,7 @@ The single-pass query pipeline in [[RAG Pipeline]] has a specific failure mode b
 
 Each of these is a different, specific failure, and a different pattern below is the fix for it — not a bigger single pipeline, but a bigger toolbox.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A single-pass retriever is a person who hears a question once, searches for it once, and reads back whatever came up — brittle if the question was oddly phrased, needed a different shelf of the library, or needed two books combined.
 
@@ -96,9 +125,11 @@ An advanced-RAG pipeline is the same person given permission to:
 - follow citations between books (GraphRAG),
 - and glance at what they found before answering — going back for another search if it looks thin (agentic/corrective RAG).
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Whiteboard version
+
+**In plain words:** Ask the same question several ways, search for each, then merge the lists. A doc that shows up near the top in many lists wins.
 
 Query rewriting in its smallest form: generate several versions of the question, retrieve for each, and fuse the ranked lists with **Reciprocal Rank Fusion** so a document that shows up (even at different ranks) across multiple phrasings outranks one that only one phrasing happened to find.
 
@@ -119,11 +150,20 @@ flowchart LR
 
 ### Query rewriting and HyDE
 
+**In plain words:** Rewriting = say the question in other words. HyDE = have the AI write a fake answer, then search for docs that look like it.
+
 **Query rewriting** asks an LLM to produce one or more alternative phrasings of the user's question before retrieving. **Multi-query retrieval** (diagram above) runs several rewrites in parallel and fuses their ranked chunk lists with Reciprocal Rank Fusion: `score(doc) = Σ 1 / (k + rank)` over every list the document appears in, `k ≈ 60` by convention (the value from the original RRF paper, which keeps one list's top pick from dominating a fused result by a huge margin). A document that ranks modestly across three rewrites can outscore one that ranks first in only one — exactly the robustness you want when you don't know in advance which phrasing will embed closest to the right chunk.
 
 **HyDE** (Hypothetical Document Embeddings) is a different move: instead of rewriting the question, ask the LLM to *write a plausible-looking answer* to the question — even though it might be factually wrong, it will typically be written in the *style and vocabulary* of a real matching document — then embed that hypothetical answer, not the question, and retrieve with it. A question and its answer are often far apart in embedding space (a question reads like a question; an answer reads like a statement of fact), but the hypothetical answer and the real matching document are usually written the same way, so this closes that gap. The hypothetical text is never shown to the user and never generated from retrieved context — it exists only to produce a better search vector.
 
+```mermaid
+flowchart LR
+    Q["Question"] --> H["AI writes a<br/>fake answer"] --> E["Embed the fake answer"] --> S["Find real docs<br/>that look like it"]
+```
+
 ### Routing
+
+**In plain words:** Like a receptionist: decide which department (data source) to send the question to, or whether to search at all.
 
 **Routing** decides, before retrieving, *where* to retrieve from or *whether* to retrieve at all. A router can be a small, cheap classifier (an LLM call with a short list of options, or a traditional text classifier) that looks at the incoming query and picks a target corpus (`product-manual`, `billing-faq`, `internal-runbook`), a retrieval strategy (`semantic`, `keyword`, `skip retrieval entirely for small talk`), or both. Routing matters for both quality (sending a billing question to the product-manual index wastes the whole retrieval budget on irrelevant chunks) and cost (skipping retrieval for `thanks!` avoids an unnecessary vector search and a padded prompt).
 
@@ -141,6 +181,8 @@ flowchart TD
 
 ### Self-query filters
 
+**In plain words:** The AI splits a question into "what it's about" (search) and hard rules like dates or prices (filters).
+
 A **self-query** retriever asks the LLM to split a natural-language question into a semantic part and a structured metadata filter:
 
 `"tickets about login errors from last week priced under $50"` becomes a vector search on `"login errors"` plus a filter `created_at > now() - 7d AND price < 50`.
@@ -149,7 +191,16 @@ Done correctly, this avoids two failure modes at once: a pure vector search that
 
 The parsed filter is only as good as the metadata the ingestion pipeline actually attached to each chunk — see [[Document Ingestion and Chunking]].
 
+```mermaid
+flowchart LR
+    Q["'login errors last week<br/>under $50'"] --> L["AI splits it"]
+    L --> V["Search: 'login errors'"]
+    L --> F["Filter: date > 7 days ago,<br/>price < 50"]
+```
+
 ### Parent-child (small-to-big) retrieval and contextual retrieval
+
+**In plain words:** Search with small, sharp pieces, but read the bigger section around them. Or add a short "where this came from" note to each piece.
 
 Small chunks (a paragraph or two) embed well: they're focused, so their vector is a precise summary of one idea, which is exactly what you want when the embedding is doing the matching.
 
@@ -172,13 +223,22 @@ flowchart LR
 
 ### Multi-hop retrieval and GraphRAG
 
+**In plain words:** Some answers need a chain: find fact A, use it to find fact B. GraphRAG stores links between things to follow that chain.
+
 Some questions can't be answered by any single retrieved chunk, because the answer is a combination of facts that live in different documents (`which vendors are affected by both the EU and California privacy changes?`).
 
 **Multi-hop retrieval** answers these iteratively: retrieve, extract an intermediate fact or entity from what came back, then retrieve again using that fact as part of the next query, repeating until enough has been gathered to answer.
 
 **GraphRAG** (Microsoft Research, 2024) builds this capability into the index itself instead of improvising it per query: an indexing-time LLM pass extracts entities and relationships from the corpus into a knowledge graph, and (in the original design) clusters that graph into communities with LLM-written summaries at each level. At query time, retrieval can then walk graph edges between entities (answering "how is X connected to Y") or pull a community summary (answering a broad, corpus-wide question a single chunk could never cover, like "what are the main themes across all these documents?"). This is a meaningfully heavier indexing pipeline — extraction and summarization passes over the whole corpus, re-run as it changes — so it earns its cost mainly for a smaller, relationship-dense corpus (an investigation, a knowledge base explicitly about how things relate) rather than as a default upgrade to plain chunk-and-embed indexing.
 
+```mermaid
+flowchart LR
+    Q["Which vendors are hit<br/>by the outage?"] --> S1["Search 1: outage<br/>affects service X"] --> S2["Search 2: who uses<br/>service X?"] --> A["Vendors A, B"]
+```
+
 ### Agentic and corrective RAG
+
+**In plain words:** Let the AI decide when and what to search, and check if the results are good enough before answering.
 
 Every pattern so far still runs a fixed, pre-decided sequence of steps.
 
@@ -188,11 +248,20 @@ This is naturally suited to multi-hop questions, since the model can issue a sec
 
 **Corrective RAG** (CRAG) is a narrower, cheaper version of the same idea: after retrieval, a lightweight evaluator (a small classifier or an LLM judge) grades the retrieved chunks as *correct* (confidently relevant — proceed as normal), *ambiguous* (mixed relevance — keep the good parts, possibly supplement with a web search or alternate source), or *incorrect* (nothing relevant — fall back to a different retrieval strategy, a broader search, or an honest "I don't know" rather than generating from bad context). It adds one grading step rather than open-ended agent autonomy, which makes it cheaper and more predictable to operate.
 
+```mermaid
+flowchart LR
+    S["Search"] --> G{"Results good enough?"}
+    G -- "yes" --> A["Answer"]
+    G -- "no" --> R["Rewrite query or<br/>try web search"] --> S
+```
+
 ### Long-context as the alternative, not a pattern
+
+**In plain words:** If all your docs fit in the prompt, you might skip search altogether.
 
 [[RAG Pipeline]] already covers the trade-off between RAG and simply pasting a small, static corpus into a long context window. None of the patterns above change that trade-off — they make retrieval smarter when you've decided retrieval is the right tool, not an argument for choosing it over a large context window in the first place.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 The code below implements the mechanism behind multi-query retrieval and routing: Reciprocal Rank Fusion over several ranked result lists, and a small rule-based router choosing a retrieval strategy.
 
@@ -483,7 +552,9 @@ PASS
 ok  	ragpatterns	1.56s
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
+
+**In plain words:** Each pattern side by side: what it fixes, when to use it, and what it costs.
 
 | Pattern | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -497,7 +568,7 @@ ok  	ragpatterns	1.56s
 | Agentic RAG | The model itself decides whether/what/how many times to retrieve, via tool calling | Open-ended or multi-hop questions where a fixed pipeline can't know retrieval is enough | Variable, possibly many LLM calls; needs stop conditions (see [[AI Agents and Agentic Workflows]]) |
 | Corrective RAG | Grade retrieved chunks (correct/ambiguous/incorrect), fall back or supplement on a bad grade | You want a bounded, predictable upgrade over single-pass RAG without full agent autonomy | One extra grading call per query |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Every pattern here is strictly more expensive — in latency, LLM calls, or indexing effort — than the single-pass pipeline in [[RAG Pipeline]]. Add one only to fix a failure mode you've actually measured, not by default.
 - Stacking several patterns (routing *and* self-query *and* reranking *and* multi-query) compounds latency and cost; a question answered perfectly well by plain hybrid search doesn't need any of this.
@@ -505,7 +576,7 @@ ok  	ragpatterns	1.56s
 - Agentic RAG trades predictability for flexibility: without a hard cap on retrieval rounds and a cost budget, a model can loop, re-retrieve unnecessarily, or run up cost on a question a single pass would have answered fine.
 - None of these patterns fix bad ingestion. Query rewriting cannot route around chunks that were never extracted, chunked, or embedded correctly in the first place — check [[Document Ingestion and Chunking]] before reaching for a fancier query-time pattern.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Anthropic's documented contextual retrieval approach (prepend chunk context before embedding, combine with hybrid search and reranking); Microsoft's GraphRAG for query-focused summarization over document collections; corrective-RAG-style grading steps in support and research assistants that can't tolerate confidently answering from irrelevant context.
 - **Failure modes → fixes:**
@@ -516,14 +587,14 @@ ok  	ragpatterns	1.56s
   - Agentic RAG looping or over-retrieving → hard cap on retrieval rounds and a token/cost budget per question (see [[AI Agents and Agentic Workflows]] for stop-condition design).
 - **What to monitor:** per-pattern retrieval recall@k and latency contribution (so you can tell whether an added pattern is actually helping — see [[RAG Evaluation]]); router misclassification rate (sampled and reviewed); extra-LLM-call cost attributable to rewriting/routing/grading steps, tracked separately from the main generation call; GraphRAG index staleness relative to the last re-run of the extraction pass.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why RRF and not score averaging.** Different retrievers (BM25, a vector search, a reranker) produce scores on incomparable scales — a BM25 score and a cosine similarity are not the same unit, and naively averaging or summing them requires careful score normalization that's easy to get wrong per corpus. RRF sidesteps this entirely by fusing on *rank* instead of raw score, so it needs no calibration between retrievers and no assumption that their score distributions are comparable.
 - **Corrective RAG's grading step in detail.** The evaluator typically scores each retrieved chunk's relevance to the query (a small trained classifier, or a cheap LLM-as-judge call), then the overall retrieval set is bucketed: if the top result is confidently relevant, proceed normally; if results are mixed, keep the relevant-looking pieces and consider supplementing (a broader search, a different index, in the original CRAG paper a web search); if nothing looks relevant, skip straight to an honest "insufficient information" rather than generating from noise. The key engineering decision is calibrating the grader's threshold against your own false-positive and false-negative costs — too strict and you throw away good context, too loose and bad context still reaches the LLM.
 - **GraphRAG's community summaries.** Beyond local entity-relationship traversal, the original GraphRAG design clusters the extracted graph into hierarchical communities and has an LLM write a summary of each community at indexing time. A broad question ("what are the main risks discussed across all these filings?") can then be answered by retrieving and combining a handful of community summaries — something no single chunk, however well-embedded, could ever answer, because the information genuinely doesn't live in one place.
 - **Combining patterns.** These are not mutually exclusive: a production pipeline might route (pick a corpus), self-query (parse a date filter), multi-query (rewrite for robustness), retrieve with parent-child chunking (precise match, generous context), and still run a corrective grading pass before generating. Each addition is justified by a specific, measured failure — adding all of them unconditionally multiplies latency and cost for marginal gain on queries that didn't need the help.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- When would you reach for HyDE instead of ordinary query rewriting?
 > When the question and its answer are written very differently — a short question versus a long explanatory passage — so a paraphrase of the question still doesn't look like the answer in embedding space. HyDE sidesteps this by retrieving with a *hypothetical answer*, which is written in the same style as the real matching document, instead of with the question itself.
@@ -546,7 +617,7 @@ ok  	ragpatterns	1.56s
 > [!question]- Design a question-answering system over vendor contracts where answers sometimes require combining facts from two different contracts. What would you add to single-pass RAG?
 > This is a multi-hop retrieval problem: plain single-pass RAG retrieves once and can't combine facts that live in separate documents. Either an agentic RAG loop (the model retrieves, notices it needs a second fact, retrieves again) or a GraphRAG-style index (if the corpus is relationship-dense enough to justify the heavier indexing cost) would let the system traverse from one contract's facts to another's rather than relying on one retrieval pass finding everything at once.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Each pattern fixes one specific single-pass-RAG failure; add the one that matches a failure you've measured, not all of them by default.
 - Multi-query + RRF: rewrite into several queries, fuse by rank (`1/(k+rank)`, `k≈60`) — robust to one bad phrasing.
@@ -559,7 +630,7 @@ ok  	ragpatterns	1.56s
 - Agentic/corrective RAG: let the model (or a grading step) decide whether one retrieval pass was enough.
 - Every pattern costs an extra call and adds latency — justify it with [[RAG Evaluation]], not intuition.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[RAG Pipeline]], [[Keyword, Semantic and Hybrid Search]]
 - **Next:** [[RAG Evaluation]], [[AI Agents and Agentic Workflows]]

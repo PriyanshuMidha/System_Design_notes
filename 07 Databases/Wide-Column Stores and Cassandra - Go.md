@@ -18,10 +18,26 @@ updated: 2026-11-13
 
 # Wide-Column Stores and Cassandra - Go
 
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "What this code shows" and Step 1 (the whiteboard table). Stop there.
+> - 🟡 **Know the basics?** Add Steps 2 to 5 and the Tests.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on twin of [[Wide-Column Stores and Cassandra]]. Cassandra keeps 3 copies of every row on 3 different machines, and the copies can briefly disagree. When they disagree, the copy with the newest time stamp wins; this rule is called **last write wins**. A delete does not erase anything; it writes a "deleted" marker called a **tombstone**, which is copied around like any other value. After about 10 days the tombstone is thrown away, and if one machine missed the delete, the old row can come back to life. The Go code models all of this in a few small functions, and the tests show the "zombie row" and the repair that stops it. Read it top to bottom: each step is a short Concept, the code, then a walkthrough.
+
+```mermaid
+flowchart LR
+    A["copy A: deleted at 10:05"] --> M["merge: newest wins"]
+    B["copy B: value at 10:00"] --> M
+    M --> R["answer: deleted"]
+```
+
 > [!summary] TL;DR
 > This note holds the code behind [[Wide-Column Stores and Cassandra]]: the CQL schema for the InvoiceOps audit events, and a Go model of last-write-wins reconciliation, tombstones, `gc_grace_seconds` and repair, with tests that show a deleted row coming back and the repair that prevents it.
 
-## Before the code
+## Before the code 🟢
 
 - **Structs** (`Cell`): one column value with its write timestamp and a tombstone flag.
 - **Maps as a named type** (`type Replica map[string]Cell`): each replica is a key-to-cell map with methods `Apply` and `Compact`.
@@ -30,7 +46,7 @@ updated: 2026-11-13
 - **`switch` with no value**: `Reconcile` uses `switch { case ...: }` as a clean if/else chain for the last-write-wins rules.
 - **What to run**: `go vet ./... && go test -race ./...` (standard library only; the CQL is reference only).
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Theory concept in [[Wide-Column Stores and Cassandra]] |
 | --- | --- |
@@ -60,17 +76,19 @@ flowchart LR
     RP -. "uses merge" .-> RC
 ```
 
-## Setup
+## Setup 🟢
 
 - Go 1.24, standard library only. A scratch module `lww` with `lww.go` and `lww_test.go`.
 - Run: `go vet ./... && go test -race ./...`.
 - The CQL runs on Cassandra 5.0 (`cqlsh`); it was not executed in this vault, so it is shown as reference DDL.
 
-## Code
+## Code 🟡
 
 The note has two parts. Steps 1 and 2 are CQL: they show how the primary key is written for one query. Steps 3 to 7 are Go: a small model of what replicas do with writes, deletes, compaction and repair, which explains why a deleted row can come back.
 
 ### Step 1: the whiteboard table
+
+**In plain words:** design the table around the one question you will ask ("show this workspace's events for a day, newest first"). The first part of the key picks the machine; the rest sets the order inside it.
 
 **Concept.** [[Wide-Column Stores and Cassandra#Designing InvoiceOps audit events query-first]] starts from the query, not from the entity. The primary key `((workspace_id, bucket_day), created_at, event_id)` has two parts: the inner parentheses are the partition key (which node stores the rows) and the rest are clustering columns (the order of rows inside the partition).
 
@@ -109,6 +127,8 @@ flowchart LR
 ```
 
 ### Step 2: the production schema
+
+**In plain words:** the same table plus real-world settings: 3 copies per data centre, and files grouped by day so a whole old day can be deleted at once.
 
 **Concept.** The production table adds the choices from [[Wide-Column Stores and Cassandra#5. Variants and comparison]] and the replica placement from [[Wide-Column Stores and Cassandra#3.1 Placement: tokens and replicas]]. `NetworkTopologyStrategy` puts 3 replicas in each data centre. Time-window compaction groups data written on the same day into the same SSTable files, so when the 365-day TTL expires, a whole file can be dropped instead of rewriting it.
 
@@ -166,6 +186,8 @@ If "events by actor" is a real query, it needs its own table with `actor_id` in 
 | `WHERE actor_id = ...` | no | cluster-wide scan |
 
 ### Step 3: the cell and the reconcile rule
+
+**In plain words:** each value carries a time stamp. When two copies disagree, keep the newer one; a delete is just a newer "deleted" marker.
 
 **Concept.** [[Wide-Column Stores and Cassandra#3.5 Repair, hints and tombstones]] explains that each cell carries a write timestamp and that replicas settle disagreements by taking the higher timestamp (last write wins). A delete is not an erase; it is a write of a marker called a tombstone, so it can be replicated and reconciled like any value.
 
@@ -240,6 +262,8 @@ flowchart TD
 
 ### Step 4: the replica, Apply and Compact
 
+**In plain words:** one machine's copy of the data: it takes in writes using the newest-wins rule, and after 10 days it forgets old delete markers.
+
 **Concept.** A `Replica` is a map from key to its one winning cell, as if compaction had already merged all versions. `Apply` is what a replica does with an incoming write: reconcile it with what it already has. `Compact` models purging: once a tombstone is older than `gc_grace_seconds` (default 10 days), the replica forgets the delete entirely.
 
 That is safe only if every other replica has seen the tombstone, which is why [[Wide-Column Stores and Cassandra#How deleted rows come back]] ties repair to the grace period.
@@ -283,6 +307,8 @@ stateDiagram-v2
 ```
 
 ### Step 5: Read, Repair and merge
+
+**In plain words:** read asks several machines and keeps the newest answer; repair does the same and then writes that answer back to everyone.
 
 **Concept.** A coordinator that reads from several replicas must merge their answers, and anti-entropy repair is the same merge followed by writing the winner back to every replica ([[Wide-Column Stores and Cassandra#3.5 Repair, hints and tombstones]]). Both use the private `merge` helper, so the rule for "what is the truth" lives in one place.
 
@@ -361,7 +387,17 @@ sequenceDiagram
 
 The model keeps one cell per key, as if compaction had already merged everything. Real compaction may drop a tombstone only when no older SSTable outside the compaction could still hold the data it shadows.
 
-## Design decisions
+**The zombie row, as a picture** 🟢
+
+```mermaid
+flowchart TD
+    D["delete reaches A and B,<br/>C is down"] --> G["10 days pass,<br/>A and B drop the marker"]
+    G --> Q["read merges A, B, C"]
+    Q --> Z["C still has the old row,<br/>so it comes back"]
+    D -.->|"repair within 10 days"| F["C gets the marker too,<br/>row stays deleted"]
+```
+
+## Design decisions 🔴
 
 | Choice in the code | Alternative | Trade-off |
 | --- | --- | --- |
@@ -372,7 +408,7 @@ The model keeps one cell per key, as if compaction had already merged everything
 | `Repair` as `merge` plus `Apply` | separate repair algorithm | one source of truth for the winner; no Merkle trees in the model |
 | Day-sized buckets with TWCS in CQL | one partition per workspace with size-tiered compaction | bounded partitions and cheap expiry; queries must supply the day |
 
-## Tests
+## Tests 🟡
 
 The tests replay the failure and its fix. Three replicas A, B and C hold a row; the delete reaches A and B while C is down longer than the hint window, so C never receives the tombstone. All tests share these constants and the `setup` helper.
 
@@ -414,6 +450,8 @@ flowchart LR
 
 ### TestDeleteResurrectsWithoutRepair
 
+**In plain words:** shows the bug: one machine missed the delete, the marker gets thrown away, and the deleted row comes back.
+
 **Property.** Without repair inside the grace period, a purged tombstone lets the stale live copy win. This is the "zombie data" failure that makes repair mandatory.
 
 | Step | Time | Read result |
@@ -439,6 +477,8 @@ func TestDeleteResurrectsWithoutRepair(t *testing.T) {
 
 ### TestRepairWithinGCGraceKeepsDelete
 
+**In plain words:** shows the fix: run repair before the 10 days are up, so every machine has the marker first.
+
 **Property.** Repair before the grace period ends copies the tombstone to C, so purging it everywhere later is safe and the delete stays deleted.
 
 | Step | Time | Read result |
@@ -462,6 +502,8 @@ func TestRepairWithinGCGraceKeepsDelete(t *testing.T) {
 **If it fails.** A returned value means repair did not spread the tombstone (the merge or `Apply` is wrong), which is exactly the production bug of a repair that did not finish within `gc_grace_seconds`.
 
 ### TestLastWriteWins
+
+**In plain words:** the newest time stamp wins no matter which arrives first, and a wrong clock can quietly lose a real write.
 
 **Property.** The reconcile rule is deterministic (a tombstone wins a tie in either argument order), and the winner is chosen by timestamp, not by arrival order. The second half shows the danger: clock skew silently discards a later write.
 
@@ -494,7 +536,7 @@ func TestLastWriteWins(t *testing.T) {
 
 **If it fails.** A failure in the first two checks means replicas could disagree on a tie depending on message order, so they would never converge. A failure in the last check means the model orders by arrival instead of timestamp, which would hide the clock-skew lesson from [[Wide-Column Stores and Cassandra#3.4 Tunable consistency]].
 
-## Running it
+## Running it 🟢
 
 ```bash
 go vet ./... && go test -race -v ./...
@@ -520,7 +562,7 @@ Reading the output line by line:
 3. Passing `TestRepairWithinGCGraceKeepsDelete` means repair prevented it.
 4. `PASS` is the package summary, and `ok  lww  1.460s` is the package result with total time; `-race` adds start-up cost but found no data race.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **One cell per key.** `Replica` stores only the winner, so it cannot show read amplification across SSTables or tombstone shadowing of older SSTables.
 - **Timestamps are given, not generated.** A real client or coordinator stamps microseconds from a clock; the tests choose the numbers to stage a clock-skew case.
@@ -528,13 +570,13 @@ Reading the output line by line:
 - **`Repair` does not purge.** It copies the winner (including a tombstone) to every replica; purging still needs `Compact`.
 - **The CQL is not tested here.** `uuid` in the whiteboard table and `text` in the production table are different on purpose; do not mix them in one schema.
 
-## Exercises
+## Exercises 🔴
 
 1. In `TestDeleteResurrectsWithoutRepair`, compact at `9*day` instead of `11*day`. Predict whether the row still resurrects and why.
 2. In `setup`, change the tombstone `WriteTS` from 2,000 to 500. Predict what `Read` returns before any compaction.
 3. Call `Repair` after compacting A and B (at day 11) instead of before. Predict whether the delete survives and which replica "wins".
 
-## Links
+## Links 🟢
 
 - **Theory:** [[Wide-Column Stores and Cassandra]]
 - **Related code:** [[NoSQL Data Modeling - Go]]

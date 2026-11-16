@@ -24,7 +24,28 @@ updated: 2026-11-13
 > - Payment confirmation is idempotent by payment ID. A payment that arrives after its hold expired queues one refund in an outbox (a list of pending side effects saved in the same step and sent later by a relay); it never takes seats back.
 > - Classic mistake: locking seats one by one, so a failure halfway leaves a partial hold.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You pick two seats for a movie show and go to pay. While you pay, those seats are kept aside for you for a few minutes; that is a **hold**. No one else can take them. If you pay in time, the seats become booked. If you do not, the hold runs out and the seats are free again. The key idea is that a seat's status belongs to "this seat for this show", called a **ShowSeat**, not to the chair itself.
+
+```mermaid
+flowchart LR
+    A["Free"] -- "you pick it" --> B["Held, few minutes"]
+    B -- "paid" --> C["Booked"]
+    B -- "timer runs out" --> A
+```
+
+Everything else in this note is just these 3 questions:
+1. Why keep seat status per show?
+2. How do you hold several seats all-or-nothing?
+3. What happens if payment arrives after the hold ran out?
 
 **The problem in one story.** A big film opens and thousands of people try to book seats at once. You pick seats C5 and C6 and go to pay. While you pay, nobody else should be able to take those seats. If you never pay, they must come back for others after a few minutes.
 
@@ -64,7 +85,7 @@ stateDiagram-v2
 > [!tip] Remember
 > State lives on ShowSeat; lock all seats or none; a late payment gets a refund, never the seats.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design movie ticket booking like BookMyShow. Users browse movies and shows, view
@@ -86,7 +107,7 @@ It tests one thing above all: **no double booking** under heavy concurrency, whi
 
 Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 to 40 for code, 10 for edge cases.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 | Question to ask | Assumption |
 | --- | --- |
@@ -101,7 +122,7 @@ Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 
 - **Non-functional:** no double booking with thousands of users on one show; expired holds free seats without waiting for a job (lazy expiry plus a sweeper); webhooks can arrive twice or late, so confirm is idempotent; hold IDs are not guessable; money is `int64` paise.
 - **Out of scope:** search and recommendations, gateway internals, food add-ons, offers.
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 | --- | --- |
@@ -114,7 +135,7 @@ Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 
 
 The hardest use cases, the ones to code: `LockSeats` for many seats at once under concurrency, and its partner `ConfirmBooking`, which must be idempotent, must verify the hold still owns the seats, and must refund a late payment exactly once.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 | --- | --- | --- |
@@ -129,7 +150,7 @@ The hardest use cases, the ones to code: `LockSeats` for many seats at once unde
 
 The modeling insight is **Seat versus ShowSeat**. Seat A1 exists once, but it is available for the 6 PM show and booked for the 9 PM show. Put `State` on `Seat` and the model breaks on the second show.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -217,7 +238,7 @@ stateDiagram-v2
 
 A late payment is not a transition: the seat is already `Available` or held by someone else, so the payment goes to the refund outbox and the seat is untouched.
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 ```text
 GET    /shows?movie_id=&city=&date=     -> list shows
@@ -232,7 +253,9 @@ POST   /bookings/{booking_id}/cancel    -> follow-up: cancel and refund through 
 
 Go surface (full code in Step 8): `LockSeats(ctx, showID, userID, seatIDs) (Hold, error)`, `ConfirmBooking(ctx, Payment) (Booking, error)`, `ReleaseHold(ctx, holdID, userID) error`, `ReleaseExpiredLocks(ctx) int`, `ProcessRefunds(ctx, Refunder) int`, `SeatState(showID, seatID) (SeatState, error)`.
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
+
+**In plain words:** Tables for shows, seats and bookings. The show_seat table holds one row per seat per show with its status.
 
 ```sql
 CREATE TABLE shows (
@@ -341,7 +364,7 @@ type BookingRepository interface {
 
 In the Step 8 code the in-memory "repository" is the maps inside `Service`, so the whole design compiles as one package.
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 | --- | --- | --- |
@@ -355,7 +378,7 @@ In the Step 8 code the in-memory "repository" is the maps inside `Service`, so t
 
 Not used: an object per seat state (three states and five transitions fit in one condition) and a Singleton service (built in `main` and injected, so tests get a fresh one).
 
-## Folder structure
+## Folder structure 🟡
 
 The code in Step 8 is printed as one file so it reads top to bottom. In the round, split it like this:
 
@@ -373,7 +396,7 @@ cmd/demo/main.go   -> wiring: repositories, pricing, service, HTTP handlers, bot
 - `service.go` holds all the locking logic; it is the only file that takes `s.mu`.
 - `jobs.go` never calls the gateway while holding `s.mu`.
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > **Write in the room (about 150 lines):** `SeatState`, `showSeat`, `Hold`, `Booking`, `Payment`; `Service` with `NewService`, `AddShow`, `free`, `LockSeats`, `ConfirmBooking`, `ReleaseHold`, `releaseLocked`, `ReleaseExpiredLocks` and `SeatState`.
@@ -424,6 +447,8 @@ How the main paths work:
    The gateway is never called under the mutex: `ProcessRefunds` copies pending rows, calls the gateway outside the lock, and marks successes. A failed call stays pending and the next tick retries it.
 4. **Amount check.** A success webhook whose amount differs from the hold amount never books: the payment is queued for refund and the hold stays, so a correct payment can still confirm it before the TTL.
 5. **`SeatState`** returns an error for an unknown show or seat; a direct `s.seats[show][seat].state` lookup would dereference a nil pointer and panic. It also applies lazy expiry, so the seat map never shows a dead hold as taken.
+
+**In plain words:** The full booking service. Start with `LockSeats`, then `ConfirmBooking`, then the expiry and refund path.
 
 ```go
 package booking
@@ -761,7 +786,7 @@ func (s *Service) SeatState(showID, seatID string) (SeatState, error) {
 }
 ```
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 | --- | --- |
@@ -773,6 +798,8 @@ func (s *Service) SeatState(showID, seatID string) (SeatState, error) {
 | `TestExpiry` | The seat map shows an expired lock as free; another user can take it; the old hold's confirm fails without freeing the new owner's seat; the sweeper releases expired holds |
 | `TestLatePaymentRefundsExactlyOnce` | Three retried late webhooks queue one refund; a gateway timeout is retried; the gateway sees exactly one refund of 40000 paise |
 | `TestConcurrentLock` | 100 goroutines lock the same 2 seats: exactly 1 winner |
+
+**In plain words:** Tests for holding, paying, expiry, late payments and 100 people fighting for the same two seats.
 
 ```go
 package booking
@@ -1002,7 +1029,7 @@ func TestConcurrentLock(t *testing.T) {
 
 Run in a scratch module with Go 1.24.4: `go vet` clean and `go test -race -count=1` passes all eight tests.
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | What happens | How the design handles it |
 | --- | --- | --- |
@@ -1022,7 +1049,7 @@ Run in a scratch module with Go 1.24.4: `go vet` clean and `go test -race -count
 | A bug in hold logic | Two bookings per seat | The partial unique index `uq_active_seat` is the final guarantee |
 | Hot show (blockbuster opening) | One mutex or one row set is contended | Per-show locks, Redis `SET seat:{show}:{seat} <hold> NX PX 600000` (run for all seats in one Lua script, so a multi-seat hold stays all-or-nothing), and a waiting room (Step 10) |
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 | --- | --- |
@@ -1050,7 +1077,7 @@ Choices made:
 - the price computed at lock time and stored on the hold, so what the user saw is what they pay
 - refunds through an outbox, so a gateway outage never loses a refund and never blocks the seat lock
 
-## Drawing
+## Drawing 🟢
 
 ![[Movie Ticket Booking LLD Drawing.excalidraw]]
 
@@ -1060,7 +1087,7 @@ It also shows the lock → pay → confirm flow with its red failure branches (s
 
 Redraw from memory: Seat versus ShowSeat, the three states with five transitions, the late-payment branch into the refund outbox, and the conditional `UPDATE` plus the two unique constraints.
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- Why does the state live on ShowSeat instead of Seat?
 > A physical seat exists once but takes part in many shows. Seat A1 is booked at 6 PM and free at 9 PM. State on `Seat` would make every show share one state; `ShowSeat` (show ID plus seat ID) is the unit that is locked and booked.
@@ -1080,7 +1107,7 @@ Redraw from memory: Seat versus ShowSeat, the three states with five transitions
 > [!question]- What breaks first on a blockbuster opening, and what do you add?
 > The single lock or the hot rows for that show. Shard locks per show, hold seats in Redis with `SET NX PX`, keep the SQL unique index as the final check, and put a virtual waiting room in front so only an admitted rate of users reaches `LockSeats`.
 
-## Interview explanation
+## Interview explanation 🔴
 
 ```text
 The core entity is ShowSeat, one row per seat per show, with three states: available, locked and booked. State lives there, not on the physical Seat. LockSeats checks every requested seat and then locks all of them in one critical section, or in one transaction with a conditional UPDATE, so a multi-seat hold is all-or-nothing and two users can never hold the same seat.
@@ -1090,7 +1117,7 @@ Each hold has a random ID and a TTL; an expired hold counts as free on every rea
 A payment that arrives too late never steals seats back: it writes one refund row keyed by the payment ID, and a relay sends it to the gateway outside the lock, with retries. A partial unique index on active booking seats is the final guarantee against double booking.
 ```
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - State on `ShowSeat`, never on `Seat`. Three states: available, locked, booked.
 - Lock in two phases: check all, then mutate all, inside one critical section or transaction.
@@ -1100,7 +1127,7 @@ A payment that arrives too late never steals seats back: it writes one refund ro
 - Random hold IDs (`crypto/rand.Text`, Go 1.24); lookups return errors, never panic.
 - Scale: per-show locks, Redis `SET NX PX`, the partial unique index, a waiting room.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[State Machines in Go]], [[Concurrency for LLD]], [[Circuit Breaker]]
 - **Next:** [[Splitwise Expense Sharing]], [[Hotel Booking]] (the same hold pattern over date ranges)

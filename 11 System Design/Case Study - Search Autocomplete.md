@@ -26,7 +26,36 @@ updated: 2026-11-13
 > - Most keystrokes never reach the service: debouncing on the client, browser caching and CDN caching for short prefixes absorb them.
 > - Trending queries need a fast lane (streaming counts merged on top of the snapshot), and offensive suggestions need a block list.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+When you type in a search box, suggestions show up after every letter.
+There is no time to search all past queries on each key press.
+So the top suggestions for every prefix ("t", "tr", "tra"...) are worked out ahead of time.
+They are kept in a **trie**: a tree where each step down adds one letter, and each spot already holds its top 10 answers.
+
+```mermaid
+flowchart LR
+    R["(root)"] --> T["t"] --> TR["tr<br/>top 10 ready"] --> TRA["tra<br/>top 10 ready"]
+```
+
+A slow job rebuilds this tree from search logs every hour or so. The fast service just looks up the prefix you typed.
+
+```mermaid
+flowchart LR
+    L["Search logs"] --> B["Hourly builder"] --> S["New tree snapshot"] --> API["Suggest service:<br/>just a lookup"]
+```
+
+So the rest of this note is just these 3 questions:
+1. How do you answer each key press in a few milliseconds?
+2. How do you keep suggestions fresh, including sudden trending topics?
+3. What happens when the tree is too big for one machine?
 
 **The problem in one story.**
 You type "tr" into a search box.
@@ -70,7 +99,7 @@ Where it breaks: real drawers are not rewritten every few minutes, and trends ca
 > [!tip] Remember
 > Precompute the top answers for every prefix offline, so each keystroke is just a lookup.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 Typing "how to bo" and seeing "how to boil eggs" saves keystrokes, fixes spelling and steers users to queries that return good results. Users expect suggestions to keep up with typing, so the whole round trip must fit between keystrokes.
 
@@ -88,7 +117,7 @@ Typing "how to bo" and seeing "how to boil eggs" saves keystrokes, fixes spellin
 
 **Out of scope**: the search results page itself, spelling correction, ranking by click-through models (mentioned as an extension).
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture a **library card catalogue drawer for every prefix**. The drawer labelled "tr" does not contain every book starting with "tr"; it contains a single card with the 10 most borrowed titles already written on it.
 
@@ -96,7 +125,7 @@ Looking something up is opening the right drawer. The expensive work, counting b
 
 The data structure is a **trie** ([[Tries, Suffix Trees and Suffix Arrays]]): each node is a prefix, children extend it by one character. The design trick is to cache the answer, the top-K list, in every node, trading memory for constant-time reads.
 
-## 3. How it works - high-level design
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart LR
@@ -166,7 +195,7 @@ sequenceDiagram
     Note over S: old snapshot freed after in-flight requests finish
 ```
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -186,6 +215,8 @@ API:       GET /v1/suggest?q=<prefix>&lang=en&region=IN -> {suggestions: [...]}
 
 ### Estimates (inputs are assumptions; results are estimates)
 
+**In plain words:** rough sums: how many key presses per second and how much memory the tree needs.
+
 | Quantity | Arithmetic | Result |
 | --- | --- | --- |
 | Requests per day | 100M users × 10 searches × 6 requests | 6 billion/day |
@@ -202,6 +233,8 @@ API:       GET /v1/suggest?q=<prefix>&lang=en&region=IN -> {suggestions: [...]}
 **What the numbers decide.** A 50 GB snapshot fits in RAM on a large machine but is costly to replicate on 40 nodes and slow to reload hourly. Three standard fixes: store only prefixes up to 20 characters (longer prefixes rarely change the answer), keep only nodes reached by real traffic, and **shard by prefix** (for example by the first two characters) so each node holds a slice. The read rate, in contrast, is easy once the CDN takes short prefixes.
 
 ### API
+
+**In plain words:** one call: give a prefix, get back up to 10 suggestions.
 
 ```http
 GET /v1/suggest?q=tr&lang=en&region=IN&limit=10
@@ -224,6 +257,8 @@ Content-Type: application/json
 - Logging: the search service, not the suggest service, logs **submitted** queries. Logging every keystroke prefix would flood the pipeline with partial queries.
 
 ### Data model
+
+**In plain words:** query counts from logs, and the built tree snapshot that the service loads.
 
 ```mermaid
 erDiagram
@@ -261,6 +296,8 @@ erDiagram
 The serving format is not a table: it is the serialized trie, where each node stores its character, child offsets and the top-10 `query_id` list, plus a string table mapping IDs to text.
 
 ### Code: a trie with top-K cached in every node
+
+**In plain words:** the builder fills each spot in the tree with its 10 best answers; lookup just walks down the letters and returns that list.
 
 `Build` runs in the offline builder; `Lookup` runs in the suggest service. The trie is immutable after building, so concurrent lookups need no locks, and a new snapshot replaces the old one with an atomic pointer swap.
 
@@ -448,13 +485,15 @@ For 100M queries of 20 characters and K = 10 that is about 2 × 10^10 small oper
 
 ### One request traced
 
+**In plain words:** follow one key press from the browser, maybe through a CDN cache, to the suggest service and back.
+
 1. At 21:00 the hourly snapshot `v1234` for `en/IN` is live on all suggest nodes.
 2. A user types "t" and "r" within 100 ms, pauses for 300 ms, then types "e" and "e". With a 100 ms debounce the client sends only `q=tr` and then `q=tree`.
 3. `q=tr` is served by the CDN (prefix length 2, cached 300 s).
 4. `q=tree` misses the CDN. The suggest node walks 4 nodes, reads `["tree", "tree house", ...]`, merges the trending overlay (nothing trending), checks the block list and returns in about 1 ms of server time (an estimate for an in-memory walk).
 5. The user submits "tree house". The search service logs it to Kafka; it appears in the next hourly count and, if it spikes, in the trending overlay within 15 minutes.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -473,14 +512,20 @@ For 100M queries of 20 characters and K = 10 that is about 2 × 10^10 small oper
 | Exponential decay (half-life 7 days, as in the diagram) | Smooth, one number per query | Needs periodic re-scoring |
 | Click-through or result quality | Suggests queries that lead to good results | Needs a learning pipeline |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Precompute over compute-on-read because** finding the top 10 among millions of matching queries per keystroke is too slow at 70k requests/s; the price is staleness (up to one build interval) and memory.
 - **Immutable snapshots over in-place updates because** they make reads lock-free and rollback trivial (point back to the previous version); the price is a full rebuild per interval, softened by the trending overlay.
 - **CDN caching of short prefixes because** short prefixes are both the most frequent and the most shared; the price is up to 5 minutes of staleness for those prefixes and no personalization in cached responses.
 - **When not to use this design:** a catalogue of 50,000 products or city names fits in a PostgreSQL 17 table with a `text_pattern_ops` B-tree index or a `pg_trgm` index, or in a single Redis sorted set. Build the trie pipeline only when query logs, not a fixed list, define the suggestions.
 
-## 7. In production
+```mermaid
+flowchart TD
+    Q{"Fewer than ~100k items<br/>(products, cities)?"} -- "yes" --> DB["Simple database prefix query"]
+    Q -- "no, huge query logs" --> T["Precomputed trie snapshots"]
+```
+
+## 7. In production 🔴
 
 - **Well-documented building blocks:**
 	- Elasticsearch's completion suggester stores suggestions in an in-memory finite-state transducer (FST) per segment and is built for fast prefix lookup with weights, documented as optimized for speed rather than flexibility.
@@ -494,9 +539,11 @@ For 100M queries of 20 characters and K = 10 that is about 2 × 10^10 small oper
 	- *Privacy leak* (a rare query with a phone number or name appears as a suggestion) → minimum distinct-user thresholds and PII filters in the aggregator.
 - **SLOs and monitoring (targets):** server p99 under 10 ms; end-to-end p99 under 100 ms; availability 99.9% (search works without it); CDN hit ratio; snapshot age (alert if older than 3 build intervals); share of empty responses for common prefixes; block-list propagation time.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### 8.1 Trending queries without hourly lag
+
+**In plain words:** a small fast side-path counts the last few minutes and mixes sudden hot queries into the normal list.
 
 A breaking news query must appear within minutes, but a full trie rebuild takes longer than that. A **fast lane** solves it:
 1. A stream job ([[Stream Processing Basics]]) keeps per-query counts in 5-minute tumbling windows for the last hour.
@@ -508,6 +555,8 @@ Counting the heaviest queries in a stream without storing every query exactly is
 
 ### 8.2 Sharding the trie
 
+**In plain words:** when the tree is too big for one machine, split it by prefix across several.
+
 When one language-region snapshot no longer fits comfortably on one node, shard it.
 - **By prefix range:** shard 1 holds prefixes starting `a`-`c`, and so on. Simple routing (the first characters pick the shard) but skewed: far more English queries start with "s" than with "x". Split ranges by measured traffic, not by alphabet, and keep a routing table.
 - **By hash of the first two characters:** more even, but a range of related prefixes no longer lives together, which does not matter here because each lookup touches one prefix.
@@ -517,11 +566,13 @@ The top levels (prefixes of 1 to 2 characters) are the hottest and smallest; the
 
 ### 8.3 Unicode and normalization
 
+**In plain words:** make "Café", "cafe" and "CAFE" count as the same text before building, carefully for each language.
+
 Lower-casing is locale-sensitive (Turkish dotted and dotless i), accents may or may not matter ("café" vs "cafe"), and scripts like Hindi combine characters. Normalize queries the same way in the aggregator and at lookup: Unicode NFC, locale-aware lower-casing, optional accent folding per language.
 
 Store trie edges by rune (as the Go code does with `range` over a string), not by byte, so a multi-byte character is one edge. A mismatch between build-time and request-time normalization shows up as "no suggestions" for real users, so test it with sample inputs in every supported language.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why store the top-K list in every trie node?
 > Without it, a lookup for "t" would have to visit every query under "t" (millions) and sort them. With a cached list, a lookup walks at most `len(prefix)` nodes and returns the stored list. The cost is memory (K entries per node) and offline rebuilds.
@@ -544,7 +595,7 @@ Store trie edges by rune (as the Go code does with `range` over a string), not b
 > [!question]- Trie or a prefix → list table in Redis?
 > Both precompute. The trie keeps everything in process memory (fastest, no network hop, rebuilt per node). A Redis table is shared and simpler to update per prefix but adds a network hop and holds one key per prefix. Choose by snapshot size and how many serving nodes you run.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 A 45-minute interview script:
 - **0-5 min, requirements:** top 10 by popularity for a prefix; p99 under 100 ms end to end; trending within 15 minutes; block list; out of scope: typo tolerance, results page.

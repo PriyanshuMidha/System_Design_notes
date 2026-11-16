@@ -27,7 +27,41 @@ updated: 2026-11-13
 > - Redis does not run exact LRU or LFU. It samples a few keys and evicts the best candidate, and its default policy is `noeviction`, which makes writes fail when memory is full.
 > - Modern libraries (Caffeine, Ristretto) use TinyLFU admission to get better hit ratios than LRU.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how LRU and LFU work), 4 (the code and the measured comparison), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A cache is a small, fast box of saved answers.
+The box has a fixed size, so one day it is full.
+When a new item arrives, something old has to go; removing it is called **evicting** it.
+The rule that picks what goes is the **eviction policy**.
+
+```mermaid
+flowchart LR
+    N["new item"] --> F{"box full?"}
+    F -- "no" --> S["store it"]
+    F -- "yes" --> R["rule picks one to throw out"] --> S
+```
+
+The most common rule is **LRU**, "least recently used": throw out the thing nobody touched for the longest time.
+Another is LFU, "least frequently used": throw out the thing used the fewest times.
+A good rule keeps the items people keep asking for, so most requests are answered from the box.
+
+```mermaid
+flowchart LR
+    B["box: A, B, C<br/>(C untouched longest)"] --> D["D arrives"]
+    D --> X["LRU throws out C"]
+```
+
+The rest of this note is just these 3 questions:
+1. Which item should go when the box is full?
+2. How do you find that item fast, even with millions of items?
+3. How does Redis do it, and which setting should you pick?
 
 **The problem in one story.**
 Your phone's photo gallery keeps thumbnails in a small fast area.
@@ -72,14 +106,14 @@ Where it breaks: you know your own reading habits; a cache only sees past access
 > [!tip] Remember
 > Eviction = memory full, invalidation = data changed; LRU is map + doubly linked list with O(1) get and put.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A Redis node with 4 GB for cache data, holding product objects of about 590 bytes each (see the measurement in [[Caching Fundamentals]]), fits roughly 7 million of them. The catalogue has 40 million products. Something has to decide which 7 million stay.
 
 - Keep the wrong ones, and the hit ratio drops from, say, 95% to 70%. The database then sees six times as many reads.
 - Keep nothing new (Redis's default when memory is full), and every `SET` fails with an `OOM` error. Measured on Redis 8.2 with `maxmemory 2mb` and the default `noeviction`: the first seven 100 KB `SET`s succeeded and every following one returned `OOM command not allowed when used memory > 'maxmemory'`.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Your phone's home screen has room for 20 apps.
 
@@ -88,9 +122,21 @@ Your phone's home screen has room for 20 apps.
 - **LFU:** remove the app you open least often. Survives that scroll, but an app you used heavily last year keeps its place unless old counts fade.
 - **TTL:** every app uninstalls itself after 30 days, full screen or not.
 
-## 3. How it works
+**The four rules side by side.** Same full box, same new item, different victim.
+
+```mermaid
+flowchart TD
+    Full["box full, new item arrives"] --> F1["FIFO: drop the oldest arrival"]
+    Full --> F2["LRU: drop the one unused longest"]
+    Full --> F3["LFU: drop the one used least often"]
+    Full --> F4["TTL: items leave when their time is up,<br/>full or not"]
+```
+
+## 3. How it works 🟡
 
 ### LRU: a hash map plus a doubly linked list
+
+**In plain words:** a lookup table finds any item instantly, and a line of items keeps "most recently used" at the front. Use an item: move it to the front. Need room: drop the one at the back.
 
 ```mermaid
 flowchart LR
@@ -132,6 +178,8 @@ A full LRU with per-entry TTLs and concurrency is solved step by step in the pra
 
 ### LFU in O(1)
 
+**In plain words:** keep one line per use count (used once, used twice, ...). To make room, drop from the line with the smallest count.
+
 Keep one list per access count (a **frequency bucket**) and remember the smallest non-empty count, `minFreq`.
 
 - **Get:** move the entry from bucket `f` to bucket `f+1`. If bucket `f` became empty and `f == minFreq`, increment `minFreq`.
@@ -142,6 +190,8 @@ Every step touches a fixed number of nodes, so both operations are `O(1)`. The t
 **Plain LFU never forgets.** An item with 1 million hits last week outlives everything new. Real LFU caches age counts: halve all counters periodically (TinyLFU's reset), or decay them with time (Redis).
 
 ### Other policies
+
+**In plain words:** a quick tour of other rules (random, FIFO, and smarter mixes) and where each one wins or loses.
 
 | Policy | Evicts | Strength | Weakness |
 | --- | --- | --- | --- |
@@ -156,6 +206,8 @@ Every step touches a fixed number of nodes, so both operations are `O(1)`. The t
 
 ### TTL expiry vs eviction
 
+**In plain words:** expiry is a sell-by date on one item; eviction is clearing shelf space because the shelf is full. They are two separate reasons an item disappears.
+
 TTL expiry and eviction are separate mechanisms that both free memory:
 
 - **Expiry** removes a key because its TTL passed, even if memory is nearly empty. Redis does it lazily on access and actively in a background cycle (details and a measurement in [[Cache Invalidation, TTL and Consistency]]).
@@ -163,7 +215,19 @@ TTL expiry and eviction are separate mechanisms that both free memory:
 
 A cache with long TTLs and too little memory evicts constantly; a cache with short TTLs and lots of memory may never evict.
 
+**Two separate exits, as a picture.**
+
+```mermaid
+flowchart LR
+    K["key in cache"] --> T{"TTL passed?"}
+    T -- "yes" --> X1["expired (removed)"]
+    K --> M{"memory over limit?"}
+    M -- "yes, and policy picks it" --> X2["evicted (removed)"]
+```
+
 ### How Redis evicts
+
+**In plain words:** when Redis runs out of its memory budget, it looks at a setting that says which keys may be removed and how to choose them.
 
 Redis checks memory before running a command that may add data. If `used_memory` is above `maxmemory`, it frees memory according to `maxmemory-policy` until it is under the limit, or rejects the command.
 
@@ -184,9 +248,11 @@ Defaults measured on Redis 8.2 with `CONFIG GET`: `maxmemory 0` (no limit on 64-
 - **Approximate LFU.** The same 24 bits hold a 16-bit last-decrement time and an 8-bit **logarithmic counter** (maximum 255). A hit increments the counter only with probability `1 / ((counter − 5) × lfu-log-factor + 1)`, so it grows roughly with the logarithm of the hit count. New keys start at 5 so they are not evicted immediately. The counter is decremented by one for each `lfu-decay-time` minutes the key goes unaccessed; the decay is applied lazily, when the key is next accessed or sampled for eviction, not by a background sweep.
 - **The `volatile-*` trap.** With a `volatile-*` policy, keys without a TTL are never evicted. If none of the keys have a TTL, Redis behaves like `noeviction`. Measured on Redis 8.2: with `volatile-lru` and no TTL keys, a `SET` over the limit returned `OOM`.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the smallest LRU cache you could write on a whiteboard: a map plus a list.
 
 ```go
 type LRU struct {
@@ -219,6 +285,8 @@ func (c *LRU) Put(k, v int) {
 ```
 
 ### Full code: FIFO, LRU and O(1) LFU behind one interface (Go 1.24)
+
+**In plain words:** three caches with the same Get and Put, so you can swap the rule and compare results fairly.
 
 ```go
 // Package eviction implements FIFO, LRU and O(1) LFU caches with a common
@@ -385,6 +453,8 @@ func HitRatio(c Cache, trace []int) float64 {
 
 ### Tests and a measured comparison (pass `go vet` and `go test -race`)
 
+**In plain words:** run the three caches on the same request patterns and count how often each one already had the answer.
+
 ```go
 package eviction
 
@@ -511,6 +581,8 @@ How to read it:
 
 ### Approximate LRU in Redis, measured
 
+**In plain words:** Redis does not track a perfect "oldest" order. It picks a few keys at random and throws out the oldest of those, which is cheaper and nearly as good.
+
 Measured on Redis 8.2 with `maxmemory 2mb` and `allkeys-lru`: 40 keys of 100 KB written in order `big:1` … `big:40`, none read. `INFO stats` showed `evicted_keys:31`, and the 9 survivors were:
 
 ```text
@@ -529,7 +601,17 @@ The LFU counter, measured with `OBJECT FREQ` under `allkeys-lfu` (default `lfu-l
 
 The counter is logarithmic and probabilistic, so it distinguishes "hot" from "very hot" within one byte. `OBJECT IDLETIME` returns an error under an LFU policy, because the same bits store the counter instead of the access time.
 
-## 5. Variants and comparison
+**How Redis picks a victim, as a picture.**
+
+```mermaid
+flowchart LR
+    S["sample 5 random keys"] --> P["add them to a small<br/>pool of candidates"]
+    P --> O["evict the oldest<br/>in the pool"]
+    O --> C{"still over limit?"}
+    C -- "yes" --> S
+```
+
+## 5. Variants and comparison 🟡
 
 | Choice | Use when | Avoid when | Cost |
 | --- | --- | --- | --- |
@@ -542,7 +624,7 @@ The counter is logarithmic and probabilistic, so it distinguishes "hot" from "ve
 | In-process LRU (`container/list`) | Small Go cache, simple workload | Very high concurrency on one lock | One mutex; GC scanning of pointers |
 | Ristretto / TinyLFU | High-throughput Go cache needing the best hit ratio | You need exact, predictable eviction | Approximate; admission may reject a new item |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **No eviction policy fixes a cache that is too small.** If the working set is ten times the cache, every policy hits poorly. Grow the cache, shrink values, or cache less.
 - **Exact LRU costs memory and locks.** Two pointers per entry plus a global list that every read must update (a write on every read). That is why Redis approximates it and why high-throughput libraries buffer reads.
@@ -550,7 +632,7 @@ The counter is logarithmic and probabilistic, so it distinguishes "hot" from "ve
 - **Mixed roles in one Redis break eviction.** Sessions, locks, queues and cache in one instance with `allkeys-lru` will eventually evict a lock or a queue. Separate instances, or `volatile-*` with TTLs only on cache keys.
 - **Memoization is not a cache policy.** Memoization caches a pure function's results for given inputs (often for one computation, unbounded); a cache serves shared, mutable data with a size limit, TTLs and invalidation. A memo table that lives forever needs an eviction policy too.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Redis (sampled LRU/LFU), Memcached (a segmented LRU per slab class: hot, warm and cold queues), Caffeine (W-TinyLFU, the Java default), Ristretto (TinyLFU admission with sampled LFU eviction, built by Dgraph for Go), and PostgreSQL's buffer pool (a clock-sweep approximation of LRU with usage counts).
 - **Failure modes → fixes:**
@@ -560,7 +642,7 @@ The counter is logarithmic and probabilistic, so it distinguishes "hot" from "ve
 	- `maxmemory` set equal to the machine's RAM → replication buffers, fragmentation and fork copy-on-write push the process over and the OS kills it. Leave headroom ([[Redis in Production - Memory, Latency, Security]]).
 - **What to monitor:** `evicted_keys` rate, `expired_keys` rate, `used_memory` vs `maxmemory`, hit ratio (`keyspace_hits / (keyspace_hits + keyspace_misses)`), and, under LFU, a sample of `OBJECT FREQ` values on hot keys.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Concurrency in Go.** A single mutex around an LRU serialises every read, because `Get` mutates the list. Options: **shard** the cache into N independent LRUs by key hash (each with its own lock, 16–256 shards); **buffer** recency updates and apply them in batches (Ristretto and Caffeine do this, accepting slightly stale recency); or accept approximate LRU with per-entry timestamps updated atomically and evict by sampling, as Redis does.
 - **Where `sync.Map` fits.** The Go docs recommend it for keys written once and read many times, or for goroutines working on disjoint key sets. It has no size limit and no eviction, so it is a fit for an append-mostly lookup table, not for a bounded cache.
@@ -569,7 +651,7 @@ The counter is logarithmic and probabilistic, so it distinguishes "hot" from "ve
 - **Admission vs eviction.** Eviction chooses a victim; admission decides whether the new item deserves a place at all. TinyLFU rejects a one-hit-wonder rather than evicting a proven item for it, which is why it resists scans without frequency buckets per entry.
 - **Redis eviction under load.** Eviction runs inside command processing. If writes arrive faster than eviction frees memory, `maxmemory-eviction-tenacity` (default 10) controls how long each command spends evicting before Redis defers the rest to a background loop; memory can overshoot `maxmemory` briefly.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Implement an LRU cache with O(1) get and put. Which data structures?
 > A hash map from key to a node in a doubly linked list ordered by recency. `Get` finds the node and moves it to the front; `Put` inserts at the front and, when full, removes the back node and its map entry. In Go, `container/list` plus `map[K]*list.Element`.
@@ -592,7 +674,7 @@ The counter is logarithmic and probabilistic, so it distinguishes "hot" from "ve
 > [!question]- How would you make an in-process LRU fast under 64 concurrent goroutines?
 > Shard it by key hash into independent LRUs with their own locks, or use a library that buffers access records and applies them in batches (Ristretto). A single mutex serialises every `Get`, because each read moves a list node.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Eviction = memory is full; invalidation = data changed; expiry = TTL passed.
 - LRU = map + doubly linked list, `O(1)`; flushed by scans.
@@ -603,7 +685,7 @@ The counter is logarithmic and probabilistic, so it distinguishes "hot" from "ve
 - `volatile-*` with no TTL keys behaves like `noeviction`.
 - W-TinyLFU (Caffeine, Ristretto) adds admission and resists scans.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Caching Fundamentals]], [[Hash Tables and Go Maps]]
 - **Next:** [[LRU Cache with TTL]] (practice), [[Redis in Production - Memory, Latency, Security]], [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]

@@ -22,7 +22,41 @@ updated: 2026-11-13
 > - The highest-value signal isn't a dashboard — it's a rule that promotes a bad trace (guardrail fired, TTFT spiked, user downvoted) into a new eval test case automatically.
 > - Alert on cost, latency and guardrail-trigger rate as first-class SLIs for this feature, the same way you'd alert on error rate for any other service (see [[SLIs, SLOs, SLAs and Error Budgets]]).
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A user says "the bot was slow and wrong". A normal log line only says "request took 4 seconds". It does not say why.
+
+**Observability** means recording enough about each AI call that you can answer "why?" later, without running it again.
+
+```mermaid
+flowchart LR
+    U["'Bot was slow<br/>and wrong'"] --> L["Plain log:<br/>4.3 s, 200 OK"] --> Q["No idea why"]
+```
+
+The tool for this is a **trace**: a timeline of one request, split into steps. Each step is a **span**, with its own time, cost and details.
+
+```mermaid
+flowchart TD
+    R["Request: 4.3 s"] --> A["Search docs: 0.04 s"]
+    R --> B["AI model call: 4.2 s<br/>3,000 tokens, $0.01"]
+```
+
+Now you can see the slow part at once. You also save which prompt version and which documents were used.
+
+Prompts often hold private customer data, so you store IDs, not full text, in normal logs.
+
+The rest of this note is just these 3 questions:
+1. What should you record for every AI call?
+2. How do steps nest into a trace, and how do you hide private data?
+3. How do bad traces become tests and alerts?
+
 
 **The problem in one story.**
 A user reports "the bot gave me a wrong and slow answer".
@@ -71,13 +105,15 @@ Where it breaks: a parcel's contents are not logged, while an LLM span would nat
 
 ### Whiteboard version
 
+**In plain words:** One request = one timeline with a bar per step. The longest bar is your problem.
+
 A RAG chat feature handles one question as: embed query → retrieve 8 chunks → build prompt → call the model → return answer.
 
 Traced as one span per step, nested under a root span for the whole request, a slow answer shows up immediately as "retrieval took 40ms, the LLM call took 4.2s" rather than one opaque "request took 4.3s" line.
 
 And the LLM call's own span additionally carries its token counts, cost and which chunk IDs it saw, so a wrong answer can be traced back to exactly which chunks were retrieved without re-running anything.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A plain request log ("POST /chat 200 4.3s") tells you a call was slow or wrong, but not why: was it queued behind a rate limit, did retrieval return garbage, did the model ignore good context, did a guardrail silently rewrite the output?
 
@@ -87,15 +123,17 @@ At volume, that also means no way to compute aggregate numbers that matter for t
 
 Concretely: an agent that calls the LLM three times (plan, call a tool, summarize) and takes 8 seconds end-to-end is unreadable as a single log line. As a trace with one span per step, the 8 seconds decomposes into "planning: 1.1s, tool call: 0.3s, summarization: 6.6s" — pointing straight at which step to optimize, which a flat log line cannot.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 An LLM call is just another span in a trace, the same mental model as [[Distributed Tracing with OpenTelemetry]] applied to one more kind of remote call — except this span's attributes are GenAI-shaped (model, tokens, cost) instead of HTTP-shaped (status code, route).
 
 An agent loop or a RAG pipeline is a small tree of these spans under one root, exactly like a fan-out of internal service calls under one incoming request.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Per-call capture
+
+**In plain words:** For each AI call, save a receipt: which prompt, which model, how many tokens, how much money, how long.
 
 Every LLM call's span should carry enough to answer "what happened, what did it cost, and what did it see" without re-running anything:
 
@@ -117,7 +155,15 @@ flowchart LR
     End --> Export["exporter: collector / Langfuse / Phoenix / LangSmith"]
 ```
 
+```mermaid
+flowchart LR
+    C["One AI call"] --> I["In: prompt version,<br/>model, chunk IDs"]
+    C --> O["Out: tokens, cost,<br/>time to first token, errors"]
+```
+
 ### Spans for chains and agents, and the GenAI semantic conventions
+
+**In plain words:** Multi-step flows become a tree of steps. A shared naming standard (gen_ai.*) lets any tool read them.
 
 A multi-step chain or an agent loop is a trace: a root span for the whole request, with child spans for retrieval, each LLM call, and each tool execution, so the trace viewer shows the real timeline, not just a total.
 
@@ -140,25 +186,43 @@ gantt
 
 ### Redaction and retention
 
+**In plain words:** Keep private text out of everyday logs. Store IDs there, and the full text in a locked box that is deleted soon.
+
 Prompt text, response text and retrieved chunk contents routinely carry customer data, so none of it belongs directly in a span attribute that flows to a general-purpose tracing backend with broad read access.
 
 The pattern: put IDs and hashes (template ID, chunk ID, a content hash) in span attributes, and, only if you need full-text debugging, send the actual text to a separate store with short retention and the same access controls as the data it's quoting (see [[Secrets Management]]).
 
 The guardrail and security details for untrusted model output and tool results belong to [[Guardrails and LLM Security]] and [[OWASP API Security Top 10]]; this note's job is making sure the trace itself doesn't become a second copy of sensitive data sitting in a looser-access system.
 
+```mermaid
+flowchart LR
+    C["AI call"] --> S["Span: IDs + hashes<br/>kept long, safe to share"]
+    C --> T["Full prompt text<br/>locked store, deleted in days"]
+```
+
 ### Promoting bad traces into eval cases
+
+**In plain words:** Every bad answer you catch in production becomes a test, so it never sneaks back.
 
 The highest-leverage use of a trace is feeding it back into [[LLM Evals in Production]]: a call where a guardrail fired, where TTFT blew past budget, or where a user downvoted the answer is worth more as a new regression test case than as a line in a dashboard.
 
 A simple rule-based promotion (as in the worked example) turns "something went wrong in production" into "we now have a test that catches it before the next deploy," which is the actual payoff of capturing all this data in the first place.
 
+```mermaid
+flowchart LR
+    P["Production trace"] --> B{"Bad?<br/>thumbs down, slow,<br/>guardrail fired"}
+    B -- "yes" --> E["Add to eval set"] --> CI["Checked on every deploy"]
+```
+
 ### Alerts
+
+**In plain words:** Set alarms on cost, speed and safety-filter hits, just like for any other service.
 
 Cost, latency and guardrail-trigger rate deserve the same alerting discipline as any other SLI (see [[SLIs, SLOs, SLAs and Error Budgets]]): a rolling-window threshold, not just a human staring at a dashboard.
 
 A guardrail-trigger-rate spike, in particular, is often the earliest signal of a prompt-injection attempt or an upstream data-quality regression (bad documents entering the retrieval corpus) well before it shows up as a user complaint.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 Recording GenAI-shaped span attributes with the OpenTelemetry Go SDK, against an in-memory exporter (no live collector; representative output). It compiles and passes `go vet` and `go test -race` on Go 1.24.
 
@@ -382,7 +446,9 @@ func TestGuardrailTriggerRate(t *testing.T) {
 
 **Measured (this test run, Go 1.24, 2026-11-07):** `TestStartFinishSpanRecordsGenAIAttributes` confirms every listed `gen_ai.*` and `prompt.*` attribute is present on the exported span. `TestFinishSpanRedactsChunkRefsNotJustIDs` fails the build if raw chunk text ever reaches a span attribute. `TestGuardrailTriggerRate` checks `2/4 = 0.5`. `TestAlertRuleBreach` and `TestPromoteToEvalSet` (full table in the repo) pass under `go test -race`.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
+
+**In plain words:** Your options: an AI-specific tool, your existing tracing stack, or both.
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -391,14 +457,14 @@ func TestGuardrailTriggerRate(t *testing.T) {
 | LLM-specific platform (Langfuse, LangSmith, Phoenix) | Purpose-built UI for prompts/traces/evals, often ingesting OTel or its own SDK | Teams iterating on prompts/evals daily and wanting a built-in UI | SaaS cost or self-host ops; another system to keep in sync |
 | Sampling (trace a fraction of calls) | Full detail on a sampled percentage, aggregates on the rest | Very high volume where full tracing is too expensive to store | Misses rare failures unless sampling is biased toward errors/guardrail hits |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Full per-call tracing on every request adds storage and, at very high volume, real cost; sample or down-sample low-stakes traffic while always tracing guardrail trips and errors.
 - Redaction has a cost of its own: if you need to debug an actual wrong answer, IDs alone may not be enough, and you'll want the short-retention full-text store — budget for both, not just the cheap attribute-only path.
 - A platform built for LLM traces (Langfuse/LangSmith/Phoenix) is faster to get value from than hand-rolled OTel dashboards, but adds a dependency and, for a hosted option, sends trace data to a third party — check that against your data-handling requirements.
 - For a one-off script or a low-volume internal tool, structured logging without a tracing backend is enough; don't stand up a collector for ten calls a day.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Langfuse, LangSmith and Arize Phoenix are widely used LLM-specific observability platforms as of 2026 (verify current feature sets); teams already running OpenTelemetry for the rest of their backend increasingly emit GenAI spans into the same collector rather than running a second, LLM-only pipeline.
 - **Failure modes → fixes:**
@@ -408,7 +474,7 @@ func TestGuardrailTriggerRate(t *testing.T) {
   - Bad traces pile up in a dashboard nobody reads → wire the promotion rule directly into the eval dataset's ingestion instead of leaving it as a manual step.
 - **What to monitor:** cost and token counts per model/tenant (own home: [[LLM Cost, Latency and Caching]]); TTFT and total latency percentiles; guardrail-trigger rate; retrieval hit rate (did the top chunk ever get cited); eval-set growth rate from auto-promoted traces; span export failure rate (an observability pipeline that silently drops spans is worse than none, because it looks healthy).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why a span, not just a log line, for the LLM call.** A span carries a parent-child relationship to the rest of the request's spans, so a trace viewer can show the LLM call's exact position and duration inside the whole request — "retrieval: 40ms, LLM call: 4.2s, of which TTFT was 1.8s" — which a flat log line, even a structured one, loses once there's more than one step per request.
 - **Why GenAI semantic conventions matter even half-finished.** An experimental spec still buys interoperability: a span emitted with `gen_ai.*` attributes is readable by any backend that understands the convention, instead of every team inventing its own attribute names and nobody's dashboards matching anybody else's.
@@ -417,7 +483,7 @@ func TestGuardrailTriggerRate(t *testing.T) {
 - **Sampling bias toward failure, not uniform sampling.** At high volume, uniformly sampling 1% of traces will sample almost no guardrail trips or slow outliers, because they're rare by definition — always-trace errors and guardrail hits, and uniformly sample the rest; this is the same "sample the interesting tail, not the whole distribution" lesson as request tracing in a normal backend.
 - **Trace-to-eval promotion is the actual ROI of all this instrumentation.** Dashboards answer "is something wrong right now"; a pipeline that turns a bad trace into a new regression test answers "will this specific failure happen again" — the second is what prevents the same guardrail bypass or retrieval miss from recurring after the next prompt change.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why trace an LLM call as a span instead of just logging tokens and cost per request?
 > A span fits into a trace tree alongside the rest of the request's spans (retrieval, tool calls, other services), so you can see exactly where time and cost went inside a multi-step request, not just that the whole request was slow or expensive. A flat log line can carry the same numbers but loses that structural position.
@@ -437,7 +503,7 @@ func TestGuardrailTriggerRate(t *testing.T) {
 > [!question]- What's the risk of sampling traces uniformly at 1% on a high-volume feature?
 > Rare events — guardrail trips, slow-tail latency, the one retrieval miss in a thousand — are exactly the traces you need and exactly the ones uniform sampling is least likely to keep. Always-trace errors and guardrail hits, and apply sampling only to the ordinary successful traffic.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - One span per LLM call; a chain/agent is a trace (tree of spans), same model as any distributed trace.
 - Capture: template id/version, model, tokens (input/output/cached), cost, TTFT, chunk refs, tool calls, error.
@@ -447,7 +513,7 @@ func TestGuardrailTriggerRate(t *testing.T) {
 - Always-trace errors and guardrail hits; sample the rest if volume demands it.
 - Promote bad traces (guardrail fired, slow TTFT, low feedback) into the eval set automatically.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Distributed Tracing with OpenTelemetry]], [[LLM Cost, Latency and Caching]]
 - **Next:** [[LLM Evals in Production]], [[Production AI Checklist]]

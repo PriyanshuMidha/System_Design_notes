@@ -23,7 +23,40 @@ updated: 2026-11-13
 > - Probes (liveness, readiness, startup) decide whether a Pod gets traffic and whether it gets restarted — they are not the same check.
 > - ConfigMaps and Secrets inject configuration; Secrets are base64-encoded, not encrypted, unless you add encryption at rest or a secrets operator.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You have a Go app in a container. Running one copy on one server is fragile: if the server dies, the app dies.
+**Kubernetes** runs many copies of your containers across many machines and keeps them alive.
+You don't tell it "start this". You tell it "I want 3 healthy copies", and it makes that true, again and again.
+
+```mermaid
+flowchart LR
+    Y["You: want 3 copies"] --> K["Kubernetes compares<br/>wanted vs running"]
+    K -- "only 2 running" --> S["Start 1 more"]
+```
+
+The smallest unit it runs is a **Pod**: one or a few containers that live together.
+A **Service** gives those pods one stable name and address, and sends traffic only to healthy pods.
+
+```mermaid
+flowchart LR
+    U["Traffic"] --> SV["Service: api"] --> P1["Pod 1"]
+    SV --> P2["Pod 2"]
+    SV --> P3["Pod 3"]
+```
+
+The rest of this note is just these 3 questions:
+1. What are the parts of a cluster, and what happens after kubectl apply?
+2. What are Deployments, Pods, Services, probes and config?
+3. How does a pod shut down without dropping requests?
+
 
 **The problem in one story.**
 Your Go API runs in one container on one server.
@@ -68,7 +101,7 @@ Where it breaks: a thermostat controls one number; Kubernetes reconciles thousan
 > [!tip] Remember
 > You write down what you want; Kubernetes controllers keep nudging reality until it matches.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Running a Go API as a single process on a single VM works until that VM reboots, runs out of memory, or needs a second instance for load.
 
@@ -83,7 +116,7 @@ Kubernetes automates four things that used to be manual ops work:
 
 A single dropped node used to mean manually finding out which services were on it and restarting them elsewhere. In Kubernetes, the scheduler already knows every node's capacity and every Pod's resource request, so it places a replacement automatically — typically in seconds once the node is marked unreachable.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Kubernetes is a **reconciliation loop**, not a command executor.
 
@@ -91,9 +124,11 @@ You never tell it "start 3 more Pods." You tell it "I want 5 Pods of this spec t
 
 A useful analogy: a thermostat doesn't execute "turn on the heater now" as a one-off action. It continuously compares the room's actual temperature to the set point and acts whenever they differ. Every Kubernetes controller (Deployment, ReplicaSet, HPA, and others) is a thermostat for some piece of desired state.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Control plane and nodes
+
+**In plain words:** the control plane is the brain (stores wishes, makes decisions). Nodes are the worker machines that actually run your pods.
 
 ```mermaid
 flowchart TB
@@ -131,6 +166,8 @@ flowchart TB
 
 ### `kubectl apply` to a running Pod
 
+**In plain words:** your YAML is saved, then a chain of helpers each do one job: pick a machine, pull the image, start the container.
+
 ```mermaid
 sequenceDiagram
     participant U as kubectl apply
@@ -162,6 +199,11 @@ The gap between "container running" and "receiving traffic" is the readiness pro
 
 ### The object chain: Deployment → ReplicaSet → Pod
 
+```mermaid
+flowchart LR
+    D["Deployment<br/>(the plan, version history)"] --> RS["ReplicaSet<br/>(keeps N copies)"] --> P["Pods"]
+```
+
 A **Deployment never manages Pods directly.** It manages a ReplicaSet, which manages Pods.
 
 This indirection is what makes rolling updates and rollback possible: a new Deployment revision creates a *new* ReplicaSet (scaled up) while the old ReplicaSet (scaled down to zero but not deleted) is kept in history, so `kubectl rollout undo` just scales the old ReplicaSet back up.
@@ -176,6 +218,8 @@ See [[Rollback and Safe Migrations]] for the rollback mechanics this enables.
 - **Job / CronJob:** runs a Pod to completion once, or on a schedule, instead of keeping it running forever — batch work, scheduled reports.
 
 ### Services, DNS and Ingress/Gateway API
+
+**In plain words:** a Service is a fixed name inside the cluster. Ingress or Gateway is the front door that lets outside traffic in.
 
 ```mermaid
 flowchart LR
@@ -198,6 +242,8 @@ A **Service** is a stable virtual IP and cluster-internal DNS name that load-bal
 
 ### ConfigMaps, Secrets, probes, and resources
 
+**In plain words:** config and secrets are fed in from outside the image. Probes ask "are you alive / ready?". Resources say how much CPU and memory each pod may use.
+
 - **ConfigMap:** non-sensitive key-value configuration, injected as environment variables or mounted files. Editing it doesn't automatically restart Pods that already read it as env vars — a mounted file updates in place (with a propagation delay), but most apps still need a restart or a reload mechanism to pick up a mounted ConfigMap change.
 - **Secret:** structurally the same as a ConfigMap but intended for sensitive data. **The value is only base64-encoded, not encrypted**, unless the cluster has encryption at rest configured for etcd. Anyone who can read the Secret object or the etcd data directly can decode it trivially. For real secret management (rotation, external vaulting), see [[Secrets Management]]; tools like External Secrets Operator or Sealed Secrets sync from a real secrets store into Kubernetes Secrets rather than storing the source of truth there.
 - **Probes** (see sequence diagram above for where they run):
@@ -208,6 +254,8 @@ A **Service** is a stable virtual IP and cluster-internal DNS name that load-bal
 - **Namespaces** partition a cluster into logical groups (by team or environment) for naming, RBAC scope, and resource quotas — they are not a network or security boundary by themselves; that needs NetworkPolicies and RBAC on top.
 
 ### Graceful termination
+
+**In plain words:** when a pod is told to stop, it is first taken out of traffic, then gets time to finish open requests, then is killed.
 
 ```mermaid
 flowchart LR
@@ -227,7 +275,7 @@ A `preStop` hook that sleeps a few seconds before SIGTERM, combined with the app
 
 The application side of this (signal handling, connection draining, the exact Go pattern) is covered in [[Graceful Shutdown and Health Checks]] — this note only covers what Kubernetes does around it.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -263,6 +311,8 @@ spec:
 This runs, but it has no health checks (a stuck Pod keeps taking traffic forever), no resource requests (the scheduler can pack it badly and it can starve or be starved by neighbours), and no Secrets. The full manifest below fills in the production concerns.
 
 ### Full manifest for a Go API (Kubernetes 1.31+)
+
+**In plain words:** a complete production YAML. Each block maps to one idea from section 3.
 
 ```yaml
 apiVersion: apps/v1
@@ -371,7 +421,7 @@ api-6b8d7c5a4-jkl78    0/1     ContainerCreating    0          3s
 
 The new ReplicaSet's Pod (`6b8d7c5a4`) is being created alongside all three old Pods still `Running` — `maxSurge: 1` in action. Once `jkl78` passes readiness, one old Pod terminates, and the cycle repeats until the new ReplicaSet is fully up.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Choice | How it works | Use when | Cost |
 | ------ | ------------- | -------- | ---- |
@@ -384,14 +434,14 @@ The new ReplicaSet's Pod (`6b8d7c5a4`) is being created alongside all three old 
 | EKS (managed control plane) | AWS runs the control plane; you run worker nodes (or Fargate) | You want Kubernetes APIs with AWS handling etcd/API server availability | Per-cluster control-plane fee, still real Kubernetes YAML/kubectl |
 | ECS (AWS-native, not Kubernetes) | AWS's own orchestrator: Task Definitions instead of Pods, Services instead of Deployments | Simpler AWS-only stack, no Kubernetes YAML to learn | Locked to AWS; no portable manifests, smaller ecosystem of tools |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Kubernetes adds real operational surface: etcd backups, control-plane upgrades (or paying a managed offering to handle them), RBAC design, networking (CNI) choices. A single service with steady, modest load often runs fine and far more simply on a managed container platform like ECS/Fargate or Cloud Run.
 - YAML sprawl is real: a moderately complex service easily has 5–10 manifests (Deployment, Service, Ingress, ConfigMap, Secret, HPA, NetworkPolicy, ServiceAccount) that need their own templating (Helm, Kustomize) to stay manageable across environments.
 - Namespaces and RBAC give you blast-radius control, but they are not a hard multi-tenancy boundary — a determined workload in one namespace can still affect node-level resources (CPU, memory, network) shared with workloads in another namespace unless you also set resource quotas and, for stronger isolation, separate node pools.
 - Debugging is one layer removed from the process: a slow request now means checking Pod logs, then Service endpoints, then Ingress controller logs, then node-level resource pressure — more places to look than a single VM running one process.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** nearly every large-scale backend that isn't fully serverless runs on Kubernetes or a managed variant (EKS, GKE, AKS) today; it's the de facto standard for container orchestration. Companies with smaller platform teams commonly use a managed layer on top (Fargate for EKS, or a PaaS like Render/Fly.io) to avoid running the control plane and node fleet themselves.
 - **Failure modes → fixes:**
@@ -401,7 +451,7 @@ The new ReplicaSet's Pod (`6b8d7c5a4`) is being created alongside all three old 
   - A Secret value leaks in a log line or a `kubectl describe` by a user with read access → Secrets are not encrypted by default; enable etcd encryption at rest and tighten RBAC on `get`/`list` for Secret objects, and keep real secret rotation in an external store (see [[Secrets Management]]).
 - **What to monitor:** Pod restart count and reason, readiness-probe failure rate per Service, resource usage vs. requests/limits (to catch both waste and starvation), rollout duration and stuck rollouts, and node-level pressure (`DiskPressure`, `MemoryPressure` conditions).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why the ReplicaSet indirection matters.** If a Deployment managed Pods directly, "roll back to the previous version" would mean recreating Pods from a remembered spec — slower and with no natural place to keep a scaled-down-but-not-deleted fleet warm. By delegating to ReplicaSets, the previous revision's ReplicaSet just needs its replica count turned back up; its Pod template never had to be reconstructed from history.
 - **The Endpoints race in termination.** Removal from a Service's Endpoints and the SIGTERM signal are sent concurrently by the kubelet and the endpoint controller, not sequenced — there is no built-in guarantee that "stop receiving new traffic" fully propagates through kube-proxy's iptables/IPVS rules on every node before SIGTERM arrives. A `preStop` sleep is a pragmatic (not perfectly guaranteed, but very reliable in practice) way to widen that gap.
@@ -409,7 +459,7 @@ The new ReplicaSet's Pod (`6b8d7c5a4`) is being created alongside all three old 
 - **CPU limits throttle via CFS bandwidth control**, not by killing the process — the kernel's Completely Fair Scheduler caps how many CPU-seconds a cgroup gets per period, and if a container's limit is below its actual need, the kernel simply schedules it less, which shows up as added latency, not an error. This is a common cause of "it's slow under load but never crashes."
 - **EKS vs. ECS is a real architectural choice, not just a preference.** EKS gives you standard Kubernetes APIs — portable manifests, the whole open-source ecosystem (Helm charts, operators, Argo CD) — at the cost of needing Kubernetes expertise on the team. ECS is AWS-native with a smaller conceptual surface (Task Definitions, Services, Clusters) and less YAML, but everything you learn is AWS-specific and the ecosystem of third-party tools is far smaller.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does a Deployment manage a ReplicaSet instead of Pods directly?
 > So that each rollout's Pod template is preserved as a distinct ReplicaSet, scaled up or down. This is what makes rolling updates (shift replicas gradually between two ReplicaSets) and rollback (scale the previous ReplicaSet back up) simple operations instead of needing to reconstruct Pod specs from history.
@@ -432,7 +482,7 @@ The new ReplicaSet's Pod (`6b8d7c5a4`) is being created alongside all three old 
 > [!question]- What happens between a Pod being marked for termination and the container actually stopping?
 > It's marked `Terminating` and removed from the Service's Endpoints (no new traffic) while, concurrently, any `preStop` hook runs and then SIGTERM is sent. The container has until `terminationGracePeriodSeconds` (default 30s) to exit cleanly; past that, it gets SIGKILL. The concurrency between Endpoints removal and SIGTERM is why a `preStop` delay plus in-app graceful shutdown both matter.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Deployment → ReplicaSet → Pod. Never Deployment directly to Pods.
 - Control plane: API server (the only entry point), etcd (state), scheduler (placement), controller manager (reconciliation loops). Nodes: kubelet (runs Pods), kube-proxy (Service routing).

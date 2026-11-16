@@ -27,7 +27,40 @@ updated: 2026-11-13
 > - Multi-key commands, transactions and Lua scripts in Cluster need all keys in one slot: use hash tags like `{user:42}`.
 > - Managed services (ElastiCache, Redis Cloud) run the same two shapes: "cluster mode disabled" (one shard) and "cluster mode enabled" (many shards).
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (replication, Sentinel, Cluster), 4 (slots and redirects in Go), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+One Redis server has two limits: if it dies, everything stops, and it can only hold as much as one machine's memory.
+The first fix is **replication**: other servers keep a live copy of the main one, called **replicas**.
+If the main server dies, a replica can take over.
+**Sentinel** is a small watcher program that notices the death and promotes a replica for you.
+
+```mermaid
+flowchart LR
+    P["primary<br/>(takes writes)"] --> R1["replica 1"]
+    P --> R2["replica 2"]
+    S["Sentinels watch"] -.-> P
+```
+
+The second fix is **Cluster**: split the keys across several primaries, each with its own replicas.
+Every key belongs to one of 16,384 numbered buckets, and each primary owns a range of buckets.
+
+```mermaid
+flowchart LR
+    K["key user:42"] --> H["hash it: say bucket 7,000"]
+    H --> N2["node B owns<br/>buckets 5,461 to 10,922"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do copies stay in step, and what is lost when the main server dies?
+2. Who decides that the main server is dead, and who replaces it?
+3. How are keys split across servers, and how does your app find the right one?
 
 **The problem in one story.**
 Your app uses a single Redis server.
@@ -72,7 +105,7 @@ Where it breaks: students here copy slightly behind the teacher, so a new teache
 > [!tip] Remember
 > Replicas give copies, Sentinel gives automatic failover, Cluster gives sharding plus failover; all of them are asynchronous.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps runs one Redis 8 instance with 20 GB of data serving 80,000 operations per second.
 
@@ -82,7 +115,16 @@ InvoiceOps runs one Redis 8 instance with 20 GB of data serving 80,000 operation
 
 Replication solves the first two, Sentinel automates the first, and Cluster solves all three.
 
-## 2. Mental model
+**Which tool fixes which problem, as a picture.**
+
+```mermaid
+flowchart LR
+    A["server dies"] --> S["replication + Sentinel"]
+    B["too many reads"] --> R["replication<br/>(read from copies)"]
+    C["too much data or<br/>too many writes"] --> C2["Cluster"]
+```
+
+## 2. Mental model 🟢
 
 - **Replication** is a teacher (primary) dictating to students (replicas). Students write down everything the teacher says, a little behind. If the teacher leaves, a student has almost the whole lesson, but maybe not the last sentence.
 - **Sentinel** is a group of hall monitors. When most of them agree the teacher is gone, they elect one monitor to pick the best student as the new teacher and tell everyone.
@@ -94,9 +136,11 @@ Terms:
 - **Split brain**: two nodes both acting as primary after a network partition.
 - **Hash slot**: one of 16,384 buckets; every key belongs to exactly one.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Replication
+
+**In plain words:** the main server streams every change to its copies. A copy that drops off briefly catches up from a short buffer; one that was gone too long gets a full fresh copy.
 
 ```mermaid
 sequenceDiagram
@@ -129,6 +173,8 @@ sequenceDiagram
 
 ### Sentinel
 
+**In plain words:** three or more small watchers ping the main server. When enough of them agree it is dead, they pick the best copy and make it the new main.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Up
@@ -147,6 +193,8 @@ stateDiagram-v2
 - **Lost writes.** If the old primary is cut off with some clients still writing to it, those writes are discarded when it rejoins as a replica. `min-replicas-to-write 1` and `min-replicas-max-lag 10` bound this to about 10 seconds of writes.
 
 ### Redis Cluster
+
+**In plain words:** keys are spread over several main servers by bucket number. Ask the wrong server and it tells you which one to ask instead.
 
 ```mermaid
 flowchart TB
@@ -183,9 +231,11 @@ flowchart TB
 
 Redis Cluster does not use a consistent-hashing ring; the fixed slots and why they differ are explained in [[Consistent Hashing]].
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the short recipe every cluster client follows to find which server holds a key.
 
 How every cluster client finds a key's slot:
 
@@ -211,7 +261,18 @@ func Slot(key string) int {
 }
 ```
 
+**A redirect, as a picture.**
+
+```mermaid
+flowchart LR
+    App["app asks node A<br/>for user:42"] --> A["node A: MOVED,<br/>try node B"]
+    A --> U["app updates its map"]
+    U --> B["node B answers"]
+```
+
 ### Slots, hash tags and redirects in Go
+
+**In plain words:** Go code that works out a key's bucket exactly like Redis does, and reads the "ask that server instead" replies.
 
 The package below computes slots exactly like Redis, checks whether a multi-key command will hit `CROSSSLOT`, and parses `MOVED`/`ASK` errors. It compiles, passes `go vet`, and its tests pass with `go test -race` on Go 1.24. The expected slot numbers in the test were taken from `CLUSTER KEYSLOT` on a cluster-enabled Redis 8.2.
 
@@ -364,6 +425,8 @@ The InvoiceOps key `dashboard:{workspace_id}:summary:v2` already puts the worksp
 
 ### Connecting from Go
 
+**In plain words:** which go-redis client to use for one server, for Sentinel, and for Cluster.
+
 go-redis v9 has a client for each shape. Both compile against `github.com/redis/go-redis/v9` v9.7.0 and pass `go vet`.
 
 ```go
@@ -406,7 +469,7 @@ func NewClusterClient(password string) *redis.ClusterClient {
 
 During a failover, commands fail for a few seconds (connection refused, `READONLY` from the demoted primary, or `CLUSTERDOWN`). Retries with backoff ([[Timeouts, Retries and Backoff]]) and idempotent writes let the service ride through; a cache read can fall back to the database.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -420,7 +483,7 @@ During a failover, commands fail for a few seconds (connection refused, `READONL
 | Managed: ElastiCache cluster mode enabled | Redis Cluster across shards and AZs | Like Redis Cluster, managed | Same cluster limits |
 | Managed: ElastiCache Serverless | AWS scales capacity behind one endpoint | Spiky or unknown load, no capacity planning | Price per data stored and per request unit |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Do not cluster too early.** One primary with replicas and Sentinel (or a managed equivalent) handles tens of gigabytes and a large share of a million simple operations per second with pipelining. Cluster adds hash-tag design, CROSSSLOT failures and harder operations.
 - **Replica reads are stale.** A user who writes and then reads from a replica may not see their write. Read from replicas only for data where lag is acceptable, or pin a user to the primary right after their own writes.
@@ -428,9 +491,11 @@ During a failover, commands fail for a few seconds (connection refused, `READONL
 - **None of this is strongly consistent.** Async replication plus failover can lose acknowledged writes. Locks and counters that must never be wrong need fencing or a consensus store (see [[Distributed Locks and Fencing Tokens]]).
 - **Sentinel with two nodes does not work.** Two Sentinels cannot form a majority after losing one; use three or more on independent hosts.
 
-## 7. In production
+## 7. In production 🔴
 
 ### Managed: ElastiCache and Valkey
+
+**In plain words:** the cloud-hosted options, and what changed after Redis's licence change.
 
 - **Engines.** In March 2024 Redis moved from the BSD license to RSALv2/SSPLv1 (from Redis 7.4), and the Linux Foundation started **Valkey**, a BSD-licensed fork of Redis 7.2.4. Redis 8.0 (2025) added AGPLv3 as a license option. ElastiCache offers both Valkey and Redis OSS engines, with lower prices for Valkey.
 - **Cluster mode disabled**: one shard, a primary and up to 5 read replicas. Clients use the **primary endpoint** (a DNS name that follows failover) for writes and the **reader endpoint** to spread reads across replicas.
@@ -443,6 +508,8 @@ During a failover, commands fail for a few seconds (connection refused, `READONL
 
 ### Failure modes → fixes
 
+**In plain words:** what usually breaks with copies and clusters, and the fix for each.
+
 - Failover loses the last second of writes → accept it for caches; for queues use idempotent consumers and `WAIT` on critical writes; keep the record in PostgreSQL.
 - Replicas keep doing full resyncs ("Unable to partial resync" in logs) → backlog too small; raise `repl-backlog-size`. Full syncs also hit the replica output buffer limit (default `replica 256mb 64mb 60`, measured on Redis 8.2), which disconnects the replica and starts the loop again.
 - Split brain after a partition → `min-replicas-to-write` on the primary, Sentinels on three independent hosts.
@@ -452,9 +519,11 @@ During a failover, commands fail for a few seconds (connection refused, `READONL
 
 ### What to monitor
 
+**In plain words:** the few numbers that tell you copies are healthy and in step.
+
 `role`, `connected_slaves`, `master_link_status`, replica lag (`master_repl_offset` minus each replica's offset), `sync_full` and `sync_partial_err` (from `INFO stats`), Sentinel `+sdown`/`+odown`/`+switch-master` events, `cluster_state`, `cluster_slots_fail`, and per-shard memory, CPU and operations (to spot a hot slot).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why 16,384 slots?** The cluster bus heartbeat carries a bitmap of the sender's slots: 16,384 bits is 2 KB. 65,536 slots would make each heartbeat 8 KB. The Redis author also states the cluster is not designed for more than about 1,000 primaries, so 16,384 slots are enough to balance them.
 - **Epochs.** Each primary has a `configEpoch`; a failover winner takes a new, higher epoch. When two nodes claim the same slot, the higher epoch wins, which is how a returning old primary learns it was replaced.
@@ -463,7 +532,7 @@ During a failover, commands fail for a few seconds (connection refused, `READONL
 - **Pub/Sub in Cluster.** Classic `PUBLISH` is broadcast to every node over the bus, which does not scale. Redis 7.0 added sharded Pub/Sub (`SPUBLISH`/`SSUBSCRIBE`), where a channel lives in a slot like a key.
 - **Resharding big keys.** `MIGRATE` moves keys one at a time, serialising each one; a key of hundreds of megabytes blocks both nodes while it moves. Split big keys first ([[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Is Redis replication synchronous? What does `WAIT` give you?
 > No. The primary acknowledges writes before replicas have them. `WAIT n timeout` blocks until n replicas acknowledged the write, which shrinks the loss window, but a failover can still promote a replica without it, so Redis with `WAIT` is still not strongly consistent.
@@ -486,7 +555,7 @@ During a failover, commands fail for a few seconds (connection refused, `READONL
 > [!question]- Why does a replica keep doing full resyncs?
 > The replication backlog is smaller than the stream it missed while disconnected, so partial resync fails; or the full sync overflows the replica output buffer limit and the primary drops it, restarting the loop. Raise `repl-backlog-size` and the replica buffer limit.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Replication: async; PSYNC with replication ID + offset; backlog (1 MB default) decides partial vs full resync.
 - `WAIT` and `min-replicas-to-write` narrow, but do not close, the write-loss window.
@@ -496,7 +565,7 @@ During a failover, commands fail for a few seconds (connection refused, `READONL
 - ElastiCache: cluster mode disabled (1 shard, ≤ 5 replicas, primary + reader endpoints) vs enabled (configuration endpoint) vs Serverless; Valkey is the BSD fork.
 - Failover takes seconds: retries, timeouts and a DB fallback in the client.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Replication]], [[Partitioning and Sharding]], [[Redis Persistence - RDB and AOF]]
 - **Next:** [[Redis in Production - Memory, Latency, Security]], [[Redis in Go]]

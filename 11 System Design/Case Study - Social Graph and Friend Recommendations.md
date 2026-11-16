@@ -29,7 +29,37 @@ updated: 2026-11-13
 > - "Degrees of separation" is a **bidirectional BFS** that stops at depth 2 or 3 online.
 > - "People you may know" counts friends-of-friends, ranks them with features, and is **precomputed in batch**; online it is a lookup plus filtering (blocked, already friends, dismissed).
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A social network is a big web of people and the links between them.
+In computer words, each person is a **node** and each friendship is an **edge**. Together they make a **graph**.
+Each person's friend list is stored together in one place, so "show my friends" is one quick read.
+Mutual friends are just the names that appear in both lists.
+
+```mermaid
+flowchart LR
+    Y["Your friends:<br/>A B C D"] --> M["In both lists:<br/>B, D"]
+    T["Their friends:<br/>B D E"] --> M
+```
+
+"People you may know" are friends of your friends. Working that out for a billion people is heavy, so it is done offline and saved.
+
+```mermaid
+flowchart LR
+    You --> F1["Friend"] --> S["Their friend:<br/>suggest to you"]
+```
+
+So the rest of this note is just these 3 questions:
+1. How do you store a billion friend lists so reading one is fast?
+2. How do you count mutual friends quickly?
+3. How do you make good friend suggestions without a huge live search?
 
 **The problem in one story.**
 You open a social app and see your 300 friends.
@@ -73,7 +103,7 @@ Where it breaks: a phone book is printed once, but friendships change every seco
 > [!tip] Remember
 > Shard friend lists by user, write both sides of every friendship, and compute suggestions offline.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 Every social product is a graph underneath. On the first day you can keep friendships in one SQL table and run `JOIN`s. On the day you have a billion users, three things break: friend lists no longer fit one database, "mutual friends" becomes a join on two huge tables, and suggestions would need billions of two-hop traversals per day.
 
@@ -124,7 +154,7 @@ flowchart LR
 > [!tip] Remember
 > Every feature maps to one graph primitive. If you can name the primitive, you can name its cost.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a **city phone book where every person has a personal page listing their friends**. Finding your friends is turning to your own page: one lookup. Finding mutual friends is laying two pages side by side and ticking off names that appear on both.
 
@@ -145,7 +175,7 @@ Terms:
 > [!tip] Remember
 > One person's neighbors live together. Everything cheap in this design is "read one person's list"; everything expensive is "read many people's lists".
 
-## 3. How it works - high-level design
+## 3. How it works - high-level design 🟡
 
 ### Storing the graph: the options
 
@@ -172,6 +202,8 @@ flowchart TD
 For the generic database decision see [[Choosing a Database - Decision Guide]].
 
 ### The architecture
+
+**In plain words:** a graph service stores friend lists split by user; an offline job makes suggestions; caches serve the hot reads.
 
 ```mermaid
 flowchart LR
@@ -203,7 +235,7 @@ Walk through it:
 > [!tip] Remember
 > Two copies of the same friendship (one per user) are the price of fast reads. An outbox plus a projector keeps them honest.
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -219,6 +251,8 @@ read time: drop blocked / already friends / dismissed
 Say aloud: 1 billion users, 300 friends each, so 300 billion adjacency entries (150 billion friendships); about 7.2 TB raw, 14.4 TB with indexes and about 43 TB with 3x replication (estimates).
 
 ### Estimates
+
+**In plain words:** rough sums: users, total friendships, storage, and reads per second.
 
 All inputs are **estimates** for this exercise.
 
@@ -244,6 +278,8 @@ The key numbers: storage is large but ordinary; the FoF join is enormous unless 
 
 ### API
 
+**In plain words:** send and accept friend requests, list friends, get mutual friends, and get suggestions.
+
 ```http
 POST   /v1/friend-requests               {"to_user": 8841}            -> 201 {"id": "fr_9"}
 POST   /v1/friend-requests/{id}/accept                                -> 204   (idempotent)
@@ -266,6 +302,8 @@ Notes:
 - Privacy is enforced in the query service (a blocked user's list must return 404-like behavior, and `mutual-friends` may only show people the viewer is allowed to see).
 
 ### Data model
+
+**In plain words:** one row is the official record of a friendship; each person also has their own friend list copy for fast reads.
 
 Two layers: a **relation** table (the single canonical truth for a pair, used for state changes) and an **adjacency** table (a read-optimized projection per user).
 
@@ -335,6 +373,8 @@ Good key choices:
 
 ### The friend-request lifecycle
 
+**In plain words:** a request is pending, then accepted, declined or cancelled.
+
 ```mermaid
 stateDiagram-v2
     [*] --> None
@@ -350,6 +390,8 @@ stateDiagram-v2
 ```
 
 ### One friendship traced
+
+**In plain words:** follow one "Accept" tap as it updates both people's friend lists.
 
 1. B taps "Accept" on A's request. The client calls `POST /v1/friend-requests/fr_9/accept`.
 2. The friendship service reads `relation(lo=A, hi=B)` and checks `state = PENDING_A_TO_B`, `version = 3`.
@@ -383,7 +425,7 @@ sequenceDiagram
 > [!tip] Remember
 > One transaction on one row decides the truth. Everything else is replayable projection.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost / failure mode |
 | --- | --- | --- | --- |
@@ -399,7 +441,7 @@ sequenceDiagram
 
 See [[Consistent Hashing]] and [[Partitioning and Sharding]] for resharding, and [[Choosing Consistency, Replication and Partitioning - Decision Guide]] for the consistency choice between the two sides of a friendship.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Two copies vs one.** Storing both directions doubles storage but makes "list my friends" a single-shard range scan. One copy would force a scatter-gather to find all edges that point at you.
 - **Eventual consistency between the two sides.** For a second or so, A may see B in their list while B does not yet see A. This is acceptable for friends, not for a bank. If you need atomic cross-shard writes use a distributed transaction (slower, less available) or sagas with compensation.
@@ -408,7 +450,14 @@ See [[Consistent Hashing]] and [[Partitioning and Sharding]] for resharding, and
 - **Do not compute FoF online for everyone.** It would be 90,000 candidates per request, times 58,000 requests per second.
 - **Friend caps are a design tool.** Facebook publicly limits a personal account to 5,000 friends, which bounds adjacency list size, mutual-friend cost and the batch join. Asymmetric follow graphs (celebrities) need a different treatment.
 
-## 7. In production
+```mermaid
+flowchart LR
+    A["A accepts B"] --> R["Official record: friends"]
+    R --> LA["Add B to A's list<br/>(shard 1)"]
+    R --> LB["Add A to B's list<br/>(shard 7, a moment later)"]
+```
+
+## 7. In production 🔴
 
 - **Failure modes and fixes:**
 	- Projector crashes after writing A's list but before B's. Result: asymmetric edge. Fix: upserts are idempotent and the event is replayed; a repair job compares `relation` with both adjacency sides and fixes drift (TAO calls out inverse association repair as an eventual process).
@@ -426,7 +475,7 @@ See [[Consistent Hashing]] and [[Partitioning and Sharding]] for resharding, and
 	- Block-leak rate: suggestions shown that violate a block (must be zero, alert on any).
 - **Privacy operations:** account deletion must remove the user from every adjacency list (a large fan-in write), suggestions and caches. Run it as an asynchronous, idempotent job and keep a tombstone so later projector events for that user are ignored.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### 8.1 Mutual friends: set intersection at scale
 
@@ -587,7 +636,7 @@ flowchart TD
 > [!tip] Remember
 > Shard by user, make one row the truth, project the rest, and repair. Bound every online traversal to a few thousand lookups.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How do you store a graph of one billion users and 300 billion friendship entries?
 > Partition by user id so each person's adjacency list lives on one shard, store both directions of each friendship (about 300 B entries, about 7 TB raw), cache hot lists, and keep a separate counter for friend counts.
@@ -617,7 +666,7 @@ flowchart TD
 > [!question]- Someone blocks a user. Where must that take effect?
 > Everywhere: friend lists, mutual friends, search, suggestions (read-time filter plus batch exclusion), degree results, notifications and feed. Store blocks as a small per-user set cached near each service, apply the filter at read time (batch results go stale), and test with a metric that must stay at zero for block leaks.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 A 45-minute script:
 

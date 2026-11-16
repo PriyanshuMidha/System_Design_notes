@@ -25,7 +25,34 @@ updated: 2026-11-13
 > - Several pairs look alike and differ only in intent: Strategy and State, Decorator, Proxy and Adapter, Facade and Mediator.
 > - A pattern that hides the failure path or adds a layer nobody varies is making the design worse.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Some design problems show up again and again, like "let the user pick a sorting rule" or "add logging to every call".
+A **design pattern** is a named, proven answer to one of those problems.
+The famous list is the 23 **GoF** patterns, from a 1994 book by four authors (the "Gang of Four").
+They fall into three groups: making objects, shaping how objects fit together, and how objects behave and talk.
+In Go, many patterns shrink to a few lines, because Go has interfaces, plain functions and closures.
+The trick is not to memorise all 23. Ask "what part of this changes?" and pick the pattern that isolates that part.
+
+```mermaid
+flowchart LR
+    P["Problem: what changes?"] --> C["Creating objects = creational"]
+    P --> S["Fitting objects together = structural"]
+    P --> B["How objects act = behavioural"]
+```
+
+The rest of this note is just these 3 questions:
+1. Which patterns exist, in which group?
+2. How do you pick one from the problem you hear?
+3. Which patterns become tiny in Go, and which pairs get mixed up?
+
 
 **The problem in one story.**
 You build a food app that charges a delivery fee.
@@ -70,7 +97,7 @@ Where it breaks: a cook does not need a recipe to boil water, and many patterns 
 > [!tip] Remember
 > Start from what changes, then pick the smallest Go construct that isolates it.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A checkout service starts with one payment provider, one delivery fee and one way to notify the user. Within a year it has:
 
@@ -82,7 +109,12 @@ A checkout service starts with one payment provider, one delivery fee and one wa
 
 Without shared vocabulary, each of these becomes an ad-hoc `if country == ...` ladder or a copy-pasted wrapper. Patterns give each recurring shape a name and a known-good structure, so a reviewer who reads "this is a Strategy" or "this is middleware" knows where the variation lives, and an interviewer can follow your design in one sentence.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    A["Team says 'use a Strategy here'"] --> B["Everyone pictures the same design"] --> C["Shorter talks, fewer mistakes"]
+```
+
+## 2. Mental model 🟢
 
 Patterns are like chess openings. Nobody wins by reciting openings; they win by recognising the position and knowing which plan fits it. The position is your problem, described by **what varies** and **what must stay stable**. The pattern is the plan that puts the varying part behind a seam.
 
@@ -92,9 +124,11 @@ Terms used below:
 - **Seam:** a place where you can change behaviour without editing the code around it (an interface, a function parameter, a registry).
 - **Idiom:** a language-specific way of writing something. A pattern in one language can be a mere idiom in another; Peter Norvig argued in a 1996 talk that 16 of the 23 GoF patterns are invisible or simpler in dynamic languages such as Lisp and Dylan, thanks to features like first-class functions and types.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The catalogue
+
+**In plain words: all the patterns in one table, grouped by what they help with.**
 
 The 23 GoF patterns, plus the backend patterns this folder treats as first-class, and the note that owns each:
 
@@ -150,6 +184,8 @@ Each decision node asks one exclusive question, so every path ends at exactly on
 
 ### Problem-to-pattern decision table
 
+**In plain words: match a phrase you hear in the requirements to the pattern that fits.**
+
 | Problem you hear in the requirements | Pattern | Backend example | Where it is practised |
 | --- | --- | --- | --- |
 | "Fee or pricing rule depends on city, time or user tier" | Strategy | Delivery fee: flat, free above ₹199, night surge | [[Cart Checkout with Coupons]], [[Rate Limiter]] |
@@ -173,6 +209,8 @@ Each decision node asks one exclusive question, so every path ends at exactly on
 
 ### Patterns in the Go standard library
 
+**In plain words: Go itself uses these patterns; seeing them there makes them easy to remember.**
+
 | Pattern | Standard library example |
 | --- | --- |
 | Decorator | `bufio.NewReader`, `gzip.NewReader`, `io.LimitReader` wrap an `io.Reader`; `http.TimeoutHandler` and `http.StripPrefix` wrap an `http.Handler` |
@@ -189,7 +227,7 @@ Each decision node asks one exclusive question, so every path ends at exactly on
 | Flyweight | `unique.Make` interns comparable values (Go 1.23) |
 | Singleton | `sync.OnceValue` (Go 1.21); `http.DefaultClient` is a package-level shared instance |
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -205,6 +243,8 @@ Observer          Subject with attach/notify                    []func(Event) or
 ```
 
 ### The tested code
+
+**In plain words: four patterns written the Go way, each just a few lines.**
 
 Four GoF patterns written as Go idioms. Each is shorter than its class-based form and has no extra types.
 
@@ -396,6 +436,8 @@ ok  	example.com/chooser	1.452s
 
 ### Choosing patterns for one problem
 
+**In plain words: one real problem, broken into the pieces that change, with a pattern for each.**
+
 Requirements for a dark-store checkout: pick a store by rule, validate the cart, charge one of several providers, move the order through a lifecycle, and notify several channels. Walking the chooser:
 
 1. *Store choice varies by rule* → Strategy ([[Inventory Order Assignment (Dark Store)]]).
@@ -408,9 +450,11 @@ Requirements for a dark-store checkout: pick a store by rule, validate the cart,
 
 Seven patterns, and none was chosen for its name: each answers one "what varies" question from the requirements.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Patterns that Go idioms replace or shrink
+
+**In plain words: in Go, a function or an interface often replaces a whole class-based pattern.**
 
 | GoF pattern | Why it shrinks in Go | Go idiom |
 | --- | --- | --- |
@@ -429,6 +473,8 @@ Patterns rarely needed in Go (all in [[Rare GoF Patterns in Go]] unless noted):
 Visitor (a type switch over a closed set is usually enough), Interpreter (only for real rule languages), Flyweight (`unique.Make` covers interning), Prototype (copy a struct value; deep-copy only slices and maps), Bridge (two interfaces already give two independent axes), Mediator (an orchestrating service usually suffices, see [[Facade (vs Mediator)]]), and Memento (a snapshot struct, see [[Command, Undo and Memento]]).
 
 ### Confusable pairs
+
+**In plain words: patterns that look the same in code but have different goals.**
 
 | Pair | Same shape | Difference in intent | Quick test |
 | --- | --- | --- | --- |
@@ -449,7 +495,7 @@ flowchart LR
     B -->|"maybe stop and answer itself, else pass on"| C["Chain link"]
 ```
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Pattern-itis.** Using a pattern because the name is impressive. A `PaymentStrategyFactoryProvider` for one provider is three files of indirection. Write the direct code first and introduce the seam when the second variant arrives.
 - **Java-style pairs.** `IOrderService` plus `OrderServiceImpl` with one implementation adds nothing in Go: interfaces are satisfied implicitly, so declare the interface in the consumer when it is needed (see [[SOLID in Go]]).
@@ -457,7 +503,13 @@ flowchart LR
 - **Layers that hide performance.** A Repository that issues one query per item inside an Iterator causes N+1 queries; a deep decorator stack adds an allocation and a call per layer on hot paths.
 - **Closed sets.** If you own all the cases and they rarely change (five order statuses), a `switch` on a typed constant beats a State interface per status.
 
-## 7. In production
+```mermaid
+flowchart TD
+    Q{"Does this part really change today?"} -- "yes" --> P["Use the pattern"]
+    Q -- "maybe one day" --> K["Keep plain code, add it later"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:** Go HTTP servers are decorator stacks (`net/http` middleware in chi, gorilla/handlers, otelhttp); `database/sql` is a registry factory plus a bridge to drivers; `log/slog` handlers are chained decorators; Kubernetes controllers are state machines driven by an event loop.
 - **Failure modes and fixes:**
@@ -467,7 +519,7 @@ flowchart LR
 	- *Channel iterator abandoned by a `break`:* goroutine leak. Use `iter.Seq`, or pass a `context` and cancel it.
 - **What to monitor:** patterns are invisible to monitoring, but their failure modes are not: goroutine count (leaked iterators or observers), per-middleware latency (deep decorator stacks), and duplicate side effects (retry decorators).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why the catalogue shrinks in Go.** Many GoF patterns work around missing language features in 1994 C++: no first-class functions (Strategy, Command), no closures (Observer callbacks), no built-in iteration protocol (Iterator), and inheritance as the main reuse tool (Template Method). Go has functions as values, closures, range-over-func (since Go 1.23), implicit interfaces and embedding, so the *intent* of these patterns remains while the *structure* disappears. The intent is what you name in an interview: "this is a strategy; in Go it is just a `func`".
 
@@ -485,7 +537,7 @@ flowchart LR
 
 **Interview signal.** Interviewers rarely ask "implement the Visitor pattern". They give a problem with a hidden variation point and watch whether you isolate it. Naming the pattern earns little; placing the seam correctly, and explaining why you did *not* add one elsewhere, earns a lot.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What are the three GoF categories, with one Go example each?
 > Creational (how objects are built): functional options for an HTTP client. Structural (how objects are combined and wrapped): `func(http.Handler) http.Handler` middleware. Behavioural (how responsibility and communication are split): a strategy `func` that computes delivery fees.
@@ -508,7 +560,7 @@ flowchart LR
 > [!question]- How do you avoid over-using patterns in an LLD round?
 > Add a seam only where the requirements name a variation or where testing needs one. Write the direct code first, name the pattern in one sentence when it appears, and explain where you deliberately did not add an abstraction.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Ask "what varies?" first; the answer picks the pattern.
 - Creational = building, structural = wrapping and combining, behavioural = deciding and reacting.
@@ -518,7 +570,7 @@ flowchart LR
 - Facade simplifies for clients; Mediator is a hub for peers.
 - No `IFoo`/`FooImpl`, no pattern without a second variant, never hide the failure path.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[SOLID in Go]], [[UML for LLD]], [[OOP in Go - Structs, Interfaces, Embedding]]
 - **Next:** [[Strategy and Template Method]], then the pattern notes in catalogue order, ending with [[Rare GoF Patterns in Go]]

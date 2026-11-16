@@ -22,7 +22,35 @@ updated: 2026-11-13
 > - The rule that matters: a facade talks one way (down to its parts); a mediator talks both ways (between its colleagues).
 > - Classic mistake: forgetting compensation, so a declined payment leaves stock reserved forever.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then the rest of this "Start here" section, sections 1, 2 and the cheat sheet (10). Skip the big code blocks on a first pass. Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works, with the small whiteboard code), section 4 (the full worked example) and sections 5 and 6 (variants and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Placing an order touches many systems: stock, payment, shipping.
+You do not want every caller to know all of them and call them in the right order.
+A **facade** is one simple front door, like a `Checkout` method, that does all those calls for you in order.
+If a later step fails, the facade also undoes the earlier steps. That undo is called **compensation**.
+A **mediator** is a different thing: a hub that many peers report to, and the hub decides who acts next.
+
+```mermaid
+flowchart LR
+    C["Caller"] --> F["Checkout<br/>(facade)"]
+    F --> S["Stock"]
+    F --> P["Payment"]
+    F --> SH["Shipping"]
+```
+
+The Go code builds both patterns. Read the pictures and the words first; the code follows them step by step.
+The rest of this note is just these 3 questions:
+1. What does a facade hide, and in what order does it call things?
+2. How does it undo earlier steps when one fails?
+3. How is a mediator different, and when do you need one?
+
 
 **The problem in one story.**
 You order a pizza by phone. Behind the counter, someone checks stock, takes payment and tells the kitchen.
@@ -67,7 +95,7 @@ Where it breaks: a real concierge improvises when things fail; code compensation
 > [!tip] Remember
 > Facade: one simple door down into many parts. Mediator: one hub that peers talk through.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 **Facade.** Placing an order touches three services: reserve 2 units of milk in inventory, charge ₹136 through payments, create the order.
 
@@ -81,12 +109,12 @@ A facade puts the sequence and its undo logic in one place, so every caller make
 
 With a control tower, each plane talks only to the tower (30 links) and the rule lives in one object. The mediator turns many-to-many coupling into many-to-one.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 - **Facade = a hotel concierge.** You say "book me dinner and a taxi at 8". The concierge calls the restaurant and the taxi firm; they never call you or the concierge back with their own requests. You could still call the restaurant yourself; the concierge is a convenience, not a wall.
 - **Mediator = an air-traffic control tower.** Pilots never talk to each other. Each one reports to the tower ("requesting landing", "landed"), and the tower tells the others what to do ("hold", "cleared to land"). The pilots know the tower; the tower knows all the pilots.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ```mermaid
 classDiagram
@@ -186,6 +214,8 @@ sequenceDiagram
 
 ### Whiteboard version
 
+**In plain words:** Reserve stock, take payment, and give the stock back if payment fails. That is a facade in a few lines.
+
 Reserve, charge, and release the reservation when the charge fails. This is the bare idea you can draw in two minutes; the full version below adds production concerns.
 
 ```go
@@ -227,7 +257,9 @@ func main() {
 }
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
+
+**In plain words:** One program with both patterns: a checkout facade that undoes earlier steps on failure, and a mediator hub. Read the facade first, then the mediator.
 
 One `package main` with both patterns and distinct code: the checkout facade with compensation, idempotency and in-memory fakes, and the control-tower mediator. It compiles with Go 1.24 and passes `go vet` and `go test -race`, with no dependencies outside the standard library.
 
@@ -591,6 +623,9 @@ The retry with key `k1` returns the first receipt without a second charge. The d
 
 The tests drive the facade through fakes: one table covers every failure branch and checks the compensation, and three more check retries, a retry after a refund, and concurrent duplicates. The mediator tests check that 30 concurrent landing requests leave exactly one plane cleared:
 
+
+**In plain words:** These are the tests. They use fake services to make each step fail in turn and check that earlier steps are undone.
+
 ```go
 package main
 
@@ -740,7 +775,7 @@ func count(l *Log, word string) int {
 
 `go test -race -count=1 -v` passes all six tests and the four subtests.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Pattern | Who knows whom | Direction | Owns logic? | Use when |
 | --- | --- | --- | --- | --- |
@@ -756,7 +791,7 @@ func count(l *Log, word string) int {
 - A **facade** is the structural idea: a simpler interface over several parts. It runs in-process and finishes within one request.
 - An **orchestrator** (saga orchestrator) drives a long-running, multi-service workflow with its state **persisted**, so it can resume after a crash and retry steps for minutes or days. When the checkout above must survive the process dying between `Charge` and `Create`, it has outgrown a facade; see [[Saga Pattern]] and the coupon checkout in [[Cart Checkout with Coupons]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 **When not to use a Facade in Go:**
 
@@ -778,7 +813,7 @@ func count(l *Log, word string) int {
 - **The god mediator.** All rules of the system drift into one `Notify` switch. Keep one mediator per interaction (one runway, one form), and move rules that are not about coordination back into the colleagues.
 - **Calling colleagues while holding the mediator's lock.** A colleague that notifies again deadlocks on a non-reentrant `sync.Mutex`. Decide under the lock, call after unlocking.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- `http.Get(url)` is a facade: it calls `DefaultClient.Get`, which builds the request and runs it through `http.DefaultTransport` (connection pooling, proxy settings from the environment, TLS, HTTP/2). Most callers never touch `Transport`; those who need timeouts build their own `http.Client`.
@@ -792,7 +827,7 @@ func count(l *Log, word string) int {
 	- Compensation itself fails → return both errors with `errors.Join` (Go 1.20+), log them, and queue a retry or alert; never swallow them.
 - **What to monitor:** checkout latency per step, the compensation rate and compensation failures, idempotent replays, `ErrInProgress` counts, and for a mediator, queue length and time waiting (planes holding).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why the facade receives interfaces.** The constructor takes `InventoryService`, `PaymentService` and `OrderService` interfaces declared next to the facade (the consumer side), which is what makes the fake-driven tests possible. The interface mechanics are in [[Interfaces]].
 - **Ordering the steps.** Put the step that is easiest to undo first and the hardest last. Reserving stock is cheap to release; a charge needs a refund that the customer sees; an order row may already have triggered emails. That is why the order is reserve → charge → create.
@@ -801,7 +836,7 @@ func count(l *Log, word string) int {
 - **The mediator's lock discipline.** `Notify` computes `tell` under the lock and runs it after `Unlock`. Without that, `ClearToLand` calling back into `Notify` would block forever, because `sync.Mutex` is not reentrant. The price is ordering: when two notifications race, their commands can reach a colleague out of order (a plane could log "cleared to land" before its own "holding"). When order matters, deliver each colleague's commands through one goroutine or queue.
 - **Mediator vs event bus, precisely.** Both decouple senders from receivers. The bus is generic: it routes by topic and has no idea what the events mean. The mediator is specific: `ControlTower` knows that only one plane may hold the runway. The full Mediator form, including UI and chat examples, lives in [[Rare GoF Patterns in Go]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the difference between a Facade and a Mediator?
 > A facade is one-way: callers use it, it calls the subsystem, and the subsystem never knows it exists. A mediator is two-way: colleagues hold a reference to it, notify it of events, and it calls other colleagues back based on its rules. If it only simplifies a public API, call it Facade.
@@ -824,7 +859,7 @@ func count(l *Log, word string) int {
 > [!question]- Name two facades in the Go standard library.
 > `http.Get` hides the client, the request and the transport behind one call. `os.ReadFile` hides open, stat, the read loop and close. Both leave the full API available for callers who need control.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Facade: one simple method over several services; one-way; the parts do not know it.
 - Keep it thin: sequence, compensate, de-duplicate. No business rules, no HTTP.
@@ -835,7 +870,7 @@ func count(l *Log, word string) int {
 - Decide under the mediator's lock, call colleagues after unlocking.
 - Event bus routes by topic with no rule; mediator routes by rule.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Interfaces]], [[Design Patterns Overview and Chooser]], [[Proxy]]
 - **Next:** [[Composite]], [[Observer and Event Bus]], [[Cart Checkout with Coupons]]

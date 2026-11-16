@@ -22,7 +22,33 @@ updated: 2026-11-13
 > - Go's standard library has both shapes at once: `encoding/json` is a library you call; `net/http`'s `*http.Server` is a small framework that calls your `http.Handler` when a request arrives.
 > - Choosing a framework is choosing to hand over control flow in exchange for a convention you no longer have to invent yourself — and the lock-in that comes with it.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A **library** is code you call when you want, like a calculator you pick up.
+A **framework** is code that calls you, like a game that asks you to make a move when it is your turn.
+With a library, you are in charge of the order of things. With a framework, it is.
+This flip is called **inversion of control**: "don't call us, we'll call you".
+Go's `net/http` is a small example: you register a handler, and the server calls it for each request.
+Dependency injection is the same idea for building objects: you are handed what you need instead of making it yourself.
+
+```mermaid
+flowchart LR
+    Y1["Your code"] -- "calls" --> L["Library"]
+    F["Framework"] -- "calls" --> Y2["Your code"]
+```
+
+The rest of this note is just these 3 questions:
+1. What exactly flips between a library and a framework?
+2. Where does this show up inside one Go program?
+3. When should you pick a library, and when a framework?
+
 
 **The problem in one story.**
 You write a function `sayHello` and call it yourself on line 10: you are in charge.
@@ -67,7 +93,7 @@ Where it breaks: a line cook can refuse or be slow, but your handler cannot chan
 > [!tip] Remember
 > You call a library; a framework calls you.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A new engineer on InvoiceOps is asked to add structured logging and gets two different answers depending on which part of the codebase they touch.
 
@@ -77,7 +103,12 @@ In the HTTP layer, they register a handler with `mux.HandleFunc("POST /invoices"
 
 Mixing up the two is a common, costly mistake: expecting a registered handler to run exactly once like a function call (it can run concurrently, many times, for many requests) or trying to "just call" a piece of framework-owned lifecycle code out of its normal sequence (a React component's render function, a test framework's `setUp`) and getting surprising results, because that code was written assuming the framework's rules about *when* it runs.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    R["Many apps repeat the same loop:<br/>read request, route, call code, write reply"] --> F["Put the loop in a framework"] --> Y["You only write the 'call code' part"]
+```
+
+## 2. Mental model 🟢
 
 Picture two kitchens. In the first, you are the chef: you decide which knife to pick up and when (a library — you call it).
 
@@ -85,7 +116,7 @@ In the second, you are a line cook working a shift: an expediter calls out order
 
 **Simple test:** stare at the call site. If *your* code's line number is where the function starts running, it is a library. If your code is sitting inside a slot (a registered handler, a callback, an interface method) and you cannot point to the line in your codebase that calls it, it is a framework calling you.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The inversion, drawn as two sequences
 
@@ -111,6 +142,8 @@ sequenceDiagram
 The two diagrams show the same shape with the arrows reversed. In the library diagram, your code is the one initiating; in the framework diagram, the framework initiates and your code is a slot it calls into.
 
 ### Library, framework, platform/SDK: three different words
+
+**In plain words: three words that sound alike but differ in who is in charge.**
 
 | Term | What it controls | Go example |
 | --- | --- | --- |
@@ -140,6 +173,8 @@ This is the same Hollywood principle at the scale of a single request, and it is
 
 ### Dependency injection: IoC applied to construction
 
+**In plain words: instead of a function building its own database client, someone hands one in.**
+
 Dependency injection is the specific case where what gets "called for you" is the *construction* of a dependency, not a lifecycle event. Instead of:
 
 ```text
@@ -157,7 +192,14 @@ service := domain.NewService(store, notifier)   // handed in, not constructed in
 
 In Go this is usually done by hand in a `main` composition root (see [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]); `google/wire` generates that wiring code at compile time, and `uber-go/fx` builds and calls it at runtime from a dependency graph, but both are automating the same manual pattern, not doing something different in kind.
 
-## 4. Worked example
+```mermaid
+flowchart LR
+    M["main()"] -- "builds" --> DB["DB client"]
+    M -- "hands DB to" --> S["InvoiceService"]
+    S -. "never builds its own" .-> DB
+```
+
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -390,11 +432,13 @@ ok  	note2/validate	1.436s
 
 ### `net/http` is the real-world version of `miniframework`
 
+**In plain words: the standard Go web server is a small framework: it calls your handler.**
+
 `mux.HandleFunc("POST /invoices", createInvoice)` is exactly `app.Register` above: you hand the server a slot-filler, and from that point on `(*http.Server).Serve` decides when `createInvoice` runs, on which goroutine, and what happens to the connection afterward.
 
 `http.Handler` middleware (logging, recovery, auth) wraps a handler the same way `Middleware` does here — this is why the pattern in `net/http` code and in this note's toy framework look identical: it is the same inversion of control, at production scale.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Shape | Who initiates the call | Go example | Trade-off |
 | --- | --- | --- | --- |
@@ -404,14 +448,14 @@ ok  	note2/validate	1.436s
 | Platform / SDK | The platform's runtime, including scaling decisions | AWS Lambda handler, Kubernetes controller-runtime `Reconcile` | Framework trade-off plus operational lock-in (how it scales, deploys, retries) |
 | Dependency injection container | Whatever resolves the graph (your `main`, or `wire`/`fx`) | hand-wired `main.go`, `google/wire`, `uber-go/fx` | Removes manual wiring boilerplate; a generated or reflection-based graph is harder to read top-down |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A framework buys you a convention (routing, lifecycle, configuration) you did not have to invent, at the cost of your code now running inside rules someone else wrote — a bug in understanding *when* your code runs is a framework bug, not a logic bug, and is usually harder to find.
 - Framework lock-in is real: code written against a framework's lifecycle (hooks, base classes, required method shapes) is expensive to port to a different framework later, because the coupling is to *when and how you are called*, not just to a function signature.
 - For a small number of call sites, a library-shaped direct call is simpler to read, trace and test than registering a handler with a framework and hoping its lifecycle matches your mental model.
 - Dependency injection containers (`fx`-style, resolved by reflection at runtime) trade a small amount of manual wiring code for a graph that is harder to read statically — prefer hand-wiring in `main` until the number of dependencies makes that wiring itself unwieldy.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** React is a library (you call `createRoot(...).render(...)`, and your code decides when state changes trigger it); Next.js, layered on top of React, is a framework (it owns routing, data-fetching lifecycle and build output, and calls your page components). `net/http` is simultaneously a small framework (`*http.Server` calling your `http.Handler`) and ships libraries beside it (`net/http.Get`, which you call). Gin and Echo are slightly heavier frameworks than the stdlib mux, trading `http.Handler` compatibility for their own context type and conventions.
 - **Failure modes → fixes:**
@@ -420,7 +464,7 @@ ok  	note2/validate	1.436s
   - Adopting a framework for a service with one route and no middleware needs, then spending more code satisfying its conventions than the route itself required. Fix by starting with the standard library and only adopting a router or framework when route grouping or middleware composition earns its keep.
 - **What to monitor:** nothing is IoC-specific to alert on directly; the practical signal is how much of a PR's diff is "satisfying the framework" (config, lifecycle boilerplate) versus actual business logic, which is a cheap proxy for whether the framework is pulling its weight.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **The Hollywood principle's older name.** "Don't call us, we'll call you" is older film-industry slang for a casting rejection, reused in software to describe exactly this call-you relationship; "inversion of control" is the more general, later term that also covers DI containers.
 
@@ -438,7 +482,7 @@ Larger frameworks (Rails, Django, Spring, NestJS) additionally invert control ov
 
 `fx` instead resolves the graph at runtime via reflection and manages component lifecycles (start/stop order) for you, trading compile-time checking for less boilerplate on large graphs — reach for it once the number of services and their startup/shutdown ordering becomes hard to track by hand, not as a default.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the one-sentence test for "is this a library or a framework"?
 > Look at the call site: if your code's call starts the execution, it is a library; if your code sits in a slot something else invokes, on a schedule it controls, it is a framework calling you.
@@ -461,7 +505,7 @@ Larger frameworks (Rails, Django, Spring, NestJS) additionally invert control ov
 > [!question]- Give a Go example of IoC that is not "a whole framework".
 > An `http.Handler` middleware chain: each middleware is handed `next` and decides whether and when to call it, and the outer `App`/`Dispatch`-style owner decides the composition order. No capital-F framework is involved; it is IoC at the scale of one request.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - You call a library; a framework calls you (the Hollywood principle: "don't call us, we'll call you").
 - Platform/SDK ≈ framework + an operational environment (scaling, deployment) wrapped around the same call-you relationship.
@@ -471,7 +515,7 @@ Larger frameworks (Rails, Django, Spring, NestJS) additionally invert control ov
 - React (library, you call `render`) vs Next.js (framework, it owns routing and calls your pages) is the canonical frontend example of the same split.
 - Pick a framework for the convention it saves you from inventing; expect the lock-in that comes with its lifecycle.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Interfaces]], [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]
 - **Next:** [[Hexagonal Architecture (Ports and Adapters)]], [[Monolith vs Microservices]]

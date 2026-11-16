@@ -22,7 +22,39 @@ updated: 2026-11-13
 > - A field should be unloggable by construction when it must never appear: implement `slog.LogValuer` on the type and it always renders as `[REDACTED]`, no matter who logs the struct that holds it.
 > - The fields worth standardizing across every service are the ones that let you filter and join: `trace_id`, `request_id`, `service`, and a few domain fields — not an unbounded dump of every variable in scope.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A normal log line is a sentence: "payment failed for order 42". Easy for a human, hard for a machine to search.
+A **structured log** writes the same thing as named fields, usually JSON: {"msg":"payment failed","order_id":42}.
+Now you can search "all failures for order 42" or "count errors per customer" in seconds.
+
+```mermaid
+flowchart LR
+    T["Text: payment failed for order 42"] --> J["JSON: msg, order_id=42, error=declined"]
+```
+
+Each request also gets a **request ID** added to every log line it writes. Then one search shows that request's whole story.
+
+```mermaid
+flowchart LR
+    R["Request id=abc"] --> H["handler logs id=abc"]
+    R --> D["db layer logs id=abc"]
+    H --> S["Search id=abc: full story"]
+    D --> S
+```
+
+The rest of this note is just these 3 questions:
+1. How does Go's log/slog library work?
+2. How do you attach request IDs and keep secrets out of logs?
+3. Which fields go on every line, and how do logs get shipped?
+
 
 **The problem in one story.**
 A customer says "my payment failed at about 3 p.m.".
@@ -76,7 +108,7 @@ logger.Info("invoice created", "invoice_id", 482, "amount_cents", 129900)
 
 One call, one JSON object, one event. Everything below adds what production needs: standard fields, request-scoped context, redaction, levels, sampling and a real pipeline.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A `printf` log line like `log.Printf("payment failed for order %d: %v", orderID, err)` is fine to read once, by eye, in a terminal.
 
@@ -90,7 +122,7 @@ A structured log line for the same event —
 
 — is already a row a log backend (Loki, Elasticsearch, CloudWatch Logs Insights) can filter on `tenant="acme" AND error_code="card_declined"` and count, without parsing anything. The cost is discipline: every field has a stable key, and nobody free-text-formats a value that should be its own field.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of `printf` logging as handwriting a diary entry and structured logging as filling in a form. The diary entry is natural to write and read once, but a thousand diary entries can only be searched by reading them.
 
@@ -98,7 +130,9 @@ A thousand filled-in forms can be filtered, sorted, counted and joined — becau
 
 `log/slog`'s job is to make filling in that form as easy as calling a function: `logger.Info(msg, key1, val1, key2, val2, ...)` builds one structured record; the `Handler` decides how it's rendered (JSON for machines, a human-readable line for a local terminal) and where it goes.
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words:** middleware makes one logger per request with the IDs already filled in, and every layer below uses that logger.
 
 A request's logger is built once by middleware and carries `request_id` and `trace_id` into every layer that logs from then on, without every function needing to pass those fields explicitly:
 
@@ -127,6 +161,8 @@ Every log line from this one request — whether written by the handler or three
 
 ### `log/slog`'s building blocks
 
+**In plain words:** Logger is what you call, Handler decides the format (JSON or text), and Attrs are the key-value fields.
+
 - **`Logger`** is what you call (`Info`, `Warn`, `Error`, `Debug`, and their `*Context` variants that also record the current span if one is active).
 - **`Handler`** decides format and destination. `slog.NewJSONHandler(w, opts)` is the production choice; `slog.NewTextHandler` is readable for local development.
 - **`With(key, val, ...)`** returns a new `*Logger` carrying those attributes on every future call — this is how a request-scoped logger is built once and reused.
@@ -134,7 +170,9 @@ Every log line from this one request — whether written by the handler or three
 - **`LogValuer`** is an interface a type implements to control how it renders when logged — the mechanism for redaction (see `## 4`).
 - **`HandlerOptions.Level`**, backed by an `slog.LevelVar`, can be changed at runtime (e.g. via an admin endpoint) without restarting the process — useful for turning on `Debug` logging on one instance during an incident.
 
-## 4. Worked example
+## 4. Worked example 🟡
+
+**In plain words:** Go code for request-scoped logging, plus a trick that makes a password field print as "[REDACTED]" no matter what.
 
 The Go code below builds a request-scoped logger via middleware, and makes a password field unloggable by construction with `LogValuer`. It compiles and passes `go vet` and `go test -race` on Go 1.24.
 
@@ -245,6 +283,8 @@ func TestRequestLoggerInjectsFields(t *testing.T) {
 
 ### Standard fields worth putting on every line
 
+**In plain words:** a short list (time, level, service, request ID, trace ID...) that makes every line searchable and joinable.
+
 | Field | Why |
 | --- | --- |
 | `time`, `level`, `msg` | `slog`'s own required fields |
@@ -256,6 +296,8 @@ func TestRequestLoggerInjectsFields(t *testing.T) {
 | `error_code` | A stable, grep-able code, separate from the free-text error message |
 
 ### The shipping pipeline
+
+**In plain words:** the app just writes to standard output. An agent picks it up and sends it to the search store.
 
 From a `slog.JSONHandler` writing to `stdout` to a line a human can search:
 
@@ -270,7 +312,7 @@ flowchart LR
 
 The agent is where redaction rules, batching and drop rules for low-value lines live — centrally, not re-implemented per service.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -284,14 +326,14 @@ The agent is where redaction rules, batching and drop rules for low-value lines 
 >
 > Don't log a counter you could aggregate as a metric instead (e.g. don't log every cache hit just to count the hit rate), and don't try to reconstruct per-event detail from a metric's aggregates — it can't be done.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - JSON logs are heavier to eyeball in a local terminal than a formatted sentence; most teams keep a `TextHandler` for local development and `JSONHandler` only in deployed environments.
 - Every attribute has an allocation and encoding cost on the hot path (see `## 8`); logging at `Debug` level on every request in a high-traffic service is a real latency and cost problem, not just noise — set the level per environment and consider sampling.
 - Structured logs are not a substitute for metrics or traces: computing "p99 latency over the last 5 minutes" by scanning log lines is far more expensive than reading it off a Prometheus histogram that was built for exactly that.
 - Audit logs and application logs have different retention, access-control and immutability requirements; mixing them into one stream makes both harder to govern correctly.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** nearly every Go service post-2023 uses `log/slog` directly or through a thin wrapper; Loki, Elasticsearch and CloudWatch Logs Insights are the three most common JSON-log backends; the `otelslog` bridge (part of the OpenTelemetry Go contrib repo) attaches the active span's `trace_id`/`span_id` to every `slog` record automatically, so handlers don't have to do it by hand.
 - **Failure modes → fixes:**
@@ -301,7 +343,7 @@ The agent is where redaction rules, batching and drop rules for low-value lines 
   - Debug-level logging left on in production under load → set the level per environment via `HandlerOptions.Level` backed by an `slog.LevelVar`, and sample noisy debug lines (e.g. log every 100th) instead of all of them.
 - **What to monitor:** log volume (bytes/lines per minute) per service, so a logging regression shows up as a cost and ingestion-lag spike before it becomes a Loki/Elasticsearch outage; the ratio of `ERROR` lines to total requests, as a cheap proxy error-rate metric; dropped/throttled lines at the shipping agent.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **The pipeline.** `stdout` (JSON lines) → a log-shipping agent (Fluent Bit, Vector, or the OpenTelemetry Collector's filelog/stdout receiver) → a backend (Loki, Elasticsearch, CloudWatch Logs) → retention tiers (7–14 days hot/searchable, longer cold storage for compliance).
 
@@ -311,7 +353,7 @@ The agent is where redaction rules, batching and drop rules for low-value lines 
 - **The `otelslog` bridge.** Rather than manually pulling `trace_id`/`span_id` out of `context` at every log call, the OTel `otelslog` handler wraps your base handler and reads the active span from context automatically, attaching the IDs to every record — the same correlation as `## 3`'s manual middleware, done once at the handler level instead of per request.
 - **Never log:** passwords, full auth tokens, card numbers (PCI), and other PII in the clear. Hash or truncate an identifier if you need to correlate without storing the raw value (e.g. a hashed email for deduplication).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why is a structured log better than a formatted sentence?
 > A structured log is a row of named fields a backend can filter, aggregate and join without parsing free text. A formatted sentence like `"user 42 paid $19.99"` can only be searched by regex, which breaks the moment the wording changes, and can't be reliably aggregated (what if the amount format changes?).
@@ -331,7 +373,7 @@ The agent is where redaction rules, batching and drop rules for low-value lines 
 > [!question]- What's the difference between an audit log and an application log?
 > An audit log is an append-only, tamper-evident record of who did what, kept for compliance and security review, often for years. An application log is operational telemetry for debugging, usually retained for days to weeks. Mixing them into one stream makes both harder to govern: audit logs need stricter access control and immutability than routine debug noise needs.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Structured = key-value rows (JSON), not formatted sentences. Rows are queryable; sentences aren't.
 - `log/slog`: `Logger` + pluggable `Handler` (`JSONHandler` in prod); `.With(...)` builds a reusable logger carrying fixed fields.

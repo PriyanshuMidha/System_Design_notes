@@ -24,7 +24,28 @@ updated: 2026-11-13
 > - Keep each room's bookings sorted, so a binary search plus two neighbour checks finds a clash.
 > - Classic mistake: using `<=` (closed intervals), which makes a 10:00-11:00 and an 11:00-12:00 meeting clash.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+People in an office book rooms for meetings. Two meetings in the same room clash if their times overlap. A meeting from 10:00 to 11:00 and one from 11:00 to 12:00 do not clash, because the end time is not included. The hard case is two people booking the same room at the same moment. Only one must win. Repeating meetings, like every Monday, are turned into a list of single meetings, and they are booked all together or not at all.
+
+```mermaid
+flowchart LR
+    A["Request: Room A, 10-11"] --> B{"Overlaps an existing meeting?"}
+    B -- "no" --> C["Book it"]
+    B -- "yes" --> D["Reject"]
+```
+
+Everything else in this note is just these 3 questions:
+1. When do two time slots overlap?
+2. How do you stop two people booking one room at the same moment?
+3. How do repeating meetings and time zones work?
 
 **The problem in one story.** Your office has five meeting rooms. Two people open the booking page at the same moment and both pick Room A for 10:00. Only one of them should get it. And a meeting that ends at 11:00 must not block one that starts at 11:00.
 
@@ -65,7 +86,7 @@ flowchart LR
 > [!tip] Remember
 > Clash means `start < otherEnd && otherStart < end`; check and insert under one lock.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design a meeting room booking system for an office.
@@ -84,7 +105,7 @@ Two people must never hold the same room at overlapping times, even if they clic
 5. Add `FindAvailableRooms` and `CancelBooking`.
 6. Add recurring series (all or nothing), then test the race and the boundaries.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 ### Questions to ask (with assumed answers)
 
@@ -106,7 +127,7 @@ Two people must never hold the same room at overlapping times, even if they clic
 
 - Invites and attendee calendars (only capacity counts), notifications (an Observer extension), equipment filters, approvals and waitlists.
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 |---|---|
@@ -115,7 +136,7 @@ Two people must never hold the same room at overlapping times, even if they clic
 
 The hardest use case is **BookRoom**: check-for-overlap and insert must be atomic per room, or two people get the same slot.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
@@ -128,7 +149,7 @@ The hardest use case is **BookRoom**: check-for-overlap and insert must be atomi
 
 Modelling insight: **do not store slots** (30-minute cells). Store intervals and check overlap; slots break on odd times and bloat storage. Give each room its own calendar, because the invariant "no two BOOKED intervals overlap" is per room, so the room is the unit of locking.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -150,7 +171,7 @@ classDiagram
     Service ..> Series : expands
 ```
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 ```text
 POST   /rooms                      {name, capacity}                       -> 201 room
@@ -178,7 +199,9 @@ type SchedulerService interface {
 var _ SchedulerService = (*Service)(nil) // compile-time check
 ```
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
+
+**In plain words:** The rooms and bookings tables. In Postgres a special constraint stops two overlapping bookings for one room, even under a race.
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS btree_gist;  -- lets GiST index the "=" on room_id
@@ -245,7 +268,7 @@ type BookingRepository interface {
 }
 ```
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 |---|---|---|
@@ -255,7 +278,7 @@ type BookingRepository interface {
 | [[Observer and Event Bus]] | extension: `BookingCreated`, `BookingCancelled` | Invites, calendars and a waitlist without touching booking code |
 | Not used | State pattern for Booking; a Singleton service | Two stored states and one transition; pass `*Service` through constructors, since globals make tests share state |
 
-## Folder structure
+## Folder structure 🟡
 
 ```text
 scheduler/
@@ -276,7 +299,7 @@ cmd/demo/main.go  -> wiring: NewService(SmallestFit{}, time.Now), add rooms, boo
 - `service.go`: validation, UTC conversion, locking order, the auto-pick retry loop.
 - The Step 8 block below is these files merged into one, so it compiles standalone.
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > Aim for about 150 lines in the room.
@@ -302,6 +325,8 @@ cmd/demo/main.go  -> wiring: NewService(SmallestFit{}, time.Now), add rooms, boo
 **Recurring meetings:** `Series.Occurrences` steps with `AddDate(0, 0, 7*k)` on a time in the rule's `Loc`, so "Mondays 10:00 New York" stays at 10:00 local when DST starts (15:00 UTC on 2 March 2026, 14:00 UTC from 9 March), skips `Except` dates (EXDATE), and stops at `Until` or the 26-week expansion window, whichever comes first; a periodic job materializes the next window.
 
 `BookSeries` checks every occurrence and inserts them all under the one room lock, or returns a `ConflictError` listing the clashing starts. Cancelling one occurrence later is how an exception is recorded after creation.
+
+**In plain words:** The full scheduler. Start with `BookRoom`: it checks for overlaps and saves the booking while holding that room's lock.
 
 ```go
 package scheduler
@@ -658,7 +683,7 @@ func (s *Service) find(id string) (*Booking, *calendar, error) {
 }
 ```
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 |---|---|
@@ -670,6 +695,8 @@ func (s *Service) find(id string) (*Booking, *calendar, error) {
 | `TestConcurrentSameSlotOneWinner` | 50 goroutines, overlapping requests for one room: exactly 1 wins, 49 get `ErrConflict` |
 
 All six pass under `go test -race` (Go 1.24.4). The test imports `time/tzdata` so `America/New_York` loads on any machine.
+
+**In plain words:** Tests for the overlap rule, booking, finding a free room, cancelling and repeating meetings across time zones.
 
 ```go
 package scheduler
@@ -886,7 +913,7 @@ func TestConcurrentSameSlotOneWinner(t *testing.T) {
 }
 ```
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | What happens | How the design handles it |
 |---|---|---|
@@ -904,7 +931,7 @@ func TestConcurrentSameSlotOneWinner(t *testing.T) {
 | Attendees > capacity | Room too small | `ErrTooSmall`; search filters by capacity |
 | Room deleted with future bookings | Dangling bookings | Soft-delete the room; cancel or move future bookings and notify (follow-up) |
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 |---|---|
@@ -930,7 +957,7 @@ Postgres gets the same effect from the GiST index behind `EXCLUDE`. Below a few 
 - **Search is a snapshot, Book is the truth.** The design never promises that a searched room stays free.
 - **Bounded expansion versus infinite rules.** Materializing 26 weeks keeps `EXCLUDE` as the single guard; the cost is a job that extends each series.
 
-## Drawing
+## Drawing 🟢
 
 ![[Meeting Room Scheduler LLD Drawing.excalidraw]]
 
@@ -967,7 +994,7 @@ sequenceDiagram
     end
 ```
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- Why half-open intervals, and what is the overlap test?
 > With `[start, end)`, a meeting ending at 11:00 and one starting at 11:00 do not share an instant, so back-to-back bookings are allowed. Two intervals clash iff `s1 < e2 && s2 < e1`; the four "starts inside, ends inside, contains, encloses" cases all reduce to this.
@@ -984,7 +1011,7 @@ sequenceDiagram
 > [!question]- One occurrence of a 10-week series clashes. What do you return?
 > Book nothing and return the clashing dates (`ConflictError`), so the user can skip them (EXDATE) or pick another room. Partial success leaves a series nobody asked for. In Postgres, insert all occurrences in one transaction so one exclusion violation rolls back all of them.
 
-## Interview explanation
+## Interview explanation 🔴
 
 ```text
 The core rule is interval overlap: two bookings for the same room clash if start < otherEnd and otherStart < end, with half-open intervals so back-to-back meetings are fine.
@@ -998,7 +1025,7 @@ Across many servers I would move the invariant into Postgres with an EXCLUDE USI
 I store all times in UTC; a weekly series is expanded in the organizer's IANA time zone inside a 26-week window, so 10:00 stays 10:00 across DST, and all occurrences are booked in one step, all or nothing.
 ```
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - Clash iff `s1 < e2 && s2 < e1` on half-open `[start, end)`; back-to-back is fine.
 - One calendar per room: mutex + bookings sorted by start; binary search + two neighbours.
@@ -1006,7 +1033,7 @@ I store all times in UTC; a weekly series is expanded in the organizer's IANA ti
 - Postgres: `tstzrange` + `EXCLUDE USING gist` with `btree_gist`; 23P01 maps to 409.
 - Store UTC; expand recurring rules in the organizer's IANA zone inside a bounded window; a series books all or nothing; a cancelled occurrence is a later exception; an interval tree only for very dense calendars.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Library Management]], [[Concurrency for LLD]], [[Strategy and Template Method]]
 - **Next:** [[LRU Cache with TTL]]

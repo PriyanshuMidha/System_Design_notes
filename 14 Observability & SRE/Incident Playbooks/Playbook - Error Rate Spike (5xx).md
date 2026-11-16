@@ -40,7 +40,41 @@ flowchart LR
 
 Say it out loud in an interview: "I confirm, scope, check what changed, mitigate, communicate, and only then diagnose, using the status code and the metrics to pick a branch."
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (first 5 minutes and steps), 4 (worked example), 5 (the four error codes) and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Every web reply comes with a number called a **status code**.
+200 means "all good". Codes from 500 to 599, called **5xx**, mean "the server side failed".
+Normally almost no replies are 5xx. Maybe 1 in 1,000.
+Suddenly 8 in 100 are 5xx. That is an **error rate spike**.
+Users see error pages and can't finish what they were doing.
+
+```mermaid
+flowchart LR
+    U["User"] --> P["Proxy / load balancer"]
+    P --> A["Your app"]
+    A --> D[("Database")]
+    A -. "something here fails" .-> E["User sees 5xx"]
+```
+
+The number itself is a clue. Each code tells you *which hand* in the chain dropped the request.
+
+```mermaid
+flowchart LR
+    C500["500: your app broke"] --> W["Look in app logs"]
+    C502["502 / 503 / 504:<br/>proxy could not get<br/>a good answer"] --> X["Look at app health<br/>and timeouts"]
+```
+
+The rest of this note is just these 3 questions:
+1. Is it real, and how big is it?
+2. What changed just before it started?
+3. Which code is it, and so which part of the chain is broken?
 
 **The problem in one story**
 
@@ -90,7 +124,7 @@ Where it breaks: a restaurant serves one table at a time; a service fails thousa
 > [!tip] Remember
 > Check what changed first; if a deploy lines up with the spike, roll back before debugging.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 **Symptoms.** The 5xx ratio on a service crosses its alert threshold (for example above 2% for 5 minutes). Users see "Something went wrong", a blank page, a Bad Gateway page from the load balancer, or a mobile app spinner that ends in a retry toast. Support tickets and social posts follow within minutes.
 
@@ -101,7 +135,7 @@ The running example in this note is **InvoiceOps**, a Go invoicing API behind ng
 > [!tip] Remember
 > A 5xx is the server admitting fault. The fastest path is scope, change, mitigate, then decode the status.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 ### Picture the request path as a chain of hands
 
@@ -126,7 +160,7 @@ flowchart LR
 > [!tip] Remember
 > Ask "which hop produced this status?" before "which line of code is wrong?".
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The first 5 minutes
 
@@ -150,6 +184,8 @@ Do these in order. Each step is short on purpose.
 > Spending 20 minutes reading logs while a one-command rollback sits unused. If a deploy happened within the error window, roll back first and investigate afterwards on the old build in a calm environment.
 
 ### Step A: Confirm with a query
+
+**In plain words:** before acting, check the numbers: what share of requests fail, and on which routes and codes.
 
 Overall 5xx ratio (assuming the common `http_requests_total` counter with a `code` label; adapt the names to your instrumentation):
 
@@ -191,6 +227,8 @@ sum by (code) (rate(http_requests_total{job="invoiceops",code=~"5.."}[5m]))
 
 ### Step B: What changed
 
+**In plain words:** most error spikes follow a change: a deploy, a setting, a feature switch. List what changed in the last hour.
+
 ```bash
 # Recent rollouts of this deployment
 kubectl rollout history deployment/invoiceops -n prod
@@ -207,6 +245,8 @@ Compare the deploy time on your CD dashboard with the moment the 5xx line left t
 
 ### The diagnosis flowchart
 
+**In plain words:** follow the arrows from the symptom to the most likely cause, one question at a time.
+
 ```mermaid
 flowchart TD
     S["5xx ratio high"] --> Q1{"Which code dominates?"}
@@ -222,9 +262,11 @@ flowchart TD
     D --> D1["App slow: DB lock, pool wait, slow downstream. See High Latency playbook"]
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Incident walkthrough: InvoiceOps returns 502 after a Friday deploy
+
+**In plain words:** a realistic incident, minute by minute, showing the steps above in order.
 
 All times UTC. This is a composite, realistic scenario, not a real company incident.
 
@@ -252,7 +294,7 @@ Step by step:
 
 Total user impact: about 9 minutes of elevated errors. Without the rollback-first habit, the team would have spent most of that 40 minutes serving errors.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Variant 1: 500 Internal Server Error (your code failed)
 
@@ -359,6 +401,8 @@ curl -o /dev/null -s -w 'dns=%{time_namelookup} connect=%{time_connect} tls=%{ti
 
 ### Comparison of the four codes
 
+**In plain words:** one row per code: who sent it, the usual cause, and the first thing to type.
+
 | Code | Who produced it | Most likely cause | First command |
 | --- | --- | --- | --- |
 | 500 | Your app | Bug, unhandled dependency error | `kubectl logs ... \| jq` error grouping |
@@ -366,9 +410,11 @@ curl -o /dev/null -s -w 'dns=%{time_namelookup} connect=%{time_connect} tls=%{ti
 | 503 | Proxy or app | Zero ready backends, shedding | `kubectl get endpoints` |
 | 504 | Proxy | App or dependency too slow | `curl -w`, p99 per route |
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 ### Fixes and their costs
+
+**In plain words:** each quick fix has a speed and a risk. The table tells you when each one is the wrong choice.
 
 | Mitigation | Speed | Risk | When it is the wrong choice |
 | --- | --- | --- | --- |
@@ -382,7 +428,7 @@ curl -o /dev/null -s -w 'dns=%{time_namelookup} connect=%{time_connect} tls=%{ti
 > [!warning] Common mistake
 > Restarting everything before collecting evidence. Grab `kubectl logs --previous`, a goroutine dump or a heap profile from **one** bad pod, then restart. Otherwise the next incident starts from zero.
 
-## 7. In production
+## 7. In production 🔴
 
 ### Three layers of fix
 
@@ -391,6 +437,8 @@ curl -o /dev/null -s -w 'dns=%{time_namelookup} connect=%{time_connect} tls=%{ti
 3. **Prevention.** Canary deploys gated on 5xx ratio, load tests in CI, readiness probes that reflect reality, alert on the ratio and on burn rate, runbook updates, chaos or game-day testing.
 
 ### The alert you want
+
+**In plain words:** page a human only when errors are eating your error budget fast, not on every small blip.
 
 A multi-window burn-rate alert on the error SLO (see [[SLIs, SLOs, SLAs and Error Budgets]]) pages on real, sustained impact and stays quiet for one-minute blips. A flat "5xx above 1%" threshold is simpler but noisy at low traffic.
 
@@ -406,9 +454,11 @@ A multi-window burn-rate alert on the error SLO (see [[SLIs, SLOs, SLAs and Erro
 
 Screenshots of the graph with deploy markers, the exact error log lines, the `kubectl describe` output and the timeline. The postmortem needs them and they vanish when pods are replaced.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Why the ratio can mislead
+
+**In plain words:** the error % is errors divided by all requests. If normal traffic drops, the % can jump even when nothing new broke.
 
 A 5xx ratio is errors divided by total. If an upstream outage drops real traffic by 90%, the ratio can look worse while the absolute number of errors is unchanged, or look fine while users cannot reach you at all (traffic that never arrives has no status).
 
@@ -416,21 +466,44 @@ Always plot request **rate** next to the error ratio, and keep an external synth
 
 ### Retries amplify
 
+**In plain words:** when callers retry failed requests, a struggling service gets even more traffic, and fails more.
+
+```mermaid
+flowchart LR
+    F["Service fails 10%"] --> R["Callers retry 3 times"]
+    R --> M["More traffic hits it"]
+    M --> W["It fails even more"]
+    W --> R
+```
+
 If clients retry failed requests 3 times, a 10% error rate becomes roughly 30% more traffic at the failing component. Use jittered exponential backoff with a retry budget; see [[Timeouts, Retries and Backoff]]. A retry storm often explains why a small fault became a large outage.
 
 ### Proxy timeouts must nest
+
+**In plain words:** each layer should give up a little sooner than the layer in front of it. Otherwise the outer layer gives up first and the inner work is wasted.
+
+```mermaid
+flowchart LR
+    B["Browser 60 s"] --> L["Load balancer 40 s"]
+    L --> A["App 25 s"]
+    A --> D["DB query 5 s"]
+```
 
 Make timeouts shrink as you go deeper (example values): browser 60 s, load balancer 40 s, app request 25 s, DB statement 5 s. If an inner timeout is longer than an outer one, the outer layer gives up first, returns 504, and the inner work keeps running for nobody.
 
 ### Health check versus real health
 
+**In plain words:** "I am alive" is not the same as "I can do real work". A pod can pass its check and still fail every real request.
+
 A pod that answers `/healthz` can still return 500 on every real request (for example it lost its database connection permanently). Liveness restarts only help if the check exercises the thing that breaks. Prefer metrics on real traffic outcomes for alerting.
 
 ### Panics and goroutines
 
+**In plain words:** in Go, a crash in a side task you started yourself can take down the whole app.
+
 An unrecovered panic in a goroutine you started yourself (not the request goroutine) crashes the whole process, because `net/http` only recovers panics on its own request goroutines. This shows up as pod restarts followed by 502s. Wrap long-lived goroutines with their own recover and a counter.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Your service's 5xx rate just spiked to 20%. Walk me through your first 5 minutes.
 > Confirm with the dashboard and scope by route, pod and status code. Check what changed (deploy, flag, config, traffic, dependency). Mitigate first: roll back a recent deploy, flip a flag, delete one bad pod, scale or shed load. Communicate in the incident channel with impact and current action. Verify the ratio drops. Diagnose properly only after impact has stopped.
@@ -450,7 +523,7 @@ An unrecovered panic in a goroutine you started yourself (not the request gorout
 > [!question]- Why is putting a database check in the readiness probe dangerous?
 > A short database blip makes every pod NotReady at the same time. The service then has zero endpoints and returns 503 to everyone, turning a degraded dependency into a full outage. Keep readiness local and cheap; handle dependency failure inside request handling with timeouts, breakers and fallbacks.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - First 5 minutes: confirm, scope, what changed, mitigate, communicate, verify.
 - 500 app bug, 502 bad upstream response, 503 refusing, 504 upstream too slow.
@@ -461,7 +534,7 @@ An unrecovered panic in a goroutine you started yourself (not the request gorout
 - Never restart before saving evidence from one bad pod.
 - Fix in three layers: immediate, proper, prevention. Then write the postmortem.
 
-## 11. Post-incident checklist
+## 11. Post-incident checklist 🟡
 
 - [ ] Timeline written with deploy, alert, mitigation and recovery timestamps.
 - [ ] Customer impact measured (error count, affected users, revenue estimate).

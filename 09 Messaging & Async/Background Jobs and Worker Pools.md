@@ -28,7 +28,38 @@ updated: 2026-11-13
 > - Retries use backoff and a maximum; permanent failures go to a dead-letter state for a human.
 > - Size the pool by what the job waits on, cap concurrency per downstream, and drain gracefully on shutdown.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the job life cycle), 4 (worked example) and 5-6 (sizing and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Some work is slow, like making a PDF or sending an email.
+If the server does it while you wait, your screen just spins.
+So the server writes a small note, "do this later", and replies at once.
+That note is a **job**, and the list of notes is the **queue**.
+A few helper programs, called **workers**, pick notes from the queue and do the slow part.
+
+```mermaid
+flowchart LR
+    A["You click"] --> B["Server does the slow work"] --> C["You wait ~3 s"]
+```
+
+```mermaid
+flowchart LR
+    A["You click"] --> B["Server saves a note<br/>and replies in ~20 ms"]
+    B --> Q[("Queue of notes")]
+    Q --> W["Workers do the slow work later"]
+```
+
+The rest of this note is just these 3 questions:
+1. How does a worker take a job so no one else takes it too?
+2. What happens when a job fails or a worker dies halfway?
+3. How many workers should you run?
+
 
 **The problem in one story.**
 You click "Download invoice" and the server must build a PDF, which takes a few seconds.
@@ -75,7 +106,7 @@ Where it breaks: a real cook never cooks the same ticket twice, but a worker tha
 > [!tip] Remember
 > Save the job, reply fast, let a bounded pool of idempotent workers do the slow part and retry safely.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An invoicing API generates a PDF (≈2 s of CPU), stores it in S3 (≈300 ms), and emails it (≈500 ms at the provider) when the user clicks "Send invoice". Inline, that request takes about 2.8 s (an estimate for this example). Three things go wrong:
 
@@ -87,7 +118,20 @@ With a background job, the API writes the invoice and a job row and returns in a
 
 Typical work that leaves the request path: transactional emails and SMS, PDF and report generation, image and video processing, webhook fan-out to customers ([[Webhooks - Sending and Receiving]]), search indexing, data exports, and calls to slow third parties.
 
-## 2. Mental model
+**Same click, two designs** (rough numbers from the example above):
+
+```mermaid
+flowchart TB
+    subgraph Inline["Inline: user waits"]
+        I1["Click"] --> I2["PDF 2 s + S3 0.3 s + email 0.5 s"] --> I3["Reply after ~2.8 s"]
+    end
+    subgraph Job["Background job: user does not wait"]
+        J1["Click"] --> J2["Save job"] --> J3["Reply after ~20 ms"]
+        J2 --> J4["Worker does the 2.8 s later"]
+    end
+```
+
+## 2. Mental model 🟢
 
 A restaurant kitchen. The waiter (API) writes the order on a ticket, spikes it on the rail (queue), and goes back to the floor. Cooks (workers) take tickets. A cook who takes a ticket holds it (lease).
 
@@ -95,9 +139,21 @@ If the cook walks out, the ticket goes back on the rail after a while (lease exp
 
 The number of cooks is set by the number of stoves (downstream capacity), not by the number of tickets.
 
-## 3. How it works
+**The kitchen, drawn:**
+
+```mermaid
+flowchart LR
+    W["Waiter (API)"] -- "writes ticket" --> R[("Ticket rail (queue)")]
+    R -- "cook holds ticket (lease)" --> C["Cook (worker)"]
+    C -- "cook walks out" --> R
+    C -- "dish keeps failing" --> S["Shelf for the chef<br/>(dead letter)"]
+```
+
+## 3. How it works 🟡
 
 ### The job lifecycle
+
+**In plain words:** a job is like a ticket that moves between boxes: waiting, being worked on, done, waiting to retry, or put aside for a human.
 
 ```mermaid
 stateDiagram-v2
@@ -123,6 +179,8 @@ stateDiagram-v2
 
 ### The pool around the queue
 
+**In plain words:** the API drops jobs in, a fixed team of workers takes them out, and a small timer brings back jobs whose worker went quiet.
+
 ```mermaid
 flowchart LR
     API[API: insert invoice + job in one tx] -->|202 Accepted, job_id| C[client]
@@ -146,6 +204,8 @@ flowchart LR
 **Returning the job to the client.** The API returns `202 Accepted` with a `Location: /jobs/{id}` header (or the id in the body). The client polls `GET /jobs/{id}` for `{state, progress, result_url, error}`, or the server pushes completion through a webhook, SSE or WebSocket.
 
 ### Claiming jobs in PostgreSQL
+
+**In plain words:** one database query lets many workers grab different rows at the same time, each skipping rows that someone else already holds.
 
 A Postgres table is a complete job queue for most teams up to thousands of jobs per second (an estimate; it depends on the hardware and row churn). `FOR UPDATE SKIP LOCKED` makes concurrent workers skip rows another transaction has locked instead of waiting.
 
@@ -202,9 +262,11 @@ A second worker running the same statement at the same moment skips row 90412 an
 
 WHERE id = $1 AND attempts = $2`, and the `attempts` check stops a worker whose lease expired from overwriting the new owner's result. Go code that wires this up with pgx, River and graceful shutdown lives in [[Background Workers and Job Queues]].
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** this is the whole worker loop on one napkin: grab a job, run it, then mark it done, retry later, or give up.
 
 ```text
 claim(lease):
@@ -226,6 +288,8 @@ shutdown: stop claiming; give in-flight jobs a drain window; requeue the rest
 ```
 
 ### Code: the lifecycle and pool as a tested model
+
+**In plain words:** a small Go program that copies the queue rules in memory, with tests, so you can see each rule work without a real database.
 
 This is an in-memory model of the queue semantics, so every rule above has a test. A production version swaps `Store` for the SQL above or for SQS.
 
@@ -640,7 +704,7 @@ Run with `go test -race ./jobs` (Go 1.24): all 7 tests pass, also with `-count=3
 | `TestShutdownLetsShortJobFinish` | A job that ends within the drain window completes normally |
 | `TestHeartbeatKeepsLongJobLeased` | A 100 ms job on a 30 ms lease is not stolen, because the heartbeat extends the lease |
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Backend | How claim and ack work | Use when | Cost |
 | --- | --- | --- | --- |
@@ -654,13 +718,15 @@ Run with `go test -race ./jobs` (Go 1.24): all 7 tests pass, also with `-count=3
 
 ### Sizing the pool
 
+**In plain words:** count workers by what the job waits on: lots of workers for jobs that mostly wait on the network, about one per CPU core for jobs that crunch numbers.
+
 - **IO-bound jobs** (HTTP calls, emails): concurrency ≈ target throughput × average job time. To send 200 emails/s at 500 ms each you need about 100 jobs in flight; in Go that can be 100 goroutines in one process. Cap it below the provider's rate limit.
 - **CPU-bound jobs** (PDF rendering, image resizing): about one job per CPU core per process; more just adds context switching. Scale out with more processes.
 - **Per-queue concurrency:** run separate queues (or weights) for `critical`, `default`, `bulk`, so a 2-million-row export does not starve password-reset emails.
 - **Per-tenant fairness:** if one tenant enqueues 100,000 jobs, round-robin claims across tenants or cap concurrent jobs per tenant; otherwise everyone else waits behind them.
 - **Per-downstream limits:** a semaphore per provider (for example 20 concurrent calls to the PSP) protects partners. See [[Backpressure and Flow Control]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **The user sees "processing", not a result.** You need a status endpoint or push, and UI states for pending, failed and retried.
 - **At-least-once means duplicates.** A crash after the email was sent but before the ack sends it again. Make handlers idempotent (provider idempotency key, a `sent_at` check in the same transaction, or a dedupe table): [[Idempotency and Idempotency Keys]].
@@ -668,7 +734,7 @@ Run with `go test -race ./jobs` (Go 1.24): all 7 tests pass, also with `-count=3
 - **Retry storms.** 10,000 jobs failing against a down provider, all retried every 10 s without jitter, hit it with synchronized waves when it recovers. Use exponential backoff with jitter and a circuit breaker per provider.
 - **Do not use a background job** when the work takes 50 ms and the user needs its result to continue, or when you cannot tolerate eventual completion (a payment authorization the UI must show). Do it inline with a timeout.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** River (Go, Postgres), asynq (Go, Redis), Sidekiq (Ruby, Redis), Celery (Python, RabbitMQ/Redis), BullMQ (Node, Redis), and SQS with Lambda or ECS consumers. River and Postgres-backed queues are popular in Go because `INSERT job` joins the business transaction.
 - **Failure modes → fixes** (the classic list: backlog, duplicates, stuck workers, retry storms, poison messages, lost acks, uneven concurrency):
@@ -683,7 +749,7 @@ Run with `go test -race ./jobs` (Go 1.24): all 7 tests pass, also with `-count=3
 - **Autoscaling:** scale worker replicas on queue depth or oldest-job age, not CPU (IO-bound workers idle on CPU while the backlog grows). KEDA has scalers for SQS, Redis Streams, PostgreSQL queries and Kafka lag. See [[Autoscaling]].
 - **What to monitor:** queue depth per queue, oldest job age, enqueue and completion rate, success/failure/retry rate per job kind, dead-job count, job runtime p50 and p99, lease expiries (a sign of crashes or too-short leases), and trace context carried from the request into the job.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Lease length is a trade-off between duplicate work and recovery time.** A 60 s lease means a crashed worker's job waits up to 60 s before anyone retries it. A 5 s lease recovers fast but, if a GC pause or slow network delays one heartbeat, the job is reclaimed while still running, and two workers run it at once. Choose a lease around 3 heartbeat intervals and keep the per-job timeout below the lease.
 
@@ -697,7 +763,17 @@ Run with `go test -race ./jobs` (Go 1.24): all 7 tests pass, also with `-count=3
 
 **Exactly-once job execution does not exist** across a crash between "side effect done" and "ack recorded". You get effectively-once by making the effect idempotent. See [[Delivery Semantics and Exactly-Once]].
 
-## 9. Interview questions
+**Lease length, as a picture:** a short lease recovers fast but risks two workers on one job; a long lease is safe but slow to recover.
+
+```mermaid
+flowchart LR
+    A["Worker takes job<br/>(lease starts)"] --> B{"Worker still alive<br/>when lease ends?"}
+    B -- "yes, but paused (GC, slow net)" --> D["Job given to 2nd worker<br/>=> may run twice"]
+    B -- "no, it crashed" --> E["Job given to 2nd worker<br/>=> correct retry"]
+    B -- "it renewed in time" --> F["Only one worker runs it"]
+```
+
+## 9. Interview questions 🔴
 
 > [!question]- Walk through what happens when a worker crashes halfway through a job.
 > The job is in `running` with a lease (or SQS visibility timeout). Nobody acks it. When the lease expires, another worker's claim picks it up as the next attempt.
@@ -722,7 +798,7 @@ Run with `go test -race ./jobs` (Go 1.24): all 7 tests pass, also with `-count=3
 > [!question]- Postgres `SKIP LOCKED` queue or SQS?
 > Postgres if you already run it and want transactional enqueue with business data, at moderate volume. SQS for zero-ops elastic scale and isolation from the main database, at the price of an outbox for reliable enqueue and no priorities within a queue.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - API enqueues in the business transaction and returns `202` + job id; client polls `/jobs/{id}`.
 - Lifecycle: queued → running (lease) → succeeded | retry_scheduled → dead; lease expiry = reclaim.

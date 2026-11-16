@@ -19,7 +19,38 @@ updated: 2026-11-13
 > - An item is checked only when you can give a concrete production example, a failure mode, and a trade-off for it, out loud, without the note open.
 > - This vault does not yet cover every folder; the honest gap list at the end says exactly which ones.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Feeling "almost ready" for a senior interview is a feeling, not a fact. This note turns it into a list you can tick.
+
+Each topic gets one line that starts with "I can...". Each line links to the note that teaches it.
+
+```mermaid
+flowchart LR
+    F["'I think I'm ready'"] --> C["Checklist: one 'I can...'<br/>line per topic"] --> G["Clear list of gaps<br/>to study next"]
+```
+
+A line only counts as done if you can do four things without the note open: explain it, draw it, name how it breaks, and name its **trade-off** (what it gains and what it costs).
+
+```mermaid
+flowchart LR
+    E["Explain it"] --> D["Draw it"] --> B["Say how it breaks"] --> T["Say the trade-off"] --> OK["Tick the box"]
+```
+
+Every unticked line tells you exactly what to study next.
+
+The rest of this note is just these 3 questions:
+1. What does "ready" mean for one topic?
+2. How do you run the checklist, folder by folder?
+3. What do you revise in the last week, and how do you practise?
+
 
 **The problem in one story.**
 You have read a lot of notes and feel "almost ready" for a senior backend interview.
@@ -63,7 +94,7 @@ Where it breaks: a pilot's checklist is fixed, while this one grows as more vaul
 > [!tip] Remember
 > Tick a box only when you can explain, draw, break and trade it off out loud, without the note open.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 The old source material for this checklist ("2026 SDE3 Gap Checklist", "SDE3 Backend Roadmap", "START HERE - Advanced Backend SDE3 Path") each had a completion checklist, but the three disagreed on what "done" meant and attached a generic, copy-pasted set of interview Q&A to every topic regardless of what the topic actually was.
 
@@ -74,7 +105,7 @@ A checklist only works if two things are true:
 
 This note replaces all three with one checklist, tied to this vault's actual folders and actual write-progress, so "I'm SDE-3 ready" is a claim you can check folder by folder instead of a feeling.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of readiness as a row per folder, with four columns:
 
@@ -85,7 +116,7 @@ Think of readiness as a row per folder, with four columns:
 
 A folder only counts as "I can" when all four are true, not just the first one — "I can define a circuit breaker" is not the same claim as "I can tell you when one is the wrong fix."
 
-## 3. How it works
+## 3. How it works 🟡
 
 ```mermaid
 flowchart TD
@@ -120,7 +151,7 @@ stateDiagram-v2
     end note
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 A worked pass through one folder, using [[Consistent Hashing]] as the concrete topic:
 
@@ -131,7 +162,9 @@ A worked pass through one folder, using [[Consistent Hashing]] as the concrete t
 
 Only once all four are fluent does [[07 Databases MOC]]'s consistent-hashing item get checked below.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
+
+**In plain words:** Different styles of checklist, and what each one is good at catching.
 
 | Checklist style | What it checks | Weakness it fixes |
 |---|---|---|
@@ -139,21 +172,23 @@ Only once all four are fluent does [[07 Databases MOC]]'s consistent-hashing ite
 | Old "must know deeply" list (2026 Gap Checklist) | A flat bullet list per subject area, no links | No link from a weak area back to a note to fix it |
 | **This checklist** | One row per rebuilt folder, linked to its MOC/notes, four-question bar per item | Granular, linked, and honest about what's not written yet |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - This checklist assumes you've already read the linked notes at least once; it is a self-test, not a syllabus — use [[Backend Roadmap and Tech Landscape]] for first-pass learning order.
 - Checking every box here does not replace mock interviews: it proves topic fluency, not interview performance under time pressure and follow-ups (see [[LLD Round Playbook]] for the performance side).
 - A folder marked pending below has no note to self-test against yet; treat those as "not yet checkable," not "known to be hard."
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** every "I can" item below is phrased as something you'd actually say in a design review, not a trivia answer — that's deliberate, since the loop this checklist prepares for is testing the same thing a design review tests.
 - **Failure modes → fixes:** the single most common way candidates fail this bar is stopping at "explain unaided" and skipping straight to the next topic — always force yourself through all four questions per item.
 - **What to monitor:** track your own pass/fail per item over time (a simple table or the vault's progress properties); re-check items you haven't touched in a month, since fluency decays.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Readiness checklist by folder
+
+**In plain words:** The actual checklist: one block per topic area. Tick a line only when you pass all four checks.
 
 Each item checks against the four-question bar in section 2. Folders already rebuilt in this vault get real links; folders not yet rebuilt are listed honestly in the gap section below instead of being linked to notes that don't exist.
 
@@ -207,6 +242,8 @@ Each item checks against the four-question bar in section 2. Folders already reb
 
 ### Honest gaps in this vault, today
 
+**In plain words:** Areas these notes don't cover well yet, so you know where to look elsewhere.
+
 As of this note's `updated` date, these folders have not been rebuilt yet, so their checklist items above have no linked note to self-test against:
 
 **01 CS Fundamentals, 02 Networking & Web, 03 Frontend, 04 Go Language, 06 Backend Engineering in Go, 12 Security & Auth, 13 DevOps & Cloud, 14 Observability & SRE, 15 Testing, 16 Software Architecture, 18 AI Engineering.**
@@ -214,6 +251,8 @@ As of this note's `updated` date, these folders have not been rebuilt yet, so th
 Treat those rows as placeholders until each folder's notes exist — checking them off before then would be checking off a note that doesn't exist.
 
 ### Final-week revision list
+
+**In plain words:** What to go over in the last week, most important first.
 
 In the last week before a loop, revise in this order, spending more time on anything still unchecked above:
 
@@ -223,7 +262,14 @@ In the last week before a loop, revise in this order, spending more time on anyt
 4. Re-read [[Go Interview Questions and Traps]] once, out loud, the morning of a Go-heavy loop.
 5. Write down three STAR-format ownership stories (a production incident you drove, a design you pushed back on, a rollout you owned) with one metric each — these answer the "what separates senior from mid-level" question that no code question tests directly.
 
+```mermaid
+flowchart LR
+    D["1. Redraw DB, messaging,<br/>distributed diagrams"] --> S["2. Two timed<br/>system designs"] --> L["3. Two timed<br/>LLD problems"] --> G["4. Re-read Go traps"] --> T["5. Three STAR stories"]
+```
+
 ### Mock-interview plan
+
+**In plain words:** Practice each kind of round at least twice, under a real timer.
 
 Across a typical SDE-3 loop you should rehearse four round types at least twice each:
 
@@ -234,7 +280,12 @@ Across a typical SDE-3 loop you should rehearse four round types at least twice 
 
 Time-box every rehearsal to the real interview's length so the first time-pressure surprise doesn't happen in the actual loop.
 
-## 9. Interview questions
+```mermaid
+flowchart LR
+    S["System design x2"] --> L["LLD x2"] --> C["Coding x2"] --> B["Behavioural x2"] --> R["Review notes after each"]
+```
+
+## 9. Interview questions 🔴
 
 > [!question]- What's the difference between "I know consistent hashing" and "I'm SDE-3 ready on consistent hashing"?
 > Knowing it means you can define it. Being ready means you can also say what breaks (a hot key still breaks it; without virtual nodes, load is uneven), and what it costs relative to `hash % N` (an `O(log P)` lookup for much smaller data movement on resize).
@@ -251,7 +302,7 @@ Time-box every rehearsal to the real interview's length so the first time-pressu
 > [!question]- Your interviewer asks you to design something touching a pending folder (e.g. an SLO for your design). What do you do?
 > Answer with what you do know from adjacent, written folders (e.g. retries and circuit breakers from [[10 Distributed Systems & Resilience MOC]]) and say plainly what you'd want to define as a next step — a senior answer names the gap and a plan, rather than inventing confident-sounding detail.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Four questions per item: explain unaided, redraw, name a failure mode, name a trade-off.
 - Checklist order mirrors [[Backend Roadmap and Tech Landscape]]'s folder order.
@@ -260,7 +311,7 @@ Time-box every rehearsal to the real interview's length so the first time-pressu
 - Final week: redraw diagrams, run two timed system-design and two timed LLD prompts, write three STAR stories.
 - This checklist tests topic fluency; [[LLD Round Playbook]] tests interview performance — use both.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Backend Roadmap and Tech Landscape]]
 - **Next:** [[Go Interview Questions and Traps]]

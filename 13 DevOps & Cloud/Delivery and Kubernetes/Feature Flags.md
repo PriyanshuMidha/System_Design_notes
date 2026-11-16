@@ -23,7 +23,38 @@ updated: 2026-11-13
 > - Percentage rollouts use a deterministic hash of `(flag, user ID)`, so a user's bucket never changes as the percentage ramps up.
 > - Flags are not free: every flag left in the code after its decision is made is a small amount of permanent complexity and a branch nobody tests both sides of.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A **feature flag** is an on/off switch in your code that you can flip without a new deploy.
+The code for a new feature ships "off". Later you turn it on for 1% of users, then 10%, then everyone.
+
+```mermaid
+flowchart LR
+    D["Deploy code<br/>(flag off)"] --> T["Turn on for staff"] --> P["1% then 50%"] --> A["100%"]
+```
+
+If something goes wrong, you flip it off in seconds. No rollback, no redeploy.
+This splits two ideas people usually mix up: deploying (code is on the servers) and releasing (users can see it).
+
+```mermaid
+flowchart LR
+    R["Request from user 42"] --> F{"Flag 'new-checkout'<br/>on for user 42?"}
+    F -- "yes" --> N["New checkout"]
+    F -- "no" --> O["Old checkout"]
+```
+
+The rest of this note is just these 3 questions:
+1. How does the app decide "on or off" for each user?
+2. How do percentage rollouts stay stable for the same user?
+3. How do you stop old flags from piling up into a mess?
+
 
 **The problem in one story.**
 Your team builds a new checkout page, but marketing wants to launch it next Tuesday, not today.
@@ -66,7 +97,7 @@ Where it breaks: a light switch has two positions; a flag can be on for just 10%
 > [!tip] Remember
 > Deploy the code off, release it by flipping a flag, and delete the flag once the decision is final.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Say a team is rewriting the checkout flow. Without flags, that rewrite ships as one all-or-nothing deploy: merge, build, deploy, and every user hits the new checkout the moment the rollout finishes.
 
@@ -81,7 +112,7 @@ With a flag:
 
 The flag turns "redeploy under pressure, with a live incident running" into "change one number," which is both faster and far less risky, since changing a flag's rollout percentage cannot introduce a new bug the way a fresh deploy can.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A feature flag is a named, cached decision table the application consults before running a branch of code: "for this flag, for this user/request, true or false (or which variant)?"
 
@@ -93,7 +124,9 @@ A flag's rules are usually more than one percentage number. A real targeting con
 
 The percentage bucket is the last, catch-all rule in the list, not the whole targeting model.
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words:** the app keeps a copy of all flag rules in memory. For each request it checks the rules locally, so no network call slows you down.
 
 ```mermaid
 sequenceDiagram
@@ -127,9 +160,11 @@ flowchart LR
     Off --> M
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** mix the flag name and user ID into a number from 0-99. If it is under the rollout percent, the flag is on. Same user, same answer every time.
 
 The bare mechanism: hash the flag name and user ID together into a stable number, and compare it to the rollout percentage.
 
@@ -148,6 +183,8 @@ func enabled(flag, userID string, pct int) bool {
 The full version below adds the edge cases that matter in production: percentage clamping, and the guarantee that ramping up the percentage only ever adds users, never removes someone who was already in.
 
 ### Local percentage evaluation, in Go
+
+**In plain words:** Go code of that exact trick, with tests showing the split comes out close to the target.
 
 This models what an OpenFeature-style SDK does per request: no network call, just a deterministic hash against a cached percentage. A real OpenFeature client call looks like `client.BooleanValue(ctx, "new-checkout", false /* default */, evalCtx)`.
 
@@ -252,7 +289,7 @@ func TestEnabled_Bounds(t *testing.T) {
 
 **Measured (Go 1.24, `go test -race`, 2026-11-07):** over 100,000 synthetic user IDs, `Enabled(..., pct)` turned on 10.05% of users at `pct=10`, 25.08% at `pct=25`, and 50.14% at `pct=50` — within about 0.15 percentage points of the target at every level, which is the kind of spread an `FNV-1a`-based bucketing gives in practice.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Flag type | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -262,7 +299,7 @@ func TestEnabled_Bounds(t *testing.T) {
 | Entitlement flag | Gates a feature by plan/tier/tenant rather than by rollout percentage | Paid-plan gating, enterprise-only features | Long-lived by design; not something to "clean up" like a release toggle |
 | Client-side flag | Evaluated in the browser/mobile app, often fetched at app start | UI-only behavior, where no sensitive targeting logic needs to stay server-side | Flag values and targeting rules are visible to the client; never put a security decision behind a client-side flag |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Every flag left in the codebase after its rollout decision is made is permanent complexity: a branch, a config value to keep correct across environments, and (usually) a combination nobody tests, because most test suites only exercise the "current" combination of flags, not all `2^n` combinations of n active flags.
 - A flag is not a substitute for a real deployment strategy when the risk is in the binary itself (a crash, a memory leak, a broken startup) rather than in one code path — no flag check runs if the process never starts.
@@ -270,7 +307,7 @@ func TestEnabled_Bounds(t *testing.T) {
 - For a one-off internal script or a feature with no realistic rollback scenario, the overhead of wiring a flag is not worth it; plain code plus a normal deploy is simpler and has no flag debt to clean up later.
 - If the flag service's SDK does not evaluate locally with a safe default, a flag you added to reduce risk can itself become a single point of failure that blocks every request when it can't be reached — the opposite of its purpose.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** LaunchDarkly, Unleash, GrowthBook, and Flagsmith are commercial/open-source flag platforms; most of them, along with in-house systems at large tech companies, follow the same shape — a control plane for rules and a lightweight SDK that caches and evaluates locally. The OpenFeature project (under the CNCF) standardizes the evaluation API so an application can swap providers without rewriting every flag check.
 - **Failure modes → fixes:**
@@ -281,7 +318,7 @@ func TestEnabled_Bounds(t *testing.T) {
   - Flag evaluation shows up as a measurable amount of per-request latency → that almost always means the SDK is calling out to the flag service per request instead of evaluating against a local cache; switch to a streaming/polling SDK, not a remote-evaluation one.
 - **What to monitor:** evaluation counts and error rate per flag (did evaluation ever fall back to default?), the audit trail of who changed which flag's rules and when, number of active flags and how many are past their planned cleanup date, and — for anything tied to a rollout — the same per-variant business metrics used for canary analysis (see [[Deployment Strategies - Rolling, Blue-Green, Canary]]).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Streaming vs. polling.** A flag SDK typically either polls the control plane every N seconds or holds a long-lived streaming connection (SSE or a websocket) that pushes rule changes as they happen. Streaming gets near-instant propagation (useful for an ops kill switch during an incident); polling is simpler and tolerates flakier networks, at the cost of a propagation delay bounded by the poll interval.
 - **Local evaluation is the architecture, not an optimization.** The naive design — call the flag service synchronously on every request — adds a network round trip (and a new failure mode: flag service down means app down) to every single request. Real SDKs instead treat the flag service purely as a source of *rule updates*, decoupling "is the flag service healthy right now" from "can this request be served."
@@ -290,7 +327,7 @@ func TestEnabled_Bounds(t *testing.T) {
 - **Audit trail.** Every rule or percentage change is logged with who changed it, when, and the before/after value — LaunchDarkly and Unleash both keep this as a first-class feature, not an afterthought. When an incident review starts with "did anything change recently?", the flag audit log is one of the first places to check, right alongside the deploy log, precisely because a flag change can cause a production regression with no code deploy and no entry in Git history at all.
 - **Testing flag combinations.** Since most of a test suite exercises only the currently-default combination of flags, a common practice is to explicitly run the critical path's tests once with each release toggle forced on and once forced off, rather than relying on incidental coverage — this is one of the concerns [[Testing in CI-CD, Flaky Tests and Testing in Production]] covers for CI pipelines with flags in play.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's the difference between deploying and releasing a feature?
 > Deploying means the code is running in production; releasing means users (or some percentage of them) can actually reach it. A feature flag is what lets those happen at different times — code can be deployed disabled, and released later by flipping a config value, with no redeploy.
@@ -318,7 +355,7 @@ func TestEnabled_Bounds(t *testing.T) {
 >
 > You can run 100% of traffic on the new binary while a risky feature inside it stays flagged off for everyone, and ramp the flag independently of any deploy — see [[Deployment Strategies - Rolling, Blue-Green, Canary]].
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Flags separate *deploy* (code is running) from *release* (users can reach it).
 - Evaluation is local, against a cached rule set; the flag service is a control plane, not a per-request dependency.

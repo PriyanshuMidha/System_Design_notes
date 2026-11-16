@@ -22,7 +22,39 @@ updated: 2026-11-13
 > - Rotation without downtime needs two active credentials at once — the old one keeps working until every consumer has picked up the new one.
 > - The strongest fix for "a service needs a secret" is often to need no long-lived secret at all: workload identity (IRSA, GitHub OIDC) lets a service assume a cloud role instead of holding a credential.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A **secret** is anything that lets a program in somewhere: a database password, an API key, a signing key.
+If it leaks, anyone holding it can act as your app.
+The rule: keep each secret in one safe place, a **secrets manager** (a locked vault service), never in code or logs.
+
+```mermaid
+flowchart LR
+    V["Secrets manager<br/>(one locked copy)"] --> A["Your app, at start-up"]
+    G["Git repo / logs / images"] -. "never" .- A
+```
+
+Your app asks the vault for the secret when it starts or when it needs it.
+Secrets should also be changed now and then. That is called rotation, and it should not need a redeploy.
+When a secret leaks anyway, act fast: cancel it, swap in a new one, then check who used it.
+
+```mermaid
+flowchart LR
+    K["Leak found"] --> R1["Revoke"] --> R2["Rotate"] --> R3["Audit"]
+```
+
+The rest of this note is just these 3 questions:
+1. Where should a secret live, and how does it reach the app?
+2. How does the vault itself keep secrets safe (envelope encryption)?
+3. How do you rotate a secret without downtime?
+
 
 **The problem in one story.**
 Your app needs a database password to start.
@@ -66,7 +98,7 @@ Where it breaks: a lost house key is noticed; a copied secret is usually not, so
 > [!tip] Remember
 > Keep secrets out of code, images and logs; fetch them by identity from a store, and make rotation easy.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A production incident, reconstructed from common cases: a developer debugging a flaky integration adds `fmt.Println(cfg)` to print the loaded config, ships it, and the log line includes the database password because the config struct has no `json:"-"` tag hiding it.
 
@@ -76,15 +108,17 @@ Neither path required a sophisticated attacker. Both are "a secret existed somew
 
 Secrets management is the set of practices that make the *leak path* narrow (so secrets rarely end up in Git, logs or images in the first place) and the *response path* fast (so a leak that happens anyway is cheap to close).
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A secret is like a house key: it should exist in as few physical copies as possible, each copy should be traceable to who holds it, and if one copy goes missing you change the lock rather than hoping the missing key is never found.
 
 A secrets manager is the key safe: it hands out a key only to an identity that's allowed to have one, logs every time it does so, and lets you swap the lock (rotate) without reprinting the house's address on every door.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Where a secret should and shouldn't live
+
+**In plain words:** one vault, read only by the app that needs it. Everywhere else (git, chat, logs, Docker images) is a leak waiting to happen.
 
 ```mermaid
 flowchart TD
@@ -110,6 +144,8 @@ A specific, frequently missed layer: `docker history --no-trunc` reveals every `
 
 ### Env vars vs mounted files vs runtime fetch
 
+**In plain words:** three ways to hand the secret to the app. Env vars are easy but leak into crash dumps; files and live fetch are safer and can change without a restart.
+
 Once a secret has reached the one process that needs it, there are still three different ways to hand it that value, with different exposure:
 
 - **Environment variable.** The simplest to wire up, and the most commonly recommended default, but it has one sharp edge: on Linux, anything with permission to read `/proc/<pid>/environ` for that process — a co-located debugging tool, a crash/core-dump collector that captures the environment block, or another process in the same container/namespace after a container-escape bug — can read every environment variable the process was started with, for its entire lifetime. A child process also inherits the full parent environment by default unless the code explicitly strips it, so a secret meant for one service can leak into a logging shim or a subprocess it shells out to.
@@ -119,6 +155,14 @@ Once a secret has reached the one process that needs it, there are still three d
 None of the three eliminates risk; they trade *where* the narrowest remaining exposure is. A mounted file or runtime fetch is the stronger default for anything handling a high-value secret; an environment variable is a reasonable choice for lower-sensitivity config where the operational simplicity is worth the `/proc` exposure.
 
 ### Envelope encryption
+
+**In plain words:** lock each secret with its own small key, then lock that small key with one master key. Like putting house keys in a lockbox whose key sits in a bank.
+
+```mermaid
+flowchart LR
+    S["Your secret"] -- "locked by" --> D["Data key (random)"]
+    D -- "locked by" --> M["Master key in KMS<br/>(never leaves)"]
+```
 
 Secrets managers don't encrypt every stored secret directly with one master key — that would mean every decrypt call needs the master key material available, and rotating the master key means re-encrypting everything it has ever touched.
 
@@ -145,6 +189,8 @@ This is exactly what AWS KMS `GenerateDataKey`, Vault's `transit` engine, and Go
 
 ### Rotation without downtime
 
+**In plain words:** for a short while, both the old and the new secret work. Switch everyone to the new one, then turn the old one off.
+
 ```mermaid
 sequenceDiagram
     participant Ops
@@ -169,13 +215,15 @@ The key invariant: **two credentials are valid at once** for an overlap window. 
 
 AWS Secrets Manager's built-in rotation Lambda follows exactly this create-new → test → mark-current → (later) delete-old sequence; Vault's dynamic database credentials sidestep the problem differently, by generating a short-lived, unique credential per consumer with a lease, so there's no single shared secret to rotate at all — each lease simply expires.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
 AES-GCM twice: once to encrypt the real secret with a random data key, once to wrap that data key with a longer-lived master key. Store only the wrapped key and the ciphertext; the data key itself never touches disk.
 
 ### Go: envelope encryption, tested end to end
+
+**In plain words:** this code does the lockbox trick for real: encrypt the data with a fresh key, then encrypt that key with the master key.
 
 Compiles and passes `go vet` and `go test -race` on Go 1.24. This reproduces the KMS envelope-encryption pattern locally — `MasterKey` stands in for a KMS customer master key, and in a real deployment the wrap/unwrap calls would be a network round trip to KMS instead of a local AES call, with the master key material never leaving KMS at all.
 
@@ -370,7 +418,7 @@ func TestOpenFailsOnTamperedCiphertext(t *testing.T) {
 
 **Measured:** `go test -race ./envelope/...` on Go 1.24.4: 3/3 tests pass — the round trip recovers the exact plaintext without it ever appearing in the ciphertext, decryption fails cleanly when the wrong master-key version is used (simulating a rotation where the old version wasn't kept available), and tampering with even one ciphertext byte is detected by AES-GCM's authentication tag rather than silently returning corrupted data.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Store | Model | Rotation | Use when |
 | --- | --- | --- | --- |
@@ -383,14 +431,14 @@ func TestOpenFailsOnTamperedCiphertext(t *testing.T) {
 > [!warning] Interview trap
 > A raw Kubernetes `Secret` is base64-*encoded*, not encrypted. Anyone with `get secrets` RBAC access or etcd access can decode it trivially. It needs encryption at rest configured on the cluster, and is usually paired with an operator (External Secrets, Sealed Secrets) that syncs from a real secrets manager rather than storing the authoritative copy in Kubernetes itself.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Dynamic, per-request credentials (Vault-style) eliminate rotation as a concept but add a dependency: if Vault is unreachable, new leases can't be issued, so the blast radius of a Vault outage is wider than one static secret failing to rotate on schedule.
 - Workload identity removes the secret-storage problem entirely but only works where the cloud and the workload's identity provider both support it — it doesn't help a third-party SaaS API that only accepts a static API key.
 - Short credential lifetimes shrink the leak window but increase load on the secrets manager and add a failure mode (a service that can't refresh in time gets `401`s) that a long-lived credential doesn't have; pick a lifetime the service's retry/backoff logic can tolerate.
 - For a single local development script, a short-lived `.env.local` that is `.gitignore`d is a reasonable trade-off — the failure mode to prevent is that file reaching a shared repo or a shared machine, not the existence of a local file at all.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** AWS Secrets Manager rotates RDS/Redshift/DocumentDB credentials out of the box; HashiCorp Vault's dynamic database secrets engine issues a unique, time-boxed credential per application instance; GitHub Actions' OIDC-to-AWS integration lets a CI job assume an AWS role with zero stored AWS keys in the repository at all.
 - **Failure modes → fixes:**
@@ -400,7 +448,7 @@ func TestOpenFailsOnTamperedCiphertext(t *testing.T) {
   - A Kubernetes Secret is readable by far more service accounts than intended → tighten RBAC on `get`/`list` for secrets, and move the authoritative copy to a real secrets manager with an operator sync.
 - **What to monitor:** failed authentication rate right after a rotation, age of the oldest active credential per secret (flag anything past its rotation SLA), secrets-manager access logs for an identity reading a secret it's never read before, and CI/scanner alerts (gitleaks, push protection) as a leading indicator rather than waiting for an incident.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why envelope encryption instead of encrypting directly with the master key.** If every secret were encrypted directly with the master key, decrypting *anything* requires the master key material to be available to the decrypting process — which either means distributing it widely (defeating the point) or routing every decrypt through the KMS as a live network call carrying the full payload. Envelope encryption routes only the small, fixed-size data key through the KMS; the (potentially large) payload is encrypted locally with a key that exists only for the duration of one operation and is never persisted in plaintext.
 - **Key rotation vs. secret rotation are two different operations.** Rotating the *master key* (the KMS key) only requires re-wrapping existing data keys — cheap, and AWS KMS supports this transparently by keeping old key material available for decrypt while a new key version handles new wraps. Rotating a *secret itself* (a database password) requires coordinating with every consumer of that secret, which is the harder, application-level problem the overlap-window sequence above addresses.
@@ -408,7 +456,7 @@ func TestOpenFailsOnTamperedCiphertext(t *testing.T) {
 - **Workload identity removes an entire class of risk**, not just a leak-response cost: an ECS task role, IAM Roles for Service Accounts (IRSA) on EKS, and GitHub's OIDC-to-cloud integration all mean the workload authenticates as itself (via a signed, short-lived token or the platform's own instance/task metadata, rather than a credential anyone had to generate and store) and the cloud provider hands back temporary credentials — there is no standing secret for `gitleaks` to find, no rotation schedule to maintain, and no static credential that outlives the workload that needed it.
 - **The order of leak response matters: revoke before rotate before audit.** Revoking first stops the credential from being usable the instant it's flagged, even before a replacement exists (accepting brief service disruption over continued exposure); rotating issues the replacement; auditing (what did this credential touch while it was live) comes last because it doesn't need to block service recovery, but it determines whether downstream systems also need a response.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why does AWS KMS use envelope encryption instead of encrypting data directly with the master key?
 > The master key's raw material never needs to leave KMS: only the small data key is sent to KMS to be wrapped/unwrapped, while the (potentially large) payload is encrypted locally with that data key. This keeps the expensive or sensitive operation (touching the master key) to a small, fixed-size value, and means re-encrypting everything on master-key rotation is replaced by re-wrapping small data keys.
@@ -428,7 +476,7 @@ func TestOpenFailsOnTamperedCiphertext(t *testing.T) {
 > [!question]- When is workload identity (IRSA, GitHub OIDC-to-cloud) strictly better than a stored secret, and when can't you use it?
 > It's strictly better whenever the workload and the target API are both within a cloud/identity ecosystem that supports federating the workload's own platform identity into temporary credentials — there's no standing secret to leak, store, or rotate at all. It doesn't apply when the target is a third-party SaaS API that only accepts a static API key with no federation support; that case still needs full secrets-manager treatment.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - A secret lives in exactly one authoritative store (Secrets Manager, Vault, SSM) — never in Git, image layers, logs, or frontend bundles.
 - Envelope encryption: a one-time data key encrypts the payload; a master key in a KMS only ever wraps/unwraps the small data key.

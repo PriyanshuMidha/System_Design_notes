@@ -29,7 +29,34 @@ updated: 2026-11-13
 > - Same-shard transfers use one local ACID transaction. Cross-shard transfers use a **saga with holds** (reserve, then commit or release), not distributed locks.
 > - A **reconciliation** job continuously proves that the sum of all balances equals the sum of the ledger, and that the wallet matches the bank.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A wallet app holds money for you, like Paytm or PhonePe.
+When you send money, the app must take it from you and give it to your friend, both or neither.
+It never just changes a number. It writes two lines in a record book: "minus 300 from you" and "plus 300 to friend". This book is the **ledger**.
+Lines in the ledger are never erased. A mistake is fixed by writing a new line.
+Every "send" request carries a unique ticket number, called an **idempotency key**. If the same ticket comes twice, the second one is ignored.
+
+```mermaid
+flowchart LR
+    T["Send ₹300<br/>ticket #77"] --> W["Wallet"]
+    T2["Retry, ticket #77"] --> W
+    W --> L["Ledger: -300 you, +300 friend<br/>(written once)"]
+```
+
+A checker job compares the ledger with the bank every day, to catch any mistake.
+
+So the rest of this note is just these 3 questions:
+1. How do you make a retried payment happen only once?
+2. How do you move money when the two wallets live on different databases?
+3. How do you prove, every day, that no money appeared or vanished?
 
 **The problem in one story.**
 You have ₹1,000 in a wallet app and send ₹300 to a friend.
@@ -74,7 +101,7 @@ Where it breaks: one cash book sits in one shop; a large wallet splits its book 
 > [!tip] Remember
 > Never update money in place: write balanced, immutable ledger entries with an idempotency key, in one transaction with the balance.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 You hold ₹1,000 in a wallet app.
 
@@ -106,7 +133,7 @@ A wallet exists to make these two failures impossible: **no double spend and no 
 > [!tip] Remember
 > The first sentence in the interview: "money must be conserved, so I model it as immutable double-entry ledger entries, and every write is idempotent."
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the paper cash book at a small shop.
 
@@ -140,7 +167,7 @@ flowchart LR
     R --> PSP
 ```
 
-## 3. How it works - high-level design
+## 3. How it works - high-level design 🟡
 
 1. **Request.** The app calls `POST /v1/transfers` with `from_wallet`, `to_wallet`, `amount_minor`, `currency` and an `Idempotency-Key` header created once per user action.
 2. **Claim the key.** The API inserts the key into an `idempotency_keys` table with a unique constraint (atomic `INSERT ... ON CONFLICT DO NOTHING`). If the key already exists, it returns the stored result, or "in progress".
@@ -195,6 +222,8 @@ Estimate: 20M transfers/day ~ 230/s avg ~ 2,300/s peak ~ 16K row writes/s
 
 ### Estimation (all inputs are labelled estimates)
 
+**In plain words:** rough sums: how many transfers per second and how many ledger lines that creates per day.
+
 | Quantity | Arithmetic | Result |
 | --- | --- | --- |
 | Wallets (estimate) | given | 50,000,000 |
@@ -224,9 +253,11 @@ flowchart TD
     H -->|"tight, no headroom"| I["Shard by wallet id<br/>8 to 16 shards"]
 ```
 
-## 4. Worked example - API, data model and one transfer
+## 4. Worked example - API, data model and one transfer 🟡
 
 ### API
+
+**In plain words:** a handful of calls: send money, check balance, see history. Every money call carries an idempotency key.
 
 ```http
 POST /v1/transfers
@@ -253,6 +284,8 @@ Content-Type: application/json
 Rules: amounts are **integers in minor units** (paise) plus a currency code; never floating point. Every write endpoint requires an idempotency key (see [[Idempotency and Idempotency Keys]]).
 
 ### Data model
+
+**In plain words:** three main tables: wallets with their balance, transfers, and the ledger lines that explain every change.
 
 ```mermaid
 erDiagram
@@ -350,7 +383,17 @@ Failure examples:
 - **Crash after COMMIT, before the response:** the client retries with K. The idempotency record shows `completed`, so the stored response is returned. No second debit.
 - **Insufficient funds:** step 4 fails, the transaction rolls back, the API returns 422 and stores that result under K.
 
+```mermaid
+flowchart LR
+    S["Start transaction"] --> K["Save idempotency key"]
+    K --> D["W1 -300, W2 +300<br/>(two ledger lines)"]
+    D --> B["Update both balances"]
+    B --> C["Commit: all or nothing"]
+```
+
 ### Double entries for the main flows
+
+**In plain words:** for each kind of money movement, which account goes down and which goes up. Each row adds up to zero.
 
 | Event | Debit | Credit |
 | --- | --- | --- |
@@ -383,7 +426,7 @@ flowchart LR
     end
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Decision | Alternatives | Pick here | Why | Guide |
 | --- | --- | --- | --- | --- |
@@ -405,7 +448,7 @@ flowchart TD
     Q3 -->|"no, eventual completion is fine"| A4["Saga with a hold<br/>and compensation"]
 ```
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Ledger plus cached balance** costs two writes per movement but gives audit and fast reads. A pure derived balance (sum entries) has no duplicate truth but is slow without snapshots.
 - **Saga over 2PC** keeps services available and avoids long locks, but money is briefly in an intermediate state (held), and compensation logic must be correct. 2PC gives atomicity but blocks if the coordinator dies mid-way (see [[Two-Phase Commit]]).
@@ -416,7 +459,13 @@ flowchart TD
 > [!tip] Remember
 > Say the trade-off aloud: "I accept an intermediate hold state and compensation logic, to avoid cross-shard locks and keep availability."
 
-## 7. In production
+```mermaid
+flowchart LR
+    A{"Both wallets on<br/>one database?"} -- "yes" --> T["One transaction"]
+    A -- "no" --> SG["Saga: hold money,<br/>credit, then release hold"]
+```
+
+## 7. In production 🔴
 
 - **Square's Books.** Square describes "Books", an immutable double-entry accounting database service, as the ledger beneath its payments. The public lesson: entries are immutable, balances are derived, and the ledger is its own service with strict invariants.
 - **Stripe idempotency.** Stripe documents idempotency keys on every POST and prunes keys after at least 24 hours. Wallet APIs copy the pattern, scoping keys by caller.
@@ -425,7 +474,7 @@ flowchart TD
 - **Operations:** monthly partitions on `ledger_entries`, archive old months to object storage, keep an audit export. Backups with point-in-time recovery (see [[Backup, PITR and Disaster Recovery]]); a restore drill is part of the compliance story.
 - **Money moves, so test it:** property tests that random sequences of transfers never change the total, and chaos tests that kill services mid-saga.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Deep dive 1: idempotency and exactly-once effect
 
@@ -560,6 +609,8 @@ Checks:
 
 ### Scaling and bottlenecks
 
+**In plain words:** what breaks first as traffic grows, and the fix for each.
+
 ```mermaid
 flowchart TD
     L1["Stateless Wallet API<br/>autoscale"] --> L2["Router<br/>wallet id hash -> shard"]
@@ -581,6 +632,8 @@ flowchart TD
 
 ### Failure handling
 
+**In plain words:** for each thing that can fail, what the user sees and how the system repairs it.
+
 | Failure | Effect | Handling |
 | --- | --- | --- |
 | API crashes before commit | nothing changed | client retries with the same key |
@@ -591,7 +644,7 @@ flowchart TD
 | PSP times out on a top-up | outcome unknown | do not credit yet; webhook or lookup decides (see [[Case Study - Payment System]]) |
 | Bug posts wrong entry | invariant check fails | reversing entry plus incident review, never an `UPDATE` |
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why a double-entry ledger instead of just a balance column?
 > Entries are immutable, so every balance is explainable and rebuildable, and "debits equal credits" catches bugs immediately. A mutable balance loses history and is easy to corrupt through lost updates. In practice we keep both: entries as truth, balance as a cache updated in the same transaction.
@@ -617,7 +670,7 @@ flowchart TD
 > [!question]- The interviewer says 1 million transfers per second. What changes?
 > About 1,000 TPS per shard means on the order of 1,000 shards, so I maximise same-shard transfers by placement, move cross-shard transfers to sagas, make merchant credits append-only, use a read model for history, and use a router with logical shards for resharding. Correctness rules, idempotency and reconciliation stay identical.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Immutable double-entry ledger; balance is a same-transaction cache; corrections are reversing entries.
 - Every write has an idempotency key; claim it atomically; store the response; 409 on body mismatch.

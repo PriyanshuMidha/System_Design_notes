@@ -38,7 +38,38 @@ updated: 2026-11-13
 > - Default partitioning: do not shard until a single node (plus replicas and caching) cannot hold the load. When you must, pick a key that spreads writes and keeps your hottest query on one shard.
 > - Name the trade-off aloud: freshness against latency and availability.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (12). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the six decisions), 4 (chat example), 5, 6 and 9 (drills).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 10 and 11. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+One database gets too busy. So you make copies of it on other machines. Making copies is called **replication**.
+Copies take a moment to catch up. So a reader may see slightly old data for a short time.
+Later, even copies are not enough, because there is too much data to fit on one machine.
+So you split the data into pieces, and each machine owns one piece. That is **partitioning** (or sharding).
+Which piece a row goes to is decided by one field, the **shard key**, like user id.
+
+```mermaid
+flowchart LR
+    W["Write"] --> L["Main copy"]
+    L -- "catches up in ms" --> F["Read copy"]
+    R["Read"] --> F
+```
+
+```mermaid
+flowchart LR
+    K["user_id"] --> A["Machine A: users 1-1M"]
+    K --> B["Machine B: users 1M-2M"]
+```
+
+The rest of this note is just these 3 questions:
+1. How fresh must each read be?
+2. How are the copies kept in sync, and who accepts writes?
+3. How do you split the data, and do you even need to?
 
 **The problem in one story.**
 Your chat app keeps messages in one database. It gets too busy, so you add copies of the database on other machines.
@@ -84,7 +115,7 @@ Where it breaks: photocopies are made by hand once, while replicas update contin
 > [!tip] Remember
 > Pick the weakest consistency the business allows, one leader with async followers by default, and shard only when one node cannot cope.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A single database server eventually fails to meet one of three needs. It may be too slow for the reads, too small for the data, or too fragile because one crash takes the product down.
 
@@ -95,7 +126,7 @@ In an interview these questions arrive in disguise: "what happens if the primary
 > [!tip] Remember
 > Consistency, replication and partitioning are three separate dials. Turning one changes the cost of the others.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a bank with branches. Each branch keeps a copy of the customer ledger (replication). A branch handles only certain surnames (partitioning). Customers want to see the true balance (consistency).
 
@@ -111,7 +142,7 @@ flowchart LR
     D --> E["Latency, availability, cost, operability"]
 ```
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Decision 1: how consistent must reads be?
 
@@ -140,6 +171,8 @@ flowchart TD
 
 ### Session guarantees: the cheap middle
 
+**In plain words:** Most users do not need perfect freshness. They just need to see their own changes, and never see time go backwards. Those are cheap to give.
+
 Many complaints about "eventual consistency" are really about three small problems. Each has a cheap fix without full strong consistency.
 
 | Symptom | Guarantee | Typical fix |
@@ -150,6 +183,13 @@ Many complaints about "eventual consistency" are really about three small proble
 
 > [!warning] Common mistake
 > Saying "eventual consistency" and stopping. Interviewers want to hear which users would notice and what you do about it, usually read-your-writes.
+
+```mermaid
+flowchart LR
+    U["You post a comment"] --> L["Main copy"]
+    U2["You reload the page"] -- "read-your-writes:<br/>send YOUR reads to the main copy<br/>for a few seconds" --> L
+    O["Other users"] --> F["Read copy<br/>(a bit behind is fine)"]
+```
 
 ### Decision 2: single-leader, multi-leader or leaderless?
 
@@ -300,7 +340,7 @@ flowchart TD
 
 **Why it matters.** "I would shard" with no numbers is a red flag. Estimate load first with [[Back-of-the-Envelope Estimation]]. A well-tuned PostgreSQL primary often serves tens of thousands of simple queries per second (an estimate that depends heavily on hardware and workload).
 
-## 4. Worked example: a chat application
+## 4. Worked example: a chat application 🟡
 
 Design the storage for 1:1 and group chat with 50M daily users.
 
@@ -331,7 +371,7 @@ Partitioning: hash for spread, range for scans; key = user/tenant/channel+bucket
 Shard when  : indexes, cache, replicas, scale-up are exhausted
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Dimension | Single-leader (PostgreSQL, MySQL) | Multi-leader (DynamoDB global tables, multi-region MySQL) | Leaderless (Cassandra, ScyllaDB, Riak) | Consensus per partition (Spanner, CockroachDB, TiDB) |
 | --- | --- | --- | --- | --- |
@@ -350,6 +390,8 @@ Numbers in latency rows are rough estimates, not benchmarks. See [[Replication]]
 
 ### Consistency choice by data type
 
+**In plain words:** Different data needs different care. Money must be exact. Like counts can be a little behind.
+
 | Data | Consistency | Why |
 | --- | --- | --- |
 | Account balance, inventory count at checkout | Strong | Wrong value loses money |
@@ -359,7 +401,7 @@ Numbers in latency rows are rough estimates, not benchmarks. See [[Replication]]
 | Chat inside one channel | Causal or per-channel order | Replies must follow questions |
 | Cache of product pages | Eventual with TTL | Freshness traded for speed |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Strong consistency** adds a round trip per operation and limits availability during partitions (see [[CAP and PACELC]]). Do not use it for counters, feeds and analytics.
 - **Async replication** is fast but can lose the tail on failover. Do not use it alone for payments.
@@ -371,7 +413,7 @@ Numbers in latency rows are rough estimates, not benchmarks. See [[Replication]]
 > [!tip] Remember
 > Each stronger guarantee or bigger scale step trades away latency, simplicity or a feature. Say which.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Instagram (2012 post):** sharded PostgreSQL using many logical shards mapped onto fewer physical servers, with the shard id embedded in the generated 64-bit id so any id tells you where the row lives. Logical shards let them move data without rehashing. See [[Unique ID Generation]].
 - **Discord:** Cassandra, then ScyllaDB, for messages keyed by channel and bucket, per their 2023 post.
@@ -390,9 +432,11 @@ What to monitor:
 | Cross-shard query rate | A rising scatter-gather rate means the shard key is wrong |
 | Conflict or repair counts (multi-leader, leaderless) | Reveals overwrites and drift |
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Why `R + W > N` is not linearizable
+
+**In plain words:** Asking enough copies means at least one has the latest write. It does not mean everyone sees writes in the same order at the same moment.
 
 Overlap guarantees a read set contains at least one replica with the latest acknowledged write. It does not guarantee that concurrent writes or sloppy quorums and clock-based timestamps behave.
 
@@ -402,6 +446,8 @@ For true linearizability you need consensus or a single ordered log. See [[Quoru
 
 ### Resharding without downtime
 
+**In plain words:** Moving data to a new layout is like moving house while still living in it. Copy first, keep both in sync, then switch over.
+
 1. Create a new layout (more logical shards or new nodes).
 2. Dual-write or stream changes from old to new.
 3. Backfill and verify counts and checksums.
@@ -410,15 +456,27 @@ For true linearizability you need consensus or a single ordered log. See [[Quoru
 
 Logical shards or consistent hashing make steps 1 and 4 cheap. See [[Zero-Downtime Schema Migrations]] for the same pattern applied to schemas.
 
+```mermaid
+flowchart LR
+    A["Old layout"] --> B["Copy data to new layout"]
+    B --> C["Keep both in sync"]
+    C --> D["Switch reads, then writes"]
+    D --> E["Retire old layout"]
+```
+
 ### Cross-shard operations
+
+**In plain words:** If one action touches two machines, try to redesign so it touches one. If you cannot, use a saga (steps plus undo steps) or a slower two-step commit.
 
 When a business operation spans shards you have three options. Redesign the key so it stays on one shard, use a saga with compensations ([[Saga Pattern]]), or use two-phase commit ([[Two-Phase Commit]]) and accept its blocking behavior. Distributed SQL engines hide this but still pay the latency.
 
 ### Geo partitioning and the speed of light
 
+**In plain words:** Light takes time to cross an ocean. Any write that must be confirmed on two continents pays that delay every time.
+
 A strongly consistent write across US-East and EU-West needs at least one transatlantic round trip, roughly tens of milliseconds at the physical minimum (an estimate). No technology removes this. Either keep each entity's leader near its users (home region) or accept eventual consistency across regions. See [[Multi-Region Architecture]].
 
-## 9. Scenario drills: scenario, choice, why
+## 9. Scenario drills: scenario, choice, why 🟡
 
 | Scenario | Choice | Why | Say in the interview |
 | --- | --- | --- | --- |
@@ -433,7 +491,7 @@ A strongly consistent write across US-East and EU-West needs at least one transa
 | Flash-sale inventory | One strongly consistent counter per item, with a queue in front | Overselling is costly | "Serialize on the item, and shed load with a queue." |
 | Time-series metrics | Range by time inside hash of series id, TTL old data | Appends and range scans | "Hash the series, range by time, so scans stay local and writes spread." |
 
-## 10. How to say it in the interview
+## 10. How to say it in the interview 🔴
 
 - "I would start with a single-leader relational store and async replicas, because it is simple and covers our read load. Where acknowledged writes must survive a failover I add one synchronous standby."
 - "Reads from replicas can be stale, so for the user's own writes I use read-your-writes by reading from the leader for a short window."
@@ -441,7 +499,7 @@ A strongly consistent write across US-East and EU-West needs at least one transa
 - "If we shard, I pick tenant id because joins stay inside a tenant. The cost is that cross-tenant reports go to the warehouse."
 - "This trades consistency for availability. During a partition this path serves possibly stale data, which is fine for a feed and not for a ledger."
 
-## 11. Interview questions
+## 11. Interview questions 🔴
 
 > [!question]- When would you choose eventual consistency over strong?
 > When stale reads are invisible or harmless (feeds, counts, caches, analytics) and latency or availability matters more. Add session guarantees such as read-your-writes where users would notice. Keep strong consistency for money, inventory and uniqueness.
@@ -461,7 +519,7 @@ A strongly consistent write across US-East and EU-West needs at least one transa
 > [!question]- Is DynamoDB leaderless?
 > No. Each partition has a leader and uses a Multi-Paxos style replication, per the 2022 USENIX ATC paper. The Dynamo paper's design was leaderless, which causes the confusion.
 
-## 12. Cheat sheet
+## 12. Cheat sheet 🟢
 
 - Strongest guarantee only where wrong data costs money or safety.
 - Default: single leader, async followers, one sync follower for must-not-lose data.
@@ -472,7 +530,7 @@ A strongly consistent write across US-East and EU-West needs at least one transa
 - Fixed logical partitions beat `mod N`.
 - Always state the trade-off: freshness versus latency and availability.
 
-## Links
+## Links 🟢
 
 - Deep notes, storage: [[Replication]], [[Partitioning and Sharding]], [[Consistent Hashing]], [[Distributed SQL]], [[SQL vs NoSQL]], [[Wide-Column Stores and Cassandra]], [[NoSQL Data Modeling]], [[Isolation Levels and MVCC]], [[Backup, PITR and Disaster Recovery]]
 - Deep notes, distributed systems: [[CAP and PACELC]], [[Consistency Models]], [[Quorums and Leaderless Replication]], [[Consensus - Raft and Paxos]], [[CRDTs and Conflict Resolution]], [[Multi-Region Architecture]], [[High Availability and Failover]], [[Saga Pattern]], [[Two-Phase Commit]]

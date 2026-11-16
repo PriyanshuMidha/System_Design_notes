@@ -30,7 +30,41 @@ updated: 2026-11-13
 > - Write-hot keys are fixed by splitting them: sharded counters, batching, or one writer per key with a queue.
 > - Classic mistake: answering "add more shards" or "use consistent hashing". Neither moves a single key.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (where hot keys come from and the fix menu), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Big apps spread their data over many machines, so no single machine does all the work.
+Each piece of data has a name, called a **key**. The key decides which machine holds it.
+That machine's slice of the data is called a **partition**.
+Usually traffic is spread out nicely. But sometimes one key gets crazy popular: a celebrity post, a flash-sale item, a cricket score.
+Now one machine gets almost all the requests, while the others sit idle. That popular key is a **hot key**.
+
+```mermaid
+flowchart LR
+    F["1 million fans"] --> K["one key: post:9"]
+    K --> M1["Machine 3: on fire"]
+    M2["Machines 1, 2, 4: idle"]
+```
+
+Adding more machines does not help, because the same key always goes to the same machine.
+The fix is either to keep copies closer to the readers, or to split the one key into many smaller keys.
+
+```mermaid
+flowchart LR
+    H["Hot key"] --> R["Mostly reads?<br/>Keep copies (cache)"]
+    H --> W["Mostly writes?<br/>Split into key#0..key#N"]
+```
+
+The rest of this note is just these 3 questions:
+1. Why does one key land on one machine, no matter what?
+2. How do you fix a key that is read too much, or written too much?
+3. What do those fixes cost you (old data, lost order, extra reads)?
 
 **The problem in one story.**
 A ticket site stores data across ten machines, each holding a slice of the keys.
@@ -73,7 +107,7 @@ Where it breaks: a supermarket can just let every lane sell tickets; with data, 
 > [!tip] Remember
 > Sharding spreads keys, not traffic: a hot key must be copied (if read-hot) or split (if write-hot), not just given more machines.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A ticketing site opens sales for a stadium concert at 10:00. One million fans are waiting. At 10:00:00 each of them refreshes the event page, which reads the cache key `event:8812:availability`.
 
@@ -95,7 +129,13 @@ Adding a 13th shard does nothing: the key still maps to one slot. The same shape
 | Cassandra / Bigtable / HBase | one partition or tablet | one replica set or one tablet server |
 | SQL row | one row | row lock: writers to it run one at a time |
 
-## 2. Mental model
+## 2. Mental model 🟢
+
+```mermaid
+flowchart LR
+    Z["Zed's 10,000 fans"] --> C["Copy the lane:<br/>any lane can answer (reads)"]
+    Z --> S["Split the work:<br/>Zed-0..Zed-9 over 10 lanes,<br/>add totals at the end (writes)"]
+```
 
 Think of a supermarket with 12 checkout lanes, where every customer is assigned a lane by the first letter of their surname. That works until a celebrity named "Zed" arrives with 10,000 fans who all insist on being in Zed's lane. Opening a 13th lane does not help, because the rule still sends all of them to one lane.
 
@@ -111,9 +151,11 @@ Key terms used below:
 - **Salting (key suffixing):** appending a small number (`#0` to `#N-1`) to a key so its traffic spreads over N physical keys.
 - **L1 cache:** a small cache inside each application process, in front of the shared (L2) cache such as Redis.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Where skew comes from
+
+**In plain words:** "skew" just means traffic is uneven. Here are the usual reasons one key ends up far busier than the rest.
 
 1. **Celebrity or viral content:** a post by an account with 100 million followers, a trending video, a breaking-news article.
 2. **Flash events:** a flash-sale SKU, a concert on-sale, a cricket final's live score.
@@ -123,6 +165,8 @@ Key terms used below:
 6. **Default and null values:** every event without a user ID gets key `""` or `"anonymous"` and lands in one Kafka partition.
 
 ### 3.2 Why one key cannot be spread by the partitioner
+
+**In plain words:** the rule that picks a machine looks only at the key. Same key, same machine, every time. So adding machines never moves a hot key.
 
 Every partitioner, whether `hash % N`, a [[Consistent Hashing]] ring, Redis Cluster's `CRC16(key) mod 16384` slots or a range map, is a **function of the key**. The same key always gives the same partition.
 
@@ -150,6 +194,8 @@ flowchart LR
 ```
 
 ### 3.3 The fix menu
+
+**In plain words:** for reads, keep copies so the hot machine is asked less. For writes, split one key into many and add them up later. For a bad key design, choose a better key.
 
 **Read-hot fixes:**
 
@@ -186,7 +232,7 @@ flowchart TD
     K1 -->|yes| K3["Keep the key; scale the consumer<br/>internally or pre-aggregate upstream"]
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 A social app shows a like count under every post. A celebrity posts; the post gets **50,000 likes per second** at peak and **300,000 count reads per second** (both estimates for the scenario). Counts live in DynamoDB, with Redis in front for reads.
 
@@ -208,6 +254,8 @@ WRITE (50k/s)                         READ (300k/s)
 
 ### The arithmetic
 
+**In plain words:** one key can take only about 1,000 writes a second. We need 50,000. So we split it into about 64 pieces and each piece gets a safe share.
+
 - **Without sharding:** one item `likes:9` receives 50,000 writes/s. One partition allows 1,000 WCU/s, and a 1 KB-or-smaller `UpdateItem` costs 1 WCU. 50,000 WCU/s ÷ 1,000 WCU/s = **50 times over the limit**. Requests are throttled.
 - **Sub-key count:** need N ≥ 50,000 ÷ 1,000 = 50. Pick **N = 64** for head-room: 50,000 ÷ 64 ≈ **781 WCU/s per sub-item**, which is under the limit only if the sub-items land on different partitions.
 
@@ -216,6 +264,8 @@ WRITE (50k/s)                         READ (300k/s)
 - **So reads go through L1:** 200 app pods × 1 refresh per second per pod = **200 sharded reads per second** × 32 RCU = **6,400 RCU/s**, spread over 64 items. Users see a count that is up to 1 s old, which a like counter tolerates.
 
 ### Go code
+
+**In plain words:** the code builds a like counter split into many pieces, a tiny cache inside each server, and a small "is this key hot?" checker.
 
 The code below has three pieces: the sharded counter, the L1 cache, and a simple hot-key detector. The store and the clock are injected, so tests run without Redis and without sleeping. It passes `go vet` and `go test -race` on Go 1.24.
 
@@ -516,7 +566,7 @@ sequenceDiagram
     A-->>U: post with like count
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Technique | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -534,7 +584,7 @@ sequenceDiagram
 > [!warning] Interview trap
 > "Use consistent hashing" or "add shards" does **not** fix a hot key. Both decide *which* shard owns a key; neither lets one key live on two shards. Consistent hashing balances key counts; bounded-load hashing balances *connections* to cache nodes, but one key's requests still go to one place.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Do not shard a counter that is not hot.** Reading 64 sub-keys instead of one is 64 times the read cost. Shard only keys that a detector flags, or only keys known to be hot (celebrity accounts, on-sale events).
 - **Salting a Kafka key breaks ordering for that key.** Messages for `match:42#3` and `match:42#5` land on different partitions and can be consumed out of order. Salt only when consumers do not need per-key order (metrics, analytics), and see [[Message Ordering and Partition Keys]].
@@ -543,7 +593,7 @@ sequenceDiagram
 - **Batching loses data on crash.** Use it for views and impressions, not for payments.
 - **Sometimes the simple fix wins:** if one shard is hot because the cluster is too small *overall*, scale the cluster. Hot-key techniques are for traffic concentrated on a few keys.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real cases:**
 	- **Like and view counters:** sharded counters, or batching in a stream processor, then periodic writes.
@@ -565,7 +615,7 @@ sequenceDiagram
 	- A Kafka consumer for the hot partition falls behind → pre-aggregate upstream, or process the partition with internal parallelism keyed by a finer sub-key.
 - **What to monitor:** max/average ratio of ops per shard, top-N keys by request rate, throttled requests per partition key, per-partition consumer lag, L1 hit rate.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why skew gets worse with scale.** With a Zipf-like distribution, the top key's share of traffic stays roughly constant as total traffic grows.
 
@@ -589,7 +639,7 @@ sequenceDiagram
 
   Options in order of preference: choose a finer key that still gives the ordering you need (`match_id + innings` instead of `match_id`); pre-aggregate before producing; salt the key when order does not matter; inside the consumer, dispatch the hot partition's records to worker goroutines by a finer sub-key while committing offsets only after all earlier records finish.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- We added 4 more Redis shards and one shard is still at 100% CPU. Why?
 > A single key always maps to one slot (`CRC16(key) mod 16384`), so one hot key's traffic stays on one shard no matter how many shards exist. Find the key with `redis-cli --hotkeys` (LFU policy) or per-key sampling, then add an L1 cache with a short TTL and, if needed, replicate the key across slots.
@@ -612,7 +662,7 @@ sequenceDiagram
 > [!question]- An event on-sale makes the seat-availability key hot. Can you use an L1 cache?
 > For the *display* of availability, yes: a 1 s stale "312 seats left" is fine. For the *hold* or purchase, no: that must check the authoritative row (or a per-section single writer) inside a transaction, so two users cannot buy the same seat.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Partitioning spreads keys, not traffic. A hot key lives on one partition.
 - Ceilings: one Redis main thread; DynamoDB 3,000 RCU / 1,000 WCU per partition; one consumer per Kafka partition.

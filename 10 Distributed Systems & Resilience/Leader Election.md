@@ -29,7 +29,42 @@ updated: 2026-11-13
 > - Even so, a paused old leader can wake up and act: protect writes with an **epoch** (fencing) number.
 > - Classic mistake: "the node with the lowest IP is leader", decided by each node from its own view of who is alive. That creates two leaders during a partition.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You run 3 copies of a service, so one crash does not stop you.
+But some jobs must run only once, like "charge every customer today".
+If all 3 copies run it, every customer pays 3 times.
+
+```mermaid
+flowchart LR
+    R1["Copy 1"] --> J["Charge customers"]
+    R2["Copy 2"] --> J
+    R3["Copy 3"] --> J
+    J --> X["Charged 3 times"]
+```
+
+**Leader election** picks exactly one copy to do the job.
+The copies race to grab a **lease**: a record in a safe shared store, with an expiry time.
+The winner is the leader and must keep renewing the lease. If it dies, the lease runs out and another copy takes it.
+
+```mermaid
+flowchart LR
+    R1["Copy 1: holds lease, renews"] --> L["Shared store: lease ends in 10 s"]
+    R2["Copy 2: waits"] -. "tries again later" .-> L
+    R3["Copy 3: waits"] -. "tries again later" .-> L
+```
+
+The rest of this note is just these 3 questions:
+1. How does a copy grab and keep the lease?
+2. What happens when the leader dies or freezes?
+3. How do you stop two copies from both thinking they lead?
 
 **The problem in one story.**
 You run three copies of a billing service so one crash does not stop it.
@@ -75,7 +110,7 @@ Where it breaks: a real runner knows when they dropped the baton; a paused proce
 > [!tip] Remember
 > A leader is just whoever holds an expiring lease in a consistent store, and every leader action should carry its epoch.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 You deploy a billing service with 3 replicas for availability. It has a job, "charge all subscriptions due today at 02:00", that must run **exactly once** per day. If all 3 replicas run it, each customer is charged 3 times. If you pin it to replica 1 and replica 1 dies, nobody is charged.
 
@@ -87,7 +122,15 @@ You need: one replica runs it, and if that replica dies, another takes over with
 
 The hard part is not choosing; it is guaranteeing that two instances never both believe they lead (**split brain**) when the network is partitioned or a process is paused.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    P1["Pin job to copy 1"] --> D["Copy 1 dies"]
+    D --> N["Nobody is charged"]
+    A["Run on all copies"] --> T["Everyone charged 3 times"]
+    E["Leader election"] --> O["Exactly one runs it"]
+```
+
+## 2. Mental model 🟢
 
 **A baton with a sand timer.** There is one baton in a locked box (the consistent store). Whoever takes it turns over a 15-second sand timer and must come back to flip the timer before it runs out.
 
@@ -100,9 +143,11 @@ If the holder does not come back, after the sand runs out anyone may take the ba
 - **Renew deadline:** how long the leader keeps acting without a successful renewal. Always shorter than the TTL.
 - **Epoch (or term, generation, `leaseTransitions`):** a number that grows each time leadership changes. Used as a fencing token.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The lease lifecycle
+
+**In plain words:** grab the lease, renew it before it runs out, and if you cannot renew in time, stop acting as leader.
 
 ```mermaid
 sequenceDiagram
@@ -131,6 +176,8 @@ sequenceDiagram
 
 ### Each instance's states
 
+**In plain words:** each copy is either a follower waiting, a candidate trying to grab the lease, or the leader doing the work.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Follower
@@ -144,14 +191,18 @@ stateDiagram-v2
 
 ### Four rules that keep it safe
 
+**In plain words:** let the store decide, renew early, step down on time, and protect writes with a growing number.
+
 1. **The store decides.** Acquisition must be an atomic compare-and-set (or create-if-absent) on a linearizable store. Two instances cannot both succeed.
 2. **The leader gives up early.** It stops leader-only work when `now - lastSuccessfulRenew >= renewDeadline` (10 s), while followers wait for the full lease duration (15 s). The gap absorbs clock-rate differences and in-flight requests.
 3. **Every takeover bumps the epoch.** Downstream systems reject writes carrying an older epoch. This handles the case rule 2 cannot: a leader paused *in the middle* of a write.
 4. **Release on shutdown.** A leader that stops cleanly deletes the lease so a follower takes over immediately instead of waiting 15 s.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** a loop: try to take the lease; if you have it, renew and work; if renewal fails, stop at once.
 
 ```text
 loop every retryPeriod (2s):
@@ -168,6 +219,8 @@ on SIGTERM: release lease if I hold it
 ```
 
 ### Go implementation with an injected clock
+
+**In plain words:** working code for the lease loop; time is passed in so tests can fast-forward the clock.
 
 `Store` is the linearizable compare-and-set store (in production, etcd or a Kubernetes Lease object). `Elector` is one candidate. The clock is injected so the tests can simulate a 15-second pause without sleeping. It passes `go vet` and `go test -race` on Go 1.24.
 
@@ -378,7 +431,7 @@ Kubernetes' client-go avoids comparing them: each candidate measures, with its o
 
 That still assumes clocks *run* at roughly the same rate, which is why the 10 s / 15 s margin exists.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Method | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -392,6 +445,8 @@ That still assumes clocks *run* at roughly the same rate, which is why the 10 s 
 | Database lease | `pg_try_advisory_lock(42)` on a session, or a `leases` row updated with `WHERE expires_at < now()` | You already have PostgreSQL and no etcd | The database becomes a dependency of failover; advisory locks are lost silently when the connection drops |
 
 ### PostgreSQL lease row
+
+**In plain words:** one row in a table is the lease, and the database's own clock decides when it has expired.
 
 When the only consistent store you have is PostgreSQL, a lease row works. The database's clock (`now()`) is the single clock, and the `epoch` column is the fencing token.
 
@@ -427,7 +482,7 @@ UPDATE 1
 
 A call by `pod-b` while `pod-a`'s lease is live returns `(0 rows)` and `UPDATE 0`. The row lock taken by `UPDATE` serializes competing candidates, so at most one sees a row back.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Failover is never instant.** Detection time is roughly the lease duration, plus the retry period, plus the new leader's warm-up. Shorter leases mean faster failover but more renewal traffic and more false failovers during GC pauses or brief network blips.
 - **A lease is a promise about time.** It holds only if clocks run at similar rates and pauses are shorter than the margin. Add fencing for anything that writes.
@@ -436,7 +491,14 @@ A call by `pod-b` while `pod-a`'s lease is live returns `(0 rows)` and `UPDATE 0
 	- For "run this cron job once", a row lock with `FOR UPDATE SKIP LOCKED` on a jobs table, or a unique constraint on `(job, run_date)`, makes duplicates impossible without any election (see [[Scheduled Jobs - Cron to Durable Schedulers]]).
 	- Idempotent work can simply run on every replica.
 
-## 7. In production
+```mermaid
+flowchart LR
+    D["Leader dies"] --> W["Lease runs out, about 10 s"]
+    W --> R["Another copy retries and grabs it"]
+    R --> S["New leader starts work"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:**
 	- `kube-controller-manager` and `kube-scheduler` run several replicas with one active via a Lease object.
@@ -451,7 +513,7 @@ A call by `pod-b` while `pod-a`'s lease is live returns `(0 rows)` and `UPDATE 0
 	- Advisory-lock leader loses its DB connection and the lock with it, but keeps running → check the lock (or re-acquire) before each unit of work, or use the lease row with an epoch.
 - **What to monitor:** current leader identity, leadership transitions per hour, time since last successful renewal, renewal latency, and time with no leader during failovers.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why renew deadline < lease duration.** The leader starts its 10 s countdown from when it *sent* its last successful renewal (the Go example records the time before calling the store for this reason), while the store computes expiry from when it *received* it, which is later. So the leader always believes its lease ends before the store does. The 5 s gap also absorbs a clock that runs a little fast and the time to finish an in-flight operation.
 - **Detection vs safety.** A failure detector (heartbeats, phi accrual; see [[Failure Detection, Gossip and Membership]]) can say a leader is *probably* dead. It can never be sure, because a slow node looks like a dead one. So the safety of election must come from the store's atomic compare-and-set and from fencing, never from "I think the leader is dead".
@@ -460,6 +522,8 @@ A call by `pod-b` while `pod-a`'s lease is live returns `(0 rows)` and `UPDATE 0
 - **Epoch in the data path.** The strongest form puts the epoch inside the store transaction itself: etcd transactions can check that the leader key still has its create revision (`Txn().If(Compare(CreateRevision(leaderKey), "=", rev))`), so a write succeeds only while that exact leadership is live.
 
 ### The same with etcd's election API
+
+**In plain words:** if you already run etcd, its library does the lease, the race and the renewal for you.
 
 In a Go service that already runs etcd, the library does the lease, the campaign and the watch-your-predecessor logic. This compiles and passes `go vet` against `go.etcd.io/etcd/client/v3` v3.6.7; it needs a live etcd cluster to run, so it has no unit test here.
 
@@ -511,7 +575,7 @@ func RunAsLeader(ctx context.Context, cli *clientv3.Client, id string, work func
 
 `sess.Done()` closes when the keep-alive fails and the lease is gone, but the process learns that late, so the epoch still has to be checked downstream.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why can't each node just elect the node with the highest ID among those it can reach?
 > During a partition each side sees a different set of live nodes and elects its own leader: split brain. Election must go through a majority-backed decision (a consensus store or a quorum vote), so the minority side cannot elect anyone.
@@ -531,7 +595,7 @@ func RunAsLeader(ctx context.Context, cli *clientv3.Client, id string, work func
 > [!question]- Do you even need a leader for a daily cron job?
 > Often not. Insert a row keyed by `(job_name, run_date)` with a unique constraint, or claim it with `SELECT … FOR UPDATE SKIP LOCKED`; whoever inserts or claims it runs it. That turns "exactly one runner" into a database constraint.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Leader = holder of a lease in a linearizable store, acquired by compare-and-set.
 - Kubernetes defaults: 15 s lease, 10 s renew deadline, 2 s retry.

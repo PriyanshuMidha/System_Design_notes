@@ -34,7 +34,39 @@ flowchart LR
 
 Everything in this note is about making each arrow fast and each box well-defined: what counts as "detected," who decides severity, what "mitigate" is allowed to mean before root cause is known, and how you know you are actually stable rather than just quiet for five minutes.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+An **incident** is when your system is broken for users right now.
+In a panic, everyone jumps in and nobody is in charge. That makes it worse.
+So you follow a simple drill: notice it, judge how bad it is, pick one leader, stop the damage, then figure out why.
+
+```mermaid
+flowchart LR
+    D["Detect"] --> T["Triage: how bad?"] --> L["One leader"] --> M["Stop the damage"] --> R["Resolve"] --> P["Postmortem"]
+```
+
+A **severity** level (SEV1 = worst) tells everyone how urgent it is.
+People get clear jobs: one leads, one fixes, one talks to customers, one writes notes.
+
+```mermaid
+flowchart LR
+    IC["Incident commander: decides"] --> O["Ops lead: fixes"]
+    IC --> Cm["Comms: updates users"]
+    IC --> Sc["Scribe: notes"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you rate how bad an incident is?
+2. Who does what during the incident?
+3. How do you communicate and keep a timeline?
+
 
 **The problem in one story.**
 At 2 a.m. the checkout page starts failing.
@@ -78,7 +110,7 @@ Where it breaks: a fire is obvious, but a software incident can look "quiet" whi
 > [!tip] Remember
 > One person in charge, stop the bleeding first, explain it later.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps's payment webhook handler commits the database update for an invoice, then returns `200 OK`.
 
@@ -94,7 +126,7 @@ With a defined process, the shape is different: the on-call engineer who takes t
 
 The difference between the two timelines is not technical skill — it is that **mitigation did not wait for a decision about who was allowed to act.**
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 An incident runs like an emergency room, not like a debugging session at a desk.
 
@@ -105,9 +137,11 @@ An incident runs like an emergency room, not like a debugging session at a desk.
 
 The mistake this model rules out: treating an incident like solo debugging, where one person reads code quietly until they understand the bug. An incident needs **coordination and a stop-the-bleeding action** before it needs understanding.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Severity
+
+**In plain words:** a small scale from SEV1 (big outage, wake people up) to SEV4 (minor). The table says what counts as each.
 
 | Severity | Criteria (any one qualifies) | Paging | Example |
 | -------- | ----------------------------- | ------ | ------- |
@@ -128,6 +162,8 @@ An incident starts the moment any of these fires, not the moment someone opens a
 
 ### Roles
 
+**In plain words:** borrowed from fire and rescue teams: one commander makes calls, others do the hands-on work, talking and note-taking.
+
 Borrowed from the Incident Command System (ICS) that emergency services use, and the model both PagerDuty and incident.io document for software incidents:
 
 - **Incident Commander (IC).** Owns the incident's state and decisions: declares severity, decides what gets mitigated and when, decides when the incident is resolved. The IC does **not** read logs or write a fix themselves — the moment they start debugging, nobody is tracking the incident as a whole, and decisions stop getting made.
@@ -138,6 +174,8 @@ Borrowed from the Incident Command System (ICS) that emergency services use, and
 For a SEV3/SEV4, one person often holds all four roles — the model does not require four separate humans, it requires that all four jobs get done by someone.
 
 ### Lifecycle
+
+**In plain words:** every incident moves through the same stages, from "something's wrong" to "we wrote down what we learned".
 
 ```mermaid
 stateDiagram-v2
@@ -153,6 +191,8 @@ stateDiagram-v2
 The transition most teams skip is **Mitigated → Resolved**: "the error rate just went back to zero" is not the same as "it will stay at zero." Resolved means the symptom held through at least one more full cycle of whatever caused it (one more deploy wave, one more traffic peak) before anyone stands down.
 
 ### Communication during the incident
+
+**In plain words:** regular short updates on a fixed schedule, to a known channel, even if the update is "still working on it".
 
 ```mermaid
 sequenceDiagram
@@ -177,7 +217,7 @@ sequenceDiagram
 
 Every arrow into Comms is the IC's job, not the tech lead's — this is the concrete reason the roles are split: without a Comms lead, "what's the status?" messages interrupt the one person actually fixing the problem.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -201,6 +241,8 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 This is the entire mechanism behind "flip the kill switch" in the timeline above: a flag an IC can set from a config service or admin endpoint in seconds, with no deploy and no code change, buying time for the real fix.
 
 ### A timeline recorder for the scribe role
+
+**In plain words:** Go code for a simple timestamped log of who did what, which later becomes the postmortem timeline.
 
 The scribe's timestamped log is the raw material the postmortem's timeline section is built from (see [[Postmortems and Root Cause Analysis]]). It has one real requirement: appends from multiple goroutines (the IC's handler, a Slack-bot integration, a status-page webhook) must never race or lose an entry.
 
@@ -323,7 +365,7 @@ Total time to mitigation: 4 minutes 20 seconds from alert to rollback complete.
 
 Root cause (a changed timeout value that made the load balancer time out before the handler's response, not the handler being slow) was found afterward, during the postmortem, and took a further 40 minutes to isolate — confirming the mitigate-first order: a correct fix that takes 40 minutes would have let the duplicate count run roughly ten times longer than the rollback did.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Model | How it works | Use when | Cost |
 | ----- | ------------- | -------- | ---- |
@@ -335,14 +377,14 @@ Root cause (a changed timeout value that made the load balancer time out before 
 > [!warning] Interview trap
 > "Who fixes the bug during an incident?" is the wrong question to lead with. The IC's job is to decide **whether and when** to mitigate, not to write the fix — conflating the two is the single most common mistake candidates make describing incident response.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Formal roles add coordination overhead that is wasted on a SEV4 — a typo in an internal admin page does not need a four-person process.
 - "Mitigate first" sometimes means rolling back a deploy that also contained an unrelated urgent fix; reverting always has an opportunity cost, which is why the IC's call must weigh user impact against it, not apply the rule blindly.
 - A rigid severity rubric can be gamed (under-reporting severity to avoid paging), so the numbers behind each tier must be audited, and SEV levels should be reviewed when a SEV2 incident turns out to have hidden SEV1-level data loss discovered later.
 - Running a full IC/tech/comms/scribe rotation requires enough on-call staff to fill it at any hour; a four-person team cannot realistically dedicate four people to every page.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Google's SRE practice (the book's "Managing Incidents" chapter) formalized IC/Ops/Comms roles for software incidents from the ICS model; PagerDuty, Opsgenie and incident.io all ship IC-rotation tooling and status-page integrations built around the same roles; most companies run their live coordination in a dedicated chat channel (ChatOps) per incident, created automatically when a SEV1/SEV2 is declared.
 - **Failure modes → fixes:**
@@ -356,7 +398,7 @@ Root cause (a changed timeout value that made the load balancer time out before 
   - Repeat-incident rate: the fraction of incidents whose root cause matches a previous incident's, the clearest signal that postmortem action items are not being completed.
   - Pages per on-call shift, to catch alert fatigue before it causes a missed page.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why "mitigate before root cause" survives scrutiny.** The objection is "what if the rollback doesn't actually fix it, and we wasted time?" The answer is asymmetric cost: a rollback is a known, reversible, pre-tested state (the previous deploy was running minutes ago, under load, without this symptom), while a root-cause fix is unverified code written under pressure.
 
@@ -372,7 +414,7 @@ Separating the roles is a scheduling discipline, not a skill hierarchy — the I
 
 **"Investigating" is also an action.** The comms lead's first update should go out within minutes of declaration even with zero new information — "we are aware and investigating" sets expectations and stops a flood of "is anyone looking at this?" messages from both customers and internal stakeholders, which themselves consume the tech lead's attention.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Walk me through what you do in the first five minutes of a page.
 > Acknowledge the page, assess impact against the severity table (not a gut feeling), declare yourself IC if no one else has, and check "what changed" (deploys, config, flags, traffic, data). If a cheap, reversible mitigation exists (rollback, kill switch, failover), do it before investigating further.
@@ -395,7 +437,7 @@ Separating the roles is a scheduling discipline, not a skill hierarchy — the I
 > [!question]- Tell me about an incident you led or participated in.
 > Structure the answer around the lifecycle: what detected it, what severity and why, what the mitigation was and how fast, and one concrete number (duplicate count, users affected, minutes to mitigate). Name one thing the postmortem changed afterward.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Mitigate first (rollback, kill switch, failover, scale, shed load, block abuser); root-cause after stable.
 - Severity is a table with concrete criteria (users, revenue, data loss), not a feeling.

@@ -24,7 +24,33 @@ updated: 2026-11-13
 > - The rule that matters: SDK types never leak past the adapter into business code.
 > - Classic mistake: an adapter that ignores `ctx` and returns raw SDK errors, so callers cannot cancel or decide what to retry.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then the rest of this "Start here" section, sections 1, 2 and the cheat sheet (10). Skip the big code blocks on a first pass. Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works, with the small whiteboard code), section 4 (the full worked example) and sections 5 and 6 (variants and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your code wants to call things in its own way. Outside code (a payment company's library) has its own way.
+The two ways do not match: different names, different money units, different errors.
+An **adapter** is a small piece of code in the middle that translates one way into the other.
+Your code only ever talks to a shape you design, called an **interface** (a list of methods you promise to have).
+When you add a new provider, you write one new adapter. The rest of your code does not change.
+
+```mermaid
+flowchart LR
+    A["Your checkout code"] --> B["Adapter<br/>(translator)"]
+    B --> C["Payment company's library"]
+```
+
+This note teaches the idea with Go code. Read the words first; the code just shows the same idea in detail.
+The rest of this note is just these 3 questions:
+1. What exactly does the adapter translate (calls, timeouts, errors)?
+2. How do you write one in Go, and test it without the real provider?
+3. How is it different from Facade, Decorator and Proxy?
+
 
 **The problem in one story.**
 Your shop takes payments through Razorpay today.
@@ -67,7 +93,7 @@ Where it breaks: a plug adapter only changes shape; a software adapter also has 
 > [!tip] Remember
 > Your code owns the interface; the adapter bends the outside world to fit it, and SDK types never leak past it.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A checkout service accepts Razorpay, Stripe, an internal wallet and cash on delivery. Each provider has its own SDK: different method names, amount types, metadata formats and error types. If the checkout code calls the SDKs directly:
 
@@ -78,7 +104,7 @@ A checkout service accepts Razorpay, Stripe, an internal wallet and cash on deli
 
 The adapter below avoids the last two problems: it honours `ctx` and translates SDK errors into domain errors.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A travel plug adapter.
 
@@ -88,7 +114,7 @@ A good travel adapter also has a fuse: it protects your side from whatever the w
 
 The key point is **direction**: you own the target interface, written in your domain's words, and adapt the external thing **to it**. If you shape your interface after one SDK, the next SDK will not fit.
 
-## 3. How it works
+## 3. How it works 🟡
 
 1. **Define the target interface on your side**, in domain terms: `PaymentGateway.Charge(ctx, ChargeRequest)` with amounts in paise and your own error values `ErrDeclined`, `ErrUnavailable`, `ErrUnknownOutcome`.
 2. **Describe the slice of the SDK you use** as a small interface (`RazorpaySDK`). The real SDK client satisfies it implicitly, and tests can supply a fake.
@@ -138,6 +164,8 @@ Every method also returns an `error`, left out of the diagram for space. The rea
 
 ### A timeout for an SDK call that takes no context
 
+**In plain words:** The provider's library has no "give up after 3 seconds" button, so the adapter holds a stopwatch itself and walks away if the answer is too slow.
+
 The adapter runs the SDK call in a goroutine and waits on whichever comes first: the result or `ctx.Done()`.
 
 ```mermaid
@@ -163,6 +191,8 @@ Two details make this safe:
 - A timeout **abandons** the call; it does not cancel it. The provider may still charge the customer. That is why a timeout maps to `ErrUnknownOutcome` ("check the payment status before retrying"), not to "failed".
 
 ### Whiteboard version
+
+**In plain words:** This is the smallest adapter you can draw in an interview: your interface on one side, a struct that fits it on the other.
 
 The adapter implements our interface and converts rupees, context and errors at the boundary. This is the bare idea you can draw in two minutes; the full version below adds production concerns.
 
@@ -208,7 +238,9 @@ func main() {
 }
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
+
+**In plain words:** The full program: our payment interface, a Razorpay adapter that fits it, a fake Razorpay for testing, and a small `main` that shows each case. Read the comments and the printed output; you do not need to follow every line.
 
 One `package main` with `PaymentGateway`, `ChargeRequest` and `RazorpayAdapter`, including context handling, a timeout, error translation, a compile-time check, a function adapter and a fake SDK. `RzpError` codes are modeled on Razorpay's documented error codes; the SDK itself is an in-memory stand-in. Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
 
@@ -402,6 +434,9 @@ func main() {
 }
 ```
 
+
+**In plain words:** These are the tests. Each one feeds the adapter a fake provider answer and checks that our code sees the right error.
+
 ```go
 package main
 
@@ -506,7 +541,7 @@ What to notice:
 - **slow**: the 50 ms SDK call lost to the 20 ms timeout, and the error wraps both `ErrUnknownOutcome` and `context.DeadlineExceeded` (two `%w` verbs, allowed since Go 1.20).
 - **cod** and **http.HandlerFunc**: functions turned into interface values by a one-line method.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 **Forms of Adapter in Go:**
 
@@ -528,7 +563,7 @@ What to notice:
 
 See [[Facade (vs Mediator)]], [[Decorator and Middleware]] and [[Proxy]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **One provider, used in one place, with no plan for a second:** calling the SDK directly from a small payment package can be fine. Add the adapter when a second provider or real tests appear. Even then, keep provider types out of your domain packages.
 - **The SDK already accepts `context.Context` and returns usable errors:** the adapter becomes thin (renaming and error mapping only). Do not add a goroutine-and-select timeout; pass the context through.
@@ -536,7 +571,7 @@ See [[Facade (vs Mediator)]], [[Decorator and Middleware]] and [[Proxy]].
 - **Leaky adapters** return provider structs or wrap provider errors with `%w`. Callers then type-assert on them, and the adapter stops protecting anything.
 - **Cost:** one more type and one translation per call (negligible next to a network call), plus mapping tables to keep up to date when the provider adds error codes.
 
-## 7. In production
+## 7. In production 🔴
 
 **Real systems:**
 
@@ -561,7 +596,7 @@ See [[Facade (vs Mediator)]], [[Decorator and Middleware]] and [[Proxy]].
 
 **What to monitor:** per provider and per domain error (`declined`, `unavailable`, `unknown_outcome`): call rate, error rate and latency percentiles. Watch the count of timeouts, because every timeout is a payment that needs reconciliation.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Anti-corruption layer.** In Domain-Driven Design, an anti-corruption layer is the translation boundary that stops an external model from leaking into yours. A payment adapter is a small one: your model says `Amount int64 // paise` and `OrderID`; Razorpay's says amount, a user reference and a `notes` map. For a large external system (a courier platform with its own status machine), the layer also translates **states**: "OUT_FOR_PICKUP" and "REACHED_PICKUP" may both map to your `PickupInProgress`. Keep the layer in its own package (`payments/razorpay`) that imports both models; nothing in your domain packages imports the SDK.
 
@@ -575,7 +610,7 @@ See [[Facade (vs Mediator)]], [[Decorator and Middleware]] and [[Proxy]].
 
 **Testing with a fake SDK.** Because the adapter depends on the narrow `RazorpaySDK` interface, tests swap in `FakeRazorpay` and script failures (`Errs`) and latency (`Delay`). Each translation rule, the retry policy, the timeout and the cancelled-context case get their own test, with no network.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the intent of the Adapter pattern?
 > To make an existing type that you cannot change fit an interface that you own. The interface is written in your domain's terms; each adapter translates calls, data and errors from one external API into it, so the rest of the code never sees the external API.
@@ -598,7 +633,7 @@ See [[Facade (vs Mediator)]], [[Decorator and Middleware]] and [[Proxy]].
 > [!question]- Why is `http.HandlerFunc` called an adapter?
 > It converts a function with the right signature into a type that has a `ServeHTTP` method, so a plain function satisfies the `http.Handler` interface. The method simply calls the function.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - You own the target interface; adapt each external API to it, never the reverse.
 - Object adapter = struct holding the SDK; function adapter = func type with the one method (`http.HandlerFunc`).
@@ -609,7 +644,7 @@ See [[Facade (vs Mediator)]], [[Decorator and Middleware]] and [[Proxy]].
 - Test with a fake SDK that scripts errors and latency.
 - Adapter changes the interface; Decorator and Proxy keep it; Facade simplifies many.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Interfaces]], [[Error Handling]], [[Context Package]]
 - **Next:** [[Decorator and Middleware]]

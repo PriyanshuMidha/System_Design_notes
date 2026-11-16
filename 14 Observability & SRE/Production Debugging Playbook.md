@@ -33,7 +33,37 @@ flowchart LR
 
 Each step narrows scope by roughly an order of magnitude: metrics narrow "something is wrong" down to "latency, not errors, and only on `POST /invoices`"; traces narrow that down to "the `db.update_invoice` span"; logs narrow that down to the exact SQL error and the request ID that triggered it.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Something is broken in production. The worst move is to open the logs and start reading at random.
+Instead, follow a fixed order, from cheap clues to detailed ones.
+First ask: how bad is it, and what changed recently? Most outages follow a deploy or a config change.
+
+```mermaid
+flowchart LR
+    I["How bad?"] --> C["What changed?"] --> S["Who is affected?"] --> M["Metrics"] --> T["Traces"] --> L["Logs"]
+```
+
+Compare who is failing with who is not: one region? one endpoint? one customer? That narrows things fast.
+Your first job is to stop the pain (roll back, turn a flag off), not to find the deep cause. That comes after.
+
+```mermaid
+flowchart LR
+    F["Found likely cause"] --> Mi["Mitigate first<br/>(rollback, flag off)"] --> R["Then root cause, calmly"]
+```
+
+The rest of this note is just these 3 questions:
+1. What are the steps, in order?
+2. Which symptom patterns point to which cause?
+3. What does a real incident look like, with numbers?
+
 
 **The problem in one story.**
 At 2 am your phone buzzes: "checkout is slow".
@@ -78,7 +108,7 @@ Where it breaks: a patient can describe symptoms; a service can't, so you rely o
 > [!tip] Remember
 > Impact, what changed, scope, then metrics → traces → logs; mitigate first, explain second.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 At 02:14, InvoiceOps's p99 latency on `GET /invoices/:id` jumps from 180 ms to 2.1 s. p50 stays flat at 40 ms. Without a method, the natural instinct is to open the slowest-looking code path and start reading — which, on a 40,000-line service, is a search with no stopping condition.
 
@@ -88,19 +118,21 @@ Scoping by cohort shows the slow requests cluster on one Kubernetes pod. A trace
 
 One pod's connection pool is exhausted — probably by a long-running query or a connection leak specific to that pod's recent restart — not a database-wide problem. The mitigation (restart the pod, which resets its pool) takes thirty seconds; finding that same fact by reading code would have taken much longer, if it was found at all.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Debugging in production is **the scientific method under time pressure**: form a hypothesis from the cheapest evidence available, check it against slightly more expensive evidence, and discard it the instant it is contradicted — rather than committing to the first plausible story and hunting for evidence that confirms it.
 
 The funnel in the whiteboard version encodes a cost ordering: a metrics query answers in milliseconds over already-aggregated data; a trace lookup answers in seconds over one request; grepping logs across a fleet can take minutes. Always spend the cheap step first, because it usually tells you exactly where to spend the next, more expensive one.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Step 1: Impact and severity
 
 Before anything else: how many users, which operation, and is data being lost? This decides whether you are debugging calmly or triggering [[Incident Response]] first. A 2 s p99 on a read endpoint and a payment webhook silently dropping events are both "slow," but only one needs a kill switch flipped in the next sixty seconds.
 
 ### Step 2: What changed?
+
+**In plain words:** deploys, config edits, traffic shifts and dependency changes cause most outages. Check them first.
 
 In order of how often each one is the actual cause:
 
@@ -115,6 +147,8 @@ In order of how often each one is the actual cause:
 A changefeed that lists all of these on one timeline (see the Go example below) turns "what changed" from a round of Slack messages into a single query.
 
 ### Step 3: Scope by cohort
+
+**In plain words:** split traffic into groups (region, endpoint, version) and see which group is broken. The difference points at the cause.
 
 Compare a cohort that is failing against one that is not, varying one dimension at a time: endpoint, region/AZ, tenant, client version, pod, or client type. "Everyone, everywhere, right now" points at a global dependency or deploy.
 
@@ -139,15 +173,21 @@ flowchart TD
 
 ### Step 4–6: Metrics → traces → logs
 
+**In plain words:** use graphs to find where, traces to find which step, and logs to find exactly why.
+
 - **Metrics** answer "which RED signal, for which route, since when" (see [[Metrics and Prometheus]]). This is where you learn p99-only-not-p50, or 5xx-only-from-one-pod, or 429s rising on calls to one dependency.
 - **Traces** answer "which span, on an actual slow or erroring request" (see [[Distributed Tracing with OpenTelemetry]]). Read the waterfall for the critical path: a gap between spans with no span covering it is time lost to queueing, scheduling, or GC, not to any instrumented code.
 - **Logs** answer "what exact error, for which request ID, with what payload shape" (see [[Structured Logging]]) — the most expensive signal to search, so it is read last, once traces have already pointed at the suspect component.
 
 ### Step 7–8: Mitigate, then root-cause
 
+**In plain words:** pick the cheapest fix that stops user pain now. Find the true cause once things are calm.
+
 Pick the cheapest mitigation that removes user impact, in roughly this order of cost: feature flag off, rollback, failover to a healthy replica/region, scale out, shed low-priority load, block one abusive client. Root cause and prevention become the postmortem's job once the system is stable (see [[Postmortems and Root Cause Analysis]]).
 
 ### Symptom patterns worth recognizing on sight
+
+**In plain words:** some graph shapes are almost signatures. Learn them and you skip half the search.
 
 | Pattern | Usual cause |
 | ------- | ----------- |
@@ -158,6 +198,8 @@ Pick the cheapest mitigation that removes user impact, in roughly this order of 
 | Latency rising slowly over hours, no deploy | A slow leak (memory, goroutines, or an unbounded cache) rather than a single triggering event |
 
 ### A culprit catalogue for "nothing changed, but it's slow/broken anyway"
+
+**In plain words:** when nobody deployed anything, look at things that fill up slowly: pools, disks, certificates, memory.
 
 - **Connection pool exhaustion** — `sql.DBStats.WaitCount` climbing; see [[Debugging Database Performance]] and [[Connection Pooling]].
 - **DNS** — a resolver cache expiring, or a DNS-based failover not propagating; check with `dig` (see [[Network Debugging Toolkit - dig, curl, ss, tcpdump]]).
@@ -182,7 +224,7 @@ Queues and background workers fail in their own characteristic ways, invisible t
 | `/debug/pprof` (Go) | CPU, heap, goroutine, block and mutex profiles — see [[Benchmarks, Profiling and Tracing]] |
 | `EXPLAIN (ANALYZE, BUFFERS)`, `pg_stat_activity` | Query plan and actual execution; what every connection is currently doing/waiting on — see [[Debugging Database Performance]] |
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -329,6 +371,8 @@ func TestChangeFeedSinceFiltersByTime(t *testing.T) {
 
 ### The 02:14 incident, worked with real numbers
 
+**In plain words:** a real-feeling walk through one incident, showing which number gave the game away.
+
 Representative output (PostgreSQL 17) — `sql.DBStats` sampled on the affected pod during the incident:
 
 ```text
@@ -342,7 +386,7 @@ WaitDuration:       38.6s
 
 Twenty connections, all in use, 1,842 goroutines having queued for one at some point — a pool that has run out, not a database that is slow to answer once a connection is acquired. `pg_stat_activity` on the database at the same moment showed no long-running or blocked queries, which rules out a database-side lock problem and points squarely at the pod's own pool or a connection leak.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 | -------- | ------------- | -------- | ---- |
@@ -351,14 +395,14 @@ Twenty connections, all in use, 1,842 goroutines having queued for one at some p
 | Read-the-code-first | Start from the suspected function and reason about it | A bug reproducible locally, no production-only behaviour | Does not scale to "which of 40 services" or timing-dependent bugs |
 | Differential/cohort comparison | Compare a failing cohort against a healthy one across every available dimension | The failure is scoped to something (a tenant, a pod, a version) but you don't yet know what | Needs enough cardinality in metrics/logs to slice by | 
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - The funnel assumes metrics, traces and logs are already wired up and correlated by a shared ID; without that instrumentation, the method degrades back to "read logs and guess," which is why [[Observability Fundamentals]] is a prerequisite, not an afterthought.
 - Mitigating before root-causing can mask a problem that will recur — a restarted pod with a connection leak will leak again; the playbook explicitly defers, not skips, root cause.
 - For a bug with no production impact (caught in staging, no users affected), the formal scope-then-mitigate sequence is overkill; just read the code and fix it.
 - Cohort comparison needs enough traffic volume per cohort to be statistically meaningful — comparing one request from a rare cohort against thousands from a common one is not a comparison, it's noise.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** this funnel (narrow by metric, confirm by trace, nail down by log) is the backbone of how Google's SRE practice describes effective troubleshooting, and matches how most APM vendors (Datadog, Honeycomb, Grafana) structure their own investigation UIs — metrics dashboard first, trace waterfall next, log search last.
 - **Failure modes → fixes:**
@@ -368,7 +412,7 @@ Twenty connections, all in use, 1,842 goroutines having queued for one at some p
   - Mitigation gets skipped in favor of "just fixing it properly" → make the cheap mitigations (feature flag, rollback) a one-click action, so they are never slower than writing a patch.
 - **What to monitor:** time-to-first-hypothesis (how long from alert to "I think it's X"), time-to-mitigation, how often the first hypothesis was actually correct (a low rate suggests scoping is being skipped), and dashboard/trace query volume during incidents as a proxy for how much the tooling is actually used.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why order matters, not just coverage.** Teams with all three signals still debug slowly when they read logs first. A log search across a fleet, even a fast one, returns ambiguous matches until you already know roughly where to look; a metrics query answers "where" in milliseconds, and a trace then answers "which exact span," which turns the subsequent log search from "grep everything" into "pull the five log lines with this request ID."
 
@@ -380,7 +424,7 @@ That gap is time spent somewhere the SDK did not see: scheduler queueing, GC, a 
 
 **Tail amplification changes the "symptom pattern" table.** A service that fans out to 100 downstream calls and waits on all of them has its p99 dominated by the single slowest call, even if only 1% of individual calls are themselves slow (`1 − 0.99^100 ≈ 63%` of requests touch at least one slow call) — which is why "p99 up, p50 flat" so often points at one dependency or one shard, not a global problem (see [[Latency, Percentiles and Bottleneck Analysis]] for the full derivation).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- p99 latency tripled but p50 is flat. Walk me through your investigation.
 > p50 flat rules out a global slowdown; p99-only points at a tail cause: one bad pod/node, GC pauses, pool exhaustion affecting a subset of requests, or a hot partition. Scope by cohort (which pod, which tenant, which shard) before reading any code, then confirm with a trace from one of the slow requests.
@@ -400,7 +444,7 @@ That gap is time spent somewhere the SDK did not see: scheduler queueing, GC, a 
 > [!question]- What makes "what changed" the highest-leverage question in production debugging?
 > The large majority of incidents trace back to a deploy, config edit, flag flip, cron run, or a data backfill — all of which are cheap to check (a timeline query) compared to reading code, and all of which have a cheap, known-good reversal (rollback, flag off).
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Funnel: metrics (which signal, which cohort) → traces (which span) → logs (exact error) — cheapest, most-specific-last.
 - Always ask "what changed" first: deploy, flag, config, cron, data backfill, dependency, traffic.

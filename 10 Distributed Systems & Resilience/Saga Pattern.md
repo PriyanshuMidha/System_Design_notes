@@ -26,7 +26,40 @@ updated: 2026-11-13
 > - Sagas are atomic in the end (all or compensated) but not isolated: other requests can see half-finished work.
 > - Classic mistake: charging the card before reserving stock, so every stock-out turns into a refund.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Checkout in an online shop touches three services: stock, payment and shipping.
+Each has its own database, so you cannot wrap them in one big transaction.
+What if stock is reserved and the payment then fails?
+
+```mermaid
+flowchart LR
+    S["Reserve stock: done"] --> P["Charge card: FAILS"]
+    P -.-> X["Stock stuck as reserved"]
+```
+
+A **saga** runs the job as a chain of small steps, one per service.
+Each step commits on its own.
+If a later step fails, the saga runs **compensations**: business undo steps for the steps that already finished, in reverse order.
+So "reserve stock" is undone by "release stock".
+
+```mermaid
+flowchart LR
+    S["Reserve stock"] --> P["Charge card: fails"]
+    P --> U["Undo: release stock"]
+```
+
+The rest of this note is just these 3 questions:
+1. Who drives the steps: one boss (orchestrator) or the services themselves?
+2. Which steps can be undone, and in what order should they run?
+3. What goes wrong when two sagas run at the same time?
 
 **The problem in one story.**
 You buy a keyboard online.
@@ -70,7 +103,7 @@ Where it breaks: phone cancellations are done by you on the spot, but a saga mus
 > [!tip] Remember
 > A saga is a chain of local commits with an undo step for each, run in reverse when a later step fails.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An online shop splits checkout across three services, each with its own database:
 
@@ -86,7 +119,7 @@ Inside one PostgreSQL database you would wrap all three in `BEGIN … COMMIT`. A
 
 Without a pattern, a crash between "charge card" and "book courier" leaves a customer charged with no shipment, and nobody notices until a support ticket arrives. A saga makes that gap explicit: every step either completes, or the steps before it are compensated, and the saga's own state is persisted so a crash cannot lose track.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A saga is a **travel booking done by phone**. You book a flight, then a hotel, then a car. If the car company has nothing, you do not "roll back time". You call the hotel and cancel, then call the airline and cancel. Each cancellation is a new, real action with its own rules: the airline may keep a fee.
 
@@ -96,7 +129,7 @@ Three terms used throughout:
 - **Compensating action (compensation):** a new local transaction that semantically undoes an earlier one. It is a business action (a refund, a release, an apology email), not a database rollback. The original row stays in history.
 - **Saga log:** the persisted record of which steps finished, so the saga can resume after a crash.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Two ways to coordinate
 
@@ -154,6 +187,8 @@ sequenceDiagram
 
 ### Step types and the ordering rule
 
+**In plain words:** do the easy-to-undo steps first, then the one point of no return, then only steps that can be retried until they work.
+
 Not every step can be undone. Richardson's *Microservices Patterns* names three kinds:
 
 | Step kind | Meaning | Checkout example | On failure |
@@ -166,7 +201,15 @@ Not every step can be undone. Richardson's *Microservices Patterns* names three 
 
 A common design charges the card first and reserves stock second. With that order a stock-out needs a refund, which costs a payment fee, takes days to reach the customer and creates support tickets. Reserving first means a stock-out costs nothing: there is nothing to undo.
 
+```mermaid
+flowchart LR
+    C["Undoable steps: reserve stock, hold card"] --> P["Point of no return: capture payment"]
+    P --> R["Retry-only steps: ship, send receipt"]
+```
+
 ### The orchestrator as a state machine
+
+**In plain words:** the orchestrator saves where it is after each step, so after a crash it continues from the right place.
 
 The orchestrator persists its state after every transition, so a restarted process knows where it was:
 
@@ -192,6 +235,8 @@ stateDiagram-v2
 
 ### Making each step reliable
 
+**In plain words:** messages can be lost or sent twice, so each step must be safe to repeat and must save its result reliably.
+
 A saga step talks to another service, so every message can be lost, delayed or duplicated:
 
 - **Publish with the state change.** A service that commits "stock reserved" and then publishes `StockReserved` can crash in between. Write the event into an outbox table in the same local transaction (see [[Transactional Outbox and CDC]]).
@@ -199,9 +244,19 @@ A saga step talks to another service, so every message can be lost, delayed or d
 - **Compensations must be retriable too.** "Release reservation" cannot be allowed to fail permanently, so it is retried with backoff (see [[Timeouts, Retries and Backoff]]).
 - **Compensations must commute with a late original.** If "reserve" times out, the orchestrator compensates with "release". The reserve may still arrive later. The participant records "order-42 cancelled", so a late reserve for a cancelled saga is ignored.
 
-## 4. Worked example
+```mermaid
+flowchart LR
+    O["Orchestrator"] -- "step command, with id" --> S["Service"]
+    S -- "seen this id before?" --> D{"Dedupe"}
+    D -- "yes" --> A["Return saved result"]
+    D -- "no" --> W["Do the work, save result"]
+```
+
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** run steps in order; on failure, undo the finished ones in reverse.
 
 The bare idea: run steps in order, and on failure undo the finished ones in reverse.
 
@@ -231,6 +286,8 @@ func Run(ctx context.Context, steps []Step) error {
 This is not yet safe: it forgets everything if the process crashes, it would undo a step after the pivot, and a failed undo is silently dropped. The full version fixes all three.
 
 ### Go: an orchestrator with a saga log
+
+**In plain words:** a working orchestrator that writes a log after every step, retries what can be retried, and undoes the rest.
 
 The orchestrator below validates the step order, writes a log entry after every step, retries retriable steps and compensations with exponential backoff, parks the saga as `Stuck` when a post-pivot step keeps failing, and can `Resume` from the log after a crash.
 
@@ -638,9 +695,11 @@ WHERE status IN ('running', 'compensating')
   AND updated_at < now() - interval '15 minutes';
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Orchestration vs choreography
+
+**In plain words:** one central boss versus services reacting to each other's events. Side by side.
 
 | | Orchestration | Choreography |
 | --- | --- | --- |
@@ -653,6 +712,8 @@ WHERE status IN ('running', 'compensating')
 
 ### Saga vs other ways to stay consistent
 
+**In plain words:** how sagas compare with two-phase commit, the outbox pattern and simply not splitting the data.
+
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
 | One local transaction | Put the data in one database | The data can live in one service | Larger service boundary |
@@ -660,7 +721,7 @@ WHERE status IN ('running', 'compensating')
 | Saga | Local transactions plus compensations | Long-running, cross-service, external APIs involved | No isolation, compensation code for every step |
 | Reservation (TCC: try-confirm-cancel) | Each service offers try, confirm and cancel; try reserves resources | Resources can be held cheaply (seats, stock, credit) | Every participant implements three operations |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **No isolation.** A saga is ACD without the I: between steps, other requests see its partial effects (section 8).
 - **Compensation is not always possible.** You cannot unsend an email or un-ship a parcel. Put such actions after the pivot, or make the compensation a follow-up action ("send a correction").
@@ -669,7 +730,7 @@ WHERE status IN ('running', 'compensating')
 - **Do not use a saga** when the data can live in one database. Merging two tightly coupled services is often cheaper than a saga between them.
 - **Do not use a saga** for a two-step flow where a simple "do A, then retry B until it succeeds" (A durable, B idempotent) already works. That is a saga with no compensations; call it what it is and keep it small.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- **Temporal** (and Cadence, which it forked from): the workflow is ordinary code whose state is persisted by replaying an event history; activities have retry policies; compensation is written as deferred calls in the workflow (see [[Workflow Engines and Durable Execution]]).
@@ -688,9 +749,11 @@ WHERE status IN ('running', 'compensating')
 	- End-to-end saga duration p50 and p99.
 	- One **correlation id** (the saga id) in every log line, trace span and message header, so one order can be followed across services (see [[Distributed Tracing with OpenTelemetry]]).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Lack of isolation and its countermeasures
+
+**In plain words:** other requests can see half-finished sagas, so you add tricks like "pending" states to stay safe.
 
 Because each step commits on its own, concurrent sagas can interfere:
 
@@ -721,7 +784,7 @@ A step that does not answer is neither a success nor a failure. Treat a timeout 
 
 An orchestrator is stateless code over the `saga_instance` table, so it scales horizontally as long as one saga id is driven by one worker at a time. Partition the commands topic by saga id, or claim rows with `SELECT … FOR UPDATE SKIP LOCKED`. Workflow engines do this for you; Temporal shards workflow histories across its history service.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why not use two-phase commit across microservices?
 > The coordinator blocks: if it fails after participants vote "prepared", they hold locks until it recovers. Most participants (payment APIs, Kafka, third-party HTTP services) cannot join an XA transaction anyway. And holding locks across network round trips caps throughput. Sagas trade isolation for availability and loose coupling.
@@ -744,7 +807,7 @@ An orchestrator is stateless code over the `saga_instance` table, so it scales h
 > [!question]- What do you do when a step after the pivot keeps failing?
 > You never compensate after the pivot. Keep retrying with capped backoff; when retries are exhausted, park the saga as stuck, alert, and let an operator or a sweeper finish it. Design post-pivot steps so they can eventually succeed: idempotent, with fallbacks such as a second courier.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Saga = chain of local transactions + compensations; atomic in the end, never isolated.
 - Order: compensatable → one pivot → retriable. Reserve before you charge.

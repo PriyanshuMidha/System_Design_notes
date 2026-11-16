@@ -21,12 +21,30 @@ updated: 2026-11-13
 
 # SQL Essentials - Go
 
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "What this code shows" and Step 1 (the tables). Stop there.
+> - 🟡 **Know the basics?** Add Steps 2 to 6 and the Tests.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on twin of [[SQL Essentials]]. The first half is plain SQL you can paste into Postgres: four small tables (clients, invoices, invoice items, payments) and a few bigger queries that group, total and rank them. The second half is a tiny Go package that builds a search query safely. The key safety idea is a **placeholder**: the SQL text says `$1`, and the real value travels separately, so a user can never sneak SQL in. A second guard is a **whitelist**: sort options come from a fixed list, never from raw user text. Read it top to bottom: each step is a short Concept, the code, then a numbered walkthrough.
+
+```mermaid
+flowchart LR
+    U["user input<br/>status, sort, limit"] --> B["Build()"]
+    B --> S["SQL text with $1, $2"]
+    B --> A["values, sent separately"]
+    S --> DB["Postgres"]
+    A --> DB
+```
+
 > [!summary] TL;DR
 > The runnable side of [[SQL Essentials]]: the InvoiceOps schema and the long reference queries (grouping, recursive CTE, the traced collections report) as PostgreSQL 17 SQL, plus a small Go package that builds a list query with `$n` placeholders and a fixed sort whitelist, so user input can never become SQL.
 >
 > Every block is short and comes with a concept paragraph, a numbered walkthrough, and a diagram where one helps.
 
-## Before the code
+## Before the code 🟢
 
 - **Structs as input**: a `Filter` struct holds the user's choices (workspace, status, sort, limit).
 - **Maps as whitelists**: `orderBy` maps a sort key to a fixed SQL fragment, so unknown keys are rejected.
@@ -35,7 +53,7 @@ updated: 2026-11-13
 - **Multiple return values**: `Build` returns SQL, args and an `error`.
 - **Run**: `go vet ./... && go test -race ./...` inside the `listquery` module; no database needed.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in the theory note |
 | --- | --- |
@@ -60,16 +78,18 @@ The diagram is the whole Go story in one picture: the HTTP request becomes a `Fi
 
 The SQL parts of this note have no Go in them; they are the queries the theory note traces by hand.
 
-## Setup
+## Setup 🟢
 
 - Go 1.24, standard library only (`fmt`, `strings`; the test adds `reflect` and `testing`).
 - Layout: a module `listquery` with `listquery.go` and `listquery_test.go`.
 - Run it with `go vet ./... && go test -race ./...`.
 - The SQL runs on PostgreSQL 17. The outputs shown are representative output (PostgreSQL 17), computed by hand from the sample data in the theory note; they were not produced by a live server in this vault.
 
-## Code
+## Code 🟡
 
 ### Step 1: the running schema
+
+**In plain words:** four tables that every later query uses: who the clients are, what they were billed, the lines on each bill, and what they paid.
 
 **Concept.** Every example in [[SQL Essentials#The running schema]] runs against four tables: clients, invoices, invoice items and payments. This is a trimmed version, only as wide as the queries need.
 
@@ -142,6 +162,8 @@ CREATE TABLE payments (
 
 ### Step 2: grouping and aggregates
 
+**In plain words:** put rows into piles (one pile per client, say), then count or add up each pile.
+
 **Concept.** This implements [[SQL Essentials#Grouping and aggregates]]. After `GROUP BY`, each output row stands for a whole group and aggregate functions summarise it.
 
 The query is built to expose two classic surprises: `count(*)` counts joined rows while `count(i.id)` counts only non-NULL values, and `sum` over no rows is NULL, not 0.
@@ -191,6 +213,8 @@ Read the last row first: `joined_rows = 1` against `invoices = 0` is the `count(
 
 ### Step 3: a recursive CTE
 
+**In plain words:** a query that keeps calling itself to walk down a family tree of companies, however deep it goes.
+
 **Concept.** This is the recursive form of [[SQL Essentials#Subqueries and CTEs]]. A client can be the parent of other clients, so "Acme's balance including subsidiaries" needs a walk down a tree of unknown depth, which a fixed number of self-joins cannot do.
 
 A recursive CTE has an anchor (the starting rows) and a step (rows reached from rows already found); the database repeats the step until it finds nothing new.
@@ -229,6 +253,8 @@ flowchart LR
 Representative output (PostgreSQL 17): `group_open_minor = 230000` (150000 from INV-102 plus 80000 from INV-103). If the data could contain a cycle, add PostgreSQL 14's `CYCLE id SET is_cycle USING path` clause, which marks and stops on a repeated row instead of looping forever.
 
 ### Step 4: the collections query
+
+**In plain words:** one bigger query that answers "who owes us the most, and how late are they?" using every trick from the theory note.
 
 **Concept.** This is the whiteboard query from [[SQL Essentials#The collections query, traced]], with every feature of the topic in one statement: a tenant filter, a CTE, lateness arithmetic, a share of the total and a rank.
 
@@ -301,6 +327,8 @@ Reading it line by line:
 
 ### Step 5: building SQL safely from Go, the types
 
+**In plain words:** the shapes of the data: what the user may ask for, and the fixed list of allowed sort orders.
+
 **Concept.** This is [[SQL Essentials#Building SQL safely from Go]]. Values must travel as parameters (`$1`, `$2`): drivers such as pgx send the SQL text and the values in separate protocol messages by default, so a value can never become SQL.
 
 Column names and `ASC`/`DESC` cannot be parameters, so the builder maps each public sort key to a fixed fragment.
@@ -350,6 +378,8 @@ flowchart LR
 ```
 
 ### Step 6: building SQL safely from Go, `Build`
+
+**In plain words:** check the request first; only if it is valid, write the SQL text with numbered blanks and a separate list of values.
 
 **Concept.** `Build` turns a `Filter` into SQL text with `$n` placeholders plus the argument slice. It validates first and builds second, so an invalid request never produces SQL at all.
 
@@ -408,7 +438,17 @@ sequenceDiagram
     P-->>H: rows
 ```
 
-## Design decisions
+**Safe vs unsafe, as a picture** 🟢
+
+```mermaid
+flowchart TD
+    I["user types: x' OR '1'='1"] --> Bad["glue into SQL text"]
+    I --> Good["send as $1 value"]
+    Bad --> X["database runs the attacker's SQL"]
+    Good --> OK["database just compares a weird string"]
+```
+
+## Design decisions 🔴
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -420,11 +460,13 @@ sequenceDiagram
 | Money as integer minor units | `numeric` or float | Integers are exact and compact; the unit must be remembered by the reader |
 | Plain `database/sql`-style SQL text | ORM or code generation ([[Database Access (database-sql, pgx, sqlc)]]) | Full control and no dependency; more hand-written code to maintain |
 
-## Tests
+## Tests 🟡
 
 The three tests prove three properties of `Build`, each of which would otherwise be a security or correctness bug.
 
 ### Test 1: values travel as parameters
+
+**In plain words:** a nasty value like `'; DROP TABLE` stays a plain value and never lands inside the SQL text.
 
 **Property.** A hostile value stays a value. It appears in `args` and never in the SQL text, which is the definition of injection safety here.
 
@@ -461,6 +503,8 @@ If it fails, either the hostile text leaked into the SQL (an injection hole) or 
 
 ### Test 2: placeholders renumber without a status
 
+**In plain words:** if a filter is left out, the blanks are still numbered 1, 2, 3 with no gaps.
+
 **Property.** The optional filter does not break numbering. With no status, the limit must become `$2`, not `$3`; a gap in numbering is a protocol error at the database.
 
 | Input | Expected |
@@ -488,6 +532,8 @@ A failure here means the code uses a fixed placeholder number for the limit inst
 
 ### Test 3: unknown sort and bad limit are rejected
 
+**In plain words:** anything not on the allowed list is refused before any SQL is written.
+
 **Property.** Anything outside the whitelist or the limit range is refused before SQL exists.
 
 | Input | Expected |
@@ -510,7 +556,7 @@ func TestUnknownSortAndBadLimitRejected(t *testing.T) {
 
 A failure means the whitelist lookup or the range check was bypassed. Note the boundary values: 0 and 101 are the first invalid values on each side, and the loop does not test 1 or 100, which tests 1 and 2 cover implicitly by succeeding with limits 20 and 5.
 
-## Running it
+## Running it 🟢
 
 ```bash
 go vet ./... && go test -race -v ./...
@@ -635,7 +681,7 @@ ok  	listquery	1.489s
 > }
 > ```
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **Placeholders cannot stand in for identifiers.** `ORDER BY $1` sorts by a constant string, not by a column. That is why the sort goes through a map of fixed fragments.
 - **Do not format values into the SQL string.** Only the whitelisted fragment and the generated `$n` numbers are formatted in with `Fprintf`; every value goes into `args`.
@@ -644,13 +690,13 @@ ok  	listquery	1.489s
 - **`LastInsertId` does not work with Postgres drivers.** Read generated ids with `QueryRowContext(...).Scan(&id)` on an `INSERT ... RETURNING id`.
 - **Map the SQLSTATE, not the message.** 23505 becomes a 409 Conflict, 23503 and 23514 become 422 or 400, decided from the error code.
 
-## Exercises
+## Exercises 🔴
 
 1. Add a sort key `"-number"` that orders by `number DESC, id DESC`. Predict which test breaks if you forget the `id` tie-breaker, then write a test for the new key.
 2. Run the grouping query after inserting a client with `parent_id = 13` and no invoices. Predict the new row's `joined_rows`, `invoices` and `open_minor` values before running it.
 3. Change the recursive CTE's anchor to `id = 11`. Predict `group_open_minor`, and explain why Acme Corp's invoice is not included.
 
-## Links
+## Links 🟢
 
 - Theory: [[SQL Essentials]]
 - Schema in full: [[Relational Schema Design - Go]]

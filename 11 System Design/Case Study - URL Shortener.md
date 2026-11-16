@@ -25,7 +25,37 @@ updated: 2026-11-13
 > - Choose 302 when you need click analytics, 301 when you want browsers to remember the redirect.
 > - Click analytics go to a queue and an analytics store, never into the redirect's critical path.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A URL shortener turns a long web address into a short one, like `sho.rt/aZ3k9Qx`.
+Making a short link: take the next number from a counter and write it with letters and digits. This is **base62** (0-9, a-z, A-Z), and 7 of these characters cover trillions of links.
+Opening a short link: look up the code and send the browser to the long address. This send-on is a **redirect**.
+
+```mermaid
+flowchart LR
+    W["Long URL"] --> N["Next number:<br/>125"] --> E["Base62: '21'"] --> S["Save code -> URL"]
+```
+
+Links are opened far more often than they are made, so the lookups are cached.
+
+```mermaid
+flowchart LR
+    T["Tap sho.rt/aZ3k9Qx"] --> C{"In cache?"}
+    C -- "yes" --> R["Redirect"]
+    C -- "no" --> DB["Database"] --> R
+```
+
+So the rest of this note is just these 3 questions:
+1. How do you make short codes that never clash?
+2. How do you make redirects very fast for billions of clicks?
+3. How do you handle custom names, expiry and abuse?
 
 **The problem in one story.**
 You want to share a very long link in a text message.
@@ -70,7 +100,7 @@ Where it breaks: a coat check runs one counter in one room, while here many serv
 > [!tip] Remember
 > A short link is just a key: make unique keys from a counter in base62, then look them up fast.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 Long URLs break in SMS messages, printed posters and tweets with character limits, and they reveal tracking parameters. A shortener gives a short, stable alias and, as a bonus, counts clicks.
 
@@ -88,7 +118,7 @@ Long URLs break in SMS messages, printed posters and tweets with character limit
 
 **Out of scope**: user accounts and billing, link editing after creation, a link-preview page, QR-code rendering.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A URL shortener is a **coat-check counter**. You hand over a long coat (the URL) and get a small numbered ticket (the code). The hard parts are not the hanger rail; they are making sure two clerks never hand out the same ticket number, and serving the queue of people collecting coats very fast.
 
@@ -96,7 +126,7 @@ Two ideas carry the whole design:
 1. **The write path is an ID problem.** Turn a unique number into a short string. Uniqueness is the job of [[Unique ID Generation]]; base62 is just the encoding.
 2. **The read path is a cache problem.** A redirect is a single-key lookup with a 100:1 read ratio, the best case for [[Caching Patterns]] (cache-aside) and [[CDN and Edge]].
 
-## 3. How it works - high-level design
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart LR
@@ -163,7 +193,7 @@ sequenceDiagram
     R-->>B: 302 Found, Location: long_url, Cache-Control: private, max-age=0
 ```
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -183,6 +213,8 @@ GET  /{code}                                       -> 302 | 404 | 410
 
 ### Estimates (all inputs are interview assumptions, so the results are estimates)
 
+**In plain words:** rough sums: links made per second, clicks per second, and storage for all links.
+
 | Quantity | Arithmetic | Result |
 | --- | --- | --- |
 | Create rate | 100,000,000 / 86,400 s | ≈ 1,157 writes/s |
@@ -199,6 +231,8 @@ GET  /{code}                                       -> 302 | 404 | 410
 **What the numbers decide.** 1.2k writes/s fits on any distributed KV store, so the write side is not the problem. 116k reads/s at a hot set of 50 GB means Redis plus CDN absorb nearly all reads; at a 95% cache hit rate (assumed) the KV store sees about 5.8k reads/s.
 
 ### API
+
+**In plain words:** one call to create a short link, and a plain GET that redirects.
 
 ```http
 POST /api/v1/urls
@@ -230,6 +264,8 @@ The `Idempotency-Key` header lets a mobile client retry a timed-out create witho
 
 ### Data model
 
+**In plain words:** one simple table: short code, long URL, owner, and expiry.
+
 ```mermaid
 erDiagram
     URLS {
@@ -260,6 +296,8 @@ erDiagram
 `URLS` lives in a KV store partitioned by `code` (DynamoDB or Cassandra); the access pattern is only "get by code" and "put if absent", so there are no joins and partitioning is trivial (see [[Partitioning and Sharding]]). `CLICK_EVENTS` is a Kafka topic; `DAILY_CLICKS` is a table in an OLAP store such as ClickHouse.
 
 ### Code: base62 encoding and block allocation
+
+**In plain words:** each server grabs a block of numbers in advance, then hands them out and writes each as base62. No server ever repeats a number.
 
 This is the code-generation core: a counter split into blocks, encoded in base62. Each write server owns one `Allocator`; the `RangeSource` is a ticket table or an etcd counter in production and an in-memory fake in tests.
 
@@ -453,6 +491,8 @@ func TestTwoAllocatorsNeverCollide(t *testing.T) {
 
 ### One request traced
 
+**In plain words:** follow one link from creation, through the first click, to the cached clicks after it.
+
 1. A marketer posts `https://shop.example.com/sale?...` with `ttl_days: 30` and no alias.
 2. The write service's current block is `[125,000,000,000, 125,000,001,000)`; the next ID is `125,000,000,417`.
 3. `Encode(125000000417, 7)` gives a 7-character code: `2CRTGIz`.
@@ -460,7 +500,7 @@ func TestTwoAllocatorsNeverCollide(t *testing.T) {
 5. A customer taps the SMS link. The CDN has no cached response (we send `302` with `max-age=0`), the redirect service misses Redis, reads the KV store in about 5 ms (an estimate for a single-digit-millisecond KV read), fills Redis and returns `302`.
 6. The click event goes to Kafka without blocking the response. A stream job rolls it into `DAILY_CLICKS(code, 2026-11-04, IN) += 1`.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 **Key generation** is the main design choice.
 
@@ -481,7 +521,7 @@ func TestTwoAllocatorsNeverCollide(t *testing.T) {
 | 307 Temporary Redirect | Temporary, method preserved | Like 302 | Every click | Same as 302 when non-GET requests are possible |
 | 308 Permanent Redirect | Permanent, method preserved | Like 301 | Undercounts | Rare for shorteners |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **302 over 301 because** analytics are a product feature; the price is every click hitting the CDN or origin. If analytics are not needed, 301 with a long `Cache-Control: max-age` cuts origin traffic sharply.
 - **Counter over hash because** it never collides and needs no read-before-write; the price is predictable codes. Scramble with a bijection if that matters.
@@ -489,7 +529,13 @@ func TestTwoAllocatorsNeverCollide(t *testing.T) {
 - **Async analytics over synchronous counters because** an `UPDATE clicks = clicks + 1` per redirect turns a viral link into a write hotspot.
 - **When not to build one**: an internal tool with a few thousand links works fine with one PostgreSQL table, a `BIGSERIAL` key and no cache. For marketing at scale, a hosted shortener may beat building your own.
 
-## 7. In production
+```mermaid
+flowchart LR
+    A["301 permanent"] --> A1["Browser remembers it:<br/>fewer hits, no click counts"]
+    B["302 temporary"] --> B1["Every click comes back:<br/>click stats work"]
+```
+
+## 7. In production 🔴
 
 - **Real building blocks (documented):**
 	- Flickr's 2010 ticket-server design used MySQL `REPLACE INTO` with `auto_increment` on two servers (odd and even IDs) to hand out unique IDs; the block allocator here is the same idea with larger reservations.
@@ -504,9 +550,11 @@ func TestTwoAllocatorsNeverCollide(t *testing.T) {
 	- *Kafka down* → buffer click events in memory with a bounded queue and drop when full; redirects must never block on analytics.
 - **SLOs and what to monitor (targets, estimates):** redirect availability 99.99% monthly; redirect p99 under 20 ms at the origin; cache hit ratio above 95%; KV read and conditional-put error rates; remaining IDs in each server's block; Safe Browsing call latency; Kafka producer drop count.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### 8.1 Making sequential codes unguessable
+
+**In plain words:** counting 1, 2, 3 makes codes easy to guess; scramble the number before encoding it.
 
 Counter IDs produce codes such as `...0001`, `...0002`. Anyone can enumerate everyone's links. Two fixes keep the "no collision" property:
 - **Bijective scrambling.** Apply a reversible permutation to the ID before encoding, for example `code_id = (id × m) mod 62^7`. Multiplication by any `m` coprime to `62^7` (any number not divisible by 2 or 31) is a bijection on `[0, 62^7)`. Unique IDs in give unique codes out, but neighbouring IDs give unrelated codes. A small Feistel cipher over the 42-bit space is stronger.
@@ -516,6 +564,8 @@ Scrambling hides sequence, not existence: with 182.5B of 3.52T codes used (5.2%)
 
 ### 8.2 Custom aliases and the race
 
+**In plain words:** two people asking for the same custom name at once: let the database's "must be unique" rule pick the winner.
+
 Two users ask for `diwali-sale` at the same moment. A "read, then write if absent" check has a race window. The fix is to make the store decide: a conditional put (`attribute_not_exists`), an `INSERT ...
 
 IF NOT EXISTS`, or in PostgreSQL 17 `INSERT ... ON CONFLICT (code) DO NOTHING RETURNING code`, where an empty result means "taken, return 409".
@@ -524,11 +574,13 @@ Custom aliases share the table with generated codes, so reserve a namespace: gen
 
 ### 8.3 Expiry and cleanup
 
+**In plain words:** an expired link stops working right away; a background job deletes it later.
+
 Expiry has two halves:
 - **Lazy check on read.** The redirect service compares `expires_at` with now and returns `410 Gone`, and sets the Redis TTL to `min(1 day, time left)` so caches do not outlive the link.
 - **Background deletion.** DynamoDB TTL or Cassandra `USING TTL` removes rows later; on a SQL store, a batch job deletes in chunks (`DELETE ... WHERE ctid IN (SELECT ctid ... LIMIT 10000)`) to avoid long locks. Expired codes are **not reused**: someone may still have the old link printed, and reuse would send them to a stranger's page.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why 7 characters?
 > Base62 with 7 characters gives 62^7 ≈ 3.5 trillion codes. At 100M new links per day for 5 years we need 182.5 billion, about 5% of the space. Six characters give only 56.8 billion, which runs out in about 1.5 years.
@@ -551,7 +603,7 @@ Expiry has two halves:
 > [!question]- Should the same long URL always get the same code?
 > Only if the product wants it. Deduping needs an index on `long_url` (or its hash) per owner, which adds a lookup to every write. Most shorteners give each create its own code because different owners want separate analytics.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 A 45-minute interview script:
 - **0-5 min, requirements:** shorten, redirect, custom alias, expiry, analytics; 100:1 reads; redirects 99.99%; out of scope: accounts, editing.

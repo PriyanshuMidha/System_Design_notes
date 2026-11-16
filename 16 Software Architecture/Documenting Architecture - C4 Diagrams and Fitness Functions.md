@@ -51,7 +51,32 @@ flowchart TB
 
 Everything below is this same zoom-in repeated one more level (Container into Component) and made precise: what each level is allowed to show, who reads it, and how a Go test keeps the arrows true.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Architecture diagrams are often one messy picture that nobody trusts.
+**C4** fixes this with four maps that zoom in, like Google Maps: country, city, street, house.
+Level 1 shows your system and who uses it. Level 2 shows its apps and databases. Level 3 shows the parts inside one app. Level 4 is the code.
+Each map uses the same simple boxes and arrows.
+But a picture can go out of date. A **fitness function** is a test that checks the rule from the picture, like "the domain package never imports the database package".
+So the picture explains the rule, and the test keeps it true.
+
+```mermaid
+flowchart LR
+    C1["Context"] --> C2["Container"] --> C3["Component"] --> C4["Code"]
+```
+
+The rest of this note is just these 3 questions:
+1. What does each C4 level show, and who reads it?
+2. How do you turn a diagram's rules into tests?
+3. How do ADRs, C4 and fitness functions fit together?
+
 
 **The problem in one story.**
 Three engineers each draw "the architecture" of the same service.
@@ -94,7 +119,7 @@ Where it breaks: a map updates itself from satellites; diagrams only stay true i
 > [!tip] Remember
 > Diagrams show intent; fitness functions enforce it.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A team without a shared diagramming convention produces three "architecture diagrams" for the same system that disagree with each other and with the code: one slide shows boxes for "frontend", "backend", "database" with no indication of what "backend" actually deploys as; another shows every Go package as a box, so dense that nobody but its author can read it; a third is a sequence diagram mislabeled as "the architecture."
 
@@ -104,7 +129,13 @@ C4 fixes the first problem (which diagram answers which question) by fixing exac
 
 A Go test that fails when `internal/domain` imports `database/sql` catches the violation in the same pull request that introduced it; a diagram that merely *claims* the domain layer has no infrastructure dependency catches nothing on its own.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    D["Diagram drawn once"] --> X["Code changes for a year"] --> W["Diagram is now wrong"]
+    T["Fitness test in CI"] --> K["Rule stays true"]
+```
+
+## 2. Mental model 🟢
 
 Think of C4 as **Google Maps for a system**: zoomed all the way out, you see a city on a map of the country (Context — InvoiceOps as one box, talking to a payment provider and an email service); zoom in once and you see the city's neighbourhoods (Container — the API service, the worker, Postgres, Redis, each a separately deployable or runnable thing); zoom in again and you see one neighbourhood's streets (Component — the groupings of code inside the API container: an HTTP layer, a service layer, a repository layer); zoom in once more and you'd see individual buildings (Code — classes and structs, usually better read straight from an IDE's "go to definition" than drawn by hand).
 
@@ -112,9 +143,11 @@ Nobody hand-draws every building in a city map; C4's own guidance is that most t
 
 A **fitness function**, in the same metaphor, is a zoning inspector that actually visits the buildings instead of trusting the zoning map: it runs against the real source tree and fails the build the moment a "residential" neighbourhood (the domain package) has an industrial building (a raw SQL import) in it.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 The four levels, what each one shows, and who reads it
+
+**In plain words: four zoom levels, each for a different reader.**
 
 | Level | Shows | Audience | Notation |
 | --- | --- | --- | --- |
@@ -220,6 +253,8 @@ classDiagram
 
 ### 3.6 Fitness functions: turning the diagram's rules into tests
 
+**In plain words: a normal test that fails the build when the code breaks an architecture rule.**
+
 A **fitness function** (Ford, Parsons & Kua, *Building Evolutionary Architectures*, 2017) is any automated, objective check of an architectural characteristic, run the same way as a unit test — in Go, that means an ordinary `_test.go` file. Two concrete kinds, both shown fully in the worked example below:
 
 - **Structural fitness functions** parse the import graph and fail if a rule like "the domain package imports no infrastructure" is broken — the exact rule the Component diagram in 3.4 draws as an arrow direction, now enforced instead of merely illustrated.
@@ -245,11 +280,18 @@ sequenceDiagram
 
 ### 3.7 Where ADRs, C4 and fitness functions fit together
 
+**In plain words: the ADR says why, the diagram shows what, the test keeps it true.**
+
 An [[Architecture Decision Records|ADR]] records *why* a rule exists ("the domain layer must not import `database/sql`, decided 2026-03-01, because X"); the Component diagram (3.4) draws the rule as a picture for a human to understand quickly; the fitness function (3.6) is the rule enforced every time CI runs.
 
 Keep an explicit link from the ADR to the fitness function's test name, so a reviewer who finds the test failing can trace it back to the decision instead of guessing why the rule exists.
 
-## 4. Worked example
+```mermaid
+flowchart LR
+    ADR["ADR: why"] --> C4["C4 diagram: what"] --> FF["Fitness function: check"] --> CI["CI fails if broken"]
+```
+
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -617,7 +659,7 @@ func TestBudgetP95CatchesARegression(t *testing.T) {
 
 `go vet ./...` is clean on both packages, and `go test -race -v ./...` passes all 5 tests: the import-rule checker correctly passes a clean tree, correctly fails a tree with a planted violation (proving it isn't vacuously green) and correctly scopes a rule to only the packages it names; the latency budget correctly passes a fast real workload and correctly fails a deliberately slow one.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -627,14 +669,14 @@ func TestBudgetP95CatchesARegression(t *testing.T) {
 | arc42 / full architecture document | A structured template covering constraints, quality goals, risks, and diagrams together | A larger system needing a complete written architecture record, not just diagrams | Much more writing to keep current; C4 diagrams often live inside an arc42 document's "Building Block View" section |
 | Fitness functions (structural, quality-attribute) | Automated tests enforcing the rules a diagram only illustrates | Any rule worth drawing is worth enforcing in CI | Writing and maintaining the checks themselves; a rule with no test is only a suggestion |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **C4 documents structure, not behaviour.** A Context or Container diagram shows nothing about the order requests happen in or what happens on failure — pair it with a sequence diagram (as [[Capstone - InvoiceOps]] does for its webhook flow) for that; C4 isn't a replacement for every other diagram type, only a standard for the structural ones.
 - **Component and Code diagrams rot fastest.** They describe the part of the system that changes on nearly every pull request; a team that commits to hand-drawing and maintaining them accurately is taking on real, ongoing cost. Brown's own recommendation — stop at Container for most systems, draw Component only for a container worth explaining, skip Code — exists because of this cost, not as a shortcut.
 - **Fitness functions only check what someone wrote a check for.** A structural rule nobody encoded (say, "every exported error must be wrapped with context") goes unenforced regardless of how clear the diagram and the ADR are; writing the fitness function is the actual commitment, not drawing the arrow.
 - **For a small system (one container, a handful of packages)**, a Context diagram may be the only one worth drawing at all — Container, Component and fitness functions earn their cost only once there's enough structure for ambiguity to creep in.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Structurizr (Simon Brown's own tool) generates C4 diagrams from a DSL or from code, specifically to avoid the hand-maintained-diagram-rot problem described above.
@@ -646,14 +688,14 @@ func TestBudgetP95CatchesARegression(t *testing.T) {
 	- A fitness function's rule is correct the day it's written but the architecture legitimately evolves (a new, approved cross-layer call is added) → treat a fitness-function failure as a prompt to either fix the regression or update the rule and its backing ADR together, never to silently delete the failing test.
 - **What to monitor:** which fitness functions exist and their pass/fail history in CI (a flaky or frequently-overridden one is a signal the rule or the architecture needs revisiting); how long since each C4 diagram was last regenerated or reviewed against the current container/component list; number of ADRs with no corresponding fitness function for a rule that's meant to be enforced, not just documented.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why Context and Container survive longest.** Both describe boundaries that change only when a real architectural decision is made — adding a new external system, splitting a service — which is inherently rarer than the code changes that make Component and Code diagrams rot. This is the structural reason Brown's guidance to stop at Container for most teams isn't laziness; it matches how often each level's truth actually changes.
 - **Fitness functions as executable ADRs.** An ADR's "Decision" section is prose a human has to remember to check against; a fitness function is the same decision made checkable by a machine on every commit. Teams practicing evolutionary architecture (Ford/Parsons/Kua) treat "did we write a fitness function for this decision" as part of the Definition of Done for an ADR that constrains structure, not merely records a choice with no structural consequence.
 - **Parsing vs. type-checking for structural fitness functions.** `importrules` above only parses import declarations (`parser.ImportsOnly`), deliberately not using `go/types` or `golang.org/x/tools/go/packages` to build a full type-checked program. This trades the ability to catch deeper violations (a function value smuggled across a layer without an import, for instance) for speed and for working even when the target tree doesn't currently compile — a property worth having in CI, where a fitness-function stage should fail fast and independently of the build stage.
 - **Composing multiple rules.** A real system's fitness-function suite usually has several `Rule` values at once (domain-imports-no-infra, adapters-import-no-other-adapters, handlers-import-no-repositories-directly) rather than one — `Check` above takes a `[]Rule` for exactly this reason, so new rules are additive, each with its own name traceable back to the ADR that justified it.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's the difference between a C4 Container and a Docker container?
 > A C4 container is Brown's term for any independently deployable or runnable unit — a Go service, a database, a queue, a mobile app, an SPA — regardless of how it's packaged. A Docker container is one specific packaging technology that might implement a C4 container; the words collide but mean different things, and conflating them is the most common C4 mistake.
@@ -673,7 +715,7 @@ func TestBudgetP95CatchesARegression(t *testing.T) {
 > [!question]- Why does the import-rule checker in this note parse source files instead of using `go/types` for a full type-checked analysis?
 > Parsing only the import declarations runs in milliseconds, needs no dependency resolution, and still works on a tree that doesn't currently compile — all properties a CI fitness-function stage benefits from. The trade is that it can't catch a violation smuggled in without an import statement (a function value passed in some other way), which a full type-checked analysis could.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - C4 = Context (the system + the world) → Container (deployable/runnable units, Brown's term, not Docker) → Component (code groupings inside one container) → Code (classes — usually generated, not hand-drawn).
 - Each level zooms into one box from the level above; one notation throughout, not a different style per level.
@@ -683,7 +725,7 @@ func TestBudgetP95CatchesARegression(t *testing.T) {
 - Diagrams document intent, ADRs record why, fitness functions enforce it on every commit — a rule with only the first two is a suggestion.
 - A fitness function must be proven to actually fail on a violation (test it against a deliberately broken fixture), or it may be silently vacuous.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Hexagonal Architecture (Ports and Adapters)]], [[Clean Architecture]]
 - **Next:** none planned in this folder — apply this note's fitness-function pattern retroactively to any note above it.

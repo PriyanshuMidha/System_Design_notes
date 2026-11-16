@@ -30,7 +30,39 @@ updated: 2026-11-13
 > - Security is network isolation first (private subnet, no public IP), then ACL users with least privilege, then TLS.
 > - Classic mistake: running `KEYS *` or `MONITOR` on a busy production server.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (memory, latency and security in detail), 4 (the settings block, measurements and the Go big-key scanner), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Running Redis for real traffic comes down to three things: memory, speed and safety.
+Memory: Redis lives in RAM, so you must set a limit and say what to throw away when it is full.
+Speed: Redis does one command at a time, so one slow command makes everyone else wait; that wait is called **latency**.
+Safety: Redis must never be reachable from the internet, and every app should log in with its own limited user, called an **ACL** user.
+
+```mermaid
+flowchart LR
+    M["memory:<br/>set a limit"] --> OK["healthy Redis"]
+    L["speed:<br/>no slow commands"] --> OK
+    S["safety:<br/>private + passwords"] --> OK
+```
+
+The speed rule is the one people forget most.
+
+```mermaid
+flowchart LR
+    D["DEL on a 2M-field hash<br/>(about 350 ms)"] --> Q["every other command<br/>waits behind it"]
+    Q --> P["p99 spikes for everyone"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you keep Redis from running out of memory?
+2. What makes Redis slow, and how do you find it?
+3. How do you lock Redis down?
 
 **The problem in one story.**
 Redis ran fine in testing, so it went to production.
@@ -76,7 +108,7 @@ Where it breaks: a toll booth cannot throw cars out of a full lot, but Redis can
 > [!tip] Remember
 > Production Redis = cap memory on purpose, keep the main thread free, and keep the port private.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 The InvoiceOps Redis has been fine for a year. Then, in one week:
 
@@ -86,7 +118,7 @@ The InvoiceOps Redis has been fine for a year. Then, in one week:
 
 Each of these has a standard fix. This note collects them.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Redis is a very fast single-lane bridge. Every command crosses the same lane, one at a time.
 - **Memory** is the weight limit of the bridge. Exceed it and it collapses (OOM) unless you declare in advance what to throw off (eviction).
@@ -98,9 +130,11 @@ Terms:
 - **Fragmentation ratio**: `used_memory_rss / used_memory`. Above 1.5 means much memory is held but unused; below 1 usually means part of Redis is swapped out.
 - **Encoding**: Redis stores small collections in compact forms (listpack, intset) and converts them to full structures (hash table, skiplist) when they grow.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Memory: where the bytes go
+
+**In plain words:** your data is not the only thing using RAM. Saving to disk, client buffers and wasted gaps all need room, so set the limit well below the machine's size.
 
 ```mermaid
 flowchart TB
@@ -124,7 +158,19 @@ flowchart TB
 - **Fragmentation.** After many deletes, the allocator holds freed memory in partly used pages. On Linux builds with jemalloc, `activedefrag yes` moves values to compact memory while running. (The macOS build measured here uses the libc allocator, `mem_allocator:libc`, where active defrag is unavailable.)
 - **Client buffers.** Each client has an output buffer. Defaults measured on Redis 8.2: `normal 0 0 0` (no limit), `replica 256mb 64mb 60`, `pubsub 32mb 8mb 60`. A slow Pub/Sub subscriber or a client running `HGETALL` on a huge hash can grow its buffer without bound if its class has no limit.
 
+**Where the RAM goes, as a picture.** Leave headroom; your data is only one slice.
+
+```mermaid
+flowchart LR
+    VM["8 GB machine"] --> MX["maxmemory, about 5 GB<br/>(your keys)"]
+    VM --> F["save-to-disk copies"]
+    VM --> B["client buffers"]
+    VM --> G["fragmentation gaps"]
+```
+
 ### Latency: who blocks the main thread
+
+**In plain words:** anything big or slow (a huge key, a scan of all keys, a disk save) holds up the single lane. Redis has built-in logs to show you who did it.
 
 ```mermaid
 flowchart TD
@@ -146,6 +192,8 @@ flowchart TD
 
 ### Security: layers
 
+**In plain words:** several fences in a row: a private network, a password, users who can only touch their own keys, and dangerous commands switched off.
+
 ```mermaid
 flowchart LR
     NET["Network<br/>private subnet, security group,<br/>no public IP, bind to private IP"] --> TLS["TLS<br/>tls-port, certs,<br/>optional client certs"]
@@ -160,9 +208,11 @@ flowchart LR
 - **Dangerous commands.** `FLUSHALL`, `CONFIG`, `DEBUG`, `KEYS`, `MONITOR`, `SHUTDOWN` belong to `@dangerous`/`@admin`. Since Redis 7.0, `enable-protected-configs no` and `enable-debug-command no` are the defaults, so `CONFIG SET dir` and `DEBUG` are refused from clients unless enabled in the config file. Prefer ACLs over the old `rename-command`.
 - **Patch.** Lua scripting runs inside the server; CVE-2025-49844, a use-after-free in the Lua engine disclosed in October 2025, allowed an authenticated user to run code on the host and was fixed in Redis 8.2.2 and backported releases. If you cannot patch at once, deny `EVAL`/`EVALSHA`/`FUNCTION` via ACL to users that do not need scripting.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** a starting settings file for a production cache.
 
 The production block an InvoiceOps cache instance starts from:
 
@@ -189,6 +239,8 @@ maxclients 10000
 
 ### Measured on Redis 8.2: the slow paths
 
+**In plain words:** real timings of the commands that freeze Redis, so you know which ones to avoid.
+
 Setup: Redis 8.2 (Homebrew build), Apple M4, local `redis-cli`, durations from `SLOWLOG GET` (server execution only). `DEBUG SLEEP` needs `enable-debug-command local`, because `DEBUG` is refused by default since Redis 7.0.
 
 | Command | Data | Server time | What it means |
@@ -201,6 +253,8 @@ Setup: Redis 8.2 (Homebrew build), Apple M4, local `redis-cli`, durations from `
 `SCAN` with `COUNT 1000` does the same job as `KEYS` in small steps, each a fraction of a millisecond, so other clients run between steps.
 
 ### Measured on Redis 8.2: a least-privilege ACL user
+
+**In plain words:** create a user that can only read and write its own keys, and see Redis refuse everything else.
 
 ```text
 $ redis-cli ACL SETUSER invoiceops on '>s3cret-from-vault' '~dashboard:*' '~invoice:*' '+@read' '+@write' '-@dangerous'
@@ -216,6 +270,8 @@ OK
 `ACL LOG` then lists each denial with the user, the reason (`command` or `key`) and the client address, which is useful for spotting a misconfigured service or an intruder. Store the password in a secrets manager ([[Secrets Management]]), never in code.
 
 ### Go: find the biggest keys without blocking Redis
+
+**In plain words:** a Go job that walks through keys a few at a time, measures each, and reports the biggest ones, without freezing Redis.
 
 `redis-cli --bigkeys` and `--memkeys` exist, but a scheduled job that reports the top keys by memory to your metrics is more useful.
 
@@ -444,7 +500,15 @@ key:609678            128 bytes
 
 The scan took 75 seconds because it makes one round trip per key (about 68 µs each here, an estimate from total time ÷ keys) plus a 1 ms pause per batch. That is the point: it never blocks Redis. To make it faster, pipeline the `MEMORY USAGE` calls for each batch, and run it against a replica.
 
-## 5. Variants and comparison
+**Big key clean-up, as a picture.**
+
+```mermaid
+flowchart LR
+    D["DEL big key"] --> B["blocks Redis<br/>for hundreds of ms"]
+    U["UNLINK big key"] --> F["key gone at once,<br/>memory freed in background"]
+```
+
+## 5. Variants and comparison 🟡
 
 | Problem | Option | How it works | Cost |
 | --- | --- | --- | --- |
@@ -460,7 +524,7 @@ The scan took 75 seconds because it makes one round trip per key (about 68 µs e
 | Access control | ACL users | Per-user keys, commands, channels | Files or `ACL SAVE` to manage |
 | Transport | TLS | Encrypted, optional mTLS | CPU cost; I/O threads help |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Eviction hides capacity problems.** A cache under `allkeys-lru` never fails, but its hit ratio quietly drops; alert on `evicted_keys` rate and hit ratio, not only on errors.
 - **Memory headroom is money.** Reserving 25-40% of RAM is expensive at scale; snapshotting on replicas or disabling persistence on pure caches reduces how much you need.
@@ -468,7 +532,7 @@ The scan took 75 seconds because it makes one round trip per key (about 68 µs e
 - **ACL rules can block your own tools.** Monitoring agents need `INFO`, `SLOWLOG GET` and `LATENCY LATEST`, which sit in `@admin`/`@dangerous`. Grant them as explicit commands and subcommands (`+info +slowlog|get +latency|latest`) to a separate monitoring user; never grant `+@slow`, which also includes `CONFIG`, `FLUSHALL` and `KEYS`.
 - **Do not self-manage when a managed service fits.** Patching, failover, backups and TLS certificates are the bulk of the work above; ElastiCache, MemoryDB or Redis Cloud do most of it.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Managed Redis/Valkey services enforce several of these defaults for you: ElastiCache keeps `reserved-memory-percent` at 25%, offers in-transit and at-rest encryption, and RBAC user groups; parameter groups set the eviction policy.
 - **Failure modes → fixes:**
@@ -487,7 +551,7 @@ The scan took 75 seconds because it makes one round trip per key (about 68 µs e
 	- Security: `ACL LOG` entries, failed auth counts, Redis version against current advisories.
 	- Export with `redis_exporter` to Prometheus ([[Metrics and Prometheus]]).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why a single slow command hurts p99 so much.** If 50,000 commands per second arrive and one takes 350 ms, about 17,500 commands queue behind it. Each of them sees up to 350 ms extra latency, so one command in a second can move the p99 of the whole second ([[Latency, Percentiles and Bottleneck Analysis]]).
 - **Lazy freeing.** `UNLINK`, `FLUSHALL ASYNC` and the `lazyfree-lazy-*` options (`lazyfree-lazy-eviction`, `-expire`, `-server-del`, `-user-del`; `lazyfree-lazy-user-del` is `no` by default, measured on Redis 8.2) unlink the key from the keyspace on the main thread and free its memory in a background thread. Small values are still freed inline because handing them off costs more than freeing them.
@@ -496,7 +560,7 @@ The scan took 75 seconds because it makes one round trip per key (about 68 µs e
 - **`SCAN` guarantees.** A full iteration returns every key that existed for the whole iteration at least once; keys added or removed during the scan may or may not appear, and duplicates are possible. Code that acts on scan results must be idempotent.
 - **Measuring client-side latency correctly.** `redis-cli --latency` and `--latency-history` measure round trips from a client host; `--intrinsic-latency 100` on the server host measures how much the OS or hypervisor itself delays a process, which is the floor Redis cannot beat.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Your Redis was OOM-killed during a nightly snapshot. What happened and how do you prevent it?
 > `BGSAVE` forks; copy-on-write duplicates every page written during the save, so memory can approach 2× the dataset. With no `maxmemory` and no headroom the kernel killed it. Set `maxmemory` well below RAM, `vm.overcommit_memory=1`, disable THP, and snapshot on a replica.
@@ -519,7 +583,7 @@ The scan took 75 seconds because it makes one round trip per key (about 68 µs e
 > [!question]- Do Redis I/O threads make slow commands faster?
 > No. Since 6.0 they parallelise reading requests and writing replies; commands still execute one at a time on the main thread. They help with many connections, large replies and TLS, not with a slow `SMEMBERS`.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `maxmemory` at about 60-75% of RAM (estimate) when forks happen; ElastiCache reserves 25%.
 - Default policy is `noeviction`: choose `allkeys-lfu`/`lru` for caches.
@@ -529,7 +593,7 @@ The scan took 75 seconds because it makes one round trip per key (about 68 µs e
 - Security: private network → TLS → per-service ACL users → no `@dangerous` → patch (CVE-2025-49844 fixed in 8.2.2).
 - Small hashes (listpack) are about 6× smaller than real hash tables (6,160 vs 36,992 bytes at 512 fields, measured).
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Redis Fundamentals]], [[Redis Persistence - RDB and AOF]], [[Redis Replication, Sentinel and Cluster]]
 - **Next:** [[Redis in Go]], [[Metrics and Prometheus]]

@@ -29,7 +29,33 @@ updated: 2026-11-13
 > - Coupling is how much one module must know about another; cohesion is how well one module's parts belong together. Aim for low and high.
 > - Tell, don't ask: ask an object to do the work (`wallet.Debit`) instead of reading its data and deciding for it.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Patterns are answers. Principles are rules of thumb that tell you where code should go.
+**DRY** (Don't Repeat Yourself): each business rule lives in one place, so you change it once.
+**KISS** (Keep It Simple): build the simplest thing that works for today's needs.
+**YAGNI** (You Aren't Gonna Need It): do not build for a future that may never come.
+Low **coupling** means parts know little about each other. High **cohesion** means each part does one clear job.
+These rules can clash, for example too much DRY can tie unrelated code together. The note shows how to choose.
+
+```mermaid
+flowchart LR
+    R["Tax rule written in 3 places"] --> B["Change it once, miss 2, bug"]
+    O["Tax rule in 1 place"] --> G["Change once, done"]
+```
+
+The rest of this note is just these 3 questions:
+1. What does each principle really say?
+2. How do they look in Go code?
+3. When do they clash, and which one wins?
+
 
 **The problem in one story.**
 A refund rule ("refund within 7 days") is copied into three files.
@@ -72,7 +98,7 @@ Where it breaks: kitchens can see the cost of a spare oven immediately; in code 
 > [!tip] Remember
 > One owner per rule, the simplest code that works today, and modules that know as little about each other as possible.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Take a cart checkout service in its first month.
 
@@ -82,7 +108,7 @@ Take a cart checkout service in its first month.
 
 The principles are the vocabulary for spotting and naming these problems in an LLD round, before they are coded.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Every piece of code answers two questions: **what does it know**, and **why would it change**?
 
@@ -93,9 +119,11 @@ Every piece of code answers two questions: **what does it know**, and **why woul
 
 **Analogy:** a kitchen. DRY is one recipe card per dish, not three slightly different copies. KISS is not buying a 40-piece knife set before you know what you will cook. Cohesion is keeping the spices in one cupboard; low coupling is the waiter asking the chef for a dish rather than walking in and cooking it.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### DRY: one authoritative representation
+
+**In plain words: DRY is about one owner per rule, not about removing every line that looks alike.**
 
 The Pragmatic Programmer defines DRY as "every piece of knowledge must have a single, unambiguous, authoritative representation within a system". The unit is knowledge, not text:
 
@@ -116,6 +144,8 @@ Duplication of the same knowledge is **real duplication**; similar-looking code 
 **Go's angle.** The Go proverb "A little copying is better than a little dependency" applies DRY's cost to packages: importing a large module to reuse a 10-line function couples your build, your upgrades and your security surface to it.
 
 ### KISS and YAGNI
+
+**In plain words: build what is needed now, in the plainest way.**
 
 - **KISS:** the simplest design that satisfies the stated use cases. In Go that means fewer types, plain structs, direct control flow, explicit errors, no reflection, and no framework layers. A useful measure in an interview: can you explain the core flow of each type in one sentence, and does every type appear in at least one use case?
 - **YAGNI:** do not build capability for requirements nobody has stated. Fowler calls the result **speculative generality**: hooks, parameters and interfaces with one implementation "in case we need it".
@@ -154,6 +184,8 @@ The "critical rule" shortcut matters: a cancellation, pricing or permission rule
 
 ### Coupling and cohesion
 
+**In plain words: coupling is how tied two parts are; cohesion is how well one part sticks to one job.**
+
 **Coupling** is how much one module must know about another to work and to change. From loosest to tightest (after Stevens, Myers and Constantine):
 
 | Kind | Example in Go | Problem |
@@ -178,6 +210,8 @@ The "critical rule" shortcut matters: a cancellation, pricing or permission rule
 The full request path is in [[Backend Request Lifecycle and Layering]].
 
 ### Law of Demeter and tell, don't ask
+
+**In plain words: talk to your direct friends only, and tell objects what to do instead of pulling out their data.**
 
 The **Law of Demeter** (Lieberherr and Holland, 1989): a method should call methods only on its own object, its parameters, objects it creates, and its direct fields, not on objects returned by those. `order.Customer().Wallet().Debit(x)` breaks it: checkout now depends on the shape of `Customer` and `Wallet`.
 
@@ -205,11 +239,19 @@ sequenceDiagram
 
 In the "tell" version, the check and the update are one method, so adding a mutex (or a conditional SQL `UPDATE`) inside `Debit` fixes concurrency for every caller at once. In the "ask" version every caller must remember to lock.
 
+```mermaid
+flowchart LR
+    A["Order"] -- "ok: order.Total()" --> B["Cart"]
+    A -. "bad: cart.Items()[0].Price.Amount" .-> C["Price deep inside"]
+```
+
 ### Composition over inheritance
+
+**In plain words: build bigger things by putting small parts together, not by deep family trees of types.**
 
 The GoF book's advice, "favor object composition over class inheritance", is built into Go: there is no inheritance. Build behaviour by holding small parts (a `Service` holds a `Saver`, a `Clock`, a `[]Rule`) instead of deep "is-a" trees. The parts can be swapped and tested alone. How embedding differs from inheritance is in [[OOP in Go - Structs, Interfaces, Embedding]].
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 **The tension, on one feature: cart discounts.** All amounts are `int64` paise (1 rupee = 100 paise), so there is no rounding error.
 
@@ -302,6 +344,8 @@ func Total(c Cart, rules ...Rule) int64 {
 ```
 
 ### Full code (tested)
+
+**In plain words: the before and after code, with tests.**
 
 ```go
 // Package pricing is the DRY/KISS/YAGNI worked example: cart discounts.
@@ -506,7 +550,7 @@ Rule order changes the result: applying the 10% first would give 10% of 21300 = 
 
 When rules need names, logging or persistence, an interface with `Discount` and `Name` methods would be the next step; see [[Strategy and Template Method]] and the full problem in [[Cart Checkout with Coupons]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Principle | Says | Use when | Over-applied, it becomes |
 | --- | --- | --- | --- |
@@ -539,7 +583,7 @@ And the YAGNI test the other way: a pattern is justified by a real problem.
 | An order lifecycle with rules per state | State |
 | Several subscribers to one event | [[Observer and Event Bus]] |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **DRY vs coupling.** Every extraction couples its callers to each other through the shared code. Extract when they change together; duplicate when they change apart.
 - **DRY in tests.** Table-driven tests remove repetition, but test helpers that hide the arrange and assert steps make failures hard to read. A little repetition in tests is often clearer.
@@ -548,7 +592,14 @@ And the YAGNI test the other way: a pattern is justified by a real problem.
 - **Law of Demeter on data.** Plain data structures (DTOs, config) are meant to be read; `cfg.DB.Host` is fine. The law matters for objects that own rules.
 - **Interfaces for testability.** A fake for the database or clock is a real need even with one production implementation; that is one of the four questions, not a YAGNI violation.
 
-## 7. In production
+```mermaid
+flowchart TD
+    Q{"Two code blocks look alike"} --> Q2{"Do they change for the same reason?"}
+    Q2 -- "yes" --> M["Merge them: DRY"]
+    Q2 -- "no" --> K["Keep both: they only look alike"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:** the Go standard library shows cohesion by package (`net/http`, `encoding/json`, `strconv`), small interfaces that keep coupling low (`io.Reader`), and almost no `util` packages. Proverbs like "a little copying is better than a little dependency" are why many Go projects vendor or copy small helpers instead of importing a utility module.
 - **Failure modes → fixes:**
@@ -564,7 +615,7 @@ And the YAGNI test the other way: a pattern is justified by a real problem.
 
 - **What to monitor:** in code review, watch for flag parameters, interfaces with one implementation, packages named `util`/`common`, and chains like `a.B().C().D()`. Import graphs (`go list -deps`, `go mod graph`) show coupling between packages.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **DRY applies to knowledge in every form**, not just code: a rule in Go and the same rule in a SQL `CHECK` constraint is duplication, but often the right kind (the database is the last line of defence when several services write). Make it deliberate: name the owner, and test that both agree.
 
@@ -578,7 +629,7 @@ And the YAGNI test the other way: a pattern is justified by a real problem.
 - "The balance check and the debit belong in `Wallet`, so the lock lives in one place."
 - "This is the third discount type, so now a `Rule` type pays for itself."
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What does DRY actually mean?
 > One authoritative representation of each piece of knowledge, such as a business rule or formula. It is not "no similar lines": code that looks alike but changes for different reasons is incidental duplication and should stay separate.
@@ -601,7 +652,7 @@ And the YAGNI test the other way: a pattern is justified by a real problem.
 > [!question]- Where does composition over inheritance show up in Go?
 > Everywhere: Go has no inheritance. A service holds small parts (a store, a clock, a list of rules) passed in by its constructor, and each part can be replaced or faked.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - DRY = one owner per piece of knowledge, not per line; incidental duplication stays.
 - Rule of three; but merge critical rules (money, state, permissions) on the second copy.
@@ -611,7 +662,7 @@ And the YAGNI test the other way: a pattern is justified by a real problem.
 - Low coupling (pass data, not modes), high cohesion (no `util`), handler/service/repo.
 - Tell, don't ask: the owner checks and changes its own state in one method.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[OOP in Go - Structs, Interfaces, Embedding]]
 - **Next:** [[SOLID in Go]], [[Design Patterns Overview and Chooser]], [[LLD Interview Method]]

@@ -23,7 +23,40 @@ updated: 2026-11-13
 > - **tmpfs** is memory-backed, never touches disk, and disappears the moment the container stops.
 > - Classic mistake: believing a bind mount is a backup. Deleting a file inside the container deletes it on the host too, in both directions, in real time.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Anything a container writes inside itself is lost when the container is deleted.
+That is fine for temp files, but terrible for a database.
+So Docker gives you three kinds of outside storage.
+
+```mermaid
+flowchart LR
+    C["Container"] --> V["Volume: Docker-managed folder<br/>(survives, for data)"]
+    C --> B["Bind mount: your own folder<br/>(for live code)"]
+    C --> T["tmpfs: in memory<br/>(gone on stop)"]
+```
+
+A **volume** is storage Docker manages for you. Use it for databases.
+A **bind mount** links a folder on your computer into the container. Use it for code you edit while developing.
+
+```mermaid
+flowchart LR
+    R["docker rm container"] --> L["Its own writes: gone"]
+    R --> K["Volume data: still there"]
+```
+
+The rest of this note is just these 3 questions:
+1. How long does each kind of storage live?
+2. How do you write the mount options?
+3. Which one should you pick, and how do you back it up?
+
 
 **The problem in one story**
 
@@ -69,7 +102,7 @@ Where it breaks: a real door into your house does not let the guest delete your 
 > [!tip] Remember
 > Data you care about goes on a named volume; a bind mount is a live window, never a backup.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Every container starts from its image's read-only layers plus one new, empty writable layer (see [[Docker 02 - Images, Layers and Containers]]). Anything the running process writes — log files, uploaded files, a database's data directory — lands in that writable layer.
 
@@ -83,16 +116,18 @@ The old note on this topic (`DOCKER Volums`) got the mental model backwards in e
 
 Deleting a file from inside the container deletes it from the host folder too, instantly, in both directions. There is no snapshot, no second copy, and no protection against `rm -rf` run inside the container.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 - The container's **writable layer** is a sheet of paper taped to a whiteboard: erase the whiteboard (`docker rm`) and the paper goes with it.
 - A **named volume** is a filing cabinet in a separate room that Docker manages — the container has a key to one specific drawer, and that drawer exists independently of any particular container holding the key.
 - A **bind mount** is not a cabinet at all; it's a window cut directly into a specific room of the host's own filesystem — whatever is on the other side of that window is what you see and change, with no Docker management in between.
 - **tmpfs** is a whiteboard that was never paper in the first place: it's RAM, and it's gone the instant the container stops, by design.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Three kinds of storage, three different lifetimes
+
+**In plain words:** volume lives until you delete it, bind mount is your own folder, tmpfs vanishes when the container stops.
 
 ```mermaid
 flowchart TB
@@ -120,6 +155,8 @@ flowchart TB
 
 ### `-v` vs `--mount` syntax
 
+**In plain words:** two ways to write the same thing. --mount is longer but clearer and fails loudly on typos.
+
 ```bash
 # Named volume, short syntax: "app-data" is a volume name (no slash in it)
 docker run -v app-data:/var/lib/postgresql/data postgres:17
@@ -141,6 +178,8 @@ That is a common source of surprise when a typo turns an intended volume name in
 
 ### Anonymous volumes and image-declared `VOLUME`
 
+**In plain words:** if an image declares a VOLUME, Docker quietly makes a random unnamed volume each time. These pile up and are easy to lose.
+
 A Dockerfile can declare `VOLUME /var/lib/postgresql/data`, which causes every container from that image to get an **anonymous volume** mounted there automatically, even with no `-v` flag at all.
 
 This is how official images like `postgres` and `mongo` guarantee their data directory is never silently left in the ephemeral writable layer if you forget to mount something yourself.
@@ -152,6 +191,8 @@ The cost:
 - `docker volume prune` deletes any volume not currently attached to a running or stopped container — including an anonymous one from a container you already removed, if you didn't first copy the data out.
 
 ### Choosing the right one
+
+**In plain words:** data to keep means volume, code you are editing means bind mount, secrets or scratch that must not hit disk means tmpfs.
 
 ```mermaid
 flowchart TD
@@ -168,7 +209,7 @@ flowchart TD
 - **Secrets or scratch space that must never be written to disk** → tmpfs. Useful for things like a decrypted credential a process needs only in memory for its own lifetime.
 - **Production stateless services** → neither, usually. Keep the container itself fully stateless and push persistence to a managed database or object store, or, on Kubernetes, a `PersistentVolumeClaim` backed by cloud block storage (EBS, Persistent Disk) — a volume on a single Docker host disappears if that host dies.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -210,6 +251,8 @@ This single flag is the most common cause of "I ran one Compose command and lost
 
 ### Backing up and restoring a named volume
 
+**In plain words:** start a throwaway container that mounts the volume and zips it into a file. Reverse it to restore.
+
 Because a named volume isn't a host path you can just `cp`, the standard pattern is a disposable container that mounts the volume and writes a tar archive to a bind-mounted host folder:
 
 ```bash
@@ -233,6 +276,8 @@ This is the generic mechanism — see [[Replication]] for Postgres-specific back
 
 ### Ownership mismatches on bind mounts
 
+**In plain words:** the user ID inside the container may differ from yours outside, so files show up as owned by "someone else".
+
 ```bash
 $ docker run --rm -v "$(pwd)/data:/data" alpine chown -R 1000:1000 /data
 $ ls -ln data
@@ -248,7 +293,7 @@ The fix is either:
 1. `chown` the host folder to match the container's UID ahead of time, or
 2. run the container with `--user $(id -u):$(id -g)` so it writes as your own UID in the first place.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -258,14 +303,14 @@ The fix is either:
 | tmpfs | RAM-backed mount, no disk at all | Secrets, scratch space that must not persist | Gone on container stop, not just removal; limited by available RAM |
 | Kubernetes `PersistentVolumeClaim` | A volume abstraction backed by real cloud block storage, decoupled from any one host | Production stateful workloads on Kubernetes | More setup; not a Docker-native concept, see [[Containerizing Go Services]] for where container packaging ends and orchestrator-level storage begins |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Named volumes on a single Docker host are tied to that host's disk; they don't replicate and don't survive the host dying. Production stateful data belongs in a managed database or a cloud-backed persistent volume, not a bare Docker volume on one machine.
 - Bind mounts on macOS and Windows go through Docker Desktop's filesystem-sharing layer (gRPC FUSE or VirtioFS), which is measurably slower than native Linux bind mounts — large `node_modules`-style directories with thousands of small files are the worst case; excluding them from the bind mount (installing dependencies inside the image instead) is the usual fix.
 - tmpfs size is bounded by available host RAM and counts against the container's memory limit if one is set; a tmpfs mount sized larger than the container's memory limit will hit `OOM` behaviour under load rather than simply filling up disk.
 - Keeping containers stateless and pushing all persistence to managed services (RDS-style databases, S3-style object storage) avoids the volume-lifecycle question entirely for anything that must survive a host failure, not just a container restart.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Postgres, MySQL, and MongoDB's official images all declare `VOLUME` for their data directories specifically so a forgotten `-v` flag doesn't silently store the database only in the ephemeral writable layer. Compose-based local development stacks universally use named volumes for databases and bind mounts for live source code.
 - **Failure modes → fixes:**
@@ -275,14 +320,14 @@ The fix is either:
   - Slow file-watching/hot-reload in a bind-mounted dev container on macOS → filesystem-sharing overhead; exclude large dependency directories from the bind mount, or switch to a Docker Desktop VirtioFS-backed mount (the modern default) if still on the older gRPC FUSE backend.
 - **What to monitor:** disk usage under `/var/lib/docker/volumes`, orphaned anonymous volumes (`docker volume ls -f dangling=true`), and — for any volume backing a database — whether backups of it are actually being taken and tested, not just assumed because "it's a volume, it persists."
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why a bind mount isn't a backup, precisely.** A bind mount is a kernel-level bind mount (the same Linux `mount --bind` mechanism used outside Docker too): the container's view at the mount point *is* the host directory, not a copy synced to it. There is exactly one copy of the data on disk. Deleting a file through the container's view and deleting it through the host's own filesystem browser are the same operation on the same inode.
 - **Where named volumes actually live.** By default, `/var/lib/docker/volumes/<name>/_data` on the Docker host (Linux; Docker Desktop's case differs because the "host" from the volume's point of view is the Linux VM Docker Desktop runs, not macOS/Windows directly — see [[Docker 01 - Why Containers]] for that VM). A custom volume driver can back a volume with anything else (NFS, a cloud block-storage API), which is how some orchestration layers extend volumes beyond a single local disk without changing anything from the container's point of view.
 - **`compose down` vs `down -v` precisely.** `down` removes containers, networks, and (by default) anonymous volumes created for that run, but explicitly preserves named volumes declared in `volumes:` so a routine redeploy doesn't wipe data. `down -v` additionally removes every named volume the Compose file declares — a deliberate, rarely-wanted operation that should never be a muscle-memory habit alongside `down`.
 - **UID mapping and rootless/user-namespace Docker.** With Docker's rootless mode or user namespace remapping enabled (see [[Docker 09 - Container Security and Hardening]]), the UID a process sees *inside* the container is deliberately not the same UID the host sees for the same file — the kernel remaps it. Bind-mount ownership questions get an extra layer of indirection in that mode: what looks like UID 999 inside the container may show up as a much higher, remapped UID when you `ls -l` the bind-mounted host folder directly.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Is a bind mount a backup of the data inside the container?
 > No. A bind mount is a live, two-way view of one specific host folder — there is exactly one copy of the data. Deleting a file from inside the container deletes it on the host too, instantly. A real backup needs a separate copy, taken deliberately (the throwaway-container-plus-tar pattern, or a database-native backup tool).
@@ -302,7 +347,7 @@ The fix is either:
 > [!question]- When would tmpfs be the right choice over a named volume?
 > When the data must never touch disk at all — a decrypted secret held only for a process's lifetime, or scratch space where persistence would be a security or correctness problem rather than a convenience. It's also the fastest option since it's pure RAM, but it vanishes the moment the container stops, not just when it's removed.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Writable layer: ephemeral, dies with `docker rm`. Named volume: Docker-managed, survives it. Bind mount: your own host folder, live two-way view, not a backup. tmpfs: RAM, gone at container stop.
 - `-v name:/path` is a volume if `name` has no slash, a bind mount if it looks like a path; `--mount type=...` is explicit and preferred for anything beyond a quick test.

@@ -26,7 +26,38 @@ updated: 2026-11-13
 > - **Modules** are reusable, parameterized bundles of resources (e.g. "an ECS service" as one module instantiated per microservice).
 > - Classic mistake: running `apply` without a remote, locked state backend, so two engineers (or two CI runs) stomp on each other's state.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Setting up servers, databases and networks by clicking in a web console is slow and nobody remembers what was clicked.
+**Infrastructure as code** means writing your setup in text files, kept in git like normal code.
+**Terraform** reads those files, compares them with what really exists, and shows you the difference before changing anything.
+
+```mermaid
+flowchart LR
+    F["Your .tf files"] --> P["terraform plan:<br/>show the diff"] --> R["You review"] --> A["terraform apply:<br/>make it real"]
+```
+
+Terraform keeps a **state file**: its memory of what it created. That is how the next plan knows what already exists.
+
+```mermaid
+flowchart LR
+    C["Code (wanted)"] --> D{"Diff"}
+    S["State + real cloud (actual)"] --> D
+    D --> Ch["create / update / replace / delete"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do plan, apply and state work together?
+2. What are resources, data sources, modules and variables?
+3. How do you spot a dangerous change (replace or delete) before it happens?
+
 
 **The problem in one story.**
 You built your AWS setup by clicking around the console.
@@ -71,7 +102,7 @@ Where it breaks: a builder can see the house, but Terraform mostly trusts its st
 > [!tip] Remember
 > Write what you want, read the plan, then apply; the state file is Terraform's memory, so guard it.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Before IaC, "provision an ECS service with its own ALB target group, RDS instance, and security groups" meant a person clicking through the AWS console, or a shell script calling the AWS CLI dozens of times with no way to know what already existed.
 
@@ -91,7 +122,7 @@ resource "aws_ecs_service" "api" {
 
 Run `terraform plan` and Terraform tells you, before touching anything: "this will create 1 ECS service, 1 target group, 0 changes to the VPC." Change `desired_count` to `5` and plan again, and it says: "this will update 1 resource (desired_count: 3 → 5), 0 creates, 0 destroys." That diff-before-you-touch-anything property is what makes infrastructure changes reviewable in a pull request the same way application code is.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Terraform is a **reconciliation loop you run by hand**, not a continuously running controller like a Kubernetes operator:
 
@@ -102,9 +133,11 @@ Terraform is a **reconciliation loop you run by hand**, not a continuously runni
 
 If someone changes a resource outside Terraform (clicks a button in the AWS console), the next `plan` shows that as **drift**: Terraform will plan to change it back unless you import the new reality or adjust your `.tf` files to match.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The core workflow and where state locking matters
+
+**In plain words:** write, plan, apply. The state file is locked during apply so two people can't change things at once.
 
 ```mermaid
 sequenceDiagram
@@ -137,6 +170,8 @@ Local state files (the default, `terraform.tfstate` on disk) have no locking, wh
 
 ### Resources, data sources, modules, and variables
 
+**In plain words:** resource = something Terraform creates. Data source = something it only reads. Module = a reusable bundle. Variable = an input.
+
 - A **resource** block (`resource "aws_ecs_service" "api" {...}`) is one thing Terraform manages end-to-end: create, update in place where possible, or destroy-and-recreate when a change can't be done in place (e.g. changing an RDS instance's `engine` family).
 - A **data source** (`data "aws_vpc" "default" {...}`) reads something Terraform does *not* manage — useful for referencing a VPC or AMI that another team or process owns.
 - A **module** is a directory of `.tf` files with declared input `variable`s and output `output`s, instantiated with `module "api" { source = "./modules/ecs-service" ... }`. Modules are how a reference architecture (VPC + ALB + ECS service + RDS) becomes a parameterized, reusable unit instead of copy-pasted HCL per environment.
@@ -158,11 +193,13 @@ flowchart TB
 
 ### `plan` and `apply`, and the three change kinds
 
+**In plain words:** each change is create, update in place, or replace. "Replace" deletes and recreates, so watch for it on databases.
+
 Every resource change in a plan is one of: **create**, **update in place**, or **replace** (destroy then create — shown as `-/+` and flagged because it usually means downtime or data loss for stateful resources).
 
 A CI gate should always stop and ask a human before auto-applying a plan containing a replace of a database, not just any plan at all.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -303,6 +340,8 @@ resource "aws_ecs_service" "this" {
 ```
 
 ### Go: gating a CI apply on what the plan actually changes
+
+**In plain words:** Go code that reads the plan as JSON and blocks the pipeline if anything would be destroyed.
 
 The reference architecture's CI/CD pipeline (see [[CI-CD Pipelines (GitHub Actions for Go)]]) runs `terraform plan -out=plan.tfplan`, then `terraform show -json plan.tfplan` to get a machine-readable plan.
 
@@ -463,7 +502,7 @@ Terraform will perform the following actions:
 Plan: 1 to add, 1 to change, 1 to destroy.
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Tool | Language | State model | Use when | Cost / note |
 | --- | --- | --- | --- | --- |
@@ -474,14 +513,14 @@ Plan: 1 to add, 1 to change, 1 to destroy.
 | Pulumi | TypeScript/Python/Go/etc. | Explicit state (Pulumi Cloud or self-hosted) | You want a general-purpose language instead of HCL, multi-cloud | Free CLI; Pulumi Cloud paid above free tier |
 | Ansible | YAML (imperative-leaning) | No persistent state file; re-run and converge | Configuration management (packages, users, files) more than provisioning cloud resources | Free; often paired with Terraform, not a replacement for it |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Terraform's state file is a **single point of failure for Terraform's own understanding of reality** — losing it, or editing it by hand incorrectly, can make Terraform plan to destroy things that are fine. Always use a remote backend (S3 + DynamoDB lock table, or HCP Terraform) with versioning enabled on the bucket.
 - HCL is declarative and intentionally limited: real loops exist (`for_each`, `count`) but complex conditional logic gets awkward fast. If your infrastructure logic genuinely needs general-purpose programming, CDK or Pulumi read more naturally — at the cost of leaving the single most widely known IaC tool.
 - A `replace` on a stateful resource (database, cache cluster) is a destroy-then-create from Terraform's point of view; always read `Plan: X to add, Y to change, Z to destroy` and never let `Z > 0` auto-apply on a stateful resource without a human looking first.
 - For a single EC2 instance a team will tear down by Friday, `aws cli` one-liners are simpler than writing a module; Terraform earns its setup cost once infrastructure outlives the person who made it, or exists in more than one environment.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** most AWS-native shops running ECS/EKS use Terraform or OpenTofu to provision the VPC, cluster, and per-service infrastructure, while CI/CD (GitHub Actions, see [[CI-CD Pipelines (GitHub Actions for Go)]]) handles the application deploy itself (new task definition revision) — Terraform typically owns the slower-moving infrastructure layer, not the every-commit application rollout.
 - **Failure modes → fixes:**
@@ -491,7 +530,7 @@ Plan: 1 to add, 1 to change, 1 to destroy.
   - Secrets committed in plaintext `.tfvars` → pull secrets from [[Secrets Management]] (SSM Parameter Store / Secrets Manager) via a data source at apply time, never hardcode them in version control.
 - **What to monitor:** plan/apply success rate and duration in CI, drift-detection job results (a scheduled `terraform plan` that alerts if it's non-empty against an "untouched" environment), and state-lock contention (frequent lock-wait failures mean too many people/pipelines racing the same state).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **State locking mechanics:** with the S3 + DynamoDB backend, `apply` writes a lock item (keyed by the state file's path) into DynamoDB before touching state, and removes it after.
 
@@ -504,7 +543,7 @@ Plan: 1 to add, 1 to change, 1 to destroy.
 - **Drift and `terraform plan -refresh-only`:** a refresh-only plan updates Terraform's recorded state to match reality without proposing any resource changes, useful for reconciling after a deliberate out-of-band change (an incident fix made directly in the console) before the next real apply.
 - **OpenTofu's relationship to Terraform:** HashiCorp moved Terraform from MPL-2.0 to the Business Source License (BSL) in 2023; OpenTofu is the Linux Foundation-governed fork of the last MPL-licensed version, aiming for command and state-file compatibility with Terraform so existing `.tf` files and modules work with either CLI. New projects choosing between them is mostly a licensing/governance decision, not a technical one, as of Terraform 1.9+/OpenTofu's current releases.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What problem does the state file solve, and what happens if it's lost?
 > It's Terraform's record of what it actually created (IDs, ARNs, current attribute values), used to compute the diff for the next plan. Lose it and Terraform has no memory of what exists: the next plan will propose to create everything again, potentially producing duplicate resources or orphaning the real ones. Always use a remote, versioned, locked backend.
@@ -528,7 +567,7 @@ Plan: 1 to add, 1 to change, 1 to destroy.
 > [!question]- How does a CI pipeline safely automate `terraform apply` without risking an unreviewed destructive change?
 > Run `plan` and save it to a file, review (or programmatically gate on) the plan's JSON summary for any delete/replace of stateful resource types, require manual approval only for those, and always `apply` the exact saved plan file rather than re-planning at apply time (closing the gap where reality could have changed between review and apply).
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `plan` is a dry run, `apply` executes it; always read the plan before applying.
 - State file = Terraform's memory of reality; always remote + locked (S3 + DynamoDB, or HCP Terraform) past a single contributor.

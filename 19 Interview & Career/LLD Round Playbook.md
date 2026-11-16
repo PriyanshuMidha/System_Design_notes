@@ -23,7 +23,38 @@ updated: 2026-11-13
 > - Silence and rewriting from scratch are the two most expensive mistakes; narrate, and change one thing at a time.
 > - Classic mistake: spending 30 minutes drawing classes and never coding the one method that holds the hard invariant.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+An **LLD round** (low-level design) is an interview where you design and often code a small system, like a parking lot or a booking app, in 45-90 minutes.
+
+Most people who fail already knew enough. They failed on time: too long on questions, no working code at the end.
+
+```mermaid
+flowchart LR
+    A["25 min of questions"] --> B["Pretty diagram"] --> C["No code, time up"] --> F["Fail"]
+```
+
+The fix is a plan for the clock. In a 45-minute round: spend a few minutes on scope, a few on the main classes, most of the time on one working core, and keep a few minutes to test and discuss.
+
+```mermaid
+flowchart LR
+    S["Scope<br/>~5 min"] --> M["Model<br/>~10 min"] --> C["Core code<br/>~20 min"] --> T["Test + extend<br/>~10 min"]
+```
+
+And talk while you work. The interviewer is writing a report about how you think, not just what you build.
+
+The rest of this note is just these 3 questions:
+1. What kind of round is it, and how do you split the time?
+2. What does the interviewer write down?
+3. How do you recover when stuck, and what extra does SDE-3 need?
+
 
 **The problem in one story.**
 You are asked to "design a parking lot" in 60 minutes, with an interviewer watching.
@@ -66,7 +97,7 @@ Where it breaks: an examiner rarely interrupts you, but an LLD interviewer will 
 > [!tip] Remember
 > Agree scope fast, code the method that guards the hard rule, and keep talking.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Most candidates who fail an LLD round knew the content. They lose on execution: 25 minutes of clarifying questions, a beautiful class diagram, and no working method when the hour ends. Or they code from minute 2 and build the wrong thing.
 
@@ -77,15 +108,17 @@ A concrete scenario: a 60-minute round for "design a parking lot".
 
 Both know the same patterns; A gets a hire signal because the evaluator saw working code, an invariant and trade-offs. This note exists so you are always candidate A.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 An LLD round is a **paired work session with a senior colleague who is also writing a report**. They want to see how you would work on their team: clarify, propose, build the important part, test it, and explain your choices.
 
 Analogy: a cooking exam. The examiner does not want every dish in the cookbook. They want one dish, cooked on time, tasted before serving, with you explaining why you added salt. The menu (requirements) is short on purpose; the clock is the real test.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Step 1: identify the round format
+
+**In plain words:** First figure out the type of round: talk-only, code-only, or a mix. Each one wants a different focus.
 
 | Format | Signals in the invite | Typical length | Code expected | What to optimise |
 | --- | --- | --- | --- | --- |
@@ -95,7 +128,16 @@ Analogy: a cooking exam. The examiner does not want every dish in the cookbook. 
 
 If the invite is unclear, ask the recruiter one question: "Is the LLD round a discussion or do I need runnable code?" Product-company hybrids are covered in [[Zepto-style Product LLD Round]].
 
+```mermaid
+flowchart LR
+    I["Interview invite"] --> D["Discussion:<br/>talk + diagram"]
+    I --> M["Machine coding:<br/>working code"]
+    I --> H["Hybrid:<br/>some of both"]
+```
+
 ### Step 2: run the clock
+
+**In plain words:** Split your time into boxes and watch the clock, so you always end with something working.
 
 ```mermaid
 flowchart LR
@@ -120,6 +162,8 @@ Rule of thumb: in a 45 or 60-minute round you should be typing real code by abou
 
 ### Step 3: present while you work
 
+**In plain words:** Say your plan out loud, check it with the interviewer, and keep them in the loop.
+
 - **Say the plan** in the first minute (script below) and ask "does that match what you want?".
 - **Write requirements as a short list** on the board or at the top of the file, marked in-scope and out-of-scope. It becomes your contract.
 - **Narrate decisions, not keystrokes:** "I keep `Spot` state inside `Level` so one mutex covers find-and-assign" is useful; "now I type a for loop" is not.
@@ -127,6 +171,8 @@ Rule of thumb: in a 45 or 60-minute round you should be typing real code by abou
 - **Check in at phase boundaries:** "I have the model; shall I code `Park` now?" Interviewers often know which method they want to see.
 
 ### Step 4: know what the evaluator writes down
+
+**In plain words:** The interviewer fills a scorecard. Know the boxes so you show each one.
 
 ```mermaid
 flowchart TD
@@ -140,7 +186,7 @@ flowchart TD
 
 These six areas are the owner's interviewer checklist rewritten as a rubric: can you clarify scope, model entities, write working code, separate model, service and repository, handle edge cases, use patterns only where useful, and discuss concurrency and idempotency. Most companies use some variant of these areas; the exact names and weights differ and are not public.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 A 60-minute discussion round, "design a meeting room booking system", traced minute by minute.
 
@@ -165,7 +211,9 @@ minutes for edge cases and extensions. Does that work for you?
 
 What the evaluator likely wrote: clear scope, correct invariant, working `Book`, tested race, good DB answer. That is a hire signal for the LLD part.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
+
+**In plain words:** How to change your plan for different situations: short rounds, a pushy interviewer, a strange problem.
 
 | Situation | What changes | Do | Avoid |
 | --- | --- | --- | --- |
@@ -175,7 +223,7 @@ What the evaluator likely wrote: clear scope, correct invariant, working `Book`,
 | Concurrency-heavy (rate limiter, LRU, pub-sub) | Code is the whole round | Small API, clear locking, a race test | Over-designing interfaces |
 | Senior (SDE-3) bar | Same question, deeper follow-ups | Bring failure paths, multi-instance, observability yourself | Waiting to be asked |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **The time boxes are a default, not a law.** If the interviewer says "skip requirements, start coding", do it. Following your plan over their hint is a red flag.
 - **Asking too many questions** costs as much as asking none. Four to six targeted questions is enough; state assumptions for the rest.
@@ -183,7 +231,7 @@ What the evaluator likely wrote: clear scope, correct invariant, working `Book`,
 - **Patterns are a cost.** Each interface you add is something to explain. Name a pattern only when the requirement changes along that axis ([[Design Patterns Overview and Chooser]]).
 - **This playbook is not for HLD rounds.** A system-design round has a different shape; use [[System Design Interview Framework]].
 
-## 7. In production
+## 7. In production 🔴
 
 Here "production" means the real interview loop.
 
@@ -217,9 +265,11 @@ Here "production" means the real interview loop.
 
 Work through problems in the order of [[17 LLD MOC]], and revise with [[LLD Problem Cheat Sheet]].
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Recovering when stuck
+
+**In plain words:** Stuck happens to everyone. Say it, shrink the problem, and get something small working.
 
 ```mermaid
 stateDiagram-v2
@@ -239,6 +289,8 @@ stateDiagram-v2
 
 ### Calibrating for SDE-3
 
+**In plain words:** At senior level, a correct design is the minimum. They also want trade-offs, failure cases, and you leading the session.
+
 At SDE-1/2 a correct model and working method usually pass. At SDE-3 the same question is used to look for:
 
 - Invariants named before code.
@@ -249,13 +301,20 @@ At SDE-1/2 a correct model and working method usually pass. At SDE-3 the same qu
 
 Language matters less than judgment; Go idioms help only when they make the design simpler ([[OOP in Go - Structs, Interfaces, Embedding]]).
 
+```mermaid
+flowchart LR
+    J["SDE-1/2: correct model<br/>+ working code"] --> S["SDE-3 adds: trade-offs,<br/>concurrency, failure cases,<br/>you drive the round"]
+```
+
 ### Go-specific presentation tips
+
+**In plain words:** Keep it in one package, show a small test, and use plain Go features over clever tricks.
 
 - Keep one package for a 45-minute round; split files (`model.go`, `service.go`, `service_test.go`) only if the editor makes it easy. The layout is in [[LLD Interview Method]].
 - Use typed constants for states and sentinel or typed errors for failures.
 - A `go test -race` winner test is the fastest way to prove a concurrency claim ([[Testing LLD Code]], [[Concurrency for LLD]]).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- The interviewer says "design X" and goes quiet. What do you do in the first two minutes?
 > Say the plan (scope → model → core method → test → extensions), ask 4–6 scoping questions, write the answers down as in-scope and out-of-scope, and ask "does that match?". Silence at the start reads as no structure.
@@ -275,7 +334,7 @@ Language matters less than judgment; Go idioms help only when they make the desi
 > [!question]- What separates a hire from a strong hire in LLD?
 > Both have a working core method. A strong hire also names invariants first, tests the race, codes the failure path, and offers prioritised extensions with costs, without being prompted.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Identify the format: discussion, machine coding or hybrid.
 - First minute: say the plan and ask "does that match?".
@@ -286,7 +345,7 @@ Language matters less than judgment; Go idioms help only when they make the desi
 - Never restart; fix the smallest thing.
 - SDE-3: failure paths, multi-instance, extensions with costs.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[LLD Interview Method]], [[17 LLD MOC]]
 - **Next:** [[Zepto-style Product LLD Round]], [[LLD Problem Cheat Sheet]], [[Learning Resources]]

@@ -24,7 +24,33 @@ updated: 2026-11-13
 > - Execution is therefore **at least once**. The job's effect must be idempotent.
 > - Recurring (cron) schedules create one run per fire time, deduplicated by a unique key `(schedule_id, fire_time)`.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A job scheduler runs tasks at a set time, like "send this reminder at 9 am".
+On one computer, a simple timer tool (cron) does it. But if that computer is down at 9 am, the reminder never goes out.
+So jobs are saved in a database, sorted by their run time. Many workers check it for jobs that are due.
+A worker that takes a job gets a **lease**: "this job is mine for the next 30 seconds". It must keep renewing it while it works.
+If a worker dies, its lease runs out and another worker picks the job up.
+
+```mermaid
+flowchart LR
+    DB["Saved jobs,<br/>sorted by time"] --> W1["Worker 1 takes job<br/>(30 s lease)"]
+    W1 -. "dies, lease runs out" .-> W2["Worker 2 takes it over"]
+```
+
+Because a job can run twice in rare cases, every job must be safe to repeat. That is called **idempotent**.
+
+So the rest of this note is just these 3 questions:
+1. How do workers find due jobs without two of them grabbing the same one?
+2. How do you notice a dead worker and hand its job to someone else?
+3. How do you stop a "zombie" worker that wakes up late from messing things up?
 
 **The problem in one story.**
 You want an app to send 10 million reminders a day, each at its own time.
@@ -68,7 +94,7 @@ Where it breaks: a human caller who wakes up late knows not to call again, but a
 > [!tip] Remember
 > Store jobs durably, claim them with expiring leases, and make every job safe to run twice.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 A single-server cron runs jobs until the server reboots during the 02:00 run, or until you add a second replica and every job runs twice.
 
@@ -92,7 +118,7 @@ The single-service mechanics (cron syntax, Kubernetes CronJob, `SKIP LOCKED` pol
 
 **Glossary.** A **job** is one unit of work with a due time. A **schedule** is a recurring rule that creates a job per fire time. A **lease** is a time-limited claim on a job by one worker. A **heartbeat** extends a lease. A **fencing token** is a number that increases each time a job is re-leased; the store rejects updates carrying an old number. **DLQ / dead** is the state for jobs that exhausted their attempts.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture a hotel wake-up-call desk:
 
@@ -102,7 +128,19 @@ Picture a hotel wake-up-call desk:
 4. If a card has not been re-signed for 30 seconds, the desk assumes the caller fainted and gives the card, with a new attempt number, to someone else.
 5. When the first caller wakes up and tries to stamp "done" with the old number, the desk refuses.
 
-## 3. How it works - high-level design
+```mermaid
+sequenceDiagram
+    participant D as Desk (store)
+    participant A as Caller A
+    participant B as Caller B
+    A->>D: take card (attempt 1)
+    Note over A: stops re-signing
+    D->>B: give card (attempt 2)
+    B->>D: done, attempt 2: accepted
+    A->>D: done, attempt 1: refused
+```
+
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart LR
@@ -150,7 +188,7 @@ sequenceDiagram
 
 The target system still saw two calls (one from each worker). That is why the call carries `job_id:attempt` or just `job_id` as an idempotency key, and why the target must deduplicate (see [[Idempotency and Idempotency Keys]]).
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -169,6 +207,8 @@ Numbers: 50M runs/day = 579/s avg; top-of-minute burst ~14k in 1 s.
 ```
 
 ### Estimates
+
+**In plain words:** rough sums: how many jobs per second become due at peak, and how big the job table gets.
 
 All inputs are estimates.
 
@@ -190,6 +230,8 @@ The burst, not the average, sizes the system. Two fixes:
 
 ### API
 
+**In plain words:** create a job, cancel it, and check its status.
+
 ```http
 POST /v1/jobs
 Idempotency-Key: 2b9f...
@@ -209,6 +251,8 @@ GET    /v1/schedules/{id}/runs  -> paginated run history
 `next_fire_at` for `0 2 * * *` in `Asia/Kolkata` (UTC+05:30) is 20:30 UTC the previous day. The service stores and compares times in UTC and evaluates cron in the schedule's own time zone, which is the only correct place to handle daylight-saving gaps and repeats for zones that have them.
 
 ### Data model
+
+**In plain words:** one main table of jobs, with the run time, the current owner, and the lease end time.
 
 ```mermaid
 erDiagram
@@ -295,6 +339,8 @@ Limit  (cost=0.56..9.21 rows=100 width=22)
 
 ### Job lifecycle
 
+**In plain words:** a job moves through a few states: waiting, running, done or failed, and back to waiting for a retry.
+
 ```mermaid
 stateDiagram-v2
     [*] --> scheduled: submit / cron fire
@@ -311,6 +357,8 @@ stateDiagram-v2
 ```
 
 ### Go: a lease-based job store with fencing
+
+**In plain words:** the code claims due jobs, renews leases, and refuses a "done" from a worker holding an old attempt number.
 
 The in-memory `Store` models the job table: each method corresponds to one atomic SQL statement above. The clock is injected, so tests can expire leases and wait out backoffs instantly.
 
@@ -663,7 +711,7 @@ func TestConcurrentWorkersNeverShareAJob(t *testing.T) {
 
 `TestExpiredLeaseIsReclaimedAndOldWorkerIsFenced` is the sequence diagram above as a test: the heartbeat keeps the lease alive, silence lets it expire, attempt 2 goes to another worker, and the zombie's `Complete` gets `ErrStaleLease`.
 
-## 5. Variants
+## 5. Variants 🟡
 
 | Approach | How due jobs are found | Good for | Limits |
 | --- | --- | --- | --- |
@@ -675,7 +723,7 @@ func TestConcurrentWorkersNeverShareAJob(t *testing.T) {
 | Workflow engine (Temporal timers) | durable timers inside workflows | multi-step processes with waits | heavier platform (see [[Workflow Engines and Durable Execution]]) |
 | Kubernetes CronJob | controller creates a Job per fire time | a handful of infra tasks | not built for millions of user jobs |
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 - **Polling vs push.** Polling every 250 ms adds up to 250 ms of delay and constant queries, but it is simple and self-healing. A timing wheel loaded a few seconds ahead gives precise firing while the database stays the source of truth.
 - **Lease length.** A short lease (10 s) detects dead workers fast but needs frequent heartbeats and risks re-running a job paused by GC; a long lease (5 min) means a crash delays the retry by up to 5 minutes. Pick a lease of about 3 heartbeat intervals and make long jobs heartbeat.
@@ -683,7 +731,13 @@ func TestConcurrentWorkersNeverShareAJob(t *testing.T) {
 - **Shard by job ID vs by due time.** Hash of job ID spreads writes evenly; sharding by due time makes "what is due now" a single-shard read but puts the whole top-of-hour burst on one shard. This design hashes by ID and has every shard poll its own slice.
 - **When a simpler design wins:** if you have one service with a few thousand jobs a day, a jobs table in its own Postgres with `SKIP LOCKED` workers (River, or a 50-line loop) is the whole scheduler. A separate platform pays off once many teams share it.
 
-## 7. In production
+```mermaid
+flowchart LR
+    S["Short lease (10 s)"] --> S1["Dead worker found fast,<br/>more renew traffic"]
+    L["Long lease (5 min)"] --> L1["Less traffic,<br/>slow to notice a dead worker"]
+```
+
+## 7. In production 🔴
 
 - **Real systems.** Postgres-backed queues with periodic jobs (River for Go, GoodJob and Solid Queue for Ruby), Redis-backed schedulers (asynq for Go, Sidekiq Enterprise periodic jobs for Ruby), Quartz in clustered JDBC mode, Kubernetes CronJob, Amazon EventBridge Scheduler, and Temporal for durable timers all implement parts of this design.
 - **Failure: the target is down for an hour.** Retries with exponential backoff and jitter, capped at a few minutes, plus a per-target circuit breaker so 50,000 jobs do not hammer a dead endpoint (see [[Timeouts, Retries and Backoff]]).
@@ -692,7 +746,7 @@ func TestConcurrentWorkersNeverShareAJob(t *testing.T) {
 - **Failure: the scheduler was down for 20 minutes.** On restart, all overdue jobs are due at once. Claim in `run_at` order with per-tenant limits; for cron schedules apply each schedule's catch-up policy (`latest_only` skips missed fires instead of running 20 copies).
 - **What to monitor:** due-but-unclaimed count and age of the oldest due job (the key lag signal); start delay (`started_at - run_at`) p99; success, retry and dead rates per tenant; lease expiries (crashing or slow workers); heartbeat failures; table bloat and autovacuum lag on the jobs table; a dead-man's switch alert for critical schedules that did not run.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why the attempt number is a fencing token.** A lease is based on time, and a process cannot know it has been paused. After a 40-second GC pause, worker 1 still believes it holds the job. Every write it makes is therefore guarded by `attempt = $token`. When the job is re-leased, the attempt increments, so the old holder's writes match zero rows. This is the fencing pattern from [[Distributed Locks and Fencing Tokens]] applied to jobs. It protects the job store, but it does not stop worker 1's HTTP call to the target that is already in flight. That is why the target also needs an idempotency key.
 
@@ -704,7 +758,7 @@ func TestConcurrentWorkersNeverShareAJob(t *testing.T) {
 
 **Exactly-once effects.** "Exactly once" execution is not achievable across a network boundary, but exactly-once *effect* is: the target stores `job_id` in a unique column or an idempotency table in the same transaction as its side effect, and the scheduler can safely retry forever. For jobs that write to the same Postgres as the scheduler, completing the job and doing the work in one transaction gives a true exactly-once effect.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How do you stop two workers from running the same job?
 > They never claim the same row: the claim uses `FOR UPDATE SKIP LOCKED` and flips the state in the same statement. After a crash, a job can run again, but only after its lease expires, and with a higher attempt number that fences off the old worker's writes.
@@ -727,7 +781,7 @@ func TestConcurrentWorkersNeverShareAJob(t *testing.T) {
 > [!question]- Where should the lease expiry time come from?
 > From one clock: the database's `now()`. Worker clocks can drift; if each worker computed expiry locally, a fast clock could steal a lease that is still valid.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Durable job table is the truth; queues, wheels and caches are accelerators.
 - Claim: `UPDATE … FROM (SELECT … ORDER BY run_at LIMIT n FOR UPDATE SKIP LOCKED)`, partial index `WHERE state='scheduled'`.

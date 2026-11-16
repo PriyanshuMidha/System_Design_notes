@@ -29,7 +29,42 @@ updated: 2026-11-13
 > - Decide explicitly what happens to runs missed during downtime: skip, run once, or run all.
 > - Run schedules in UTC and alert when a job did **not** run (dead man's switch).
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (levels 1-3), 4 (worked example) and 5-6, including "Time zones and DST".
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Some work must run on a clock: every night at 2 am, or every 15 minutes.
+The classic tool for this is **cron**: a line like `0 2 * * *` that means "2 am every day".
+On one machine that is easy.
+But real apps run many copies of the same server, so each copy fires the job, and users get 3 emails.
+And if the server restarts at the wrong second, the job is just skipped.
+The fix is to keep the schedule in a shared, saved place and let only one copy **claim** each run.
+
+```mermaid
+flowchart LR
+    T["2 am"] --> R1["Copy 1 sends email"]
+    T --> R2["Copy 2 sends email"]
+    T --> R3["Copy 3 sends email"]
+    R1 & R2 & R3 --> U["User gets 3 emails"]
+```
+
+```mermaid
+flowchart LR
+    T["2 am"] --> DB[("Saved schedule")]
+    DB -- "only one copy wins the claim" --> R1["Copy 1 sends email"]
+    R1 --> U["User gets 1 email"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you make many copies run a job only once?
+2. How do you save "do this at 9 am tomorrow" so a restart does not lose it?
+3. What do you do about missed runs and time zone changes?
+
 
 **The problem in one story.**
 Your app must email reminders at 9 am and clean up old data every night.
@@ -72,7 +107,7 @@ Where it breaks: nurses notice a missed dose by looking; software needs an expli
 > [!tip] Remember
 > The timer is easy; run once across replicas, survive restarts, handle missed runs, and make reruns harmless.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An invoicing service has these jobs (kept from the owner's original job list):
 
@@ -91,7 +126,17 @@ In March, the server's local time zone jumps from 02:00 to 03:00 for daylight sa
 
 Each of these is a different problem: **duplication**, **durability**, **missed runs** and **time zones**. This note covers all four.
 
-## 2. Mental model
+**Four different problems from one simple timer:**
+
+```mermaid
+flowchart TB
+    T["time.Ticker in the API"] --> D["3 replicas => 3 emails<br/>(duplication)"]
+    T --> R["Deploy at 01:59 => no run<br/>(durability)"]
+    T --> M["Server down => run missed<br/>(catch-up)"]
+    T --> Z["Clock jumps for DST<br/>(time zones)"]
+```
+
+## 2. Mental model 🟢
 
 Think of a hospital ward's medication schedule.
 
@@ -107,9 +152,20 @@ Terms:
 - **Lease:** a claim that expires on its own, so a crashed worker's job becomes claimable again.
 - **Dead man's switch:** an alert that fires when an expected signal (a successful run) stops arriving.
 
-## 3. How it works
+**The ward chart, drawn:**
+
+```mermaid
+flowchart LR
+    C[("Chart on the wall<br/>(job store)")] --> N1["Nurse 1 initials 9 am dose<br/>(claim)"]
+    C --> N2["Nurse 2 sees initials, skips"]
+    N1 --> G["Dose given once"]
+```
+
+## 3. How it works 🟡
 
 ### Level 1: one process, one timer
+
+**In plain words:** a plain timer in one program. Fine on one machine, breaks as soon as you run two copies or restart at the wrong time.
 
 `cron` on one VM, or a loop around `time.Ticker` in Go. Simple and fine for one machine.
 
@@ -118,6 +174,8 @@ It breaks as soon as there are two copies of the process or the machine restarts
 A Go `Ticker` also drops ticks when the job is slower than the period, because it delivers at most one pending tick; the Go-side details (and the Go 1.23 timer changes) are in [[Scheduled Jobs]].
 
 ### Level 2: make "N replicas" run once
+
+**In plain words:** ways to make sure only one copy runs the job: run the timer in one place, or let all copies race for a lock and only the winner works.
 
 Options, from simplest to most general:
 
@@ -149,6 +207,8 @@ The transaction-scoped advisory lock (`pg_try_advisory_xact_lock`) is released a
 A lock only stops **simultaneous** runs. A replica whose clock is 5 seconds late can still run after the winner has finished and released. So the job itself must also be idempotent: "mark overdue where status = 'sent' and due date has passed" naturally does nothing the second time.
 
 ### Level 3: durable one-off scheduling
+
+**In plain words:** save each future job as a row with its run time; pollers pick up rows whose time has come, like a to-do list on a shared wall.
 
 "Remind me at 9 am tomorrow" cannot live in a process's memory. Store it:
 
@@ -198,9 +258,11 @@ RETURNING j.id, j.kind, j.payload;
 
 `SKIP LOCKED` makes concurrent pollers take **different** rows instead of waiting on each other. The lease (`locked_until`) handles crashes: if a worker dies, the row becomes due again after 5 minutes. That is at-least-once execution, so the job's effect must be idempotent ([[Delivery Semantics and Exactly-Once]]). The `dedupe_key` stops the same reminder from being scheduled twice.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** both patterns on one napkin: recurring jobs race for a lock, one-off jobs sit in a table until they are due.
 
 ```text
 recurring:  every replica ticks -> try lock -> winner enqueues work -> commit (unlock)
@@ -214,6 +276,8 @@ every effect idempotent ; alert if last success is older than 2 x period
 ```
 
 ### Full version in Go
+
+**In plain words:** a Go model of the jobs table with claims that expire, plus the rule for missed runs, with tests.
 
 An in-memory model of the jobs table (claim with lease, complete) and the catch-up policy. It compiles and passes `go vet` and `go test -race` on Go 1.24. `ClaimDue` holds a mutex for the whole select-and-lease step, which is what `FOR UPDATE SKIP LOCKED` inside one statement gives you in PostgreSQL.
 
@@ -424,7 +488,7 @@ The race test runs three concurrent pollers over 300 due jobs with batches of 25
 | `RunOnce` | the 14:00 slot | Jobs that process "everything due so far": overdue marking, reconciliation |
 | `RunAll`, cap 3 | 12:00, 13:00, 14:00 | Per-slot work: hourly reports, one billing period each |
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -440,13 +504,15 @@ The race test runs three concurrent pollers over 300 due jobs with batches of 25
 
 ### Kubernetes CronJob settings that matter
 
+**In plain words:** three settings decide most CronJob surprises: can runs overlap, how late is too late, and which time zone is used.
+
 - `concurrencyPolicy`: `Allow` (default, runs may overlap), `Forbid` (skip a run while the previous one is still running), `Replace` (kill the old run and start the new one).
 - `startingDeadlineSeconds`: how late a run may start before it counts as missed. If it is unset and the controller finds **more than 100 missed schedules** since the last run, it does not start the job and logs an error.
 - `timeZone` (stable since Kubernetes 1.27): for example `Etc/UTC`. Without it, schedules follow the controller manager's time zone.
 - `backoffLimit` on the job template, and `successfulJobsHistoryLimit` (default 3) / `failedJobsHistoryLimit` (default 1).
 - The docs say a CronJob creates a Job "about once" per schedule; in rare cases two or none. Jobs must be idempotent.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Do the work in workers, not in the scheduler.** The scheduler should only decide *what is due* and enqueue it. A scheduler that sends 50,000 emails itself holds its lock for an hour and cannot be scaled.
 - **Batches must be resumable.** Process in chunks of 500 with `FOR UPDATE SKIP LOCKED`, commit each chunk, and loop until empty. A crash after chunk 30 resumes at chunk 31 because finished rows no longer match the `WHERE`.
@@ -457,11 +523,13 @@ The race test runs three concurrent pollers over 300 due jobs with batches of 25
 
 ### Time zones and DST
 
+**In plain words:** clocks jump forward and back once a year in many places, so a local 2 am can happen zero or two times. Schedule in UTC.
+
 - Store and schedule in **UTC**. `0 2 * * *` in `Europe/London` hits a missing hour on the last Sunday of March (01:00 jumps to 02:00) and a repeated hour in October.
 - Implementations differ: some run a skipped job right after the jump, some skip it, some run a repeated hour twice. Do not rely on any of them.
 - If the business really means local time ("send at 9 am in the user's time zone"), compute the next `run_at` in UTC from the user's zone with a proper time zone database, one occurrence at a time, and store the UTC instant.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Kubernetes CronJob for nightly batch jobs; EventBridge Scheduler on AWS for large numbers of one-off schedules.
@@ -480,7 +548,7 @@ The race test runs three concurrent pollers over 300 due jobs with batches of 25
 	- Due-but-unclaimed jobs: `count(*) WHERE run_at < now() - interval '1 minute' AND state = 'scheduled'`, meaning pollers are behind.
 	- Lease expiries (a sign of crashing or too-slow workers).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Timing wheels for millions of timers.** A heap gives `O(log n)` insert and pop (see [[Heaps and Priority Queues]]).
   A **timing wheel** is a circular array of buckets, one per tick (say 1 second, 3,600 buckets for an hour). Inserting a timer is `O(1)`: put it in bucket `(now + delay) mod 3600`.
@@ -496,7 +564,15 @@ The race test runs three concurrent pollers over 300 due jobs with batches of 25
 - **Exactly when?** No scheduler runs at an exact instant. Pollers add up to one poll interval of delay, Kubernetes adds pod start time, EventBridge Scheduler offers a flexible time window on purpose. State the precision you need ("within 60 seconds") and design to it.
 - **Long periodic jobs should checkpoint.** Store progress (`last_processed_id`) in a table after each chunk. A restart resumes from the checkpoint instead of starting over, and the catch-up policy only has to decide about new slots.
 
-## 9. Interview questions
+**A timing wheel, drawn** (1 bucket per second, 3,600 buckets):
+
+```mermaid
+flowchart LR
+    I["New timer: due in 90 s"] -- "put in bucket (now + 90) mod 3600" --> W(("Wheel of buckets"))
+    W -- "each tick: fire the current bucket" --> F["Timers due now"]
+```
+
+## 9. Interview questions 🔴
 
 > [!question]- You run a cron library in a service with 5 replicas. What goes wrong, and how do you fix it?
 > Each replica fires, so the job runs 5 times. Fix by moving scheduling out (Kubernetes CronJob, a 1-replica scheduler, EventBridge Scheduler), by taking a per-run lock such as `pg_try_advisory_xact_lock`, or by leader election. Also make the job idempotent, because locks do not stop a late replica from running after the winner finished.
@@ -519,7 +595,7 @@ The race test runs three concurrent pollers over 300 due jobs with batches of 25
 > [!question]- How do you hold millions of pending timers efficiently?
 > A hierarchical timing wheel gives `O(1)` insert and per-tick firing, instead of `O(log n)` for a heap. Durability still needs a store: keep timers in a table or log, load the next window (for example the next hour) into the wheel, and shard by timer ID across nodes.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Cron = `min hour dom month dow`; `0 2 * * *` is 02:00 daily. Schedule in UTC.
 - N replicas with a timer = N runs. Fix: external scheduler, per-run lock, or leader.

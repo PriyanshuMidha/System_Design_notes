@@ -27,7 +27,40 @@ updated: 2026-11-13
 > - Every cache needs an answer to "what if it is empty or down?" Stampede protection is part of the design, not an extra.
 > - Numbers in this note are rough estimates unless a source is named.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the five steps), 4 (worked example), 5, 6 and the scenario drills.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 9 and "How to say it in the interview". Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Reading from a database is slow-ish, and many users ask for the same thing again and again.
+So you keep a copy of popular answers in fast memory. That fast copy is a **cache**.
+If the copy is there (a **hit**), you answer in about a millisecond. If not (a miss), you ask the database and save the answer for next time.
+The catch: when the real data changes, the copy can be wrong for a while.
+So every copy gets an expiry time, and you delete the copy when you change the data.
+
+```mermaid
+flowchart LR
+    A["App"] -- "1. ask cache" --> C["Cache"]
+    C -- "hit: answer fast" --> A
+    A -- "2. miss: ask DB" --> D["Database"]
+    A -- "3. save copy" --> C
+```
+
+```mermaid
+flowchart LR
+    W["Price changes"] --> D["Update database"]
+    D --> X["Delete cached copy"]
+    X --> N["Next read fetches<br/>the new price"]
+```
+
+The rest of this note is just these 3 questions:
+1. Where should the cache sit, and who fills it?
+2. How do you keep it fresh enough?
+3. What happens when it is empty, overloaded or down?
 
 **The problem in one story**
 
@@ -74,7 +107,7 @@ Where it breaks: a sticky note never fills up, but a real cache has limited memo
 > [!tip] Remember
 > Cache-aside, a TTL and delete-on-write; then plan for the cache being empty or down.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Say you are designing the home page of a food delivery app. The "restaurants near me" list is read about 50,000 times per second at peak (an estimate) but changes only when a restaurant edits its menu, maybe once a day.
 
@@ -85,7 +118,7 @@ In an HLD round the interviewer does not want "I would add Redis". They want to 
 > [!tip] Remember
 > "Add a cache" is not a design. "Cache-aside in Redis with a 60 s TTL, delete on write, singleflight on miss" is.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a restaurant kitchen. The **walk-in fridge** is the database: big, slow to walk to. The **counter shelf** next to the chef is the cache: small, instant. The **pre-plated dishes under the heat lamp** are a CDN edge: they never reach the kitchen at all.
 
@@ -113,7 +146,7 @@ Each hop is a chance to stop early. The earlier you stop, the cheaper the reques
 > [!tip] Remember
 > The best cache hit is the one that never leaves the user's device.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Step 1: where to cache (the layers)
 
@@ -215,6 +248,8 @@ See [[Cache Invalidation, TTL and Consistency]].
 
 ### Step 4: which store (local, Redis, Memcached)
 
+**In plain words:** A cache inside your app's own memory is fastest but each copy of the app has its own. A shared cache like Redis is one copy for everyone, one network hop away.
+
 ```mermaid
 flowchart TD
     S{"What do I need to store?"}
@@ -277,7 +312,7 @@ See [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]
 > [!tip] Remember
 > Jitter the TTL, coalesce the miss, cache the "not found", and size the database for a cold cache.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 **Problem:** the "restaurant details" endpoint of a food delivery app. Facts (estimates): 20,000 reads per second at peak, 200 writes per day per restaurant, 500,000 restaurants, 4 KB per restaurant document.
 
@@ -319,9 +354,11 @@ flowchart TD
 > [!tip] Remember
 > Size the data first. If it fits in one node's RAM, you do not need a clustered cache yet.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### The full comparison table
+
+**In plain words:** Four ways to fill a cache, side by side. Cache-aside (the app fills it on a miss) is the usual default.
 
 | Dimension | Cache-aside | Read-through | Write-through | Write-behind |
 | --- | --- | --- | --- | --- |
@@ -339,6 +376,8 @@ flowchart TD
 
 ### Picking by data type
 
+**In plain words:** Not all data needs the same care. Static images can live for days; a stock count may need seconds or no cache at all.
+
 | Data | Where | Pattern | Freshness |
 | --- | --- | --- | --- |
 | Static assets, images | CDN, browser | Versioned URLs | Immutable, `max-age=31536000` |
@@ -352,7 +391,7 @@ flowchart TD
 | Feature flags | Local plus pub/sub | Push invalidation | Seconds |
 | Payments, balances | Do not cache | Read the primary | Strong |
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 - **Staleness versus speed.** Every cache is a promise that old data is acceptable for some time. Write that time down.
 - **Complexity.** A cache adds invalidation bugs, a new failure mode, and a new thing to monitor.
@@ -367,7 +406,7 @@ flowchart TD
 > [!warning] Common mistake
 > Adding a cache to hide a slow query. Fix the index first ([[Query Plans and EXPLAIN]]), then cache what is still hot.
 
-## 7. In production
+## 7. In production 🔴
 
 Real systems, with what is publicly documented:
 
@@ -388,9 +427,11 @@ Monitor:
 
 See [[Redis in Production - Memory, Latency, Security]] and [[Cache Eviction Policies - LRU, LFU, TTL]].
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Two-level caches
+
+**In plain words:** A tiny cache inside the app, in front of Redis, saves trips. But now there are two copies that can go stale, so keep the inner one very short-lived.
 
 A local cache in front of Redis cuts Redis traffic and latency but doubles the staleness problem. Use a tiny local TTL (1 to 5 s) or invalidate with Redis pub/sub. Redis also offers server-assisted client-side caching that tells a client when a tracked key changed.
 
@@ -409,20 +450,41 @@ sequenceDiagram
 
 ### Multi-region
 
+**In plain words:** Each region keeps its own cache. When data changes, a message tells other regions to drop their copy, and they are a little behind for a moment.
+
 Each region has its own cache. Writes go to the primary region and a change stream deletes keys in the other regions. Accept that remote regions are stale by the replication lag plus the delete delay. Facebook's paper describes the same idea with invalidations sent from the database log.
+
+```mermaid
+flowchart LR
+    W["Write in region A"] --> DB["Primary DB"]
+    DB --> CS["Change stream"]
+    CS --> CA["Delete key in<br/>region A cache"]
+    CS --> CB["Delete key in<br/>region B cache"]
+```
 
 ### Negative caching and Bloom filters
 
+**In plain words:** Remember "this does not exist" too. Otherwise bots asking for fake ids hit your database every single time.
+
 If 5 percent of requests ask for IDs that do not exist (bots, scans), each one reaches the database. Cache "not found" for 30 s, or put a Bloom filter of valid IDs in front.
 
+```mermaid
+flowchart LR
+    R["Request for id 999"] --> B{"Bloom filter:<br/>could it exist?"}
+    B -- "no" --> N["Return not found<br/>(DB never touched)"]
+    B -- "maybe" --> C["Cache, then DB"]
+```
+
 ### Why delete instead of update on write
+
+**In plain words:** If two writers both update the cache, they can land in the wrong order and leave a wrong value. Deleting is safe: the next reader loads the fresh value.
 
 Updating the cache on write has a race: two writers can set the cache in the opposite order of their database writes, leaving the wrong value until TTL. Deleting is safe because the next reader reloads the latest value. A rare race remains where a slow reader refills an old value after the delete, which is why the TTL stays.
 
 > [!tip] Remember
 > Delete beats update. TTL backs up the delete.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Where would you cache for a read-heavy product catalogue and why?
 > Public, same-for-everyone data goes to the CDN with `Cache-Control: public` and a short `max-age` plus `stale-while-revalidate`. Behind it, Redis cache-aside for the JSON documents with a TTL and delete on write. The CDN removes traffic from my servers entirely; Redis removes it from the database.
@@ -445,7 +507,7 @@ Updating the cache on write has a race: two writers can set the cache in the opp
 > [!question]- How do you keep a local cache consistent across 50 pods?
 > I would not promise strong consistency. I use a very short TTL, or publish invalidations over Redis pub/sub or a message bus so every pod drops its copy. For data that must be exact, skip the local layer.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Layers, outside in: browser, CDN, gateway, app memory, Redis or Memcached, database.
 - Default: cache-aside, TTL with jitter, delete on write, singleflight, cache not-found.
@@ -456,7 +518,7 @@ Updating the cache on write has a race: two writers can set the cache in the opp
 - Size the data before choosing the store.
 - Monitor hit ratio, evictions, database QPS, p99.
 
-## Real-life scenario drills
+## Real-life scenario drills 🟡
 
 | Scenario | Choice | Why | What you say in the interview |
 | --- | --- | --- | --- |
@@ -471,7 +533,7 @@ Updating the cache on write has a race: two writers can set the cache in the opp
 | Search suggestions | CDN or Redis with short TTL | Popular prefixes repeat | "Cache by prefix with a short TTL; long-tail prefixes are not worth it." |
 | API rate limiting | Redis atomic counters | Shared state across instances | "A shared counter in Redis, see rate limiting design." |
 
-## How to say it in the interview
+## How to say it in the interview 🔴
 
 - "I cache at the outermost layer where the data is shareable, so public data goes to the CDN and per-user data to Redis."
 - "I use cache-aside with a TTL and delete on write. The TTL is my safety net."
@@ -480,7 +542,7 @@ Updating the cache on write has a race: two writers can set the cache in the opp
 - "If Redis fails, the app falls back to the database behind a circuit breaker, and the database is sized for that."
 - Trade-off line: "The cost of this cache is staleness and one more thing to operate, which I think is worth it at 20k reads per second."
 
-## Links
+## Links 🟢
 
 - Before this: [[Caching Fundamentals]], [[Caching Patterns]]
 - Deep notes: [[Cache Invalidation, TTL and Consistency]], [[Cache Eviction Policies - LRU, LFU, TTL]], [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]], [[Redis Fundamentals]], [[Redis Data Structures and When to Use Each]], [[Redis Use Cases]], [[Redis Replication, Sentinel and Cluster]], [[Redis Persistence - RDB and AOF]], [[Redis in Production - Memory, Latency, Security]], [[Redis Hands-on Setup with Go]], [[Redis in Go]]

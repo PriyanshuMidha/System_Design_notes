@@ -23,7 +23,33 @@ updated: 2026-11-13
 > - The rule that matters: order is outside-in on the way in and inside-out on the way back, so `Logging(Auth(h))` runs Logging first.
 > - Classic mistake: putting business rules in middleware, or logging before the status code is known.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then the rest of this "Start here" section, sections 1, 2 and the cheat sheet (10). Skip the big code blocks on a first pass. Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works, with the small whiteboard code), section 4 (the full worked example) and sections 5 and 6 (variants and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Many requests need the same extra jobs: log it, check login, catch crashes.
+Copying those jobs into every handler is messy and easy to forget.
+A **decorator** wraps something and looks exactly the same from outside, but adds one extra job before or after.
+In Go web servers this wrapper is called **middleware**.
+You stack wrappers like layers of an onion. The request goes in through each layer and the answer comes back out through them.
+
+```mermaid
+flowchart LR
+    R["Request"] --> L["Logging"] --> A["Auth"] --> H["Your handler"]
+    H --> A2["back out through Auth"] --> L2["back out through Logging"] --> Resp["Response"]
+```
+
+The code below is long, but each wrapper is just "do my job, then call the next one".
+The rest of this note is just these 3 questions:
+1. How does one wrapper look in Go?
+2. Why does the order of the layers matter?
+3. What should never go into middleware?
+
 
 **The problem in one story.**
 Every request to your API must be logged, checked for login and protected from crashes.
@@ -68,7 +94,7 @@ Where it breaks: a parcel layer cannot read what is inside, but a middleware see
 > [!tip] Remember
 > Same interface outside, extra work inside; layers run outside-in on the way in and inside-out on the way back.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An order API has 30 handlers. Each one needs panic recovery, a request ID, an access log line with status and latency, an auth check and a rate limit.
 
@@ -82,7 +108,7 @@ Three things to get right, all shown below:
 - A logging middleware can only log the status code if a `ResponseWriter` wrapper captures status and bytes.
 - An example that calls `http.ListenAndServe` blocks forever and produces nothing to check; running the chain through `httptest` does.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Gift wrapping. The gift (the handler) is wrapped in paper (logging), then a box (auth), then more paper (recover). Each layer has the same outside shape, "a parcel", so you can add or remove layers without the gift knowing.
 
@@ -90,7 +116,7 @@ Opening the parcel goes from the outside in; the layers you pass on the way in a
 
 That return trip is where an outer layer sees what an inner layer did, such as the status code the handler wrote.
 
-## 3. How it works
+## 3. How it works 🟡
 
 1. **Same interface in and out.** A decorator accepts an `http.Handler` and returns an `http.Handler`. Go names this shape `type Middleware func(http.Handler) http.Handler`.
 2. **Before and after.** Inside, the wrapper runs code, calls `next.ServeHTTP(w, r)`, then runs more code. It may also **not** call `next` (Auth returns 401), which makes that layer a short-circuit.
@@ -127,12 +153,16 @@ sequenceDiagram
 
 ### Why this order
 
+**In plain words:** Layers run outside-in. This list explains why each layer sits where it does, like deciding who stands at which door.
+
 - **Recover outermost**, so a panic in any layer, including other middleware, becomes a 500 instead of a dropped connection (as long as nothing was written before the panic).
 - **RequestID next**, so every inner layer can log the same ID.
 - **Logging outside Auth and RateLimit**, so rejected requests (401, 429) are logged with their real status.
 - **Auth before RateLimit**, because a per-user limit needs the user that Auth puts in the context. (The demo's limit is global for brevity.) An IP-based limit that protects the login endpoint from brute force would go before Auth instead.
 
 ### The same pattern outside HTTP
+
+**In plain words:** Wrapping is not just for web servers. Go streams (readers and writers) stack wrappers the same way, for example to compress or count bytes.
 
 Streams in the standard library are decorators of `io.Reader` and `io.Writer`. The worked example builds this stack:
 
@@ -179,6 +209,8 @@ classDiagram
 
 ### Whiteboard version
 
+**In plain words:** Two wrappers around one handler; a request with no login is stopped at the Auth layer and never reaches the handler.
+
 Two middlewares wrap one handler; a request without an `Authorization` header is stopped by Auth and never reaches the handler. This is the bare idea you can draw in two minutes; the full version below adds production concerns.
 
 ```go
@@ -218,7 +250,9 @@ func main() {
 }
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
+
+**In plain words:** One program with a stack of HTTP middlewares plus wrappers for HTTP clients and streams. Each wrapper does one job and then calls the next.
 
 One `package main` with `Logging` and `Auth` middleware (Logging captures status and bytes; Auth passes the user in the context), plus `Recover`, `RequestID`, `RateLimit`, a `Chain` helper, an `io.Writer` decorator, two `http.RoundTripper` decorators and an embedded repository decorator.
 
@@ -588,6 +622,9 @@ func main() {
 
 The tests use `httptest.NewRecorder` for middleware (no network) and `httptest.NewServer` for the client-side decorators (a real loopback server):
 
+
+**In plain words:** These are the tests. They send fake requests through the layers and check the status codes, headers and order of work.
+
 ```go
 package main
 
@@ -796,7 +833,7 @@ What to notice:
 - **The round tripper** added the token and retried one 503, so the server saw 2 attempts; the caller's own request was not modified (the test checks this).
 - **The repository** read the inner store twice: once to fill the cache, once after `Save` invalidated it. The second `Get` was a cache hit.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 **Where decorators appear in Go:**
 
@@ -820,7 +857,7 @@ What to notice:
 
 Pure decorators always call `next`. Middleware that may stop the chain (Auth, RateLimit) is also a chain of responsibility; see [[Chain of Responsibility and Pipelines]], [[Proxy]] and [[Adapter]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **No business logic in middleware**. "Orders over ₹10,000 need a second approval" belongs in the order service, where it is visible and tested with the order logic. Middleware is for cross-cutting concerns that apply to many endpoints in the same way.
 - **One concern used by one handler** does not need middleware: call a function inside that handler.
@@ -828,7 +865,7 @@ Pure decorators always call `next`. Middleware that may stop the chain (Auth, Ra
 - **Each layer costs a function call, and sometimes an allocation** (a wrapped writer, a derived context). That is small next to network I/O, but a context value lookup walks the chain of parent contexts, so do not stack dozens of `WithValue` layers.
 - **Decorators that need more than the interface** (a cache that must invalidate on writes) must override every method that matters. Forgetting one, such as `Save`, produces stale data that tests rarely catch.
 
-## 7. In production
+## 7. In production 🔴
 
 **Real systems:**
 
@@ -855,7 +892,7 @@ Pure decorators always call `next`. Middleware that may stop the chain (Auth, Ra
 
 **What to monitor:** request count, latency histogram and status class per route, all emitted by one metrics middleware; the count of recovered panics; 401 and 429 rates (a spike means a broken client or an attack); and for client decorators, retries per request.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Capturing the status correctly.** A handler can call `WriteHeader(code)` explicitly, call `Write` without `WriteHeader` (an implicit 200), or write nothing at all (also 200). `statusRecorder` handles all three: it records only the first `WriteHeader`, sets 200 on the first `Write` if no status was set, and `Logging` treats 0 as 200. A second `WriteHeader` call has no effect on the response; `net/http` logs `http: superfluous response.WriteHeader call`.
 
@@ -876,7 +913,7 @@ Both are valid; choose one and test it.
 
 **Decorator versus Proxy in practice.** The code shape is identical: a struct holding the same interface it implements. The difference is intent and lifecycle. A decorator is chosen by the caller and stacked with others; a proxy usually stands in for one specific object and controls access to it, for example creating it lazily or forwarding to a remote copy. Some layers are both: a caching repository is a decorator by construction and a proxy by intent.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What makes something a decorator rather than just a wrapper?
 > It implements the same interface as the object it wraps and adds behaviour while delegating the core work. Because the interface is the same, decorators stack in any order and callers cannot tell a decorated object from a plain one. A wrapper that changes the interface is an adapter.
@@ -899,7 +936,7 @@ Both are valid; choose one and test it.
 > [!question]- How do you decorate one method of a three-method repository interface?
 > Embed the interface in a struct and write only the methods you change; the rest are promoted. Check every promoted method: a caching decorator must also override writes to invalidate the cache, or reads go stale. Build it through a constructor so the embedded interface is never nil.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Decorator = same interface + added behaviour; layers stack because the interface does not change.
 - HTTP middleware: `type Middleware func(http.Handler) http.Handler`; `Chain(h, a, b, c)` makes `a` outermost.
@@ -910,7 +947,7 @@ Both are valid; choose one and test it.
 - RoundTripper decorators: clone the request, drain bodies, retry only safe requests.
 - Embedded partial decorators: promoted methods bypass you; test with `httptest`, never `ListenAndServe`.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Interfaces]], [[Context Package]], [[Adapter]]
 - **Next:** [[Proxy]]

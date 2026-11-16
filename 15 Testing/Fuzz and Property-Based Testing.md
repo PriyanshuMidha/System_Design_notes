@@ -24,7 +24,34 @@ updated: 2026-11-13
 > - **Property-based testing** (rapid, gopter) generates structured values from typed generators and, when a property fails, **shrinks** the failing input to the smallest case that still fails — much easier to read than fuzzing's raw bytes.
 > - Both replace a finite list of example tests with a generator plus an invariant; neither replaces unit tests for exact, known-answer cases.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A normal test checks one input and one answer you wrote by hand.
+You can only think of so many inputs, and bugs hide in the ones you missed.
+A **property** is a rule that must be true for every input, like "decode(encode(x)) gives back x".
+A tool then makes thousands of inputs for you and checks the rule each time.
+**Fuzzing** is this idea aimed at finding crashes, using random and odd-shaped input.
+When the tool finds a failing input, it shrinks it to the smallest one, so the bug is easy to see.
+
+```mermaid
+flowchart LR
+    G["Tool makes many inputs"] --> C["Run code"] --> R{"Rule still true?"}
+    R -- "yes" --> G
+    R -- "no" --> S["Shrink to smallest failing input"]
+```
+
+The rest of this note is just these 3 questions:
+1. How does Go's built-in fuzzing work?
+2. How do you find a good rule to check?
+3. Where do fuzz tests fit next to normal tests?
+
 
 **The problem in one story.**
 You write a function that turns a price into text and back again.
@@ -70,7 +97,7 @@ Where it breaks: a toddler has no rule to check, while these tools check a state
 > [!tip] Remember
 > State a rule that must always be true, and let the tool hunt for the input that breaks it.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A hand-rolled varint encoder (the scheme protobuf uses: 7 bits of payload per byte, top bit means "more follow") looks obviously correct from 3 example tests: `0`, `127`, `300`. But the interesting bugs live at boundaries nobody thought to write by hand:
 
@@ -80,7 +107,13 @@ A hand-rolled varint encoder (the scheme protobuf uses: 7 bits of payload per by
 
 Writing a table test for every such case by hand misses the ones you didn't think of. Fuzzing and property-based testing instead state the invariant once and let a search procedure hunt for the counterexample, which is exactly the class of bug (off-by-one, overflow, malformed-input panic) that example-based tests are worst at finding.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    H["You write 5 inputs"] --> B1["Bug hides in input 6,000"]
+    F["Fuzzer tries 1 million inputs"] --> B2["Finds input 6,000"]
+```
+
+## 2. Mental model 🟢
 
 ```mermaid
 flowchart LR
@@ -95,7 +128,7 @@ Fuzzing (Go's `testing.F`) operates on raw bytes/primitive types and mutates the
 
 Property-based testing (rapid) operates on **typed generators** (`rapid.Uint64()`, `rapid.SliceOf(...)`, a generator built from your own struct) and actively **shrinks** a failing case toward a minimal reproducer before reporting it, which fuzzing's raw-byte mutation does less precisely.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Whiteboard version
 
@@ -117,6 +150,8 @@ func FuzzRoundTrip(f *testing.F) {
 
 ### Go 1.18+ native fuzzing mechanics
 
+**In plain words: you write a FuzzXxx function, give it a few seed inputs, and Go keeps changing them to find crashes.**
+
 - `testing.F` is a fuzz target: `func FuzzXxx(f *testing.F)`.
 - `f.Add(...)` seeds the **seed corpus** with known-interesting inputs (edge cases you already thought of).
 - `f.Fuzz(func(t *testing.T, args ...) {...})` is the property: argument types are restricted to strings, `[]byte`, and basic numeric/bool types — no structs directly, so structured data is fuzzed as bytes and parsed inside the function, or built via multiple primitive arguments.
@@ -124,6 +159,8 @@ func FuzzRoundTrip(f *testing.F) {
 - `go test` (default, no `-fuzz`) only runs the seed corpus plus saved crashers, so a fuzz target behaves like an ordinary fast test in CI; the expensive mutation search is something you (or a scheduled job) run separately, often continuously on a dedicated fuzzing CI step.
 
 ### Property-based testing: the general idea
+
+**In plain words: say what must always be true, and let the tool hunt for an input that breaks it.**
 
 A property-based test states "for all x matching this shape, P(x) holds" and the library both generates `x` and, on failure, searches for the smallest `x` that still fails:
 
@@ -143,6 +180,8 @@ Go has two mainstream options:
 
 ### Writing good properties
 
+**In plain words: the hard part is the rule. Round trips, "same as a simple version" and "never crashes" are the easy wins.**
+
 The hardest part of property-based testing is finding an invariant that's both true and useful. Common patterns:
 
 - **Round-trip**: `decode(encode(x)) == x` for any serializer/deserializer pair.
@@ -151,7 +190,7 @@ The hardest part of property-based testing is finding an invariant that's both t
 - **Metamorphic relations** (when there's no simple oracle): instead of checking an exact output, check a *relationship* between two related inputs — e.g. "search(query) returns a superset of search(query + extra filter)". Useful when you can't easily compute the expected value by hand, only a property it must satisfy relative to another computation.
 - **Model-based**: run the real implementation and a trivially-correct-but-slow reference implementation (e.g. a `map`-based reference against a custom tree) on the same generated inputs and assert they agree.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -176,6 +215,8 @@ func EncodeVarint(n uint64) []byte {
 The property: whatever `EncodeVarint` produces, `DecodeVarint` must return exactly the original `n`, consuming exactly that many bytes — and `DecodeVarint` must never panic or hang on arbitrary bytes, since it runs on untrusted wire input.
 
 ### Full example: encoder, two fuzz targets, two property tests
+
+**In plain words: a small number encoder with fuzz tests and property tests, all runnable.**
 
 The varint codec under test (Go 1.24; `go vet` and `go test -race` clean):
 
@@ -315,6 +356,8 @@ func TestVarintIsPrefixFree(t *testing.T) {
 
 ### Whiteboard version of an idempotency property
 
+**In plain words: doing it twice gives the same answer as doing it once.**
+
 A second common shape — checking `f(f(x)) == f(x)` — needs no new machinery, just a different assertion inside the same `rapid.Check`:
 
 ```go
@@ -332,7 +375,7 @@ func TestSortIsIdempotent(t *testing.T) {
 }
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | What it generates | Shrinking | Use when |
 | --- | --- | --- | --- |
@@ -341,7 +384,12 @@ func TestSortIsIdempotent(t *testing.T) {
 | `leanovate/gopter` | Typed values, QuickCheck-style generators and combinators | Shrinks, with its own reporting format | Teams already familiar with Haskell QuickCheck-style APIs; existing `gopter` test infrastructure |
 | Table test (example-based) | Nothing — a fixed list you wrote | N/A | The expected output needs a human-computed "right answer" per case; the inputs are few and known in advance |
 
-## 6. Trade-offs and when not to use
+```mermaid
+flowchart LR
+    E["Example test<br/>1 input, 1 answer"] --- P["Property test<br/>many inputs, 1 rule"] --- Z["Fuzz test<br/>random bytes, find crashes"]
+```
+
+## 6. Trade-offs and when not to use 🟡
 
 - Neither technique replaces example tests for cases with a specific, hand-verified expected answer (e.g. "given this exact JSON, the parsed struct must have these exact field values") — fuzzing and property testing check invariants, not specific known-correct outputs, unless you also build a reference model to compare against.
 - Finding a good property is real design work; a weak property (e.g. "doesn't panic") catches crashes but misses logic bugs that a stronger invariant (round-trip, idempotency) would catch.
@@ -349,7 +397,7 @@ func TestSortIsIdempotent(t *testing.T) {
 - `testing.F`'s argument types are limited to primitives/bytes/strings; testing an invariant over a rich domain struct means either encoding it as bytes and parsing inside the fuzz function, or switching to rapid/gopter's typed generators.
 - A failing property only tells you the input that breaks the invariant, not *why* — you still have to read the shrunk counterexample and reason about the code, same as any other test failure.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** the Go standard library itself uses native fuzzing for packages like `encoding/json`, `compress/*`, and `net/http` internals; Go's OSS-Fuzz integration runs continuous fuzzing on stdlib and participating projects. Protobuf and other binary codec libraries commonly ship fuzz targets precisely because malformed-input-must-not-panic is a security property, not just a correctness one.
 - **Failure modes → fixes:**
@@ -358,7 +406,7 @@ func TestSortIsIdempotent(t *testing.T) {
   - CI runs `-fuzz` with a long `-fuzztime` on every PR → suite becomes too slow; run the seed corpus only (plain `go test`) on every PR, and run active fuzzing with a longer time budget on a schedule (nightly/weekly) against the same fuzz targets.
 - **What to monitor:** number of corpus entries per fuzz target over time (should only grow, since passing corpus entries are regression tests), CPU-minutes spent on scheduled fuzzing campaigns, and whether any scheduled campaign is finding new crashers (a rising rate suggests a recent change introduced a new bug class).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why Go's fuzzing argument types are restricted.** `f.Fuzz` only accepts `[]byte`, `string`, and basic numeric/bool types because the corpus format needs to serialize and deserialize arbitrary mutated values deterministically and portably across machines.
   A struct's mutation would need either reflection-based field-by-field mutation (fragile across Go versions) or a user-supplied encoding.
@@ -372,7 +420,7 @@ func TestSortIsIdempotent(t *testing.T) {
   Rapid/gopter are property tests where the generator understands your domain's types directly.
   Many teams use both: native fuzzing on parsers and anything taking untrusted input, rapid for business-logic invariants over typed Go values.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Round-trip, idempotency, or model-based: your `EncodeVarint`/`DecodeVarint` pair, what's the right property?
 > Round-trip: `Decode(Encode(n)) == n` for all `n`. Idempotency doesn't apply here (encoding isn't applied to its own output); model-based isn't needed because there's a cheap, obviously-correct check (compare to the original input) without a separate reference implementation.
@@ -394,7 +442,7 @@ func TestSortIsIdempotent(t *testing.T) {
 > [!question]- What does "shrinking" give you that raw fuzzing's saved crasher doesn't always give as cleanly?
 > Shrinking actively searches for a smaller or simpler input that still fails the same property, converging toward the minimal reproducer; a raw fuzz mutation's crasher is whatever byte sequence the mutator happened to be on when it found the failure, which can be far larger or noisier than necessary to demonstrate the bug.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - A property is an invariant true for all inputs (round-trip, idempotency, a structural rule) — not a single expected output.
 - `testing.F` (Go 1.18+): `f.Add` seeds, `f.Fuzz(func(t *testing.T, args...){...})` is the property; `-fuzz=Name` actively searches, plain `go test` only replays the corpus.
@@ -404,7 +452,7 @@ func TestSortIsIdempotent(t *testing.T) {
 - Property tests complement, not replace, example-based tests with known-correct expected outputs.
 - Run the seed corpus on every PR; run active, time-boxed fuzzing on a schedule, not inline on every commit.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Testing Strategy and the Test Pyramid]], [[Unit, Integration and E2E Tests]]
 - **Next:** [[Test Data Strategy]]

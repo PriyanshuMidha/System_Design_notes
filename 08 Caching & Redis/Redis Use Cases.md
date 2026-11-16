@@ -28,7 +28,39 @@ updated: 2026-11-13
 > - A Redis lock is a lease that can expire under you; correctness-critical locks also need fencing tokens.
 > - Classic mistake: making Redis the only copy of data you cannot lose.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2, 3.1 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3.2 and 3.3 (each use case and the lock hazard), section 4 (the Go code), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your main database is the official record, but some jobs are slow or clumsy there.
+Think of a live top-100 scoreboard, a "max 5 tries a minute" limit, or a login code that dies after 5 minutes.
+Redis does each of these in one or two fast commands, because it keeps data in memory and can delete things on a timer, called a **TTL**.
+This note is a menu: for each job, which Redis shape to use and what to name the key.
+
+```mermaid
+flowchart LR
+    J["the job"] --> S["Redis shape"]
+    S --> K["key name + TTL"]
+```
+
+The golden rule: if losing the Redis data would only be annoying, Redis alone is fine.
+If losing it would cost money (like charging someone twice), keep the real record in the database too.
+
+```mermaid
+flowchart TD
+    W{"Redis wiped. Is that..."} -- "annoying" --> R["Redis alone is fine<br/>(cache, rate limit)"]
+    W -- "costly" --> D["Redis + database<br/>(payments, bookings)"]
+```
+
+The rest of this note is just these 3 questions:
+1. Which Redis shape fits each job?
+2. How do you build the tricky ones (locks, "never charge twice") safely?
+3. When is Redis the wrong tool?
 
 **The problem in one story.**
 Your ticketing app keeps everything in a normal database.
@@ -73,7 +105,7 @@ Where it breaks: a toolbox never loses its tools, but Redis can lose recent data
 > [!tip] Remember
 > Every Redis use case is four choices: data structure, key pattern, TTL, and what happens when Redis is down.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A ticketing backend on PostgreSQL starts getting these requests in the same quarter:
 
@@ -86,7 +118,7 @@ A ticketing backend on PostgreSQL starts getting these requests in the same quar
 
 Each one can be built on PostgreSQL, but each would add load, latency or locking to the database that serves bookings. Redis solves them with in-memory structures that do the work in one atomic command, and with TTLs that clean up by themselves.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of Redis as a **toolbox next to the database**, with one tool per job:
 
@@ -95,7 +127,7 @@ Think of Redis as a **toolbox next to the database**, with one tool per job:
 
 If the workbench is wiped, you lose convenience, not the business. Use cases that would lose the business if the workbench were wiped need the database too.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Use case → structure → key pattern
 
@@ -115,6 +147,8 @@ flowchart LR
 ```
 
 ### 3.2 The use cases, briefly
+
+**In plain words:** a short recipe for each job: the command to use, the key name, and the one trap to avoid.
 
 **Cache.** Store the result of an expensive read under a key with a TTL: `SET cache:event:9 <json> EX 60`. Cache-aside, read-through and write-through, with their failure semantics, are in [[Caching Patterns]]; TTL choice and invalidation in [[Cache Invalidation, TTL and Consistency]].
 
@@ -162,7 +196,19 @@ A full design with time windows, ties and top-K at scale is in [[Case Study - Le
 
 **Pub/Sub and streams.** Pub/Sub pushes a message to whoever is subscribed right now and stores nothing; streams keep an append-only log with consumer groups and acknowledgements. Both are covered in [[Redis as a Queue - Lists, Streams and Pub-Sub]].
 
+**Rate limit, as a picture.** One counter per user per minute that deletes itself.
+
+```mermaid
+flowchart LR
+    R["request"] --> I["in one step:<br/>INCR + EXPIRE 60 s NX"]
+    I --> C{"count > 5?"}
+    C -- "yes" --> X["reject: 429"]
+    C -- "no" --> OK["allow"]
+```
+
 ### 3.3 The lock and its hazard
+
+**In plain words:** a lock is a "busy" sign with a timer. The danger: your worker pauses, the timer runs out, someone else takes the lock, and now two workers run at once.
 
 ```mermaid
 sequenceDiagram
@@ -193,9 +239,11 @@ Two things save the day here:
 
 Redis alone gives you the first. The second needs a source of increasing numbers (for example `INCR lock:report:fence` at acquire time, or a consensus store's revision) and a storage layer that rejects lower tokens; `SET NX PX` itself produces no fencing token.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** every use case as one or two Redis commands on a whiteboard.
 
 ```text
 Leaderboard   ZINCRBY lb:weekly 45 ravi
@@ -217,6 +265,8 @@ Sessions      sid = 16 random bytes, base64url (22 chars)
 ```
 
 ### Leaderboard (Go 1.24, go-redis v9)
+
+**In plain words:** add points, show the top 10, and tell a player their rank, each in one command.
 
 ```go
 // Package usecases implements four common Redis use cases.
@@ -267,6 +317,8 @@ func Rank(ctx context.Context, rdb *redis.Client, board, player string) (int64, 
 ```
 
 ### Lock with an owner token
+
+**In plain words:** the lock stores a random token, and only the holder of that token may release it, so you never remove someone else's lock.
 
 ```go
 package usecases
@@ -321,6 +373,8 @@ func Release(ctx context.Context, rdb *redis.Client, name, token string) error {
 
 ### Idempotency key
 
+**In plain words:** remember each request's unique id for a while. If the same id comes again (a retry), return the first answer instead of charging again.
+
 ```go
 package usecases
 
@@ -364,7 +418,18 @@ func Abort(ctx context.Context, rdb *redis.Client, key string) error {
 
 For payments, the Redis key is a fast front door, not the guarantee: the database should also hold a unique constraint on the idempotency key, so a Redis restart cannot let a duplicate through.
 
+**Idempotency, as a picture.**
+
+```mermaid
+flowchart LR
+    P["pay, key abc"] --> S{"SET idem:abc NX"}
+    S -- "new" --> C["charge card,<br/>save result"]
+    S -- "already there" --> R["return saved result,<br/>no second charge"]
+```
+
 ### Sessions keyed by a random ID
+
+**In plain words:** a login session stored under a random id with an idle timer, plus a list of each user's sessions so you can log them out everywhere.
 
 ```go
 package usecases
@@ -427,6 +492,8 @@ func LogoutAll(ctx context.Context, rdb *redis.Client, uid string) error {
 The `user_sessions:<uid>` set can keep IDs of sessions that already expired; prune them on login with `SMEMBERS` + `EXISTS`, or give the set a TTL as long as the absolute session lifetime.
 
 ### Tests
+
+**In plain words:** tests run against a real Redis, including 50 workers racing for one lock where exactly one wins.
 
 ```go
 package usecases
@@ -567,7 +634,7 @@ func TestSessionsLogoutAll(t *testing.T) {
 
 Measured: `go test -race ./usecases/` against Redis 8.2 passed all five tests. In the lock test, 50 goroutines raced and exactly one acquired; after a simulated 80 ms pause past a 50 ms lease, the stale owner's release returned `ErrNotHeld` and the new owner's lock survived.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Use case | Redis approach | Alternative | Pick the alternative when |
 | --- | --- | --- | --- |
@@ -591,7 +658,7 @@ The **Redlock debate** in brief:
 
 The practical rule: a single-instance `SET NX PX` lock is fine for efficiency (avoiding duplicate work); for correctness, use fencing tokens with a consensus-based store. See [[Distributed Locks and Fencing Tokens]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **System of record without durability.** With default settings an unplanned restart can lose recent writes, and with eviction on, keys can disappear. Orders, payments and balances belong in the database.
 - **Large blobs.** Values in the MB range are slow to transfer and replicate and block the single thread; put files in object storage and cache only metadata.
@@ -601,7 +668,7 @@ The practical rule: a single-instance `SET NX PX` lock is fine for efficiency (a
 - **Pub/Sub for important messages.** A subscriber that is down or slow misses messages permanently.
 - **When a simpler option wins:** a unique constraint beats a Redis idempotency key for correctness; `SELECT ... FOR UPDATE SKIP LOCKED` beats a Redis lock when the job queue already lives in PostgreSQL.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Redis is widely used for sessions, rate limiting, leaderboards and caching in front of relational stores; managed services (ElastiCache, Memorystore, Upstash) host most of these deployments. Go client patterns that combine these use cases are in [[Redis in Go]].
 - **Failure modes and fixes:**
@@ -612,7 +679,7 @@ The practical rule: a single-instance `SET NX PX` lock is fine for efficiency (a
 	- Geo set keeps offline drivers: remove them on disconnect, or keep one geo set per minute bucket and query the latest.
 - **What to monitor:** per-prefix key counts and memory (sampled), lock acquire failures and lock-held durations, idempotency hits (retries replayed), `evicted_keys` (should be zero for sessions, locks and idempotency keys: keep them on an instance with `noeviction` and no cache data, because under a `volatile-*` policy their own TTLs make them eviction candidates), command latency per use case.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Separate instances by eviction needs.** Caches want `allkeys-lru`; sessions, locks and idempotency keys must never be evicted. Mixing them on one instance means a cache spike can evict a lock. Either use separate instances or `volatile-lru` with TTLs only on cache keys (which forces every non-cache key to have no TTL, often impractical). Separate instances is the simpler answer.
 - **Lock renewal must be token-checked.** Extending a lock is the same compare-then-act as release: `if GET == token then PEXPIRE`. A blind `PEXPIRE` can extend someone else's lock.
@@ -621,7 +688,7 @@ The practical rule: a single-instance `SET NX PX` lock is fine for efficiency (a
 - **Bitmaps and sparse IDs.** `SETBIT dau 4000000000 1` allocates a ~500 MB string at once. Map external IDs to dense integers or use a HyperLogLog.
 - **Cluster.** Multi-key operations (`BITOP`, `PFCOUNT a b`, the session `MULTI`) need hash tags such as `session:{u9}:…` and `user_sessions:{u9}` to keep keys in one slot. See [[Redis Replication, Sentinel and Cluster]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How do you implement a distributed lock with Redis, and what is wrong with `SETNX` + `DEL`?
 > Acquire with `SET lock:x <random token> NX PX 30000` in one command; release with a Lua script that deletes only if the value equals your token. Plain `SETNX` + `EXPIRE` can leave a lock with no TTL, and plain `DEL` can delete another client's lock after yours expired.
@@ -644,7 +711,7 @@ The practical rule: a single-instance `SET NX PX` lock is fine for efficiency (a
 > [!question]- Why is GEOSEARCH fast, and how do you expire stale drivers?
 > Geo members live in a sorted set scored by a 52-bit geohash, so a radius search scans a few score ranges and filters by exact distance. Members have no TTL, so remove drivers with `ZREM` on disconnect, or write per-minute keys with a TTL and query the newest.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Every use case = structure + key pattern + TTL + failure policy.
 - Sessions: `session:<random sid>` hash with idle TTL + `user_sessions:<uid>` set.
@@ -655,7 +722,7 @@ The practical rule: a single-instance `SET NX PX` lock is fine for efficiency (a
 - Idempotency: `SET NX EX`, store the response, plus a database unique constraint.
 - Not for: system of record, big blobs, ad-hoc queries, must-not-lose messages via Pub/Sub.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Redis Data Structures and When to Use Each]], [[Redis Hands-on Setup with Go]]
 - **Next:** [[Caching Patterns]], [[Redis in Production - Memory, Latency, Security]]

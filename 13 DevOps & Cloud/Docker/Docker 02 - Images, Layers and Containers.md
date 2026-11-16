@@ -34,7 +34,38 @@ flowchart LR
 
 Think of the image as a sealed stack of transparencies, each one adding or changing some files on top of the one below. A container clips one more, blank transparency on top that you're allowed to write on — the stack underneath never changes.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A Docker **image** is a read-only bundle of files plus a note saying how to start the app.
+It is built in **layers**: each step in your recipe adds one layer on top of the last.
+If only your code changed, only the top layer is rebuilt and uploaded. The rest is reused.
+
+```mermaid
+flowchart BT
+    B["Base OS layer"] --> R["Go runtime layer"] --> A["Your app layer (changes often)"]
+```
+
+A **container** is that image running, plus a thin writable layer on top for scratch files.
+One image can start many containers, and each gets its own scratch layer.
+
+```mermaid
+flowchart LR
+    I["Image (read-only)"] --> C1["Container 1 + own scratch"]
+    I --> C2["Container 2 + own scratch"]
+```
+
+The rest of this note is just these 3 questions:
+1. What exactly is inside an image?
+2. How do layers save time and space?
+3. Tags vs digests: how do you name an image safely?
+
 
 **The problem in one story.**
 You build your app into a 300 MB package and push it to ten servers.
@@ -78,7 +109,7 @@ Where it breaks: you cannot truly erase a lower sheet; deleting a file in a late
 > [!tip] Remember
 > An image is a stack of read-only layers; a container is that stack plus one thin writable layer on top.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Without layering, every image rebuild would re-upload and re-store the entire filesystem, even when only one file changed. Teams pushing images several times a day would pay for and wait on gigabytes of redundant transfer and storage every time, and two images sharing the same base (say, `golang:1.24-alpine`) would duplicate that base entirely on every host that pulled both.
 
@@ -88,7 +119,7 @@ Docker stores and transfers each of those shared layers exactly once; only the r
 
 A CI pipeline redeploying the same service after a one-line code change re-pushes and re-pulls only the layer(s) that actually changed — typically a few megabytes, not the full 350 MB.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 An **image** is a recipe already baked into a stack of read-only ingredients: you can't eat off it (run it as a process) directly, but you can make as many identical cakes (containers) from it as you want, and baking a second cake never disturbs the recipe.
 
@@ -96,7 +127,9 @@ A **container** is one specific cake you can still poke at: it has the full bake
 
 Throwing that cake away and baking a fresh one from the same recipe gets you back to the exact same starting stack — nothing you did to the plate persists.
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words:** an image is a list of layer files plus a small settings file. Docker stacks the layers so they look like one folder.
 
 A Docker image is, formally, an **OCI image**: a config JSON (entrypoint, environment, exposed ports, the ordered list of layer digests) plus the layers themselves, each a `tar` archive of filesystem changes (added, modified, or deleted files) relative to the layer below it.
 
@@ -135,12 +168,16 @@ The original in the image is never touched, which is exactly why many containers
 
 ### Tags vs. digests
 
+**In plain words:** a tag (like v3 or latest) is a sticky note that can be moved to another image. A digest is a fingerprint that always means the exact same image.
+
 A **tag** (`myapi:v3`, `node:20`, `latest`) is a human-friendly, *mutable* pointer that a registry maps to some digest at push time; pushing a new image to the same tag silently repoints it.  A **digest** (`myapi@sha256:3f2a9c…`) is the SHA-256 hash of the manifest itself — it can only ever refer to one specific, immutable set of layers and config.
 
 > [!warning] The `latest` pitfall
 > `latest` is not "the newest version" in any enforced sense — it's just whatever tag happened to be pushed without an explicit tag, which is frequently an old build nobody bothered to re-tag. Pulling `myapi:latest` in production gives no guarantee about *which* image you get, and no two pulls are guaranteed to return the same bytes. Deploy pipelines should resolve a build to its digest and deploy that digest, falling back to a semantic or git-SHA tag only for human readability.
 
-## 4. Worked example
+## 4. Worked example 🟡
+
+**In plain words:** a small Dockerfile, line by line, showing which line makes which layer.
 
 A minimal Go service Dockerfile (the full production version with multi-stage builds and a non-root user is [[Docker 04 - Writing a Production Dockerfile for Go]]; this is the layering story only):
 
@@ -197,7 +234,7 @@ That exit code is what tells `web-1` apart from a container that's still alive: 
 | How many can exist from one? | N/A | Unlimited, concurrently, from the same image |
 | What deleting it affects | Every container still using its layers keeps working until they're also removed | Only that container's writable layer; the image is untouched |
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach to image identity | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -206,14 +243,14 @@ That exit code is what tells `web-1` apart from a container that's still alive: 
 | Semantic + digest (`:v3@sha256:…`) | Tag for humans, digest enforced for the pull | CI/CD pipelines that want both readability and a guarantee | Slightly more tooling to keep both in sync |
 | Multi-arch manifest list | One tag resolves to a list of (architecture → image digest) pairs | Shipping one image that must run on both `amd64` and `arm64` hosts | Build step must produce and push each architecture's image, then the manifest list |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Layer caching only helps when instructions are ordered from least- to most-frequently-changing. Put a frequently changing `COPY . .` before a rarely changing `RUN go mod download` and you invalidate the dependency-download layer on every code change, defeating the cache (see [[Docker 04 - Writing a Production Dockerfile for Go]] for the correct order).
 - Overlay2's copy-on-write copies a *whole file* up to the writable layer on first write, even for a one-byte change — a container that rewrites large files repeatedly should use a volume for that path instead of relying on the writable layer.
 - A small number of total layers isn't automatically better: Docker has no hard layer-count problem in modern versions, and splitting a Dockerfile into more, well-ordered layers usually improves cache reuse more than it costs.
 - Deleting an image tag does not reclaim disk space if a container (even a stopped one) still references its layers, or if another image shares them; `docker system prune` is often needed afterward (see [[Docker 03 - CLI Essentials]]).
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** registries such as Docker Hub, AWS ECR, and GitHub Container Registry store and deduplicate layers by digest across every image pushed to them; tools like `dive` inspect a built image's exact layer-by-layer size breakdown to find waste.
 - **Failure modes → fixes:**
@@ -222,7 +259,7 @@ That exit code is what tells `web-1` apart from a container that's still alive: 
   - `docker pull` is slow in CI despite "nothing changed" → the base image tag moved (e.g., `golang:1.24-alpine` got a security patch), invalidating every layer built on top of it, including the application's own cached layers.
 - **What to monitor:** total image size over time, the digest actually running in each environment (not just the tag), and `docker system df` for how much disk layers and containers are consuming on build/CI hosts.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why content-addressing layers matters for security, not just size.** Because a layer's identity *is* the hash of its contents, two images built from different Dockerfiles that happen to produce byte-identical layers (e.g., the same base OS layer) are guaranteed to be storing and running the exact same bytes — there's no way to have "the same layer" with subtly different contents. This is also why pinning by digest is a real security control: a digest cannot be silently repointed at different bytes the way a tag can, so a digest pin guarantees that what you scanned for vulnerabilities is what actually runs.
 
@@ -230,7 +267,7 @@ That exit code is what tells `web-1` apart from a container that's still alive: 
 
 **Why `docker build` without BuildKit used to be slower.** Classic (non-BuildKit) builds executed instructions strictly in order, one at a time, even when two instructions had no dependency on each other. BuildKit (default since Docker Engine 23, and assumed throughout this vault at Docker Engine 27+) builds a dependency graph of instructions and can run independent stages in parallel, skip stages whose outputs aren't needed by the final target, and cache more precisely at the level of individual files touched by a `COPY`, not just whole instructions.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What exactly is a Docker image, structurally?
 > An ordered list of read-only filesystem layers (each a tar diff versus the layer below) plus a config JSON describing the entrypoint, environment, and that layer list. The whole thing's manifest digest is the image's true identity.
@@ -250,7 +287,7 @@ That exit code is what tells `web-1` apart from a container that's still alive: 
 > [!question]- Can two unrelated images share disk space on the same host?
 > Yes, whenever they share identical layers (most commonly the same base image). The registry and the local Docker storage driver both deduplicate by layer digest, so `node:20-alpine` used by five different application images is stored once, not five times.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Image = ordered read-only layers + config/manifest; container = image + one writable layer.
 - Each filesystem-changing Dockerfile instruction (`RUN`, `COPY`, `ADD`) creates exactly one layer.

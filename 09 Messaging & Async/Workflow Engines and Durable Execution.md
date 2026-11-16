@@ -24,7 +24,39 @@ updated: 2026-11-13
 > - Activities still run **at least once**, so they must be idempotent.
 > - Classic mistake: calling `time.Now()`, `rand`, or a network API directly in workflow code. Replay then takes a different path and the engine reports a nondeterminism error.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (lifecycle, determinism, retries), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Some business tasks have many steps and can take days: reserve stock, charge the card, book a courier.
+If the server crashes in the middle, you must know which steps are already done.
+Doing that by hand needs status columns, cron jobs, queues and lots of glue code.
+A **workflow engine** lets you write the whole flow as one normal function.
+The engine writes down the result of every finished step in a log, called the **history**.
+After a crash, the function runs again from the top, but finished steps just return their saved result instead of running twice.
+
+```mermaid
+flowchart LR
+    S1["Reserve stock"] --> S2["Charge card"] --> X["crash"]
+    X --> Q["Was the card charged? Nobody knows"]
+```
+
+```mermaid
+flowchart LR
+    S1["Reserve: done (saved)"] --> S2["Charge: done (saved)"] --> X["crash"]
+    X --> R["New worker replays:<br/>skips 1 and 2, books courier"]
+```
+
+The rest of this note is just these 3 questions:
+1. How does the engine replay your code and skip finished steps?
+2. Why must the flow code give the same result every time it runs?
+3. How are retries, timers and long waits handled for you?
+
 
 **The problem in one story**
 You order a phone. The shop reserves it, charges your card, then waits two days for a courier.
@@ -70,7 +102,7 @@ Where it breaks: a real cook can improvise, but workflow code must take the same
 > [!tip] Remember
 > Workflow code decides, activities act; the engine saves every result so a crash never repeats a finished step.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Take an order flow:
 
@@ -92,7 +124,20 @@ The business logic ("charge, then ship, refund on failure") is scattered across 
 
 A workflow engine lets you write the flow as one function and makes the engine responsible for persistence, retries, timers and recovery.
 
-## 2. Mental model
+**Same flow, by hand vs with an engine:**
+
+```mermaid
+flowchart TB
+    subgraph Hand["By hand: 6 places"]
+        H1["status column"] --- H2["retry column"] --- H3["cron scanner"]
+        H3 --- H4["queues + workers"] --- H5["webhook handlers"] --- H6["undo states"]
+    end
+    subgraph Engine["With an engine: 1 function"]
+        E1["reserve -> charge -> ship<br/>refund on failure"]
+    end
+```
+
+## 2. Mental model 🟢
 
 The workflow function is a **recipe** and the event history is a **cook's notebook**. Every time the cook finishes a step ("eggs whisked, result: bowl A"), they write it down.
 
@@ -109,7 +154,16 @@ Terms:
 - **Signal:** a message sent into a running workflow from outside (for example "courier confirmed").
 - **Durable timer:** a sleep stored by the engine, so `Sleep(48h)` survives restarts and costs no worker resources while waiting.
 
-## 3. How it works
+**The cook's notebook, drawn:**
+
+```mermaid
+flowchart LR
+    R["Recipe (workflow code)"] --> C{"Step in the notebook?"}
+    C -- "yes" --> U["Use saved result, move on"]
+    C -- "no" --> D["Do it now, write it down"]
+```
+
+## 3. How it works 🟡
 
 ```mermaid
 sequenceDiagram
@@ -140,6 +194,8 @@ Step by step:
 
 ### Execution lifecycle
 
+**In plain words:** a workflow is started, runs, may wait for days, and ends as done, failed, cancelled or timed out. The picture shows each move.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Running: StartWorkflow(id)
@@ -160,6 +216,8 @@ stateDiagram-v2
 
 ### What must be deterministic
 
+**In plain words:** the flow code is run again during replay, so it must make the same choices every time. Time, random numbers and network calls go through the engine.
+
 Workflow code runs many times over the life of one execution. Anything that could differ between runs must go through the SDK so its value is recorded in history:
 
 | Do not use in workflow code | Use instead (Temporal Go SDK) |
@@ -171,6 +229,8 @@ Workflow code runs many times over the life of one execution. Anything that coul
 | iterating a Go map (random order) and acting on order | sort the keys first |
 
 ### Retries and timeouts
+
+**In plain words:** you declare once how to retry a step (wait 1 s, then 2 s, then 4 s ...) and how long it may take; the engine does the rest.
 
 Activities get retry policies declared once, not hand-written loops. Temporal's default activity retry policy:
 
@@ -187,9 +247,11 @@ Only `ScheduleToClose` (or a `MaximumAttempts` you set) ends the retries; `Start
 
 Non-retryable error types (for example "card declined") stop retries at once. Detail on backoff and jitter: [[Timeouts, Retries and Backoff]].
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the replay idea on a napkin: each step first checks the history, and only does real work if it is not there yet.
 
 ```text
 workflow order-7:
@@ -207,6 +269,8 @@ if a deploy reorders reserve/charge: replay sees charge where history
 ```
 
 ### Go: a toy durable-execution engine
+
+**In plain words:** a small Go engine that saves step results and replays them after a fake crash, so you can see that no step runs twice.
 
 This is a teaching model of the replay idea, not a Temporal client. `Ctx.Execute` either answers from history or runs the activity with retries and appends the result. `ErrWorkerCrash` simulates the worker dying mid-activity: nothing is recorded, so the step is retried after recovery.
 
@@ -455,6 +519,8 @@ func TestManyWorkflowsConcurrently(t *testing.T) {
 
 ### The same flow in the Temporal Go SDK
 
+**In plain words:** the same order flow written with the real Temporal library, including a 48-hour wait for the courier's reply.
+
 For comparison, here is the same flow written against the real Temporal Go SDK (`go.temporal.io/sdk` v1.38.0). It adds the 48-hour wait for the courier's webhook, delivered as a signal. The activities are stubs here; in a real service they call the inventory, payment and courier APIs.
 
 ```go
@@ -548,7 +614,7 @@ Both tests pass under `go vet` and `go test -race` (Go 1.24, SDK v1.38.0).
 
 The 48-hour wait is a durable timer: no goroutine sleeps for 48 hours. The engine stores the timer and wakes the workflow when it fires or when the signal arrives.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -566,7 +632,7 @@ The 48-hour wait is a durable timer: no goroutine sleeps for 48 hours. The engin
 - Express workflows run up to 5 minutes, priced per request and duration, for high-volume short flows.
 - Asynchronous Express runs are at-least-once and synchronous Express runs are at-most-once.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Determinism discipline.** Every developer must know what may not appear in workflow code. Library upgrades or innocent refactors can break replay of running executions.
 - **Versioning running workflows.** A workflow that waits 30 days runs on code you will change many times. You must branch with `workflow.GetVersion` (or route old executions to old workers with worker versioning) for every change that alters the command sequence.
@@ -578,7 +644,7 @@ The 48-hour wait is a durable timer: no goroutine sleeps for 48 hours. The engin
 	- Stream processing of millions of events per second: use [[Stream Processing Basics]].
 	- A simple two-step flow where an outbox plus one consumer is enough ([[Transactional Outbox and CDC]]).
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Cadence was built at Uber and open-sourced in 2017; Temporal was forked from it in 2019 by Cadence's original authors. Typical uses: order and payment flows, onboarding and KYC with human steps, infrastructure provisioning, subscription billing loops, and long-running sagas.
 - **Failure modes → fixes:**
@@ -589,7 +655,7 @@ The 48-hour wait is a durable timer: no goroutine sleeps for 48 hours. The engin
 	- *Stuck workflows.* An activity with no StartToClose timeout waits forever on a hung call. Fix: always set timeouts and heartbeats for long activities.
 - **What to monitor:** schedule-to-start latency per task queue (worker capacity), workflow and activity failure rates, nondeterminism errors (should be 0), activity retry counts, history length percentiles, number of open executions per workflow type.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Replay mechanics.** A worker usually keeps a running workflow cached in memory ("sticky execution") and only feeds it new events. Full replay happens on cache eviction, worker restart or a different worker taking over.
 	- Replay compares each command the code produces with the next command recorded in history; a mismatch is a nondeterminism error and the workflow task fails (and is retried) until fixed code is deployed.
@@ -600,7 +666,15 @@ The 48-hour wait is a durable timer: no goroutine sleeps for 48 hours. The engin
 - **Durable execution vs event sourcing.** Both rebuild state by replaying a log. In [[Event Sourcing]] the log holds domain events and you write the fold. In a workflow engine the log holds *execution* events and the SDK replays your code over them.
 - **Sagas as code.** Compensations become a `defer`-like list: after each successful step, push its undo onto a slice; on failure, run the slice in reverse. The engine makes sure the compensations themselves are retried until they succeed. The saga concept is in [[Saga Pattern]].
 
-## 9. Interview questions
+**Sagas as code** (undo in reverse on failure):
+
+```mermaid
+flowchart LR
+    A["Reserve ok<br/>push 'release'"] --> B["Charge ok<br/>push 'refund'"] --> C["Ship fails"]
+    C --> U1["Run 'refund'"] --> U2["Run 'release'"]
+```
+
+## 9. Interview questions 🔴
 
 > [!question]- What is durable execution in one sentence?
 > Running ordinary code whose progress is recorded step by step in a durable history, so that after a crash the code is replayed against the history and continues from the last completed step instead of restarting the whole process.
@@ -623,7 +697,7 @@ The 48-hour wait is a durable timer: no goroutine sleeps for 48 hours. The engin
 > [!question]- Step Functions Standard or Express?
 > Standard for long-running (up to a year), low-volume flows needing exactly-once step execution and history. Express for high-volume, short (up to 5 minutes) flows such as event processing, where at-least-once (asynchronous) or at-most-once (synchronous) execution is acceptable and cost matters.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Workflow = deterministic orchestration code; activity = side effect, retried, at-least-once.
 - Engine stores event history; recovery = replay code against history.

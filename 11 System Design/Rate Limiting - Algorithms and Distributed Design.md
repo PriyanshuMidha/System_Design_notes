@@ -32,7 +32,42 @@ updated: 2026-11-13
 > - Decide up front what happens when Redis is down: **fail open** (allow, maybe with a local limiter) or **fail closed** (reject).
 > - Tell clients what happened: `429`, `Retry-After`, and the remaining quota.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (where to limit and the algorithms), 4 (Go code, Redis + Lua, the public API case) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your API can handle only so many requests per second.
+One buggy or greedy caller can send so many that everyone else gets stuck.
+A **rate limiter** is a bouncer at the door. It counts how often each caller comes in.
+If a caller goes over its allowed amount, the bouncer says "slow down" and sends back an error called **429 Too Many Requests**.
+
+```mermaid
+flowchart LR
+    C["Caller"] --> B{"Bouncer:<br/>under the limit?"}
+    B -- "yes" --> A["Your API"]
+    B -- "no" --> E["429: try again later"]
+```
+
+The most common rule is the **token bucket**: each caller has a bucket of tokens. Each request uses one. Tokens refill slowly over time.
+Quiet callers save up tokens, so they can do a short burst. Then they must wait for the refill.
+
+```mermaid
+flowchart LR
+    R["Refill: 1 token per second"] --> K["Bucket (max 10 tokens)"]
+    K -- "1 token per request" --> Q["Request allowed"]
+```
+
+When you have many servers, they must all share one count, so the count usually lives in Redis.
+
+The rest of this note is just these 3 questions:
+1. Who do you limit (user, API key, IP) and where (edge, gateway, service)?
+2. Which counting rule do you use (fixed window, sliding window, token bucket)?
+3. How do many servers share one count fast and safely?
 
 **The problem in one story.**
 A water park has one slide that fits 10 riders a minute.
@@ -77,7 +112,7 @@ Where it breaks: a real lifeguard sees the whole line at once; ten API servers e
 > [!tip] Remember
 > Count requests per key, reject the extra ones with 429, and keep the shared count atomic.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Your public API runs on 10 servers, and each can handle about 500 requests per second before latency climbs (an estimate for a typical JSON API doing one database query). That is 5,000 requests per second in total.
 
@@ -92,7 +127,12 @@ Rate limits protect against more than bugs:
 - **Fairness:** on a multi-tenant platform, one tenant must not starve the others.
 - **Business plans:** "Free: 60 requests per minute, Pro: 1,000" is a product feature.
 
-## 2. Mental model
+## 2. Mental model 🟢
+
+```mermaid
+flowchart LR
+    T["Quiet for a while:<br/>bucket full (10)"] --> B["Burst of 10 quick requests"] --> E["Bucket empty"] --> S["Now only 1 per second<br/>(as fast as tokens drip in)"]
+```
 
 Think of a **token bucket** as a turnstile that only opens when you drop a token in.
 
@@ -102,9 +142,11 @@ Think of a **token bucket** as a turnstile that only opens when you drop a token
 
 A client that has been quiet for a while has a full bucket, so it can make 10 quick requests (a **burst**). After that it can only go as fast as tokens drip in: 1 per second. Every other algorithm in this note is a different rule for when the turnstile opens.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Where to limit, and by what key
+
+**In plain words:** you can put a bouncer at several doors: the outer edge (by IP), the API gateway (by API key or user), and inside each service. Cheap checks go first.
 
 Limits usually stack in layers, cheapest first:
 
@@ -133,6 +175,8 @@ Choosing the key:
 | Key + route | Expensive endpoints | More keys in the store. |
 
 ### The algorithms
+
+**In plain words:** these are different ways to count. The simplest counts requests per minute. Smarter ones smooth out the edges between minutes or use a bucket of tokens.
 
 **1. Fixed window counter.** Keep one counter per key per window, for example `rl:user:42:2026-11-04T10:30`. Increment it on each request, reject when it is above the limit, and let it expire after the window.
 
@@ -203,6 +247,8 @@ It gives the same behaviour as a token bucket while storing one number instead o
 
 ### Choosing an algorithm
 
+**In plain words:** pick by what you need: exact counts, low memory, or allowing short bursts. The chart below walks you to an answer.
+
 ```mermaid
 flowchart TD
     Q1{"Must output be perfectly<br/>smooth (calling a strict partner)?"} -- yes --> LB["Leaky bucket as a queue"]
@@ -213,7 +259,7 @@ flowchart TD
     Q3 -- no --> SC["Sliding window counter<br/>(cheap, approximate)"]
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -244,6 +290,8 @@ func (b *Bucket) Allow(now time.Time) bool {
 Trace with capacity 10 and 1 token per second: at `t = 0` the bucket is full, so 10 requests pass and the 11th fails. At `t = 2.5 s`, 2.5 tokens have come back, so 2 more pass and the third fails (0.5 tokens left).
 
 ### Single-process limiters in Go
+
+**In plain words:** these limiters live inside the memory of one server. Fast and simple, but each server only sees its own traffic.
 
 All three take an injected clock, so tests can move time without sleeping. Each is safe for concurrent use.
 
@@ -556,6 +604,8 @@ func Example_xTimeRate() {
 
 ### Distributed token bucket: Redis + Lua
 
+**In plain words:** many servers share one bucket kept in Redis. A small script reads, refills and takes a token in one go, so two servers never spend the same token.
+
 With 10 API servers, each server's in-memory bucket only sees a tenth of the traffic. The state must be shared, and the read-refill-check-write must be **one atomic step**. Otherwise two servers both read `tokens = 1`, both allow, and both write `0`, so two requests went through on one token.
 
 Redis runs a Lua script atomically: no other command runs in the middle of it. The script also reads the time with Redis `TIME`, so every API server uses **Redis's clock**, not its own (API servers' clocks drift apart).
@@ -663,6 +713,8 @@ Notes on the script:
 
 ### HTTP middleware with headers and a fail-open fallback
 
+**In plain words:** this wraps every web request with the limit check. If Redis is down, it lets requests through (fail open) instead of blocking everyone.
+
 ```go
 package ratelimit
 
@@ -758,6 +810,8 @@ func TestMiddlewareFallsBackWhenRedisFails(t *testing.T) {
 
 ### Case: design a rate limiter for a public API
 
+**In plain words:** a full design you could draw in an interview: plans with different limits, shared counts, tiny extra delay, and keep working if the limiter breaks.
+
 **Requirements.** Limit each API key to its plan's rate (Free: 10 requests per second, burst 20; Pro: 100 per second, burst 200). Limits hold across all servers and all regions to within a few percent. The check adds under 2 ms at p99. If the limiter fails, the API keeps serving. Clients learn their quota from headers.
 
 **Estimates (all estimates, with units):**
@@ -808,6 +862,8 @@ flowchart LR
 
 ### Response headers
 
+**In plain words:** tell callers how much they have left and when to retry, so good clients can slow down on their own.
+
 ```http
 HTTP/1.1 429 Too Many Requests
 Content-Type: application/problem+json
@@ -823,7 +879,7 @@ RateLimit-Reset: 12
 - The `RateLimit-*` fields come from an IETF draft that is **not yet an RFC**. Earlier drafts (and many APIs today) use the three separate fields above; later revisions of the draft replace them with structured `RateLimit` and `RateLimit-Policy` fields. Many APIs still use their own `X-RateLimit-*` names; GitHub, for example, sends `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-used` and `x-ratelimit-reset`.
 - `Reset` as "seconds from now" avoids depending on the client's clock; an absolute Unix timestamp (GitHub's choice) breaks when the client's clock is wrong.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Algorithm | State per key | Redis type | Accuracy | Bursts | Best for |
 | --- | --- | --- | --- | --- | --- |
@@ -837,7 +893,7 @@ RateLimit-Reset: 12
 
 **Rate limits vs quotas.** A rate limit protects capacity over seconds or minutes ("100 per second"). A quota is a business allowance over a long period ("1,000,000 calls per month") and must be durable and billable, so it usually lives in a database with periodic aggregation, not in a Redis key with a TTL.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Exactness costs memory or round trips.** The sliding log is exact but O(requests) per key; the counter and the bucket are O(1) but approximate the window or allow bursts.
 - **Global accuracy costs latency.** A shared store adds a network hop to every request; local limiters are free but each one sees only part of the traffic.
@@ -846,7 +902,7 @@ RateLimit-Reset: 12
 - **IP limits punish shared networks.** One office or one mobile carrier NAT can put thousands of users behind one IP. Use IP limits as a coarse outer layer and identity-based limits inside.
 - **When a simpler option wins:** a single-instance internal tool needs `x/time/rate` in memory, not Redis. A batch job calling a partner needs a client-side limiter (a leaky bucket or `rate.Limiter.Wait`), not a server.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- **Stripe** (2017 engineering blog) described four limiters: a request-rate limiter (token bucket in Redis), a concurrent-requests limiter, and two load shedders that reserve capacity for critical traffic when the fleet or workers are saturated.
@@ -863,9 +919,11 @@ RateLimit-Reset: 12
 	- *Clock differences between servers* → take time from Redis `TIME` inside the script, not from each server.
 - **What to monitor:** 429 rate per key and per route (a sudden jump means an attack, a bug or a limit set too low), limiter latency p99, limiter errors and fallback activations (`X-RateLimit-Degraded` above), Redis CPU and ops per second per shard, and the top keys by rejections.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Why `MULTI` is not enough for a token bucket
+
+**In plain words:** a Redis transaction cannot "read, think, then write" in one step. A Lua script can, so we use that.
 
 `MULTI … EXEC` queues commands and runs them together, but you cannot use a value read inside the transaction to decide what to write inside the same transaction. A token bucket must read `tokens`, compute, and then decide whether to decrement.
 
@@ -873,11 +931,22 @@ The options are optimistic `WATCH` (retry on conflict, which spins under content
 
 ### Hash tags and multi-key scripts
 
+**In plain words:** in a Redis cluster, put the same `{...}` part in all keys of one caller so they sit on the same machine and one script can touch them all.
+
 Redis Cluster splits keys into 16,384 slots by `CRC16(key) mod 16384`. If a key contains `{…}`, only the text inside the braces is hashed. Rate-limit keys should therefore be built as `rl:{<scope>:<id>}:<suffix>`, as the `Key` helper above does, so that every key a script touches for one client is in one slot.
 
 The downside: everything for one client lives on one shard, so a very hot client is a hot shard.
 
 ### Hybrid limits, worked out
+
+**In plain words:** each server keeps a small local bucket and checks in with Redis now and then. Much less Redis traffic, at the cost of letting a few extra requests slip through.
+
+```mermaid
+flowchart LR
+    S1["Server 1: local bucket 100/s"] -- "sync every 100 ms" --> R["Redis: global 1,000/s"]
+    S2["Server 2: local bucket 100/s"] -- "sync every 100 ms" --> R
+    S3["... 10 servers"] -- "sync" --> R
+```
 
 Global limit: 1,000 requests per second for a key, 10 API servers. Give each server a local bucket of 100 per second (1,000 / 10) and sync usage to Redis every 100 ms.
 
@@ -887,11 +956,15 @@ Shorter syncs or smaller local shares reduce the overshoot and increase Redis tr
 
 ### GCRA in one picture
 
+**In plain words:** GCRA is a token bucket that stores just one time stamp ("when you may come next") instead of a token count.
+
 With rate 10 per second (`T = 100 ms`) and burst 3 (`τ = 200 ms`): three requests at `t = 0` push TAT from 0 to 100, 200, then 300 ms.
 
 A fourth request at `t = 0` would need `0 ≥ 300 − 200 = 100`, so it is rejected and told to retry in 100 ms. That is exactly the behaviour of a token bucket with capacity 3 and 10 tokens per second, but the state is one timestamp. `TestGCRA` checks this trace.
 
 ### Concurrency limits vs rate limits
+
+**In plain words:** a rate limit asks "how many started this second?". A concurrency limit asks "how many are running right now?". Slow jobs need the second one.
 
 A rate limit counts **starts per second**; a concurrency limit counts **requests in flight**. A report endpoint that takes 30 seconds can be "1 per second" and still have 30 running at once.
 
@@ -899,13 +972,15 @@ For slow or expensive work, limit concurrency (a semaphore locally, or `INCR`/`D
 
 ### The sliding counter's error
 
+**In plain words:** the sliding counter guesses, assuming the requests of the last minute were spread evenly. Usually the guess is great; in rare cases it lets in up to double.
+
 The sliding counter assumes the previous window's requests were spread evenly.
 
 If they were all at its very end, the estimate undercounts them. Worst case, with a limit of 100 per minute: 100 requests at 10:00:59, then at 10:01:58 the estimate is `100 × (1 − 58/60) + curr ≈ 3 + curr`, so about 96 more are allowed during 10:01:00-10:01:58.
 
 That is close to **2× the limit inside one 60-second span**, the same bound as the fixed window, but only for this contrived pattern. Cloudflare's measurement (0.003% of requests wrongly handled) shows that on real traffic the error is tiny; for a security limit where every attempt counts, use the sliding log instead.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Design a rate limiter for an API with 200 servers.
 > Key by API key (plus IP at the edge). Token bucket per key in Redis Cluster, updated by one Lua script that uses Redis `TIME`; keys hash-tagged per client. Middleware with a 20 ms timeout: on Redis failure, fail open to a per-server local bucket.
@@ -934,7 +1009,7 @@ That is close to **2× the limit inside one 60-second span**, the same bound as 
 > [!question]- What is the difference between a rate limit and a quota?
 > A rate limit protects capacity over a short window ("100 per second"), is approximate and can live in Redis with TTLs. A quota is a business allowance over a long period ("1 million calls per month"), must be durable and auditable for billing, and usually lives in a database fed by usage events.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Key choice: IP at the edge (from a trusted proxy's `X-Forwarded-For`), API key or user at the gateway, tenant plus route in the service.
 - Fixed window: one atomic counter; up to 2× the limit at a window boundary.

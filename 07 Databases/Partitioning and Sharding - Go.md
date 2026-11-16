@@ -20,10 +20,26 @@ updated: 2026-11-13
 
 # Partitioning and Sharding - Go
 
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "What this code shows" and the Whiteboard version. Stop there.
+> - 🟡 **Know the basics?** Add Steps 1 to 5 and the Tests.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on twin of [[Partitioning and Sharding]]. It has two halves. The first half is SQL: one big Postgres table split into smaller pieces called **partitions**, all still inside one database. The second half is Go: once data lives on several databases, your own code must pick the right database for each key, and that picker is called a **router**. Each key is hashed into one of 1,024 fixed buckets, and a small table says which database owns each bucket. Moving a bucket means: copy it, pause writes for a moment, then change one line in that table. Read it top to bottom: each step is a short Concept, the code, then a walkthrough. If you only want the idea, the Whiteboard version is the whole thing in a few lines.
+
+```mermaid
+flowchart LR
+    K["workspace ID"] --> H["hash into one of<br/>1,024 buckets"]
+    H --> M["map: bucket -> database"]
+    M --> D["db-1 / db-2 / db-3"]
+```
+
 > [!summary] TL;DR
 > The full PostgreSQL 17 partitioning DDL (range, list and hash) and a Go logical-shard router with a versioned map and a freeze-and-flip move, as described in [[Partitioning and Sharding]]. The Go code is tested under `go test -race`; the SQL is representative PostgreSQL 17 and was not run here.
 
-## Before the code
+## Before the code 🟢
 
 - **Hashing**: `hash/fnv` (whiteboard) and `crypto/sha256` (full version) turn a workspace ID into a logical shard number.
 - **`sync.RWMutex`**: many routers read the shard map at once; a move takes the write lock briefly.
@@ -32,7 +48,7 @@ updated: 2026-11-13
 - **Goroutines**: a concurrency test routes from many goroutines while shards are frozen and flipped.
 - **Run**: `go vet ./... && go test -race -v ./...` (standard library only; the SQL is not run).
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Concept in [[Partitioning and Sharding]] |
 | --- | --- |
@@ -55,16 +71,18 @@ flowchart LR
 
 The note has two halves. The SQL half (steps 1 to 3) shows what PostgreSQL does for you inside one database. The Go half (the whiteboard version and steps 4 and 5) shows what your own service must do once the data lives on several databases and PostgreSQL can no longer route for you.
 
-## Setup
+## Setup 🟢
 
 - Module `shard` with `shard.go`, `shard_test.go`, and a sub-package `wb/` for the whiteboard version.
 - Go 1.24, standard library only.
 - Run: `go vet ./... && go test -race -v ./...`
 - The SQL needs PostgreSQL 17 (not run here; representative).
 
-## Code
+## Code 🟡
 
 ### Step 1: partitioned tables in SQL
+
+**In plain words:** one table on the outside, many small tables on the inside. You insert into the parent, and Postgres drops each row into the right drawer by date, by list value or by hash.
 
 **Concept.** Declarative partitioning ([[Partitioning and Sharding#3.1 Partitioning inside PostgreSQL]]) lets one logical table be stored as many physical tables. The parent holds no rows; PostgreSQL sends each inserted row to the single partition whose bounds match its partition key.
 
@@ -151,6 +169,8 @@ CREATE TABLE invoices_p0 PARTITION OF invoices FOR VALUES WITH (MODULUS 4, REMAI
 
 ### Step 2: check pruning
 
+**In plain words:** if your query says "only March", Postgres should open only the March drawer. `EXPLAIN` shows you whether it really skipped the others.
+
 **Concept.** Partition pruning ([[Partitioning and Sharding#3.2 Partition pruning]]) is the payoff of partitioning: the planner reads the `WHERE` clause, compares it to each partition's bounds and removes the partitions that cannot match. Pruning at plan time works when the bounds are constants.
 
 When the bound is only known at execution, such as `now()`, PostgreSQL prunes at run time and reports `Subplans Removed`. Without pruning, partitioning would be slower than one table because of per-partition planning overhead.
@@ -191,6 +211,8 @@ Representative output for both is in [[Partitioning and Sharding#3.2 Partition p
 
 ### Step 3: retention
 
+**In plain words:** throwing away an old month is like taking a whole drawer out and binning it, instead of picking out rows one by one. It is instant and leaves no mess.
+
 **Concept.** Retention as a metadata operation ([[Partitioning and Sharding#3.3 Retention as a metadata operation]]) is the second big payoff. Deleting a month of rows with `DELETE` rewrites millions of tuples, generates WAL, and leaves dead rows for vacuum.
 
 Detaching a whole partition changes only catalogue entries, and `DROP TABLE` then frees the files at once. The cost is that you must keep creating future partitions and dropping old ones on a schedule.
@@ -207,6 +229,8 @@ DROP TABLE audit_logs_2025_12;   -- or archive it to object storage first
 3. `DROP TABLE` removes the standalone table. Dump it to object storage first if you need an archive.
 
 ### Whiteboard version
+
+**In plain words:** the whole sharding idea in a few lines: hash the key into a fixed bucket, then look up which database holds that bucket.
 
 **Concept.** This is the smallest form of the idea in [[Partitioning and Sharding#4. Worked example]]: a key is hashed to one of a fixed number of logical shards, and a table maps each logical shard to a database.
 
@@ -254,6 +278,8 @@ flowchart LR
 ```
 
 ### Step 4: the logical shard and the shard map
+
+**In plain words:** the real version of the bucket table: 1,024 buckets, who owns each one, a "paused" flag per bucket, and a version number so routers notice changes.
 
 **Concept.** This step implements the fixed-logical-shards idea from [[Partitioning and Sharding#3.4 Sharding across machines]] and [[Partitioning and Sharding#8.1 Why many logical shards]].
 
@@ -347,6 +373,8 @@ func NewMap(databases ...string) *Map {
 
 ### Step 5: routing, freezing and flipping
 
+**In plain words:** moving a bucket is like moving house: keep living there while you pack (copy), stop new deliveries for a minute (freeze), then change the address (flip).
+
 **Concept.** The online move in [[Partitioning and Sharding#4. Worked example]] has three phases: copy the data while writes continue, freeze writes for a short final drain, then flip the owner. `Route` implements the read and write rule, `Freeze` starts the cut-over and `Flip` finishes it.
 
 Reads can safely keep using the old owner during the freeze because the old database still has all the data. Writes must fail fast instead of queuing, so a stuck move cannot pile up requests.
@@ -425,7 +453,16 @@ sequenceDiagram
     M-->>W: db-5, version 2
 ```
 
-## Design decisions
+**The move, as a picture** 🟢
+
+```mermaid
+flowchart LR
+    C["1. copy bucket<br/>(writes still go to old db)"] --> F["2. freeze<br/>(writes get ErrMoving, retry)"]
+    F --> L["3. flip<br/>(map points to new db)"]
+    L --> N["writes resume on new db"]
+```
+
+## Design decisions 🔴
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -437,11 +474,13 @@ sequenceDiagram
 | `Flip` requires `Freeze` | Allow a direct flip | Prevents lost writes. Costs a short write pause per move. |
 | Version counter | Compare the whole map | One integer check tells a router whether its cache is stale. |
 
-## Tests
+## Tests 🟡
 
 The tests prove the properties that matter: a move changes the owner of exactly one logical shard, sequential IDs spread evenly, the freeze guard works, and the map is safe under concurrent use. All use only the standard library; no database is needed.
 
 ### TestMoveTouchesOneLogicalShard
+
+**In plain words:** proves that moving one bucket changes the owner of that bucket and nothing else.
 
 **Property.** Moving one logical shard must change the database for exactly the workspaces in that shard and for nobody else. This is the whole reason for logical shards: a move is small and local. The test also checks the freeze rules: writes are refused, reads keep using the old owner, and the version becomes 2.
 
@@ -498,6 +537,8 @@ func TestMoveTouchesOneLogicalShard(t *testing.T) {
 
 ### TestSequentialIDsSpreadEvenly
 
+**In plain words:** proves that IDs 1, 2, 3... do not all pile onto one database.
+
 **Property.** Hash routing must spread the newest IDs evenly. With range sharding by million, the 100,000 newest workspaces would all land on the third database (the hot-shard anti-pattern in [[Partitioning and Sharding#3.6 The user-ID range example is a hot-shard anti-pattern]]).
 
 | Input | Expected |
@@ -533,6 +574,8 @@ func TestSequentialIDsSpreadEvenly(t *testing.T) {
 
 ### TestFlipWithoutFreezeFails
 
+**In plain words:** proves you cannot change the address while writes are still coming in.
+
 **Property.** A flip without a freeze must be refused, because it could lose writes that arrive during the copy.
 
 | Input | Expected |
@@ -551,6 +594,8 @@ func TestFlipWithoutFreezeFails(t *testing.T) {
 **If it fails.** `Flip` accepted an unfrozen shard, so a careless mover could silently skip the freeze step and lose writes.
 
 ### TestConcurrentRouteFreezeFlip
+
+**In plain words:** many goroutines route at the same time while a move happens, and the race detector checks nothing breaks.
 
 **Property.** The map is safe when four goroutines route while another goroutine freezes and flips 50 shards. Under `-race`, any unsynchronised access to `owner`, `frozen` or `version` is reported. The only error a router may see is `ErrMoving`.
 
@@ -597,7 +642,7 @@ func TestConcurrentRouteFreezeFlip(t *testing.T) {
 
 The test file imports `errors`, `sync` and `testing`. A small test in `wb/` checks that `dbFor` follows the owner table.
 
-## Running it
+## Running it 🟢
 
 ```text
 go vet ./... && go test -race -v ./...
@@ -629,7 +674,7 @@ ok  	shard	1.655s
 | `TestConcurrentRouteFreezeFlip (0.03s)` | The race detector found no unsynchronised access. |
 | `ok shard 1.655s` | The package passed. The total is larger than the sum of the tests because `-race` instruments the binary at startup. |
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - **`Freeze` is not enough.** It stops new routing only. A write routed just before the freeze can still land after the final drain, so each database must also enforce shard ownership itself (the `shard_owner` check in [[Partitioning and Sharding#4. Worked example]]).
 - **Reads during a freeze use the old owner.** That is correct until the flip; after the flip, reads must go to the new owner, so the router has to refresh its cached map by version.
@@ -638,13 +683,13 @@ ok  	shard	1.655s
 - **The hash is SHA-256 of the 8-byte ID.** Changing the hash or `LogicalShards` re-places every workspace, so both are fixed forever.
 - **The partition key must be in the primary key.** `PRIMARY KEY (workspace_id, id)` on a table partitioned by `created_at` is rejected by PostgreSQL.
 
-## Exercises
+## Exercises 🔴
 
 1. Change `LogicalShards` to 8 and `NewMap` to 3 databases. Predict the distribution of the newest 100,000 IDs, then run `TestSequentialIDsSpreadEvenly` and see whether the 31,000 to 35,700 bound still passes.
 2. In `TestMoveTouchesOneLogicalShard`, call `Flip` twice in a row on the same shard. Predict the error from the second call, and the final `version`.
 3. Add a `Move` step that calls `Freeze`, a copy function, then `Flip`. Predict what a concurrent writer sees for workspace 42 during the copy.
 
-## Links
+## Links 🟢
 
 - **Theory:** [[Partitioning and Sharding]]
 - **Related:** [[Consistent Hashing - Go]] (a ring instead of fixed logical shards), [[Replication - Go]]

@@ -31,7 +31,35 @@ updated: 2026-11-13
 > - A **snapshot** every N operations plus the log tail is how a document opens fast; the log is also the version history.
 > - **Presence** (cursors, "Asha is typing") is ephemeral: fast, lossy, never persisted.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (11). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 6 (variants) and 7 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 5 (deep dives), 8, 9 and 10. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Google Docs lets many people type in the same document at the same time.
+Each person's screen keeps its own copy, so typing feels instant.
+Every keystroke becomes a tiny change message, called an **operation** (for example "insert 'a' at spot 5").
+Those messages go to a server, which puts them in one agreed order and sends them to everyone.
+
+```mermaid
+flowchart LR
+    A["Alice types"] --> S["Server:<br/>puts changes in one order"]
+    B["Bob types"] --> S
+    S --> A2["Alice's screen"]
+    S --> B2["Bob's screen"]
+```
+
+The hard part: if Alice and Bob type at the same spot at the same moment, "spot 5" means different things on each screen.
+Two known fixes exist. **OT** rewrites the change so it still lands in the right place. A **CRDT** gives every letter its own ID, so positions never get confused.
+
+So the rest of this note is just these 3 questions:
+1. How do two changes made at the same moment end up the same on every screen?
+2. Who decides the order, and what if that server dies?
+3. How does a document with millions of changes still open fast?
 
 **The problem in one story.**
 You and a friend open the same shopping list in Google Docs.
@@ -77,7 +105,7 @@ Where it breaks: an instruction like "add salt after word 4" goes wrong if someo
 > [!tip] Remember
 > Send small ops, give them one order per document, merge with OT or a CRDT, and snapshot so documents open fast.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 Think of two people editing a shared paper notebook, each with their own copy, and phoning each other when they change a line.
 
@@ -107,7 +135,7 @@ Real-time collaboration fixes this: everyone types freely, and the system merges
 > [!tip] Remember
 > The invariant is convergence plus no lost typing. Everything else (latency, presence, history) is built around it.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Imagine a **shared recipe card** that lives in a kitchen.
 
@@ -143,7 +171,7 @@ flowchart LR
     S --> L[("Op log<br/>source of truth")]
 ```
 
-## 3. How it works - high-level design
+## 3. How it works - high-level design 🟡
 
 ### The conflict in one picture
 
@@ -242,6 +270,8 @@ The matching decision guide for the consistency side is [[Choosing Consistency, 
 
 ### Overall architecture
 
+**In plain words:** browsers talk to one server per document over an open line; that server writes every change to a log and sometimes saves a full copy.
+
 ```mermaid
 flowchart LR
     C["Client<br/>editor + local doc copy"] -->|"WebSocket"| LB["L7 load balancer<br/>sticky by doc_id"]
@@ -267,7 +297,7 @@ flowchart LR
 > [!tip] Remember
 > One owner per live document gives you one order for free. The rest of the design is making that owner durable and replaceable.
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -277,6 +307,8 @@ flowchart LR
 - Hardest parts: merge correctness, owner failover, opening a huge document fast.
 
 ### Estimates
+
+**In plain words:** rough sums: how many people type at once and how many tiny changes per second that makes.
 
 Labelled as estimates; state your assumptions aloud in the interview.
 
@@ -297,6 +329,8 @@ Labelled as estimates; state your assumptions aloud in the interview.
 Takeaways: the bottleneck is connections and per-document ordering, not raw bandwidth; fan-out per document is tiny (mostly 1 to 5), which is why one owner per document works.
 
 ### API
+
+**In plain words:** normal web calls for opening and sharing documents, and an always-open line for the live typing.
 
 Documents and sharing are plain REST; editing is a WebSocket protocol.
 
@@ -322,6 +356,8 @@ WebSocket messages (JSON for clarity; production uses a binary format):
 `client_seq` makes the op **idempotent**: if the WebSocket drops before the ack, the client resends the same `client_seq` and the server recognises it and returns the existing ack rather than applying the op twice (see [[Idempotency and Idempotency Keys]]).
 
 ### Data model
+
+**In plain words:** three kinds of storage: the list of every change, saved full copies, and short-lived cursor positions.
 
 | Store | Table / key | Fields | Why this store |
 | --- | --- | --- | --- |
@@ -387,7 +423,7 @@ sequenceDiagram
     C->>S: op base_rev 1204
 ```
 
-## 5. Deep dives
+## 5. Deep dives 🔴
 
 ### Deep dive 1: merging concurrent edits safely
 
@@ -485,7 +521,7 @@ flowchart LR
 > [!warning] Common mistake
 > Treating offline edits as "last save wins" per document. That wipes everyone else's work done during those minutes. Merge at the operation level.
 
-## 6. Variants and comparison
+## 6. Variants and comparison 🟡
 
 | Approach | Ordering | Offline | Server role | Used by (public information) |
 | --- | --- | --- | --- | --- |
@@ -496,7 +532,7 @@ flowchart LR
 | Locking (one editor) | lock | none | lock manager | older document systems, file check-out |
 | Last save wins | none | n/a | none | naive file sync; loses edits |
 
-## 7. Trade-offs and when not to use
+## 7. Trade-offs and when not to use 🟡
 
 - **OT versus CRDT:** OT keeps documents small and is mature for central servers, but transform code is subtle; CRDTs are simpler to reason about and give offline, but cost memory per character and need tombstone cleanup. Choose OT when you already need a central server and plain text; choose CRDTs for offline-first or peer-to-peer.
 - **Sticky owner versus stateless servers:** sticky routing gives ordering cheaply but makes failover a real design item. Stateless servers with a shared lock per op would add latency on every keystroke.
@@ -504,7 +540,15 @@ flowchart LR
 - **Hot documents:** a company all-hands doc with 5,000 readers and 20 editors has high fan-out. Treat viewers differently: editors on the owner server, viewers on read-only fan-out nodes fed from the same stream.
 - **Not worth it:** for forms or settings pages with rare concurrent edits, use optimistic locking with a version column ([[Locking - Optimistic vs Pessimistic]]) and show a conflict dialog.
 
-## 8. In production
+```mermaid
+flowchart TD
+    Q{"Must it work offline<br/>for a long time?"} -- "yes" --> C["CRDT (Yjs, Automerge)"]
+    Q -- "no" --> S{"Already have one server<br/>per document?"}
+    S -- "yes" --> O["Server-ordered OT"]
+    S -- "no" --> C
+```
+
+## 8. In production 🔴
 
 - **Failure modes and fixes**
   - Owner crash: clients reconnect with backoff and jitter; new owner loads snapshot plus tail; resent ops are deduplicated by `client_seq`.
@@ -526,7 +570,7 @@ flowchart TD
     C --> G["Move doc owner or shed viewers"]
 ```
 
-## 9. Deep dive extras: scaling the design
+## 9. Deep dive extras: scaling the design 🔴
 
 **To 10x traffic.** Add collaboration servers behind the sticky load balancer (shard owners by `hash(doc_id)` with consistent hashing, see [[Consistent Hashing]]); partition the op log by `doc_id`; scale Redis presence by cluster. Because documents rarely have many editors, the system scales almost linearly with the number of documents.
 
@@ -546,7 +590,7 @@ flowchart LR
     OWN -->|"broadcast"| EDGE
 ```
 
-## 10. Interview questions
+## 10. Interview questions 🔴
 
 > [!question]- Why not just lock the document while someone edits?
 > Locking serialises users, so a second person waits or is blocked, which defeats real-time collaboration. It also leaves stale locks when a user closes the laptop. Operation-level merging lets everyone type at once.
@@ -572,7 +616,7 @@ flowchart LR
 > [!question]- A document is being edited by 5,000 people. What changes?
 > Fan-out is no longer tiny. Keep the few real editors on the owner, move viewers to read-only fan-out nodes fed from the op stream, throttle presence, and cap cursor broadcasts to nearby viewers.
 
-## 11. Cheat sheet
+## 11. Cheat sheet 🟢
 
 A 45-minute script:
 

@@ -27,7 +27,41 @@ updated: 2026-11-13
 > - The registry is **not** in the message path: each message carries a 5-byte header (magic byte + 4-byte ID), and clients cache schemas by ID.
 > - Classic mistake: thinking BACKWARD means "producers can upgrade first". It means the *new schema can read old data*, so consumers upgrade first.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (wire format, compatibility modes, formats), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+One service sends messages, and many other services read them.
+They all must agree on the shape of a message: which fields, and of what type.
+That agreed shape is called a **schema**.
+If the sender renames one field, every reader that used the old name breaks.
+A **schema registry** is a shared place that stores every version of each schema.
+Before a new version is saved, it checks: "can old readers still read this?" If not, the change is blocked.
+
+```mermaid
+flowchart LR
+    P["Sender renames 'amount'"] --> K[("Topic")]
+    K --> R1["Reader 1: amount = 0"]
+    K --> R2["Reader 2: crash"]
+```
+
+```mermaid
+flowchart LR
+    P["Sender: new schema"] --> G{"Registry:<br/>still compatible?"}
+    G -- "yes" --> S["Saved, gets an id, ships"]
+    G -- "no" --> B["Blocked in CI"]
+```
+
+The rest of this note is just these 3 questions:
+1. How does a message say which schema it was written with?
+2. What counts as a "safe" change, and who must upgrade first?
+3. What do you do when you really must break the schema?
+
 
 **The problem in one story.**
 Team A sends "order placed" messages; team B reads them.
@@ -72,7 +106,7 @@ Where it breaks: a paper form does not have version numbers in every copy; each 
 > [!tip] Remember
 > Evolve schemas only by adding fields with defaults, and let the registry block every breaking change.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 The order service publishes `OrderPlaced` as JSON to Kafka. Twelve services consume it. One Friday a developer renames `amount` to `amount_paise` to make the unit clear, and deploys the producer.
 
@@ -84,7 +118,17 @@ With a registry, the producer's CI (or its first `serialize` call) asks: "is thi
 
 The new schema cannot fill `amount_paise` from old messages, so the change fails the BACKWARD check and never ships.
 
-## 2. Mental model
+**One rename, many victims:**
+
+```mermaid
+flowchart LR
+    D["Friday: rename amount<br/>to amount_paise"] --> T[("Kafka keeps it 7 days")]
+    T --> C1["Billing: Rs 0 orders"]
+    T --> C2["Analytics: crash"]
+    T --> C3["Replays hit it again"]
+```
+
+## 2. Mental model 🟢
 
 The registry is a **library catalogue of contract versions**. Each version gets a catalogue number (the schema ID). A message carries only the catalogue number, not the whole contract. A reader who has not seen that number looks it up once and keeps a copy.
 
@@ -96,7 +140,18 @@ Terms:
 - **Subject:** the name under which versions of one schema are grouped, such as `orders-value`.
 - **Serde:** serializer/deserializer, the client library that talks to the registry and encodes messages.
 
-## 3. How it works
+**The library catalogue, drawn:** a message carries only the catalogue number, the reader looks it up once.
+
+```mermaid
+flowchart LR
+    P["Producer"] -- "register schema" --> R[("Registry")]
+    R -- "id = 7" --> P
+    P -- "[0][7][data]" --> K[("Topic")]
+    K --> C["Consumer"]
+    C -- "what is id 7? (once, then cached)" --> R
+```
+
+## 3. How it works 🟡
 
 ```mermaid
 sequenceDiagram
@@ -121,6 +176,8 @@ The registry is contacted once per new schema, not once per message. If it is do
 
 ### Wire format
 
+**In plain words:** each message starts with a tiny header: one zero byte and a 4-byte number. The number says "look up schema 7 to read me".
+
 | Bytes | Content |
 | --- | --- |
 | 0 | Magic byte, always `0` |
@@ -128,6 +185,8 @@ The registry is contacted once per new schema, not once per message. If it is do
 | 5… | Avro binary; for Protobuf first a list of message indexes (which message in the `.proto` file), then the Protobuf bytes; for JSON Schema the JSON text |
 
 ### Subjects and naming strategies
+
+**In plain words:** a subject is the folder that holds all versions of one schema; the strategy decides how that folder is named, per topic or per event type.
 
 | Strategy | Subject name | Effect |
 | --- | --- | --- |
@@ -138,6 +197,8 @@ The registry is contacted once per new schema, not once per message. If it is do
 Use a multi-type strategy when one topic must carry several event types for one aggregate (`OrderPlaced`, `OrderPaid`, `OrderShipped`) so that their relative order is kept in one partition.
 
 ### Compatibility modes
+
+**In plain words:** the mode is the house rule for changes. It answers one question: who upgrades first, the readers or the senders?
 
 ```mermaid
 flowchart TD
@@ -165,6 +226,8 @@ For a Kafka topic that consumers may replay from the beginning, the plain modes 
 
 ### Formats
 
+**In plain words:** Avro, Protobuf and JSON Schema all describe message shapes; they differ in size, speed and how they handle changes.
+
 | Format | Schema in message? | Evolution rules | Strengths | Weaknesses |
 | --- | --- | --- | --- | --- |
 | Avro | No, only the ID | Resolution by field **name**; defaults fill missing fields; aliases for renames | Compact; designed for writer/reader resolution; common in Kafka and data lakes | Needs the writer schema to decode anything; less familiar outside data teams |
@@ -173,9 +236,11 @@ For a Kafka topic that consumers may replay from the beginning, the plain modes 
 
 Protobuf evolution in detail lives in [[Protocol Buffers and Schema Evolution]]; this note covers the event-stream side.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** a short story of versions: each new version is checked against the last one, and gets saved or refused.
 
 ```text
 subject orders-value, mode BACKWARD
@@ -191,6 +256,8 @@ consumer: id 2 in cache? no -> GET /schemas/ids/2 -> cache -> decode
 ```
 
 ### Go: a registry with compatibility checks and the wire format
+
+**In plain words:** a small Go registry that stores versions, refuses unsafe changes, and adds the 5-byte header to messages, with tests.
 
 The model below uses flat record schemas and Avro's resolution rule: a reader can read a writer's data if every reader field exists in the writer with the same type, or has a default.
 
@@ -462,6 +529,8 @@ Note what `TestTransitiveCatchesOlderVersions` shows: version `c` passes the pla
 
 ### The same checks against a real registry
 
+**In plain words:** these are the real HTTP calls your CI would make to a real registry to ask "is this change safe?"
+
 The registry's REST API exposes the check directly, which is how CI should call it (representative output, Confluent Schema Registry 7.x; no registry was run for this note):
 
 ```bash
@@ -483,7 +552,7 @@ curl -s -X POST -H "Content-Type: application/vnd.schemaregistry.v1+json" \
 
 For Protobuf contracts kept in Git, `buf breaking --against '.git#branch=main'` does the same job before the schema reaches the registry.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -493,7 +562,7 @@ For Protobuf contracts kept in Git, `buf breaking --against '.git#branch=main'` 
 | Schemas in Git only | `.proto` / `.avsc` in a shared repo, checked with `buf breaking` in CI | Small teams, gRPC-first shops | No runtime lookup; consumers need the code release to read new types |
 | No schema (free JSON) | Producers emit whatever JSON they like | Prototypes | Breaks are found in production |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Coupling to a central service and its clients.** Every producer and consumer needs a serde that speaks the registry protocol; non-JVM language support varies.
 - **Binary messages are opaque.** You cannot `kafkacat` a topic and read it without the registry. Tooling must be registry-aware.
@@ -501,7 +570,7 @@ For Protobuf contracts kept in Git, `buf breaking --against '.git#branch=main'` 
 - **Defaults are a contract too.** Adding `currency` with default `"INR"` silently assigns INR to old events. Pick defaults that are true for old data, or use a nullable field.
 - **When not to use it:** two services owned by one team with a handful of event types and short retention may be fine with versioned JSON and contract tests ([[API Contract Design and OpenAPI]] for the HTTP equivalent).
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Confluent Schema Registry is the default in Kafka-centric stacks; Apicurio is common with Red Hat and Strimzi; AWS Glue Schema Registry with Amazon MSK and Kinesis.
 - **Data contracts and ownership:** the producing team owns the schema (it lives in their repo). A schema change is a code review that consumers can see. Some registries attach rules to schemas (for example, field-level validation or tags marking PII) so that the contract covers meaning as well as shape.
@@ -512,7 +581,7 @@ For Protobuf contracts kept in Git, `buf breaking --against '.git#branch=main'` 
 	- *Poison message with an unknown ID or wrong magic byte* (a producer that skipped the serializer): send it to a dead letter topic instead of crash-looping ([[Dead Letter Queues and Poison Messages]]).
 - **What to monitor:** registration rejections in CI, number of versions per subject, subjects in NONE mode, deserialisation error rate per consumer, registry request latency and cache-miss rate.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **When a break is unavoidable.** Options, from least to most disruptive:
 	1. Add the new field alongside the old, dual-write both for a deprecation period, then remove the old one (expand and contract, the same idea as [[Zero-Downtime Schema Migrations]]).
@@ -528,7 +597,16 @@ For Protobuf contracts kept in Git, `buf breaking --against '.git#branch=main'` 
 - **Global vs per-subject IDs.** Confluent IDs are global across subjects: the same schema text registered in two subjects gets the same ID. Versions are per subject. The Go model above draws IDs from one global counter, but unlike Confluent it gives identical schema text in a second subject a new ID.
 - **CloudEvents.** A CNCF spec for event metadata (id, source, type, time, datacontenttype, dataschema). It standardises the envelope, not the payload schema, and pairs well with a registry.
 
-## 9. Interview questions
+**When a break can't be avoided, the gentlest path is expand then contract:**
+
+```mermaid
+flowchart LR
+    A["v1: amount"] --> B["v2: amount + amount_paise<br/>(write both)"]
+    B --> C["All readers move to amount_paise"]
+    C --> D["v3: drop amount"]
+```
+
+## 9. Interview questions 🔴
 
 > [!question]- What does BACKWARD compatibility mean, and who deploys first? (trap)
 > The new schema can read data written with the previous one. So consumers upgrade to the new schema first (they can still read old messages), then producers start writing it. Many people get the order backwards. FORWARD is the opposite: producers first.
@@ -551,7 +629,7 @@ For Protobuf contracts kept in Git, `buf breaking --against '.git#branch=main'` 
 > [!question]- How do you stop a breaking schema from reaching production?
 > Check compatibility in CI against the registry (or `buf breaking` for Protobuf), disable auto-registration in production serializers, and keep subject compatibility levels in version-controlled config.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Wire format: `0x00` + 4-byte big-endian schema ID + payload; clients cache by ID.
 - Subject per topic by default (`orders-value`); record-name strategies for several types per topic.

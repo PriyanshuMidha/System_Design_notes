@@ -27,7 +27,38 @@ updated: 2026-11-13
 > - **Measure time, don't guess it.** The USE method (saturation of a resource) and the RED method (request-level symptoms) are the two lenses; traces show you which stage actually owns the time.
 > - **How you measure latency can be wrong.** A naive load generator suffers "coordinated omission" and silently hides the exact stalls you are trying to find.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+**Latency** is how long one request takes. Users feel it as "fast" or "slow".
+Averages lie. If 99 requests take 40 ms and 1 takes 4 seconds, the average looks fine, but that one user is furious.
+So we use **percentiles**: p99 is the time that 99% of requests beat. It shows the slow tail.
+
+```mermaid
+flowchart LR
+    A["Average: 80 ms (looks fine)"] --- P["p99: 2 s (1 in 100 users waits 2 s)"]
+```
+
+A request's time is work plus waiting in lines (queues). When a system gets busy, waiting grows much faster than work.
+To fix slowness, find which step owns the slow tail, by measuring, not guessing.
+
+```mermaid
+flowchart LR
+    R["Request time"] --> W["Real work"]
+    R --> Q["Waiting in queues (grows fast when busy)"]
+```
+
+The rest of this note is just these 3 questions:
+1. Where does a request's time go?
+2. How do you read percentiles, and why does fan-out make the tail worse?
+3. How do you find the one step causing the slowness?
+
 
 **The problem in one story.**
 A shop's checkout page loads in 0.2 seconds for most people.
@@ -74,7 +105,7 @@ Where it breaks: shoppers pick a different till, but in a fan-out request you mu
 > [!tip] Remember
 > Look at p99, not the average, and measure which stage owns the time before fixing anything.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A checkout API has an average latency of 45ms — looks healthy on any dashboard that only plots the mean. But 1 request in 100 takes 2.1 seconds, because it happens to land on a connection pool that is momentarily full.
 
@@ -86,7 +117,7 @@ That's **tail amplification**, and it's why "p99 is only slow for 1% of requests
 
 Bottleneck analysis answers the next question correctly: of DNS, TLS, the load balancer, app CPU, GC, the database, a cache, an external API and a queue, which one actually owns the time in the slow 1%? Guessing wastes an afternoon optimizing a cache that was never the problem.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Every request's total latency is a sum of two very different things:
 
@@ -99,9 +130,11 @@ A server at 60% CPU utilization and the same server at 95% CPU utilization can h
 
 Think of a single supermarket checkout lane. At 60% of capacity, a new customer almost never waits. At 95% of capacity, a slightly slow customer ahead of you (a wait that a 60%-loaded lane would absorb instantly) now creates a visible line. The register didn't get slower; it got closer to its limit.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Where time goes
+
+**In plain words:** add up every hop: network, load balancer, your code, database, other services. One of them is usually most of the time.
 
 A single request's latency decomposes into every hop it takes:
 
@@ -127,6 +160,8 @@ If spans account for 30ms but the client measured 90ms, 60ms went somewhere your
 
 ### The USE method and the RED method
 
+**In plain words:** USE checks each resource (busy? full? errors?). RED checks each service (requests, errors, duration). Use both.
+
 Two complementary lenses, each answering a different question:
 
 - **USE (Utilization, Saturation, Errors)** — Brendan Gregg's method for every *resource*: CPU, memory, disk, network, connection pools, locks. For each: what % of the time is it busy (utilization), how much work is queued waiting for it (saturation), and is it producing errors? USE finds *what is the bottleneck*.
@@ -144,6 +179,8 @@ flowchart TD
 
 ### Percentiles, and why averages lie
 
+**In plain words:** sort all times and pick the one at the 99% mark. That number shows what your unluckiest users feel.
+
 Given a sorted set of latencies, the p99 is the value below which 99% of requests fall (the "nearest-rank" method: for `n` samples, `rank = round(p/100 × (n-1))`, 0-indexed). The mean is dragged only a little by a rare huge value; the p99 is defined entirely by the tail.
 
 A system where 99% of requests take 10ms and 1% take 2000ms has a mean of about 29.9ms (`0.99×10 + 0.01×2000`) — looking almost fine — while its p99 is 2000ms: about 67× the mean, and 200× the typical (p50) request.
@@ -153,6 +190,8 @@ A system where 99% of requests take 10ms and 1% take 2000ms has a mean of about 
 This is exactly why Prometheus's `histogram_quantile()` function requires **histograms**, not pre-computed per-instance quantiles: a histogram's bucket counts are additive across instances (`sum by (le) (rate(http_request_duration_seconds_bucket[5m]))`), so the merge is mathematically correct, while an average of summaries' quantiles is not. See the comparison table below.
 
 ### Tail amplification under fan-out
+
+**In plain words:** if one request calls 100 backends, it waits for the slowest one. So a 1-in-100 slow backend makes most requests slow.
 
 If a single dependency call is slow with probability `p`, and a request makes `n` independent calls to dependencies with that same slowness rate, the probability that *at least one* call is slow is `1 − (1 − p)ⁿ`. At `p = 1%` (a dependency with a clean p99) and `n = 100` fan-out calls:
 
@@ -177,7 +216,7 @@ sequenceDiagram
     G-->>U: full response (bounded by the SLOWEST of the 100 calls)
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -305,7 +344,7 @@ func LittlesLawConcurrency(lambdaPerSec, wSeconds float64) float64 {
 
 **Worked numbers:** a service handling 500 req/s at an average latency of 40ms needs `L = 500 × 0.040 = 20` requests in flight on average. A worker pool or connection pool sized below 20 *will* queue under this exact average load — size it with headroom (e.g. 30) to absorb bursts without crossing the latency knee.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -316,14 +355,14 @@ func LittlesLawConcurrency(lambdaPerSec, wSeconds float64) float64 {
 | Open-loop load generator (k6, wrk2, Gatling) | Fixed arrival rate regardless of response time | Any latency benchmark that must be trustworthy | Needs a generator actually built for constant-arrival-rate; naive scripts default to closed-loop |
 | Closed-loop load generator (naive `for` loop calling an HTTP client) | Waits for each response before sending the next | Never, for latency measurement (fine for pure throughput ceiling tests) | Silently hides tail latency (coordinated omission) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Percentiles need enough samples to be meaningful: a p99.9 computed from 50 requests is noise, not a measurement.
 - Chasing p99.99 on an endpoint nobody waits for live (a nightly batch job) burns engineering time with no user-facing benefit — match the percentile you chase to what a human or SLA actually experiences.
 - The USE method assumes you know the resource list; on an unfamiliar system, start with RED (which endpoint, which cohort) and let the trace tell you which resource to USE-check.
 - Little's Law needs a stable average; during a traffic ramp or an incident the system isn't in steady state and L = λW will mislead you — use it for capacity planning, not for reading a live dashboard mid-incident.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Google's SRE book frames the four golden signals (latency, traffic, errors, saturation) around exactly this split between request symptoms and resource causes.
@@ -338,7 +377,7 @@ func LittlesLawConcurrency(lambdaPerSec, wSeconds float64) float64 {
 	- Cold cache after a deploy or restart → warm the cache before serving traffic, or accept a brief, bounded p99 spike and alert on duration, not on a single breach.
 - **What to monitor:** p50/p95/p99/p99.9 latency per endpoint and per dependency (never only the average); saturation per resource (CPU, pool `InUse`/`WaitCount`, goroutine count, disk queue depth); error rate alongside latency (a fast error is not a win); the gap between client-measured latency and the sum of server-side spans (unaccounted queueing time).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why the knee happens.** This is a textbook queueing model, not a measured production curve: for a simple M/M/1 queue (Poisson arrivals, exponential service time — a simplification of a real server, which rarely matches either assumption exactly), average wait time scales with `ρ/(1−ρ)` where `ρ` is utilization (0 to 1). At `ρ = 0.5`, the factor is 1; at `ρ = 0.9`, it's 9; at `ρ = 0.99`, it's 99. Real systems don't follow this formula exactly, but they share its qualitative shape — the explanation for why a resource "at 90% CPU, still fine" can be one bad minute away from a latency cliff: the curve is not linear, it diverges as `ρ → 1`.
 - **Coordinated omission, precisely.** Gil Tene's point is that most load-testing and even some in-process latency measurement (e.g. timing only requests a thread pool actually picked up) never samples the time *during which the measuring system itself was blocked*. The fix is always: decide the sampling schedule in advance (fixed-rate), and if a sample is "late" because the system was busy, record it as a very long latency rather than skipping it or compressing it.
@@ -346,7 +385,7 @@ func LittlesLawConcurrency(lambdaPerSec, wSeconds float64) float64 {
 - **Regression workflow.** When p99 jumps after a deploy: canary-compare the new version against the old one on identical traffic (not before/after on different days, which conflates time-of-day load); if that confirms a regression, take CPU profiles from both versions under the same load and diff the flame graphs — the function whose time share grew is almost always the regression's location.
 - **Trace critical path.** In a trace with parallel spans, total latency is **not** the sum of every span's duration; it's the length of the longest chain of causally-dependent spans (the critical path). A span that ran in parallel and finished early is not on the critical path even if it was slow in isolation — don't "fix" it first.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- p99 tripled but p50 is flat. What does that tell you, and where do you look?
 > The typical request is unaffected, so this isn't a global slowdown (bad deploy to every request path, DB fully down). It's localized: a subset of requests (one cohort, one dependency, one node) or a resource near its saturation point where only the unlucky requests queue. Scope by endpoint, region, tenant and pod before touching anything; check the saturation (USE) of pools, locks and any single dependency on the slow trace's critical path.
@@ -369,7 +408,7 @@ func LittlesLawConcurrency(lambdaPerSec, wSeconds float64) float64 {
 > [!question]- Trap: a teammate says "we're fine, average latency is only 40ms." What's wrong with that statement by itself?
 > Nothing is necessarily wrong with the system, but the statement proves nothing: an average can be low even when a meaningful fraction of users have a terrible experience, because a few very slow requests pull the mean only slightly while percentiles expose them directly. Ask for the p95/p99/p99.9 and the sample count before accepting "we're fine."
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Latency = service time + queueing time; queueing time explodes near 100% utilization (the knee), it doesn't grow linearly.
 - Never trust an average alone — always pair it with p95/p99/p99.9, and know your sample size.

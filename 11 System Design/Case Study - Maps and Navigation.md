@@ -30,7 +30,33 @@ updated: 2026-11-13
 > - Traffic is a **streaming aggregation** of anonymised GPS probes, after **map matching** snaps noisy points onto roads.
 > - Everything is partitioned by **geography**, because a route in Delhi never needs data from Lisbon.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (12). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 9, 10 and 11. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A maps app does three separate jobs: draw the map, find a route, and guess the travel time.
+Drawing: the world map is cut ahead of time into small square pictures called **tiles**. The app just downloads the squares it needs.
+Routing: roads are stored as a **graph**: points (junctions) joined by lines (roads), each with a travel time. A shortest-path search finds the quickest way.
+Travel time: phones on the road send their speed, so the app knows which roads are slow right now.
+
+```mermaid
+flowchart LR
+    T["Tiles: pictures"] --> APP["Maps app"]
+    G["Road graph: routes"] --> APP
+    P["Phone speeds: traffic"] --> G
+```
+
+Tiles are the same for everyone, so they are cached close to users and come back very fast.
+
+So the rest of this note is just these 3 questions:
+1. How do you show any part of the world at any zoom, fast?
+2. How do you find the best route on a graph with millions of roads, in under a second?
+3. How do you turn phone pings into live traffic and an arrival time?
 
 **The problem in one story.**
 You open a maps app, drag around the city, search "nearest petrol pump", and ask for a route home.
@@ -75,7 +101,7 @@ Where it breaks: an atlas never changes, but real roads close, jams appear and t
 > [!tip] Remember
 > Pre-cut the map into cacheable tiles, route on an in-memory road graph, and turn GPS pings into road speeds for the ETA.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 You open the app at a bus stop. In under a second you want the map around you drawn sharply. You type "airport", get suggestions, pick one, and see three routes with times.
 
@@ -112,7 +138,7 @@ Underneath is a pile of data and algorithms that must be both enormous (the whol
 > [!tip] Remember
 > Maps is three systems glued together: a **tile server** (static, cacheable), a **routing engine** (graph in RAM) and a **traffic pipeline** (streaming).
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Imagine a huge paper atlas. To show you a neighbourhood, a clerk does not redraw anything: they hand you the right pre-printed page (tile). Pages are numbered, so a copy shop on every street corner (CDN) can keep the popular ones.
 
@@ -130,7 +156,7 @@ flowchart LR
     RT -->|"route + ETA"| U
 ```
 
-## 3. How it works - high-level design
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart TB
@@ -180,7 +206,7 @@ flowchart TB
 > [!tip] Remember
 > Tiles are static and global. Routes are dynamic and per request. Traffic is the live input that connects them.
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -196,6 +222,8 @@ Numbers:  ~350k tile req/s peak, ~1.2M probes/s peak, ~1 ms route query (estimat
 ```
 
 ### Tile math
+
+**In plain words:** each zoom level cuts the world into 4 times more squares than the last. A tile's name is just its zoom, column and row.
 
 The world map is projected with **Web Mercator** onto a square, then cut into `2^z x 2^z` tiles at zoom `z`.
 
@@ -218,6 +246,8 @@ y = floor( (1 - asinh(tan(lat)) / pi) / 2 * n )
 Example: Bengaluru at `lat 12.9716, lon 77.5946`, zoom 12. `n = 4096`. `x = floor(257.5946 / 360 * 4096) = floor(2930.85) = 2930`. `y = floor(1899.13) = 1899`. The tile URL is `/tiles/12/2930/1899`. No database lookup is needed to find a tile; the address is pure arithmetic, which is why caching is trivial.
 
 ### Estimates
+
+**In plain words:** rough sums: how many tiles exist, how many requests per second, and how many phone pings per second.
 
 All inputs are **estimates**.
 
@@ -242,6 +272,8 @@ Conclusions the numbers force:
 
 ### API
 
+**In plain words:** get a tile, search a place, ask for a route, and send location pings.
+
 | Method and path | Purpose | Notes |
 | --- | --- | --- |
 | `GET /tiles/{z}/{x}/{y}.mvt` | vector tile | `Cache-Control: public, max-age=...`; versioned path `/v123/...` for map updates |
@@ -254,6 +286,8 @@ Conclusions the numbers force:
 | `POST /v1/reroute` | reroute from current position | includes the original route id for continuity |
 
 ### Data model
+
+**In plain words:** tiles live as files; the road graph lives in memory; places live in a search index.
 
 ```mermaid
 erDiagram
@@ -306,7 +340,7 @@ erDiagram
 > [!tip] Remember
 > Static base map, in-memory routing graph, live traffic overlay: three layers of data, each with its own freshness.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Decision | Options | Choice | Why |
 | --- | --- | --- | --- |
@@ -331,7 +365,7 @@ flowchart TD
     CCH --> M
 ```
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 - **Pre-build vs on-demand tiles.** Pre-building z0 to z14 (about 358 M tiles) costs storage and build time but makes the common zoom levels instant and cacheable. On-demand rendering at deeper zoom saves storage but adds origin load and cold-start latency, absorbed by the CDN after the first request.
 - **Vector vs raster.** Vector tiles are typically several times smaller than raster (an estimate that depends on the style and zoom) and flexible, but need a capable client and a style spec. Raster is simplest and works anywhere (embedding, old devices).
@@ -341,7 +375,14 @@ flowchart TD
 - **Privacy vs coverage.** Probes are essential for traffic but sensitive. Anonymise with rotating ids, drop the first and last minutes of a trip, aggregate per road and require a minimum number of devices before publishing a speed.
 - **When simpler wins.** A delivery company with 500 vehicles in one city can run an open-source engine (OSRM or Valhalla) on one machine with OpenStreetMap data, use a hosted tile provider, and skip live probes.
 
-## 7. In production
+```mermaid
+flowchart LR
+    P["Pre-build tiles"] --> P1["Fast, costs storage"]
+    D["Build on demand"] --> D1["Cheap storage,<br/>slow first view"]
+    F["Update traffic often"] --> F1["Fresh, routes may flicker"]
+```
+
+## 7. In production 🔴
 
 - **Real examples.** OpenStreetMap publishes the planet's road data.
   - OSRM and Valhalla are open-source routing engines whose documentation describes contraction hierarchies and tiled graphs.
@@ -354,7 +395,7 @@ flowchart TD
 - **Failure: ETA drift.** Predicted vs actual arrival diverge in a city during rain or an event. Monitor error per city and hour; fall back to historical-only if the live model goes bad.
 - **What to monitor.** Tile CDN hit rate and p99; origin QPS; route latency p50/p99 per region; reroute rate; ETA error (predicted vs actual) distribution; probe ingest lag; fraction of segments with fresh speed; map-matching failure rate; graph build validation results.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Deep dive 1: tile serving and the CDN
 
@@ -521,6 +562,8 @@ flowchart LR
 
 ### Offline maps
 
+**In plain words:** the app downloads the squares and a small road graph for one area, so it can work without internet.
+
 The user picks a region. The app downloads the tiles for that bounding box up to a zoom cap, a compact routing graph for the region and a places index. Navigation then runs on the phone with historical speeds only.
 
 Rough size estimate (not a published figure): vector tiles for one city up to about z15 are tens to a few hundred MB depending on detail; the routing graph for a large country is on the order of hundreds of MB.
@@ -530,7 +573,7 @@ Updates come as differential downloads keyed by map version.
 > [!tip] Remember
 > Heavy preprocessing offline, tiny work online. That pattern appears in tiles, routing and offline maps.
 
-## 9. Bottlenecks, scaling and failure handling
+## 9. Bottlenecks, scaling and failure handling 🔴
 
 **Scaling plan**
 1. **Tiles:** more CDN, longer TTLs, origin shield, versioned URLs.
@@ -558,7 +601,7 @@ Watch cost: probe processing and CDN egress dominate the bill, so shrink tile by
 
 **Consistency.** The map version must match between tiles, routing graph and search (otherwise you display a road that routing does not know). Deploy a build as a unit with a version id; clients and services switch together via a config pointer.
 
-## 10. Interview questions
+## 10. Interview questions 🔴
 
 > [!question]- How do you serve the map to hundreds of millions of users cheaply?
 > Pre-cut the map into `zoom/x/y` tiles that do not depend on the user, store them in object storage and put a CDN in front with versioned URLs and long `max-age`. Use vector tiles to cut bytes.
@@ -585,7 +628,7 @@ Watch cost: probe processing and CDN egress dominate the bill, so shrink tile by
 > [!question]- How do you detect that a user went off route and avoid rerouting spam?
 > Compare map-matched position to the route polyline. Reroute only if the deviation exceeds a threshold for several seconds, and rate limit reroutes per session. For traffic-triggered reroutes, only suggest if the saving exceeds a threshold, for example more than 2 minutes, to prevent oscillation.
 
-## 11. What interviewers look for and follow-ups
+## 11. What interviewers look for and follow-ups 🔴
 
 - **Level signals.** SDE-2: tiles with a CDN, Dijkstra, basic traffic idea. SDE-3: contraction hierarchies, map matching, traffic aggregation, versioned map builds, degradation. Staff: cross-region routing, customisable CH, ETA modelling and error budgets, privacy design, cost drivers and map data pipeline governance.
 - **Red flags.** Computing routes with SQL; no CDN for tiles; no preprocessing step; ignoring turn restrictions or one-way streets; treating GPS as exact; ignoring privacy of probes.
@@ -597,7 +640,7 @@ Watch cost: probe processing and CDN egress dominate the bill, so shrink tile by
   - "Real-time ETA sharing" (a pub-sub channel per share link; see [[Scaling WebSockets]]).
 - **Decision guides to cite.** [[Choosing Storage for Files, Search and Analytics - Decision Guide]], [[Choosing a Caching Strategy - Decision Guide]], [[Choosing a Database - Decision Guide]], [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]], [[Choosing Compute, Scaling and Deployment - Decision Guide]].
 
-## 12. Cheat sheet
+## 12. Cheat sheet 🟢
 
 - Tile address: `z/x/y`, 4^z tiles per level, computed by arithmetic. Pre-build z0-z14 (about 358 M), render deeper on demand. Vector tiles, versioned URLs, CDN hit rate about 95%.
 - Road graph: nodes are intersections, edges are directed segments with time. In RAM, sharded by region.

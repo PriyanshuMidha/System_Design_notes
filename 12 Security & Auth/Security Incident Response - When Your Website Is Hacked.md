@@ -28,7 +28,38 @@ updated: 2026-11-13
 > - You are not finished when the site looks normal. You are finished when you know how they got in and that door is closed.
 > - Never reuse the compromised machine. Rebuild from a known-good image and restore data from a backup older than the intrusion.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your site has been hacked. The natural reaction is to delete the bad stuff fast. Don't.
+Rushing wipes out the clues and usually leaves a hidden way back in (a **backdoor**).
+Instead, follow a fixed order, like firefighters do.
+
+```mermaid
+flowchart LR
+    C["Confirm"] --> S["Contain"] --> P["Preserve evidence"] --> I["Investigate"] --> E["Remove access"] --> R["Rebuild clean"] --> N["Notify"] --> F["Fix root cause"]
+```
+
+First stop the damage without destroying evidence. Then find out how they got in.
+Then remove every way back, rebuild from clean sources, and tell the people the law says you must tell.
+
+```mermaid
+flowchart LR
+    W["Wrong: wipe and restart"] --> B["Backdoor stays, attacker returns"]
+    Rt["Right: contain, investigate, then rebuild"] --> OK["Attacker stays out"]
+```
+
+The rest of this note is just these 3 questions:
+1. What are the steps, in order, and why that order?
+2. How do you find out what the attacker did?
+3. When and whom must you notify?
+
 
 **The problem in one story.**
 One morning your site shows a strange page, or users report unknown charges.
@@ -73,7 +104,7 @@ Where it breaks: a fire does not fight back; an attacker may still be inside and
 > [!tip] Remember
 > Contain first, preserve evidence, rotate everything the attacker could have seen, then learn.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Picture a shop owner who arrives to find the back window broken. If they sweep up the glass, repaint, and reopen, the police find no fingerprints, the thief still has a copy of the keys, and the owner never learns what was stolen.
 
@@ -88,7 +119,7 @@ This note is the playbook for those hours. It is a response guide; preventing th
 > [!tip] Remember
 > A hacked site is a crime scene first and a broken site second.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a fire brigade, not a handyman. Firefighters do not start by repainting. They arrive, size up the fire (confirm and scope), stop it spreading (contain), protect evidence for the investigator (preserve), put out hidden embers (eradicate), and only then let people back in (recover). Afterwards the fire marshal finds the cause so it cannot happen again (post-incident review).
 
@@ -108,7 +139,7 @@ flowchart LR
 
 The dotted arrow is important: investigation often reveals more compromised hosts, which sends you back to containment.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Detect and confirm
 
@@ -305,6 +336,16 @@ Look for odd roles, bulk `SELECT` on user tables, and large exports (`COPY ... T
 
 ### 3.5 Eradicate
 
+```mermaid
+flowchart LR
+    A["Attacker access"] --> K["Stolen keys and passwords"]
+    A --> U["Extra admin users"]
+    A --> W["Web shells / cron jobs"]
+    K --> X["Rotate all"]
+    U --> X2["Delete all"]
+    W --> X3["Rebuild from clean images"]
+```
+
 In plain words: remove every way the attacker could get back, not just the visible malware.
 
 Checklist:
@@ -364,7 +405,7 @@ Within one to two weeks, hold a blameless review. Produce a timeline, root cause
 
 Useful metrics: time to detect, time to contain, time to recover, and dwell time (how long the attacker was inside before detection). Reducing dwell time is usually the best investment.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 An online store, "ShopCo", Friday 03:10 UTC. All times are illustrative.
 
@@ -393,7 +434,7 @@ flowchart LR
 
 What the example shows: detection came from outbound traffic, not from the injection; the real dwell time was 14 days; and the damage grew because of a broad cloud role. Each lesson maps to a hardening item.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### 5.1 Common attack types and their tell-tale signs
 
@@ -438,7 +479,7 @@ With IMDSv1, a simple GET returns credentials. IMDSv2 requires a session token o
 | Medium | Vulnerability exploited with no evidence of access | Patch, hunt for follow-up activity |
 | Low | Blocked scanning | Monitor, tune rules |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 Response choices cost something, and the right one depends on the situation.
 
@@ -454,7 +495,7 @@ Response choices cost something, and the right one depends on the situation.
 
 When not to follow the standard sequence strictly: if data is leaving right now or ransomware is spreading, containment (including shutdown) comes before evidence collection. Preserve what you can, but stop the damage.
 
-## 7. In production
+## 7. In production 🔴
 
 Preparation decides how the incident goes. Before anything happens, have:
 
@@ -482,7 +523,7 @@ sum(rate(node_network_transmit_bytes_total[5m]))
 
 Alert when the second ratio stays above a threshold you choose (for example 5) for 10 minutes. The threshold is a starting point to tune against your normal variance.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### 8.1 Why snapshot before changing
 
@@ -532,7 +573,7 @@ flowchart LR
 
 Say it as: "I confirm and scope, isolate without powering off, snapshot, then work from copies to find entry, persistence and data touched. I rotate every secret in reach, rebuild from clean images and a pre-compromise backup, notify within the legal windows, and finish with a blameless review."
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Your website was defaced this morning. What do you do first?
 > Confirm and scope, then contain: isolate the affected host (remove from the load balancer, restrict network) without powering off, and snapshot disks. Defacement is often a symptom, so I look for the foothold, persistence and data access before restoring anything. Then I rotate credentials, rebuild from a clean image, and restore data from a pre-compromise backup.
@@ -555,7 +596,7 @@ Say it as: "I confirm and scope, isolate without powering off, snapshot, then wo
 > [!question]- Why does dwell time matter?
 > The longer attackers stay, the more data they collect and the more persistence they build. Centralised logs, alerts on outbound traffic and identity anomalies, and regular access reviews cut detection time, which is the best predictor of damage.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Order: detect, contain, preserve, investigate, eradicate, recover, notify, learn.
 - Isolate rather than power off; snapshot before changing anything.

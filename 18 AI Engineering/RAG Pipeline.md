@@ -22,7 +22,40 @@ updated: 2026-11-13
 > - An answer should name its sources and say "I don't know" when retrieval comes back empty or low-confidence, rather than guessing.
 > - RAG is one option, not the only one: for a few static documents a long context window can be simpler than a retrieval pipeline.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+An AI model only knows what it read during training. It does not know your company's refund policy or your latest docs.
+
+**RAG** (retrieval-augmented generation) fixes this: first search your own documents, then hand the best bits to the model with the question.
+
+```mermaid
+flowchart LR
+    Q["Question"] --> M1["Model alone"] --> G["Guesses or<br/>makes things up"]
+```
+
+It is an open-book exam. The model gets to look at the right pages before it answers.
+
+```mermaid
+flowchart LR
+    Q["Question"] --> S["Search your docs"] --> P["Best 3-5 pieces"] --> M["Model writes answer<br/>with sources"]
+```
+
+The pieces it searches are called **chunks**: small, labelled parts of your documents, prepared ahead of time.
+
+A good answer says where each fact came from, and says "I don't know" when nothing matches.
+
+The rest of this note is just these 3 questions:
+1. What are the steps from question to answer?
+2. Which knobs control what gets found?
+3. What breaks in production, and how do you fix it?
+
 
 **The problem in one story.**
 A customer asks your chatbot, "What is your refund policy for digital goods?"
@@ -64,7 +97,7 @@ Where it breaks: a student can flip through the whole book, while RAG only sees 
 > [!tip] Remember
 > Index ahead of time, retrieve at question time, answer only from what was retrieved, and cite it.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An LLM's knowledge comes from training data with a cutoff date, and it knows nothing about your company's internal wiki, your customer's account history, or a product manual published last week.
 
@@ -76,13 +109,15 @@ Fine-tuning a model on that data is slow to update and does not reliably teach i
 
 Concretely: a user asks "what's our refund policy for digital goods?" Without RAG, the model either refuses or invents a plausible-sounding but wrong policy. With RAG, the pipeline retrieves the actual refund-policy paragraph from the company's documents and the model answers from it, citing the source.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 RAG is an open-book exam instead of a closed-book one. A closed-book exam (asking the raw LLM) tests only what the model memorized. An open-book exam lets it look up the relevant page first — but only if it knows which page to open.
 
 The indexing pipeline is building the book's index ahead of time (see [[Document Ingestion and Chunking]]); the query pipeline is the "look up the index, read the matching pages, then answer" step done at question time.
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words:** Clean up the question, search, sort the best results to the top, fit them into the prompt, then let the model answer and cite.
 
 ```mermaid
 flowchart TD
@@ -137,12 +172,21 @@ sequenceDiagram
 
 ### Retrieval knobs
 
+**In plain words:** These are the dials for search: how many results to fetch, how good a match must be, and who may see what.
+
 - **top-k:** how many chunks the initial vector search returns before reranking — commonly 10–50, cut down to 3–8 after reranking.
 - **Score threshold:** drop chunks below a minimum similarity score rather than always returning k results, so a question with no good match returns nothing instead of noise.
 - **Metadata filters:** restrict by tenant, document type, date range, or permission — applied at the store, not after.
 - **MMR (maximal marginal relevance):** trade a little top-1 relevance for diversity, so the top results aren't five near-duplicate chunks of the same paragraph.
 
+```mermaid
+flowchart LR
+    V["Vector search<br/>top 30"] --> F["Drop low scores +<br/>chunks user can't see"] --> R["Rerank"] --> K["Keep top 5"]
+```
+
 ### What a good answer includes
+
+**In plain words:** A good answer is like a good school essay: answers the question, shows sources, admits when it does not know.
 
 - A direct answer to the question.
 - The source file, page, or URL for each claim.
@@ -151,9 +195,17 @@ sequenceDiagram
 
 Bad retrieval gives bad answers even when the LLM itself is strong — this is why production RAG debugging starts at retrieval, not at the prompt or the model.
 
-## 4. Worked example
+```mermaid
+flowchart LR
+    C{"Good chunks found?"} -- "yes" --> A["Answer + source<br/>for each claim"]
+    C -- "no" --> N["'I don't know' +<br/>where to ask"]
+```
+
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** One query, step by step, with each moving part named.
 
 The shape of one query, with the moving parts named:
 
@@ -411,7 +463,9 @@ func TestGenerator_CallsMessagesAPI(t *testing.T) {
 
 **Tested:** `go vet` and `go test -race` pass on Go 1.24 (scratch module, 2026-11-07), covering tenant filtering, score-ordered prompt assembly with a token budget, the empty-retrieval "don't know" path, and the Messages API call shape against an `httptest` fake. No live model call was made; the sample response text above is labelled representative.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
+
+**In plain words:** From the simplest RAG (search then answer) to fancier versions that cost more but find better.
 
 | Pattern | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -423,14 +477,20 @@ func TestGenerator_CallsMessagesAPI(t *testing.T) {
 
 Query rewriting/HyDE, routing between corpora, self-query metadata filters, contextual retrieval, GraphRAG, and agentic/corrective RAG are covered in depth in [[Advanced RAG Patterns]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - RAG adds a retrieval round-trip and a reranking step to every request's latency budget — plan for it alongside the LLM call itself, not as free.
 - It only grounds answers in what was ingested and indexed; a document uploaded five minutes ago and not yet re-indexed is invisible to it.
 - Retrieval failures are silent: a wrong or missing chunk doesn't throw an error, it just produces a wrong answer, so evaluation (see [[RAG Evaluation]]) matters more than for most backend features.
 - For a handful of small, slowly changing documents that fit comfortably in the model's context window, skipping RAG and sending the whole corpus with the question can be simpler and more reliable than building a retrieval pipeline — the trade-off is that every request then pays for all those input tokens, including the ones it doesn't need this time.
 
-## 7. In production
+```mermaid
+flowchart LR
+    D["Doc uploaded"] --> I["Not yet indexed"] --> X["RAG can't see it"]
+    I --> J["Indexed"] --> Y["RAG can find it"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:** customer-support knowledge assistants (retrieve from a help-center corpus); internal company-wiki Q&A bots; code-search assistants that retrieve relevant source files before answering a question about a codebase.
 - **Failure modes → fixes:**
@@ -442,7 +502,7 @@ Query rewriting/HyDE, routing between corpora, self-query metadata filters, cont
   - **Hallucinated citation** (cites a source that wasn't actually retrieved) → the citation-check step in this note's pipeline catches this before the answer reaches the user.
 - **What to monitor:** retrieval latency and end-to-end latency per stage, empty-result rate, citation-verification failure rate, and (from [[RAG Evaluation]]) recall@k and groundedness on a golden query set. Trace each stage with [[Distributed Tracing with OpenTelemetry]] so a slow answer can be attributed to retrieval vs. generation.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Long context vs. RAG.**
 
@@ -461,7 +521,7 @@ Query rewriting/HyDE, routing between corpora, self-query metadata filters, cont
 
   Treat retrieved chunk content as untrusted input to the LLM, not as trusted instructions — this is part of the broader guardrails problem, see [[OWASP API Security Top 10]] and [[Guardrails and LLM Security]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Design a company knowledge assistant. Walk through the pipeline.
 > Ingest documents (load, parse, chunk, embed, upsert — [[Document Ingestion and Chunking]]) ahead of time.
@@ -486,7 +546,7 @@ Query rewriting/HyDE, routing between corpora, self-query metadata filters, cont
 > [!question]- Why filter permissions at the vector store, not after the LLM call?
 > By the time results reach a post-hoc filter, the LLM has already read the disallowed chunk's content into its context — the information has already leaked, even if the final answer is discarded. The filter must be a query-time parameter on the retrieval call itself.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Indexing pipeline (offline) and query pipeline (per request) are separate; this note covers the query side.
 - Query pipeline: condense → embed → retrieve (with permission filter) → rerank → assemble under a token budget → generate → verify citations.
@@ -497,7 +557,7 @@ Query rewriting/HyDE, routing between corpora, self-query metadata filters, cont
 - Long context can replace RAG for a small, static corpus; it cannot replace it for a large or frequently-changing one.
 - RAG reduces hallucination; it does not eliminate it — verify citations.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Document Ingestion and Chunking]], [[Embeddings]], [[Vector Databases and ANN Indexes]]
 - **Next:** [[Advanced RAG Patterns]], [[RAG Evaluation]]

@@ -22,7 +22,37 @@ updated: 2026-11-13
 > - Capacity lives in **regions** (independent geographic areas) built from **Availability Zones** (physically separate data centers), so you design around one AZ or even one region disappearing.
 > - Classic mistake: treating "cloud" as a synonym for "cheaper". A badly designed deployment (idle reserved capacity, a forgotten NAT gateway, unthrottled egress) can cost more than a fixed data center.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Running a website needs computers that are always on. Buying them is slow and costly.
+**Cloud computing** means renting those computers (and storage, and databases) from a company like AWS, over the internet.
+You click or call an API, and a server is ready in a minute. You pay for what you use, like an electricity bill.
+
+```mermaid
+flowchart LR
+    O["Old way: buy servers,<br/>wait weeks, pay upfront"] --> C["Cloud: rent in minutes,<br/>pay per hour"]
+```
+
+The provider looks after the buildings, power and hardware. You look after your code and settings.
+You can rent at different levels: raw machines, a ready platform, or a finished app.
+
+```mermaid
+flowchart LR
+    I["IaaS: rent a machine"] --> P["PaaS: rent a platform"] --> S["SaaS: rent the app"]
+```
+
+The rest of this note is just these 3 questions:
+1. Why did everyone move to the cloud?
+2. What are IaaS, PaaS and SaaS, and how do they differ?
+3. How do you pay, and which bills surprise people?
+
 
 **The problem in one story.**
 A small shop sells online and gets 10x more visitors during one festival sale each year.
@@ -65,7 +95,7 @@ Where it breaks: with a rented car you never share the engine with strangers; in
 > [!tip] Remember
 > Cloud = renting metered computers and services over the network; the provider runs the building, you own what you put inside it.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Before cloud computing, running a web service meant buying physical servers, racking them in a data center you leased, wiring networking and power, and provisioning for your busiest day of the year year-round.
 
@@ -81,7 +111,7 @@ Cloud computing turns that capital purchase into a rental. [NIST SP 800-145] def
 
 Concretely: that retailer runs 10 servers year-round on AWS and asks for 90 more an hour before the Black Friday spike, then releases them the next morning. They pay for 90 extra servers for about 18 hours, not 365 days.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of it as renting serviced apartments instead of buying a house:
 
@@ -92,7 +122,9 @@ Think of it as renting serviced apartments instead of buying a house:
 
 Across all four, the building (power, physical security, networking backbone) is the provider's job. How much of the inside is your job shrinks as you move from IaaS toward SaaS — and so does how much you can customize.
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words:** the cloud is layers. The provider owns the bottom (buildings, hardware); the higher the service you rent, the more of the stack they run for you.
 
 ```mermaid
 flowchart TB
@@ -149,7 +181,7 @@ flowchart LR
 - Designing for "an AZ can disappear" means running at least 2 (ideally 3) AZs for anything stateful: an RDS Multi-AZ deployment keeps a synchronously replicated standby in a second AZ and fails over automatically, typically within one to two minutes (AWS pricing/documentation figure, varies by engine and transaction load), if the primary's AZ goes down.
 - **Edge locations** are a separate, much larger network of points of presence used by CDNs (CloudFront) to cache content close to end users; they are not where your compute runs.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -161,6 +193,8 @@ A team choosing between renting 3 fixed EC2 instances versus using on-demand Far
 | Fargate service, autoscaled 1–10 tasks | Pay per vCPU-second and GB-second actually used | Scales down to 1 task; cost drops to near the floor |
 
 ### Deep dive: picking a pricing model
+
+**In plain words:** same machine, different ways to pay: by the hour, cheaper if you promise a year, or very cheap if you accept it may be taken away.
 
 AWS EC2 (and most providers' equivalents) offer several ways to pay for the same virtual machine:
 
@@ -174,12 +208,14 @@ This mirrors **CapEx vs OpEx**: buying your own data center is capital expenditu
 
 ### Cost traps worth knowing by name
 
+**In plain words:** the bills that surprise people are usually small hourly items left running, or data moving out of the cloud.
+
 - **NAT Gateway hourly + per-GB charges**: a NAT Gateway in each AZ, left running for a service that barely uses outbound internet, bills 24/7 regardless of traffic — a common surprise line on a monthly AWS bill.
 - **Cross-AZ and egress data transfer**: traffic that crosses an AZ boundary, or leaves AWS to the internet, is billed per GB; traffic stored and served from inside one AZ generally is not.
 - **Idle reserved capacity**: committing to Reserved Instances sized for a traffic forecast that doesn't materialize locks in a cost without the matching usage.
 - **Unmonitored managed-service tiers**: provisioned-capacity services (e.g., a sized RDS instance) keep billing at the provisioned size even when actual load barely uses it, unlike serverless variants that scale to zero.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Model | What the provider manages | What you manage | Example |
 | --- | --- | --- | --- |
@@ -195,14 +231,14 @@ This mirrors **CapEx vs OpEx**: buying your own data center is capital expenditu
 | Hybrid cloud | Some workloads on-prem, some in public cloud, connected | Gradual migration, or keeping latency-sensitive/legacy systems on-prem |
 | Multi-cloud | Workloads spread across more than one public cloud provider | Avoiding vendor lock-in, or using a best-of-breed service elsewhere; costs more in operational complexity |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Elasticity is not free.** On-demand pricing means unbounded traffic can mean an unbounded bill; without budget alarms and autoscaling ceilings, a traffic spike (legitimate or a DDoS) directly becomes a cost spike.
 - **Virtualization overhead and noisy neighbors.** Multiple tenants share physical hardware; a provider's scheduler isolates you, but very latency-sensitive workloads sometimes still prefer bare-metal instances.
 - **Vendor lock-in.** Deep use of one provider's managed services (proprietary APIs, managed databases, IAM model) raises the cost of ever moving to a different provider. Using open standards (containers, Terraform, standard SQL) softens this.
 - **Predictable, steady-state workloads at large scale can be cheaper self-hosted.** A company with years of flat, well-understood traffic and the staff to run data centers (famously, Dropbox moved storage off AWS S3 to its own infrastructure in 2016 for a workload it understood precisely) can beat cloud pricing at sufficient scale — this is the exception, not the default assumption.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Netflix runs almost entirely on AWS and relies on Multi-AZ and multi-region design to survive AZ failures; Capital One is a well-known case of a regulated bank moving core workloads to AWS under the shared-responsibility model with its own compliance controls layered on top.
 - **Failure modes → fixes:**
@@ -211,7 +247,7 @@ This mirrors **CapEx vs OpEx**: buying your own data center is capital expenditu
   - Runaway autoscaling from a cost-ignorant policy → a bug causes a scaling loop → set hard maximum instance/task counts and billing alarms, not just scale-out triggers.
 - **What to monitor:** AZ-level health checks and error rates, monthly cost by service (cost allocation tags), Reserved/Savings-Plan coverage vs actual on-demand spend, and NAT Gateway / cross-AZ transfer cost specifically, since both are easy to forget.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Virtualization underneath IaaS.** A hypervisor (e.g., AWS's Nitro hypervisor, a thin KVM-based layer) partitions one physical host into multiple virtual machines, each with its own kernel, isolated from its neighbors.
 
@@ -227,7 +263,7 @@ The decision is rarely about cost per hour; it's about whether your team wants t
 
 A system can be scalable (stateless, horizontally replicable) without being elastic (if nobody wired up autoscaling), and in principle something could autoscale a component that doesn't actually scale well, though in practice elasticity is built on top of an already-scalable design.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Define cloud computing the way an interviewer wants to hear it.
 > On-demand, self-service access to a shared pool of configurable compute, storage and network resources, provisioned and released with minimal effort, and billed by actual usage. If you only have one sentence: renting metered compute and services over the network instead of owning hardware.
@@ -260,7 +296,7 @@ A system can be scalable (stateless, horizontally replicable) without being elas
 > [!question]- What does "designing for AZ failure" actually look like for a database?
 > Deploy it Multi-AZ: a synchronously replicated standby in a second AZ, with automatic failover (RDS Multi-AZ typically completes within one to two minutes, per AWS documentation) so the application only sees a brief connection error and retries successfully against the new primary, rather than an extended outage.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Cloud computing: on-demand, self-service, pooled, elastic, metered compute and services, per NIST SP 800-145.
 - IaaS → PaaS → FaaS → SaaS: the provider manages progressively more of the stack, and you keep progressively less control.

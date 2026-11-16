@@ -26,7 +26,39 @@ updated: 2026-11-13
 > - A batch job recomputes the same counts from the raw log later and is the source of truth for billing; the stream is the fast, approximate-but-close view.
 > - Classic mistake: `UPDATE counts SET clicks = clicks + 1` for every click. It cannot survive retries, replays or 50,000 clicks per second on one popular ad.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Every time someone clicks an ad, the advertiser owes the ad network a little money.
+So every click must be counted exactly once: not lost, not counted twice.
+There are about a billion clicks a day, so you cannot add them up one by one in a database.
+Instead, clicks go into a long queue (a **log**, like Kafka), and a program reads it and keeps running totals per ad per minute.
+Each one-minute bucket is called a **window**. Clicks can arrive late, so the program waits a little before closing a window.
+
+```mermaid
+flowchart LR
+    C["Clicks"] --> Q["Queue (log)"] --> S["Counter program:<br/>totals per ad per minute"] --> D["Dashboard"]
+```
+
+Every night a slower job recounts everything from the saved raw clicks. That recount is what the bill uses.
+
+```mermaid
+flowchart LR
+    F["Fast live count"] --> DASH["Charts, now"]
+    R["Slow nightly recount"] --> BILL["Invoice, exact"]
+```
+
+So the rest of this note is just these 3 questions:
+1. How do you count by the time the click *happened*, when clicks arrive late?
+2. How do you make sure a retried click is not counted twice?
+3. How do you handle one viral ad that gets most of the clicks?
+
 
 **The problem in one story.**
 A shoe company pays an ad network 10 cents every time someone clicks its ad.
@@ -73,7 +105,7 @@ Where it breaks: ballots do not get retried by a flaky network; clicks do, so du
 > [!tip] Remember
 > Count by event time, dedupe by click ID, write results by overwrite, and let the batch recount be the billing truth.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 An ad network charges advertisers per click.
 
@@ -103,7 +135,7 @@ Over 1 billion clicks a day, small error rates are real money, and advertisers a
 - Throughput: 1 billion clicks/day with peaks of 5× average (estimates for the exercise).
 - Raw events kept so any result can be recomputed.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a polling station counting votes by the hour each ballot was cast. Ballots arrive by post, some days late.
 
@@ -113,7 +145,16 @@ A ballot stamped 9:15 that turns up after the 9 am sheet is published goes into 
 
 At the end of the week an auditor recounts every ballot from the archive (the batch job), and the official result is the auditor's count.
 
-## 3. How it works - high-level design
+```mermaid
+flowchart LR
+    B["Ballot (click) arrives"] --> T{"Its hour's sheet<br/>still open?"}
+    T -- "yes" --> S["Add to that hour's sheet<br/>(skip if serial seen)"]
+    T -- "no, too late" --> L["Late tray"]
+    S --> P["Publish sheet after watermark"]
+    L --> A["Auditor's weekly recount"]
+```
+
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart LR
@@ -140,7 +181,7 @@ flowchart LR
 5. Results go to a Kafka topic and then to an OLAP store through an idempotent sink: the row for `(ad_id, minute)` is overwritten with the window's total, so replaying a result is harmless.
 6. Late clicks go to a side topic. The daily batch job recounts everything from raw files (including late clicks), writes corrected rows and produces billing totals.
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -155,6 +196,8 @@ click -> Kafka(raw, key=ad_id) -> stream job -> Kafka(results) -> OLAP (upsert b
 ```
 
 ### Estimates
+
+**In plain words:** rough sums to see how big the system must be: how many clicks per second, and how much disk the raw clicks need.
 
 All inputs are **estimates** for the exercise.
 
@@ -174,6 +217,8 @@ All inputs are **estimates** for the exercise.
 - **Dedupe state:** clicks per minute at peak = 58,000 × 60 ≈ 3.5 million IDs. At about 40 bytes per stored ID (estimate including map overhead), one window's set is about 140 MB, spread across all parallel tasks. Windows close after a minute plus lateness, so only a few are open at once.
 
 ### API
+
+**In plain words:** only a few calls: send a click, and read the counts back for charts.
 
 | Call | Purpose |
 | --- | --- |
@@ -199,6 +244,8 @@ Raw click event (the Kafka message value):
 `click_id` is generated once by the click server (a time-ordered ID; see [[Unique ID Generation]]) and travels with every retry. It is the deduplication key.
 
 ### Data model
+
+**In plain words:** two kinds of data: the raw clicks (kept for the recount) and the small per-minute totals (read by dashboards).
 
 ```mermaid
 erDiagram
@@ -258,6 +305,8 @@ WHERE ad_clicks_minute.source <> 'batch';
 The trap would be `SET clicks = ad_clicks_minute.clicks + EXCLUDED.clicks`: after a job restart that re-emits a window, every count would double.
 
 ### Event-time windows with a watermark in Go
+
+**In plain words:** the code keeps one bucket per ad per minute, drops repeated click IDs, and closes a bucket once it is fairly sure no more clicks for that minute are coming.
 
 A single-partition model of what the stream job does for one key range: tumbling windows by event time, a bounded-out-of-orderness watermark, per-window deduplication by click ID, and a side output for late clicks. Time comes only from the events, so the tests are deterministic without a clock.
 
@@ -444,7 +493,7 @@ Trace of the first test, with a 1-minute window and 10 s of allowed out-of-order
 | c6 ad-A | 12:01:11 | 12:01:11 | 12:01:01 | watermark ≥ 12:01, so window 12:00 is emitted: A=2, B=2 |
 | c7 ad-B | 12:00:40 | 12:01:11 | 12:01:01 | window 12:00 already closed: goes to `Late` |
 
-## 5. Variants
+## 5. Variants 🟡
 
 | Approach | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -472,7 +521,7 @@ flowchart TB
     end
 ```
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 - **Watermark delay vs completeness.** A 10-second bound emits results quickly but sends more clicks to the late path; a 5-minute bound catches almost everything but delays every dashboard by 5 minutes. Allowed lateness is a middle path: emit at the watermark, then emit updated results for late clicks until the lateness expires, which the overwrite sink handles naturally.
 - **Exactly-once cost.** Flink's exactly-once Kafka sink commits a Kafka transaction per checkpoint, so downstream `read_committed` readers see results only after each checkpoint completes (every 10–60 s is common). At-least-once with an idempotent overwrite sink gives the same final numbers with lower latency, because duplicates overwrite instead of add.
@@ -480,7 +529,13 @@ flowchart TB
 - **Partitioning by `ad_id`.** It keeps one ad's clicks on one task (no cross-task merge) but makes a viral ad a hot partition. See Deep dive.
 - **When not to build this:** at a few thousand clicks per minute, a single PostgreSQL table of raw clicks with a unique constraint on `click_id` and a `GROUP BY date_trunc('minute', event_time)` query is enough, and exact by construction.
 
-## 7. In production
+```mermaid
+flowchart LR
+    W1["Short wait (10 s)"] --> R1["Fast charts,<br/>more late clicks"]
+    W2["Long wait (5 min)"] --> R2["Slower charts,<br/>almost nothing late"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:** stream processors such as Apache Flink, Kafka Streams, Spark Structured Streaming and Google Cloud Dataflow implement event-time windows and watermarks as described in the Dataflow Model paper. OLAP stores such as Apache Druid, Apache Pinot and ClickHouse serve the aggregated results.
 - **Failure modes and fixes:**
@@ -492,7 +547,7 @@ flowchart TB
 	- *Stream and batch disagree:* the reconciliation job compares totals per ad per hour, raises an alert above a threshold (for example 0.1%), and batch values replace stream values.
 - **What to monitor:** consumer lag of the stream job, watermark lag (wall clock minus watermark), late-click rate, duplicate rate, checkpoint duration and failures, stream-versus-batch difference per day, end-to-end freshness of the dashboard.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Window lifecycle
 
@@ -538,6 +593,8 @@ sequenceDiagram
 
 ### Hot ads: two-stage aggregation
 
+**In plain words:** one viral ad would overload one worker. So many workers each count a slice of it first, then one worker adds the slices together.
+
 Partitioning by `ad_id` puts a viral ad on one task. Instead:
 1. **Stage 1:** key by `(ad_id, salt)` where `salt = hash(click_id) mod 16`, and count per window. The load of one ad spreads across 16 tasks. Using the click ID for the salt keeps duplicates of the same click on the same task, so dedupe still works.
 2. **Stage 2:** key by `ad_id` and sum the 16 partial counts per window. Stage 2 receives at most 16 small records per ad per minute, not thousands of clicks.
@@ -550,11 +607,13 @@ After windows close, a second operator keeps a min-heap of size N over the per-a
 
 ### Reconciliation
 
+**In plain words:** every night the slow, exact recount is compared with the fast live count, and the recount wins.
+
 The nightly batch job reads the raw Parquet files and the late-click topic, deduplicates by `click_id` across the whole day, applies the full fraud rules, and writes hourly and daily totals with `source = 'batch'`.
 
 Billing reads only batch totals. A difference above the alert threshold between stream and batch is a bug signal (a broken watermark, a lost partition), not something to average away.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why count by event time and not by processing time?
 > Processing time depends on network delays, retries and job restarts, so the same click could land in different minutes on different runs. Event time is a property of the click itself, so results are reproducible, which billing needs.
@@ -577,7 +636,7 @@ Billing reads only batch totals. A difference above the alert threshold between 
 > [!question]- Where do late clicks go?
 > Within the allowed lateness they update the already emitted window, and the sink overwrites the row. After that they go to a side output and are counted by the batch job, so billing still includes them.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Click server: assign `click_id`, write to Kafka keyed by `ad_id`, redirect; never count inline.
 - Window = `floor(event_time, 1 min)`; watermark = max event time − bound; emit when watermark ≥ window end.

@@ -31,7 +31,38 @@ updated: 2026-11-13
 > - The same pattern, the **inbox**, shows up in feeds, chat, notifications and live comments. Learn it once.
 > - Interview trap: saying "just push everything". A user with 50 million followers makes that a 50-million-write event.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (push, pull, hybrid), 4 (worked estimate) and 5.
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You post a photo. 500 people follow you. Each one should see it in their feed.
+You can do the work when you post: drop a copy into each follower's list right away. That is **push** (fan-out on write).
+Or you can do the work when a follower opens the app: go and collect posts from everyone they follow. That is **pull** (fan-out on read).
+Push makes reading fast but posting slow. Pull makes posting fast but reading slow.
+
+```mermaid
+flowchart LR
+    P["You post"] -- "push: copy now" --> L["500 follower lists"]
+    L --> R["Reader: one quick look"]
+```
+
+```mermaid
+flowchart LR
+    P["You post"] -- "pull: store once" --> S["Your posts"]
+    R["Reader opens app"] -- "collect from everyone<br/>they follow, then merge" --> S
+```
+
+A celebrity with 50 million followers breaks push: one post means 50 million copies. So real apps mix both. That mix is called the **hybrid**.
+
+The rest of this note is just these 3 questions:
+1. When is push better, and when is pull better?
+2. How does the hybrid handle celebrities and sleepy users?
+3. How do you store, sort and page through the feed at large scale?
 
 **The problem in one story.**
 You post a holiday photo. 500 friends follow you.
@@ -76,7 +107,7 @@ Where it breaks: a real reader buys one paper, but a pull feed must visit many "
 > [!tip] Remember
 > Push pays at write time, pull pays at read time; pick by read-to-write ratio and audience size.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Think about how a newspaper reaches you. A newspaper can be **delivered to your door each morning** (the paper company does the work once, early, for every subscriber). Or you can **walk to the shop and pick one up** (you do the work, when you want it). Social apps face the same choice for every post.
 
@@ -96,7 +127,7 @@ During that time the celebrity's post is not visible to most followers, and ever
 > [!tip] Remember
 > The right model depends on two numbers: the read-to-write ratio, and the size of the audience per post.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 ### 2.1 Post office versus pick-up counter
 
@@ -138,7 +169,7 @@ flowchart LR
 > [!tip] Remember
 > Push = pay at write time, cheap reads. Pull = pay at read time, cheap writes.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Fan-out on write (push)
 
@@ -275,9 +306,11 @@ flowchart LR
 > [!tip] Remember
 > Push wasted on inactive users is the biggest hidden cost. Skip them and rebuild on return.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Estimating both models for a feed with 100 million users
+
+**In plain words:** We do rough maths for both ways and compare. The winner is whichever does less total work for the same feed.
 
 Assumptions (labelled estimates): 100 M daily active users, 150 follows each on average, 20% post once per day, each user opens the feed 8 times a day, peak is 3 times the average.
 
@@ -336,7 +369,7 @@ flowchart LR
 > [!tip] Remember
 > Always do the arithmetic on both sides and on the biggest account. The long tail of huge accounts decides the design.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Aspect | Fan-out on write (push) | Fan-out on read (pull) | Hybrid |
 | --- | --- | --- | --- |
@@ -352,6 +385,8 @@ flowchart LR
 | Wrong choice when | Audiences are huge (celebrity) | Read rate is very high | Tiny scale; extra complexity |
 
 ### Where each model appears in real systems
+
+**In plain words:** Big apps almost never use pure push or pure pull. This table shows which mix each one is known to use, and why.
 
 | System | Model | Why (publicly described) |
 | --- | --- | --- |
@@ -381,7 +416,7 @@ quadrantChart
 > [!tip] Remember
 > Use the audience-size and read-frequency pair to place any new feature on the grid.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Do not push everything.** The celebrity case alone breaks it. Always ask "what is the largest audience for one post?"
 - **Do not pull everything** when reads outnumber writes by 100 to 1 and audiences are small. You will rebuild the same merge 100 times.
@@ -391,7 +426,7 @@ quadrantChart
 - **Hybrid adds complexity.** Two code paths, a threshold to tune, and a merge to test. At small scale (say under 1 million users), plain pull with a cache is usually enough. Do not add push until measurement shows read cost is the problem.
 - **Unfollow and follow need handling.** On follow, backfill the new followee's last few posts into the inbox. On unfollow, filter at read time (cheap) rather than deleting entries.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Fan-out queue health.** Metrics: queue depth, consumer lag per partition, age of the oldest unprocessed event, inbox writes per second, p99 time from post to "visible in the last follower's inbox". Alert on the last one.
 - **Isolation.** Put big fan-outs on a **separate queue or priority class** from normal ones, so one 5-million-follower post cannot delay everyone else's. See [[Hot Keys and Hot Partitions]] for the same idea with keys.
@@ -415,7 +450,7 @@ stateDiagram-v2
     Rebuilding --> Active: inbox rebuilt by pull
 ```
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### 8.1 The same pattern in chat, notifications and live comments
 
@@ -443,17 +478,37 @@ flowchart TD
 
 ### 8.2 Merging and ranking at read time
 
+**In plain words:** Your feed is built from a few lists that are already sorted by time. Merging sorted lists is cheap, like merging sorted piles of cards.
+
 A hybrid read merges two sorted lists: the inbox (newest first) and each celebrity's recent posts. Because each list is already sorted, a **k-way merge** with a heap runs in O(n log k), where n is items returned and k is the number of lists (5 to 20). That is microseconds of CPU.
 
 The expensive part is not the merge, it is the **network round trips** to fetch lists, so batch and parallelise them.
 
 When a ranker scores items instead of sorting by time, the pipeline becomes: candidate generation (inbox + celebrity posts + recommendations), then ranking (a model scores about 500 candidates), then filtering (blocked, seen, deleted), then page assembly. Push and pull are the **candidate generation** step; ranking is a separate stage.
 
+```mermaid
+flowchart LR
+    I["Your inbox<br/>(pushed posts, newest first)"] --> M["Merge by time"]
+    C1["Celebrity A recent posts"] --> M
+    C2["Celebrity B recent posts"] --> M
+    M --> F["Your feed, top 50"]
+```
+
 ### 8.3 Cursors and pagination
+
+**In plain words:** Do not say "give me items 51 to 100", because new posts shift everything. Say "give me 50 items older than the last one I saw".
 
 Never paginate an inbox by offset: new pushes shift positions and the user sees duplicates. Use a **cursor** (the last post ID or timestamp seen): "give me 50 items older than `cursor`". Snowflake-style IDs (see [[Unique ID Generation]]) make IDs time-ordered, so the post ID itself is the cursor.
 
+```mermaid
+flowchart LR
+    A["Page 1: 50 posts<br/>last seen = post 950"] --> B["Ask: 50 posts<br/>older than 950"]
+    B --> C["Page 2: no duplicates,<br/>even if new posts arrived"]
+```
+
 ### 8.4 Ordering and consistency
+
+**In plain words:** Copies may land out of order. Sort by the post's own time when you read, so the feed still looks right.
 
 - Inbox order is by post time, but fan-out workers run in parallel, so two posts can arrive out of order. Sort by the post's own timestamp or ID at read time instead of trusting insertion order.
 - A user's own post should appear in their feed immediately, even if fan-out is delayed. Merge "my recent posts" into my feed at read time: this is the **read-your-writes** guarantee.
@@ -461,9 +516,13 @@ Never paginate an inbox by offset: new pushes shift positions and the user sees 
 
 ### 8.5 Storage tiering for inboxes
 
+**In plain words:** Keep feeds of active users in fast memory. Throw away feeds of users who never open the app, and rebuild them if they come back.
+
 Hot inboxes (active users) live in memory (Redis). Cold ones (dormant users) are dropped and rebuilt on demand, or kept in a disk-backed store. This tiering makes push affordable: memory is spent only on the 10 to 30% of users who are active.
 
 ### 8.6 Sharding the inbox
+
+**In plain words:** Split the feed store by reader, so each reader's feed sits on one machine and loads in one trip.
 
 Shard the inbox by **recipient user ID**, so one feed read hits one shard. The writer's fan-out, in contrast, touches many shards (one per follower), so batch writes per shard: group 1,000 followers by shard and send one pipeline per shard. See [[Partitioning and Sharding]].
 
@@ -478,7 +537,7 @@ flowchart LR
     S3 --> R3[("Redis 3")]
 ```
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Design a news feed. Push or pull?
 > Say it depends on read-to-write ratio and audience size. Feeds are read-heavy, so push (fan-out on write) into per-user inbox lists of post IDs makes reads cheap. But celebrities make push explode, so use a hybrid: push for normal accounts, merge celebrity posts at read time. Add: skip inactive users, cap inbox length, hydrate and filter at read.
@@ -501,7 +560,7 @@ flowchart LR
 > [!question]- A user was offline for a month and logs in. What do you do?
 > Their inbox was skipped for inactivity, so it is stale or gone. Rebuild with a pull from followed accounts, return the result, and switch the user back to push mode.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Push = copy to every follower's inbox at post time; reads are one lookup; writes cost followers.
 - Pull = store once; reads merge N sources; reads cost followees.
@@ -512,7 +571,7 @@ flowchart LR
 - Use cursors, not offsets. Merge own posts at read for read-your-writes.
 - Same pattern: feed, chat, notifications, live comments.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Caching Patterns]], [[Partitioning and Sharding]], [[Back-of-the-Envelope Estimation]]
 - **Case studies that use it:** [[Case Study - News Feed]], [[Case Study - Chat System]], [[Case Study - Notification System]], [[Case Study - Live Comments and Reactions]], [[Case Study - Photo Sharing (Instagram)]]

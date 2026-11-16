@@ -30,7 +30,33 @@ updated: 2026-11-13
 > - Idempotency key = reservation ID, generated before the payment page, so double clicks and retries never double book.
 > - Search is a separate, read-heavy path (cache and search index) that may be slightly stale.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (11). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 6 (variants) and 7 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 5 (deep dives), 8, 9 and 10. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A hotel site must show free rooms and let you book one without giving the same room to two people.
+The trick: do not track each room. Track a count per room type per night, like "Deluxe, 12 March: 6 of 10 taken".
+This count is the **inventory**.
+A 3-night stay must add one to all 3 nights together, or to none. Doing several changes as one all-or-nothing step is a **transaction**.
+
+```mermaid
+flowchart LR
+    B["Book 12-15 March"] --> T{"All 3 nights<br/>have a room left?"}
+    T -- "yes" --> Y["+1 on all 3 nights<br/>(one transaction)"]
+    T -- "no" --> N["Sorry, sold out"]
+```
+
+While you pay, the room is held for about 10 minutes. If you do not pay, the hold ends and the room is free again.
+
+So the rest of this note is just these 3 questions:
+1. How do two people booking at the same moment not get the same last room?
+2. How do holds, payment and cancellations change the counts?
+3. How does search stay fast when it gets 100 times more traffic than booking?
 
 **The problem in one story.**
 You want a Deluxe room in Goa for 12 to 15 March.
@@ -74,7 +100,7 @@ Where it breaks: a paper calendar has one clerk, while the system has thousands 
 > [!tip] Remember
 > Inventory is a count per room type per night; a booking changes every night of the stay together or not at all.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 You run a small hotel with 10 Deluxe rooms. On Friday evening three guests try to book the last Deluxe room for the same weekend. If your code reads "1 room left" for all three and then saves, all three get a confirmation, and two people arrive at the front desk with nowhere to sleep. That is the overselling problem.
 
@@ -99,7 +125,7 @@ It is harder than a cinema seat because a booking spans **several nights**. A gu
 > [!tip] Remember
 > Two decisions matter most: inventory per room type per date, and atomic multi-night updates.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the hotel as a **wall calendar with one row per room type**. Each day cell shows "10 rooms, 6 sold".
 
@@ -131,7 +157,7 @@ stateDiagram-v2
     CHECKED_OUT --> [*]
 ```
 
-## 3. How it works - high-level design
+## 3. How it works - high-level design 🟡
 
 ### Inventory as a count per date
 
@@ -156,6 +182,8 @@ flowchart LR
 **Why it matters:** per-date rows make availability a range query and make atomic updates natural; per-room rows would make "any room of this type free for all 3 nights" an expensive search.
 
 ### High-level architecture
+
+**In plain words:** search reads a fast copy of availability; booking goes to one main database that holds the real counts.
 
 ```mermaid
 flowchart LR
@@ -221,7 +249,7 @@ Why a separate step to obtain the `reservation_id` first? If the browser double-
 
 Without a pre-issued ID the server cannot tell a retry from a new attempt. See [[Idempotency and Idempotency Keys]].
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -231,6 +259,8 @@ Without a pre-issued ID the server cannot tell a retry from a new attempt. See [
 - Hardest parts: concurrency on hot hotel-dates, hold expiry, keeping search consistent enough, cancellations.
 
 ### Estimates (labelled as estimates)
+
+**In plain words:** rough sums: bookings per second, searches per second, and how many inventory rows exist.
 
 | Quantity | Assumption | Result |
 | --- | --- | --- |
@@ -248,6 +278,8 @@ Takeaways: the booking write path is modest; inventory is large but tiny per row
 
 ### API
 
+**In plain words:** search for rooms, place a hold, confirm with payment, and cancel.
+
 | Call | Purpose |
 | --- | --- |
 | `GET /v1/hotels?city=&checkin=&checkout=&guests=&page=` | search results (cache and index) |
@@ -262,6 +294,8 @@ Takeaways: the booking write path is modest; inventory is large but tiny per row
 Cursor pagination for search results ([[Pagination, Filtering and Sorting]]).
 
 ### Data model
+
+**In plain words:** tables for hotels, room types, the per-night inventory counts, and reservations.
 
 ```sql
 CREATE TABLE room_type_inventory (
@@ -312,7 +346,7 @@ erDiagram
     }
 ```
 
-## 5. Deep dives
+## 5. Deep dives 🔴
 
 ### Deep dive 1: booking without overselling
 
@@ -450,6 +484,8 @@ Partition the reservation database by `hotel_id` ([[Partitioning and Sharding]])
 
 ### Deep dive 5: hot hotels and big events
 
+**In plain words:** during a big event, many people try to book the same room type on the same night, so they all fight over one row.
+
 During a festival or sports final, one hotel's popular room type gets thousands of simultaneous attempts on the same few rows.
 
 - **Short transactions:** only the conditional update and the insert; no payment call inside.
@@ -460,11 +496,13 @@ During a festival or sports final, one hotel's popular room type gets thousands 
 
 ### Deep dive 6: cancellations, modifications and refunds
 
+**In plain words:** cancel means giving back one room on every night of the stay, in one step, then refunding.
+
 - **Cancel:** in one transaction set status CANCELED and decrement `total_reserved` for every night; then start the refund via payment service and an outbox event.
 - **Modify dates:** treat as release-old plus reserve-new in one transaction; if the new dates are not available, nothing changes.
 - **Cancellation policy** (free until 48 hours before check-in, then a fee) lives in the hotel service and is evaluated at cancel time; store the policy that was shown at booking time on the reservation row so later policy changes do not alter past bookings.
 
-## 6. Variants and comparison
+## 6. Variants and comparison 🟡
 
 | Model | Unit that is booked | Strength | Weakness | Typical use |
 | --- | --- | --- | --- | --- |
@@ -476,7 +514,7 @@ During a festival or sports final, one hotel's popular room type gets thousands 
 
 For a vacation rental where each listing is one unit, a PostgreSQL range type with an exclusion constraint (`EXCLUDE USING gist (listing_id WITH =, stay WITH &&)`) lets the database refuse overlapping stays directly (the `=` on a bigint column needs the `btree_gist` extension: `CREATE EXTENSION btree_gist;`).
 
-## 7. Trade-offs and when not to use
+## 7. Trade-offs and when not to use 🟡
 
 - **Strong consistency for booking, eventual for search.** Choose this split deliberately ([[Choosing Consistency, Replication and Partitioning - Decision Guide]]); do not make search strongly consistent, it would cost heavily for no benefit.
 - **One relational database for inventory.** Multi-row atomic updates are the reason; picking a store without multi-row transactions would force you to build them ([[Choosing a Database - Decision Guide]]).
@@ -485,7 +523,13 @@ For a vacation rental where each listing is one unit, a PostgreSQL range type wi
 - **Cache staleness:** accept occasional "sold out after click" in exchange for fast search ([[Choosing a Caching Strategy - Decision Guide]]).
 - **Not needed:** for a single small hotel with a few bookings per day, a single database with a unique constraint and simple locking is enough; skip caches and queues.
 
-## 8. In production
+```mermaid
+flowchart LR
+    S["Search"] --> E["Fast cached copy:<br/>may be a little stale"]
+    B["Booking"] --> D["Main database:<br/>always exact"]
+```
+
+## 8. In production 🔴
 
 - **Failure modes and fixes**
   - Duplicate booking from a double click or retry: pre-issued `reservation_id` as primary key; the second insert fails and returns the first result.
@@ -506,7 +550,7 @@ flowchart TD
     E --> F["Fix expiry job, release leaked rows"]
 ```
 
-## 9. Deep dive extras
+## 9. Deep dive extras 🔴
 
 **Per-room assignment.** At check-in (or a few days before), the hotel assigns a physical room to each reservation. This is a small separate problem (a matching of reservations to free rooms), solved by the hotel's property system and not part of the high-volume path.
 
@@ -529,7 +573,7 @@ flowchart LR
     W -->|"events"| SE
 ```
 
-## 10. Interview questions
+## 10. Interview questions 🔴
 
 > [!question]- Why store inventory per room type per date instead of per room?
 > Guests book a type, not a specific room, so a count per type per date is small and updates atomically. A stay of N nights updates N rows. Per-room rows make "is any room of this type free for all nights" a costly search.
@@ -555,7 +599,7 @@ flowchart LR
 > [!question]- How would you shard this?
 > By `hotel_id`. All inventory and reservations for one hotel live on one shard, so a multi-night booking is a single-shard transaction. Sharding by date would turn every stay into a distributed transaction.
 
-## 11. Cheat sheet
+## 11. Cheat sheet 🟢
 
 A 45-minute script:
 

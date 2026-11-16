@@ -27,7 +27,33 @@ updated: 2026-11-13
 > - Sync is a per-namespace change journal plus a cursor per device; a long-poll or WebSocket tells devices when to pull.
 > - Concurrent edits are detected with a base-version check at commit; the loser becomes a "conflicted copy" instead of silently overwriting.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Dropbox and Google Drive keep your files the same on every device.
+Sending a whole 1 GB file again after a tiny edit would be slow and wasteful.
+So each file is cut into small pieces called **chunks**. Each chunk gets a **hash**: a short fingerprint made from its content.
+After an edit, only chunks with new fingerprints are uploaded. The rest are already stored.
+
+```mermaid
+flowchart LR
+    F["Edited file"] --> C["Cut into chunks"] --> H{"Fingerprint<br/>already stored?"}
+    H -- "yes" --> S["Skip"]
+    H -- "no" --> U["Upload this chunk"]
+```
+
+The server also keeps a list of every change. Each device remembers how far down that list it has read, and asks "what changed after this point?".
+
+So the rest of this note is just these 3 questions:
+1. How do you upload only what changed?
+2. How do other devices learn about the change?
+3. What if two devices edit the same file offline?
 
 **The problem in one story.**
 You edit a big file on your laptop, changing a tiny part.
@@ -70,7 +96,7 @@ Where it breaks: library pages never get edited at the same time by two authors 
 > [!tip] Remember
 > Split files into hashed chunks, upload only new ones, and sync devices through an ordered change journal.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 A user edits a 200 MiB video project on a laptop, changing a few kilobytes in the middle. A naive design re-uploads all 200 MiB to one server, which writes it to local disk, and the user's phone downloads the whole thing again.
 
@@ -95,7 +121,7 @@ At a few million active users this design fails on every axis:
 - **Bandwidth efficiency.** Upload only changed bytes; deduplicate identical chunks.
 - **Cost control.** Storage and egress dominate the bill, not compute.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a library that stores every book as numbered loose pages in a giant warehouse, where each page is filed under a fingerprint of its text.
 
@@ -110,7 +136,13 @@ Mapped to the system:
 - **New-cards log** = the per-namespace change journal.
 - **Bookmark** = each device's sync cursor.
 
-## 3. How it works - high-level design
+```mermaid
+flowchart LR
+    V1["Book v1: pages A B C"] --> W["Warehouse: A B C D"]
+    V2["Book v2: pages A D C<br/>(only D is new)"] --> W
+```
+
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart LR
@@ -205,9 +237,11 @@ Commit = single-shard txn, base_version check; conflict -> "conflicted copy"
 Numbers: 100M users x 5 GB = 500 PB logical; ~460 commits/s avg; egress is the bill
 ```
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Estimates (inputs are labelled estimates)
+
+**In plain words:** rough sums: how many files and bytes are stored and how many uploads per second to expect.
 
 | Quantity | Arithmetic | Result |
 | --- | --- | --- |
@@ -228,6 +262,8 @@ Numbers: 100M users x 5 GB = 500 PB logical; ~460 commits/s avg; egress is the b
 Takeaways: the metadata and chunk index are terabytes and must be sharded; the blobs are hundreds of petabytes and belong in object storage; 1,400 commits/s is easy for a sharded SQL tier; egress at about 15 Gbit/s is the biggest recurring cost, which is why delta sync and dedup matter.
 
 ### API
+
+**In plain words:** ask which chunks are missing, upload those, then commit the new file version; other devices ask for changes since their bookmark.
 
 ```http
 POST /v1/uploads
@@ -252,6 +288,8 @@ Dropbox's public API has the same shape: `files/list_folder/continue` takes a cu
 For a single huge object without dedup (for example a backup archive), use S3 multipart upload instead: parts of 5 MiB to 5 GiB (the last part may be smaller), at most 10,000 parts, then `CompleteMultipartUpload`. The browser-side details live in [[File Upload Architecture]].
 
 ### Data model
+
+**In plain words:** the metadata database lists files, versions and the chunk list of each version, plus the change journal. Chunk bytes live in object storage.
 
 ```mermaid
 erDiagram
@@ -342,6 +380,8 @@ A sequence is non-transactional: two concurrent commits could take 98231 and 982
 The `refcount` increments on the global `chunks` table live on other shards, so they happen asynchronously (from the outbox) and garbage collection tolerates the lag; see the deep dive.
 
 ### Go: fixed-size vs content-defined chunking, measured
+
+**In plain words:** cutting every 4 MB breaks badly when you insert a byte at the start. Cutting where the content itself says "cut here" keeps most chunks the same.
 
 Fixed-size chunks are simple, but inserting one byte at the front shifts every boundary and every chunk hash changes. **Content-defined chunking** (CDC) picks boundaries where a rolling hash of the last few dozen bytes matches a pattern, so boundaries move with the content.
 
@@ -513,7 +553,7 @@ re-upload after 1-byte insert: fixed=1048577 bytes, cdc=2963 bytes
 
 In production the same parameters are scaled up (for example 1 MiB minimum, 4 MiB average, 16 MiB maximum, as an estimate of typical settings); the effect is the same.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -532,7 +572,7 @@ In production the same parameters are scaled up (for example 1 MiB minimum, 4 Mi
 | Version vectors | Each replica's counter detects concurrent edits even offline and peer-to-peer | Multi-master or peer sync | Metadata grows with the number of writers ([[Clocks and Ordering]]) |
 | CRDT or operational transform | Merge edits at the operation level | Collaborative documents (Google Docs style) | Only for structured content ([[CRDTs and Conflict Resolution]]) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Chunk size.** Small chunks give better dedup and smaller re-uploads, but more metadata rows and more PUT requests (object stores bill per request). Large chunks reduce overhead but waste bandwidth on small edits. A few MiB is the common middle ground.
 - **Global vs per-user dedup.** Global dedup saves the most storage, but it reveals to an attacker whether some content already exists anywhere (an upload that "finishes instantly" leaks that fact). Per-namespace dedup, or requiring proof of possession before skipping an upload, closes that side channel at some storage cost.
@@ -540,7 +580,13 @@ In production the same parameters are scaled up (for example 1 MiB minimum, 4 Mi
 - **Strong metadata vs eventual blobs.** Object storage writes complete before the commit, and S3 has had strong read-after-write consistency since December 2020, so the "commit points at missing chunk" class of bugs is avoided by ordering (upload, verify with HEAD, then commit), not by distributed transactions.
 - **When not to build this.** For "users attach a file to a ticket", use direct-to-S3 presigned uploads and a single metadata row ([[File Upload Architecture]]). Chunking, journals and sync clients pay off only when files change and must appear on several devices.
 
-## 7. In production
+```mermaid
+flowchart LR
+    S["Small chunks"] --> S1["Better reuse,<br/>more rows and requests"]
+    B["Big chunks"] --> B1["Fewer rows,<br/>re-upload more per edit"]
+```
+
+## 7. In production 🔴
 
 - **Real systems.**
 	- Dropbox documents a content hash computed over 4 MiB blocks with SHA-256, and a cursor-plus-longpoll change API.
@@ -562,9 +608,11 @@ In production the same parameters are scaled up (for example 1 MiB minimum, 4 Mi
 	- Egress per namespace, to find abuse such as public links being used as a free CDN.
 	- GC backlog and chunk refcount drift.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Garbage collection of chunks
+
+**In plain words:** a chunk can only be deleted when no file version uses it anymore, so you must count or scan carefully.
 
 A chunk can be deleted only when no version references it and no in-flight upload is about to. Two approaches:
 - **Reference counts.** Increment when a version that uses the chunk commits; decrement when a version is purged (after the retention window). The counts live on a different shard from the version rows, so they are updated asynchronously and can drift after bugs or partial failures.
@@ -573,6 +621,8 @@ A chunk can be deleted only when no version references it and no in-flight uploa
 Production systems typically combine them: refcounts for fast reclamation, plus a periodic mark-and-sweep audit that fixes drift. The grace period (for example 7 days, an estimate) protects chunks uploaded by an upload that has not committed yet. Deleting a chunk is the only irreversible operation in the system, so it is the most conservative step.
 
 ### Storage tiering and cost
+
+**In plain words:** old, rarely opened chunks move to cheaper, slower storage.
 
 Most files are rarely read after a few weeks. A tiering job moves chunks that have not been read for a while to colder classes.
 
@@ -583,6 +633,8 @@ Most files are rarely read after a few weeks. A tiering job moves chunks that ha
 Egress is often the largest line item; serving shared files through a CDN and syncing only deltas are the main levers.
 
 ### Why commits are per-namespace serial
+
+**In plain words:** changes in one folder tree are numbered one after another, so a device only needs one number to know where it is.
 
 The journal sequence is per namespace. A device's cursor is a single integer, so "what changed since cursor c" is an index range scan on `(namespace_id, seq)`.
 
@@ -600,7 +652,7 @@ The usual fix is to split very large shared folders into sub-namespaces, not to 
 
 The client downloads chunks in parallel (for example 4 to 8 at a time) via presigned GETs or the CDN, verifies each hash, writes to a temp file, and atomically renames it into place. Because chunks are immutable and content-addressed, they cache perfectly: a CDN or a LAN peer can serve them without any invalidation logic.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why store metadata and file contents in different systems?
 > They have opposite needs. Metadata is small, mutable, queried and must be strongly consistent with transactions (a relational DB sharded by namespace). Contents are huge, immutable and only fetched by key (object storage, designed for 11 nines of durability and cheap per GB). Mixing them makes either the database enormous or the blob store transactional.
@@ -623,7 +675,7 @@ The client downloads chunks in parallel (for example 4 to 8 at a time) via presi
 > [!question]- What dominates the cost, and how do you reduce it?
 > Storage (hundreds of PB) and egress (about 15 Gbit/s in the estimate above), not compute. Reduce storage with dedup, compression, erasure coding and tiering to infrequent-access or archive classes; reduce egress with delta sync, LAN sync between a user's devices, and CDN caching for shared files.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Blobs in object storage (immutable chunks keyed by SHA-256), metadata in a SQL DB sharded by namespace.
 - Upload flow: send hash list, receive presigned URLs for missing chunks, PUT chunks, commit with a base-version check.

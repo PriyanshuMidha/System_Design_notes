@@ -36,7 +36,32 @@ InvoiceOps needed a way to run invoice reminders reliably without losing one or 
 
 Everything below is what goes inside that one document, and what the decision implies for the code.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Teams make big choices: which database, which message queue, one service or many.
+Six months later, nobody remembers why. New people undo good choices by accident.
+An **ADR** (Architecture Decision Record) is a short note that writes one choice down.
+It says what the problem was, which options you looked at, what you picked, and what it costs you.
+ADRs are numbered and never edited. If you change your mind, you write a new ADR that **supersedes** (replaces) the old one.
+So the folder of ADRs becomes the diary of why the system looks the way it does.
+
+```mermaid
+flowchart LR
+    P["Problem"] --> O["Options"] --> D["Decision"] --> C["Costs we accept"]
+```
+
+The rest of this note is just these 3 questions:
+1. What goes in an ADR?
+2. How does an ADR move from proposed to accepted to replaced?
+3. Where do ADRs live and who reviews them?
+
 
 **The problem in one story.**
 Your team picks a database queue instead of Kafka after a long debate.
@@ -80,7 +105,7 @@ Where it breaks: courts are bound by precedent; a team can drop an ADR whenever 
 > [!tip] Remember
 > An ADR records *why*, once, and is never edited; a changed mind gets a new ADR.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A new engineer opens `reminder/` six months from now and finds a job table polled every second instead of a message queue, with no comment explaining why.
 
@@ -88,7 +113,14 @@ Two things can happen: they assume it was an oversight and "fix" it by introduci
 
 An ADR is that paragraph, kept permanently. Teams that skip it do not avoid the decision-making cost — they just pay it again, from scratch, the next time someone touches the area, usually under more time pressure than the first time.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    T["Team picks Postgres"] --> Y["1 year later"] --> N["New dev: why not Mongo?"]
+    N -- "no ADR" --> R["Long debate again"]
+    N -- "ADR 0007" --> A["Reads 1 page, moves on"]
+```
+
+## 2. Mental model 🟢
 
 Think of an ADR as a **lab notebook entry for the architecture**, not a design document. A design document describes how something works; an ADR captures why it was chosen over the alternatives, at the moment the choice was made, with the information available then.
 
@@ -96,9 +128,16 @@ It is deliberately short — a page, not a spec — and deliberately permanent: 
 
 This is the same instinct as a database migration: you don't edit migration 0003 after 0007 has shipped, you write 0008. ADRs apply that discipline to decisions instead of schemas.
 
-## 3. How it works
+```mermaid
+flowchart LR
+    A1["ADR 0003: use Redis sessions<br/>Superseded"] -.-> A2["ADR 0011: use Postgres sessions<br/>Accepted"]
+```
+
+## 3. How it works 🟡
 
 ### 3.1 The template (MADR-style)
+
+**In plain words: a fixed set of headings, so every ADR reads the same way.**
 
 ```text
 # ADR-0007: Use Postgres SKIP LOCKED for reminder jobs
@@ -153,12 +192,14 @@ An ADR's text is never rewritten once `Accepted`. "Superseded by ADR-0012" is ad
 
 ### 3.3 Where it lives and how it's reviewed
 
+**In plain words: ADRs are plain files in the repo, reviewed in a pull request like code.**
+
 - Files: `docs/adr/0001-use-postgres-for-sessions.md`, `0002-...`, numbered sequentially and never renumbered.
 - Reviewed exactly like a code change: opened as a pull request, discussed in review comments, merged once the team agrees — the PR thread itself becomes part of the record of *how* the decision was reached.
 - Linked from the code it governs (a comment pointing at `docs/adr/0007-*.md` in the `reminder` package) and from runbooks, so an on-call engineer debugging the job table at 2 a.m. can find the reasoning, not just the mechanism.
 - RFC vs ADR: an RFC (or a design doc) is the *proposal*, written before a decision exists, inviting debate over several options. An ADR is the *record*, written once a decision has been made, even if that's the same document after discussion settles.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 The dependency-direction consequence of ADR-0007 is testable, not just stated. The core scheduler never imports a database package — it depends on a `Store` interface the ADR's chosen adapter implements, so the decision can be swapped later (Kafka, SQS) by writing a new adapter, never by touching the scheduler.
 
@@ -367,7 +408,7 @@ func (f *fakeStore) Release(id int64, err error) error {
 }
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Format | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -377,14 +418,14 @@ func (f *fakeStore) Release(id int64, err error) error {
 | RFC / design doc | Long-form proposal, open questions, invites debate | Before a decision exists; several stakeholders must weigh in | Not immutable, not a record — needs an ADR once it resolves |
 | Architecture log / decision log (wiki page) | One shared page, decisions appended as rows | Very small teams, low ceremony | No per-decision review trail; easy to edit history by accident |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - ADRs cost a few minutes of writing per decision. Writing one for every tiny, easily reversible choice ("use a `map[string]int` here") is pure overhead; save them for decisions that are expensive to reverse, cross a team or service boundary, or pick between genuinely different trade-offs (a database, a protocol, a consistency model).
 - An ADR documents a decision already made; it does not replace the discussion that makes it. Teams that write one line per week on faith, with no real alternatives considered, get a paper trail without the reasoning that makes it useful.
 - If nobody reads them, they rot: the fix is linking from the code and runbooks that depend on the decision, not making the format heavier.
 - For a single-developer side project, a decision log is often enough; the overhead of numbering, superseding and reviewing ADRs pays off once more than one person has to live with the decision.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** AWS, Spotify, GitHub, and most teams that publish engineering blogs describe using lightweight ADRs stored alongside code; the `adr-tools` CLI and `log4brains` (a static site generator for ADR logs) are the common tooling. ThoughtWorks has recommended ADRs on its Technology Radar since 2017.
 - **Failure modes → fixes:**
@@ -394,14 +435,14 @@ func (f *fakeStore) Release(id int64, err error) error {
   - Never revisited → an ADR from three years ago is followed as gospel after its constraints changed; fix with a periodic architecture review that asks "does ADR-00NN still hold?" and supersedes the ones that don't.
 - **What to monitor:** none of this is a runtime system, so "monitoring" is process health — are ADRs opened as PRs before the code that depends on them merges, are old ADRs marked superseded instead of silently ignored, can a new engineer find the ADR for the area they're touching within a minute.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **One-way vs two-way doors.** Amazon's shorthand: a two-way door (adding a cache, renaming an internal function) is cheap to reverse, so deciding fast and writing nothing down is fine. A one-way door (choosing a primary database, a message-delivery guarantee, a multi-tenancy strategy) is expensive or impossible to reverse later, and that is exactly the set of decisions worth an ADR — the record pays for itself specifically because undoing the decision is costly.
 - **ADRs are not architecture documentation.** An ADR explains *why* a choice was made at a point in time; it is deliberately silent on how the system works today, because "today" changes and the ADR must not. A current-state view (see [[Documenting Architecture - C4 Diagrams and Fitness Functions]] for that) is a different, living artifact that gets updated; an accepted ADR is the opposite — frozen, dated prose.
 - **Granularity in practice.** A useful heuristic: write one ADR per noun that would appear in a system diagram and could plausibly be swapped (the database, the message broker, the auth provider, the API style) — not one per class or endpoint.
 - **Cross-team decisions.** When a decision crosses a service boundary (API gateway's routing strategy, a shared event schema), review often needs a wider audience than one team's PR reviewers; some orgs route these through an architecture review board that approves the ADR before merge, turning the PR thread itself into the record of that approval.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's the difference between an ADR and a design document?
 > A design document (or RFC) is written before a decision exists, to propose options and invite debate. An ADR is written once a decision is made: it records the context, the choice, the alternatives considered, and the consequences accepted. A design doc evolves through edits; an accepted ADR does not.
@@ -424,7 +465,7 @@ func (f *fakeStore) Release(id int64, err error) error {
 > [!question]- How do you make and communicate an architecture decision on a real team?
 > Write the ADR as part of the same pull request that implements the decision, not after: Context (the constraints as they stood, including what infrastructure already existed), the Alternatives actually considered and why each was passed over, the Decision in one actionable sentence, and at least one honest Consequence. Open it for review like any code change, merge it once the team agrees, and link it from the code and runbooks it governs so the next engineer who touches that area finds the reasoning instead of having to ask around for it.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - ADR = Context + Decision + Alternatives + Consequences, one page, numbered, immutable once accepted.
 - Write one for one-way-door decisions: expensive to reverse, cross-team, or genuinely trade-off-laden. Skip it for cheap, local, reversible choices.
@@ -434,7 +475,7 @@ func (f *fakeStore) Release(id int64, err error) error {
 - A good ADR states the downside, not just the choice — "Consequences" should include at least one real cost.
 - The decision an ADR records should map to a real code boundary (an interface the core owns), so the choice stays swappable later.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]
 - **Next:** [[Documenting Architecture - C4 Diagrams and Fitness Functions]]

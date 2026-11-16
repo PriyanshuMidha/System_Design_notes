@@ -30,7 +30,39 @@ Without it, a queue between a 1,000-per-second producer and a 800-per-second con
 > - Pressure must travel all the way to the source. A hop that silently absorbs it just moves the pile-up.
 > - Choose per data type: metrics may be dropped; payments must block or be queued durably.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (strategies and credits), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+One part of a system makes work, another part does it.
+If work comes in faster than it gets done, it piles up.
+A pile with no limit grows until the program runs out of memory and dies.
+**Backpressure** means the slow side tells the fast side "slow down".
+The simple tool for this is a **bounded queue**: a waiting line with a fixed size.
+When the line is full, you must pick a rule: make the sender wait, say "no", or drop something.
+
+```mermaid
+flowchart LR
+    P["Fast sender<br/>1,000/s"] --> Q[("Line with no limit<br/>keeps growing")] --> C["Slow worker<br/>800/s"]
+    Q --> X["Out of memory, all lost"]
+```
+
+```mermaid
+flowchart LR
+    P["Fast sender"] --> Q[("Line with a limit")] --> C["Slow worker"]
+    Q -- "full: wait, say no, or drop" --> P
+```
+
+The rest of this note is just these 3 questions:
+1. What should happen when the line is full?
+2. How can the receiver say "send me only this much" in advance?
+3. How does the "slow down" signal travel back through many services?
+
 
 **The problem in one story.**
 A kitchen gets 10 orders a minute but can cook only 8.
@@ -76,7 +108,7 @@ Where it breaks: cars waiting at the light are fine for a while, but a software 
 > [!tip] Remember
 > Every queue needs a limit, and when it is full someone must slow down, drop or say no.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An ingest service accepts 1,000 events per second. Its workers can process 800 per second. The service puts incoming events in an in-memory Go slice-backed queue with no limit.
 
@@ -88,7 +120,17 @@ An ingest service accepts 1,000 events per second. Its workers can process 800 p
 
 The queue did not fix the overload. It hid it for an hour, made every request slow, and then lost the data. A **bounded** queue would have made the problem visible in the first second, and a deliberate policy would have decided who waits and what is dropped.
 
-## 2. Mental model
+**The math of the pile, drawn** (rounded):
+
+```mermaid
+flowchart LR
+    A["1,000 in/s"] --> Q[("Queue grows 200/s")]
+    Q --> B["800 out/s"]
+    Q --> C["1 hour later:<br/>720,000 waiting<br/>~1.4 GB, ~15 min wait"]
+    C --> D["Pod killed,<br/>all of it lost"]
+```
+
+## 2. Mental model 🟢
 
 A motorway on-ramp with a traffic light (ramp metering). When the motorway is full, the light turns red and cars wait on the ramp, a short and bounded queue.
 
@@ -102,9 +144,20 @@ Terms:
 - **Credit (window):** a number of items or bytes the receiver has said it can accept. The sender may send up to that much, then must wait for more credit.
 - **Consumer lag:** in a log-based broker, how far a consumer group is behind the newest message.
 
-## 3. How it works
+**The on-ramp, drawn:**
+
+```mermaid
+flowchart LR
+    City["City streets<br/>(callers)"] --> Ramp[("On-ramp<br/>short, fixed queue")]
+    Ramp -- "green light only when there is room" --> M["Motorway<br/>(workers)"]
+    Ramp -- "ramp full" --> Other["Drivers take another route<br/>(reject / retry later)"]
+```
+
+## 3. How it works 🟡
 
 ### Where the pressure goes when the buffer is full
+
+**In plain words:** when the box is full, the extra work has to go somewhere: back to the sender, onto the floor, or into a bigger box. This picture shows each road.
 
 ```mermaid
 flowchart LR
@@ -120,6 +173,8 @@ flowchart LR
 
 ### The strategies
 
+**In plain words:** there are only a few choices when the line is full: make them wait, turn them away, throw some away, or keep only the newest. The table says when each one is right.
+
 | Strategy | What happens at the bound | Good for | Danger |
 | --- | --- | --- | --- |
 | **Block the producer** | The producer waits until there is room | Work that must not be lost: orders, payments | Without a deadline, blocked callers pile up upstream instead (goroutines, threads, connections) |
@@ -131,6 +186,8 @@ flowchart LR
 | **Throttle at the source** | Rate-limit the producer to a known capacity | Known, stable consumer capacity | A fixed rate cannot adapt to a slower consumer. See [[Rate Limiting - Algorithms and Distributed Design]] |
 
 ### Credit-based flow control
+
+**In plain words:** the receiver hands out tickets in advance, like "you may send me 10 more". The sender stops when it runs out of tickets.
 
 Instead of reacting when the buffer is already full, the receiver **grants** credit in advance. TCP's receive window, HTTP/2 and gRPC flow-control windows, AMQP prefetch, and Reactive Streams' `request(n)` all work this way.
 
@@ -151,9 +208,11 @@ sequenceDiagram
 
 The consumer's buffer can never overflow, because the producer can never have more items in flight than the credit it was given.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** in Go, a channel with a size is already a bounded line, and `select` lets you choose what to do when it is full.
 
 In Go, a buffered channel **is** a bounded queue, and `select` chooses the policy:
 
@@ -169,6 +228,8 @@ metrics: len(q) as a gauge, dropped and rejected as counters
 ```
 
 ### Full version in Go
+
+**In plain words:** a complete Go program: one bounded line, three ways to handle a full line, and a team of workers, all with tests.
 
 A generic bounded queue with three producer policies and a worker pool. It compiles and passes `go vet` and `go test -race` on Go 1.24.
 
@@ -354,7 +415,7 @@ Other Go tools for the same job:
 - `errgroup.Group.SetLimit(n)` to cap concurrent goroutines in a fan-out.
 - `golang.org/x/time/rate.Limiter` to throttle a producer to a fixed rate.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Mechanism | How pressure is signalled | Where you meet it | Notes |
 | --- | --- | --- | --- |
@@ -367,7 +428,7 @@ Other Go tools for the same job:
 | SQS | Consumer pulls with `ReceiveMessage` (up to 10 per call); in-flight message quota (about 120,000 for a standard queue) | SQS | The queue is durable, so pressure becomes queue age |
 | Reactive Streams | Subscriber calls `request(n)`; publisher may send at most `n` | Project Reactor, RxJava, Akka Streams | Pure credit-based flow control in a library |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Blocking spreads upstream.** If an HTTP handler blocks on a full queue with no deadline, each blocked request holds a goroutine, a connection and memory. Always block with `ctx` and a deadline shorter than the client's timeout.
 - **Dropping is a product decision.** For metrics, dropping 1% during a spike is fine. For orders, it is data loss. Write down per data type which policy applies.
@@ -376,7 +437,7 @@ Other Go tools for the same job:
 - **Retries amplify overload.** A client that retries a 503 twice, immediately, turns 1,000 requests per second into 3,000. Rejection only works with exponential backoff, jitter and `Retry-After` on the client side.
 - **When not to bother:** a batch job reading a file at its own pace already has natural backpressure; adding queues and policies only adds code.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Kafka's pull model: producers write to the log as fast as brokers accept, consumers read at their own pace, and the backlog lives on broker disk as consumer lag.
@@ -396,7 +457,7 @@ Other Go tools for the same job:
 	- Producer block time (how long `Submit` waits).
 	- Worker utilisation: if it is near 100% all the time, you need capacity, not a bigger buffer.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why queues explode near 100% utilisation.** For a simple single-server queue with random arrivals (M/M/1), average time in the system is `1 / (μ − λ)`.
 
@@ -415,7 +476,17 @@ Other Go tools for the same job:
 	- Real-time positions: keep only the latest per entity (conflate).
 - **Conflation.** For "latest value wins" data, replace the queued value for a key instead of appending. A queue of 1 million price ticks for 500 symbols becomes at most 500 entries.
 
-## 9. Interview questions
+**The signal must travel back hop by hop.** One unbounded buffer anywhere cuts it:
+
+```mermaid
+flowchart RL
+    DB["DB is slow"] -- "slow down" --> W["Worker"]
+    W -- "slow down" --> Q[("Bounded queue")]
+    Q -- "full: 503 / wait" --> API["API"]
+    API -- "429 / 503" --> C["Client backs off"]
+```
+
+## 9. Interview questions 🔴
 
 > [!question]- Why is an unbounded queue dangerous if memory is plentiful?
 > Because latency, not memory, fails first. A new item waits for the backlog ahead of it to drain, so its wait is queue length divided by drain rate: 720,000 queued items at 800 per second is a 15-minute delay.
@@ -437,7 +508,7 @@ Other Go tools for the same job:
 > [!question]- What should you monitor to catch backpressure problems early?
 > Age of the oldest queued item and consumer time lag, not just depth. Also rejection and drop counters, producer block time, and worker utilisation; constant 100% utilisation means you need capacity, not a bigger buffer.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Bound every queue; size the bound from the latency budget: `L = λ × W`.
 - When full: block (with deadline), drop (newest, oldest, sample), spill to durable log, reject 429/503 + `Retry-After`, or throttle the source.

@@ -25,7 +25,33 @@ updated: 2026-11-13
 > - Consumers keep their own position (an offset) and commit it to the broker; the broker never deletes a message because it was read. Retention deletes whole old segments.
 > - Classic mistake: designing a queue that deletes each message on acknowledgement. That serves one consumer group, makes replay impossible and turns every ack into a random write.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A message queue lets one service drop a message and others pick it up later.
+The sender does not wait for the readers, and a reader that is down can catch up when it comes back.
+Inside, messages are written to a file that only grows at the end. This is a **log**.
+Each reader remembers how far it has read, as a number called an **offset**. Different readers can be at different spots.
+
+```mermaid
+flowchart LR
+    P["Sender"] --> L["Log: 0 1 2 3 4 5"]
+    L --> A["Reader A at 5"]
+    L --> B["Reader B at 2"]
+```
+
+To handle huge traffic, one topic is cut into many logs, called **partitions**, spread over many machines. Each log is copied to 3 machines so a crash loses nothing.
+
+So the rest of this note is just these 3 questions:
+1. How do you store messages fast and safely?
+2. How do readers keep their place and share the work?
+3. What happens when a machine dies?
 
 **The problem in one story.**
 An order service must tell billing, shipping and email about every new order.
@@ -69,7 +95,7 @@ Where it breaks: a logbook is read by people who remember where they stopped, wh
 > [!tip] Remember
 > A message queue is a durable, append-only log; producers write once, and each consumer reads at its own pace.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 Services need to hand events to each other without being online at the same moment. Example: an order service emits 50,000 events per second at peak; billing, search indexing, analytics and email each need every event; analytics is down for an hour of maintenance and must catch up afterwards without losing anything.
 
@@ -96,7 +122,7 @@ A classic work queue (one message, one consumer, deleted on ack) cannot give fou
 - Latency: produce-to-consume p99 in tens of milliseconds within one region.
 - Horizontal scale: add brokers and partitions without downtime.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A partition is a **ship's logbook**.
 
@@ -107,7 +133,16 @@ A partition is a **ship's logbook**.
 
 The design moves work to the clients: the producer chooses the partition, the consumer tracks its position, and the broker becomes a fast, mostly sequential file server.
 
-## 3. How it works - high-level design
+```mermaid
+flowchart LR
+    W["Writer"] --> LB["Logbook<br/>(add at bottom only)"]
+    LB --> C1["Copy on officer 2"]
+    LB --> C2["Copy on officer 3"]
+    LB --> R1["Reader bookmark: page 10"]
+    LB --> R2["Reader bookmark: page 900"]
+```
+
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart LR
@@ -179,7 +214,7 @@ sequenceDiagram
 
 The follower's next fetch is its acknowledgement: asking for offset 103 means "I have everything before 103".
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -195,6 +230,8 @@ retention: delete whole oldest segments; compaction keeps last value per key
 ```
 
 ### Estimates
+
+**In plain words:** rough sums: messages per second, bytes per second, and disk needed to keep a week of data.
 
 All inputs are **estimates** for the exercise.
 
@@ -218,6 +255,8 @@ All inputs are **estimates** for the exercise.
 
 ### API
 
+**In plain words:** a few calls: send messages, fetch messages from an offset, and save "I have read up to here".
+
 | Call | Request | Response |
 | --- | --- | --- |
 | `Produce` | topic, partition, record batch, `acks` (0, 1, all), producer ID and sequence | base offset per partition, or a retriable error |
@@ -230,6 +269,8 @@ All inputs are **estimates** for the exercise.
 `Fetch` uses long polling: with `max_wait_ms`, an empty partition holds the request open until data arrives, so idle consumers do not spin.
 
 ### Data model
+
+**In plain words:** messages sit in plain files on disk; only small facts (who leads which partition, who read how far) go in a metadata store.
 
 Messages live in log files, not in a database. The control plane stores small metadata records:
 
@@ -288,6 +329,8 @@ orders-0/
 ```
 
 ### The partition log in Go
+
+**In plain words:** the code appends messages to files, keeps a small index so it can jump to any offset, and starts a new file when one gets big.
 
 An in-memory model of one partition: segments named by base offset, a sparse index entry every `IndexInterval` bytes, a lookup that mirrors the broker's, time-based retention that drops whole closed segments, and the high-watermark rule. The clock is injected so the retention test does not sleep.
 
@@ -533,7 +576,7 @@ What the tests show:
 
 With the real defaults (1 GiB segment, an index entry every 4,096 bytes), one segment's index has at most 1,073,741,824 / 4,096 = 262,144 entries, and a lookup scans at most about 4 KB of records after the binary search.
 
-## 5. Variants
+## 5. Variants 🟡
 
 | Design | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -545,7 +588,7 @@ With the real defaults (1 GiB segment, an index entry every 4,096 bytes), one se
 
 For choosing between these as a user, see [[Queues vs Streams and Broker Comparison]]. This note is about building the first row.
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 - **`acks` and `min.insync.replicas`.**
 	- `acks=0`: fastest, messages can vanish silently.
@@ -556,7 +599,14 @@ For choosing between these as a user, see [[Queues vs Streams and Broker Compari
 - **Unclean leader election.** If every ISR member is dead, electing an out-of-sync replica restores availability but loses committed messages. Kafka's default is `unclean.leader.election.enable=false`: stay unavailable, keep data. See [[CAP and PACELC]].
 - **When not to use a log:** a small job queue that needs per-message delays, priorities and retries is simpler on a classic queue or a database table; see [[Background Jobs and Worker Pools]].
 
-## 7. In production
+```mermaid
+flowchart LR
+    A0["acks=0"] --> F["Fastest,<br/>can lose silently"]
+    A1["acks=1"] --> M["Leader has it,<br/>lost if leader dies early"]
+    AA["acks=all"] --> S["Slower,<br/>survives one machine loss"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:** Apache Kafka (log segments, ISR, KRaft), Redpanda (Kafka API, Raft per partition, C++), Apache Pulsar (brokers plus BookKeeper), Amazon Kinesis Data Streams (shards with sequence numbers, 24-hour default retention).
 - **Failure modes and fixes:**
@@ -568,7 +618,7 @@ For choosing between these as a user, see [[Queues vs Streams and Broker Compari
 	- *Poison message:* one record that always fails blocks its partition. Skip to a dead letter topic after N attempts; see [[Dead Letter Queues and Poison Messages]].
 - **What to monitor:** under-replicated partitions, ISR shrink and expand rate, offline partitions, consumer lag per group and partition (in messages and in seconds), produce and fetch request latency p99, request queue time, disk usage against retention, controller elections.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Replica states and the high watermark
 
@@ -589,6 +639,8 @@ stateDiagram-v2
 
 ### Why it is fast
 
+**In plain words:** it only writes at the end of a file and lets the operating system move bytes straight to the network. Disks and networks love that.
+
 - **Sequential I/O only.** Appends go to the end of one file per partition; reads by caught-up consumers come from the page cache.
 - **Batching end to end.** Producers compress whole batches; the broker stores the batch as is; consumers decompress. The broker never parses individual messages on the hot path.
 - **Zero-copy.** For unencrypted connections the broker uses `sendfile` to move bytes from page cache to socket without copying into user space. TLS needs encryption in user space, so this optimisation does not apply there.
@@ -596,10 +648,14 @@ stateDiagram-v2
 
 ### Retention and compaction
 
+**In plain words:** old data is cleaned up either by age (delete whole old files) or by key (keep only the latest value for each key).
+
 - **Delete policy:** a background task removes whole closed segments when their newest record is older than `retention.ms` (7 days by default) or when the partition exceeds `retention.bytes`. Because deletion is per segment, data can live up to one segment's lifetime longer than the setting.
 - **Compact policy:** the log cleaner rewrites old segments keeping only the latest record per key. A record with a null value (a tombstone) deletes the key and is itself removed after `delete.retention.ms` (24 hours by default). Compacted topics are a durable key-value changelog; `__consumer_offsets` is one, and so are CDC topics; see [[Transactional Outbox and CDC]].
 
 ### Consumer offsets and delivery semantics
+
+**In plain words:** when a reader saves its bookmark decides whether a crash means re-reading a message or skipping one.
 
 - Commit **after** processing gives at-least-once: a crash between processing and committing re-delivers the batch.
 - Commit **before** processing gives at-most-once: a crash after committing skips the batch.
@@ -607,10 +663,12 @@ stateDiagram-v2
 
 ### Ordering and scaling limits
 
+**In plain words:** order is only promised inside one partition, and one partition can only be read by one reader in a group at a time.
+
 - Order holds per partition only. A consumer group has at most one active consumer per partition, so the partition count caps consumer parallelism.
 - Hot keys put one partition on one broker; see [[Hot Keys and Hot Partitions]]. Spreading a hot key across partitions trades away its ordering.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why a log instead of a queue that deletes messages on ack?
 > A log lets any number of consumer groups read the same data independently, lets a consumer rewind and replay, and keeps disk access sequential. Deletion happens in bulk by segment. A delete-on-ack queue gives one reader, no replay and random I/O for every ack.
@@ -633,7 +691,7 @@ stateDiagram-v2
 > [!question]- How do you get exactly-once processing end to end?
 > Idempotent producer to stop duplicate appends, transactions to commit output records and consumer offsets atomically, `read_committed` consumers, and idempotent writes for any side effect outside the log (a database upsert keyed by a message ID).
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Topic → partitions → append-only segments named by base offset, each with a sparse `.index` (every 4 KB) and `.timeindex`.
 - Leader plus followers; followers fetch like consumers; HW = min LEO across the ISR; consumers read below HW.

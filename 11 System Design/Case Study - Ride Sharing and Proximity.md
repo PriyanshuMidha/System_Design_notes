@@ -27,7 +27,35 @@ updated: 2026-11-13
 > - Shard everything by city (or region) so a ride, its driver and its location shard live together.
 > - Straight-line distance only shortlists drivers; road-network **ETA** picks the winner.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A ride app must find a free driver near you, in about a second.
+Every driver's phone sends its location every few seconds, so positions change all the time.
+Checking the distance to every driver in the country would be far too slow.
+So the map is cut into small squares, called **cells**. Each cell keeps a list of the free drivers inside it.
+To find drivers near you, you only look at your cell and the 8 cells around it.
+
+```mermaid
+flowchart LR
+    R["Rider taps 'Book'"] --> C["Find rider's cell"]
+    C --> N["Look in that cell + 8 neighbours"]
+    N --> S["Sort by distance / ETA"]
+    S --> O["Offer trip to one driver"]
+```
+
+Before a driver gets the offer, they are briefly locked, so two riders never get the same driver.
+
+So the rest of this note is just these 3 questions:
+1. How do you keep a million moving drivers searchable?
+2. How do you pick one driver and never double-book them?
+3. How do you show the trip live and price it fairly?
 
 **The problem in one story.**
 You stand on a street corner and tap "Book a ride".
@@ -72,7 +100,7 @@ Where it breaks: real pins do not move by themselves every 4 seconds, and a wall
 > [!tip] Remember
 > Keep driver positions in memory by map cell, search your cell plus neighbours, and lock a driver before you offer the trip.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 A rider in Bengaluru opens the app at 9 am. Within a second or two they want to see cars around them, a fare quote, and after tapping "Book", a driver who accepted within about 15 seconds.
 
@@ -94,7 +122,7 @@ Meanwhile one million drivers across the country are each sending a GPS fix ever
 
 **Glossary.** A **ping** is one location update from a driver. A **cell** is a small area of the map with an ID (a geohash string, an H3 index, an S2 cell). **Dispatch** is choosing a driver and sending them an **offer** that they accept or let expire. **ETA** is the estimated time for the driver to reach the pickup by road. **Surge** is a price multiplier applied when demand outruns supply in an area.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a city map cut into a grid of tiles, and a board on the wall with one pin per free driver. Every 4 seconds each driver tells you which tile they are on, and you move their pin.
 
@@ -102,7 +130,15 @@ When a rider calls, you look at the rider's tile and the 8 tiles around it, meas
 
 Everything else in the design (sharding, ETA, surge, live tracking) is about doing that at a million pins and hundreds of calls per second.
 
-## 3. How it works - high-level design
+```mermaid
+flowchart LR
+    P["Driver ping every 4 s"] --> M["Move pin to new tile"]
+    Q["Rider calls"] --> T["Look at rider's tile + 8 around"]
+    M --> T
+    T --> R["Ring closest free driver"]
+```
+
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart LR
@@ -160,7 +196,7 @@ sequenceDiagram
     D-->>R: push: driver 42 assigned, ETA 4 min
 ```
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -177,6 +213,8 @@ Numbers: 1M drivers, 250k pings/s, ~520 ride requests/s at peak.
 ```
 
 ### Estimates
+
+**In plain words:** rough sums: how many location pings per second and how much memory to hold every driver's position.
 
 All inputs below are estimates for a large single-country deployment.
 
@@ -198,6 +236,8 @@ The numbers drive three decisions:
 
 ### Choosing a cell size
 
+**In plain words:** too small and you search many cells; too big and each cell holds too many drivers. Pick a size that gives a handful of drivers per cell.
+
 A geohash with `p` characters has `5p` bits, split between longitude and latitude (longitude gets the extra bit when `5p` is odd). Cell sizes at the equator (computed from the bit split; longitude width shrinks with `cos(latitude)`):
 
 | Precision | Bits (lon/lat) | Cell size at the equator | Good for |
@@ -211,6 +251,8 @@ The rule: a 3 × 3 block of cells is guaranteed to contain every point within ra
 For a 2 km pickup radius use precision 5, then filter by real distance. Using precision 7 and scanning 9 cells would silently ignore drivers 300 m away.
 
 ### API
+
+**In plain words:** drivers send their location; riders ask for a ride; both watch the trip live.
 
 ```http
 POST /v1/quotes
@@ -230,6 +272,8 @@ POST /v1/offers/o_55/accept    -> driver side; 409 if the offer already expired
 Driver pings travel on the streaming connection as small binary messages: `{driver_id, lat, lon, heading, speed, ts, seq}`. The `seq` lets the server drop out-of-order pings after a reconnect.
 
 ### Data model
+
+**In plain words:** live positions sit in memory by cell; rides and drivers sit in a normal database.
 
 ```mermaid
 erDiagram
@@ -296,6 +340,8 @@ WHERE status = 'offered' AND offer_expires_at < now();
 
 ### Ride lifecycle
 
+**In plain words:** a ride moves through a few states: requested, driver found, picked up, finished or cancelled.
+
 ```mermaid
 stateDiagram-v2
     [*] --> matching: POST /rides
@@ -314,6 +360,8 @@ stateDiagram-v2
 ```
 
 ### Go: geohash and an in-memory cell index
+
+**In plain words:** the code turns a position into a cell name, keeps drivers grouped by cell, and searches the 9 nearby cells.
 
 This is the core of one location shard: encode a position to a geohash cell, keep drivers bucketed by cell, and answer "k nearest fresh drivers within r km" by scanning the 3 × 3 block and filtering by great-circle distance.
 
@@ -672,7 +720,7 @@ func TestIndexConcurrentUpdates(t *testing.T) {
 
 `TestEdgeOfCellProblem` shows why you always scan neighbours: two points 22 m apart on either side of the equator get geohashes that differ in the very first character, so a prefix match alone would never find one from the other.
 
-## 5. Variants
+## 5. Variants 🟡
 
 | Choice | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- | --- |
@@ -687,7 +735,7 @@ func TestIndexConcurrentUpdates(t *testing.T) {
 | Rider updates | Push over WebSocket | gateway pushes driver position | live map | connection state (see [[Scaling WebSockets]]) |
 | | Polling every 3-5 s | stateless GETs | simple clients | more requests, coarser updates |
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 - **RAM index over a database.** You lose durability, and that is fine: if a location node dies, its drivers' next pings rebuild the state within about 4 seconds. Losing a ride row is not fine, so rides and offers stay in a durable store.
 - **City sharding over global cells.** Sharding by city keeps the ride, the driver row and the location shard together, so dispatch is one-shard work and one SQL transaction. The cost: very big cities need sub-sharding by cell, and trips that cross a city boundary need a hand-off rule (the pickup city owns the ride).
@@ -695,7 +743,13 @@ func TestIndexConcurrentUpdates(t *testing.T) {
 - **Offer TTL length.** Short TTL (10 s) means faster fallback but more missed offers from drivers who are driving; long TTL (30 s) means riders wait longer when a driver ignores the offer.
 - **When a simpler design wins:** for a city-scale taxi company with 2,000 drivers, Redis GEO plus Postgres is enough. There are 500 pings per second; no custom sharding is needed.
 
-## 7. In production
+```mermaid
+flowchart LR
+    S["Short offer time (10 s)"] --> S1["Fast fallback,<br/>more missed offers"]
+    L["Long offer time (30 s)"] --> L1["Fewer misses,<br/>rider waits longer"]
+```
+
+## 7. In production 🔴
 
 - **Real systems.** Uber developed and open-sourced H3 to analyse its marketplace data, such as setting dynamic prices (see the H3 introduction on h3geo.org). Redis GEO and PostGIS are the common off-the-shelf choices at smaller scale.
 - **Failure: a location shard restarts.** All its drivers vanish for one ping interval. Fix: dispatch treats "no candidates" as retryable for a few seconds; optionally run a hot replica fed from the same ping stream.
@@ -704,7 +758,7 @@ func TestIndexConcurrentUpdates(t *testing.T) {
 - **Failure: hot cell.** An airport or a stadium after a concert concentrates thousands of drivers and requests in one cell. Fix: finer cells there, or a dedicated FIFO queue for the airport lot (see [[Hot Keys and Hot Partitions]]).
 - **What to monitor:** ping ingest rate and lag per shard; percentage of stale drivers; match latency p50/p99; offer acceptance rate; `no_drivers` rate per cell; dispatch conflict rate (conditional update returning 0 rows); ETA error (predicted vs actual pickup time).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why soft state changes everything.** A ping has a useful life of about 4 seconds. Replicating it synchronously, fsyncing it, or indexing it in a B-tree spends money protecting data that is about to be overwritten. The location service therefore keeps one copy in memory per shard and accepts losing a few seconds of positions on failure. History goes to Kafka asynchronously for things that need it later: trip traces for fare disputes, ETA model training and surge.
 
@@ -716,7 +770,7 @@ func TestIndexConcurrentUpdates(t *testing.T) {
 
 **Cars-nearby fan-out.** 100,000 rider reads per second do not each run a query. Each location shard publishes a coarse snapshot per cell (positions rounded, only available drivers) every 1-2 seconds; rider requests read the snapshot for their cell and neighbours from a cache. Rounding positions also protects driver privacy.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why not store driver locations in Postgres with PostGIS and query them with `ST_DWithin`?
 > 250,000 updates per second means 250,000 row versions, WAL records and GiST index updates per second, for data that is stale 4 seconds later. PostGIS is great for durable geometry (zones, geofences). Live positions are soft state and belong in an in-memory index sharded by city.
@@ -741,7 +795,7 @@ func TestIndexConcurrentUpdates(t *testing.T) {
 > [!question]- How do you compute surge without hammering the dispatch path?
 > Off the hot path: a stream job aggregates requests and available drivers per H3 cell per minute from Kafka, smooths and caps the ratio, and writes multipliers to a cache read by pricing. Quotes lock the multiplier for a short time.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - 1M drivers × 1 ping / 4 s = 250k writes/s → in-memory cell index, not a database.
 - Nearby = own cell + 8 neighbours, filter by haversine, drop pings older than ~30 s; cell width ≥ search radius.

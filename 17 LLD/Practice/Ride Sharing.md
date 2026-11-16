@@ -27,7 +27,29 @@ updated: 2026-11-13
 > - Surge is computed from demand and supply near the pickup, **stored on the trip** at request time, and applied at the end. The rider pays what they were quoted.
 > - Classic mistakes: search and claim as two separate steps without re-checking the status, or a ring search that stops at the first ring with a hit.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You open a ride app and ask for a car. The app looks for free drivers near you. To find them fast, it splits the map into small squares, a **grid**, and only checks your square and the ones around it. It ranks the drivers and offers the ride to the best one. Two riders must never get the same driver, so the claim is one safe step. The trip then moves through fixed steps: requested, matched, picked up, completed.
+
+```mermaid
+flowchart LR
+    A["Ride request"] --> B["Check nearby grid squares"]
+    B --> C["Rank drivers"]
+    C --> D["Claim one driver"]
+    D --> E["Trip starts"]
+```
+
+Everything else in this note is just these 3 questions:
+1. How does the grid find nearby drivers fast?
+2. How do you claim a driver so no one else gets them?
+3. Which trip steps and cancellations are allowed?
 
 **The problem in one story.** You open an app and ask for a cab.
 The app must find a free driver close to you, fast, and must never send the same driver to you and your neighbour.
@@ -70,7 +92,7 @@ It breaks down because a real dispatcher works one call at a time, while the cod
 > [!tip] Remember
 > Find candidates without a lock, then claim one under a lock by re-checking it is still Available.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design the core of a ride-hailing app. Riders request a ride from a pickup to a drop.
@@ -90,7 +112,7 @@ Riders and drivers can cancel. Many riders request at the same time.
 5. Add the driver steps (arrive, start, end), the fare and the two cancellation paths.
 6. Test the fare table, the state machine, cancellations, surge, and 50 riders racing for 3 drivers under `-race`. Then discuss sharding by city and the database version.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 ### Questions to ask (with assumed answers)
 
@@ -123,7 +145,7 @@ Riders and drivers can cancel. Many riders request at the same time.
 - Maps, routing and ETA services; payments; ratings; shared rides (pooling).
 - Multi-region deployment (see [[Case Study - Ride Sharing and Proximity]]).
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 |---|---|
@@ -135,7 +157,7 @@ Riders and drivers can cancel. Many riders request at the same time.
 
 The hardest use case is **RequestRide** under concurrency: many riders near the same few drivers. Code that first, then the driver steps, then cancellations.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
@@ -156,7 +178,7 @@ Modelling insights:
 - Driver cancellation does not end the trip. The trip goes back to `Requested` and is rematched, and that driver is excluded for this trip.
 - The surge multiplier belongs to the **trip**, not to the fare strategy. It is a fact recorded at request time.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -222,7 +244,7 @@ classDiagram
 - **Composition** (service to index): the index exists only for the service. **Aggregation** (service to drivers and trips): they outlive a single request and would live in storage.
 - **Association** (trip to driver): by ID. **Dependency on interfaces** for all three strategies, injected in `NewService`.
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 ```text
 POST /quotes                    body: {pickup, drop}                 -> 200 {surgePct, estimatePaise, quoteId}
@@ -259,9 +281,11 @@ var _ RideService = (*Service)(nil) // compile-time check
 
 Every driver-side method checks that the caller is the assigned driver (`ErrNotYourTrip`), and every state change goes through the transition table (`ErrInvalidTransition`).
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
 
 Locations do not go to the relational database: they change every few seconds and only the latest one matters. They live in memory (or Redis `GEOADD` / `GEOSEARCH`, see [[Geospatial Indexing]]). Trips and driver status are durable.
+
+**In plain words:** Tables for drivers and trips. Live locations stay in memory or Redis, not here, because they change every few seconds.
 
 ```sql
 CREATE TABLE drivers (
@@ -325,7 +349,7 @@ type LocationStore interface { // in memory or Redis GEO, never the SQL database
 
 The conditional `UPDATE ... WHERE status = 'available'` is an optimistic compare-and-set: no lock is held while ranking, and the loser just moves on. The general trade-off is in [[Locking - Optimistic vs Pessimistic]].
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 |---|---|---|
@@ -341,7 +365,7 @@ Patterns not used, and why:
 - No State pattern with one struct per state: the states have no different behaviour, only allowed moves. A transition table is enough.
 - No Decorator for surge: the multiplier is data recorded on the trip, so it is an input to the fare, not a wrapper around it. A decorator fits a rule such as "airport fee on top", see [[Decorator and Middleware]].
 
-## Folder structure
+## Folder structure 🟡
 
 ```text
 ride/
@@ -354,7 +378,7 @@ ride/
 cmd/demo/main.go  -> wiring: index, strategies, time.Now
 ```
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > Aim for about 200 lines in the room.
@@ -390,6 +414,8 @@ cmd/demo/main.go  -> wiring: index, strategies, time.Now
 > Write `ScoredMatch` that ranks by `distanceM - 200*rating` within the radius, before looking at `NearestFirst`. Nothing in `Service` changes. The test only swaps the strategy passed to `NewService`. This is the point of the interface.
 
 Lock order is always `Service.mu` then `GridIndex.mu`; the index never calls back into the service, so there is no deadlock.
+
+**In plain words:** The full service. Start with the grid index, then `RequestRide`, which matches and claims a driver, then the trip steps.
 
 ```go
 package ride
@@ -939,7 +965,7 @@ func (s *Service) Trip(id string) (Trip, bool) {
 }
 ```
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 |---|---|
@@ -956,6 +982,8 @@ func (s *Service) Trip(id string) (Trip, bool) {
 All nine pass under `go test -race` (Go 1.24.4), and `go vet` is clean.
 
 Worked fare (from `TestStandardFare`): base 5000 + 10.5 km x 1200 = 12600 + 21 started minutes x 200 = 4200, so 21800 paise (Rs 218). At 1.5x surge: (21800 x 150 + 50) / 100 = 32700 paise.
+
+**In plain words:** Tests with a fake clock for distance, matching, fares and two riders racing for one driver.
 
 ```go
 package ride
@@ -1219,7 +1247,7 @@ func must(t *testing.T) func(Trip, error) {
 }
 ```
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | What happens | How the design handles it |
 |---|---|---|
@@ -1245,7 +1273,7 @@ func must(t *testing.T) func(Trip, error) {
 - Computing surge at the end of the trip, or using `float64` for money.
 - A boolean soup (`isStarted`, `isCancelled`) instead of one status with a transition table.
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 |---|---|
@@ -1265,7 +1293,7 @@ Tradeoffs chosen:
 - **Auto-assign versus offer.** Auto-assign keeps the code focused on the race; real apps offer and wait, which adds a state and a timer.
 - **One mutex for the service.** Fine for a city in one process. Shard by city first, then by cell block if profiling shows contention.
 
-## Drawing
+## Drawing 🟢
 
 ```mermaid
 stateDiagram-v2
@@ -1303,7 +1331,7 @@ sequenceDiagram
     S-->>R2: Assigned D2
 ```
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- How do you stop two riders from getting the same driver?
 > Search and rank without the service lock, then claim under it: re-read the driver's status and set `OnTrip` in the same critical section, and fall through to the next candidate if it is no longer `Available`.
@@ -1336,13 +1364,13 @@ sequenceDiagram
 > [!question]- How is the fare kept exact with a 1.25x multiplier?
 > Keep the multiplier as an integer percent and the fare in `int64` paise: `(raw*125 + 50) / 100` rounds half up with no floating point. Apply the minimum fare after the surge, and document the rounding rule so finance can reproduce it.
 
-## Interview explanation
+## Interview explanation 🔴
 
 ```text
 I model a Trip as a state machine with an explicit transition table: Requested, Assigned, Arrived, InProgress, Completed, plus CancelledByRider and NoDriverFound. Driver locations live in a grid index of cells; to match, I scan rings of cells around the pickup until I have enough candidates, plus one more ring, and a MatchStrategy ranks them, nearest first by default. The claim is the critical part: under the service lock I re-check that the driver is still Available and mark it OnTrip, and if another rider won I just try the next candidate. In a database that is UPDATE drivers SET status = 'on_trip' WHERE id = $1 AND status = 'available'. Surge comes from recent requests versus available drivers near the pickup, and it is locked on the trip at request time. The fare is a strategy over distance, started minutes and that surge, in int64 paise with half-up rounding and a minimum. A rider cancel is free before assignment and within a grace window, then costs a fee; a driver cancel rematches the rider and excludes that driver.
 ```
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - Trip states: Requested, Assigned, Arrived, InProgress, Completed; plus CancelledByRider and NoDriverFound. Driver cancel goes back to Requested.
 - Grid index: cell = floor(lat / size), floor(lng / size); scan rings until enough candidates, then one more ring; rank by haversine.
@@ -1351,7 +1379,7 @@ I model a Trip as a state machine with an explicit transition table: Requested, 
 - Fare = max(min, (base + km x rate + started minutes x rate) x surge%), integer paise, surge locked at request.
 - Rider cancel: free before assignment or within the grace window, flat fee after; no cancel in progress.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Strategy and Template Method]], [[State Machines in Go]], [[Concurrency for LLD]], [[Delivery Partner Assignment]]
 - **Next:** [[Hotel Booking]]

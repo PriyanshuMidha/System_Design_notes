@@ -30,7 +30,37 @@ updated: 2026-11-13
 > - ACM certificates are **free but can't leave AWS** — you can't export the private key to install it on your own nginx box; they only attach to AWS resources (ALB, CloudFront, API Gateway, etc.).
 > - A CloudFront certificate must be requested in **us-east-1** regardless of where your users or origin are; an ALB certificate must be in the **same region as the ALB**. Mixing these up is the most common ACM mistake.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+People type names like api.shop.com, but computers need IP addresses.
+**DNS** is the phone book that turns names into addresses. **Route 53** is AWS's DNS service.
+It can also give different answers to different people, like sending Indian users to the Mumbai servers.
+
+```mermaid
+flowchart LR
+    U["Browser: where is api.shop.com?"] --> R["Route 53"] --> A["Answer: the load balancer"]
+```
+
+For HTTPS, your site needs a certificate that proves it is really api.shop.com.
+**ACM** gives you those certificates for free and renews them by itself.
+
+```mermaid
+flowchart LR
+    B["Browser"] -- "HTTPS + cert check" --> L["ALB with ACM certificate"] --> S["Your service"]
+```
+
+The rest of this note is just these 3 questions:
+1. Which record types and routing options exist?
+2. Alias vs CNAME, and how to switch a record safely?
+3. How does ACM issue and renew certificates?
+
 
 **The problem in one story.**
 You type `api.myshop.com` in a browser, but computers only talk to numeric IP addresses.
@@ -74,7 +104,7 @@ Where it breaks: a phone book gives the same number to everyone, but Route 53 ro
 > [!tip] Remember
 > Route 53 answers "where is this name?"; ACM answers "is this really you?"
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A production service needs a name (`api.example.com`) that resolves to the right infrastructure, can be changed without every client needing to know a new IP, and can route different clients to different targets — a canary release at 10%, the nearest regional endpoint, or a healthy target when another has failed.
 
@@ -89,7 +119,7 @@ ACM exists to make certificate issuance and renewal a non-event: request once, v
 - Health checks: ~$0.50/month per HTTP(S) health check (endpoint-based), more for calculated/CloudWatch-alarm-based checks.
 - ACM public certificates for use with AWS resources: **free**, with no limit tied to renewal — you pay nothing extra for the cert itself, only for the AWS resources it's attached to.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of Route 53 as a **phone book that can give a different number to different callers**, and ACM as a **certificate office that only issues IDs usable inside the same building** (AWS):
 
@@ -97,9 +127,11 @@ Think of Route 53 as a **phone book that can give a different number to differen
 - An **alias record** is Route 53 silently resolving an AWS resource's current address on your behalf at query time — so when an ALB's underlying IPs change (which they do, AWS doesn't document stable ALB IPs), your alias record doesn't need to change at all.
 - ACM doesn't hand you a `.pem` file to install elsewhere; it proves domain ownership once, issues a certificate, and keeps renewing it as long as it stays attached to an AWS resource and the validation record is still in place.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Record types and routing policies
+
+**In plain words:** record types say what kind of answer (IP, another name, mail server). Routing policies say how to choose an answer (by weight, by distance, by health).
 
 ```mermaid
 flowchart LR
@@ -130,6 +162,8 @@ flowchart LR
 
 ### Alias vs CNAME
 
+**In plain words:** CNAME says "go look up this other name". Alias is AWS's shortcut that answers with the final address directly, and works at the root domain.
+
 | | CNAME | Alias record |
 | --- | --- | --- |
 | Can be used at zone apex (`example.com`, not `www.example.com`) | No (DNS spec forbids a CNAME coexisting with other records at the apex, like the required `NS`/`SOA`) | Yes |
@@ -141,11 +175,15 @@ An alias record pointing at an ALB automatically tracks the ALB's IPs as AWS rot
 
 ### DNS cutover practice
 
+**In plain words:** lower the cache time a day early, then switch. That way the change spreads in minutes, not hours.
+
 Migrating a record to point somewhere new (a new load balancer, a new region) is a two-step operation if you want to avoid a visible outage: **lower the TTL well before the cutover** (e.g. from 3600s to 60s, at least one old-TTL period ahead of time, so caches holding the old long TTL expire naturally), then flip the record, then raise the TTL back once you've confirmed the new target is healthy.
 
 Skipping the TTL-lowering step means some fraction of clients keep hitting the old target for up to the old TTL's duration after cutover — which matters if the old target is being decommissioned on a tight schedule.
 
 ### ACM: issuance, validation, and renewal
+
+**In plain words:** you prove you own the domain by adding a DNS record. ACM keeps that record checked and renews before expiry.
 
 ```mermaid
 sequenceDiagram
@@ -171,6 +209,8 @@ sequenceDiagram
 
 ### Putting it together: Route 53 + ACM + ALB
 
+**In plain words:** the name points to the load balancer, and the load balancer holds the certificate. Together that gives HTTPS at your own name.
+
 ```mermaid
 flowchart LR
     U["User"] --> R53["Route 53\nalias record for api.example.com"]
@@ -180,7 +220,7 @@ flowchart LR
 
 TLS terminates at the ALB using the ACM certificate; traffic from the ALB to the ECS tasks inside the VPC is typically plain HTTP (the VPC boundary is the trust boundary), unless you specifically need end-to-end encryption, in which case the ALB re-encrypts to the target using a certificate the targets present — see [[TLS and HTTPS]] for when re-encryption or mTLS is worth the extra cost and complexity.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -312,7 +352,7 @@ func TestResolveDropsUnhealthyTargets(t *testing.T) {
 
 The unhealthy-target test (1,000 queries against a 50/50 split where one target is marked unhealthy) sent **100%** of traffic to the remaining healthy target, confirming the pool-removal behavior rather than mere deprioritization.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Routing policy | What it optimizes for | Use when | Needs health checks to be useful? |
 | --- | --- | --- | --- |
@@ -328,14 +368,14 @@ The unhealthy-target test (1,000 queries against a 50/50 split where one target 
 | DNS validation | One CNAME record in the zone | Yes, as long as the record stays | Default for everything |
 | Email validation | Human clicks a link in an inbox | No — needs a human every cycle | Legacy domains without Route 53 access |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Route 53 health checks add real cost and complexity for a topology that genuinely never needs automatic failover — a single-region, single-target service gains nothing from them beyond alerting.
 - Weighted and latency-based routing happen at the **DNS** layer, which is cached by resolvers for the record's TTL — this makes them coarser and slower to shift than an application-layer canary (like an ALB weighted target group), which can rebalance instantly without waiting for caches to expire.
 - ACM's "can't export the private key" constraint means any workload outside AWS (an on-prem server, a non-AWS CDN) needs its own certificate from elsewhere (e.g. Let's Encrypt) — ACM is not a general-purpose certificate authority for your whole estate.
 - Geolocation routing has gaps: not every resolver's location maps cleanly to a country, and a "default" catch-all record is required or some clients get no match at all.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** nearly every AWS-hosted web service puts an alias record in front of an ALB or CloudFront distribution; weighted routing is a common way to run a canary or a gradual region migration; failover routing backs active-passive DR architectures.
 - **Failure modes → fixes:**
@@ -345,7 +385,7 @@ The unhealthy-target test (1,000 queries against a 50/50 split where one target 
   - Weighted canary isn't shifting traffic fast enough → remember DNS-layer weighting is bounded by resolver caching and TTL; for sub-second canary control, shift weight at the ALB target-group layer instead (see [[AWS 06 - Load Balancing (ALB vs NLB)]] and [[Load Balancing]]).
 - **What to monitor:** Route 53 health check status per target, ACM certificate `DaysToExpiry` (CloudWatch metric), DNS query volume/latency per hosted zone, and any `ResourceRecordSet` change (via CloudTrail) to catch accidental validation-record deletion.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why alias records exist at all.** The DNS spec requires a few record types (`NS`, `SOA`) to coexist at a zone's apex, and the spec forbids a `CNAME` from coexisting with any other record type at the same name — so a plain CNAME can never point the bare domain (`example.com`) anywhere; only a subdomain (`www.example.com`) could use one.
 
@@ -353,7 +393,7 @@ The unhealthy-target test (1,000 queries against a 50/50 split where one target 
 - **Health check evaluation is itself distributed.** Route 53 runs each health check from multiple AWS regions' health checkers and requires a configurable minimum number of them to agree a target is unhealthy before acting — this avoids one region's transient network blip single-handedly failing a target out of the pool for everyone.
 - **ACM's renewal check is the same validation record, not a fresh challenge.** Unlike some certificate authorities, renewing an ACM certificate does not ask you to redo validation from scratch each time — it periodically re-checks the *same* DNS validation record is still present and still resolves, and only fails renewal if that record is gone or the resource using the certificate was deleted, which is why "someone deleted an old-looking CNAME during cleanup" is the single most common cause of an unexpectedly expired ACM certificate.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why would Route 53 answer the same query differently for two different clients?
 > A routing policy like weighted, latency-based, or geolocation is attached to the record set, so Route 53 deliberately returns different answers depending on the policy's inputs (a hash/weight bucket, measured latency, or the resolver's location) — this is the intended behavior, not a caching bug.
@@ -375,7 +415,7 @@ The unhealthy-target test (1,000 queries against a 50/50 split where one target 
 > [!question]- You need instant, fine-grained control over a canary's traffic split. Should you use Route 53 weighted routing?
 > Not for sub-second control — DNS answers get cached by resolvers for the record's TTL, so shifting a DNS weighted split takes time to fully propagate as caches expire. An ALB weighted target group rebalances the split immediately at the request-routing layer, which is the better tool when canary speed matters.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Hosted zone = authoritative DNS records for a domain; routing policy decides which answer; health check decides whether a target is even in the pool.
 - Alias record: free, works at the apex, tracks AWS resource IP changes automatically — prefer it over CNAME for any AWS target.

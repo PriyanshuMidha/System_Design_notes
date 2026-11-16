@@ -36,7 +36,34 @@ flowchart LR
 
 Everything in this note is this one diagram made precise: what the rule can look at, how it changes over weeks instead of flipping once, and what happens to the data underneath while the arrow moves.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You have an old system that works but is hard to change. Rewriting it all at once is very risky.
+A strangler fig is a plant that grows around an old tree until it replaces it. The pattern copies that idea.
+You put a **facade** (a router) in front of the old system.
+You build one piece of the new system, then tell the router to send that one piece of traffic to it.
+Step by step, more traffic goes to the new system, and the old one shrinks until you can switch it off.
+At every step, both systems keep working, and you can roll back one slice if something goes wrong.
+
+```mermaid
+flowchart LR
+    U["Users"] --> F["Router / facade"]
+    F -- "old routes" --> O["Old system"]
+    F -- "moved routes" --> N["New system"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you pick what to move first?
+2. How do you prove the new part is right before trusting it?
+3. How do you move the data, which is the hardest part?
+
 
 **The problem in one story.**
 A company has an old app that still earns money every day.
@@ -80,7 +107,7 @@ Where it breaks: rooms in a house are separate, but old and new systems often sh
 > [!tip] Remember
 > Move one small, reversible slice at a time until the old system has no traffic left, then delete it.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A five-year-old monolith has one module — say, invoicing — that a team wants to extract into its own service, written in Go with a cleaner schema. The tempting plan is a **big-bang rewrite**: freeze the old invoicing code, write the new service over two months, cut every client over on release day.
 
@@ -92,7 +119,13 @@ A big-bang cutover has no equivalent partial state: every request is on the new 
 
 The strangler fig pattern replaces the single cutover with a long sequence of small, reversible ones, so a bad slice costs a percentage of traffic for an hour, not all of it for a weekend.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    BB["Big-bang rewrite"] --> R["Months with no value, one risky switch day"]
+    SF["Strangler fig"] --> V["Small moves, value every week, easy rollback"]
+```
+
+## 2. Mental model 🟢
 
 A strangler fig seed germinates in the branches of a host tree and sends roots down around the trunk.
 
@@ -102,7 +135,7 @@ The **facade is the fig's growing lattice**: it occupies the position every clie
 
 The host tree (the old system) never had to be demolished for the fig to take root — it keeps serving requests the facade hasn't routed away yet, right up until the facade routes nothing to it and it can be switched off.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 The three phases
 
@@ -133,6 +166,8 @@ Phase 2 is where the pattern lives — it can last months, with the migrated sli
 Phase 3 is the only truly final step: the old system is decommissioned, and the facade's "old" branch is deleted from the code, not just left unused, or the pattern never finishes and the facade becomes permanent dead weight.
 
 ### 3.2 Finding seams and routing by slice
+
+**In plain words: a seam is a spot where you can cut in and send a request somewhere else.**
 
 A **seam** is a boundary in the old system where a request can be intercepted without understanding the whole monolith: a URL prefix (`/invoices/*`), a tenant ID, a message type on a queue, or a function call behind an interface the old code already has.
 
@@ -173,11 +208,15 @@ This is the same idea as a **dark launch** (running new code in production witho
 
 ### 3.4 Branch by abstraction: the in-process sibling
 
+**In plain words: the same idea inside one codebase: put an interface in front of old code, then swap in the new code.**
+
 When the seam is inside one codebase rather than between two deployed services — the invoicing *module* needs replacing but will stay in the same binary for now — **branch by abstraction** is the strangler fig's in-code twin: introduce an interface the old implementation already satisfies, write the new implementation behind the same interface, flip a flag per call site (or per tenant, same as 3.2) to choose which implementation runs, and delete the old implementation once every call site has flipped.
 
 It avoids a long-lived feature branch that drifts from `main`; both implementations ship on every commit, selected at runtime instead of at merge time.
 
 ### 3.5 Data migration, the part that outlasts the code
+
+**In plain words: code can move one route at a time; data needs copying, syncing and a careful switch.**
 
 Code can be migrated route by route; data cannot be migrated row by row without a window where both systems might touch the same row. Three stages, in order:
 
@@ -186,7 +225,16 @@ Code can be migrated route by route; data cannot be migrated row by row without 
 3. **Dual-write danger, and why CDC beats it.** The tempting shortcut — have the *application* write to both databases in the request path — creates a window where one write succeeds and the other fails, with no transaction spanning two different database engines to make that atomic. CDC avoids this because it reads what already committed to the old database's WAL; there is nothing to partially fail. Dual-writes are acceptable only as a short bridge with reconciliation, never as the steady state.
 4. **Ownership switch.** Once CDC has run long enough that a backfill-and-diff job finds zero discrepancies between old and new for several consecutive runs, the new schema becomes authoritative: writes flip to the new service first, and a reverse sync (new → old) runs only until every remaining old-system caller has moved — one more slice in 3.2's sense, applied to the write path itself.
 
+```mermaid
+flowchart LR
+    O[("Old DB")] -- "backfill copy" --> N[("New DB")]
+    O -- "keep in sync" --> N
+    N --> C["Compare, then switch reads"] --> W["Switch writes, retire old"]
+```
+
 ### 3.6 Anti-corruption layer
+
+**In plain words: a translator so the old system's messy words do not leak into the new one.**
 
 While the old and new systems coexist, they often disagree on what a word means — the old monolith's `Invoice` row might represent what the new system splits into `Invoice` and `CreditNote`.
 
@@ -194,7 +242,12 @@ An **anticorruption layer** (a DDD term; see [[Domain-Driven Design - Strategic 
 
 Without it, the new service's domain model slowly absorbs the old system's historical quirks just to stay compatible, and the whole point of rewriting is lost.
 
-## 4. Worked example
+```mermaid
+flowchart LR
+    N["New system"] --> ACL["Anti-corruption layer<br/>translates words"] --> O["Old system"]
+```
+
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -546,7 +599,7 @@ func TestShadowFacadeIsSafeForConcurrentRequests(t *testing.T) {
 
 `go vet ./...` is clean and `go test -race -v ./...` passes all 7 tests: the path-allowlist routing, the percent-canary's validation, its stickiness and its approximate 30% split over 10,000 synthetic tenants, the shadow facade's guaranteed-old-response behaviour (including when the new backend panics), and its safety under 50 concurrent requests.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -556,7 +609,7 @@ func TestShadowFacadeIsSafeForConcurrentRequests(t *testing.T) {
 | Parallel run (dark launch without a facade decision) | Both systems run on every request; only the old answer is used, the new one is only logged | Early verification before any routing decision exists yet | Doubles load on every dependency the new system touches; no traffic actually migrates |
 | Feature-flag cutover (no slicing) | One global flag flips 100% of traffic at once, with instant rollback via the flag | A small, low-risk change where per-slice migration is overkill | No partial blast-radius control; if the new system is slow rather than wrong, a single flag does not help only some tenants |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **It is slower than a rewrite, on purpose.** A migration planned to take two months of big-bang work often takes longer end to end with a strangler fig, because verification and slow slice-by-slice rollout are real calendar time, not overhead to eliminate. The trade is calendar time for the ability to stop safely at any point.
 - **Running two systems costs real money and on-call load** for as long as phase 2 lasts: two sets of dashboards, two code paths to patch for the same security issue, and a facade that is itself a new single point of failure if it has no redundancy.
@@ -564,7 +617,7 @@ func TestShadowFacadeIsSafeForConcurrentRequests(t *testing.T) {
 - **It never finishes without an explicit retirement step.** A facade with a permanent 95%/5% split and no plan to reach 100% is not "nearly done"; it is a permanent two-system architecture wearing a migration's clothes. Put the retirement date and the "what % must hold for how long before switching ownership" criteria in an ADR (see [[Architecture Decision Records]]) when the migration starts, not when someone asks why it's still going eighteen months later.
 - **Skip the pattern entirely** for a system small enough, or new enough, that a scheduled maintenance window and a single cutover carry acceptable risk — most internal tools and anything pre-launch.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Fowler's original 2004 post takes its name from strangler figs he saw on a trip to Queensland's rain forests, used as a metaphor for colleagues' work modernising legacy systems; the post itself names no specific client, but its further-reading links to Ferri and Coggrave's writing on introducing seams into a mainframe system.
@@ -577,14 +630,14 @@ func TestShadowFacadeIsSafeForConcurrentRequests(t *testing.T) {
 	- Rollback after a bad slice forgets the data side: code routes back to the old system, but writes already landed in the new schema and are now invisible to it → the CDC/backfill job (3.5) must support running in reverse, not only forward.
 - **What to monitor:** percentage of traffic on each side, per route and per tenant; error-rate and latency parity between old and new for the same route; shadow-traffic match rate before widening a slice; CDC replication lag; count of distinct call sites or routes still pointing at the old system (the single number that answers "how much is left").
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why CDC instead of dual writes, precisely.** A dual write from the application is two separate commits to two separate storage engines with no shared transaction coordinator between them; the window between the two commits is a window where a crash, a timeout, or a retry can leave the systems permanently disagreeing, and nothing detects that disagreement until a customer notices. CDC reads a single source of truth's write-ahead log after it has already committed, so there is exactly one commit to reason about, and the sync is naturally eventually consistent rather than silently inconsistent.
 - **Sizing the first slice.** The first migrated slice should have three properties at once: low traffic (a small blast radius if wrong), no destructive side effects (prefer a read endpoint over a write), and high observability (good existing logs/metrics on the old path to diff against). A read-only PDF export or a dashboard summary endpoint usually satisfies all three; a payment-capture endpoint satisfies none of them and should migrate last, not first.
 - **Percentage canary bucket stability under tenant churn.** Hashing the tenant ID (as the Go code above does with FNV-1a) rather than assigning buckets in a lookup table means a new tenant signing up mid-migration gets a stable bucket automatically, with no table row to maintain — at the cost of not being able to force a *specific* tenant onto a side without a path- or tenant-allowlist override layered in front of the percentage rule.
 - **When the "old" system in the diagram is itself a vendor product**, the facade pattern is identical, but the anticorruption layer (3.6) usually has to carry much more translation weight, because a vendor's data model cannot be changed to meet the new system halfway the way an in-house monolith's model sometimes can.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Design the extraction of the payments module from a monolith with zero downtime. What's your first slice?
 > A read-only, low-traffic, high-observability endpoint — for example a payment receipt PDF export — behind a path-allowlist rule in a routing facade, verified with shadow traffic before it carries live responses. Payment *capture* (the write path with real financial side effects) migrates last, after the read paths have proven the new service's correctness and the data-sync machinery is trusted.
@@ -607,7 +660,7 @@ func TestShadowFacadeIsSafeForConcurrentRequests(t *testing.T) {
 > [!question]- When would you skip the strangler fig pattern entirely and just do a cutover?
 > When the system is small enough, or pre-launch, that a scheduled maintenance window and a single release carry acceptable risk — the incremental machinery (facade, shadow traffic, CDC sync) costs real engineering time that only pays off when the system is too large or too live to risk an all-or-nothing cutover.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Fowler, 2004: don't rewrite in one shot — put a facade in front of old and new, migrate slice by slice, retire the old system last.
 - Slices: by path, by tenant allowlist, or by a stable percentage canary (hash the tenant id, never flip-flop a tenant between sides).
@@ -617,7 +670,7 @@ func TestShadowFacadeIsSafeForConcurrentRequests(t *testing.T) {
 - Anticorruption layer translates between the old and new domain models while both exist, so neither has to compromise to understand the other.
 - A migration without a retirement step (old system decommissioned, old branch of the facade deleted) is a permanent two-system architecture, not a migration in progress.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Monolith vs Microservices]], [[Hexagonal Architecture (Ports and Adapters)]]
 - **Next:** [[Documenting Architecture - C4 Diagrams and Fitness Functions]]

@@ -28,7 +28,29 @@ updated: 2026-11-13
 > - Every status change is a compare-and-set (CAS: change only if the current value is still what you read), so payment and expiry cannot both win.
 > - Classic mistake: running the undo on the request context, so a client hang-up skips the release and leaks stock.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You order milk and bread from a 10-minute delivery app. The order should come from one small warehouse near you, called a **dark store**, that has every item. The system looks at nearby stores, keeps those that have everything, and picks the closest. Then it takes the stock away for all items at once, so two orders cannot get the last packet. If that fails, it tries the next store. Workers on several machines may do this together, so a short-lived claim, a **lease**, decides who handles an order.
+
+```mermaid
+flowchart LR
+    A["Order"] --> B["Nearby stores"]
+    B --> C["Has every item?"]
+    C -- "yes" --> D["Take stock for all items"]
+    C -- "no" --> B
+```
+
+Everything else in this note is just these 3 questions:
+1. How do you pick the right store?
+2. How do you take stock for many items without overselling?
+3. How do several workers share the work safely?
 
 **The problem in one story.**
 You order milk, bread and eggs on a 10-minute delivery app.
@@ -75,7 +97,7 @@ Where it breaks: real shops forget slowly; here the hold must expire automatical
 > [!tip] Remember
 > Reserve every item at one store or none, make every status change a compare-and-set, and run every undo even if the client hung up.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design a Zepto-like order assignment system. A user orders several products.
@@ -96,7 +118,7 @@ What it tests: an **atomic multi-item reservation** (all items or none, no overs
 5. Add rollback with `context.WithoutCancel` and CAS status transitions.
 6. Add `ExpireHolds` and `Cancel`, then test the last-packet race and retries.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 - **One store or split?** *One store (the dark-store model); split fulfilment is an extension.*
 - **Radius?** *3 km straight-line serviceable radius.*
@@ -119,7 +141,7 @@ What it tests: an **atomic multi-item reservation** (all items or none, no overs
 
 **Out of scope:** payment internals, pricing and coupons ([[Cart Checkout with Coupons]]), rider assignment ([[Delivery Partner Assignment]]), restocking.
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 |---|---|
@@ -131,7 +153,7 @@ What it tests: an **atomic multi-item reservation** (all items or none, no overs
 
 The hardest use case, and the one to code: **PlaceOrder**, which selects the nearest full-stock store and reserves every item atomically and idempotently.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
@@ -146,7 +168,7 @@ The hardest use case, and the one to code: **PlaceOrder**, which selects the nea
 
 Modelling insight: **a product is not an inventory item.** "Amul milk 500 ml" is global; stock lives per (store, product), and that row is what concurrent orders contend on. `OrderItem` copies the price, so later price changes do not change old orders.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -205,7 +227,7 @@ stateDiagram-v2
 
 `Order` owns its items (composition) and points to one store by ID (association). `Service` depends only on interfaces, so tests use in-memory fakes and production uses PostgreSQL and a message broker.
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 ```text
 POST /orders                 Idempotency-Key: <uuid per checkout tap>
@@ -221,7 +243,9 @@ PUT  /internal/stores/{id}/inventory/{productId}  {"available_qty": 40}
 
 In Go: `PlaceOrder(ctx, PlaceOrderRequest) (Order, error)`, `ConfirmPayment`, `MarkPacked`, `Cancel` (each `(ctx, orderID) error`) and `ExpireHolds(ctx) (int, error)` for a ticker.
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
+
+**In plain words:** Tables for stores, stock per item per store and orders. The stock update only works if enough is left, which stops overselling.
 
 ```sql
 CREATE TABLE stores (
@@ -324,7 +348,7 @@ The in-memory repositories below make them separate calls, which is exactly why 
 
 A status change is also a compare-and-set: `UPDATE orders SET status = $1 WHERE id = $2 AND status = $3` ([[Locking - Optimistic vs Pessimistic]]).
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 |---|---|---|
@@ -336,7 +360,7 @@ A status change is also a compare-and-set: `UPDATE orders SET status = $1 WHERE 
 
 Not used: a State object per status (four states with no per-state behaviour, so a transitions map is simpler) and a validation chain (one `normalize` is enough).
 
-## Folder structure
+## Folder structure 🟡
 
 ```text
 inventory/
@@ -351,7 +375,7 @@ cmd/demo/main.go   -> wires the Mem* repositories, NearestWithFullStock{MaxDista
 
 `model.go` holds plain data and the transition table; `repository.go` puts the interfaces first, then the in-memory versions (a stand-in for PostgreSQL); `service.go` is the only file that knows the order of the steps. The block below merges the files (marked by comments) so it compiles as shown.
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > Aim for about 150 lines in the room.
@@ -426,6 +450,8 @@ sequenceDiagram
 ```
 
 The store distance is the great-circle (haversine) distance; the formula is explained once in [[Geospatial Indexing]], and in a real codebase `HaversineM` lives in a shared `geo` package used by this problem and [[Delivery Partner Assignment]].
+
+**In plain words:** The complete package. Start with `PlaceOrder`, which ranks stores and reserves all items or none, then look at the lease and status code.
 
 ```go
 // File: inventory.go
@@ -999,7 +1025,7 @@ func total(items []OrderItem) int64 {
 }
 ```
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 |---|---|
@@ -1018,6 +1044,8 @@ func total(items []OrderItem) int64 {
 | `TestLateOriginalIsFencedOut` | The first attempt is slow, not dead: a retry takes the key over before its `BindKey`. The original gets `ErrLeaseLost`, cancels its own order and returns its stock; the key keeps pointing at the retry's order |
 
 Measured: `go test -race -cover` on Go 1.24.4 passes all 14 test functions with 91.4% statement coverage, and `go test -race -count=3` passes on every run (the concurrency tests reach some branches only on some schedules).
+
+**In plain words:** Fixtures with a few stores near a customer, and tests for every path, including two orders racing for the last unit.
 
 ```go
 // File: inventory_test.go
@@ -1487,7 +1515,7 @@ func TestLateOriginalIsFencedOut(t *testing.T) {
 }
 ```
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | Handling |
 |---|---|
@@ -1520,7 +1548,7 @@ Common mistakes:
 - no state machine; no idempotency key;
 - "nearest store" hard-coded in the service; logic in the HTTP handler.
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 - **Conditional `UPDATE` vs `SELECT ... FOR UPDATE` then `UPDATE`:** one round trip per item and no read-then-write gap; `FOR UPDATE` works but holds locks longer.
 - **Reserve at checkout, not at add-to-cart:** abandoned carts would starve real buyers; the cost is a late "out of stock".
@@ -1547,7 +1575,7 @@ Costs: two riders and two delivery fees, two ETAs to show, and partial cancellat
 
 **When to use this design:** any "hold limited stock before confirmation" problem: grocery stock, cinema seats, hotel rooms, wallet balance holds, coupon usage limits, rider capacity.
 
-## Drawing
+## Drawing 🟢
 
 ![[Inventory Order Assignment LLD Drawing.excalidraw]]
 
@@ -1555,7 +1583,7 @@ The drawing shows the `Service` facade with its four interfaces, the `PlaceOrder
 
 It predates the two leak fixes in Step 8: when you redraw it, add the "Save fails" and "BindKey fails" branches with their undo, the `refund.requested` event on cancel-after-payment, and the key lease with takeover and the attempt-number fence.
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- How do you stop two users from buying the last packet?
 > Make the check and the decrement one atomic step: `UPDATE inventory SET available_qty = available_qty - $1 WHERE store_id = $2 AND product_id = $3 AND available_qty >= $1`, and treat 0 rows affected as out of stock. The `CHECK (available_qty >= 0)` constraint is a second guard. The loser falls back to the next store.
@@ -1582,13 +1610,13 @@ It predates the two leak fixes in Step 8: when you redraw it, add the "Save fail
 > [!question]- No single store has all five items. What do you do?
 > Start by rejecting or offering to drop an item. The extension is split fulfilment: one shipment per store, each with its own reservation, placed as a saga that releases every shipment if any fails. It costs a second rider, fee and ETA, so the business has to want it.
 
-## Interview explanation
+## Interview explanation 🔴
 
 ```text
 I treat stock per store and product as the contended resource. PlaceOrder first claims the client's idempotency key with a short lease and an attempt number, so a retry can take over a claim whose process crashed while a late original stays fenced out; then a pluggable StoreSelector returns active stores within 3 km that have every item, nearest first. For each candidate I reserve all items with conditional decrements in one transaction, in product-id order; if any item fails I roll back and try the next store, so a store that sold its last unit a millisecond ago does not fail the order. The order is saved as reserved with a 10-minute payment hold, and the key is bound to it in the same transaction. Every undo runs with context.WithoutCancel so a client hang-up cannot leak stock, and if the key cannot be bound I cancel the order and free the key. A sweeper with an injected clock cancels unpaid orders, and every status change is a compare-and-set, so payment and expiry cannot both win. Cancelling a paid order releases stock and publishes refund.requested for the payment service, and order.created goes out for delivery assignment.
 ```
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - Stock lives per (store, product); reserve with a conditional decrement; `CHECK (available_qty >= 0)`.
 - Normalize and sort items: one lock order, no deadlocks.
@@ -1597,7 +1625,7 @@ I treat stock per store and product as the contended resource. PlaceOrder first 
 - Compensations use `context.WithoutCancel` and report errors with `errors.Join`.
 - Status moves are compare-and-set; expiry only from `reserved`; cancel-after-payment requests a refund.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Cart Checkout with Coupons]], [[State Machines in Go]], [[Repository and Unit of Work]], [[Concurrency for LLD]]
 - **Next:** [[Delivery Partner Assignment]], [[Food Ordering System]]

@@ -25,7 +25,33 @@ updated: 2026-11-13
 > - The review is owned jointly by the team shipping the service and an SRE/platform reviewer who did not write the code — a second set of eyes catches the blind spots the author has.
 > - Failing a PRR item blocks launch (or is explicitly risk-accepted by someone with the authority to accept that risk), it does not become a follow-up ticket by default.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Passing tests doesn't mean a service is ready for real users.
+A **Production Readiness Review** (PRR) is a checklist the service must pass before going live.
+It asks: can we see what it is doing? Will we be alerted if it breaks? Can someone else run it? Does it fail safely?
+
+```mermaid
+flowchart LR
+    B["Built + tested"] --> P{"PRR checklist passed?"}
+    P -- "yes" --> L["Go live"]
+    P -- "no" --> F["Fix gaps first"]
+```
+
+It is like a pilot's pre-flight checklist: not a debate about the plane's design, just "is everything set before take-off?".
+
+The rest of this note is just these 3 questions:
+1. What areas does the checklist cover?
+2. When in a service's life does the review happen?
+3. What does a real checklist look like, item by item?
+
 
 **The problem in one story.**
 Your team finishes a new payments service and wants to launch it on Friday.
@@ -83,7 +109,7 @@ flowchart LR
 
 Nine checklist areas fill in what "all items pass" means: SLOs, alerts, runbooks, dashboards, capacity, rollback, dependencies, security, and disaster recovery. The rest of this note is each of those areas done properly, with what "pass" looks like concretely.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A service passes every unit test, every integration test, and a code review. It gets deployed.
 
@@ -97,7 +123,7 @@ It is an operability gap — the kind of gap that testing and code review are no
 
 The review earns its cost by being concrete. "Do we have monitoring?" is a question anyone will answer yes to. "Paste the dashboard URL that shows p99 latency and error rate for this service, and show me the alert that fires if error rate exceeds the SLO's burn-rate threshold" is a question that either has an answer or doesn't.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a PRR as a pre-flight checklist, not a design review. A pilot's pre-flight checklist does not re-litigate whether the plane was built correctly — that happened in design and manufacturing (the equivalent of code review and testing).
 
@@ -119,7 +145,14 @@ The nine areas below are not arbitrary; each one answers a specific question an 
 | Security | Did we just expose something while firefighting? |
 | Disaster recovery | What if the whole region/database is gone? |
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words:** a written document plus a review meeting. Walk area by area: SLOs, alerts, dashboards, runbooks, capacity, failure handling, security.
+
+```mermaid
+flowchart LR
+    O["Observable?"] --> A["Alerted?"] --> R["Runbook exists?"] --> C["Capacity tested?"] --> F["Fails safely?"] --> G["Ready"]
+```
 
 A PRR is a document plus a meeting (or an async review for lower-stakes changes), walked through area by area against the service's actual artifacts — not against memory.
 
@@ -144,6 +177,8 @@ The reviewer trying the rollback command, not just reading that one exists, is t
 
 ### The lifecycle a PRR gates
 
+**In plain words:** the review sits between "it works" and "real users". Big later changes go through it again.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Drafting: Service built, passing tests
@@ -160,9 +195,11 @@ stateDiagram-v2
 
 A PRR is not one-and-done. The `Launched --> ReReview` transition matters as much as the initial gate: a service that passed its PRR at 50 RPS in one region needs another pass before it takes 10x the traffic or expands to a second region, because the capacity, dependency, and DR answers from the first review no longer hold.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### The checklist, area by area
+
+**In plain words:** each area is a few yes/no questions. Any "no" becomes a task before launch.
 
 **SLOs.** Does the service have a defined SLI (what's measured: request success rate, latency under a threshold) and an SLO (the target: "99.9% of requests succeed," "99% of requests complete under 300ms")?
 
@@ -202,7 +239,7 @@ Is there a documented and tested failover, and does it meet the business's Recov
 
 A PRR checks that DR has been exercised (a game day or a scheduled failover drill), not merely designed on a whiteboard.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Review type | When it runs | Scope | Typical owner |
 | --- | --- | --- | --- |
@@ -215,7 +252,7 @@ A PRR checks that DR has been exercised (a game day or a scheduled failover dril
 
 A PRR is deliberately narrower than an architecture review (it doesn't ask "was this the right design") and broader than a code review (it doesn't read the diff line by line). It complements both rather than replacing either.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A full PRR has real process cost: it takes a reviewer's time and can delay a launch.
 
@@ -224,7 +261,7 @@ A PRR is deliberately narrower than an architecture review (it doesn't ask "was 
 - It does not replace testing, code review, or a security review; it assumes those already happened and checks the operational surroundings they don't cover.
 - For a service that will only ever run for days (a short-lived migration job, a one-off batch), most of the alerting/on-call/DR items don't apply — drop them explicitly rather than forcing a fit, per the vault convention of leaving out sections with nothing specific to say.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Google's SRE book documents the Launch Coordination Checklist (Appendix E) used before any new service at Google takes production traffic, explicitly covering architecture, dependencies, capacity planning, and failure modes as a condition of launch.
 
@@ -238,7 +275,7 @@ A PRR is deliberately narrower than an architecture review (it doesn't ask "was 
   - Rollback "exists" but has never been exercised → require the reviewer to actually run it in staging as part of sign-off, not just confirm the runbook mentions it.
 - **What to monitor (after launch, to confirm the PRR's assumptions held):** actual SLO burn rate versus the budget assumed at review time, alert volume and false-positive rate in the weeks after launch, time-to-acknowledge and time-to-mitigate for the first real incidents (compares against what the runbook assumed), and whether the capacity plan's forecast peak matched the observed peak.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why "risk accepted" needs a named owner and a date, not just a checkbox.** A PRR item that fails but is waived without an accountable owner tends to stay waived forever — there's no mechanism forcing a revisit.
 
@@ -252,7 +289,7 @@ A PRR is deliberately narrower than an architecture review (it doesn't ask "was 
 
   A change-triggered PRR for a mature service should scope down to exactly what the change affects — a new region needs DR and dependency review, a 10x traffic increase needs capacity and alerting-threshold review — re-running the full nine areas every time creates checklist fatigue and teams start rubber-stamping.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is a Production Readiness Review, and what does it not check?
 > A checklist gate, run before a service takes real production traffic (or before a major change to one), covering SLOs, alerts, runbooks, dashboards, capacity, rollback, dependencies, security, and disaster recovery.
@@ -287,7 +324,7 @@ A PRR is deliberately narrower than an architecture review (it doesn't ask "was 
 >
 > Block sign-off until the artifact exists, or if genuinely out of scope for this launch, require an explicit risk acceptance from a named owner with a date to revisit, not a silent pass.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Nine areas: SLOs, alerts, runbooks, dashboards, capacity, rollback, dependencies, security, disaster recovery.
 - Every item needs a linked artifact (dashboard URL, runbook doc, tested command) — "we thought about it" does not pass.

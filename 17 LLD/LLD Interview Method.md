@@ -23,7 +23,32 @@ updated: 2026-11-13
 > - The score is mostly correctness of the hard method, clean boundaries, and how you handle concurrency and failure, not how many patterns you name.
 > - Classic failure: drawing 15 classes, coding getters, and never reaching the method where the race lives.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+In a **low-level design** (LLD) round, you get a vague task like "design a parking lot".
+You have about an hour to turn it into classes, method names and working code.
+Most people panic and start coding at once. Then they miss rules and run out of time.
+This note gives you one fixed order of 10 steps: ask questions, list the things (entities), link them, write the methods, then code.
+Each step has a time box, so you always know if you are behind.
+Every practice problem in this folder uses the same 10 steps, so the order becomes a habit.
+
+```mermaid
+flowchart LR
+    Q["Ask questions"] --> E["Name the things"] --> M["Write method names"] --> C["Code the hard part"] --> T["Test + edge cases"]
+```
+
+The rest of this note is just these 3 questions:
+1. What are the 10 steps, and how long does each get?
+2. How do you lead the talk with the interviewer?
+3. Which part of the code do you write first?
+
 
 **The problem in one story.**
 An interviewer says "design a parking lot" and starts a 60-minute timer.
@@ -67,7 +92,7 @@ Where it breaks: in a real kitchen nobody stops you to ask "what if two chefs gr
 > [!tip] Remember
 > Same 10 steps every time, keep the early steps short, and spend the biggest block on the hardest method.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An LLD question is deliberately under-specified. "Design a movie ticket booking system" can mean a 2-hour product spec or a 40-line seat-locking function. Without a method, candidates do one of two things:
 
@@ -86,7 +111,13 @@ In a 60-minute round you have roughly 45 minutes of design and coding once intro
 
 LLD sits between the two others: one process, in memory, but correct under concurrency. When the interviewer says "now assume 3 instances behind a load balancer", you are being pulled toward HLD; answer with the database-level version (see Step 10).
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    N["No method: code at minute 2"] --> X["Miss rules, rewrite at minute 40"]
+    Y["10 steps: code at minute 20"] --> OK["Right design, time for edge cases"]
+```
+
+## 2. Mental model 🟢
 
 Think of the 10 steps as **zooming in**. You start with the whole problem in one sentence and end with one function and its tests. Every step narrows the next:
 
@@ -98,7 +129,7 @@ Think of the 10 steps as **zooming in**. You start with the whole problem in one
 
 **Analogy:** an architect visiting a client. They ask how many people live there and what rooms they need before they draw walls, and they draw walls before they choose the tiles. Patterns are the tiles.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The 10 steps with time boxes
 
@@ -141,6 +172,8 @@ Each step has one output you write on the shared doc or whiteboard:
 
 ### Time boxes by round length
 
+**In plain words: how many minutes each step gets in a 45, 60 or 90 minute round.**
+
 All numbers below are planning targets (estimates), not rules from any company.
 
 | Step block | 45-min round | 60-min round | 90-min machine coding |
@@ -160,6 +193,8 @@ Rules of thumb behind the table:
 
 ### Driving the requirements
 
+**In plain words: you suggest an answer and ask "is that OK?", instead of asking open questions.**
+
 You drive; the interviewer confirms. The pattern is **propose, then ask**: "I'll assume a seat is held for 5 minutes while the user pays. Is that fine?" A proposal gets a yes or a correction in 5 seconds; an open question ("how long should a hold be?") often gets "what do you think?" back.
 
 Question bank by problem type (pick 3–5, not all):
@@ -175,7 +210,18 @@ Question bank by problem type (pick 3–5, not all):
 
 Always ask the two questions that change the code most: **"Can two requests touch the same thing at the same time?"** and **"What happens if a step fails halfway?"**
 
+```mermaid
+sequenceDiagram
+    participant Y as You
+    participant I as Interviewer
+    Y->>I: I will assume 3 floors and 2 gates, OK?
+    I-->>Y: Yes, and add bikes
+    Y->>Y: write it down, move on
+```
+
 ### Choosing the hardest method
+
+**In plain words: pick the one method where bugs and races live, and code that first.**
 
 After step 5, point at one signature and say "this is where the correctness lives, I'll code it". The hardest method is the one with:
 
@@ -193,6 +239,8 @@ After step 5, point at one signature and say "this is where the correctness live
 | Splitwise | `SimplifyDebts` | Sum of balances stays zero |
 
 ### Code layout in a round
+
+**In plain words: one package and a handful of files is enough in an interview.**
 
 For a 45–60 minute round, one package with five files is enough. Put the layout on screen before you code so the interviewer sees the boundaries:
 
@@ -221,7 +269,7 @@ dark-store/
 
 Package by domain (`internal/order`, `internal/inventory`), not by technical layer (`models/`, `services/`), because a change to "orders" then touches one folder. The `internal/` directory makes those packages importable only from inside this module. The full production layout is in [[Service Project Layout and Wiring]].
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 Problem: "Design movie ticket booking. Users pick seats for a show, hold them while paying, and confirm." Here is the method applied with the outputs you would actually write.
 
@@ -330,6 +378,8 @@ func (s *Service) HoldSeats(showID string, ids []string) (Hold, error) {
 The two loops run under one lock, so no other caller can sneak in between "check" and "mark". This is the whole answer to "how do you prevent double booking in one process".
 
 ### Step 8, core code (tested)
+
+**In plain words: the core code for the example problem, with tests. Skim the method names first.**
 
 ```go
 // Package booking is the 45-minute core of a movie-booking round:
@@ -464,6 +514,8 @@ func (s *Service) Confirm(holdID string) error {
 
 ### What to test
 
+**In plain words: three small tests cover what interviewers ask about most.**
+
 Three tests cover what interviewers ask about most:
 
 - **Winner test:** N goroutines race for the same seat; exactly one wins and N−1 get `ErrSeatTaken`. Run it with `-race`.
@@ -564,7 +616,7 @@ Measured: `go vet` is clean and `go test -race -count=1` passes on Go 1.24.4 (da
 
 **Step 10, trade-offs:** one mutex for all shows is simple and correct but serialises every show; a lock per show removes that contention (see [[Concurrency for LLD]]). With 3 service instances the mutex no longer protects anything, so the hold moves into the database as a conditional `UPDATE` or `SELECT ... FOR UPDATE`. A hold is a lease: it trades a little seat availability (abandoned holds block seats for 5 minutes) for never charging two people for one seat.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it runs | Use when | Cost |
 | --- | --- | --- | --- |
@@ -574,7 +626,7 @@ Measured: `go vet` is clean and `go test -race -count=1` passes on Go 1.24.4 (da
 | **Class-diagram first (UML)** | Draw the full class diagram, then code | Some Java-heavy panels expect it | Long diagrams eat the clock; keep it to 6–8 classes (see [[UML for LLD]]) |
 | **Code first, explain later** | Start typing at minute 2 | Never as a plan; only when told "just code it" | Wrong model, rewrites, no shared understanding |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Do not run all 10 steps at the same depth.** For [[LRU Cache with TTL]] steps 2–4 are one line each ("one actor, two entities: entry and list"); go straight to the data structure. For [[Splitwise Expense Sharing]] step 4 deserves time.
 - **Skip step 6 in pure in-memory rounds** if the interviewer says "no persistence". Still keep a repository interface if it makes testing easier, and say why in one sentence.
@@ -582,7 +634,7 @@ Measured: `go vet` is clean and `go test -race -count=1` passes on Go 1.24.4 (da
 - **The method can make you slow** if you write long prose at each step. The output of each step is a few lines, not a paragraph.
 - **When the interviewer redirects, follow.** If they say "skip requirements, I'll give them to you", jump to step 3 and keep the order from there.
 
-## 7. In production
+## 7. In production 🔴
 
 The same steps map onto real design work, which is why interviewers use them:
 
@@ -611,7 +663,7 @@ The same steps map onto real design work, which is why interviewers use them:
 | Extensibility | One interface where variation is real | Interfaces everywhere, or none where needed |
 | Communication | Narrates decisions and trade-offs as they happen | Long silences, then a code dump |
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Narrating trade-offs.** A trade-off statement has three parts: the choice, its cost, and the condition to switch. "I hold seats with one mutex; that serialises all shows, which is fine for one process; if contention shows up I'd switch to a lock per show." Practise saying one of these per step 7–10.
 
@@ -625,7 +677,7 @@ The same steps map onto real design work, which is why interviewers use them:
 
 **Machine-coding specifics.** In a runnable round, add a thin driver: a loop that reads commands such as `hold show-1 A1 A2` from standard input and calls the service. Keep it in `main.go` so the service stays testable without it.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the difference between an HLD round, an LLD round and a machine-coding round?
 > HLD is services, storage and scale across machines. LLD is classes, interfaces and method signatures inside one service, with one or two methods coded. Machine coding is a runnable program in 60–120 minutes. LLD questions often end with an HLD twist: "now run 3 instances".
@@ -648,7 +700,7 @@ The same steps map onto real design work, which is why interviewers use them:
 > [!question]- What does the interviewer score most heavily?
 > A correct, tested hard method with its concurrency and failure handling, and clear explanation of choices. Pattern names count for little; a pattern with no varying part counts against you.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - 10 steps: requirements, use cases, entities, relationships, APIs, storage, patterns, code, edge cases, trade-offs.
 - Time: steps 1–4 at most a quarter, code is the biggest block (40–50%); in machine coding compress design to a few lines.
@@ -659,7 +711,7 @@ The same steps map onto real design work, which is why interviewers use them:
 - Layout: one package with model, errors, repository, service, test; `internal/<domain>` for bigger rounds.
 - Every trade-off: choice, cost, when to switch.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[OOP in Go - Structs, Interfaces, Embedding]], [[Design Principles - DRY, KISS, YAGNI, Coupling and Cohesion]]
 - **Next:** [[UML for LLD]], [[Design Patterns Overview and Chooser]], then practise on [[Parking Lot]] and [[Movie Ticket Booking]]

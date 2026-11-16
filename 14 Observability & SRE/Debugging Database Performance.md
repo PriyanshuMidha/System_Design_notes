@@ -26,7 +26,39 @@ updated: 2026-11-13
 > - Go's connection pool exhaustion (`sql.DBStats.WaitCount`) looks identical to a slow query from the outside — the client just waits longer — so check it before blaming the database.
 > - Stale planner statistics make PostgreSQL pick a bad plan even with the right index in place; `ANALYZE` is often the one-line fix nobody tries first.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+An endpoint is slow, and the trace says most of the time is in the database.
+There are only a few usual suspects: a slow query, a missing **index** (the database's lookup table, like a book index), a lock, too few connections, or too many small queries.
+
+```mermaid
+flowchart LR
+    S["Slow DB time"] --> Q["Bad plan / missing index"]
+    S --> L["Waiting on a lock"]
+    S --> P["Connection pool full"]
+    S --> N["Too many queries (N+1)"]
+```
+
+Don't guess. Check them in a fixed order with a few built-in Postgres tools.
+Fix only what the evidence points to.
+
+```mermaid
+flowchart LR
+    A["1. Which query? (pg_stat_statements)"] --> B["2. How does it run? (EXPLAIN)"] --> C["3. Waiting? (pg_stat_activity)"] --> D["4. Pool full? (sql.DBStats)"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you find the slowest queries?
+2. How do you read a query plan?
+3. How do you tell a slow query from a lock or a full pool?
+
 
 **The problem in one story.**
 A web page that used to load in a blink now takes 4 seconds.
@@ -71,7 +103,7 @@ Where it breaks: in a database, several of these can happen at once and feed eac
 > [!tip] Remember
 > A slow DB span has five suspects; collect evidence for each before you change anything.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A dashboard-rendering endpoint goes from 80ms p99 to 4 seconds p99 over a week, with no deploy in between. The trace shows 3.9 of those 4 seconds inside a single DB span. Three engineers independently assume three different causes: "we need an index," "the pool is too small," "it's locks from the backup job." Only one measurement settles it — and it's rarely the first guess, because the real distribution of root causes in production is wider than "add an index": data growth silently changing a plan from an index scan to a sequential scan, a long-running report holding a row lock, or a connection pool sized for yesterday's traffic.
 
@@ -79,7 +111,7 @@ A dashboard-rendering endpoint goes from 80ms p99 to 4 seconds p99 over a week, 
 
 Every query against that table now reads 1.2M rows end to end, average query time goes from 4ms to 850ms, every connection serving that tenant now holds a database connection nearly 200× longer, and the pool that served 25 concurrent requests comfortably now queues.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture the request's time in the database as one of four doors, and only one is the real exit:
 
@@ -95,9 +127,11 @@ flowchart TD
 
 Each branch has a different fix. Adding an index does nothing for a lock wait. Scaling the pool does nothing for a bad plan. The job is to pick the right branch with evidence, not intuition.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Step 1 — Find the query: `pg_stat_statements`
+
+**In plain words:** Postgres keeps a scoreboard of every query and how much total time it used. Sort by total time to find the worst.
 
 `pg_stat_statements` (a standard extension, enabled via `shared_preload_libraries`) tracks every distinct query shape with aggregate statistics:
 
@@ -128,6 +162,8 @@ Sort by **total time** (`calls × mean_exec_time`), not mean time alone: a query
 `calls` also tells you N+1 at a glance: 198,400 calls to fetch line items for an endpoint hit 50 times a second is a strong N+1 signal before you even look at the query text.
 
 ### Step 2 — Read the plan: `EXPLAIN (ANALYZE, BUFFERS)`
+
+**In plain words:** ask Postgres to run the query and show each step it took and how long. Look for big full-table scans.
 
 ```sql
 EXPLAIN (ANALYZE, BUFFERS)
@@ -161,6 +197,8 @@ Three things to read, in order:
 `CONCURRENTLY` avoids taking the write lock that a plain `CREATE INDEX` would hold for the build's duration — essential on a table serving live traffic. A partial index (`WHERE status = 'open'`, if only open invoices are ever queried this way) or a covering index (`INCLUDE (total_cents)` to let the query answer from the index alone) can shrink this further once the base composite index is in place — see [[Indexing Fundamentals]] for when each applies.
 
 ### Step 3 — Rule out locks: `pg_stat_activity`
+
+**In plain words:** a query might not be slow at all, just waiting for another one to let go of a row. This view shows who waits on whom.
 
 A query that is simply *waiting*, not running, looks identical in `pg_stat_statements`'s mean time but shows a wait event here:
 
@@ -204,6 +242,8 @@ If two sessions instead each hold a lock the other needs, PostgreSQL's deadlock 
 
 ### Step 4 — Rule out the pool: `sql.DBStats`
 
+**In plain words:** if all connections are busy, new requests wait in your Go app before even reaching the database.
+
 From the Go side, a connection pool at its ceiling produces symptoms indistinguishable from a slow database unless you check the pool's own counters:
 
 ```go
@@ -215,7 +255,7 @@ stats := db.Stats()
 
 `MaxOpenConns` caps total connections; `MaxIdleConns` caps how many sit ready between requests (too low and the pool churns new connections constantly); `ConnMaxLifetime` forces periodic recycling so connections don't outlive a failover or a PgBouncer-side timeout.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -336,7 +376,7 @@ func TestDiagnosePlanNodeStaleStatistics(t *testing.T) {
 
 Two further cases behave the same way under the same logic: a sequential scan reading 1,000,000 actual rows against an estimate of 1,000,000 (no staleness, since estimate and actual agree) is flagged as a missing index, while the same node type reading 42 rows on a 40-row estimate is left `DiagnosisOK` (small lookup tables are fine to scan sequentially).
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Symptom source | What it tells you | What it never tells you | Primary tool |
 | --- | --- | --- | --- |
@@ -346,14 +386,14 @@ Two further cases behave the same way under the same logic: a sequential scan re
 | `sql.DBStats` (client) | Whether the app's own pool is the bottleneck | Anything happening inside PostgreSQL itself | Go `database/sql` |
 | Replica lag (`pg_stat_replication`) | Whether a read replica is serving stale data, and by how much | Whether the primary itself is slow | `pg_stat_replication` |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - `pg_stat_statements` normalizes query text (parameters replaced with `$1`, `$2`), so two very differently-performing executions of the same query shape (different tenant sizes) are blended into one row's average — pair it with sampled individual `EXPLAIN` runs, not statistics alone.
 - `CREATE INDEX CONCURRENTLY` avoids blocking writers but takes roughly twice as long to build and can fail partway (leaving an invalid index to clean up) — acceptable on a live table, unnecessary overhead on a maintenance window where a plain `CREATE INDEX` is fine.
 - Adding an index always costs write throughput and storage; an index that helps one rare report query but is never used otherwise is a tax on every insert — check `pg_stat_user_indexes.idx_scan` periodically and drop unused ones.
 - PgBouncer in transaction-pooling mode breaks session-level features (prepared statements across transactions, `SET` outside a transaction, advisory locks held across statements) — know which mode you're in before assuming a connection behaves like a direct one.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** PgBouncer in transaction-pooling mode is the standard way to multiplex thousands of application connections onto a much smaller set of real PostgreSQL backends, because each backend process has real memory overhead; Stripe and GitHub have both written publicly about hitting exactly this five-suspect list (plan, index, lock, pool, N+1) in incident retrospectives.
 - **Failure modes → fixes:**
@@ -363,7 +403,7 @@ Two further cases behave the same way under the same logic: a sequential scan re
 	- A single hot row (a shared counter) serializing every writer → see [[Hot Keys and Hot Partitions]] for sharding the counter instead of tuning the query.
 - **What to monitor:** `pg_stat_statements` total time leaderboard (weekly review, not just during incidents); `sql.DBStats.WaitCount` and `WaitDuration` trending; `pg_stat_activity` long-running and `idle in transaction` sessions (alert past a few minutes); replica lag; autovacuum lag (`last_autovacuum` age) on write-heavy tables.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Generic vs. custom plans for prepared statements.** PostgreSQL decides, after a handful of executions, whether to keep re-planning a parameterized query (a "custom" plan, tailored to the actual parameter values) or switch to a single cached "generic" plan.
 
@@ -374,7 +414,7 @@ Two further cases behave the same way under the same logic: a sequential scan re
   See [[N+1 Query Problem]] for the fix patterns (batching, `JOIN`, dataloader-style batching).
 - **Safe production remediation.** `pg_cancel_backend(pid)` politely asks a session to cancel its current statement (SIGINT-equivalent); `pg_terminate_backend(pid)` kills the whole connection (SIGTERM-equivalent) and is the only option for a session stuck `idle in transaction`. Prefer `statement_timeout` and `idle_in_transaction_session_timeout` as standing guardrails so you rarely need either manually, mid-incident.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- A dashboard endpoint slows down only for one tenant with a very large account. What do you check first?
 > `pg_stat_statements` to confirm which query dominates that endpoint's DB time, then `EXPLAIN (ANALYZE, BUFFERS)` with that tenant's actual ID as the parameter (not a small tenant's, since PostgreSQL may have cached a generic or differently-skewed plan). Look specifically at actual vs. estimated rows and whether the chosen index is selective for the filter that matters, not just present.
@@ -394,7 +434,7 @@ Two further cases behave the same way under the same logic: a sequential scan re
 > [!question]- Your Go service's p99 spikes, but `pg_stat_statements` shows no slow queries. Where do you look next?
 > Check `sql.DBStats` for `WaitCount`/`WaitDuration` — the pool itself may be the bottleneck, with every individual query running fast once it finally gets a connection. This is common after a traffic increase that outpaced `MaxOpenConns`, or after a code change that holds connections longer than intended (a `defer rows.Close()` missing on an error path, for example).
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Five suspects for a slow DB span: bad plan, missing index, lock wait, pool wait, N+1. Each has its own tool — don't guess.
 - `pg_stat_statements`, sorted by total time (`calls × mean_exec_time`), finds the query worth investigating.

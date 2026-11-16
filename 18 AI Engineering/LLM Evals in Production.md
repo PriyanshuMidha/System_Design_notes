@@ -25,7 +25,40 @@ updated: 2026-11-13
 > - **Offline evals gate a deploy** (CI, before anything ships); **online evals watch a deploy** (A/B tests, shadow traffic, canaries, after it ships) — they answer different questions and you need both.
 > - An eval suite is only as trustworthy as its correlation with human judgment: calibrate your judge against human labels before trusting its score.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Normal tests check `output == "30 days"`. AI answers can be right in many different wordings, so that check fails.
+
+An **eval** is a test made for AI answers. It checks for meaning, like "does the answer mention 30 days and not invent a fee?".
+
+```mermaid
+flowchart LR
+    C["Prompt change"] --> T["Try 10 questions by hand"] --> S["Ship"] --> B["Refund answer broke,<br/>nobody noticed"]
+```
+
+You keep a fixed list of questions (a **dataset**) and run it on every prompt or model change. If the pass rate drops, the change is blocked, like a failing unit test.
+
+```mermaid
+flowchart LR
+    P["Prompt / model change"] --> E["Run eval set"] --> G{"Pass rate OK?"}
+    G -- "yes" --> M["Merge"]
+    G -- "no" --> B["Block and fix"]
+```
+
+Some checks are simple code. Some use another AI as the grader. A few need a human.
+
+The rest of this note is just these 3 questions:
+1. What kinds of checks exist, from cheap to costly?
+2. What goes in the dataset, and when do you run it?
+3. How do you trust the grader and keep the set fresh?
+
 
 **The problem in one story.**
 You tweak the prompt of your support bot so it sounds friendlier.
@@ -73,7 +106,7 @@ Where it breaks: a teacher grades consistently with experience, while an LLM jud
 > [!tip] Remember
 > Evals are unit tests for fuzzy output: run cheap checks first, gate merges offline, watch real traffic online, and feed every failure back into the dataset.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Say you ship a support-bot feature backed by an LLM, and you manually try ten questions before every deploy: they look fine, you ship. Three weeks later a prompt tweak meant to fix formatting quietly breaks the bot's refund-policy answer for a class of question your ten manual tries never covered — a customer gets told the wrong refund window, and nobody notices until support tickets spike.
 
@@ -81,7 +114,7 @@ An eval suite is the fix: a fixed set of representative and adversarial question
 
 "Does my new prompt still get the 30-day refund window right" becomes a single assertion that runs in CI, the same way a regression test catches a broken function before it reaches production — except the assertion has to work on free-form text, not `want == got`.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Treat an LLM feature's correctness the way you'd treat any other software behavior under test, but swap the assertion style: instead of `assert output == "30 days"`, you assert "output contains 30 days" (code assertion), or "output's meaning matches this reference answer" (reference-based / LLM-as-judge), because the model will phrase a correct answer differently every time.
 
@@ -89,9 +122,11 @@ The dataset of cases plays the same role a table-driven test's cases play; the e
 
 The twist unit tests don't have: your "assertion function" is sometimes itself a model call (an LLM judge), which means the test can be wrong in its own right — so part of running evals seriously is testing the judge against human labels, the way you'd validate any measurement instrument before trusting its readings.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The eval loop
+
+**In plain words:** Run the questions, score the answers, compare to last time, then read the failures to learn why.
 
 ```mermaid
 flowchart LR
@@ -108,6 +143,8 @@ flowchart LR
 The loop closes on itself: failures found in production (user complaints, flagged outputs, low feedback scores) become new dataset cases, so the eval set grows to cover exactly the mistakes that actually happened, not just the ones you guessed at upfront.
 
 ### Four eval kinds
+
+**In plain words:** Four ways to grade, from cheapest to costliest: code check, compare to a model answer, AI grader, human.
 
 ```mermaid
 flowchart TB
@@ -127,13 +164,24 @@ flowchart TB
 
 ### Dataset composition
 
+**In plain words:** Your question list needs a mix: clear core questions, tricky ones and attacks, and real questions from users.
+
 | Set | What's in it | Why it exists |
 | --- | --- | --- |
 | Golden | Hand-picked cases with a clearly correct answer, covering your feature's core use cases | Catches obvious regressions fast; the floor every change must clear |
 | Adversarial | Deliberately hard, ambiguous, or malicious cases (edge-case phrasing, prompt-injection attempts, out-of-scope questions) | Catches the failures that matter most and are easiest to miss by only sampling "normal" traffic |
 | Production-sampled | Real user queries (and their outcomes: thumbs up/down, follow-up questions, support escalations) pulled from logs | Keeps the eval set honest about what your users actually ask, which drifts over time |
 
+```mermaid
+flowchart LR
+    G["Golden: clear core questions"] --> D["Eval dataset"]
+    A["Adversarial: tricky wording,<br/>attacks"] --> D
+    R["Production-sampled:<br/>real user questions"] --> D
+```
+
 ### Offline vs online: two different gates
+
+**In plain words:** Offline = test before you ship. Online = keep watching real traffic after you ship.
 
 ```mermaid
 sequenceDiagram
@@ -156,13 +204,22 @@ sequenceDiagram
 
 ### The error-analysis loop
 
+**In plain words:** Don't just look at the score. Read the failures and group them by cause.
+
 Every eval failure is a lead, not just a number. Reading failing cases, grouping them by root cause ("it's always the ambiguous-pronoun questions", "it's always when the retrieved context has more than 3 chunks") and turning the pattern into either a prompt fix or a new dataset case is what keeps an eval suite from becoming a stale, un-trusted ritual.
 
 Treat a dropping pass rate the way you'd treat a dropping test-coverage number: as the start of an investigation, not the end of one.
 
-## 4. Worked example
+```mermaid
+flowchart LR
+    F["Failing cases"] --> R["Read them"] --> G["Group by cause"] --> X["Fix biggest group"] --> N["Add new test cases"] --> F
+```
+
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** The simplest eval: run the model over each question, check with plain code, count the passes.
 
 The bare idea: run a model function over cases, check each with a plain assertion, compute a pass rate:
 
@@ -455,7 +512,9 @@ ok  	evals	1.534s
 | Judge-rated helpfulness (mean, 0–1) | 0.86 | 0.84 | >= 0.80 — passed |
 | p99 latency | 1.8s | 1.9s | <= 2.5s — passed |
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
+
+**In plain words:** Same four grading kinds, side by side with when to use each and what they cost.
 
 | Eval kind | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -465,7 +524,7 @@ ok  	evals	1.534s
 | Pairwise (A/B) judge | A model picks the better of two outputs for the same input | Comparing two prompt/model versions directly, without needing an absolute scale | Only tells you relative quality, not an absolute bar |
 | Human review | A person reads and scores output | Ground truth, judge calibration, high-stakes or ambiguous cases | Slow, expensive, doesn't scale to every CI run |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **A judge is a model, and models have blind spots.** A naive LLM judge measurably favors longer, more confident-sounding answers over shorter correct ones — calibrate against human labels before trusting a judge's absolute score, and prefer pairwise comparisons where you can.
 - **Code assertions can't check what they can't express.** "Is this answer helpful" has no regex; don't force a judge-shaped problem into a keyword check just to avoid the extra model call.
@@ -473,7 +532,7 @@ ok  	evals	1.534s
 - **For a one-off internal script with no users**, a quick manual spot-check is a reasonable call — the cost of building a full eval harness only pays off once a feature has users and will keep changing.
 - **Online evaluation needs real traffic volume to be statistically meaningful**; for a low-traffic feature, lean more heavily on offline evals and manual review of a 100% sample instead of a canary that won't reach significance for weeks.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** LangSmith and Langfuse (tracing + dataset + eval runs, often paired with LangGraph-based agents — verify current feature sets), promptfoo (config-driven, CI-first prompt testing), Braintrust (eval + experiment tracking) — note these product names and feature sets change quickly in 2026; evaluate current docs before committing to one.
 - **Failure modes → fixes:**
@@ -483,7 +542,7 @@ ok  	evals	1.534s
   - Eval dataset and the feature's prompt drift out of sync (dataset was written for an old prompt format) → version the dataset alongside the prompt and model in the same change, not separately.
 - **What to monitor:** golden/adversarial pass rate per release; judge-vs-human agreement rate (recalibrate below some set threshold, e.g. 85%); online metrics during canary (latency, user feedback/thumbs rate, escalation rate) against the baseline; dataset size and freshness (days since last production-sampled case was added).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Calibrating a judge properly** means periodically sampling judge-scored cases, having a human independently score the same cases, and computing agreement (e.g. Cohen's kappa, or simple correlation for continuous scores). A judge that disagrees with humans more than it agrees is worse than no automated check — it will actively mislead a CI gate.
 - **Versioning prompts, models and datasets together** matters because an eval result is only meaningful relative to the exact combination that produced it: "prompt v12 against model X scored 94% on dataset v7" is a reproducible claim; "it scored 94%" is not. Store all three identifiers alongside every eval run.
@@ -491,7 +550,7 @@ ok  	evals	1.534s
 - **CI gates should fail loud, not silent.** A gate that logs a warning but doesn't block the merge gets ignored within a quarter; tie it to the actual merge-blocking status check, the same discipline as any other required CI check.
 - **Cost of running evals at scale**: a judge call per case, per PR, adds up — many teams run the full adversarial+golden set on every PR but sample a smaller, faster subset for every commit, reserving the full set for pre-release gates.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why can't you just unit-test an LLM feature the normal way?
 > A unit test asserts exact equality; an LLM's correct answer can be phrased many ways. Evals swap the assertion for something suited to natural language — a keyword/regex check, a reference comparison, or another model scoring against a rubric — while keeping the rest of the testing discipline (a fixed dataset, CI, a pass/fail gate) the same.
@@ -513,7 +572,7 @@ ok  	evals	1.534s
 > [!question]- A teammate wants to skip the adversarial dataset to save CI time, keeping only the golden set. What's the risk?
 > The golden set is built from cases you already expect to work; it mostly catches regressions on what you already got right. The adversarial set — ambiguous phrasing, injection attempts, out-of-scope questions — is where most real production failures actually live, so dropping it removes the part of the suite most likely to catch the next incident.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Evals are automated tests for non-deterministic output: fixed dataset, repeatable scoring, CI gate.
 - Four kinds, cheapest first: code assertion → reference-based → LLM-as-judge → human review.
@@ -524,7 +583,7 @@ ok  	evals	1.534s
 - Break pass rate down per use-case category; a single blended number hides where the regression actually is.
 - Feed production failures back into the dataset — a suite that never grows goes stale.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Prompt Engineering]], [[RAG Evaluation]]
 - **Next:** [[Guardrails and LLM Security]], [[LLM Observability]]

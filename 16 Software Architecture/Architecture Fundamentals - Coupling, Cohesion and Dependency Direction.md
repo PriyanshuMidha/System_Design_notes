@@ -24,7 +24,33 @@ updated: 2026-11-13
 > - Go gives you three structural tools for this: packages, the `internal/` directory, and interfaces declared where they are consumed, not where they are implemented.
 > - There is no one correct architecture. The right one depends on domain complexity, team size and how many external systems you integrate with, and it is allowed to change as the service grows.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+**Architecture** is the set of choices that are hard to change later.
+Where do you draw lines between parts of the code? Which part may know about which?
+**Coupling** is how much one part depends on another. Less is better: you can change one part without breaking the other.
+**Cohesion** is how well the things inside one part belong together. More is better.
+The most important rule is the direction of arrows: your business rules should not depend on the database or the web framework.
+Instead, the database code depends on the business rules. Every pattern in this folder is a way to keep that arrow pointing the right way.
+
+```mermaid
+flowchart LR
+    DB["Database code"] --> CORE["Business rules"]
+    WEB["Web handlers"] --> CORE
+```
+
+The rest of this note is just these 3 questions:
+1. What do coupling and cohesion really mean in Go code?
+2. How do you point dependencies the right way?
+3. How do you pick an architecture style?
+
 
 **The problem in one story.**
 You change how invoices are saved to the database.
@@ -65,7 +91,7 @@ Where it breaks: a socket standard is fixed for decades; your own interfaces wil
 > [!tip] Remember
 > Low coupling, high cohesion, and dependencies point toward the code that changes least.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A two-person team building InvoiceOps starts with one package: `main.go` calls the Postgres driver directly inside the HTTP handler that creates an invoice. For the first month this is the fastest way to ship.
 
@@ -77,7 +103,20 @@ The HTTP handler and the SQL driver are one unit, so testing one means running t
 
 **Measured, in this vault's own history:** the old note this one replaces (`Architecture Patterns Content Table`) scored about half "real content" against a template — roughly half its lines were definitions without ever drawing the dependency arrows a reader needs to apply them. This note exists to fix that: concrete arrows, not just names.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    subgraph Tangled
+      A1["Billing"] <--> B1["Email"]
+      B1 <--> C1["DB"]
+      A1 <--> C1
+    end
+    subgraph Clean
+      A2["Email"] --> B2["Billing rules"]
+      C2["DB"] --> B2
+    end
+```
+
+## 2. Mental model 🟢
 
 Think of every package or service as a cell with a wall. The wall decides two things: what can cross it, and which side initiates the crossing.
 
@@ -86,9 +125,16 @@ Think of every package or service as a cell with a wall. The wall decides two th
 
 **Analogy:** a restaurant kitchen. The chef (your domain logic) does not know or care which supplier delivered today's tomatoes (a database, an email provider, a payment gateway) — a line cook (an adapter) deals with the delivery truck and hands the chef prepared ingredients in the shape the chef already expects. Swap suppliers and the chef's recipes do not change.
 
-## 3. How it works
+```mermaid
+flowchart LR
+    LC["Low coupling<br/>few, thin links"] --- HC["High cohesion<br/>related code together"] --> G["Easy to change one part"]
+```
+
+## 3. How it works 🟡
 
 ### What architecture actually decides
+
+**In plain words: a short list of the big, costly-to-change choices, shown on one example app.**
 
 | Decision | Example for InvoiceOps |
 | --- | --- |
@@ -99,6 +145,8 @@ Think of every package or service as a cell with a wall. The wall decides two th
 
 ### Coupling: four kinds that matter at this level
 
+**In plain words: four ways one package can be tied to another, from "many depend on me" to "I know your internals".**
+
 - **Afferent coupling** (incoming): how many other packages depend on this one. A `domain` package with high afferent coupling and few dependencies of its own is a stable, trustworthy core.
 - **Efferent coupling** (outgoing): how many other packages this one depends on. High efferent coupling on concrete adapters (a specific SQL driver, a specific HTTP client) means a change to any of them can break you.
 - **Temporal coupling**: two components only work if called in a specific order or at the same time (service A must deploy before service B reads its new field). Invisible in the code, visible only at runtime or deploy time.
@@ -107,6 +155,8 @@ Think of every package or service as a cell with a wall. The wall decides two th
 Deployment coupling is a fifth, operational kind: if two packages must always be deployed together to work, they are one deployment unit whatever the repository layout says.
 
 ### Cohesion and Go package shape
+
+**In plain words: keep things that change together in the same package.**
 
 Cohesion asks: do the things inside this boundary belong together? Two ways to slice the same InvoiceOps handlers:
 
@@ -129,6 +179,8 @@ Package-by-layer groups files that change for the *same reason* (all repositorie
 Package-by-feature is the common Go default once a service has more than a handful of entities: each feature package is cohesive, and only the handful of things every feature needs (a shared `Invoice` ID type, a logger) live in a small, genuinely shared package — never a catch-all `utils`.
 
 ### Dependency inversion with a consumer-defined interface
+
+**In plain words: the business code says "I need something that can save an invoice"; the database code provides it.**
 
 The direction that makes testable, swappable architecture possible: the package that *uses* a capability declares the interface, in its own package, in the shape it needs.
 
@@ -164,11 +216,15 @@ Three consequences fall out of this one picture:
 
 ### Go-specific boundary tools
 
+**In plain words: Go gives you tools to stop the wrong imports: internal folders, small interfaces, and lint rules.**
+
 - **`internal/`**: any package under a directory named `internal` is importable only by code rooted at its parent. `internal/domain` can be shared across your own `cmd/` binaries but never imported by another module — this is how Go enforces "this is ours, not a public API" at compile time, not by convention.
 - **Import cycles are a compile error.** If `domain` imports `adapters/postgres` and `adapters/postgres` imports `domain`, `go build` refuses to build it. Go turns "we have a circular dependency" from an architecture smell into a build failure, which is why the arrow in the diagram above only ever points one way.
 - **No `utils` dumping ground.** A package named `utils` or `common` that keeps growing is a sign that cohesion was never decided; split it by what each function is actually about (`timeutil`, `moneyutil`), or better, put the function next to its one caller until a second caller proves it is shared.
 
 ### Quality attributes this buys (and costs)
+
+**In plain words: good boundaries make testing and changing easier, but add files and steps.**
 
 | Attribute | What a good boundary buys | What it costs |
 | --- | --- | --- |
@@ -177,6 +233,8 @@ Three consequences fall out of this one picture:
 | Scalability | a hot module (e.g. search) can get its own resources once isolated | premature isolation adds network calls you did not need yet |
 
 ### Conway's law
+
+**In plain words: your code ends up shaped like your teams talk to each other.**
 
 > [!quote] Melvin Conway, 1968
 > Organizations which design systems are constrained to produce designs which are copies of the communication structures of these organizations.
@@ -208,7 +266,7 @@ The evolutionary path almost every real service takes: start layered, and once a
 
 [[Hexagonal Architecture (Ports and Adapters)]] and [[Clean Architecture]] cover what that extraction looks like in Go.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -508,6 +566,8 @@ ok  	note1/domain	4.635s
 
 ### InvoiceOps: the boundary that grows
 
+**In plain words: one example app, step by step, as its boundaries get clearer.**
+
 ```text
 handler -> service -> repository -> database
 ```
@@ -520,7 +580,7 @@ Webhook handler -> Payment service -> Invoice service -> PaymentProvider verifie
 
 Each arrow here is a boundary with a specific job: the webhook handler only parses and verifies the HTTP envelope; the payment service only decides what a verified event means; the invoice service only applies the business rule; the repository only persists it, inside one transaction. See [[Capstone - InvoiceOps]] for the full service this pattern comes from.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Boundary tool | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -530,14 +590,14 @@ Each arrow here is a boundary with a specific job: the webhook handler only pars
 | `internal/` package | Compiler-enforced "do not import this from outside" | Marking code as intentionally private to a module or repo | None; it is free |
 | Explicit composition root | One package (`main`, or a `cmd/` binary) wires every concrete type | Any service past the one-file stage | Slightly more boilerplate wiring code |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Introducing ports and a composition root for a 150-line script that will never get a second adapter is pure overhead; a single `main.go` calling the database directly is the right call until a second real need for substitution appears.
 - Package-by-feature can duplicate small helpers across features before a real, three-times-repeated need for a shared package is visible; resist extracting one on the first repetition (see [[Design Principles - DRY, KISS, YAGNI, Coupling and Cohesion]]).
 - Every boundary you draw is a boundary someone has to cross in a debugger later; a boundary drawn around a guess at future requirements, rather than a requirement you have today, is usually a net cost (YAGNI applied to architecture).
 - Dependency inversion fixes *coupling direction*, not quantity: a `domain` package with forty methods on one interface is just as hard to fake in a test as a direct dependency would have been. Keep ports narrow.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Go's own standard library follows this rule throughout: `database/sql` defines `driver.Driver` as the port, and `lib/pq`, `pgx`'s `stdlib` shim and others are adapters that import `database/sql`'s types, never the reverse. `io.Writer` is the smallest and most reused Go port of all.
 - **Failure modes → fixes:**
@@ -547,7 +607,7 @@ Each arrow here is a boundary with a specific job: the webhook handler only pars
   - *Interface pollution*: wrapping every concrete type in an interface "for testability" even when it has exactly one implementation and no test ever swaps it. Fix by writing the concrete type first and extracting an interface only when a second implementation (a fake, a different backend) actually appears.
 - **What to monitor:** import-cycle and `internal/` violations are caught at compile time, not at runtime, so there is nothing to alert on directly; the proxy metrics are PR review time per change and how often a one-line business-rule fix touches more than one package.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Measuring coupling in your own repo.** `go list -deps ./...` prints every package's full dependency tree; piping it through a short script that counts, per package, how many other packages import it (afferent) versus how many it imports (efferent) gives a rough, measurable coupling score without installing anything beyond the Go toolchain. A `domain`-style package should sit at high afferent, low efferent; an adapter sits at the opposite corner.
 
@@ -557,7 +617,7 @@ Each arrow here is a boundary with a specific job: the webhook handler only pars
 
 **Connascence as a finer-grained lens.** Page-Jones' connascence taxonomy (name, type, position, meaning, algorithm, …) measures coupling strength between two pieces of code that must change together; [[Design Principles - DRY, KISS, YAGNI, Coupling and Cohesion]] covers it at the object/function level. The architecture-level coupling kinds in section 3 are the same idea at the package/service granularity this folder owns.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What does "architecture" actually mean, as opposed to "design"?
 > Architecture is the set of decisions that are expensive to change later: boundaries, dependency direction, deployment units and data ownership. Design (a function's parameters, a class's methods) is cheap to change by comparison. The dividing line is cost of reversal, not file size.
@@ -580,7 +640,7 @@ Each arrow here is a boundary with a specific job: the webhook handler only pars
 > [!question]- When is a `utils` package acceptable?
 > Almost never as a growing dumping ground. A function used by exactly one caller belongs next to that caller. Once a second genuinely identical need appears, extract a narrowly named package (`timeutil`, `moneyutil`) for just that behaviour, not a catch-all.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Architecture = boundaries + dependency direction + deployment units + data ownership; everything else is design.
 - Dependency arrow points from volatile to stable: adapters depend on `domain`, never the reverse.
@@ -590,7 +650,7 @@ Each arrow here is a boundary with a specific job: the webhook handler only pars
 - Chooser: 1-2 engineers and few integrations → layered. Growing integrations → add ports (hexagonal/clean). Multiple teams/domains → modular monolith, split to microservices only when a module needs independent scaling or deploys. DDD is orthogonal, add it when the domain rules are genuinely complex.
 - Big ball of mud, distributed monolith, anemic model and interface pollution are the four anti-patterns to name and avoid.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Interfaces]], [[Design Principles - DRY, KISS, YAGNI, Coupling and Cohesion]]
 - **Next:** [[Layered Architecture]], [[Hexagonal Architecture (Ports and Adapters)]], [[Clean Architecture]]

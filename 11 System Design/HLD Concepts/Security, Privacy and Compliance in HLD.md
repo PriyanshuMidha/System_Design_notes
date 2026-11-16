@@ -33,7 +33,38 @@ updated: 2026-11-13
 > - **Zero trust** means the network location of a caller proves nothing. Each service proves identity on every call.
 > - **Erasure and retention** are design problems when data is copied into logs, events, caches and backups. Plan them early.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the controls one by one), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your app holds people's names, phones, addresses and cards. Bad things can happen to that data.
+Someone can read it on the wire. Someone can steal a disk or a backup. A service can be tricked into asking for data it should not get.
+So you lock data when it moves (TLS), and you lock data when it sits on disk. Locking data is called **encryption**.
+You check who is calling on every call, even between your own services. That idea is called **zero trust**.
+Laws like GDPR add one more job: you must know where every copy of a person's data lives, so you can delete it when asked.
+
+```mermaid
+flowchart LR
+    U["User"] -- "locked on the wire" --> S["Your service"]
+    S -- "checks who is asking" --> D["Database<br/>(locked on disk)"]
+    S --> L["Audit log:<br/>who touched what"]
+```
+
+```mermaid
+flowchart LR
+    A["User: delete my data"] --> B["Find every copy:<br/>DB, cache, logs, backups"]
+    B --> C["Delete or make unreadable"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you lock data on the wire and on disk?
+2. How do you control and record who touches personal data?
+3. How do you find, keep and delete data the way the law asks?
 
 **The problem in one story.**
 You run a food delivery app. It stores names, phone numbers, addresses and cards.
@@ -78,7 +109,7 @@ Where it breaks: a bank vault is in one place, while your data is copied into lo
 > [!tip] Remember
 > Encrypt, minimise, check every call, log access, and know where every copy of personal data lives.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Imagine you design a food delivery app. In the first draft, the app server writes the customer's phone number, address and card details into one `orders` table. Logs print full request bodies. Every microservice trusts any caller that sits inside the VPC.
 
@@ -93,7 +124,7 @@ None of this is exotic. It is what happens when security is added after the boxe
 > [!tip] Remember
 > Security failures are rarely clever attacks. They are usually data in too many places with too few checks.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a **bank branch**. The street is the internet. The front door has a guard (edge: WAF, TLS).
 
@@ -133,7 +164,7 @@ flowchart LR
 > [!tip] Remember
 > Draw the boundary, then ask of every arrow that crosses it: who is calling, may they, is it encrypted, is it logged.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Encryption in transit
 
@@ -375,7 +406,7 @@ The cost: cross-region features (a user travelling, global search) get harder. S
 
 **Why it matters:** the edge is the only layer that absorbs volume attacks without charging your database.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 **Problem:** add a "saved cards and delivery history" feature to the food delivery app for users in the EU and India.
 
@@ -410,7 +441,7 @@ sequenceDiagram
     G-->>U: 200
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Choice | Option A | Option B | Pick A when | Pick B when |
 | --- | --- | --- | --- | --- |
@@ -421,7 +452,7 @@ sequenceDiagram
 | Residency | Regional cells | Single global DB | Laws require it, large user base per region | Small product, no such law applies |
 | Audit store | Write-once object store | DB table | Compliance, tamper evidence | Low-stakes internal tools |
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 | Control | Benefit | Cost |
 | --- | --- | --- |
@@ -436,7 +467,7 @@ sequenceDiagram
 > [!warning] Common mistake
 > Treating encryption at rest as a full defence. If the app has the key and the app is compromised (or has an injection bug), the attacker reads plaintext. Encryption at rest protects lost disks and stolen backups, not a compromised application.
 
-## 7. In production
+## 7. In production 🔴
 
 - **KMS outage.** Cache DEKs in memory for minutes, set alarms on KMS error rate, and decide the failure mode (fail closed for restricted data).
 - **Key rotation.** Automatic annual KEK rotation is typical, and re-wrap rather than re-encrypt. Test restoring from backup with a rotated key.
@@ -446,21 +477,44 @@ sequenceDiagram
 - **Backups.** Encrypt them with a separate key and test restores. An unreadable backup is not a backup.
 - **Breach readiness.** GDPR Art. 33 requires notifying the regulator within 72 hours of becoming aware of a personal-data breach. Know your contact tree in advance. See [[Security Incident Response - When Your Website Is Hacked]].
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Why AES-GCM and why never roll your own
+
+**In plain words:** Use a well-known, tested lock (AES-GCM) that also notices if someone changed the data. Home-made crypto almost always has holes.
 
 GCM is an authenticated mode: it encrypts and also detects tampering. The classic mistakes are reusing a nonce with the same key (which breaks confidentiality) and using unauthenticated modes. Use library defaults (for example Go's `crypto/cipher` with `NewGCM`, or a vetted envelope-encryption SDK) and let KMS generate keys.
 
 ### Deterministic encryption and search
 
+**In plain words:** Normal encryption makes the same email look different every time, so you cannot search it. A keyed fingerprint of the email gives you a searchable column without showing the email.
+
 If you need equality lookup on an encrypted field (find user by email), either store a **keyed hash** (HMAC with a secret) in a separate indexed column, or use deterministic encryption. Both leak equality (two equal values look equal). Do not use plain unsalted hashes of low-entropy values like phone numbers: an attacker can enumerate all numbers.
+
+```mermaid
+flowchart LR
+    E["Email: a@x.com"] --> H["Keyed hash (HMAC)"]
+    H --> C["Indexed column:<br/>fingerprint only"]
+    Q["Login lookup"] --> H2["Same keyed hash"] --> C
+```
 
 ### Passwords are different
 
+**In plain words:** You never need to read a password back, only check it. So you store a slow, salted fingerprint of it, not a locked copy.
+
 Passwords are never encrypted. They are hashed with a slow, salted algorithm (Argon2id, bcrypt). See [[Password Storage and Login Security]].
 
+```mermaid
+flowchart LR
+    P["Password typed"] --> S["Slow hash + salt<br/>(Argon2id, bcrypt)"]
+    S --> CMP{"Matches stored hash?"}
+    CMP -- yes --> OK["Logged in"]
+    CMP -- no --> NO["Rejected"]
+```
+
 ### Multi-tenant isolation
+
+**In plain words:** For business customers, the strongest wall is a separate key, and maybe a separate database, per customer.
 
 For B2B systems, the strongest isolation is a key and a database per tenant (or per tier of tenants).
 
@@ -469,6 +523,8 @@ It makes tenant deletion and tenant-specific key revocation trivial, and limits 
 The cheaper model is a shared database with a tenant ID on every row, enforced by row-level security, and a per-tenant DEK for sensitive columns.
 
 ### Threat modelling in five minutes
+
+**In plain words:** Before building, ask "how could someone break this?" for each arrow on your diagram. STRIDE is a 6-word checklist that helps you ask.
 
 Use STRIDE as a prompt: **S**poofing, **T**ampering, **R**epudiation, **I**nformation disclosure, **D**enial of service, **E**levation of privilege. For each arrow across a trust boundary say which of these applies and which control answers it. This turns a vague "we will secure it" into a visible list.
 
@@ -497,7 +553,7 @@ flowchart LR
 
 Say it in 30 seconds: "Trust boundary at the gateway. TLS outside, mTLS inside with per-pair policy. Data classified; restricted values tokenized; the rest envelope-encrypted with per-user keys so I can crypto-shred. Audit goes to a write-once store. Data stays in its home region. Retention jobs enforce deletion."
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How would you protect card data in a checkout system?
 > Keep it out of your systems. The browser sends the card straight to a payment provider that returns a token; we store the token, brand and last four digits.
@@ -525,7 +581,7 @@ Say it in 30 seconds: "Trust boundary at the gateway. TLS outside, mTLS inside w
 > [!question]- Encryption at rest is on. Is the data safe from a SQL injection bug?
 > No. The database decrypts transparently for the application, so an injection query reads plaintext. At-rest encryption protects stolen disks and backups. Injection is stopped by parameterised queries, least-privilege DB accounts and field-level encryption for the most sensitive columns.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 | Need | Control | One-line reason |
 | --- | --- | --- |
@@ -542,7 +598,7 @@ Say it in 30 seconds: "Trust boundary at the gateway. TLS outside, mTLS inside w
 
 Order to mention in an interview: classify, boundary, TLS, auth, encrypt, tokenize, audit, erase, residency.
 
-## 11. Links
+## 11. Links 🟢
 
 - Authentication basics: [[Authentication vs Authorization]], [[Access and Refresh Tokens]], [[JWT - Structure, Validation and Pitfalls]], [[OAuth 2.0 and OpenID Connect]]
 - Services and secrets: [[Service-to-Service Auth - API Keys, HMAC, mTLS]], [[Secrets Management]], [[AWS 02 - IAM]]
@@ -550,7 +606,7 @@ Order to mention in an interview: classify, boundary, TLS, auth, encrypt, tokeni
 - Data and resilience: [[Multi-Region Architecture]], [[Event Sourcing]], [[Backup, PITR and Disaster Recovery]], [[TLS and HTTPS]]
 - Framework: [[System Design Interview Framework]], [[Cost-Aware System Design]]
 
-## Links
+## Links 🟢
 
 ### Watch on YouTube
 

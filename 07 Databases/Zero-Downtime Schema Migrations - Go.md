@@ -18,10 +18,26 @@ updated: 2026-11-13
 
 # Zero-Downtime Schema Migrations - Go
 
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "What this code shows" and Step 1 (the SQL). Stop there.
+> - 🟡 **Know the basics?** Add Steps 2 to 5 and the Tests.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on twin of [[Zero-Downtime Schema Migrations]]. You added a new column, and now 20 million old rows need a value in it. Doing it in one giant update would lock rows and swamp the copies of the database, so the app would slow down or stall. Instead, a small Go job fills the column a little at a time; this is called a **backfill**. It updates a small slice of rows, takes a short break, checks the copies (the **replicas**) have caught up, then does the next slice. If someone stops it halfway, it remembers where it got to and carries on from there without redoing rows. Read it top to bottom: each step is a short Concept, the code, then a walkthrough.
+
+```mermaid
+flowchart LR
+    L["replicas caught up?"] -->|"yes"| B["update next 1,000 rows"]
+    L -->|"no"| W["wait"] --> L
+    B --> P["short pause"] --> L
+```
+
 > [!summary] TL;DR
 > A throttled, resumable backfill job in Go for the data-migration step of expand, migrate, contract: it fills `invoices.total_minor` in short batches, waits while replicas lag, and can be interrupted and resumed without rewriting rows. The theory is in [[Zero-Downtime Schema Migrations]]. The store is an in-memory fake, so the tests need no PostgreSQL.
 
-## Before the code
+## Before the code 🟢
 
 - **Interfaces** (`Store`): the backfill loop talks to an interface, so tests use an in-memory fake and production uses pgx.
 - **`context.Context`**: lets an operator cancel a long backfill; the loop stops cleanly and returns where to resume.
@@ -30,7 +46,7 @@ updated: 2026-11-13
 - **`errors.Is(err, context.Canceled)`**: tells "someone stopped us" apart from a real failure.
 - **What to run**: `go mod init example.com/backfill`, then `go vet ./... && go test -race ./...`.
 
-## What this code shows
+## What this code shows 🟢
 
 Schema changes that avoid long locks are mostly SQL, but the one step that needs a program is the data migration: copying 20 million old values into a new column without hurting production. That step is a loop with three safety properties, and this package implements exactly those: each batch is small, the loop slows down when replicas fall behind, and a stop at any moment can be resumed without redoing work.
 
@@ -55,7 +71,7 @@ sequenceDiagram
     R-->>R: return next so a rerun can resume
 ```
 
-## Setup
+## Setup 🟢
 
 - Go 1.24, standard library only. The real `Store` would wrap `pgx` and run the SQL from the theory note; here an in-memory fake stands in for it, so the tests are labelled as fake-store tests.
 - Module layout: package `backfill` with `backfill.go` and `backfill_test.go`.
@@ -67,9 +83,11 @@ go vet ./...
 go test -race ./...
 ```
 
-## Code
+## Code 🟡
 
 ### Step 1: the SQL behind the interface
+
+**In plain words:** one small UPDATE that fills only rows in a short id range, and only rows that are still empty, so running it twice does no harm.
 
 **Concept.** This is the "migrate" step of expand, migrate, contract ([[Zero-Downtime Schema Migrations#4. Worked example]]). Updating 20 million rows in one statement would hold row locks for the whole run, produce a huge burst of WAL, and make replicas lag. Instead each statement touches a small id range.
 
@@ -102,6 +120,8 @@ flowchart LR
 ```
 
 ### Step 2: the store interface and the config
+
+**In plain words:** the loop only talks to a small "store" contract, so tests can plug in a fake. Three knobs set how big each batch is, how long to rest, and how much replica delay is OK.
 
 **Concept.** `Store` is the seam between the loop and the database. The loop knows nothing about SQL, and the database code knows nothing about throttling, so the loop can be tested with an in-memory fake. `Config` holds the three tuning knobs the theory note describes: batch size, pause, and the maximum acceptable lag.
 
@@ -158,6 +178,8 @@ classDiagram
 ```
 
 ### Step 3: the resumable loop
+
+**In plain words:** check delay, do one batch, rest, repeat. If stopped, it hands back the id to start from next time.
 
 **Concept.** `Run` is the loop of the worked example in [[Zero-Downtime Schema Migrations#4. Worked example]]: check lag, run one batch, pause, repeat. It returns the id where a rerun should resume, which is the checkpoint. Checking the context between batches, never inside one, means a stop leaves every batch either fully committed or never started.
 
@@ -216,6 +238,8 @@ stateDiagram-v2
 
 ### Step 4: waiting for replicas
 
+**In plain words:** before each batch, ask "are the copies keeping up?" If not, wait instead of piling on more work.
+
 **Concept.** Every updated row is a new row version, so a backfill produces a lot of WAL, and replicas that cannot replay it fast enough serve stale reads ([[Zero-Downtime Schema Migrations#7. In production]]). The loop therefore reads the lag before each batch and sleeps until it is acceptable.
 
 This is feedback control: the job runs as fast as the slowest replica allows. A fixed sleep alone would either be too slow when the system is idle or too fast when it is busy. The lag check costs one cheap query per batch.
@@ -246,6 +270,8 @@ func waitForReplicas(ctx context.Context, s Store, cfg Config) error {
 
 ### Step 5: a cancellable sleep
 
+**In plain words:** a nap that wakes up straight away if someone says "stop", instead of finishing the nap first.
+
 **Concept.** `time.Sleep` cannot be interrupted, so a deploy that cancels the job would wait out the pause. Waiting on a timer and on `ctx.Done()` in a `select` makes the sleep return the moment the context ends.
 
 The up-front context check is deliberate: with a zero pause both channels can be ready at once and `select` picks randomly, so without it a cancelled job could run one more batch.
@@ -273,7 +299,16 @@ func sleep(ctx context.Context, d time.Duration) error {
 2. `time.NewTimer` plus `defer t.Stop()` releases the timer when the context wins, instead of leaving it to fire later.
 3. `select` returns `nil` when the timer fires (a normal pause) and `ctx.Err()` when the context ends, which is `context.Canceled` or `context.DeadlineExceeded`.
 
-## Design decisions
+**Stop and resume, as a picture** 🟢
+
+```mermaid
+flowchart LR
+    R1["run 1: rows 1 to 5,000"] --> X["deploy stops it,<br/>returns 5,001"]
+    X --> R2["run 2 starts at 5,001"]
+    R2 --> D["done: every row filled once"]
+```
+
+## Design decisions 🔴
 
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
@@ -285,11 +320,13 @@ func sleep(ctx context.Context, d time.Duration) error {
 | One transaction per batch | One transaction for the whole job | Short locks and vacuum can proceed; the whole job is not atomic, which the expand step makes acceptable |
 | Cancellable `select` sleep | `time.Sleep` | A stop is immediate, at the cost of a few lines |
 
-## Tests
+## Tests 🟡
 
 The fake store keeps a `filled` map (has `total_minor` been written for this id?) and a `writes` counter per id, and records the order of `lag` and `batch` calls in `events`. Two tests then prove the two main safety properties.
 
 ### The fake store
+
+**In plain words:** a pretend database in memory that counts how many times each row was written, so tests need no Postgres.
 
 **Concept.** The fake models exactly the behaviour the loop depends on. `BackfillRange` honours the `IS NULL` rule by skipping ids that are already filled, which is what makes reruns harmless. It counts writes per id so a test can assert "written exactly once".
 
@@ -370,6 +407,8 @@ var cfg = Config{BatchSize: 1000, Pause: time.Millisecond, MaxLag: time.Second}
 
 ### Test 1: interrupt, resume, and write every row once
 
+**In plain words:** stop the job halfway, start it again, and check every row was filled exactly once.
+
 **Property.** Interrupting the job and resuming from the returned id must leave every row filled, and filled exactly once. This is the guarantee that lets a deploy kill the job at any moment.
 
 ```mermaid
@@ -431,6 +470,8 @@ A `filled` count below 10,000 means rows were skipped, which in production leave
 
 ### Test 2: wait for replicas before the first batch
 
+**In plain words:** while the copies are behind, no batch runs at all.
+
 **Property.** While replicas are lagging more than `MaxLag`, no batch may run. The fake feeds readings of 5 s, 3 s and 0 s against a limit of 1 s.
 
 | Lag reading | Compared with `MaxLag` = 1 s | Action |
@@ -460,7 +501,7 @@ func TestBackfillWaitsForReplicaLag(t *testing.T) {
 
 **What a failure means.** If `batch` appears before the third `lag`, the loop ignores lag and would push replicas further behind during a real backfill, serving stale invoices to readers on the replicas. If fewer than three `lag` events appear, the comparison is wrong (for example using `<` against the wrong side).
 
-## Running it
+## Running it 🟢
 
 Measured: `go vet` is clean and both tests pass under `go test -race` (Go 1.24.4, darwin/arm64).
 
@@ -478,7 +519,7 @@ Reading the output line by line:
 3. `PASS` is the overall result for the package.
 4. `ok  example.com/backfill  1.228s` is the package summary. Most of that time is building with the race detector enabled, which found no data race.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - Start the job only after every pod runs the dual-write version, or old pods will keep creating rows with `total_minor` NULL after `MaxID` was read.
 - `BackfillRange` must be idempotent. A rerun of a batch has to be harmless, or the resume guarantee is lost.
@@ -487,7 +528,7 @@ Reading the output line by line:
 - Each `BackfillRange` call must be its own transaction. One transaction around the whole loop would hold row locks and block vacuum for the full 13 minutes.
 - `ReplicaLag` returns zero when the replica has caught up (the SQL uses `coalesce`). A NULL read as an error would stall the job on an idle system.
 
-## Exercises
+## Exercises 🔴
 
 1. In `TestBackfillResumesWithoutRewritingRows`, cancel after batch 5 instead of batch 3. Predict the `next` value returned by the first run.
 2. In `TestBackfillWaitsForReplicaLag`, change the readings to `{0, 5s, 0}`. Predict the sequence of `events` before the first `batch`.
@@ -571,7 +612,7 @@ Reading the output line by line:
 > }
 > ```
 
-## Links
+## Links 🟢
 
 - Theory: [[Zero-Downtime Schema Migrations]]
 - **Before this:** [[Relational Schema Design]], [[Locking - Optimistic vs Pessimistic]]

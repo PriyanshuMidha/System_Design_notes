@@ -25,7 +25,17 @@ updated: 2026-11-13
 > - A unit of work runs the changes of one business operation, across several repositories, in **one transaction**: all commit or none do.
 > - Classic mistakes: a generic `Update(entity)` that hides what changed, and slow remote calls (payment provider) inside the transaction.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Business code should not be full of SQL. A **repository** is an object that looks like a simple collection: `Get(id)`, `Save(order)`. It hides the database behind it. A **unit of work** groups several saves into one transaction, so either all of them happen or none. This note shows both in Go with PostgreSQL. Read the plain-words line above each code block first.
+
 
 **The problem in one story.**
 A shop app places an order: it saves the order, lowers the stock, and records the payment.
@@ -71,7 +81,7 @@ Where it breaks: a librarian cannot undo a loan made at another library, and a u
 > [!tip] Remember
 > Repository = "where data lives" is hidden behind an interface; unit of work = one business operation is one transaction.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A checkout service places an order in two steps: reserve stock, then create the order. The first version writes SQL inline in the HTTP handler. Four problems follow:
 
@@ -82,7 +92,7 @@ A checkout service places an order in two steps: reserve stock, then create the 
 
 The old in-memory version had its own bug: an unguarded map. Two goroutines writing to a Go map at once crash the process with `fatal error: concurrent map writes`, which cannot be recovered.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A **repository** is a librarian. You ask for "book 42" or "the next ten books by this author", and you hand books back. You never learn whether a book was on the shelf, in the basement or at another branch.
 
@@ -94,9 +104,13 @@ Three rules make the pattern work in Go:
 2. **The interface belongs to the consumer.** The checkout package declares the small `OrderRepository` it needs; the storage packages implement it ([[Interfaces]]).
 3. **Repositories store and fetch; services decide.** "Quantity must be 1 to 10" is a business rule and lives in the service. "Never let `available` go below zero" must be enforced atomically where the data lives, so the repository exposes it as a named operation, `Reserve`.
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words: the business code talks to a collection-like interface; only the repository knows SQL.**
 
 ### Structure
+
+**In plain words: one repository per main object, plus one unit of work that owns the transaction.**
 
 ```mermaid
 classDiagram
@@ -153,6 +167,8 @@ The pieces:
 
 ### A unit of work, step by step
 
+**In plain words: begin, do all the saves with the same transaction, then commit or roll back.**
+
 ```mermaid
 sequenceDiagram
     participant S as Checkout.PlaceOrder
@@ -185,6 +201,8 @@ sequenceDiagram
 5. If `fn` returns nil, `WithTx` commits. A deferred `Rollback` covers panics and is a no-op after a successful commit (it returns `sql.ErrTxDone`).
 
 ### Three ways to span repositories
+
+**In plain words: three ways to share one transaction across repositories, and their costs.**
 
 | Option | How it works | Strength | Weakness |
 | --- | --- | --- | --- |
@@ -248,7 +266,9 @@ func main() {
 }
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
+
+**In plain words: a Postgres repository and a unit of work across two repositories, with tests.**
 
 The schema the PostgreSQL implementation expects (PostgreSQL 17):
 
@@ -745,7 +765,7 @@ cancel a pending order as if paid: conflict: state changed
 
 The stock holds 2 units, so the third order fails inside the transaction and is never created (its ID stays 0). The last line is the compare-and-set refusing to cancel order 1 "from paid", because the order is still pending.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Variant | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -755,7 +775,7 @@ The stock holds 2 units, so the third order fails inside the transaction and is 
 | ORM unit of work | The ORM tracks changed objects and flushes them in one transaction | Teams already on an ORM | Hidden queries, N+1 risk, less control of SQL |
 | Active record | Objects save themselves (`order.Save()`) | Simple CRUD apps | Domain types depend on the database |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Small CRUD with no business logic does not need it.** For tiny scripts or simple CRUD with no business logic, a repository layer may be extra ceremony. Call sqlc-generated queries directly.
 - **Avoid the generic god-interface.** A `Repository[T]` with `Save(T)` makes the read-modify-write pattern the easy path: `Get`, change a field, `Save`. Two concurrent requests then overwrite each other. Name the operations the domain needs instead (`Reserve`, `CompareAndSetStatus`).
@@ -763,7 +783,7 @@ The stock holds 2 units, so the third order fails inside the transaction and is 
 - **Do not put business rules in repositories.** A repository that decides who may cancel an order cannot be reused, and the rule cannot be tested without storage. Keep storage invariants (`available >= 0`) in the database and the repository, and policy in the service.
 - **Do not mock what you can fake.** A mock of `OrderRepository` checks that methods were called; a fake checks behaviour. A fake that passes the same contract tests as PostgreSQL is worth more than a hundred mock expectations ([[Testing LLD Code]]).
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- sqlc generates a `DBTX` interface and a `Queries` type with `WithTx(tx)`, the same shape as `PgOrders` over `DBTX` here.
@@ -779,7 +799,7 @@ The stock holds 2 units, so the third order fails inside the transaction and is 
 	- N+1 queries: a loop calling `Get` per ID → add a batch method (`GetMany(ids)`) to the repository.
 - **What to monitor:** `sql.DB.Stats()` (`InUse`, `WaitCount`, `WaitDuration`), transaction duration, rollback rate, and how often `ErrConflict` and `ErrInsufficientStock` are returned.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why the conditional update is safe at Read Committed.** PostgreSQL's default isolation level is Read Committed. When two transactions run `UPDATE stock SET available = available - 1 WHERE sku = 'sku' AND available >= 1` at once, the second one waits for the first to commit, then re-checks its `WHERE` clause against the newly committed row before updating it. With 1 unit left, the second update finds `available = 0`, matches no row, and reports 0 rows affected. A plain `SELECT` followed by an `UPDATE` in the service has no such re-check and loses updates. Other fixes for read-modify-write are `SELECT … FOR UPDATE` or an optimistic `version` column ([[Locking - Optimistic vs Pessimistic]]).
 
@@ -793,7 +813,7 @@ The stock holds 2 units, so the third order fails inside the transaction and is 
 
 **Iteration.** For exports over millions of rows, a repository can return an `iter.Seq2[Order, error]` that pages internally ([[Iterator and range-over-func]]) instead of a huge slice.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Where should the `OrderRepository` interface live, and why?
 > In the package that uses it, such as the checkout service, declaring only the methods that service needs. The storage packages implement it without importing the service. Small consumer-owned interfaces keep fakes small and keep storage details out of the domain.
@@ -813,7 +833,7 @@ The stock holds 2 units, so the third order fails inside the transaction and is 
 > [!question]- Is a generic `Repository[T any]` with CRUD a good idea in Go? (trap)
 > Rarely. It forces every aggregate into the same five methods, hides the queries the domain needs, and makes read-modify-write the default. Go generics are better spent on small helpers (scanning rows, pagination) than on a god-interface.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Repository = collection-like interface per aggregate; the consumer owns the interface.
 - Map storage errors to sentinels: `sql.ErrNoRows` → `ErrNotFound`.
@@ -824,7 +844,7 @@ The stock holds 2 units, so the third order fails inside the transaction and is 
 - Fake with a mutex + one contract suite for fake and PostgreSQL.
 - Avoid generic `Repository[T]` CRUD god-interfaces.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Interfaces]], [[Error Handling]], [[Transactions and ACID]]
 - **Next:** [[Rare GoF Patterns in Go]], [[Testing LLD Code]]

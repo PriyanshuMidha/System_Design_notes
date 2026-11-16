@@ -34,7 +34,39 @@ flowchart LR
 
 Everything below is about doing each box honestly: a timeline that is facts only (no interpretation), a factors list that resists collapsing to one sentence, and action items that get tracked to closure rather than filed and forgotten.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+After an outage is fixed, the team writes a short report called a **postmortem**.
+It says what happened, who was affected, a timeline, why it happened, and what we will change.
+It is **blameless**: it looks at how the system let a mistake through, not at who to punish.
+
+```mermaid
+flowchart LR
+    I["Incident fixed"] --> W["Write: timeline, impact, causes"] --> A["Action items with owners"] --> F["Follow up until done"]
+```
+
+Big failures rarely have one single cause. Usually a few small things lined up.
+The goal is fixes that stop the whole class of problem, not just this exact one.
+
+```mermaid
+flowchart LR
+    T["Trigger: a deploy"] --> X["Outage"]
+    C1["Missing test"] --> X
+    C2["No alert"] --> X
+```
+
+The rest of this note is just these 3 questions:
+1. When is a postmortem needed, and what goes in it?
+2. How do you dig for causes (5 whys and others)?
+3. How do you make sure the action items actually get done?
+
 
 **The problem in one story.**
 Your service broke yesterday and you fixed it by undoing a change.
@@ -80,7 +112,7 @@ Where it breaks: aviation reports are slow and formal; a software postmortem sho
 > [!tip] Remember
 > Facts first, several causes not one, blame the system, and every action item has an owner and a date.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 After the InvoiceOps webhook-duplication incident is mitigated (see [[Incident Response]]), the team has stopped the bleeding but has learned nothing yet that prevents a repeat. Without a postmortem, the natural outcome is a one-line Slack message — "rolled back the bad deploy, duplicates stopped" — and the actual mechanism (a load-balancer timeout shorter than the handler's p99 latency, which made the client retry a request whose write had already succeeded) stays undiscovered.
 
@@ -90,13 +122,13 @@ With a postmortem: the timeline shows the deploy at 14:02 did not cause the symp
 
 Four contributing factors, not one. The action items fix the timeout mismatch, widen the idempotency window, and add an alert on handler-latency approaching the LB timeout — three real, different fixes a single sentence like "fixed the deploy" would never have produced.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A postmortem is closer to an aviation incident report than a bug ticket: it is written assuming the people involved made locally reasonable decisions with the information and pressure they had at the time, and it looks for the **conditions** that made those decisions produce a bad outcome, rather than for a person to label at fault.
 
 An investigator who writes "the pilot should have noticed X" has stopped investigating — the useful question is **why X was not noticeable**, given the displays, training, and workload at that moment, which is exactly transferable to "why didn't the on-call engineer notice the timeout mismatch before it mattered."
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### When one is required
 
@@ -104,11 +136,15 @@ A postmortem is mandatory for any SEV1 or SEV2 (see [[Incident Response]] for th
 
 ### Blameless, Just Culture
 
+**In plain words:** we still record every detail, but we ask "why did this make sense at the time?" instead of "who messed up?".
+
 Blameless does not mean consequence-free or detail-free. It means the write-up never names an individual as the cause and never asks "who" — it asks "what about our systems, processes, or defaults let this happen," which is Sidney Dekker's Just Culture framing: accountability is owed to the organization that builds the conditions people operate under, not extracted from the individual who happened to be on shift.
 
 A postmortem that says "the engineer forgot to check the dashboard" has identified nothing useful; one that says "the dashboard the runbook points to was three releases out of date" has identified something fixable.
 
 ### The template
+
+**In plain words:** a fixed set of headings so every postmortem is easy to read and compare.
 
 | Section | Content |
 | ------- | ------- |
@@ -124,11 +160,15 @@ A postmortem that says "the engineer forgot to check the dashboard" has identifi
 
 ### Trigger, root cause and contributing factors are three different things
 
+**In plain words:** the trigger is what kicked it off. The root cause is the deeper weakness. Contributing factors are the things that made it worse.
+
 - **Trigger:** the immediate event that started the incident (the 14:02 deploy).
 - **Contributing factors:** the conditions that let the trigger cause harm (the mismatched timeout, the narrow idempotency race, the two-week-old config change that raised latency).
 - **Root cause**, used loosely, usually means "the contributing factor that, if fixed alone, would have prevented this specific incident" — but naming only that one and stopping is the single most common postmortem mistake, because the other factors will cause a *different* incident later.
 
 ### RCA techniques
+
+**In plain words:** 5 Whys is quick for simple chains. Bigger outages need methods that look at many causes at once.
 
 - **5 Whys.** Ask "why" five times, each answer becoming the next question. Fast and good for a single, linear chain, but it stops at whichever answer sounds complete and rarely branches — run it more than once from the same starting symptom, asking a different first "why" each time, to surface factors a single chain misses.
 - **Fishbone (Ishikawa) diagram.** Groups candidate causes into categories (code, config, infrastructure, dependency, process, people) around the symptom, which is better than 5 Whys at surfacing *several* independent contributing factors at once rather than one linear chain.
@@ -148,11 +188,15 @@ flowchart TD
 
 ### No single root cause, in complex systems
 
+**In plain words:** in big systems, failure needs several holes lining up. Fixing just one "root cause" leaves the others.
+
 Richard Cook's *How Complex Systems Fail* argues that failures in complex systems are normally the result of several small, individually survivable conditions combining — the system already contains latent weaknesses (the stale timeout, the narrow race window) that sit harmless until a trigger (the deploy) lines them up.
 
 Writing "root cause: the 14:02 deploy" treats a trigger as if it were the whole explanation and leaves the latent weaknesses in place for the next trigger.
 
 ### Action items
+
+**In plain words:** each fix needs a person, a date and a priority, or it never happens.
 
 Every action item needs an **owner**, a **due date**, a **priority**, and a **category**:
 
@@ -179,7 +223,7 @@ A postmortem is reviewed in a short meeting (or async review for a smaller incid
 
 Teams that track postmortems in one place over time can run trend analysis: the same contributing factor (stale timeouts, missing alerts on a specific class of thing) appearing across several unrelated incidents is itself a signal worth its own action item.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -300,7 +344,7 @@ func TestOverdueSkipsClosedItems(t *testing.T) {
 
 Both tests pass under `go vet` and `go test -race` on Go 1.24.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Technique | How it works | Use when | Cost |
 | --------- | ------------- | -------- | ---- |
@@ -309,14 +353,14 @@ Both tests pass under `go vet` and `go test -race` on Go 1.24.
 | Fault tree / causal-factor charting | Explicit AND/OR tree of conditions required for failure | The incident needed multiple things to go wrong together | Most rigorous, also the most time-consuming to build correctly |
 | One-line "rolled back the bad deploy" (anti-pattern) | Names the trigger and stops | Never, as a substitute for a postmortem | Guarantees recurrence of the untouched contributing factors |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A full postmortem for every SEV4 is wasted ceremony; reserve the full template for SEV1/SEV2 and near-misses worth the team's attention, and use a short note for the rest.
 - Blameless culture requires organizational buy-in above the team writing the postmortem — if a manager reads one and reprimands an individual anyway, the next postmortem will quietly omit the honest details that made this one useful, and the practice collapses.
 - 5 Whys alone, used as the *only* technique, systematically under-counts contributing factors in anything but the simplest incidents — treat it as a fast first pass, not the final analysis.
 - Writing the postmortem too soon, before the facts are settled, risks a timeline built from memory rather than from logs/dashboards/the scribe's record from [[Incident Response]]; wait until the evidence is gathered, even if that is a day or two after resolution.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Google's SRE book and workbook both describe blameless postmortems with this template as central practice; incident.io and similar tools automate pulling the timeline from the chat transcript and alert history directly into a draft; many companies publish selected postmortems externally (a practice that itself pressures the writing to be honest and specific, since it will be read outside the team).
 - **Failure modes → fixes:**
@@ -326,7 +370,7 @@ Both tests pass under `go vet` and `go test -race` on Go 1.24.
   - Nobody reads old postmortems → tag and archive them searchably, and reference relevant ones explicitly during the next incident's triage.
 - **What to monitor:** repeat-incident rate (the clearest signal of unexecuted action items), postmortem completion rate for SEV1/SEV2 within an agreed window (for example, 5 business days), fraction of action items closed by their due date, and number of distinct contributing factors per postmortem (a value that is consistently 1 suggests analysis is stopping too early).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why "root cause" as a singular noun is itself a trap.** The word invites a one-sentence answer, which is convenient for a status update but wrong for an incident that needed several conditions to align.
 
@@ -342,7 +386,7 @@ Naming that explicitly turns a day that "wasn't so bad" into a genuine warning a
 
 **Action items need an SLO of their own.** A team that tracks action-item completion against a due date the same way it tracks an SLO (completed within N days, with a visible burn-down) treats follow-through as seriously as uptime — which is the practical difference between a postmortem that changes anything and one that is a well-written historical document.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What does "blameless" mean in a postmortem, concretely?
 > It means the write-up never asks "who" and never names an individual as the cause — it asks what about the system, process, or defaults let a reasonable person produce this outcome. It is not consequence-free: it still produces specific, owned action items.
@@ -365,7 +409,7 @@ Naming that explicitly turns a day that "wasn't so bad" into a genuine warning a
 > [!question]- Tell me about a postmortem you wrote or participated in.
 > Structure it around the template: impact and duration, the timeline, at least two distinct contributing factors (not one), and one or two action items with their actual owner and due date — and ideally, whether that action item was later completed.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Template order: summary, impact, timeline (facts only), detection, response, contributing factors (plural), what went well/badly, where we got lucky, action items.
 - Blameless asks "what about the system," never "who."

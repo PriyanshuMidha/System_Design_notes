@@ -26,7 +26,42 @@ updated: 2026-11-13
 > - Quorums tolerate slow or dead replicas without failover, but they are not consensus and not linearizable.
 > - Classic mistake: calling DynamoDB leaderless. DynamoDB has a leader per partition (Multi-Paxos); Cassandra, Riak and ScyllaDB are the leaderless ones.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Many databases keep each piece of data on 3 machines, called **replicas**.
+In some designs, there is no boss machine. Any replica can take a write or a read.
+So how do you know a read sees the latest write?
+
+```mermaid
+flowchart LR
+    C["Client writes x=5"] --> A["Replica A: ok"]
+    C --> B["Replica B: ok"]
+    C -.-> D["Replica C: missed it"]
+```
+
+The trick is a **quorum**: wait for enough replicas, not all.
+With 3 replicas, wait for 2 on every write, and ask 2 on every read.
+Any 2 out of 3 always share at least one replica, so the read always reaches someone who has the new value.
+The rule is: read count + write count must be bigger than the number of replicas.
+
+```mermaid
+flowchart LR
+    W["Write went to A, B"] --> O["Overlap: B"]
+    R["Read asks B, C"] --> O
+    O --> N["Read sees x=5"]
+```
+
+The rest of this note is just these 3 questions:
+1. Why does "R + W > N" make reads see recent writes?
+2. How do replicas that missed a write catch up?
+3. Why is this still not as strong as one single copy?
 
 **The problem in one story.**
 You keep a shopping cart on 3 database servers so one can die.
@@ -72,13 +107,23 @@ Where it breaks: secretaries agree on what "newest" means, but servers with skew
 > [!tip] Remember
 > If `R + W > N`, every read overlaps the latest completed write, with no leader and no failover needed.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 With single-leader replication, every write for a key goes through one node. When that leader dies, writes for its keys stop until a failover finishes, which takes tens of seconds (see [[High Availability and Failover]]). A shopping cart service that must accept "add to cart" during a node failure cannot wait for that.
 
 Leaderless replication removes the failover step. Each key lives on 3 replicas. A write that reaches any 2 of them succeeds, so one dead or slow replica is simply ignored. The Dynamo paper (2007) built Amazon's cart this way, trading strict consistency for "always writable".
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    subgraph Leader["Single leader"]
+        L["Leader dies"] --> S["Writes stop until a new leader"]
+    end
+    subgraph NoLeader["Leaderless"]
+        A["One replica dies"] --> K["Others keep taking writes"]
+    end
+```
+
+## 2. Mental model 🟢
 
 - **N**: replicas per key (the replication factor).
 - **W**: acks needed before a write is reported successful.
@@ -89,9 +134,11 @@ Two groups of size `W` and `R` drawn from `N` must overlap if `W + R > N`, by th
 
 **Analogy.** A club records each decision in the notebooks of any 2 of its 3 secretaries. To learn the latest decision you ask any 2 secretaries and believe the newest entry. At least one of the two you ask wrote the last decision down.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The overlap argument
+
+**In plain words:** any group of W replicas and any group of R replicas must share one replica when R + W is bigger than N.
 
 ```mermaid
 flowchart LR
@@ -118,6 +165,8 @@ Common settings with `N = 3`:
 
 ### Write and read paths
 
+**In plain words:** send the write to all replicas and wait for W to say ok; ask R replicas on read, keep the newest answer, and fix stale ones.
+
 1. **Write**: the coordinator stamps the value with a version (Cassandra: a timestamp per cell; Riak: a causal context), sends it to all `N` replicas, and replies "OK" after `W` acks. The remaining replicas still receive it unless they are down.
 2. **Read**: the coordinator asks replicas, waits for `R` replies, and returns the newest version.
 3. **Read repair**: if some of those replies were older, the coordinator writes the newest version back to them.
@@ -143,10 +192,22 @@ sequenceDiagram
 
 ### Choosing the newest value
 
+**In plain words:** either the biggest timestamp wins (simple, can lose writes) or you keep both versions and let the app merge.
+
 - **Last-writer-wins (LWW)**: keep the version with the highest timestamp. Cassandra does this per cell. Simple, but concurrent writes lose silently, and a node with a fast clock wins wrongly (see [[Clocks and Ordering]]).
 - **Version vectors and siblings**: each version carries a vector of per-replica counters. If neither version's vector dominates, they are concurrent and both are kept as **siblings** for the application (or a CRDT) to merge. Dynamo and Riak do this; the Dynamo cart merged siblings by union, which is why deleted items occasionally reappeared.
 
+```mermaid
+flowchart LR
+    V1["x=5 at 10:00:01"] --> Q{"Rule?"}
+    V2["x=7 at 10:00:02"] --> Q
+    Q -- "last writer wins" --> L["Keep x=7, lose x=5"]
+    Q -- "keep siblings" --> S["Keep both, app merges"]
+```
+
 ### Sloppy quorum and hinted handoff
+
+**In plain words:** if home replicas are down, another machine holds the write for a while and hands it back later.
 
 When some of a key's `N` home replicas are unreachable, a **sloppy quorum** accepts the write on other healthy nodes outside the home set, which store it with a **hint** naming the intended owner. When the owner comes back, the hint is handed off.
 
@@ -167,9 +228,11 @@ The catch: a later read with `R = 2` may ask B and C, which both lack the write.
 
 Cassandra uses hinted handoff to speed up recovery but still counts only real replicas toward its consistency level (and `ANY` is the only level a hint alone satisfies). Its default `max_hint_window` is 3 hours.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the overlap rule and the read path in a few lines.
 
 ```text
 put(k, v, ts):
@@ -195,6 +258,8 @@ Trace with `N = 3, R = W = 2`, replica 3 down:
 2. Replica 2 also dies. `put(cart:7, "3 items", 200)`: only replica 1 acks → ERROR, but replica 1 now holds "3 items". This is a **partially failed write**: the client was told "failed", yet a later read may return it.
 
 ### Go: a toy leaderless store
+
+**In plain words:** a small working store with N, R and W you can change, to watch stale reads appear and disappear.
 
 This compiles and passes `go vet` and `go test -race` on Go 1.24. Timestamps are passed in, so ordering is deterministic.
 
@@ -354,9 +419,11 @@ func TestLWWDropsConcurrentWrite(t *testing.T) {
 
 The toy contacts replicas in a fixed order to stay deterministic; a real coordinator sends to all and takes the first `R` replies, which is also why latency is set by the replicas, as the next section shows.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Per-request choice in Cassandra
+
+**In plain words:** Cassandra lets each request choose how many replicas must answer: ONE is fast, QUORUM is safer.
 
 | Consistency level | Replicas that must answer | Use |
 | --- | --- | --- |
@@ -367,6 +434,8 @@ The toy contacts replicas in a fixed order to stay deterministic; a real coordin
 | `ALL` | every replica | rarely; one dead replica fails the request |
 
 ### Quorum vs consensus vs leader-based
+
+**In plain words:** who decides the order of writes: nobody, a voted majority, or one leader.
 
 | Approach | Who orders writes | Linearizable? | Failure handling | Examples |
 | --- | --- | --- | --- | --- |
@@ -379,7 +448,7 @@ Quorum replicas only **acknowledge**: each one independently stores whatever arr
 > [!warning] Trap: DynamoDB is not Dynamo-style
 > DynamoDB keeps 3 replicas per partition in different AZs, and one is the leader elected with Multi-Paxos. Writes go to the leader and are acknowledged after a majority persist them; strongly consistent reads go to the leader. It shares a name with the 2007 Dynamo paper, not its replication design.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Latency is set by the slowest replica you wait for.** With `W = 2` of 3, a write's latency is the second-fastest replica's. Coordinators reduce tail latency with **speculative retries**: if a replica has not answered by about its usual p99, ask another one (Cassandra's per-table `speculative_retry` option, default `99p`, written `99PERCENTILE` before 4.0).
 - **Conflict handling moves to the application.** LWW loses concurrent writes; siblings need merge code.
@@ -387,7 +456,7 @@ Quorum replicas only **acknowledge**: each one independently stores whatever arr
 - **When not to use:** money, inventory counts, uniqueness constraints, and anything that needs read-modify-write correctness. Use a leader-based or consensus store, or a CRDT if the operation merges naturally (see [[CRDTs and Conflict Resolution]]).
 - **When it shines:** high write throughput, multi-DC writes, time-series, carts, sessions, and feeds where "always writable" beats "always exact".
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Cassandra and ScyllaDB (LWW per cell, tunable consistency, hinted handoff, Merkle-tree repair); Riak KV (siblings with dotted version vectors). Voldemort, LinkedIn's Dynamo-style store, is no longer actively developed.
 - **Failure modes → fixes:**
@@ -397,7 +466,7 @@ Quorum replicas only **acknowledge**: each one independently stores whatever arr
   - Coordinator overload during a hint replay storm → throttle hinted handoff (`hinted_handoff_throttle` in Cassandra 4.1+, `hinted_handoff_throttle_in_kb` in older versions; it limits how fast each node replays its stored hints).
 - **What to monitor:** hints stored and replayed, read-repair rate, repair progress and age of last successful repair per table, digest mismatch rate, per-replica p99 latency, and unavailable or timeout exceptions per consistency level.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 Why `R + W > N` is still **not linearizable**:
 
@@ -412,7 +481,7 @@ At scale:
 - **Merkle tree granularity.** A tree over a large range with few leaves flags whole big ranges as different and streams much more data than needed; more leaves cost memory. Cassandra builds these trees during validation compaction, which is CPU and I/O heavy, so repairs are scheduled per range.
 - **Choosing N.** `N = 3` with `R = W = 2` tolerates one unavailable replica per operation. `N = 5` with `R = W = 3` tolerates two but costs more storage and writes.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Explain `R + W > N` and why it matters.
 > With `N` replicas, a write waits for `W` acks and a read for `R` replies. If `R + W > N`, any read set overlaps any completed write set in at least one replica, so the read sees the latest completed write and picks it by version. With `N = 3`, `R = W = 2` is the usual choice.
@@ -435,7 +504,7 @@ At scale:
 > [!question]- How is a quorum different from consensus?
 > Quorum replicas each store what they receive and acknowledge; nobody agrees on an order, so concurrent writes conflict. Consensus elects a leader and commits a single ordered log on a majority, which supports linearizable reads and conditional updates.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Leaderless: any replica takes writes; no failover step.
 - `R + W > N` → overlap → read sees the latest completed write. Default `N=3, R=W=2`.

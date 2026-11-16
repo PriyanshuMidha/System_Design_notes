@@ -26,7 +26,33 @@ updated: 2026-11-13
 > - Respect robots.txt (RFC 9309), cache it per host, and cap pages and depth per host to escape traps.
 > - Store raw pages in object storage and hand them to parsing and indexing through a queue, so fetching never waits on processing.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A web crawler is a program that visits web pages to read them, like Google's bot.
+It starts with a few page addresses. It downloads each page, finds the links on it, and adds new ones to its to-do list.
+That to-do list is called the **frontier**.
+It must remember which pages it already saw, so it does not fetch them again.
+It must also be **polite**: it waits between visits to the same website, so it never overloads anyone.
+
+```mermaid
+flowchart LR
+    F["To-do list"] --> G["Fetch page<br/>(politely)"] --> S["Save it"] --> L["Find links"]
+    L --> N{"Seen before?"}
+    N -- "no" --> F
+    N -- "yes" --> X["Skip"]
+```
+
+So the rest of this note is just these 3 questions:
+1. How do you pick the next page while staying polite to every site?
+2. How do you remember billions of seen pages cheaply?
+3. How do you avoid traps and decide when to visit a page again?
 
 **The problem in one story**
 
@@ -73,7 +99,7 @@ Where it breaks: libraries do not invent new books while you walk around, but we
 > [!tip] Remember
 > A crawler is a loop: take a URL, fetch it politely, save it, extract new links, skip what you have seen.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 The naive crawler is a breadth-first search: a queue of URLs, a loop that pops one, fetches it, and pushes its links. Run that with 500 threads and three things go wrong within minutes:
 - **It attacks one site.** Most links on a page point to the same host, so the queue fills with `example.com/*` and 500 threads hit one small server at once. That is effectively a denial-of-service attack, and the site will ban you.
@@ -94,7 +120,7 @@ The naive crawler is a breadth-first search: a queue of URLs, a loop that pops o
 - **Freshness and priority:** important and fast-changing pages are fetched more often.
 - **Extensibility:** new content types and processing stages without rewriting the fetcher.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Imagine a team of librarians photocopying every book in a city. A dispatcher holds one small tray per library branch and hands out at most one request per branch at a time, waiting a few seconds before sending anyone back to the same branch.
 
@@ -109,7 +135,16 @@ Mapped to the system:
 - **Posted rules** = robots.txt.
 - **Infinite next volume** = a crawler trap, handled by per-host page and depth caps.
 
-## 3. How it works - high-level design
+```mermaid
+flowchart LR
+    D["Dispatcher:<br/>one tray per library"] --> L1["Librarian 1"]
+    D --> L2["Librarian 2"]
+    L1 --> B["Ledger:<br/>books already copied"]
+    L2 --> B
+    L1 -. "new titles found" .-> D
+```
+
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart LR
@@ -180,9 +215,11 @@ Numbers: 1B pages/month = ~386 pages/s; 100 KB/page = ~310 Mbit/s;
          10B URLs in a 1% Bloom filter = ~12 GB
 ```
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Estimates (inputs are labelled estimates)
+
+**In plain words:** rough sums: pages per second, bandwidth, and storage for all the saved pages.
 
 | Quantity | Arithmetic | Result |
 | --- | --- | --- |
@@ -204,6 +241,8 @@ The interesting line is concurrency: 386 fetches per second only works if work i
 
 ### Interfaces
 
+**In plain words:** there is no public API, just the inside parts that hand work to each other.
+
 A crawler has no public API, but its internal interfaces are worth stating:
 
 ```text
@@ -215,6 +254,8 @@ Event page.fetched {url, final_url, status, warc_file, offset, length, content_s
 ```
 
 ### Data model
+
+**In plain words:** the to-do list, the seen-pages set, saved raw pages, and per-site rules.
 
 ```mermaid
 erDiagram
@@ -256,6 +297,8 @@ erDiagram
 At 10 billion URLs, the `urls` table belongs in a wide-column store partitioned by host (for example Cassandra, see [[Wide-Column Stores and Cassandra]]), so each crawler node reads and writes the hosts it owns. Raw bodies never go in the database; they live in WARC files in object storage, and the `fetches` row stores the file and offset.
 
 ### Go: a polite frontier with an injected clock
+
+**In plain words:** the code keeps one queue per website and only hands out a page when that site's wait time is over.
 
 The frontier keeps one FIFO queue per host and a min-heap of hosts ordered by `readyAt`, the earliest time the host may be fetched again. `Next` pops a URL only from a host whose time has come; otherwise it tells the caller how long to wait.
 
@@ -466,7 +509,7 @@ Verified with Go 1.24: `go vet ./...` is clean and `go test -race ./...` passes 
 
 This frontier starts the politeness gap when a URL is handed out. A production version starts it when the fetch **finishes** (a `Done(host)` call), so a slow server automatically gets fewer requests; Mercator-style crawlers set the gap to a multiple (for example 10×) of the last fetch time.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Choice | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -479,7 +522,7 @@ This frontier starts the politeness gap when a URL is handed out. A production v
 | Bloom filter | ~9.6 bits per URL at 1% false positives | Memory is tight; missing 1% of URLs is acceptable | False positives mean pages are **never** crawled |
 | Headless browser rendering | Run JavaScript before extracting links | Single-page apps | 10× to 100× more CPU per page (estimate); run only for hosts that need it |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Freshness vs coverage.** Every re-crawl of a known page is a new page you did not fetch. Spend the budget by estimated change rate and importance, not uniformly.
 - **Politeness vs throughput.** Throughput comes from breadth across hosts, never from depth on one host. A crawl that needs 10,000 pages from one site per hour should ask the site for a feed or a sitemap instead.
@@ -487,7 +530,13 @@ This frontier starts the politeness gap when a URL is handed out. A production v
 - **Store raw pages** even though parsing is the goal: when the parser improves, you can reprocess without re-fetching the web.
 - **When not to build a crawler.** If the data is available through an API, sitemaps, RSS, Common Crawl's public archives or a data partnership, use that. Crawling sites that forbid it in robots.txt or their terms of service is a legal and ethical problem, not a technical one.
 
-## 7. In production
+```mermaid
+flowchart LR
+    B["Fixed fetch budget"] --> N["New pages<br/>(coverage)"]
+    B --> R["Re-visits<br/>(freshness)"]
+```
+
+## 7. In production 🔴
 
 - **Real systems.**
 	- Mercator (Heydon and Najork) introduced the front-queue and back-queue frontier still taught in Introduction to Information Retrieval.
@@ -519,9 +568,11 @@ This frontier starts the politeness gap when a URL is handed out. A production v
 	- The Kafka lag between fetchers and parsers.
 	- Pages per host, as a trap detector: a host whose page count keeps growing with near-identical content.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### The two-level frontier
+
+**In plain words:** first pick by importance, then sort into one queue per website so politeness is easy.
 
 ```mermaid
 flowchart LR
@@ -551,6 +602,8 @@ flowchart LR
 
 ### URL normalization and dedupe
 
+**In plain words:** clean up each address (lowercase, drop junk parts) so two ways of writing the same page become one.
+
 Two URLs that fetch the same resource should become one string before the seen-check:
 - lower-case the scheme and host;
 - drop default ports and the fragment;
@@ -567,6 +620,8 @@ Remember the direction of the error: a false positive says "seen" for a new URL,
 
 ### Content dedupe with SimHash
 
+**In plain words:** a fingerprint that stays almost the same when a page changes a little, so near-copies are spotted.
+
 Exact duplicates are caught with a SHA-256 of the normalized body. Near-duplicates (the same article with a different ad block or date) need **SimHash**:
 1. Split the text into features (for example word shingles) and hash each feature to 64 bits.
 2. For each bit position, add the feature's weight if that bit is 1 and subtract it if 0.
@@ -576,6 +631,8 @@ Similar documents get fingerprints that differ in few bits. Manku et al. used 64
 
 ### Re-crawl scheduling
 
+**In plain words:** pages that change often are visited often; pages that never change are visited rarely.
+
 Each URL gets a `next_fetch_at`. After a fetch, compare the content hash with the last one:
 - if it changed, shorten the interval (for example halve it);
 - if not, lengthen it, within bounds such as 1 hour to 30 days.
@@ -584,12 +641,14 @@ Conditional requests (`If-Modified-Since`, `If-None-Match`) turn unchanged pages
 
 ### Scaling out
 
+**In plain words:** each machine owns a set of websites, so politeness for a site stays on one machine.
+
 - **Nodes.** Each node owns a set of hosts through consistent hashing on `host`. It runs its own frontier, fetchers, robots cache and seen-filter shard.
 - **Routing links.** Links found on node A for a host owned by node B are batched and sent to B, either over a partitioned Kafka topic keyed by host or by direct RPC. Batching matters: most links are cross-host, so per-link RPCs would cost more than fetching.
 - **Rebalancing.** When a node joins, only the hosts on its arc of the ring move, together with their queues and seen-set slices.
 - **Geography.** For politeness and latency, a host can be pinned to a crawler region near it.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How do you make sure you never send more than one request at a time to a website?
 > Partition URLs by host, so exactly one node owns each host. In that node's frontier, keep one queue per host and a min-heap of hosts by `ready_at`; a fetcher takes a URL only from a host whose `ready_at` has passed, and the host's next slot is set from when the fetch finishes. No global lock is needed because ownership is exclusive.
@@ -612,7 +671,7 @@ Conditional requests (`If-Modified-Since`, `If-None-Match`) turn unchanged pages
 > [!question]- How do you decide which pages to re-crawl and how often?
 > Keep a per-URL change estimate. If the content hash changed since the last fetch, shorten the interval; if it did not, lengthen it, within bounds. Use conditional GETs to make unchanged pages cheap, and prefer sitemap `lastmod` hints. Weight the schedule by importance so a news homepage is checked every few minutes and an old forum thread every few weeks.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - The frontier has front queues for priority and back queues for politeness (one host each), plus a min-heap by `ready_at`.
 - Partition by `hash(host)` with consistent hashing; politeness becomes a local decision.

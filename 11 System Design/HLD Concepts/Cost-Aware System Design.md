@@ -28,7 +28,42 @@ updated: 2026-11-13
 > - Match the **purchase model** to the load shape: reserved for the steady base, on-demand for the swing, spot for work that can be interrupted.
 > - Say the number. "About 3 cents per thousand requests" is stronger than "it should be cheap".
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (cost levers), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+In the cloud you do not buy computers. You rent them by the hour, and you pay for every GB you store and send.
+So every design choice has a price tag, even if nobody shows it to you.
+The surprise is usually not the servers. It is data leaving the cloud, called **egress**, and data moving between data centres.
+A cost-aware design guesses the monthly bill early, before the bill guesses it for you.
+The best single number is **cost per request** (or per user, or per order): total bill divided by how much work you did.
+
+```mermaid
+flowchart LR
+    A["Design choice"] --> B["Servers"]
+    A --> C["Storage"]
+    A --> D["Data sent out"]
+    B --> E["Monthly bill"]
+    C --> E
+    D --> E
+```
+
+Most savings come from three moves: do less work, keep data on cheaper shelves, and send less data over the network.
+
+```mermaid
+flowchart LR
+    B["Before:<br/>every request hits servers,<br/>all data on fast disks"] --> A["After:<br/>cache + CDN serve most,<br/>old data on cheap storage"]
+```
+
+The rest of this note is just these 3 questions:
+1. Where does the money actually go?
+2. Which levers cut the bill without hurting users?
+3. How do you trade cost against speed, safety and uptime in an interview?
 
 **The problem in one story**
 
@@ -79,7 +114,7 @@ Where it breaks: a restaurant's prices are on a menu you can read, while cloud c
 > [!tip] Remember
 > Every design choice has a price; estimate egress, cross-AZ traffic and storage tier first.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 You design a photo sharing app. 10 million daily users each view 50 images of 300 KB.
 
@@ -94,7 +129,7 @@ Interviewers at SDE-3 level notice when a candidate sees this unprompted.
 > [!tip] Remember
 > The biggest line on the bill is usually the one nobody drew on the whiteboard: the arrows.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of running a **restaurant**. Rent (compute you keep on), ingredients (storage), delivery fees (network), and the catering company you hire for desserts (managed services).
 
@@ -124,7 +159,7 @@ flowchart TD
 > [!tip] Remember
 > Four buckets: compute, storage, network, managed services. Ask which one dominates before optimising any of them.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 The main cost drivers
 
@@ -327,7 +362,7 @@ sequenceDiagram
 > [!tip] Remember
 > One sentence, one number, one trade-off. Then move on.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 **Problem:** cost-review the video streaming part of a startup app. 2 million monthly viewers, average 4 hours per month, average bitrate 3 Mbps (all estimates).
 
@@ -350,7 +385,7 @@ flowchart LR
 
 Result: from $540,000 of naive monthly egress alone to about $200,000 in total (about $0.10 per viewer) through CDN offload, bitrate control, tiering and spot transcoding. The point is the method: estimate, find the dominant line, attack it.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Lever | Typical saving | Risk | Best for |
 | --- | --- | --- | --- |
@@ -365,7 +400,7 @@ Result: from $540,000 of naive monthly egress alone to about $200,000 in total (
 
 All savings above are broad, commonly cited ranges and estimates, not guarantees.
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 | Saving | What you give up |
 | --- | --- |
@@ -381,7 +416,7 @@ All savings above are broad, commonly cited ranges and estimates, not guarantees
 > [!warning] Common mistake
 > Cutting redundancy to save money and not telling the interviewer the availability cost. Cost cuts that silently lower the SLA are a red flag. State the trade-off.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Tag everything** (team, service, environment) so each bill line has an owner. Untagged spend cannot be fixed.
 - **Budgets and anomaly alerts.** A daily spend alarm catches a runaway loop or a forgotten test cluster within a day, not at month end.
@@ -392,9 +427,11 @@ All savings above are broad, commonly cited ranges and estimates, not guarantees
 - **Test with load, not guesses.** Autoscaling that thrashes (scale up and down every few minutes) pays for instance warm-up repeatedly. See [[Autoscaling]].
 - **Cloud egress alternatives.** Some providers charge little or nothing for egress (Cloudflare R2 advertises zero egress fees), which changes the maths for large public content. Weigh it against integration cost.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Unit economics as a design constraint
+
+**In plain words:** Set a money budget per order (or per user) first. Then check every design idea against it, like you check against a speed target.
 
 Define the target first: "infra cost under 3 percent of GMV" or "under $0.02 per order". Then every design choice is checked against the budget, the same way latency budgets work. A p99 budget splits across hops; a cost budget splits across components.
 
@@ -409,15 +446,33 @@ flowchart LR
 
 ### Cost versus availability
 
+**In plain words:** Each extra "nine" of uptime means more spare copies running. Spares cost money even when nothing breaks.
+
 Each extra nine of availability roughly demands another level of redundancy: multi-AZ, then multi-region. Multi-region active-active can more than double infra cost and adds cross-region transfer. Choose the tier from the business impact of downtime, not from habit. A small internal tool does not need three regions. See [[Multi-Region Architecture]].
 
+```mermaid
+flowchart LR
+    A["One zone<br/>cheapest"] --> B["Multi-zone<br/>more spare copies"]
+    B --> C["Multi-region active-active<br/>can more than double the bill"]
+```
+
 ### Cost of consistency and durability
+
+**In plain words:** Making every copy agree right away, and never losing a byte, means more waiting and more copies. Both cost money.
 
 Synchronous cross-region replication and strongly consistent reads cost latency and money. Quorum writes use more IO and network. Provisioned IOPS and multi-AZ standby are insurance you pay for every month. State what failure each one covers.
 
 ### Egress as a lock-in factor
 
+**In plain words:** Clouds charge you to take data out. The more data you store in one cloud, the more it costs to ever leave.
+
 Moving data out of a cloud costs per GB. A design that keeps a 5 PB data lake in one provider has a real exit cost: at roughly $0.05 per GB, about $250,000 just to read it out (illustrative). Mention it only if the interviewer asks about multi-cloud or vendor lock-in.
+
+```mermaid
+flowchart LR
+    A["5 PB data lake<br/>in Cloud A"] -- "about $0.05 per GB" --> B["Cloud B"]
+    A --> C["Exit bill: about $250k<br/>just to move the data"]
+```
 
 ### Whiteboard version
 
@@ -436,7 +491,7 @@ flowchart LR
 
 Say it in 30 seconds: "Four buckets: compute, storage, network, managed. I estimate each, find the dominant line (usually egress or the database), and attack that first: CDN and cache for reads, reserved baseline plus autoscale plus spot for compute, lifecycle tiers for storage. I report cost per request and say what each saving costs me in availability or freshness."
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- The interviewer says your design is too expensive. What do you do?
 > Ask what the budget is (cost per user or per request). Estimate the bill by bucket, find the dominant line, usually egress or the database, then name two or three levers for it with numbers: CDN and caching, right-sizing, tiering, spot for batch. State the trade-off each lever makes (freshness, interruptions, retrieval latency). Do not cut redundancy without saying what happens to the SLA.
@@ -456,7 +511,7 @@ Say it in 30 seconds: "Four buckets: compute, storage, network, managed. I estim
 > [!question]- When is building your own better than a managed service?
 > When the service is a core differentiator or the scale is so large that the premium exceeds the cost of a dedicated team. Dropbox built its own storage at exabyte scale. For most teams the people cost, on-call and risk make managed cheaper overall. Say you would revisit at about ten times the scale.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 | Bucket | First lever | Number to quote |
 | --- | --- | --- |
@@ -472,7 +527,7 @@ Say it in 30 seconds: "Four buckets: compute, storage, network, managed. I estim
 
 Interview habit: estimate, find the dominant line, one lever, one number, one trade-off.
 
-## 11. Links
+## 11. Links 🟢
 
 - Estimation and scale: [[Back-of-the-Envelope Estimation]], [[Scaling Basics]], [[Performance Engineering and Capacity Planning]]
 - Network and caching: [[CDN and Edge]], [[Caching Patterns]], [[Choosing a Caching Strategy - Decision Guide]]
@@ -480,7 +535,7 @@ Interview habit: estimate, find the dominant line, one lever, one number, one tr
 - Resilience cost: [[Multi-Region Architecture]]
 - Framework: [[System Design Interview Framework]], [[Security, Privacy and Compliance in HLD]]
 
-## Links
+## Links 🟢
 
 ### Watch on YouTube
 

@@ -26,7 +26,41 @@ updated: 2026-11-13
 > - A CPU profile (`pprof`) answers "which function" in 30 seconds; `top -H` and `pidstat` answer "which thread or process".
 > - Mitigate by adding capacity or removing load first; fix the code after.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (what the CPU numbers mean), 4 (first 5 minutes and the incident), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+The **CPU** is the part of a computer that does the actual thinking work.
+It can only do so much work per second.
+When requests come in faster than it can handle them, they wait in a line.
+The line grows, so every request gets slower, not just the extra ones.
+That is **CPU saturation**: the CPU is full and work is waiting.
+There is a sneaky version too: the CPU is not full, but a rule (a **limit**) pauses your app anyway.
+
+```mermaid
+flowchart LR
+    A["12 requests a second"] --> Q["Line grows"]
+    Q --> C["CPU can do 10 a second"]
+    C --> S["Everyone waits longer"]
+```
+
+You fix it in two moves: first make the line shorter (add machines, or turn away some work), then find the slow code.
+
+```mermaid
+flowchart LR
+    P["Site is slow"] --> M["Add machines or<br/>roll back"]
+    M --> F["Then find the<br/>hot code"]
+```
+
+The rest of this note is just these 3 questions:
+1. Is the CPU really full, or is something pausing it?
+2. What changed to make it busy?
+3. Which piece of code is eating the CPU?
 
 **The problem in one story.**
 A shop has one cashier who serves 10 customers a minute.
@@ -71,7 +105,7 @@ Where it breaks: a container limit is like a manager forcing the cashier to take
 > [!tip] Remember
 > Check throttling and what changed first; add capacity or shed load before you fix the code.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A CPU is like a single cashier. If customers arrive slower than the cashier can serve, no queue forms. When arrivals exceed service speed, a queue forms and every customer waits longer, not only the extra ones. That is why latency climbs sharply as CPU use approaches 100 percent.
 
@@ -101,13 +135,15 @@ flowchart LR
 > [!tip] Remember
 > Saturation is about waiting, not about the percentage. Look for the queue, not only the usage.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A CPU core is a cashier; the run queue is the line; throttling is a manager who says "you only get 2 hours of cashier time per shift" even though the shop is open; steal time is another shop borrowing your cashier.
 
 Where it breaks down: a real CPU can be time-sliced across thousands of threads, so the queue is invisible per request. You see it as latency, not as a line.
 
 ### The four situations
+
+**In plain words:** four different problems all look like "CPU is high". The table tells them apart by one clue each.
 
 | Situation | CPU usage looks like | Key evidence | Fix |
 | --- | --- | --- | --- |
@@ -119,9 +155,11 @@ Where it breaks down: a real CPU can be time-sliced across thousands of threads,
 > [!warning] Common mistake
 > Reading "CPU 50 percent" on a pod with a 1-core limit as healthy. If the pod is throttled, the node looks half idle while the pod has used 100 percent of its quota and is being paused.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### CPU time and what each number means
+
+**In plain words:** tools like `top` split CPU time into buckets: your code, the system, waiting for disk, and so on. Each bucket points to a different cause.
 
 On Linux, CPU time per core is split into states. `top` and `mpstat` show them.
 
@@ -169,11 +207,21 @@ sequenceDiagram
 
 ### Go and GOMAXPROCS
 
+**In plain words:** Go decides how many things to run at once. If it guesses more than your container is allowed, your app gets paused a lot.
+
 Go starts as many running threads as `GOMAXPROCS`. Before Go 1.25 it defaulted to the number of CPUs on the node, not the container limit. A pod limited to 2 CPUs on a 64-core node would run 64 scheduler threads and get throttled constantly.
 
 Since Go 1.25 the runtime reads the cgroup CPU limit and sets `GOMAXPROCS` accordingly. On older versions use `go.uber.org/automaxprocs` or set `GOMAXPROCS` by hand. See [[Runtime - Goroutine Scheduler (GMP)]].
 
 ### Load average versus utilisation
+
+**In plain words:** "busy %" tells how full the CPU is. "Load" tells how many things are waiting. Waiting is what users feel.
+
+```mermaid
+flowchart LR
+    U["Utilisation:<br/>how busy is the CPU?"] --> X["Can be 100% and fine"]
+    L["Load / run queue:<br/>how many are waiting?"] --> Y["Growing = users wait"]
+```
 
 **Load average** counts tasks that are running or waiting (on Linux it also includes uninterruptible I/O waits). A load of 8 on an 8-core machine means fully busy; 16 means a queue of 8. It lags the real situation because it is an exponential average over 1, 5 and 15 minutes.
 
@@ -182,7 +230,7 @@ Since Go 1.25 the runtime reads the cgroup CPU limit and sets `GOMAXPROCS` accor
 > [!tip] Remember
 > Look at throttling and run-queue wait. A pod can be starved while the average CPU looks fine.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### First 5 minutes
 
@@ -206,6 +254,8 @@ kubectl rollout undo deployment/search -n prod
 ```
 
 ### Real-world-style incident timeline
+
+**In plain words:** a made-up but realistic incident, minute by minute, so you can see the steps in order.
 
 An illustrative scenario: a search API in Go, 8 pods, CPU limit 2 cores each.
 
@@ -249,7 +299,7 @@ flowchart TD
     P --> F["Fix hot path, add benchmark and alert"]
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Diagnosis flowchart: from symptom to cause
 
@@ -269,6 +319,8 @@ flowchart TD
 
 ### Investigation steps for each likely cause
 
+**In plain words:** one row per suspect: where to look, what to type, and what the answer means.
+
 | Cause | Where to look | Command or query | What the result means |
 | --- | --- | --- | --- |
 | Which process or thread | Node or container | `top -H -p PID`, `pidstat -u -t 1` | One thread at 100 percent is a single-thread bottleneck; many equal threads is parallel load |
@@ -282,6 +334,8 @@ flowchart TD
 | Context switches | Node | `pidstat -w 1` | Very high `cswch/s` points to lock contention or too many threads |
 
 ### Dashboards and PromQL
+
+**In plain words:** ready-made queries for your graphs. Each one answers one question: how busy, how paused, which pod.
 
 ```promql
 # CPU used per pod, in cores
@@ -311,6 +365,8 @@ rate(go_gc_duration_seconds_sum[5m])
 ```
 
 ### Reading the CPU profile
+
+**In plain words:** a profile is a list of which functions used the most CPU. The top few lines usually name the problem.
 
 ```bash
 # Print the top functions by cumulative time (non-interactive)
@@ -342,9 +398,11 @@ sequenceDiagram
     You->>You: hot function: fix, benchmark, redeploy
 ```
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 ### Fixes: immediate, proper, prevention
+
+**In plain words:** quick fix today, real fix this week, and a guard so it doesn't happen again.
 
 | Level | Action | Cost |
 | --- | --- | --- |
@@ -353,6 +411,8 @@ sequenceDiagram
 | Prevention | Load tests with a CPU profile, benchmarks in CI, throttling alert, autoscaling with headroom, capacity planning | Ongoing work |
 
 ### CPU limits: set them or not?
+
+**In plain words:** a limit protects your neighbours but can pause your app. The table shows when each choice is better.
 
 | Choice | Benefit | Risk |
 | --- | --- | --- |
@@ -369,9 +429,11 @@ sequenceDiagram
 - New pods need warm-up time and may be slow at first (cold caches, JIT, connection pools).
 - If the cause is a retry storm, adding pods only lets more retries in. Shed load first. See [[Autoscaling]].
 
-## 7. In production
+## 7. In production 🔴
 
 ### Alerts that catch it early
+
+**In plain words:** alert on waiting and pausing, not just on "CPU is busy". Busy alone is often fine.
 
 | Alert | Fires when | Why |
 | --- | --- | --- |
@@ -382,6 +444,8 @@ sequenceDiagram
 | `NodeSteal` | Steal above 5 percent for 10 minutes | Noisy neighbour |
 
 ### Always-on profiling
+
+**In plain words:** keep a light profiler running all the time, so you already have the data when trouble starts.
 
 Continuous profilers (Pyroscope, Parca, Grafana Cloud Profiles) sample production at low overhead (usually a few percent) so you have a profile from before the incident. Without one, take the profile as early as possible during the incident, because the problem may vanish after a restart.
 
@@ -408,9 +472,18 @@ This needs `import _ "net/http/pprof"`. Binding to `127.0.0.1` keeps it off the 
 6. A bad actor: scraper, bot or a client with a bug calling in a loop.
 7. Crypto (bcrypt, TLS handshakes) at high rate. Reuse connections and keep-alives.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Why latency curves bend near 100 percent
+
+**In plain words:** a line at a shop is fine at 50% busy, bad at 90%, and terrible at 99%. Waiting grows much faster than busyness near the top.
+
+```mermaid
+flowchart LR
+    A["50% busy<br/>wait x1"] --> B["80% busy<br/>wait x4"]
+    B --> C["90% busy<br/>wait x9"]
+    C --> D["99% busy<br/>wait x99"]
+```
 
 In queueing theory, mean wait grows roughly as `rho / (1 - rho)` for a single server, where `rho` is utilisation. At 50 percent the wait factor is 1; at 90 percent it is 9; at 95 percent it is 19.
 
@@ -425,6 +498,8 @@ flowchart LR
 
 ### CFS throttling subtleties
 
+**In plain words:** the limit is checked in tiny time slices. Apps with many threads can use up their slice early and then sit paused.
+
 - Quota is counted per period (100 ms by default), across all threads. A multi-threaded service burns quota faster than wall time.
 - Throttling can happen at low average CPU because the burst consumes the quota in a few milliseconds.
 - `cpu.stat` in cgroup v2 gives `nr_periods`, `nr_throttled`, `throttled_usec`. In cgroup v1 the same data is in `cpu.stat` as `nr_throttled` and `throttled_time`.
@@ -432,9 +507,13 @@ flowchart LR
 
 ### Steal time
 
+**In plain words:** on shared cloud machines, another customer can borrow your CPU. Your app waits even though it did nothing wrong.
+
 In a VM, `st` is time the hypervisor ran another guest on your vCPU. On burstable instance types (such as AWS T-series), running out of CPU credits also appears as throttling at the instance level. Check the cloud provider's CPU credit metrics. The fix is a non-burstable instance type or a dedicated host.
 
 ### Single-thread bottleneck
+
+**In plain words:** one worker can be at full speed while the rest sit idle. The total looks low, but that one worker is the line.
 
 A service that is slow while total CPU is low (for example 12 percent on 8 cores) may have one thread at 100 percent: a global lock, a single-threaded event loop, or a single goroutine consuming a channel.
 
@@ -442,13 +521,17 @@ A service that is slow while total CPU is low (for example 12 percent on 8 cores
 
 ### Spinning versus blocking
 
+**In plain words:** threads fighting over the same lock burn CPU without doing real work.
+
 High `sy` with high context switches (`pidstat -w`) means too many threads competing or lock ping-pong. In Go, a very high number of runnable goroutines raises scheduler latency; check `go tool trace` for scheduler delays and see [[Benchmarks, Profiling and Tracing]].
 
 ### When the CPU is a symptom
 
+**In plain words:** sometimes the CPU is busy because something else is slow. Fix the slow thing, not the CPU.
+
 CPU may be high because something else is slow: a slow database makes requests pile up, which means more concurrent goroutines and more context switching, which looks like a CPU problem. Always read the dependency dashboards alongside CPU.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Latency is high but CPU usage on the pod is only 50 percent. What do you check?
 > CPU throttling first. If the pod has a CPU limit, the kernel can pause all its threads once the quota per 100 ms period is used, even when the average looks low. Check `container_cpu_cfs_throttled_periods_total` divided by `container_cpu_cfs_periods_total`, and `cpu.stat`. Also check `GOMAXPROCS` against the limit, node steal time, and whether a single thread is saturated.
@@ -468,7 +551,7 @@ CPU may be high because something else is slow: a slow database makes requests p
 > [!question]- What is the difference between load average and CPU utilisation, and why do you care?
 > Utilisation is the share of time cores are busy. Load average counts tasks that are running or waiting, including uninterruptible I/O waits on Linux, averaged over 1, 5 and 15 minutes. Load above the core count shows queueing even at 100 percent utilisation, and high load with low CPU suggests I/O wait. PSI (`/proc/pressure/cpu`) is a more direct measure of stalls.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Saturation is waiting. Look at latency, run queue and throttling, not just CPU percent.
 - Latency high with CPU low in a container: check CFS throttling first.

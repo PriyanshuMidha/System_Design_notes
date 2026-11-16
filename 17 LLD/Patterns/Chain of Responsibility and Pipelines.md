@@ -22,7 +22,34 @@ updated: 2026-11-13
 > - **Pipeline:** every step must pass; any step can stop the request (validation, HTTP middleware).
 > - Classic mistake: doing irreversible work (dispensing cash, charging a card) while the chain is still running. Plan the whole result first, then commit it.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then the rest of this "Start here" section, sections 1, 2 and the cheat sheet (10). Skip the big code blocks on a first pass. Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works, with the small whiteboard code), section 4 (the full worked example) and sections 5 and 6 (variants and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Sometimes a request must pass through a line of small steps, one after another.
+There are two kinds of line.
+In a **chain**, each step asks "can I handle this?" The first one that can, does, and the line stops there. Think of a helpline: robot, then junior, then senior.
+In a **pipeline**, every step must say "OK". Any step can say "no" and stop it. Think of airport security.
+In code, each step is a small function, and the line is just a list of them.
+
+```mermaid
+flowchart LR
+    R["Request"] --> S1["Step 1"] --> S2["Step 2"] --> S3["Step 3"] --> D["Done"]
+    S1 -. "chain: handled, stop" .-> D
+    S2 -. "pipeline: rejected, stop" .-> X["Error"]
+```
+
+The Go code below builds both kinds. Read the steps in words first, then the code.
+The rest of this note is just these 3 questions:
+1. When does the line stop (first win, or first failure)?
+2. How do you build the list of steps in Go?
+3. How do you avoid doing something you cannot undo (like giving out cash) while the line is still running?
+
 
 **The problem in one story.**
 You call a bank helpline. A recorded menu tries to help first.
@@ -66,7 +93,7 @@ Where it breaks: humans can use judgement to skip steps; code runs exactly the o
 > [!tip] Remember
 > A chain is an ordered list of small steps: in CoR the first one that handles it wins, in a pipeline all must pass.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Take the checkout of a food-delivery app.
 
@@ -82,7 +109,7 @@ Support desks have the mirror-image problem. A refund ticket must go to the **ch
 
 The chain turns each rule or approver into its own small unit and turns the order into data: a slice you can read, reorder and test.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Every link in a chain answers one question about the request, and has exactly three possible answers:
 
@@ -100,9 +127,11 @@ The two flavours differ in which answers a link may give:
 > [!tip] Say which one you mean
 > If no link can stop the chain with a success, you have a pipeline, not classic Chain of Responsibility. Both are useful; they just answer different questions ("who handles this?" vs "is this allowed?").
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Structure
+
+**In plain words:** Every step has the same small shape, so the runner can treat them all alike and walk them in order.
 
 ```mermaid
 classDiagram
@@ -138,6 +167,8 @@ There are two ways to connect the links:
 
 ### The run, step by step
 
+**In plain words:** The runner hands the request to step 1, looks at its answer, then moves on or stops.
+
 1. Build the chain once at startup, in order: cheap, local checks first; remote calls last.
 2. The runner offers the request to link 0.
 3. The link returns a decision (and, in a pipeline, an error when it rejects).
@@ -146,6 +177,8 @@ There are two ways to connect the links:
 6. Falling off the end means `ErrUnhandled` in a classic chain and success in a pipeline.
 
 ### The coupon pipeline
+
+**In plain words:** A coupon is checked by several rules in a row; the first rule that fails gives the reason the coupon is rejected.
 
 ```mermaid
 flowchart LR
@@ -162,6 +195,8 @@ flowchart LR
 The two cheap checks run first, so a ₹300 cart never reaches the remote store. The remote check has two different failure exits: "the coupon was used" is a validation result the user should see, while "the store did not answer" is an infrastructure error that the checkout must handle differently (retry, or fail open or closed by policy).
 
 ### Whiteboard version
+
+**In plain words:** The bare idea: a list of functions walked in order, once as a pipeline and once as a first-wins chain.
 
 The bare idea: a slice of functions walked in order, once as a pipeline and once as a first-wins chain. The full version in section 4 adds the production concerns.
 
@@ -221,7 +256,9 @@ func main() {
 }
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
+
+**In plain words:** One program with four kinds of chain: a helpline-style chain, a coupon pipeline, an ATM dispenser, and HTTP-style steps. Read one form at a time.
 
 One package with all four forms: a classic escalation chain, a coupon pipeline (three of the five rules from section 1) with fail-fast and collect-all, the ATM dispenser as linked handlers, and HTTP middleware.
 
@@ -487,6 +524,9 @@ func main() {
 }
 ```
 
+
+**In plain words:** These are the tests. They walk requests through each chain and check where the line stopped and why.
+
 ```go
 // main_test.go
 package main
@@ -636,6 +676,8 @@ What the code shows:
 
 ### The ATM dispenser, traced
 
+**In plain words:** We follow one cash withdrawal through the chain, note by note, to see that the plan is made first and money moves only at the end.
+
 The ATM holds one ₹2,000 note, two ₹500 notes and ten ₹100 notes. A customer asks for ₹3,700.
 
 ```mermaid
@@ -658,7 +700,7 @@ sequenceDiagram
 
 The plan stops as soon as the amount reaches zero: that is the **short-circuit on success**. Withdrawing while walking the chain would be a bug: on the second request the ₹100 cassette would hand out three notes before the chain discovered it could not pay the rest.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Variant | How it works | Stops when | Use when | Cost |
 | --- | --- | --- | --- | --- |
@@ -671,7 +713,7 @@ The plan stops as soon as the amount reaches zero: that is the **short-circuit o
 
 **Slice vs linked, in one line:** use a slice and a runner when links are independent checks; use linked handlers when a link must run code both before and after the rest of the chain (timing, recovery, transactions).
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Three fixed checks do not need a chain.** A function with three `if` statements is easier to read than a slice of rules and a runner. Reach for the chain when rules are added often, reused across flows, or reordered per configuration.
 - **Exactly one handler per key is a map, not a chain.** Routing an event by its type to one handler is `handlers[event.Type]`: O(1), and no ordering bugs. A chain earns its place when several handlers could match and order decides.
@@ -679,7 +721,7 @@ The plan stops as soon as the amount reaches zero: that is the **short-circuit o
 - **"Who handled this?" is harder to answer.** The decision is spread over links. Return or log the deciding link's name and index, as `Escalate` does.
 - **Business-editable rules want data, not code.** When marketing defines coupon conditions, a rule expression evaluated by an interpreter fits better than compiled links (see [[Rare GoF Patterns in Go]]).
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- `net/http` middleware is Go's everyday chain: `func(http.Handler) http.Handler`. A recovery, logging, auth or rate-limit link either calls `next.ServeHTTP` or writes a response and returns. See [[Middleware]] for the backend view and [[Decorator and Middleware]] for the wrapping structure.
@@ -695,7 +737,7 @@ The plan stops as soon as the amount reaches zero: that is the **short-circuit o
 	- A link mutates the shared request (for example, it upper-cases the coupon code in place) → later links, logs and retries see a request the caller never sent. Fix: pass the request by value, as `Escalate` and `Validate` do, and make any normalisation an explicit first step of the chain.
 - **What to monitor:** decisions per link (accept, reject, pass) as counters labelled with the link name, latency per link as a histogram, the `ErrUnhandled` rate, and timeouts per step.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why the greedy ATM chain is safe here and not everywhere.** A partial-handling chain is a greedy algorithm: each link takes as much as it can. Greedy always finds a solution when one exists for ₹2,000/₹500/₹100, because each note value divides the next larger one. With ₹500 and ₹200 notes it fails: for ₹600 it takes one ₹500 and cannot pay ₹100, although three ₹200 notes work. For non-divisible denominations, plan with dynamic programming instead of a chain.
 - **`errors.Join` behaviour (since Go 1.20).** It drops nil errors and returns nil if all are nil. Its message joins the messages with newlines. `errors.Is` and `errors.As` search every joined error, but `As` stops at the first match, so to list every `RuleError`, range over `Unwrap() []error`, as the test does.
@@ -705,7 +747,7 @@ The plan stops as soon as the amount reaches zero: that is the **short-circuit o
 - **Concurrency.** A chain built at startup is shared by every request goroutine. Keep links stateless or guard their state; `Cassette` counts are mutable, so a real ATM serialises withdrawals (one customer at a time per machine, or a mutex). Read-only chains need no locking.
 - **Depth.** A linked chain adds one stack frame per link. Goroutine stacks grow on demand, so tens or hundreds of links are fine; a slice runner has constant depth.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the difference between Chain of Responsibility and a validation pipeline?
 > In classic CoR the first link that can handle the request handles it and stops the chain with success; falling off the end is an error. In a pipeline every link must pass; any link can reject, none can accept early, and reaching the end is success. Code that can only reject or pass is a pipeline.
@@ -725,7 +767,7 @@ The plan stops as soon as the amount reaches zero: that is the **short-circuit o
 > [!question]- When would you use a map instead of a chain?
 > When exactly one handler matches a known key, such as an event type or a command name. A map lookup is O(1) and has no ordering bugs. A chain is for fallbacks and overlapping conditions, where order decides who handles the request.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Three answers per link: accept (stop, success), reject (stop, failure), pass (next).
 - Classic CoR: the first accepting link wins; the end of the chain means unhandled. Pipeline: every link must pass; the end means success.
@@ -736,7 +778,7 @@ The plan stops as soon as the amount reaches zero: that is the **short-circuit o
 - Keep validation errors (`RuleError`) apart from infrastructure errors (`%w`).
 - Partial handling (ATM): plan, then commit.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Interfaces]], [[Error Handling]], [[Design Patterns Overview and Chooser]]
 - **Next:** [[Command, Undo and Memento]], [[Decorator and Middleware]]

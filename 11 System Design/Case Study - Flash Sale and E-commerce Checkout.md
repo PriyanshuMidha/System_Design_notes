@@ -29,7 +29,33 @@ updated: 2026-11-13
 > - Checkout is a **saga** (reserve, pay, confirm, or compensate), with idempotency keys on every step.
 > - Redis is the fast gate; the SQL database is the final judge. Better to undersell briefly than to oversell.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 6 (variants) and 7 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 5 (deep dives), 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A flash sale sells a small, fixed stock to a huge crowd at one exact time.
+The one rule that must never break: do not sell more items than you have. That mistake is called **overselling**.
+Most of the crowd will lose. So the system's job is to say "sold out" fast and cheaply to most people.
+First, a virtual **waiting room** lets people in a little at a time, so the servers are not flooded.
+
+```mermaid
+flowchart LR
+    C["1 million people"] --> W["Waiting room<br/>(lets a few in)"] --> G["Stock counter:<br/>take 1 if any left"]
+    G -- "got one" --> P["Pay within 10 min"]
+    G -- "none left" --> S["Sold out"]
+```
+
+A winner gets a short **hold** on one item. If they do not pay in time, the item goes back on sale.
+
+So the rest of this note is just these 3 questions:
+1. How do you take one item from the stock safely, thousands of times a second?
+2. How do you keep the crowd from crashing everything?
+3. How do unpaid holds and failed payments give stock back?
 
 **The problem in one story.**
 A shop says: "10,000 phones at half price, 12:00 sharp."
@@ -75,7 +101,7 @@ Where it breaks: a real box is never read by 100,000 people per second, and a re
 > [!tip] Remember
 > Shed the crowd early, decide winners with one atomic step, and let the database have the final word.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 ### The problem in plain words
 
@@ -87,6 +113,8 @@ Two things go wrong in a naive design. First, the database melts under load, bec
 > A flash sale is a hot-key problem plus a correctness problem plus a crowd-control problem, all at the same minute.
 
 ### Functional requirements
+
+**In plain words:** what the shopper must be able to do: see the sale, try to buy, pay, and get a clear answer.
 
 - Show the sale page with a countdown, price and stock status.
 - "Buy now" reserves one unit (limit per user, for example 1 or 2).
@@ -108,6 +136,8 @@ Two things go wrong in a naive design. First, the database melts under load, bec
 
 ### How it differs from ticket booking
 
+**In plain words:** tickets are many different seats; a flash sale is many copies of one item, so it is just a counter going down.
+
 | | [[Case Study - Ticket Booking]] | Flash sale |
 | --- | --- | --- |
 | Inventory | Many distinct seats, each row cold | One or a few SKUs, one row extremely hot |
@@ -118,7 +148,7 @@ Two things go wrong in a naive design. First, the database melts under load, bec
 > [!tip] Remember
 > Same family as ticket booking, but the hot spot is one counter, so the counter must live somewhere very fast.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 ### Analogy: a shop door with a bouncer and a tiny till
 
@@ -157,7 +187,7 @@ stateDiagram-v2
 > [!tip] Remember
 > Every purchase attempt is a small state machine with a timer, so stuck states heal themselves.
 
-## 3. How it works - high-level design
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart LR
@@ -177,6 +207,8 @@ flowchart LR
 ```
 
 ### Step-by-step path of one purchase
+
+**In plain words:** follow one shopper from the sale page, through the waiting room and the stock check, to payment.
 
 1. **Static sale page.** The page, images and countdown are plain files on the CDN, so a million viewers never reach the origin. The page asks the server for the time once, then counts down in the browser.
 2. **Waiting room.** At sale start, users get a random or first-come position and an admission token as capacity allows.
@@ -204,7 +236,7 @@ flowchart TD
 
 (All numbers here are illustrative estimates.)
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -220,6 +252,8 @@ Say first: "Redis decides fast, SQL decides finally, and every step is idempoten
 ```
 
 ### Estimates (labelled, teaching numbers)
+
+**In plain words:** rough sums: how many people tap "buy" per second and how few of them can actually win.
 
 | Quantity | Assumption | Result |
 | --- | --- | --- |
@@ -237,6 +271,8 @@ The key insight from the arithmetic: the database sees at most a short burst of 
 
 ### API
 
+**In plain words:** a handful of calls: join the queue, try to reserve, pay, and check the order.
+
 | Call | Purpose | Notes |
 | --- | --- | --- |
 | `GET /sales/{id}` | Page data | Cacheable, CDN |
@@ -249,6 +285,8 @@ The key insight from the arithmetic: the database sees at most a short burst of 
 `reserve` is idempotent per user: the second call returns the same reservation, never a second unit. See [[Idempotency and Idempotency Keys]].
 
 ### Data model
+
+**In plain words:** stock counts, reservations with an expiry time, and orders; the database is the final truth.
 
 ```sql
 CREATE TABLE inventory (
@@ -311,7 +349,7 @@ erDiagram
 > [!tip] Remember
 > The database CHECK constraint is your seatbelt: even if every other layer has a bug, the row cannot go over capacity.
 
-## 5. Deep dives
+## 5. Deep dives 🔴
 
 ### Deep dive 1: stopping overselling at high speed
 
@@ -523,7 +561,7 @@ Saga theory is in [[Saga Pattern]]; payment details are in [[Case Study - Paymen
 > [!tip] Remember
 > Idempotency key at every step, compensation for every step, and a reconciliation job as the safety net.
 
-## 6. Variants and comparison
+## 6. Variants and comparison 🟡
 
 | Variant | What changes | Good for | Watch out for |
 | --- | --- | --- | --- |
@@ -535,7 +573,14 @@ Saga theory is in [[Saga Pattern]]; payment details are in [[Case Study - Paymen
 | Payment-first | Charge, then allocate | Simple | Refund load for losers; bad UX |
 | Reserve-first | Allocate, then pay | Standard | Expiry handling |
 
-## 7. Trade-offs and when not to use
+```mermaid
+flowchart TD
+    Q{"How extreme is demand?"} -- "extreme, fairness matters" --> L["Lottery sale"]
+    Q -- "high, normal sale" --> R["Instant reserve (this note)"]
+    Q -- "made on demand" --> P["Pre-order"]
+```
+
+## 7. Trade-offs and when not to use 🟡
 
 - **Oversell vs undersell.** Slight undersell is cheap (return stock, sell again); oversell means refunds and angry users. Bias toward undersell.
 - **Hold time.** 10 minutes frees stock slowly; 3 minutes causes failed payments. UPI approvals and OTPs argue for 5 to 10 minutes.
@@ -544,9 +589,17 @@ Saga theory is in [[Saga Pattern]]; payment details are in [[Case Study - Paymen
 - **Strong vs eventual stock display.** Showing "only 3 left" accurately costs reads on the hot counter. Cache it for 1 to 2 seconds and accept that it is approximate.
 - **Single region vs multi-region.** Sale stock is a single-writer problem. Keep the gate in one region; serve static content globally.
 
-## 8. In production
+```mermaid
+flowchart LR
+    O["Oversell"] --> O1["Refunds, angry users:<br/>never allowed"]
+    U["Undersell"] --> U1["A few items unsold for a while:<br/>cheap, sell again"]
+```
+
+## 8. In production 🔴
 
 ### Failure modes and fixes
+
+**In plain words:** a list of what goes wrong on sale day and the fix for each.
 
 | Failure | What happens | Fix |
 | --- | --- | --- |
@@ -595,7 +648,7 @@ sequenceDiagram
     Ops->>Sys: reconcile Redis vs DB, refund late payers
 ```
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How do you prevent overselling under 20,000 requests per second on one SKU?
 > Do the check and the decrement as one atomic operation, in a place built for speed: a Redis Lua script as a gate, with a conditional SQL update (and a CHECK constraint) as the final judge. Filter the crowd first with a CDN, waiting room and per-user limits so the gate and database see a small fraction of the traffic.
@@ -621,7 +674,7 @@ sequenceDiagram
 > [!question]- Would you use a queue to serialise purchase requests?
 > Optionally. Putting reservation requests on a per-SKU queue with a single consumer gives strict fairness and trivial correctness, but throughput is bound by that consumer. A Redis atomic gate gives similar correctness at much higher speed; use a queue for the slow downstream work (orders, notifications).
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 A 45-minute script:
 

@@ -20,7 +20,39 @@ updated: 2026-11-13
 > - API1 (BOLA) and API5 (BFLA) are the two most common and most expensive to get wrong — they are an authorization bug one query away from a direct fix.
 > - This note owns the security *concepts*; the Go implementation of authz middleware lives in [[Authentication and Authorization in Go]], and request-shape hardening lives in [[Secure Coding for Go Services]].
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+**OWASP** is a non-profit group that lists the most common ways websites and APIs get hacked.
+Their API list has 10 items, ranked by how often they happen in real breaches.
+Most items are the same mistake: the server believed what the request said instead of checking.
+
+```mermaid
+flowchart LR
+    R["GET /trips/999<br/>(not your trip)"] --> S{"Server checks<br/>only 'logged in?'"} --> L["Leaks someone else's trip"]
+```
+
+The number 1 bug is called **BOLA** (broken object level authorization): you change an ID in the URL and see someone else's data.
+The fix is always the same shape: on every request, check that this caller may touch this exact thing.
+
+```mermaid
+flowchart LR
+    R["GET /trips/999"] --> C{"Is trip 999<br/>this user's?"}
+    C -- "no" --> N["404"]
+    C -- "yes" --> Y["200"]
+```
+
+The rest of this note is just these 3 questions:
+1. What are the 10 bugs, in one line each?
+2. Where must the permission check run?
+3. What does a fixed handler look like in Go?
+
 
 **The problem in one story.**
 A shopping app shows your order at `/orders/1001`.
@@ -66,7 +98,7 @@ Where it breaks: a hotel has a handful of doors; an API has thousands of object 
 > [!tip] Remember
 > Most API breaches are not broken crypto; they are a missing "is this object yours?" check.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A ride-hailing API exposes `GET /api/v1/trips/{tripId}`. The backend checks that the caller has a valid session, loads the trip by `tripId`, and returns it:
 
@@ -81,15 +113,17 @@ Nothing was "hacked" — the attacker used their own valid login and the documen
 
 This single pattern — **Broken Object Level Authorization (BOLA)** — has been OWASP's #1 API risk in both the 2019 and 2023 editions, because it is easy to introduce (one missing `WHERE owner_id = ?`) and devastating once found (every sequential ID is a free enumeration).
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of each API endpoint as a door with two separate locks: an **authentication** lock (do you have a valid key at all?) and an **authorization** lock (does *this specific key* open *this specific door*?).
 
 Most of this list is incidents where only the first lock was installed. BOLA is "any valid key opens every room's door." BFLA is "any valid key opens the staff-only doors too." Unrestricted resource consumption is "the door has no limit on how many times per second you can walk through it." Treat every item below as: which lock is missing, and on what resource?
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The 2023 list, each with the one-line bug and the one-line fix
+
+**In plain words:** skim this as a checklist. Each row is "the server trusted X" followed by "check X yourself".
 
 ```mermaid
 flowchart TD
@@ -125,6 +159,8 @@ flowchart TD
 
 ### Where authorization actually has to happen
 
+**In plain words:** the gateway can check "is this a real user". Only the service that owns the data can check "is this row theirs", so that check must live there.
+
 ```mermaid
 sequenceDiagram
     participant Client
@@ -146,13 +182,15 @@ The gateway can confirm the token is genuine (API2) and even do coarse role chec
 
 This is why BOLA keeps recurring in audits: teams correctly centralize authentication at the edge and then assume authorization is "handled," when object-level authorization is a per-endpoint, per-query responsibility that a gateway structurally cannot do for you.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
 The bare fix for BOLA: never query by the ID alone. Always add the caller's own identity to the `WHERE` clause (or the in-memory lookup), and return "not found," not "forbidden," so the response doesn't even confirm the ID exists.
 
 ### Go: BOLA and BOPLA, vulnerable vs fixed
+
+**In plain words:** two versions of the same handler side by side. The fixed one adds the owner to the database query and only returns allowed fields.
 
 Compiles and passes `go vet` and `go test -race` on Go 1.24.
 
@@ -281,7 +319,7 @@ func TestApplyUpdateCannotEscalatePrivilege(t *testing.T) {
 
 For the full Go middleware chain this check sits in — request-ID, auth, rate limiting, body-size limits — see [[Authentication and Authorization in Go]] and [[Secure Coding for Go Services]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Risk | Layer it's checked at | Caught by a pentest? | Caught by code review? |
 | --- | --- | --- | --- |
@@ -293,13 +331,13 @@ For the full Go middleware chain this check sits in — request-ID, auth, rate l
 | API6 Sensitive Business Flows | Business logic + anti-automation | Rarely — needs domain knowledge of what "abuse" means here | Rarely — it's a product-risk question, not a code bug |
 | API7 SSRF | Any outbound fetch the server makes on the client's behalf | Yes, standard SSRF payloads | Yes, if outbound URL handling is reviewed |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - This list is not a checklist to run once; BOLA and BFLA must be re-verified on every new endpoint, because each one is a fresh place to forget the check — static analysis catches syntax, not "did you scope this query."
 - Allow-listing response fields (API3) costs more upfront engineering than serializing the whole model, but the alternative is auditing every model change for a new sensitive field forever.
 - Aggressive anti-automation for API6 (CAPTCHA, hard rate limits) adds friction for legitimate users too; apply it to the specific flows where abuse is the actual business risk (checkout, ticket purchase), not uniformly across the whole API.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** large BOLA breaches have hit ride-hailing, fintech and social apps via exactly the sequential-ID pattern above; SSRF via a "fetch this URL" feature reaching cloud metadata endpoints has been behind several well-known cloud account compromises; API6-style ticket/sneaker bot abuse is a standing arms race for e-commerce and events platforms.
 - **Failure modes → fixes:**
@@ -309,14 +347,14 @@ For the full Go middleware chain this check sits in — request-ID, auth, rate l
   - An "import from URL" feature is repurposed to probe internal services (API7) → resolve and validate the destination before fetching, block RFC 1918/link-local ranges, and fetch via an egress proxy with no cloud credentials attached.
 - **What to monitor:** 403/404 rates per endpoint (a spike on one object ID pattern suggests enumeration), request volume per account/IP on sensitive flows, outbound request destinations from any "fetch a URL" feature, and the set of live API versions against what's actually monitored.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why BOLA keeps winning #1.** It's not a framework bug or a missing library — `authMiddleware.Required()` runs fine, the token is valid, the user genuinely is who they say they are. The missing step is a second, independent check — "does this caller own this specific row" — that has to be written per query, so it scales with the number of endpoints rather than being solved once centrally. Policy engines (OPA, Casbin — see [[Authentication vs Authorization]]) help by moving the *rule* out of each handler, but someone still has to call the check on every object access.
 - **BOPLA subsumes two 2019 categories** ("Excessive Data Exposure" and "Mass Assignment") because OWASP 2023 recognized they're the same bug from opposite directions: a response that serializes too many fields out, and a request that binds too many fields in. The single fix — an explicit, allow-listed DTO per direction, per role — covers both.
 - **API6 is the odd one out on this list**: it isn't a missing technical check so much as a missing *product* threat model — "what happens if this flow runs a million times per second by a bot, not a human." The defense (rate limits, device signals, purchase caps, deliberate friction) overlaps heavily with [[API Abuse and Bot Protection]], which this note defers to for the detection and mitigation mechanics.
 - **SSRF and cloud metadata.** The specific danger of API7 inside a cloud deployment is that `169.254.169.254` (AWS/GCP/Azure instance metadata) often serves short-lived credentials with no additional auth required from inside the VM/container network — so a single unvalidated outbound fetch can turn into full credential theft. IMDSv2-style hop-limited, token-gated metadata APIs and network policies that block the metadata address from application containers are the infrastructure-side mitigation, independent of fixing the application's URL validation.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's the difference between API1 (BOLA) and API5 (BFLA)?
 > BOLA is about *which object* a caller may access — they're allowed to call the endpoint, but not for someone else's resource. BFLA is about *which function/endpoint* a caller may invoke at all — a regular user calling an admin-only endpoint, regardless of whose object it touches. The fix for BOLA is scoping the query by owner; the fix for BFLA is a role/permission check before the handler runs at all.
@@ -339,7 +377,7 @@ For the full Go middleware chain this check sits in — request-ID, auth, rate l
 > [!question]- Give an example of API6 (Unrestricted Access to Sensitive Business Flows) that isn't really a "security bug" in the traditional sense.
 > A ticket-sale API correctly authenticates every request and never leaks another user's data, but a bot farm buys 95% of a flash-sale inventory in the first second using thousands of real, individually-registered accounts. Nothing was "hacked" — every single request was valid and authorized — but the business rule "one human gets a fair shot at one ticket" was never enforced. The fix lives in anti-automation and business-rule design, not in authentication or object-level authorization.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - API1 BOLA: scope every object query by the caller's own identity; return 404, not 403.
 - API2 Broken Auth: validate signature + alg allowlist + exp/aud/iss on every token; short TTLs; rate-limit auth endpoints.

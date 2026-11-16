@@ -27,7 +27,33 @@ updated: 2026-11-13
 > - Delivery status comes back later by callbacks and is recorded per message.
 > - Broadcasts expand a segment into per-user messages in batches and are throttled to provider quotas.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Apps send you messages in many ways: phone push, SMS, email.
+Your app does not deliver these itself. It hands them to outside companies (Apple, Google, an SMS company). These are **providers**, and they are slow and sometimes down.
+So every request first goes into a **queue**, a waiting line that workers empty at a safe speed.
+Urgent messages, like a login code, get their own fast line. Bulk sales messages go in a slow line.
+
+```mermaid
+flowchart LR
+    R["Send request"] --> G["Gate: duplicate?<br/>user said no?"]
+    G --> U["Urgent line"] --> W1["Workers"] --> P["Providers"]
+    G --> B["Bulk line"] --> W2["Workers"] --> P
+```
+
+Before queueing, a gate drops repeats and respects the user's settings, like "no marketing at night".
+
+So the rest of this note is just these 3 questions:
+1. How do you keep urgent messages fast while millions of bulk ones are sending?
+2. How do you never send the same message twice?
+3. What do you do when a provider is slow or down?
 
 **The problem in one story.**
 You log in to your bank and wait for the one-time password (OTP) SMS.
@@ -76,7 +102,7 @@ Where it breaks: a post office owns its vans; here the "vans" are third-party pr
 > [!tip] Remember
 > Separate queues by urgency, dedupe at the gate, and treat providers as unreliable.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 Without a shared service, every team calls Twilio and SES directly. Each one re-implements retries, nobody checks opt-outs consistently, and a marketing team's 10-million-email campaign uses up the account's sending quota while password-reset emails wait for an hour.
 
@@ -96,7 +122,7 @@ Without a shared service, every team calls Twilio and SES directly. Each one re-
 
 **Out of scope**: building an SMS gateway or mail server, campaign authoring UI, A/B testing analytics, rich content rendering.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a **post office sorting room**. Letters (requests) arrive at one counter. A clerk checks the address book (preferences) and throws away exact copies (dedupe). Letters are dropped into separate bins: express and bulk, per carrier (channel and priority queues).
 
@@ -106,7 +132,17 @@ Two principles:
 1. **Isolation by priority and channel.** Separate queues and separate worker pools; a slow SMS provider cannot block push, and a campaign cannot block an OTP.
 2. **The provider is the bottleneck and the unreliable part.** Design for its quotas, latency and outages, not for your own CPU.
 
-## 3. How it works - high-level design
+```mermaid
+flowchart LR
+    L["Letter arrives"] --> C["Clerk checks address book<br/>(preferences)"]
+    C --> E["Express counter (OTP)"]
+    C --> S["Slow counter (promos)"]
+    E --> K["Carrier"]
+    S --> K
+    K -- "undeliverable" --> DL["Dead-letter shelf"]
+```
+
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart LR
@@ -218,7 +254,7 @@ stateDiagram-v2
     bounced --> [*]
 ```
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -237,6 +273,8 @@ POST /v1/notifications {recipient|segment, template_id, params,
 
 ### Estimates (inputs are interview assumptions; results are estimates)
 
+**In plain words:** rough sums: messages per second on a normal day and during a big campaign.
+
 | Quantity | Arithmetic | Result |
 | --- | --- | --- |
 | Daily volume | 10M + 5M + 1M | 16M messages/day |
@@ -254,6 +292,8 @@ The design is driven by the **11k/s broadcast peak** and by **provider quotas**:
 The queue's job is to smooth the burst, and the worker pool's rate limiter must match the provider quota.
 
 ### API
+
+**In plain words:** one call to send a notification (with a repeat-safe key), plus calls to read and change user settings.
 
 ```http
 POST /v1/notifications
@@ -285,6 +325,8 @@ Content-Type: application/json
 - Providers call `POST /v1/callbacks/{provider}`; the receiver verifies the provider's signature and dedupes by provider event ID (see [[Webhooks - Sending and Receiving]]).
 
 ### Data model
+
+**In plain words:** notifications and their status, user settings, and each user's device tokens.
 
 ```mermaid
 erDiagram
@@ -345,6 +387,8 @@ erDiagram
 `NOTIFICATIONS` has a unique index on `(producer, idempotency_key)`; the insert either succeeds or returns the existing row, which is the dedupe. In PostgreSQL 17 that is `INSERT ... ON CONFLICT (producer, idempotency_key) DO NOTHING RETURNING notification_id`, followed by a `SELECT` when nothing is returned.
 
 ### Code: the admission gate (dedupe plus frequency cap)
+
+**In plain words:** the code says no to a repeat key, and no if this user already got too many messages in the last hour.
 
 The gate below keeps an in-memory sliding-window log per user. In production the same logic runs against Redis (a sorted set per user, `ZREMRANGEBYSCORE` then `ZCARD` then `ZADD` in a Lua script) so all gate instances share state; the algorithm and the test cases are the same. The clock is injected so the test controls time.
 
@@ -503,6 +547,8 @@ func TestConcurrentChecksRespectCap(t *testing.T) {
 
 ### One request traced
 
+**In plain words:** follow one "your order shipped" message from the order service to the phone.
+
 1. At 18:02 IST the order service calls `POST /v1/notifications` for `ORD-7781` with key `order-ORD-7781-shipped`, channels push and email, priority high.
 2. The API inserts into `NOTIFICATIONS`; the unique index accepts it. The gate reads preferences: `order_updates` is opted in for push and email; the user has two valid device tokens.
 3. Transactional, so no quiet-hours or cap check. Templates `order_shipped` v3 `en-IN` for push and email are rendered.
@@ -511,7 +557,7 @@ func TestConcurrentChecksRespectCap(t *testing.T) {
 6. The order service retries the call after a network blip; the unique index returns the existing `n_9001`, so nothing is sent twice.
 7. SES later reports a delivery event; the callback receiver sets the email row to `delivered`.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Choice | Option A | Option B | Pick A when | Pick B when |
 | --- | --- | --- | --- | --- |
@@ -530,7 +576,7 @@ func TestConcurrentChecksRespectCap(t *testing.T) {
 | Email | SES API or SMTP | Bounce notification (hard bounce) | Delivery, bounce and complaint notifications |
 | SMS | Twilio REST API | Error codes for invalid or unreachable numbers | Status callback (`sent`, `delivered`, `undelivered`, `failed`) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Per-priority queues over one queue with a priority field because** a FIFO queue cannot let an OTP overtake 5M promos already in it. The cost is more queues and worker pools to run.
 - **At-least-once plus dedupe over exactly-once because** exactly-once to a third-party SMS gateway is impossible; the worker can always crash after the provider accepts and before it records `sent`. Dedupe narrows the duplicate window; it cannot close it. See [[Delivery Semantics and Exactly-Once]].
@@ -538,7 +584,14 @@ func TestConcurrentChecksRespectCap(t *testing.T) {
 - **Fallback SMS provider** improves availability but doubles integration and contract work, and a failover after a timeout can send twice.
 - **When not to build this**: one product with a few thousand emails per day should call SES or a hosted service directly from a background job ([[Background Jobs and Worker Pools]]); add the platform when several teams, channels or campaigns appear.
 
-## 7. In production
+```mermaid
+flowchart LR
+    W["Worker sends"] --> T{"Provider timed out"}
+    T --> R["Retry: maybe sent twice"]
+    R --> D["Same message ID,<br/>dedupe where possible"]
+```
+
+## 7. In production 🔴
 
 - **Real systems and provider behaviour (documented):**
 	- APNs returns HTTP `410` with reason `Unregistered` when a device token is no longer active; FCM HTTP v1 returns `UNREGISTERED`. Both mean "delete or disable this token", and continuing to send to dead tokens wastes quota.
@@ -554,9 +607,11 @@ func TestConcurrentChecksRespectCap(t *testing.T) {
 	- *Producers lose events when the DB commit and the notify call disagree* → producers write the "order shipped" event with the [[Transactional Outbox and CDC]] pattern, so a notification is requested if and only if the order change committed.
 - **SLOs and monitoring (targets, estimates):** transactional time-to-provider p99 under 2 s; queue age (oldest message) per queue, with a strict alert on `*.high`; provider error rate and latency per provider; hard-bounce rate and complaint rate for email; invalid-token rate for push; DLQ depth; campaign progress (sent per second vs plan).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### 8.1 Broadcasting to 20 million users without hurting anyone
+
+**In plain words:** a big campaign is split into small batches and sent slowly in its own line, so it never blocks urgent messages.
 
 A campaign is a job, not a request. The campaign service stores `campaign(id, segment_id, template, send_window)` and the expander pages through the segment with keyset pagination (`WHERE user_id > $last ORDER BY user_id LIMIT 1000`). For each page it applies preferences, caps and quiet hours, renders, and enqueues to the **low** priority queues. Three controls matter:
 - **Throttle to the provider quota.** A token bucket per provider account sized to, say, 80% of the documented send rate, leaving 20% for transactional traffic. A 20M push campaign at 11k/s takes 30 minutes; a 5M email campaign at an assumed 500 emails/s quota takes about 2.8 hours.
@@ -565,11 +620,15 @@ A campaign is a job, not a request. The campaign service stores `campaign(id, se
 
 ### 8.2 Deduplication at three levels
 
+**In plain words:** repeats are blocked in three places: when the request arrives, before sending, and on the phone.
+
 1. **Producer to API:** the `(producer, idempotency_key)` unique index; a retrying producer gets the same ID. Keys must describe the business event (`order-ORD-7781-shipped`), not the HTTP attempt.
 2. **Queue to worker:** queues redeliver after a visibility timeout or a consumer crash. The worker does a conditional update `status = 'sending' WHERE status = 'queued'` (a compare-and-set) before calling the provider; a second worker sees zero rows updated and skips.
 3. **Worker to provider:** the unavoidable gap. If the process dies after the provider accepted the message and before the log update, the redelivered message is sent again. Keep that window small and, for high-value messages, query the provider by your own reference ID before resending.
 
 ### 8.3 Device token hygiene
+
+**In plain words:** phone addresses (tokens) go stale; remove the ones providers say are dead.
 
 Tokens change when users reinstall apps or restore phones. The app re-registers its token on each start (`PUT /v1/devices`), updating `last_seen_at`.
 
@@ -577,7 +636,7 @@ Workers disable tokens on APNs `410 Unregistered` or FCM `UNREGISTERED`, and a w
 
 Without this, a broadcast spends a large share of its throughput on tokens that can never receive a message.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How do you make sure an OTP is not delayed by a marketing campaign?
 > Separate queues per priority (and per channel) with separate worker pools, and reserve part of each provider's rate limit for high priority. A single FIFO queue cannot let an OTP overtake millions of queued promos.
@@ -600,7 +659,7 @@ Without this, a broadcast spends a large share of its throughput on tokens that 
 > [!question]- The SMS provider times out. Retry or fail over?
 > A timeout means "unknown". Retry the same provider with backoff and jitter a limited number of times; if its circuit is open, fail over. For OTPs a possible duplicate is acceptable; for financial alerts, query the first provider for the message before sending again.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 A 45-minute interview script:
 - **0-5 min, requirements:** channels (push, email, SMS, in-app), transactional vs marketing, preferences and quiet hours, scheduling, tracking; OTP p99 under 2 s; no duplicates.

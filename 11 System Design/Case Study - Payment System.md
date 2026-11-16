@@ -28,7 +28,33 @@ updated: 2026-11-13
 > - Webhooks are verified, deduplicated by event id and applied through a state machine that ignores out-of-order events.
 > - A daily reconciliation against the PSP's settlement file is the final safety net.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+When you pay online, your app does not move the money itself. It asks a payment company (a **PSP**, like Razorpay or Stripe) to charge your card or UPI.
+The network can fail in the middle. Then you do not know if the money moved.
+So before calling the PSP, the system saves a unique key for this payment. This is the **idempotency key**.
+If anything retries, the same key is sent again, and the PSP knows it is the same payment, not a new one.
+
+```mermaid
+flowchart LR
+    U["Pay ₹500"] --> S["Save payment + key"] --> P["Call PSP with key"]
+    P -- "timeout" --> Q["Ask PSP: did key K go through?"]
+```
+
+Every rupee is recorded in a **ledger**: a book of lines that is only ever added to, where each payment has a matching minus and plus.
+Every day the system compares its book with the PSP's report to catch any mismatch.
+
+So the rest of this note is just these 3 questions:
+1. How do you make sure a retry never charges twice?
+2. What do you do when you do not know if a payment worked?
+3. How do you keep a record that always balances?
 
 **The problem in one story.**
 You tap "Pay ₹500" for a movie ticket and the screen spins, then shows an error.
@@ -75,7 +101,7 @@ Where it breaks: a shopkeeper sees the cash in hand; with a PSP a timeout leaves
 > [!tip] Remember
 > Save the key before calling the PSP, treat a timeout as unknown, and never edit the ledger.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 A ticketing site sells a ₹499 ticket. The client calls `POST /pay`, your server calls the PSP, the PSP charges the card, and then the response is lost because your 10-second timeout fires. The client sees an error and taps **Pay** again.
 
@@ -98,7 +124,7 @@ Both bugs come from the same root: the system did not write down what it was abo
 - **Availability** around 99.95% for the payment API (an estimate of a typical target); during a PSP outage, fail over or fail clearly.
 - **PCI DSS scope kept minimal**: raw card numbers never touch our servers.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a careful bank clerk with a paper logbook. Before phoning another bank to move money, the clerk writes "about to send ₹499 for order 42, reference K1" in the logbook.
 
@@ -111,7 +137,15 @@ Mapped to the system:
 - **Ledger** = double-entry entries that are only ever appended.
 - **End-of-day comparison** = reconciliation against the PSP settlement file.
 
-## 3. How it works - high-level design
+```mermaid
+flowchart LR
+    W["1. Write 'about to send, ref K1'"] --> C["2. Phone the bank with K1"]
+    C -- "line drops" --> A["3. Call back: did K1 go through?"]
+    C -- "ok" --> L["4. Write result in ledger"]
+    A --> L
+```
+
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart LR
@@ -181,9 +215,11 @@ nightly: ledger vs PSP settlement file -> mismatches alert a human
 Numbers: 1M payments/day = ~12 TPS avg; correctness, not QPS, is the problem
 ```
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Estimates (all inputs are labelled estimates)
+
+**In plain words:** rough sums: payments per second at peak, and how many ledger lines per day.
 
 | Quantity | Arithmetic | Result |
 | --- | --- | --- |
@@ -198,6 +234,8 @@ Numbers: 1M payments/day = ~12 TPS avg; correctness, not QPS, is the problem
 The conclusion is the important part: one well-tuned PostgreSQL primary with a synchronous replica handles 1,850 row writes per second. Sharding is not the first problem. The first problems are idempotency, unknown outcomes, and reconciliation.
 
 ### API
+
+**In plain words:** create a payment with a key, check its status, and refund it. The PSP also calls you back with updates.
 
 ```http
 POST /v1/payments
@@ -223,6 +261,8 @@ Content-Type: application/json
 Amounts are **integers in minor units** (paise, cents) with an ISO 4217 currency code. Floating-point is never used for money: `0.1 + 0.2` is not `0.3` in binary floating point. Note that not every currency has two decimal places (JPY has zero, KWD has three), so the exponent comes from the currency.
 
 ### Data model
+
+**In plain words:** payments, their status changes, the ledger lines, and the saved idempotency keys.
 
 ```mermaid
 erDiagram
@@ -350,6 +390,8 @@ FROM ledger_entries WHERE created_at >= date '2026-11-03' AND created_at < date 
 ```
 
 ### Go: the core rule, tested
+
+**In plain words:** the code saves the key first; a second request with the same key gets the first answer back instead of a second charge.
 
 The code below models the store with a mutex-guarded map whose `claim` behaves like `INSERT … ON CONFLICT DO NOTHING`. The interesting cases are in the tests: a PSP that charges the card and then times out, a crash before the PSP call, key reuse with a different amount, and 50 concurrent duplicates.
 
@@ -695,7 +737,7 @@ sequenceDiagram
 
 Whichever resolver arrives second finds `status <> 'processing'`, updates zero rows, and does nothing. That conditional update is what makes the webhook path and the reconciler path safe to run together.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Choice | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -709,7 +751,7 @@ Whichever resolver arrives second finds `status <> 'processing'`, updates zero r
 
 For the class-level design of a ledger (accounts, transfers, balance invariants in Go), compare with [[Digital Wallet and Ledger]].
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Synchronous vs asynchronous confirmation.** Returning the PSP result inline gives a fast happy path, but you still need the webhook path for 3-D Secure, UPI and timeouts. Designing only the inline path is the most common bug.
 - **Strong consistency costs availability.** Payment writes go to a single primary with a synchronous replica; during a failover the API may return 503 for tens of seconds. That is the right trade: an unavailable payment page is recoverable, a double charge is a support ticket and a chargeback.
@@ -717,7 +759,13 @@ For the class-level design of a ledger (accounts, transfers, balance invariants 
 - **When not to build this.** If you sell a few products, use the PSP's hosted checkout and its dashboard as your ledger of record, and store only the PSP's payment id against your order. Build your own ledger when you hold customer balances, pay out to merchants, split payments, or must reconcile multiple PSPs.
 - **Do not cache payment status aggressively.** A stale `processing` causes clients to retry or users to pay again via a different method.
 
-## 7. In production
+```mermaid
+flowchart TD
+    Q{"Sell only a few products?"} -- "yes" --> H["Use the PSP's hosted checkout"]
+    Q -- "no, many merchants or flows" --> B["Build this: keys, ledger,<br/>reconciliation"]
+```
+
+## 7. In production 🔴
 
 - **Real systems.**
 	- Stripe exposes idempotency keys on every POST and documents that keys are pruned after they are at least 24 hours old.
@@ -739,9 +787,11 @@ For the class-level design of a ledger (accounts, transfers, balance invariants 
 	- Ledger imbalance, which must always be zero.
 	- Refund and chargeback rate.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Reconciliation: the last line of defence
+
+**In plain words:** every day, line up your records with the PSP's report and flag anything that does not match.
 
 Every day the PSP publishes a settlement report with each charge, refund, fee and payout. The reconciler loads it into a staging table and runs a full outer join against the ledger:
 
@@ -762,6 +812,8 @@ WHERE s.psp_charge_id IS NULL OR l.psp_charge_id IS NULL OR s.amount_minor <> l.
 
 ### Double-entry accounts for one ticket sale
 
+**In plain words:** one ticket sale, written as minus-here and plus-there lines that add up to zero.
+
 | Event | Debit | Credit |
 | --- | --- | --- |
 | Charge ₹499 succeeds | psp_clearing 49,900 | merchant_payable 44,900 and platform_revenue 5,000 |
@@ -771,6 +823,8 @@ WHERE s.psp_charge_id IS NULL OR l.psp_charge_id IS NULL OR s.amount_minor <> l.
 Each row of the table is one `txn_id`; within it, debits equal credits. Balances are derived as sums (or from periodic snapshots plus later entries), never stored as the only truth. A mistake is fixed by a reversing entry, never by `UPDATE`.
 
 ### Hot ledger accounts
+
+**In plain words:** one big merchant's account gets every sale, so updating one balance row becomes a traffic jam. Split it or add up later.
 
 A single `merchant_payable` account for a large merchant receives every sale. If you keep a running balance row and lock it per sale, that row becomes a serial bottleneck (one lock holder at a time; see [[Hot Keys and Hot Partitions]]). Options:
 - Do not keep a running balance on the write path. Append entries only and compute balances asynchronously.
@@ -795,9 +849,11 @@ A chargeback arrives only by webhook; it freezes the disputed amount with ledger
 
 ### Multi-region
 
+**In plain words:** each payment gets one home region that is allowed to write it, so two regions never both change it.
+
 Payments need one writer per payment. A common pattern is to home each merchant or user in one region, run the payment primary there with a synchronous replica in another availability zone, and fail over regionally only by operator decision. Active-active writes to the same payment from two regions would need consensus or would risk two charges; see [[Multi-Region Architecture]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Your API calls the PSP and the call times out. What do you do?
 > Treat it as "unknown", not "failed". The intent is already in the database as `processing` with key K. Return 202 to the client, then resolve by PSP webhook or by a reconciler that looks up K at the PSP.
@@ -827,7 +883,7 @@ Payments need one writer per payment. A common pattern is to home each merchant 
 > [!question]- PSP A is down. Can you just retry the payment on PSP B?
 > Only for payments that never reached PSP A, or that PSP A confirms it did not charge. A payment with an unknown outcome at A must stay with A until resolved, because a charge on B would be a second, independent charge. Route new payments to B behind a circuit breaker.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Load is tiny (1M/day ≈ 12 TPS). The design is about correctness.
 - Order of operations: claim key and insert intent (commit), then call the PSP with the same key, then record the outcome, ledger entries and outbox row in one transaction.

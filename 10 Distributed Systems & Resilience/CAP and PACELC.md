@@ -27,7 +27,41 @@ updated: 2026-11-13
 > - PACELC: if Partition, choose A or C; Else, choose Latency or Consistency. The "else" branch is what you pay every day.
 > - Classic mistake: "pick 2 of 3". A "CA" system is just a single node, or a system that has not met a partition yet.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Big apps keep the same data on more than one machine, so one broken machine does not lose it.
+Those machines talk over a network. Sometimes that network breaks, and the machines cannot reach each other. That break is called a **partition**.
+
+```mermaid
+flowchart LR
+    U1["User A"] --> M1["Copy in Mumbai"]
+    U2["User B"] --> M2["Copy in Chennai"]
+    M1 x--x|"link broken"| M2
+```
+
+Now a user asks one copy for data. That copy has two choices.
+It can say "sorry, try later" so it never gives a wrong answer. That is choosing **consistency**.
+Or it can answer with what it has, even if it might be old. That is choosing **availability**.
+CAP says: during a partition, you must pick one of these two.
+PACELC adds: even when the network is fine, being always-correct makes you slower, because copies must check with each other first.
+
+```mermaid
+flowchart TB
+    Q{"Network broken?"} -- "yes" --> P["Pick: correct OR always answering"]
+    Q -- "no" --> E["Pick: correct OR fast"]
+```
+
+The rest of this note is just these 3 questions:
+1. What exactly happens to a request during a partition?
+2. Why is "pick 2 of 3" a misleading way to say it?
+3. Where do real databases like Cassandra and Spanner sit?
 
 **The problem in one story.** A shop has two branches that share one stock list by phone. The phone line goes dead. A customer at each branch wants the last item. Each branch must choose: refuse to sell until the line is back (stay correct), or sell anyway and maybe sell the same item twice (stay open).
 
@@ -67,7 +101,7 @@ flowchart TD
 > [!tip] Remember
 > During a partition you choose correct or available; the rest of the time you choose fast or consistent.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A ticketing service keeps the seat count for a show on 3 replicas, two in Mumbai (nodes 0 and 1) and one in Chennai (node 2). The link between the cities drops for 90 seconds. A user in Chennai tries to buy the last seat while a user in Mumbai does the same.
 
@@ -76,7 +110,21 @@ A ticketing service keeps the seat count for a show on 3 replicas, two in Mumbai
 
 There is no third option that is both correct and always answering. CAP names that choice, so a design review can say "seat booking is CP, the 'people viewing this show' counter is AP" instead of arguing about vague "reliability".
 
-## 2. Mental model
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant C as Chennai copy
+    participant M as Mumbai copies
+    U->>C: Book seat
+    C--xM: Cannot reach
+    alt Choose consistency
+        C-->>U: Error, try later
+    else Choose availability
+        C-->>U: Booked (might clash later)
+    end
+```
+
+## 2. Mental model 🟢
 
 - **Partition**: some nodes cannot exchange messages with others. It is not only a cut cable. A long GC pause, a full NIC queue, a misconfigured firewall rule or a switch reboot all look the same to the other side: messages are lost or arrive too late.
 - **Consistency (C)**: the system behaves like a single copy. Once a write is acknowledged, every later read, on any node, returns it or something newer. The formal name is **linearizability** (see [[Consistency Models]]).
@@ -84,7 +132,13 @@ There is no third option that is both correct and always answering. CAP names th
 
 **Analogy.** Two bank branches share one ledger by phone. The phone line goes dead. Each branch can either stop serving withdrawals until the line is back (C), or keep serving and sort out overdrafts later (A). Ignoring the dead phone is not an option.
 
-## 3. How it works
+```mermaid
+flowchart LR
+    A["Fine network"] -- "trade" --> B["Speed vs correctness"]
+    C["Broken network"] -- "trade" --> D["Answer vs correctness"]
+```
+
+## 3. How it works 🟡
 
 The theorem (Brewer's conjecture in 2000, proved by Gilbert and Lynch in 2002) says: in an asynchronous network where messages can be lost, no system can guarantee both linearizability and availability on every node during a partition.
 
@@ -122,12 +176,16 @@ sequenceDiagram
 
 ### Why "pick 2 of 3" misleads
 
+**In plain words:** network breaks are not optional, so the real choice is only between the other two, and only while the network is broken.
+
 - You cannot opt out of P. If your system runs on more than one machine, partitions happen. Bailis and Kingsbury (2014) collect public incident reports of exactly this.
 - So the choice exists **only while a partition is happening**. The rest of the time a system can offer both C and A.
 - "CA" therefore means "one node" (a single PostgreSQL server) or "a cluster that has not had a partition yet". It is not a third design.
 - The choice can be **per operation**, not per product: Brewer's 2012 article points out that a system can refuse some operations during a partition and allow others.
 
 ### PACELC
+
+**In plain words:** most of the time the network is fine, and then the trade is speed versus being always correct.
 
 Daniel Abadi (2010 blog, 2012 IEEE Computer article) observed that CAP ignores normal operation. To be linearizable, a write must reach other replicas (or a majority) before it is acknowledged, and that costs round trips even when nothing is broken.
 
@@ -146,9 +204,11 @@ flowchart TD
     EC --> PAEC
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** this is the one decision every copy makes on every request: can I reach enough other copies? If not, refuse or answer anyway.
 
 The decision a node makes on every request, in pseudo-code:
 
@@ -172,6 +232,8 @@ on partition heal:
 ```
 
 ### Go simulation
+
+**In plain words:** a small program that fakes 3 copies and a broken link, so you can watch both choices play out.
 
 This package models one register on 3 replicas with a partition map. It compiles and passes `go vet` and `go test -race` on Go 1.24. Logical timestamps are passed in, so the tests are deterministic.
 
@@ -342,7 +404,7 @@ What the two tests show:
 
 The majority side (nodes 0 and 1) keeps working in both modes. CP does not mean "the whole system is down"; it means the minority side stops.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 Where real systems sit, using their **default** settings. Many are tunable per request, so treat this as a starting point, not a label.
 
@@ -366,13 +428,15 @@ Where real systems sit, using their **default** settings. Many are tunable per r
 
 ### Tunable consistency in practice
 
+**In plain words:** many databases let you choose per request: fast and maybe old, or slower and surely fresh.
+
 | Knob | Weak / fast | Strong / slower |
 | --- | --- | --- |
 | Cassandra consistency level | `ONE`, `LOCAL_ONE` | `QUORUM`, `LOCAL_QUORUM`, `ALL`; strong reads need `R + W > N` (see [[Quorums and Leaderless Replication]]) |
 | DynamoDB `GetItem` / `Query` | default: eventually consistent | `ConsistentRead: true` (twice the read capacity cost) |
 | MongoDB | `readConcern: "local"`, `w: 1` | `readConcern: "majority"` or `"linearizable"`, `w: "majority"` (the default write concern since MongoDB 5.0) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **CP costs availability on the minority side and latency everywhere.** Every write waits for a majority. Cross-region majorities add one inter-region round trip (tens of milliseconds, an estimate that depends on the regions).
 - **AP costs correctness work.** Someone must merge divergent versions: last-writer-wins (silently loses writes), application merge (shopping cart union), or CRDTs (see [[CRDTs and Conflict Resolution]]).
@@ -382,7 +446,7 @@ Where real systems sit, using their **default** settings. Many are tunable per r
 - **CAP is too coarse for design work.** It only talks about one consistency level (linearizable) and one failure type (partition). Use [[Consistency Models]] for the real menu and PACELC for everyday latency.
 - **Do not cite CAP to justify a weak design.** Most outages are not partitions. A system that loses writes during normal operation has a bug, not a CAP trade-off.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
   - Kubernetes stores cluster state in etcd. If the etcd members lose quorum, the API server cannot write: CP by design.
@@ -398,7 +462,7 @@ Where real systems sit, using their **default** settings. Many are tunable per r
   - Rejected requests caused by "no quorum" (CP) and conflict or read-repair counts (AP).
   - Hinted-handoff backlog in Cassandra-style stores.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Where single-leader databases sit.** PostgreSQL with one primary and async replicas fits no CAP label cleanly.
 
@@ -410,7 +474,7 @@ Where real systems sit, using their **default** settings. Many are tunable per r
 - **Partition recovery** (Brewer 2012): track which operations ran on each side, then merge, compensate (refund the double-booked seat), or apologise. Designing this recovery path is most of the real work of an AP system.
 - **Stronger than CAP's C, weaker than CAP's C.** Spanner offers strict serializability (external consistency): linearizability extended to multi-key transactions, so it is stronger than CAP's single-register C. Causal consistency is the strongest model that stays available during partitions (Mahajan, Alvisi and Dahlin, 2011). See [[Consistency Models]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Explain CAP in two sentences.
 > In a distributed system, network partitions will happen. While one is happening, each node that cannot reach the others must either refuse requests (keep consistency) or answer from possibly stale local data (keep availability).
@@ -435,7 +499,7 @@ Where real systems sit, using their **default** settings. Many are tunable per r
 > [!question]- A partition heals in an AP system. What happens to the data?
 > Replicas exchange versions. With last-writer-wins, the version with the highest timestamp overwrites the others and the rest are lost, even though they were acknowledged. With version vectors, concurrent versions are kept as siblings and the application or a CRDT merges them.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Partition = lost or delayed messages between nodes; it will happen.
 - During a partition: CP refuses on the minority side, AP answers and diverges.

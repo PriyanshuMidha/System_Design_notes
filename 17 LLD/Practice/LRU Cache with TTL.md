@@ -32,7 +32,28 @@ updated: 2026-11-13
 > - An expired entry is never returned: drop it when read, sweep it in the background, and evict it before any live entry.
 > - Classic mistake: using `RLock` in `Get`, although `Get` moves the node and so writes to the list.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code) and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A cache is a small fast box of saved answers. It has room for only N items. When it is full and a new item comes, it must throw one out. **LRU** means "least recently used": throw out the item nobody touched for the longest time. Items can also have a **TTL**, a time after which they expire. The trick is doing both in constant time with a map plus a linked list.
+
+```mermaid
+flowchart LR
+    A["Get or Put"] --> B["Move item to front"]
+    B --> C{"Full?"}
+    C -- "yes" --> D["Drop the back item"]
+```
+
+Everything else in this note is just these 3 questions:
+1. How do a map and a list give O(1) get and put?
+2. How do expired items get removed?
+3. How do you make it safe for many goroutines?
 
 **The problem in one story.**
 Your service asks a slow database for a user's profile on every request.
@@ -79,7 +100,7 @@ Where it breaks: a real stack only lets you take from the top, while the cache u
 > [!tip] Remember
 > Map for "where is it", list for "who is oldest", heap for "who expires first"; one lock, because `Get` writes.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design an in-memory LRU cache with per-entry TTL.
@@ -102,7 +123,7 @@ acceptable for entries that carry a TTL). Many goroutines use the cache.
 5. Add TTL: lazy expiry on `Get`, `Sweep` for active expiry, expired-first eviction.
 6. Test with an injected clock (no sleeps) and with `-race`.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 Questions to ask, with the answer this design assumes:
 
@@ -120,7 +141,7 @@ Questions to ask, with the answer this design assumes:
 
 **Out of scope:** size in bytes, LFU, read-through loading (see Step 10).
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 |---|---|
@@ -130,7 +151,7 @@ Questions to ask, with the answer this design assumes:
 
 The hardest use case, and the one to code first: **Put into a full cache** where some entry in the middle has already expired.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
@@ -151,7 +172,7 @@ The node stores its own `key` because eviction starts from a node (`tail.prev` o
 
 It stores `heapIdx` so `heap.Remove` and `heap.Fix` run in O(log n) without searching.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -203,7 +224,7 @@ classDiagram
 - **Aggregation:** the heap holds pointers to the same nodes, only those with a TTL.
 - **Dependency:** the clock and the callback are plain funcs, the Go form of single-method interfaces.
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 This is a library component, so the API is the Go method set (no REST):
 
@@ -219,7 +240,7 @@ This is a library component, so the API is the Go method set (no REST):
 
 No `context.Context` on `Get`/`Put`: they never block on I/O. Only the janitor, which runs for the life of the process, takes one.
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
 
 Nothing is persisted, so there is no repository.
 
@@ -229,7 +250,7 @@ Redis also offers `volatile-ttl`, which evicts keys that have a TTL, shortest re
 
 That is close to this design's expired-first rule, but it evicts live keys that expire soon, while this cache only puts dead keys ahead of the LRU entry.
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 |---|---|---|
@@ -242,7 +263,7 @@ That is close to this design's expired-first rule, but it evicts live keys that 
 
 Not used, and why: a Strategy interface for eviction in the base version is YAGNI with one policy. One mutex guards map, list and heap together because they must change atomically ([[Concurrency for LLD]]).
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > Aim for about 150 lines in the room.
@@ -251,6 +272,8 @@ Not used, and why: a Strategy interface for eviction in the base version is YAGN
 > - **Talk only:** `RunJanitor`, sharding the cache for a 32-core hot spot, and lock-free or approximate LRU.
 
 Folder layout: `lru/lru.go` (the cache, list and heap helpers), `lru/lru_test.go`, and `cmd/demo/main.go` for wiring (`New[string, []byte](1000, nil, logEvict)`, then `t := time.NewTicker(time.Second)`, `defer t.Stop()` and `go c.RunJanitor(ctx, t.C, 1000)`; cancel `ctx` on shutdown so the janitor goroutine exits). The whole package is one file here so it compiles as shown.
+
+**In plain words:** The full cache. The map finds an item fast, the list keeps the use order, and a small heap finds the next item to expire.
 
 ```go
 // File: lru.go
@@ -528,7 +551,7 @@ flowchart TD
     D --> J[unlock, no eviction]
 ```
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 |---|---|
@@ -543,6 +566,8 @@ flowchart TD
 | `TestRandomOpsKeepInvariants` | 5,000 seeded random operations never return a stale or expired value; map, list and heap always agree |
 
 Measured: `go test -race -cover` on Go 1.24.4 passes all 9 tests with 100.0% statement coverage.
+
+**In plain words:** A fake clock so the tests can expire items on demand and check exactly which item gets thrown out.
 
 ```go
 // File: lru_test.go
@@ -793,7 +818,7 @@ func checkInvariants[K comparable, V any](t *testing.T, c *LRU[K, V]) {
 }
 ```
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | Risk | Handling |
 |---|---|---|
@@ -812,7 +837,7 @@ func checkInvariants[K comparable, V any](t *testing.T, c *LRU[K, V]) {
 
 Common mistakes: a map without a list (no order) or a slice for order (O(n) move); not storing the key in the node; skipping the sentinels, so the empty and one-node cases need nil checks and break; forgetting to move on `Get`; evicting on update; firing callbacks under the lock; calling `time.Now()` directly so tests need `time.Sleep`.
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 **Choices made:**
 
@@ -850,7 +875,7 @@ Common mistakes: a map without a list (no order) or a slice for order (O(n) move
 | Read-through and write-back | A decorator with a loader func; `onEvict` writes dirty entries back |
 | Distributed cache | Redis, or many cache nodes placed with [[Consistent Hashing]] |
 
-## Drawing
+## Drawing 🟢
 
 ![[LRU Cache LLD Drawing.excalidraw]]
 
@@ -860,7 +885,7 @@ It predates the expiry heap: when you redraw it, add the heap under the list wit
 
 Redraw it from memory: the map arrows into list nodes, the sentinels and which end is evicted, the node fields and why `key` and `heapIdx` are stored, both flows, and where the lock is taken and the callback runs.
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- Why a map plus a doubly linked list, and why does the node store its key?
 > The map finds a node in O(1); the list keeps recency order so the front is the most recent and `tail.prev` the least, and unlinking a node is O(1) because it knows both neighbours. Eviction starts from a node, so the node must carry its key to delete the map entry.
@@ -880,13 +905,13 @@ Redraw it from memory: the map arrows into list nodes, the sentinels and which e
 > [!question]- The cache is a hot spot on a 32-core service. What do you change?
 > Profile first. Then shard by key hash so each shard has its own lock, or remove writes from the read path: sampled approximate LRU like Redis, CLOCK reference bits, or buffered access records like Ristretto. In production code, use ristretto or golang-lru rather than a hand-rolled cache.
 
-## Interview explanation
+## Interview explanation 🔴
 
 ```text
 I combine a hash map from key to node with a doubly linked list ordered by recency, using sentinel head and tail nodes, so lookups and recency moves are O(1). Entries with a TTL also sit in a min-heap ordered by expiry, and each node stores its key and its heap index so eviction and heap fixes need no search. Get removes an entry whose deadline has passed and returns a miss, otherwise it moves the node to the front. Put updates in place and resets the TTL; when the cache is full it evicts the heap top if that entry has already expired, otherwise tail.prev. One mutex guards the map, the list and the heap together, because even Get writes, and the eviction callback runs after the unlock so it cannot deadlock. The clock and the janitor's ticker are injected, so TTL tests never sleep. To scale reads I would shard by key hash or move to sampled LRU, and in production I would use ristretto or golang-lru.
 ```
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - Map key to node plus doubly linked list with sentinels: O(1) lookup and O(1) recency moves.
 - The node stores `key` (for map delete on eviction) and `heapIdx` (for O(log n) heap fixes).
@@ -896,7 +921,7 @@ I combine a hash map from key to node with a doubly linked list ordered by recen
 - Callbacks run after `Unlock`; clock and ticker are injected for deterministic tests.
 - Scale reads with sharding or approximate LRU (Redis samples 5 keys by default); in production use ristretto or golang-lru.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Heaps and Priority Queues]], [[Concurrency for LLD]], [[Testing LLD Code]]
 - **Next:** [[Elevator System]], [[In-memory KV Store with TTL and Transactions]], [[Rate Limiter]]

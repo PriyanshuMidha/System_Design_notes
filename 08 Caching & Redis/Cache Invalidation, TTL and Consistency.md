@@ -25,7 +25,42 @@ updated: 2026-11-13
 > - Fixes for the race: leases, versioned values, versioned keys, or invalidation driven by the database's change log.
 > - Add **jitter** to TTLs so keys written together do not expire together.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (TTLs, invalidation and the stale-set race), 4 (the Go code), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A cache keeps a saved copy of data so you do not ask the database every time.
+When the real data changes, the saved copy is now wrong; we call it **stale**.
+There are two ways to get rid of a stale copy.
+One: give every copy a **TTL**, a "throw me away after 30 seconds" timer.
+Two: when you change the data, delete the saved copy straight away; this is **invalidation**.
+
+```mermaid
+flowchart LR
+    W["user saves new name"] --> DB["database updated"]
+    DB --> X["delete the cached copy"]
+    X --> N["next read fetches the new name"]
+```
+
+Good systems do both: delete on change, and keep a timer as a safety net in case a delete is lost.
+There is one sneaky bug: a slow reader can put an old copy back right after you deleted it.
+
+```mermaid
+flowchart LR
+    R["slow reader grabs old value"] --> D["writer deletes cache"]
+    D --> P["slow reader saves old value"]
+    P --> S["cache is stale again"]
+```
+
+The rest of this note is just these 3 questions:
+1. How stale is OK for each screen?
+2. How do you remove stale copies: timers, deletes, or both?
+3. How do you stop an old copy from sneaking back in?
 
 **The problem in one story.**
 A user changes their display name from "Ravi" to "Ravi K".
@@ -70,7 +105,7 @@ Where it breaks: a shop worker cannot accidentally re-hang yesterday's tag after
 > [!tip] Remember
 > Commit to the DB, then delete the cache key, and always keep a TTL as the safety net.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps caches each workspace's dashboard summary for 30 seconds. A customer records a ₹50,000 payment, refreshes the dashboard, and still sees the invoice as unpaid, because the cached summary is up to 30 seconds old. They record the payment again.
 
@@ -79,7 +114,7 @@ Two separate problems hide in that story:
 - **Policy:** was 30 seconds of staleness acceptable for *this* screen right after *this* user's write? (Probably not for the user who just paid; fine for everyone else.)
 - **Mechanism:** even if the payment handler deletes the cache key, can the old summary come back? Yes, through the race in section 3.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A cached value is a **photograph** of the database. The TTL is the **date stamp** after which you throw the photo away. Invalidation is **someone shouting "that photo is old"** when the scene changes.
 
@@ -87,9 +122,20 @@ A cached value is a **photograph** of the database. The TTL is the **date stamp*
 - If you only shout, a missed shout (a crashed process, a lost message) leaves a wrong photo up forever.
 - The stale-set race is a photographer who took a picture **just before** the change, walks back slowly, and pins it up **just after** the shout.
 
-## 3. How it works
+**Timers vs deletes, as a picture.**
+
+```mermaid
+flowchart TD
+    C["data changes"] --> T["timer only:<br/>wrong for up to the TTL"]
+    C --> D["delete only:<br/>one lost delete = wrong forever"]
+    C --> B["both:<br/>fixed fast, timer catches misses"]
+```
+
+## 3. How it works 🟡
 
 ### Pick a freshness model per feature
+
+**In plain words:** decide per screen how old the data may be. A bank balance after you pay must be fresh; a "top products" list can be a minute old.
 
 | Model | Meaning | InvoiceOps example | How to get it |
 | --- | --- | --- | --- |
@@ -101,6 +147,8 @@ A cached value is a **photograph** of the database. The TTL is the **date stamp*
 State the model before choosing a mechanism. The general theory is in [[Consistency Models]].
 
 ### TTLs in Redis (measured on Redis 8.2)
+
+**In plain words:** how Redis timers really behave, including the trap where a plain `SET` quietly removes the timer and the key lives forever.
 
 ```text
 127.0.0.1:6391> SET a 1 EX 100
@@ -132,11 +180,15 @@ Measured on Redis 8.2: 100,000 keys written with `PX 500`. One second later, wit
 
 ### Choosing a TTL and adding jitter
 
+**In plain words:** the timer is the longest a user can see old data. Shorter means fresher but more database work; add a little randomness so keys do not all expire together.
+
 - Start from the freshness model: the TTL is the **maximum** staleness if every invalidation is lost.
 - Shorter TTLs cost more misses. With 300 reads per second on one key and a 30 s TTL, there is one rebuild per 30 s (9,000 reads per rebuild). With a 1 s TTL there are 30 rebuilds in the same time.
 - **Jitter:** keys written together by a deploy, warm-up script or batch job also expire together, and the database sees a burst of misses. Add a random ±10% to each TTL. With 30 s ± 3 s, a batch of keys written in the same second expires spread over 6 seconds instead of in one. Mass-expiry bursts are covered in [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
 
 ### Invalidation strategies
+
+**In plain words:** the different ways to remove a stale copy (delete, overwrite, bump a version, listen to the database log) and what each costs.
 
 | Strategy | How | Staleness bound | Cost |
 | --- | --- | --- | --- |
@@ -148,6 +200,8 @@ Measured on Redis 8.2: 100,000 keys written with `PX 500`. One second later, wit
 | Tag-based | Keep a set of keys per tag (`tag:ws_123` → keys) and delete all on change | Instant | Tag sets must be maintained and expire too |
 
 ### The stale-set race
+
+**In plain words:** a slow reader fetched old data before your change, and puts it back in the cache just after you deleted it.
 
 Delete-on-write (as in [[Caching Patterns]]) still has a window:
 
@@ -169,6 +223,8 @@ sequenceDiagram
 The window needs a miss, then a write, then the slow fill, in that order, so it is rare per key. At millions of reads per second it happens every day. Facebook reported exactly this problem in its memcache deployment and fixed it with **leases**.
 
 ### The lease fix
+
+**In plain words:** give the reader a ticket when it misses. Deleting the key cancels the ticket, so a late reader with a cancelled ticket is not allowed to save.
 
 ```mermaid
 sequenceDiagram
@@ -192,9 +248,11 @@ A lease must also expire on its own (a short timeout), or a filler that crashes 
 
 Facebook's leases also rate-limit tokens per key (one every 10 seconds in the paper), which doubles as stampede protection: other readers wait briefly or take a slightly stale value instead of all querying the database.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the shortest correct pattern: write the database, then delete the cache key, and always set a timer.
 
 ```go
 // Miss hands out a token; Del cancels it; Set needs the live token.
@@ -221,6 +279,8 @@ func (c *LeaseCache) Set(k, v string, token uint64) bool {
 ```
 
 ### Full code (Go 1.24, go-redis v9.7.0)
+
+**In plain words:** the race reproduced, then fixed two ways: with tickets in memory, and with a version check in Redis.
 
 The package contains the unprotected cache (to reproduce the race), the lease cache (to fix it in memory), a Redis version guard (to fix it in Redis), and TTL jitter.
 
@@ -340,6 +400,8 @@ The guard needs the newer value to be **written** (update-on-write or CDC), not 
 Measured on Redis 8.2 with the same script through `redis-cli EVAL`: writing version 5 returned `1`, a later write of version 4 returned `0`, and `HGETALL product:7` still showed `ver 5, val price=399`.
 
 ### Tests (pass `go vet` and `go test -race`; the Redis test ran against Redis 8.2)
+
+**In plain words:** tests that make the race happen on purpose, then prove each fix stops it.
 
 ```go
 package invalidation
@@ -461,6 +523,8 @@ func TestSetIfNewerRedis(t *testing.T) {
 
 ### Versioned keys for group invalidation
 
+**In plain words:** put a version number in every key name. To throw away thousands of keys at once, just bump the number; old keys are ignored and time out.
+
 When a change affects many keys (a catalogue re-import, a tenant's price list), deleting each key is slow and easy to get wrong. Keep a **namespace version** and put it in every key:
 
 ```text
@@ -474,7 +538,18 @@ OK
 
 Measured on Redis 8.2. The cost is one extra read of `ns:catalog` per request (cache it in-process for a second) and a brief burst of misses after each bump.
 
+**Version bump, as a picture.**
+
+```mermaid
+flowchart LR
+    V1["ns:catalog = 1<br/>keys: catalog:v1:*"] --> B["re-import: INCR ns:catalog"]
+    B --> V2["ns:catalog = 2<br/>reads use catalog:v2:*"]
+    V2 --> O["old catalog:v1:* keys<br/>just time out"]
+```
+
 ### CDC-driven invalidation
+
+**In plain words:** instead of your code remembering to delete, a listener reads the database's own change log and deletes the right cache keys.
 
 ```mermaid
 flowchart LR
@@ -491,7 +566,7 @@ No application code path can forget to invalidate, rollbacks never reach the cac
 
 The cost is a pipeline to run and a lag of typically well under a second to a few seconds (an estimate; measure your connector's lag). See [[Transactional Outbox and CDC]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Fix for stale data | Prevents the stale-set race? | Needs | Use when |
 | --- | --- | --- | --- |
@@ -503,7 +578,7 @@ The cost is a pipeline to run and a lag of typically well under a second to a fe
 | Versioned keys | Yes for the bumped group | A namespace counter | Bulk changes, schema changes |
 | CDC-driven invalidation | Removes "forgot to invalidate"; combine with versions for the race | Debezium or similar, a consumer | Many writers, many services sharing a cache |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Every invalidation mechanism is an extra moving part. If the feature can live with a 30 s TTL, a TTL alone is often the right answer.
 - Delete-on-write requires every writer, including batch jobs, admin scripts and other services, to know every derived key. Aggregates (a dashboard summary derived from 10 tables) make that fragile; CDC or a short TTL scales better.
@@ -511,7 +586,7 @@ The cost is a pipeline to run and a lag of typically well under a second to a fe
 - Versioned keys leave garbage behind. Without TTLs, old versions sit in memory until evicted.
 - **Do not** try to make a cache strongly consistent with distributed transactions. If a read must be exactly current, read the database.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Facebook's memcache leases and its use of MySQL's commit log to broadcast deletes across regions (the "mcsqueal" daemons in the NSDI 2013 paper) are the reference design. Debezium-to-Kafka invalidators are a common open-source version of the same idea.
 - **Failure modes → fixes:**
@@ -522,7 +597,7 @@ The cost is a pipeline to run and a lag of typically well under a second to a fe
 	- Mass expiry after a warm-up job → jitter TTLs.
 - **What to monitor:** keys without TTL; `expired_keys` rate; invalidation errors and retries; CDC lag; a sampled **staleness check** (read a key from the cache and the database, compare versions, export the mismatch rate).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Delayed double delete.** Delete, then delete again about a second later (longer than a typical read-to-fill). Late fills that land in between are removed by the second delete. It shrinks the window but cannot close it: a fill delayed longer than the gap still wins.
 - **Why a version guard needs the newer value written.** After `DEL`, a late fill with version 4 finds no stored version and succeeds. Pair the guard with update-on-write (set version 5 after commit) or with CDC that sets the new version, or keep a short-lived "tombstone with version" instead of deleting.
@@ -531,7 +606,7 @@ The cost is a pipeline to run and a lag of typically well under a second to a fe
 - **Leases and stampedes are the same problem from two sides.** Both are "who is allowed to fill this key". The lease answers it for correctness (no stale fill); with a token rate limit it also answers it for load (one filler). Load-side techniques are in [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
 - **Eviction is not invalidation.** Eviction removes a key because memory is full ([[Cache Eviction Policies - LRU, LFU, TTL]]); invalidation removes it because it is wrong. A system that relies on eviction to clear stale data has no staleness bound.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Walk through the stale-set race in cache-aside with delete-on-write.
 > Reader A misses and reads the old row. Writer B commits a new value and deletes the key. A, delayed, sets the old value. The cache now disagrees with the database until the TTL. Fixes: leases, version-guarded sets, delayed double delete, or a short TTL.
@@ -551,7 +626,7 @@ The cost is a pipeline to run and a lag of typically well under a second to a fe
 > [!question]- A user updates their profile and immediately sees the old one. What do you do?
 > That is a read-your-writes violation. Delete the key after commit and, for that user's next reads, bypass the cache for a few seconds or read by version. Also check that cache fills after a miss do not come from a lagging read replica.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Decide the freshness model per feature: strong, read-your-writes, bounded, eventual.
 - TTL = maximum staleness if invalidation fails; add ±10% jitter.
@@ -561,7 +636,7 @@ The cost is a pipeline to run and a lag of typically well under a second to a fe
 - Race fixes: leases, version-guarded set (Lua), versioned keys, CDC-driven invalidation.
 - Eviction is not invalidation.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Caching Fundamentals]], [[Caching Patterns]]
 - **Next:** [[Cache Eviction Policies - LRU, LFU, TTL]], [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]

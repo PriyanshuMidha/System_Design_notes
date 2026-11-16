@@ -29,7 +29,42 @@ updated: 2026-11-13
 > - Stronger models cost latency and availability (see [[CAP and PACELC]]), so choose per feature.
 > - Classic mistake: confusing linearizable (one object, real-time) with serializable (multi-object transactions, any order).
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Big apps keep copies of the same data on several machines.
+One copy gets a change first. The others catch up a moment later.
+So if you read from a copy that is behind, you see old data.
+
+```mermaid
+flowchart LR
+    U["You save a new bio"] --> P["Main copy: new bio"]
+    P -. "a bit later" .-> R["Other copy: still old bio"]
+    U2["You reload the page"] --> R
+```
+
+A **consistency model** is the promise a system makes about what a read may return.
+The strongest promise acts like there is only one copy: you always see the latest.
+The weakest promise only says copies agree **eventually**.
+In between are friendly promises, like "you always see your own changes".
+
+```mermaid
+flowchart LR
+    S["Strong: always latest"] --> C["Causal: cause before effect"]
+    C --> SG["Session: see your own writes"]
+    SG --> E["Eventual: copies agree later"]
+```
+
+The rest of this note is just these 3 questions:
+1. What does each model promise, and what does it allow?
+2. How does lag between copies cause strange reads?
+3. How do you fix it cheaply, for example with a "read your own writes" token?
 
 **The problem in one story.**
 You change your profile photo and press save.
@@ -75,13 +110,24 @@ Where it breaks: a courier visits buildings in order, but replicas can apply wri
 > [!tip] Remember
 > A consistency model is a contract about stale reads; pick the weakest one each feature can tolerate.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A user edits their profile bio. The write goes to the primary database, and the page reloads from a read replica that is 400 ms behind. The old bio comes back, the user thinks the save failed, and edits again.
 
 Nothing is "broken": the replica will catch up. But the system never said what a read may return, so the application cannot tell whether this is a bug. A consistency model is that contract. Here the violated promise is **read-your-writes**, and it can be fixed without making every read go to the primary.
 
-## 2. Mental model
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant P as Primary
+    participant R as Replica
+    U->>P: Save bio
+    P-->>U: Saved
+    U->>R: Reload page
+    R-->>U: Old bio (not copied yet)
+```
+
+## 2. Mental model 🟢
 
 Think of all operations from all clients laid out on one timeline. A consistency model says how much the system may **reorder or delay** what each reader sees.
 
@@ -92,9 +138,11 @@ Think of all operations from all clients laid out on one timeline. A consistency
 
 **Analogy.** A group chat. Linearizable: everyone sees each message the moment it is sent. Causal: you never see a reply before the message it replies to. Eventual: messages may arrive in any order, but after a while everyone's history is the same.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The hierarchy
+
+**In plain words:** stronger promises sit at the top. If a system gives you a strong one, you also get every weaker one below it.
 
 An arrow points from a stronger model to a weaker one. A system that gives a model also gives every model reachable below it.
 
@@ -120,6 +168,8 @@ Linearizable, sequential and serializable cannot stay available on the minority 
 
 ### Single-object models
 
+**In plain words:** how fresh one value must look: always the latest, or the same order for everyone, or just eventually right.
+
 | Model | Promise | Allowed | Forbidden |
 | --- | --- | --- | --- |
 | Linearizable | Behaves like one copy; once a write completes, every later read (in real time) sees it | nothing beyond concurrent ops in some order | stale read after a completed write |
@@ -128,6 +178,8 @@ Linearizable, sequential and serializable cannot stay available on the minority 
 | Eventual | If writes stop, all replicas converge | almost anything in the meantime | replicas staying different forever |
 
 ### Session guarantees
+
+**In plain words:** four small promises scoped to one user, like "you see your own writes" and "time never goes backwards for you".
 
 These four come from the Bayou project (Terry et al., 1994). Each is scoped to **one client session**, which is why they are cheap: no global coordination is needed.
 
@@ -141,6 +193,8 @@ These four come from the Bayou project (Terry et al., 1994). Each is scoped to *
 Causal consistency includes all four.
 
 ### How replication lag produces the anomalies
+
+**In plain words:** each copy is a little behind. Read from different copies and you can see new data, then old data again.
 
 With a leader and asynchronous followers (see [[Replication]]), each follower is a slightly old copy, and each one is old by a different amount. A load balancer that sends consecutive reads to different followers turns that lag into time travel:
 
@@ -163,14 +217,26 @@ sequenceDiagram
 
 ### Implementing session guarantees
 
+**In plain words:** remember how far your last write got, and only read from a copy that has caught up at least that far.
+
 - **Read from the leader** for a short window after the user writes (for example 5 s). Simple, but it moves load to the leader.
 - **Sticky routing**: send each user to the same replica (hash of user id). This gives monotonic reads while that replica stays up, but not read-your-writes if the write went to the leader and the replica lags.
 - **Version tokens (LSN tokens)**: after each write or read, the client keeps the highest log position it has seen. A read goes only to a replica that has applied at least that position, otherwise to the leader. In PostgreSQL 17 the primary reports `pg_current_wal_lsn()` and a standby reports `pg_last_wal_replay_lsn()`. MongoDB causally consistent sessions do the same with `operationTime` and `afterClusterTime`.
 - **Synchronous apply**: PostgreSQL `synchronous_commit = remote_apply` makes a commit wait until the synchronous standbys have applied it, so reads on those standbys see it. This costs a round trip on every commit.
 
-## 4. Worked example
+```mermaid
+flowchart LR
+    W["Write returns position 100"] --> T["Client keeps token 100"]
+    T --> Q{"Replica at 100 or more?"}
+    Q -- "yes" --> R["Read from replica"]
+    Q -- "no" --> L["Read from leader or wait"]
+```
+
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the write returns a position number; the next read waits for, or picks, a copy that has reached that number.
 
 The LSN-token rule fits on a whiteboard:
 
@@ -194,6 +260,8 @@ read(k):
 The first `max` gives read-your-writes. The second gives monotonic reads.
 
 ### Go: LSN tokens over lagging replicas
+
+**In plain words:** a small simulation of lagging copies, and code that uses the position token to never show you stale data.
 
 This compiles and passes `go vet` and `go test -race` on Go 1.24. Replication lag is simulated with an explicit `CatchUp` call, so the tests are deterministic.
 
@@ -337,9 +405,11 @@ func TestSessionTokenGivesMonotonicReads(t *testing.T) {
 
 In a real service the token travels in a cookie or response header (for example `X-Min-LSN: 0/3000060`), and the read router compares it with each replica's `pg_last_wal_replay_lsn()`, polled every few hundred milliseconds.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Linearizable vs serializable vs strict serializable
+
+**In plain words:** these sound alike but differ: one is about single values and real time, one is about whole transactions.
 
 | Property | Scope | Real-time order? | Example |
 | --- | --- | --- | --- |
@@ -348,6 +418,8 @@ In a real service the token travels in a cookie or response header (for example 
 | Strict serializable | multi-object transactions | yes | Spanner, FoundationDB. CockroachDB is serializable and gives single-key linearizability; its own consistency write-ups say it is not strict serializable for transactions on unrelated keys (no stale reads, but causal reverse is possible) |
 
 ### Defaults in real systems
+
+**In plain words:** what popular databases promise out of the box, and the setting to get a stronger promise.
 
 | System | Default | How to get stronger |
 | --- | --- | --- |
@@ -370,7 +442,7 @@ The table carried over from the old note, with the model named:
 | Comment thread | causal (at least writes-follow-reads) | a reply must not appear before its parent |
 | Feed of followed accounts | monotonic reads | posts must not vanish on refresh |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Linearizable costs a round trip to a leader or majority on every write and, for strict reads, on every read.** Across regions that is tens of milliseconds per operation (an estimate). It also stops on the minority side of a partition.
 - **Causal costs metadata.** Each write carries its dependencies (vector clocks or explicit dependency lists, see [[Clocks and Ordering]]), and a replica must delay showing a write until its dependencies have arrived.
@@ -378,7 +450,7 @@ The table carried over from the old note, with the model named:
 - **Eventual costs application logic**: every reader must tolerate stale or conflicting data, and conflicting writes must be merged (see [[CRDTs and Conflict Resolution]]).
 - **When not to bother:** a single-node database is already linearizable. Add replicas for reads only when you have measured that the primary cannot serve them.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
   - Read-after-write routing that pins a user to the primary for a few seconds after a write is a common pattern in Rails and Django database routers.
@@ -394,7 +466,7 @@ The table carried over from the old note, with the model named:
   - Percentage of reads that fell back to the leader.
   - Conflict and read-repair counts in leaderless stores.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Linearizability is composable; serializability is not.** If each object is linearizable, the whole system of objects is linearizable (Herlihy and Wing call this locality). Serializability is defined over transactions, so two separately serializable databases do not give a serializable cross-database transaction.
 - **Serializable does not mean fresh.** A serializable system may serve a read-only transaction from an old snapshot, because ordering it "before" recent writes is a valid serial order. That is why Spanner and FoundationDB advertise strict serializability.
@@ -402,7 +474,7 @@ The table carried over from the old note, with the model named:
 - **Sequential vs linearizable.** Sequential consistency allows a read to return a value that is "old in real time" as long as everyone agrees on the order. Linearizability adds the real-time constraint, which is what makes it useful for locks and leader leases.
 - **Causal needs dependency tracking.** Systems such as COPS track explicit dependencies per write. Others use hybrid logical clocks (MongoDB cluster time) to approximate causality cheaply (see [[Clocks and Ordering]]).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the difference between linearizable and serializable? (trap)
 > Linearizable is about single objects and real time: once a write completes, every later read sees it. Serializable is about multi-object transactions: the result equals *some* serial order, which need not match real time. Strict serializable is both.
@@ -425,7 +497,7 @@ The table carried over from the old note, with the model named:
 > [!question]- How would you check that a database really gives the model it claims?
 > Run a Jepsen-style test: many clients, record each operation's invocation and completion time, inject partitions, crashes and clock skew, then check the history with a linearizability or serializability checker.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Strict serializable > linearizable / serializable > sequential > causal > session guarantees > eventual.
 - Linearizable = one copy, real time, single object. Serializable = some serial order of transactions.

@@ -24,7 +24,37 @@ updated: 2026-11-13
 > - Say trade-offs out loud, with numbers; name failure modes and what you would monitor.
 > - At SDE-3 level the interviewer scores whether you drive the conversation, quantify, and keep the design simple and operable, not how many technologies you name.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (time budget and steps), 4 (URL shortener in 45 minutes) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 (common mistakes) and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+In a system design interview you get a vague task like "design a URL shortener" and about 45 minutes.
+There is no single right answer. The interviewer watches how you think and decide.
+People who jump straight to fancy tools usually run out of time before the basic flow works.
+So you follow a fixed order, a **framework**, and spend your minutes on purpose.
+First ask questions and agree on numbers. Then draw a simple design that works. Then go deep on the hardest part, called the **deep dive**.
+
+```mermaid
+flowchart LR
+    Q["Ask: what and how much?"] --> S["Draw a simple working design"] --> D["Go deep on the hardest part"] --> W["Sum up trade-offs"]
+```
+
+Every box you draw should be there because a number asked for it.
+
+```mermaid
+flowchart LR
+    N["Number: 100k reads per second"] --> C["So: add a cache"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you split 45 minutes?
+2. What do you say and draw at each step?
+3. Which part do you pick for the deep dive, and how do you present options?
 
 **The problem in one story.**
 You get 45 minutes to plan a city's bus network out loud.
@@ -68,7 +98,13 @@ Where it breaks: a doctor can order more tests later; in an interview the clock 
 > [!tip] Remember
 > Requirements, numbers, simple design, then deep dives, and say every trade-off out loud.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
+
+```mermaid
+flowchart LR
+    A["Candidate A: tools first"] --> A2["Minute 35: core flow missing"]
+    B["Candidate B: requirements, numbers, simple design"] --> B2["Two solid deep dives, every box justified"]
+```
 
 Two candidates get "design a URL shortener".
 
@@ -77,13 +113,13 @@ Two candidates get "design a URL shortener".
 
 The difference is not knowledge; it is a plan. Interviews are short, open-ended and judged on reasoning, so a fixed structure frees your attention for the actual design.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of an architect meeting a client. The architect does not start with the roof material. They ask how many people will live there and what the budget is (requirements), sketch the floor plan (high-level design), then go deep on the hard part (the cantilevered balcony), while telling the client what each choice costs.
 
 The interviewer is the client and a colleague at the same time: they want to see how you decide, not just the final drawing.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The time budget
 
@@ -101,6 +137,8 @@ For a 60-minute slot, give the extra time to deep dives. For a 35-40 minute slot
 
 ### The steps (the 10-step framework, grouped)
 
+**In plain words:** ten small steps, grouped into six phases. Each phase leaves something on the board, so the interviewer can see your progress.
+
 | Phase | Steps | What you produce |
 | --- | --- | --- |
 | Requirements | 1. Clarify functional requirements (3-5 core features). 2. Non-functional requirements with numbers. Say what is out of scope. | A short list on the board |
@@ -112,6 +150,8 @@ For a 60-minute slot, give the extra time to deep dives. For a 35-40 minute slot
 | Wrap-up | 10. Trade-offs, bottlenecks, evolution path | Summary in 4-5 sentences |
 
 ### How the conversation flows
+
+**In plain words:** it is a back-and-forth, not a speech. You propose, the interviewer pushes, you adjust.
 
 ```mermaid
 sequenceDiagram
@@ -133,6 +173,8 @@ sequenceDiagram
 Check in at each phase boundary ("Does this scope work for you?"), but do not wait for permission at every sentence. Driving is part of the signal.
 
 ### Choosing the deep dive
+
+**In plain words:** go deep where the numbers make life hardest, for example huge read traffic or "never lose a payment". Show two or three ways, then pick one and say why.
 
 Pick the component where the non-functional requirements are hardest to meet, then present two or three options with their costs.
 
@@ -157,7 +199,7 @@ Pick the component where the non-functional requirements are hardest to meet, th
 | [[Case Study - Ad Click Aggregation]] | Stream aggregation, dedup | Late events and exactly-once counts |
 | [[Rate Limiting - Algorithms and Distributed Design]] | Token bucket, sliding window | Distributed counters and their accuracy |
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -173,6 +215,8 @@ WRAP  302 vs 301 trade-off, failure of cache, metrics: hit rate, p99, 404 rate
 ```
 
 ### The URL shortener in 45 minutes
+
+**In plain words:** the full framework run once on a real problem, minute by minute.
 
 **Minutes 0-5, requirements.** Functional: create a short link for a long URL; redirect a short code to the long URL; optional expiry. Out of scope: user accounts, analytics dashboards, custom domains. Non-functional: 100 M new links/day, 100 reads per write, p99 redirect under 50 ms, redirects 99.99% available, links never lost, codes not guessable in sequence (a nice-to-have).
 
@@ -199,6 +243,8 @@ WRAP  302 vs 301 trade-off, failure of cache, metrics: hit rate, p99, 404 rate
 
 ### Self-review rubric
 
+**In plain words:** after a practice run, grade yourself on each item so you know what to fix next time.
+
 Score yourself 0-2 on each after a practice run (0 = missing, 1 = present but shallow, 2 = solid):
 
 | Area | 2 points looks like |
@@ -214,7 +260,7 @@ Score yourself 0-2 on each after a practice run (0 = missing, 1 = present but sh
 
 As a personal heuristic (not an interviewer's scale), 12 or more of 16 is a solid answer and below 8 means repeat the problem.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Format | What changes | How to adapt |
 | --- | --- | --- |
@@ -231,7 +277,7 @@ As a personal heuristic (not an interviewer's scale), 12 or more of 16 is a soli
 | SDE-3 / senior | Drives the session, quantifies, picks the right deep dive unprompted, discusses failure and operations, prefers the simpler design that meets the numbers |
 | Staff | Frames the problem and its business constraints, multiple viable designs, migration and evolution, cross-team impact |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Do not follow the framework blindly.** If the interviewer jumps to a deep dive at minute 8, follow them; the framework is a default, not a script.
 - **Do not over-estimate.** Estimating cache size for a write-only system wastes minutes. Estimate what changes a decision.
@@ -239,7 +285,7 @@ As a personal heuristic (not an interviewer's scale), 12 or more of 16 is a soli
 - **Do not default to microservices.** A modular service with a clear data model is usually the stronger starting point; split only for a stated reason.
 - **Do not chase completeness.** Two deep dives done well beat six components named.
 
-## 7. In production
+## 7. In production 🔴
 
 The interview is a compressed version of real design work, and the same habits show up in design docs:
 
@@ -252,7 +298,7 @@ The interview is a compressed version of real design work, and the same habits s
 	- Fought the interviewer's hint → treat hints as requirements changes; adapt and say what changes.
 - **What to watch in yourself:** time per phase (use a timer in practice), number of explicit trade-off statements, and whether every component on the board maps to a requirement.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Common mistakes** (from the owner's original list, extended):
 
@@ -282,7 +328,7 @@ The interview is a compressed version of real design work, and the same habits s
 5. Compare one alternative design and when it would win.
 6. Score yourself with the rubric above and repeat weak areas.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the first thing you do when given a design problem?
 > Clarify requirements: the 3-5 core features, who the users are, scale (DAU, read:write), latency and availability targets, consistency needs, and what is out of scope. Write them down; every later choice points back to them.
@@ -305,7 +351,7 @@ The interview is a compressed version of real design work, and the same habits s
 > [!question]- How much time should estimates take?
 > Three to five minutes, and only for numbers that change the design: read and write QPS, storage growth, and maybe bandwidth or connection counts. Round aggressively and state the implication of each number.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Timeline (45 min): requirements 5, estimates 3-5, entities + API 5, HLD 10, deep dives 15-20, wrap-up 5.
 - Requirements: features, NFRs with numbers, out of scope.

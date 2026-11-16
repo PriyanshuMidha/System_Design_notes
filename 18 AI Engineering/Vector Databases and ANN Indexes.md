@@ -25,7 +25,40 @@ updated: 2026-11-13
 > - Metadata filtering (tenant, permissions, date) has to compose correctly with the ANN index, or it silently returns fewer than k results.
 > - Most teams do not need a dedicated vector database: pgvector on the Postgres you already run covers single-digit-million-row RAG workloads.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Embeddings turn each document into a list of numbers (a vector). To answer a question, you find the stored vectors closest to the question's vector.
+
+Checking every single vector works for a few thousand. For millions, it is far too slow per question.
+
+```mermaid
+flowchart LR
+    Q["Question vector"] --> A["Compare with all<br/>5 million vectors"] --> S["Too slow"]
+```
+
+A **vector database** stores vectors and uses a smart shortcut called an **ANN index** (approximate nearest neighbor). It checks only the vectors likely to be close, and skips the rest.
+
+```mermaid
+flowchart LR
+    Q["Question vector"] --> I["ANN index:<br/>jump to the right area"] --> C["Check a few thousand"] --> T["Top 10, in milliseconds"]
+```
+
+"Approximate" means it may miss a true match now and then. You trade a tiny bit of accuracy for huge speed.
+
+Real queries also need filters, like "only this customer's data". That part is easy to get wrong.
+
+The rest of this note is just these 3 questions:
+1. How do the two main shortcuts (graph and clusters) work?
+2. How do you shrink memory and add filters safely?
+3. Which database do you pick, and how big will it get?
+
 
 **The problem in one story.**
 You have a million help articles and a user types "my payment failed twice".
@@ -71,7 +104,7 @@ Where it breaks: a library has exact labels, while an ANN index only guesses the
 > [!tip] Remember
 > A vector database finds "close enough" neighbors fast; recall@k tells you how close enough really is.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Say you have 5 million support-ticket chunks, each embedded as a 1,536-dimension vector (a common OpenAI-style embedding size), and a user asks a question.
 
@@ -82,7 +115,7 @@ Exact search does not scale past roughly a million vectors at interactive latenc
 
 An **approximate nearest neighbor (ANN)** index restructures the data (a graph, or clusters) so a query only compares against a small fraction of the vectors, in exchange for occasionally missing the true closest match. In practice, a well-tuned ANN index recovers 95–99% of the exact top-k while touching 1–10% of the data.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Exact k-NN is "check every row." An ANN index is "check only the rows likely to matter," using one of two tricks:
 
@@ -91,9 +124,11 @@ Exact k-NN is "check every row." An ANN index is "check only the rows likely to 
 
 Both turn `O(N)` work into roughly `O(log N)` (HNSW) or `O(N/nlist · nprobe)` (IVF) work, at the cost of sometimes skipping the true answer.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Exact search, for comparison
+
+**In plain words:** The slow but perfect way: measure the distance to every vector and keep the closest.
 
 ```mermaid
 flowchart LR
@@ -103,6 +138,8 @@ flowchart LR
 ```
 
 ### HNSW (Hierarchical Navigable Small World)
+
+**In plain words:** Like using highways, then main roads, then local streets: big jumps first, then small steps to the exact spot.
 
 HNSW builds several layers of a graph. The top layer has few nodes and long links (for big jumps); the bottom layer has all nodes and short links (for fine-grained search).
 
@@ -136,6 +173,8 @@ HNSW is memory-heavy: it stores the full vectors plus `M` links per node per lay
 
 ### IVF (Inverted File Index)
 
+**In plain words:** Sort vectors into buckets ahead of time. At query time, only search the few buckets nearest the question.
+
 ```mermaid
 flowchart TD
     Build["build time: k-means over all vectors -> nlist centroids"]
@@ -159,6 +198,8 @@ IVF is lighter on memory than HNSW (no per-vector link list, just `N` bucket ass
 
 ### Quantization: shrinking the vectors themselves
 
+**In plain words:** Store each number with fewer bits, like saving a photo at lower quality. Much less memory, slightly worse results.
+
 Both index families can store a **compressed** copy of each vector to cut memory further:
 
 - **Scalar quantization**: each `float32` becomes an `int8`, a 4× memory cut for a small recall hit.
@@ -166,7 +207,15 @@ Both index families can store a **compressed** copy of each vector to cut memory
 - **Binary quantization**: one bit per dimension (sign of the value) with Hamming-distance search; roughly 32× smaller, usable as a cheap first pass before rescoring with full vectors.
 - **DiskANN** (Microsoft, 2019) takes this further: it keeps a compressed graph and vectors on SSD instead of RAM, making billion-scale ANN affordable without a huge memory footprint, at higher per-query latency than an all-in-RAM index.
 
+```mermaid
+flowchart LR
+    F["float32 vector<br/>1,536 numbers = 6 KB"] --> S["Scalar (int8)<br/>1.5 KB"]
+    F --> P["Product quantization<br/>~100 bytes"]
+```
+
 ### Metadata filtering: three strategies, one trap
+
+**In plain words:** You can filter before the search, after it, or during it. Filtering after can leave you with almost no results.
 
 A real query is rarely "nearest k vectors" alone — it is "nearest k vectors where `tenant_id = X`". There are three ways to combine the filter with the ANN index, and they are not interchangeable:
 
@@ -179,7 +228,16 @@ A real query is rarely "nearest k vectors" alone — it is "nearest k vectors wh
 > [!warning] Selectivity trap
 > Post-filtering a 1%-selective tenant filter against `efSearch = 100` candidates expects about one matching candidate — that is not enough to fill a top-10 request. Either raise `efSearch`/`nprobe` well above `k`, or use an index that filters during the graph/list walk, not after it.
 
+```mermaid
+flowchart LR
+    A["Post-filter:<br/>top 10, then filter"] --> X["May leave 0-2 results"]
+    B["Pre-filter:<br/>filter, then search"] --> Y["Correct, can be slow"]
+    C["Filter during search"] --> Z["Usually best"]
+```
+
 ### Sequence: a filtered, tenant-scoped query end to end
+
+**In plain words:** One customer's question, from the app to the database and back, only ever touching that customer's data.
 
 ```mermaid
 sequenceDiagram
@@ -199,6 +257,8 @@ sequenceDiagram
 Metadata filtering is a performance and relevance feature, not a security boundary by itself — enforce authorization in application logic too, in case the filter is misconfigured or bypassed upstream.
 
 ### Record design and hybrid (sparse + dense) support
+
+**In plain words:** Each stored row holds the vector plus its ID, text, source and filter fields.
 
 A stored record is more than the raw vector. A typical shape:
 
@@ -224,9 +284,11 @@ The optional `sparse_values` field is how a vector database stores a learned-spa
 - Qdrant, Weaviate and OpenSearch support this "hybrid" mode natively, Milvus supports it to varying degrees depending on version (verify against current docs before relying on it).
 - pgvector has no single built-in hybrid operator, so a Postgres-based hybrid setup runs BM25 (via `tsvector`) and `pgvector` as two queries fused in the application.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** The bucket idea in code: group vectors once, then scan only the closest buckets.
 
 The shape of an inverted-file index: cluster once, scan only the closest clusters.
 
@@ -529,7 +591,9 @@ This is the whole trade-off in one table.
 
 Two further tests in the same package assert that invariant directly and confirm that a tenant filter never leaks another tenant's records through either index — all three tests pass under `go test -race` on Go 1.24.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
+
+**In plain words:** The main index types side by side: how they work and what they cost.
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -540,6 +604,8 @@ Two further tests in the same package assert that invariant directly and confirm
 | DiskANN | Compressed graph + vectors on SSD | Billion-scale, cost-sensitive, latency budget allows disk I/O | Higher per-query latency than all-RAM HNSW |
 
 ### Where to run it
+
+**In plain words:** Your hosting choices: inside Postgres, a dedicated vector database, or a managed cloud service.
 
 | Option | Good fit | Watch out for |
 | --- | --- | --- |
@@ -555,7 +621,13 @@ Two further tests in the same package assert that invariant directly and confirm
 >
 > If an interviewer asks you to design a multi-tenant semantic search service, bolting FAISS directly onto an API is not an answer by itself — you still need storage, CRUD, filtering and operational tooling around it.
 
-## 6. Trade-offs and when not to use
+```mermaid
+flowchart LR
+    Q{"Already on Postgres<br/>and data is modest?"} -- "yes" --> P["pgvector"]
+    Q -- "no" --> D["Dedicated or managed<br/>vector database"]
+```
+
+## 6. Trade-offs and when not to use 🟡
 
 - ANN indexes trade a small amount of recall for a large amount of speed — there is no setting that gives you both exact results and sublinear cost.
 - HNSW is memory-expensive; at tens of millions of high-dimension vectors it can be the single largest line item in your infra budget. Quantization or IVF+PQ exist specifically to fight this.
@@ -563,7 +635,7 @@ Two further tests in the same package assert that invariant directly and confirm
 - If your corpus is under about 100k vectors, flat (exact) search is often fast enough and removes an entire class of recall bugs — don't reach for ANN before you need it.
 - A vector index alone cannot do exact-match lookups (an invoice number, a user ID) well; combine it with lexical search (see [[Keyword, Semantic and Hybrid Search]]) for those.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- pgvector ships HNSW and IVFFlat index types inside Postgres 17; teams already running Postgres often start here before adopting a dedicated vector database.
@@ -581,7 +653,7 @@ Two further tests in the same package assert that invariant directly and confirm
 	- Index memory footprint and build/rebuild time.
 	- Empty-result and below-k-result rates (a proxy for the post-filter trap above).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **RAM sizing.** A back-of-envelope budget for an all-in-memory HNSW index: `N × (d × 4 bytes + M × 8 bytes × average layers) ` plus the engine's own overhead (often 1.3–2×).
   For 10 million 768-dimension vectors at `M=16`: raw vectors alone are `10,000,000 × 768 × 4 bytes ≈ 28.6 GiB` — this is why quantization and IVF+PQ exist at this scale (estimate; actual overhead varies by engine and must be measured against your own data).
@@ -594,7 +666,7 @@ Two further tests in the same package assert that invariant directly and confirm
   Each shard still answers an ANN query independently; the service fans a query out to all shards and merges the top-k results (scatter-gather), so tail latency is bounded by the slowest shard.
 - **Backups.** A vector index is derived data (it can be rebuilt from the source documents plus the embedding model), but rebuilding at scale is slow and costs API or GPU time — back up the index snapshots themselves, not just the source documents, for any index past a few hundred thousand vectors.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Exact vs. approximate nearest neighbor: what is the actual trade-off?
 > Exact search is `O(N·d)` per query and always correct. ANN indexes (HNSW, IVF) restructure the data so a query touches a small fraction of it, in exchange for sometimes missing the true nearest neighbor. The trade is tuned and measured with recall@k against an exact-search baseline, not assumed.
@@ -630,7 +702,7 @@ Two further tests in the same package assert that invariant directly and confirm
 > [!question]- When would you *not* reach for a vector database at all?
 > Below roughly 100k vectors, exact (flat) search is often fast enough on a single machine and sidesteps an entire class of recall bugs. Add an ANN index only once you've measured that exact search doesn't meet your latency budget.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Exact k-NN: `O(N·d)` per query. ANN trades some recall for much less work.
 - HNSW: layered graph, greedy descent; tune `M`, `efConstruction` (build), `efSearch` (query, no rebuild).
@@ -641,7 +713,7 @@ Two further tests in the same package assert that invariant directly and confirm
 - FAISS is a library, not a database. pgvector is often the right first stop if you're already on Postgres.
 - Metadata filters add relevance and performance; authorization still belongs in application logic too.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Embeddings]], [[Index Types and Index Design]]
 - **Next:** [[Keyword, Semantic and Hybrid Search]], [[RAG Pipeline]]

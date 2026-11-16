@@ -22,7 +22,29 @@ updated: 2026-11-13
 > - Order of the withdrawal: plan the notes, debit the bank with an idempotent transaction ID, dispense, and only then subtract the notes from the cassette. If the dispense fails, reverse the debit and go out of service.
 > - Money is `int64` paise; the bank and the hardware are interfaces, so every failure is testable.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs) and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You walk up to a cash machine, put in your card and type your PIN. You ask for ₹600. The machine asks your bank to take ₹600 from your account, then pushes out the notes. The tricky part is the order of these steps. If the notes get stuck after the bank took the money, the machine must give the money back (a **reversal**). And it can only use the notes it actually has inside, so it must plan the exact mix first. The machine is always in one named mode, like "waiting for card" or "card in". That idea is called a **state machine**.
+
+```mermaid
+flowchart LR
+    A["Card + PIN"] --> B["Plan exact notes"]
+    B --> C["Bank takes money"]
+    C --> D["Push out notes"]
+    D -- "notes stuck" --> E["Give money back"]
+```
+
+Everything else in this note is just these 3 questions:
+1. Which modes can the machine be in, and what may you do in each?
+2. How does it pick the exact notes when it has only a few of each kind?
+3. What is the safe order of steps, and how does it undo a failure?
 
 **The problem in one story.**
 You put your card in an ATM, type your PIN and ask for ₹600.
@@ -68,7 +90,7 @@ Where it breaks: a teller can see a miscount and fix it by hand; the ATM must pl
 > [!tip] Remember
 > Check the state first, plan the exact notes, debit idempotently, dispense, and reverse the debit if the hardware fails.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design an ATM. A customer inserts a card, enters a PIN, and withdraws cash.
@@ -89,7 +111,7 @@ amounts the ATM cannot make with its notes, and a cash jam after the account was
 5. Write `Withdraw` in the safe order: plan, debit (idempotent ID), dispense, commit the cassette; reverse on failure.
 6. Test the planner table, wrong PINs, timeout, a declined debit, a jam, and concurrent withdrawals; then discuss the bank-side ledger and reconciliation.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 ### Questions to ask (with assumed answers)
 
@@ -122,7 +144,7 @@ amounts the ATM cannot make with its notes, and a cash jam after the account was
 - The bank's ledger (see [[Digital Wallet and Ledger]]).
 - Physical security, cameras, receipts printing.
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 |---|---|
@@ -134,7 +156,7 @@ amounts the ATM cannot make with its notes, and a cash jam after the account was
 
 The hardest use case is **Withdraw**: it crosses two systems that can each fail, and the customer must end up with either both cash and debit, or neither.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
@@ -148,7 +170,7 @@ The hardest use case is **Withdraw**: it crosses two systems that can each fail,
 
 Modelling insight: the **ATM does not own money**; the bank does. The ATM owns only the physical notes. That is why the debit happens at the bank with an idempotency key and the ATM's own state (the cassette count) changes only after the hardware succeeds.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -190,7 +212,7 @@ classDiagram
     ATM ..> Receipt : creates
 ```
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 The ATM is a device, so its "API" is the method set the screen controller calls. The bank side is a remote API:
 
@@ -203,6 +225,8 @@ Bank switch (remote, idempotent by txnId)
   POST /debits                  {txnId, card, amount}           -> 200 | 402 insufficient funds
   POST /debits/{txnId}/reversal                                 -> 200 (also 200 if already reversed)
 ```
+
+**In plain words:** The two outside things the ATM talks to, written as small Go interfaces: the bank and the note box.
 
 ```go
 type Bank interface {
@@ -218,9 +242,11 @@ type Dispenser interface {
 
 Errors the screen maps to messages: `ErrWrongState`, `ErrWrongPIN`, `ErrCardRetained`, `ErrSessionTimeout`, `ErrInvalidAmount`, `ErrCannotDispense`, `ErrDispenseFailed`, and the bank's own decline.
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
 
 The ATM keeps very little: the cassette counts and a local journal. The bank keeps the money.
+
+**In plain words:** Two tiny tables: how many notes of each kind are inside, and a diary of every withdrawal so a crash can be cleaned up later.
 
 ```sql
 -- On the bank side: one row per ATM transaction, keyed by the ATM's ID.
@@ -247,7 +273,7 @@ WHERE txn_id = $1 AND status = 'debited';
 - **Reconciliation:** at the end of the day, the notes physically counted in the cassette must equal the loaded notes minus the notes dispensed in the journal. A mismatch after a jam is why the ATM goes out of service.
 - Account balance locking on the bank side belongs to [[Locking - Optimistic vs Pessimistic]].
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 |---|---|---|
@@ -263,7 +289,7 @@ Patterns not used, and why:
 - No State pattern objects (one struct per state): four states and short guards; a `switch` on a field reads better. Use state objects when each state carries a lot of behaviour, as discussed in [[Vending Machine]].
 - No two-phase commit with the hardware: a cash dispenser cannot "prepare" and wait; it can only dispense or fail. A compensating reversal is the realistic choice.
 
-## Folder structure
+## Folder structure 🟡
 
 ```text
 atm/
@@ -275,7 +301,7 @@ atm/
 cmd/atm/main.go -> wires the real bank client, the hardware driver and time.Now
 ```
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > Aim for about 200 lines in the room.
@@ -310,6 +336,8 @@ The order matters. Dispensing before the debit would give away cash when the ban
 
 > [!tip] Exercise: a "mix of small notes" objective
 > Customers often prefer a ₹100 note in the bundle. Change the planner so that, among exact plans, it maximises the number of ₹100 notes up to two, then minimises total notes. Hint: run the same table but with a cost tuple, or post-process: plan `amount - 2 × ₹100` first when two ₹100 notes are available, and fall back to the plain plan.
+
+**In plain words:** This is the whole machine in one file. Read `Withdraw` and `PlanNotes` first; the rest is the mode checks and small helpers.
 
 ```go
 package atm
@@ -584,9 +612,11 @@ func gcd(a, b int64) int64 {
 }
 ```
 
-## Test cases
+## Test cases 🟡
 
 Fakes for the bank, the hardware and the clock make every path deterministic. Run with `go test -race ./...` (Go 1.24.4, all pass).
+
+**In plain words:** Fake versions of the bank, the note box and the clock, so each test can force a failure (wrong PIN, jam, timeout) on purpose.
 
 ```go
 package atm
@@ -842,7 +872,7 @@ func TestConcurrentWithdrawals(t *testing.T) {
 - `TestDispenseFailureReversesDebit` proves atomicity: after a jam the balance is unchanged and the ATM refuses new cards.
 - `TestConcurrentWithdrawals`: 20 goroutines withdraw ₹500 with three ₹500 notes loaded; exactly three debits happen and the cassette ends at zero. Without the mutex, two goroutines could plan from the same note.
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | What happens | How the design handles it |
 |---|---|---|
@@ -867,7 +897,7 @@ func TestConcurrentWithdrawals(t *testing.T) {
 - A debit without an idempotency key, so a network retry charges twice.
 - `float64` rupees, and `time.Now()` inside the timeout check.
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 |---|---|
@@ -887,7 +917,7 @@ Tradeoffs chosen:
 - **Out of service after a jam.** Safer than guessing which notes came out; a person counts the cassette.
 - **Fewest notes.** Simple to state and test; a real bank may weigh note mix and remaining stock.
 
-## Drawing
+## Drawing 🟢
 
 ```mermaid
 stateDiagram-v2
@@ -934,7 +964,7 @@ Redraw it from memory:
 - [ ] The DP table for ₹600 from {₹500 × 1, ₹200 × 3}
 - [ ] The idempotent `atm_debits` row
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- Trap: the textbook ATM uses a Chain of Responsibility, ₹500 then ₹200 then ₹100. What is wrong with it?
 > Each handler takes as many notes as it can, which is greedy. With limited notes, greedy refuses amounts it could make: ₹600 from one ₹500 and three ₹200 takes the ₹500 and is stuck with ₹100. With unlimited notes of ₹500, ₹200 and ₹100 greedy happens to work, which is why the bug hides. Use bounded change-making (a small DP), or at least backtracking in the chain.
@@ -957,7 +987,7 @@ Redraw it from memory:
 > [!question]- The ATM loses power after the debit and before the dispense. What happens on boot?
 > The ATM writes a journal entry before and after each step. On boot it finds a transaction with "debit ok" but no "dispense ok" and calls `Reverse` with the same transaction ID until the bank confirms. The bank's idempotent reversal makes repeated attempts safe.
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - States: Idle, CardInserted, Authenticated, OutOfService; guard every method on the state.
 - Three wrong PINs retain the card; an injected clock drives the timeout.
@@ -966,7 +996,7 @@ Redraw it from memory:
 - The bank owns money; the ATM owns notes; a journal plus reconciliation closes crash gaps.
 - One mutex covers session, cassette and refill; `int64` paise.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[State Machines in Go]], [[Tic-Tac-Toe and Snake and Ladder]], [[Concurrency for LLD]]
 - **Next:** [[In-memory KV Store with TTL and Transactions]]

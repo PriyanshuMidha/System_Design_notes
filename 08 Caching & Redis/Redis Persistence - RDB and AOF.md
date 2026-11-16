@@ -31,7 +31,41 @@ updated: 2026-11-13
 > - Persistence protects against a restart, not against losing the machine. That needs replicas and off-host backups.
 > - Classic mistake: thinking `appendfsync always` makes Redis a fully durable database. It is durable on that disk, but replication is still asynchronous.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how RDB, AOF and restart work), 4 (settings, measured costs and the Go check), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Redis keeps all its data in memory, and memory is wiped when the machine restarts.
+To survive a restart, Redis can also save its data to disk.
+It has two ways to do that.
+**RDB** takes a full snapshot every few minutes: small and quick to load, but you lose whatever changed since the last snapshot.
+**AOF** writes down every change as it happens, like a diary: you lose at most about one second, but the file is bigger.
+
+```mermaid
+flowchart LR
+    M["data in memory"] --> R["RDB: full photo<br/>every few minutes"]
+    M --> A["AOF: diary of<br/>every change"]
+    R --> D["disk"]
+    A --> D
+```
+
+After a restart, Redis reads the file back into memory and carries on.
+
+```mermaid
+flowchart LR
+    X["server restarts,<br/>memory empty"] --> L["load file from disk"]
+    L --> B["data is back"]
+```
+
+The rest of this note is just these 3 questions:
+1. How much data can you afford to lose: none, a second, or a few minutes?
+2. What does each option cost in disk, speed and memory?
+3. What goes wrong in production, and how do you notice before a restart?
 
 **The problem in one story.**
 Redis keeps everything in RAM, which is fast but forgets everything when the power goes off.
@@ -75,7 +109,7 @@ Where it breaks: a notebook replays changes in order, but Redis also compacts it
 > [!tip] Remember
 > RDB = periodic photo (fast restore, more loss); AOF = write log (less loss, bigger file); use both when data matters.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Redis serves InvoiceOps' dashboard cache, rate-limit counters and a job queue. At 03:00 the host reboots for a kernel patch.
 
@@ -85,7 +119,16 @@ Redis serves InvoiceOps' dashboard cache, rate-limit counters and a job queue. A
 
 Which one you need depends on what the data is. A pure cache can often run with no persistence at all; a queue or a counter store cannot.
 
-## 2. Mental model
+**What a 3 a.m. reboot loses, as a picture.**
+
+```mermaid
+flowchart TD
+    B["reboot"] --> N["no persistence:<br/>everything gone"]
+    B --> R["RDB every 5 min:<br/>last 0-5 min gone"]
+    B --> A["AOF everysec:<br/>about 1 s gone"]
+```
+
+## 2. Mental model 🟢
 
 Two ways to back up a notebook:
 - **RDB** is photocopying the whole notebook every few minutes. Copies are compact and quick to restore, but anything written since the last copy is gone if the notebook burns.
@@ -96,9 +139,11 @@ Terms:
 - **Copy-on-write (COW)**: after a fork, a memory page is only copied when parent or child writes to it.
 - **fsync**: the system call that forces data from the OS page cache onto the physical disk. A `write()` alone only reaches the page cache, which a power loss erases.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### RDB snapshot
+
+**In plain words:** Redis makes a copy of itself (a child process) and that copy writes a full photo of the data to disk, while the main Redis keeps serving.
 
 ```mermaid
 sequenceDiagram
@@ -125,6 +170,8 @@ sequenceDiagram
 
 ### AOF
 
+**In plain words:** every write command is appended to a log file. Now and then Redis rewrites the log as a short summary so it does not grow forever.
+
 ```mermaid
 flowchart LR
     W["Write command<br/>SET, INCR, EXPIRE"] --> X["Execute in memory"]
@@ -143,6 +190,8 @@ flowchart LR
 - **Multi-part AOF (Redis 7.0+).** The AOF is a directory (`appenddirname`, default `appendonlydir`) holding a base file, one or more incremental files, and a manifest that lists them. A rewrite creates a new base and a new incremental file and swaps the manifest, so Redis never has to merge a rewrite buffer into the old file.
 
 ### Restart
+
+**In plain words:** on start-up Redis reloads from disk: the AOF if it is turned on (it is more complete), otherwise the RDB snapshot.
 
 ```mermaid
 stateDiagram-v2
@@ -169,9 +218,11 @@ The safe way is:
 2. Wait until `aof_rewrite_in_progress:0`.
 3. Then update the config file.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** a ready-to-copy settings block for a Redis that holds queues and counters, plus the simpler choice for a pure cache.
 
 A persistence block for a Redis that holds queues and counters, not just cache:
 
@@ -195,6 +246,8 @@ aof-load-truncated yes
 For a pure cache, `save ""` and `appendonly no` are valid choices: a restart costs a cold cache, not lost data.
 
 ### Measured: what each option costs
+
+**In plain words:** real numbers on a laptop: how big the files are, how long saving and loading take, and how much speed each option costs.
 
 Setup: Redis 8.2 (Homebrew build) on an Apple M4 laptop with its internal SSD. 1,000,000 string keys of 100 bytes created with `DEBUG POPULATE 1000000 key 100` (the padding is zeros, so it compresses unusually well). `DEBUG` commands are refused by default since Redis 7.0 (`enable-debug-command no`), so the test server was started with `enable-debug-command local`.
 
@@ -234,6 +287,8 @@ file appendonly.aof.1.incr.aof seq 1 type i startoffset 0
 ```
 
 ### Go: turn `INFO persistence` into alerts
+
+**In plain words:** a small Go health check that reads Redis's own save status and warns you if saving has been failing quietly.
 
 A persistence problem is silent until a restart. This check runs from a health endpoint or a cron job and reports the failures that matter. It compiles, passes `go vet`, and its tests pass with `go test -race` on Go 1.24.
 
@@ -368,7 +423,17 @@ func TestCheck(t *testing.T) {
 }
 ```
 
-## 5. Variants and comparison
+**Which one should I pick?** A quick guide.
+
+```mermaid
+flowchart TD
+    Q{"can you rebuild<br/>the data from the database?"} -- "yes, pure cache" --> N["no persistence<br/>(or RDB only)"]
+    Q -- "no: queues, counters" --> L{"OK to lose minutes?"}
+    L -- "yes" --> R["RDB"]
+    L -- "no" --> A["AOF everysec<br/>(plus RDB)"]
+```
+
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Data lost on crash | Use when | Cost |
 | --- | --- | --- | --- | --- |
@@ -380,7 +445,7 @@ func TestCheck(t *testing.T) {
 | RDB + AOF (hybrid) | AOF with RDB-format base, plus RDB backups | About 1 s | Default for data you care about | Both costs, both benefits |
 | Managed snapshots (ElastiCache, Redis Cloud) | Provider schedules backups | Depends on provider | Backups without running cron | Less control over timing |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Persistence is not high availability.** If the disk or host is gone, so is the data. Run replicas ([[Redis Replication, Sentinel and Cluster]]) and copy RDB files off the host (object storage) on a schedule.
 - **Replication is asynchronous.** A write acknowledged by the primary, fsynced locally, can still be lost if the primary dies and a replica that never received it is promoted. `WAIT` narrows this window but does not make Redis a consensus system.
@@ -388,7 +453,7 @@ func TestCheck(t *testing.T) {
 - **Persistence on a cache can hurt.** Loading a large RDB on start delays readiness (the server answers `LOADING` until done), and fork latency adds p99 spikes. If the cache rebuilds cheaply, skip it.
 - **Do not use Redis as the only copy of money or orders.** Use PostgreSQL as the system of record and Redis as a fast copy.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- ElastiCache and Redis Cloud offer automatic daily snapshots and on-demand backups exported as RDB files.
@@ -403,7 +468,7 @@ func TestCheck(t *testing.T) {
 	- A primary with persistence off restarts empty under a supervisor and its replicas sync the empty dataset → enable persistence on the primary or disable auto-restart, so replicas are not wiped.
 - **What to monitor:** `rdb_last_bgsave_status`, `rdb_last_save_time` (age), `rdb_changes_since_last_save`, `aof_last_write_status`, `aof_last_bgrewrite_status`, `latest_fork_usec`, `rdb_last_cow_size`/`aof_last_cow_size`, `loading`, disk free space, and the age of the last off-host backup.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why fork latency grows with memory.**
 	- `fork()` copies the page tables, not the pages.
@@ -417,7 +482,7 @@ func TestCheck(t *testing.T) {
 - **Persistence and expiry.** Expired keys are not written into a new RDB, and on load a primary skips keys already past their expiry. AOF records `PEXPIREAT` with absolute times, so a replay one hour later sees those keys as already expired.
 - **Comparison with databases.** A database's write-ahead log ([[Storage Engines - B-tree vs LSM and WAL]]) is written before the change is acknowledged, and checkpoints keep it bounded. AOF is similar, but Redis defaults to `everysec` rather than "fsync before acknowledging", trading a bounded loss window for throughput.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- RDB or AOF for a Redis that holds a job queue?
 > AOF with `appendfsync everysec`, plus RDB snapshots for backups. RDB alone can lose minutes of jobs; AOF bounds loss to about a second. If losing even that is unacceptable, the queue belongs in a system with synchronous replication (Kafka with `acks=all`, or the database via an outbox).
@@ -440,7 +505,7 @@ func TestCheck(t *testing.T) {
 > [!question]- Does a pure cache need persistence?
 > Often not. It needs a cold-start plan instead: replicas so a restart is not a full miss, warm-up, and database protection. Persistence on a cache adds fork latency and slows restarts while giving back data that is easy to rebuild.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - RDB: fork + COW snapshot; small, fast to load; lose minutes. Never run `SAVE` on a live server.
 - AOF: log of writes; `everysec` loses about 1 s (2 s worst case) and costs almost nothing; `always` cost 30× here.
@@ -450,7 +515,7 @@ func TestCheck(t *testing.T) {
 - `MISCONF` = failed save with `stop-writes-on-bgsave-error yes`.
 - Persistence is not HA, and replication is async: replicas plus off-host backups.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Redis Fundamentals]], [[Page Cache, File Systems and fsync]], [[Virtual Memory, Paging and the TLB]]
 - **Next:** [[Redis Replication, Sentinel and Cluster]], [[Redis in Production - Memory, Latency, Security]]

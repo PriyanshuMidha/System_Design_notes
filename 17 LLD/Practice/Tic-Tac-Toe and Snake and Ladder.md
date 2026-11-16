@@ -26,7 +26,29 @@ updated: 2026-11-13
 > - The dice is an interface. Production uses a random dice; tests use a scripted dice so every game is deterministic.
 > - Classic mistakes: scanning the whole board after every move, separate `Snake` and `Ladder` classes with duplicated code, calling `rand` directly inside `Play`, and forgetting turn validation.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs) and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+These are two simple board games, used as a warm-up coding round. In tic-tac-toe, two players take turns marking a grid, and three in a row wins. In snake and ladder, players roll a die and move; snakes send you down and ladders send you up. Both share the same shape: players take turns, each move is checked, and after each move you check for a winner. That shared shape becomes one **Game** interface.
+
+```mermaid
+flowchart LR
+    A["Player's turn"] --> B["Check the move"]
+    B --> C["Update board"]
+    C --> D{"Winner?"}
+    D -- "no" --> A
+```
+
+Everything else in this note is just these 3 questions:
+1. How do you model the board and the turns?
+2. How do you check for a win fast?
+3. How do both games share one design?
 
 **The problem in one story.** An interviewer asks you to code tic-tac-toe in 45 minutes, then snake and ladder.
 Both games take turns between players, both end with a winner or a draw, and both need tests.
@@ -67,7 +89,7 @@ It breaks down because a real rulebook does not keep score for you, while the co
 > [!tip] Remember
 > Share the turn and status skeleton; tic-tac-toe keeps signed line counters, snake and ladder keeps one jump map and a fake-able dice.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design two turn-based board games that share a common model:
@@ -90,7 +112,7 @@ Both games must be testable without randomness and safe if moves arrive concurre
 5. Put one mutex per game around every method so a turn is one atomic step.
 6. Test wins in every direction, a draw, bad moves, scripted snakes and ladders, the overshoot, and concurrent moves; then discuss undo, replays and a networked version.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 ### Questions to ask (with assumed answers)
 
@@ -122,7 +144,7 @@ Both games must be testable without randomness and safe if moves arrive concurre
 - An AI opponent (minimax) for tic-tac-toe.
 - Persisting games across restarts (discussed in Step 6).
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 |---|---|
@@ -133,7 +155,7 @@ Both games must be testable without randomness and safe if moves arrive concurre
 
 The hardest use case is the move itself: validate, apply, check for a win, and only then pass the turn, all in one step.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
@@ -149,7 +171,7 @@ The hardest use case is the move itself: validate, apply, check for a win, and o
 
 Modelling insight: **a snake and a ladder are the same entity**, a jump. Separate `Snake` and `Ladder` types add nothing but duplicate code. The **snake and ladder board is not a grid**; it is a size and a map. The **tic-tac-toe board needs the grid** only to reject a taken cell; the win check never reads it.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -208,7 +230,7 @@ classDiagram
 - `SnakeLadder` **depends on** the `Dice` interface, not on `math/rand`.
 - `Jump` is only constructor input; at runtime the game holds the jumps as a map.
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 ```text
 POST /games                     body: {type: "tictactoe", n: 3, players: [...]}   -> 201 {gameId}
@@ -235,9 +257,11 @@ type Game interface {
 
 Why `Move` and `Play` are not on the interface: their inputs differ (a cell versus nothing), and forcing one `Move(any)` signature would push type assertions into every caller. Keep the interface to what is truly shared.
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
 
 In the interview everything lives in memory. For a game server, store games so a restart or a second instance can continue them:
+
+**In plain words:** Tables to save a game and its moves, so a server restart does not lose it.
 
 ```sql
 CREATE TABLE games (
@@ -263,7 +287,7 @@ CREATE TABLE moves (
 - **Two requests for the same turn:** the primary key `(game_id, seq)` lets only one insert of move number `seq` succeed; the loser gets a unique violation and maps it to 409. The `version` column gives the same guarantee on the `games` row (see [[Locking - Optimistic vs Pessimistic]]).
 - Repository interface, if you are asked for one: `GameRepo.Load(id)`, `GameRepo.AppendMove(id, seq, move)` ([[Repository and Unit of Work]]).
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 |---|---|---|
@@ -280,7 +304,7 @@ Patterns not used, and why:
 - No `Cell` or `Board` class for snake and ladder: a cell has no behaviour; a size and a map cover it (YAGNI).
 - No State pattern objects: a game has three statuses with no per-state behaviour beyond "reject moves when over".
 
-## Folder structure
+## Folder structure 🟡
 
 ```text
 games/
@@ -291,7 +315,7 @@ games/
 cmd/play/main.go -> reads moves from stdin, wires a random dice
 ```
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > Aim for about 180 lines in the room.
@@ -323,6 +347,8 @@ Worked example: board of 30, ladder 3 to 22, snake 27 to 5, scripted dice 3, 5, 
 
 > [!tip] Exercise: undo the last tic-tac-toe move
 > Add `Undo()` before reading ahead. Keep a slice of moves `{r, c, playerIdx}`. Undo pops one, clears the cell, subtracts `delta` from the same four counters, decrements `moves`, sets the status back to `InProgress` and the turn back to that player. The counters make undo O(1) too, which is the payoff of storing sums instead of scanning.
+
+**In plain words:** Both games in one package. Start with the turn helper, then tic-tac-toe's move and win check, then snake and ladder.
 
 ```go
 package games
@@ -620,9 +646,11 @@ var (
 )
 ```
 
-## Test cases
+## Test cases 🟡
 
 The tests cover every win direction, the draw, every rejection, a 5 x 5 board, scripted snakes and ladders, the overshoot rule, bad configurations, and two concurrency cases. Run with `go test -race ./...` (Go 1.24.4, all pass).
+
+**In plain words:** Tests for every way to win, bad moves, a bigger board and scripted dice rolls.
 
 ```go
 package games
@@ -823,7 +851,7 @@ func TestSnakeLadderConcurrentPlayers(t *testing.T) {
 - `TestTicTacToeConcurrentSameTurn`: 50 goroutines try to make Alice's first move at the same time; exactly one succeeds and the turn passes to Bob. Without the mutex, several would see the turn as Alice's and the `-race` detector would flag the shared counters.
 - `TestSnakeLadderConcurrentPlayers`: two goroutines, one per player, spin on `Play`; `ErrNotYourTurn` keeps them in order and someone always wins.
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | What happens | How the design handles it |
 |---|---|---|
@@ -848,7 +876,7 @@ func TestSnakeLadderConcurrentPlayers(t *testing.T) {
 - Calling `rand.Intn(6)+1` inside `Play`, which makes the game untestable.
 - Passing the turn before checking for a win, so the winner is reported as the next player.
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 |---|---|
@@ -868,7 +896,7 @@ Tradeoffs chosen:
 - **Validation at construction.** Rejecting chains makes `Play` simpler (at most one jump) and makes infinite loops impossible.
 - **Exact finish.** The most common rule; the overshoot behaviour is the first thing to make a strategy if asked.
 
-## Drawing
+## Drawing 🟢
 
 ```mermaid
 stateDiagram-v2
@@ -903,7 +931,7 @@ Redraw it from memory:
 - [ ] The jump map and the `Dice` interface with the scripted implementation
 - [ ] The status state machine with "win before draw"
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- How do you detect a tic-tac-toe win in O(1) per move?
 > Keep one integer per row, per column, and one for each diagonal. Player one adds +1 and player two adds -1 to the counters of the cell's row and column, and to a diagonal only if the cell is on it.
@@ -932,7 +960,7 @@ Redraw it from memory:
 > [!question]- How would you support "k in a row wins" on a large board?
 > The counters assume a full line. Instead, after each move walk outwards from the new mark in the four directions (horizontal, vertical, two diagonals), counting matching marks on both sides until k or a gap. That is O(k) per move and still avoids scanning the board.
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - Shared skeleton: `Player`, `Status`, a shared `turns` helper held as a field, a small `Game` interface; game-specific move methods stay off the interface.
 - Tic-tac-toe: `rows[n]`, `cols[n]`, `diag`, `anti`; +1 or -1 per player; win when a counter hits ±n; check win before draw.
@@ -942,7 +970,7 @@ Redraw it from memory:
 - Inject the dice; script it in tests.
 - One mutex per game makes a turn atomic; `(game_id, seq)` unique key in a database.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[LLD Interview Method]], [[OOP in Go - Structs, Interfaces, Embedding]], [[Strategy and Template Method]]
 - **Next:** [[ATM]]

@@ -24,7 +24,42 @@ updated: 2026-11-13
 > - Agents fail by looping, picking the wrong tool, or compounding a small early error into a large wrong final action — so every real agent needs stop conditions, least-privilege tools, and human approval before anything with a side effect.
 > - Autonomy is a spectrum, not a binary: a single tool call with a fixed next step is barely an agent; an open-ended loop that plans its own steps is a full agent, and most production systems sit somewhere between.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A plain chatbot gives you one answer and stops. It cannot look things up or take actions on its own.
+
+Some jobs need many steps: find the order, check it, then refund it. Someone has to decide the steps.
+
+If **your code** decides the steps in a fixed order, that is a **workflow**. Think of a recipe you wrote down.
+
+```mermaid
+flowchart LR
+    A["Step 1: classify"] --> B["Step 2: look up"] --> C["Step 3: reply"]
+```
+
+If **the model** decides the next step each time, that is an **agent**. It is a loop: the model asks for a tool, your code runs it, the model looks at the result and decides again.
+
+```mermaid
+flowchart LR
+    M["Model decides"] -- "use a tool" --> T["Your code runs it"]
+    T -- "result" --> M
+    M -- "done" --> D["Final answer"]
+```
+
+Agents are flexible but can loop forever, pick the wrong tool, or do something risky. So you add limits and a human check for risky actions.
+
+The rest of this note is just these 3 questions:
+1. When is a fixed workflow enough, and when do you need an agent?
+2. How does the agent loop work: planning, memory, stopping?
+3. How do you keep an agent safe, cheap and debuggable in production?
+
 
 **The problem in one story.**
 You ask a chatbot: "Find my last three orders and refund the broken one."
@@ -67,7 +102,7 @@ Where it breaks: a real cook remembers the kitchen; the model remembers nothing 
 > [!tip] Remember
 > An agent is just a loop: the model asks for a tool, your code runs it, and you decide when the loop must stop.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A chatbot answers from its context window. It cannot check today's inventory, issue a refund, or look two steps ahead at what a user's question will require.
 
@@ -85,7 +120,7 @@ The concrete cost of getting this wrong is real:
 
 Anthropic's own engineering guidance reports that teams who reach for a full autonomous agent before a simpler workflow would do routinely end up with something slower, more expensive, and harder to debug than the workflow would have been — "use the simplest pattern that solves the problem" is advice from running into this repeatedly, not a hedge.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A workflow is a flowchart you drew. An agent is a `while` loop where the model is the only thing deciding whether to keep going:
 
@@ -102,9 +137,11 @@ while not done:
 
 The analogy that survives an interview follow-up: a workflow is a recipe (fixed steps, you decided the order); an agent is a contractor you handed a goal and a toolbox (they decide which tool to pick up next, and you only intervene when they reach for something risky).
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Whiteboard version
+
+**In plain words:** Ask the model, run the tool it asks for, feed the result back, repeat until it says it is done.
 
 The smallest possible agent loop: one tool, one decision per turn, no planning, no memory beyond the running conversation.
 
@@ -120,6 +157,8 @@ flowchart TD
 This already has one of the three failure modes baked in: nothing stops it from looping forever. The full version below adds the parts a production agent needs: a planning style, a stop condition, memory management, and a human-approval gate before anything risky.
 
 ### Workflows vs. agents: five named patterns
+
+**In plain words:** Most "agents" are really one of five fixed recipes. Pick the simplest recipe that does the job.
 
 Most systems that look like "an agent" from the outside are actually one of these five fixed workflow shapes, not an open-ended loop. Recognizing which one you need (before reaching for a full agent) is most of getting this right.
 
@@ -153,6 +192,8 @@ None of these five has an unbounded number of steps decided by the model mid-run
 
 ### Planning styles: ReAct vs. plan-and-execute
 
+**In plain words:** ReAct is "think one step, do it, look, repeat". Plan-and-execute is "write the full to-do list first, then do it".
+
 Two common ways an agent decides what to do next:
 
 - **ReAct** (Reasoning + Acting): the model interleaves a short reasoning step with each tool call — think, act, observe, think again — deciding the next action only after seeing the previous result. This is what the loop above does natively with tool calling; no special framework is required, since the model's own reasoning before each `tool_use` block already is the "Re" in ReAct.
@@ -160,7 +201,19 @@ Two common ways an agent decides what to do next:
 
 ReAct is simpler to build and is the default for an agent whose tools are each individually safe to call; plan-and-execute earns its extra complexity when you need a reviewable plan before execution starts, or when steps are expensive enough that discovering a bad plan after three tool calls is too costly.
 
+```mermaid
+flowchart LR
+    subgraph ReAct
+      R1["Think"] --> R2["Act"] --> R3["Look at result"] --> R1
+    end
+    subgraph PlanExecute["Plan-and-execute"]
+      P1["Write full plan"] --> P2["Do step 1, 2, 3..."] --> P3["Replan if a step fails"]
+    end
+```
+
 ### Memory: short-term, long-term, and compaction
+
+**In plain words:** The model forgets everything between calls. "Memory" is just your app saving notes and sending them back each time.
 
 "Memory" for an agent is never literally remembered by the model — it is state your application stores and re-sends:
 
@@ -181,6 +234,8 @@ sequenceDiagram
 
 ### Multi-agent: supervisor and handoffs
 
+**In plain words:** Like a team lead who hands work to specialists, instead of one person doing every job.
+
 A single agent with too many tools and too broad a goal tends to confuse itself about which tool applies when. The multi-agent fix splits responsibility:
 
 - **Supervisor (orchestrator)**: one agent holds the overall goal and a small number of "call this other agent" tools, each wrapping a narrower specialist (a research agent, a coding agent, a billing agent). The supervisor decides which specialist to invoke and in what order, the same way it would decide which ordinary tool to call.
@@ -190,7 +245,17 @@ Multi-agent setups cost more (more model calls, more context duplicated across a
 
 Most tasks that look like they need "a team of agents" are better served by one agent with better tools, or by one of the five workflow patterns above.
 
+```mermaid
+flowchart TD
+    S["Supervisor agent<br/>holds the goal"] --> A["Research agent"]
+    S --> B["Billing agent"]
+    S --> C["Coding agent"]
+    B -. "handoff" .-> C
+```
+
 ### Stop conditions
+
+**In plain words:** An agent needs brakes: a max number of steps, a money limit, and a clear "job done" check.
 
 Every agent loop needs more than one way to stop, because relying on "the model decides it's done" alone is not a safety mechanism:
 
@@ -198,7 +263,18 @@ Every agent loop needs more than one way to stop, because relying on "the model 
 - **Token / cost budget**: track cumulative `usage` across every call in the run (see [[LLM Cost, Latency and Caching]]) and stop once a run exceeds its budget, independent of step count — a small number of very large tool results can blow a budget well before hitting a step limit.
 - **Done criteria**: a tool, or a final check, that the model (or your code) can call to assert the task is actually complete against some testable condition, rather than just "the model stopped asking for tools."
 
+```mermaid
+flowchart LR
+    L["Agent loop"] --> Q{"Any brake hit?"}
+    Q -- "max steps" --> X["Stop"]
+    Q -- "budget spent" --> X
+    Q -- "done check passes" --> X
+    Q -- "none" --> L
+```
+
 ### Human-in-the-loop for side effects
+
+**In plain words:** Reading data is safe to do alone. Changing things (refunds, emails) waits for a person to say yes.
 
 A tool that only reads data is safe to auto-execute. A tool that changes state — issuing a refund, sending an email, deleting a record — should pause for a human decision before it runs, not after:
 
@@ -221,6 +297,8 @@ This is the same idea LangGraph's `interrupt()` formalizes as a first-class prim
 
 ### Failure modes
 
+**In plain words:** The four usual ways agents go wrong: going in circles, using the wrong tool, building on an early mistake, and costing too much.
+
 - **Infinite or near-infinite loops**: the model keeps retrying a tool with slightly different input, never concluding. Fixed by max steps and a cost budget, not by hoping the model notices.
 - **Wrong tool chosen**: an ambiguous tool description or overlapping tool names lead the model to call the wrong one (see the tool-design rules in [[Structured Outputs and Tool Calling]]) — this is a prompt/schema-design bug, not a reasoning bug, and the fix is almost always a clearer name or description.
 - **Compounding errors**: an early tool call returns a subtly wrong result (a stale cache, an off-by-one date range) and every subsequent step reasons from that wrong premise, arriving at a confidently wrong final action. Cheap, independent validation at the end of a run catches this better than trying to make every intermediate step perfect.
@@ -233,7 +311,7 @@ The tool-design rules — clear name, a description that says *when* to use it, 
 
 [[Model Context Protocol (MCP)]] standardizes how an agent *discovers and connects to* a set of tools (and resources, and prompts) exposed by a separate server, over a documented transport, instead of every team hand-rolling its own tool-registration format — it is a transport and discovery protocol for tools, not a different kind of tool-calling mechanism.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 A refund agent with one read-only tool (`lookup_order`) that auto-executes, and one side-effecting tool (`issue_refund`) that stops the loop for human approval — implementing the stop-conditions and human-in-the-loop sections above as code.
 
@@ -632,7 +710,9 @@ PASS
 ok  	agent	1.56s
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
+
+**In plain words:** From cheapest and most predictable (one call) to most flexible and costly (full agent).
 
 | Pattern | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -644,14 +724,14 @@ ok  	agent	1.56s
 | Plan-and-execute agent | Model plans multi-step upfront, then executes (with optional replanning) | You want a reviewable plan before any tool runs, or steps are expensive to discover wrong | Extra planning call; less reactive mid-execution than ReAct |
 | Multi-agent (supervisor/handoff) | Several specialist agents, one routing between them | A single agent's tools/goals have become too broad to stay reliable | Most expensive; adds a handoff-boundary failure mode |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - An agent is slower and more expensive than a workflow for the same task whenever the task's steps are actually fixed — you are paying for flexibility you don't need. Default to the simplest pattern in section 5 that solves the problem, and only move up to a full agent when the step sequence genuinely cannot be predicted ahead of time.
 - Non-determinism compounds with every added step: a 95%-reliable single call becomes a far less reliable multi-step loop, because each step's error can feed the next. More steps is not free reliability; it is more surface area for compounding errors.
 - An agent with broad tool access (file system, payment APIs, arbitrary code execution) is a larger attack surface than a single constrained call — every added tool is something prompt injection via tool results can try to misuse.
 - Debuggability drops: a fixed workflow's failure is "step 3 of 5 produced bad output"; an agent's failure can be "it took nine tool calls in an order we didn't predict, and call six's result was wrong," which needs full step-by-step tracing (see [[Distributed Tracing with OpenTelemetry]]) to diagnose at all.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** coding assistants that read a repo, edit files, and run tests in a loop; customer-support agents that look up orders and draft (but do not send) replies for human approval; research agents that search, read, and synthesize across many sources; data-analysis agents that write and run queries iteratively based on what earlier results showed.
 - **Failure modes → fixes:**
@@ -662,14 +742,14 @@ ok  	agent	1.56s
   - Long-running agent crashes partway through → checkpoint state after every step so a run can resume instead of restarting from scratch (see LangGraph's checkpointers in [[LangChain and LangGraph]]).
 - **What to monitor:** task success rate against a held-out set of representative tasks; trajectory checks (did it call the tools you'd expect, in a sane order, not just "did it get the right final answer") — see [[LLM Evals in Production]]; cost and step count per completed task, not just per call; rate of runs hitting MaxSteps or a cost budget (a rising rate signals a tool or prompt problem, not random bad luck); approval-queue depth and time-to-decision for human-in-the-loop gates.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Durability and checkpoints for long runs.** An agent that takes minutes or hours (multi-step research, a long code-edit session) cannot safely hold all its state only in process memory — a crash, a deploy, or a timeout loses the whole run. Persisting the message history and loop position after every step (a checkpoint) lets a run resume exactly where it left off instead of restarting, and is the same mechanism LangGraph exposes natively through its checkpointers and `thread_id` (see [[LangChain and LangGraph]]).
 - **Least-privilege tools and sandboxed execution.** Give an agent the narrowest tool it needs for the task, not a generic "run_shell_command" that happens to cover every case — a tool scoped to `refund(order_id, amount <= $50)` cannot be misused into refunding $50,000 the way a generic "execute this SQL" tool can. Where an agent genuinely needs to run arbitrary code (a coding agent), that execution belongs in an isolated sandbox (its own container or VM, no access to production credentials or the host filesystem) with its own resource and time limits, never in the same process or host as your production backend.
 - **Evaluating agents beyond "did it answer correctly."** A trajectory-level eval checks the sequence of tool calls itself against an expected (or acceptable-set-of) trajectory, which catches an agent that reached the right answer by an unsafe or accidentally-correct path — important because a single successful run proves far less about an agent's reliability than a single successful run proves about a plain LLM call, given how many independent decisions went into it.
 - **Why "an agent that issues refunds safely" is a classic interview design question.** It forces you to state, explicitly: which tools exist and how narrowly scoped each is; where the human-approval boundary sits (every refund? only above some amount? only for a first-time customer?); what the stop conditions are; what gets logged for audit; and what the fallback is when the agent cannot determine eligibility — it should say so and escalate, not guess and act.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's the actual difference between a workflow and an agent?
 > A workflow's control flow (which step runs next) is fixed by code you wrote in advance. An agent's control flow is decided by the model, turn by turn, based on what the previous tool call returned. The same tool-calling mechanism underlies both; the difference is who decides what happens next.
@@ -689,7 +769,7 @@ ok  	agent	1.56s
 > [!question]- When would you reach for a multi-agent (supervisor/handoff) design instead of one agent with more tools?
 > Only once a single agent's tool list and system prompt have actually become unreliable because they cover too many unrelated domains — not as a default "more agents is more capable" assumption. Multi-agent adds real cost (duplicated context across agents) and a new failure mode (information lost at a handoff), so it should be a response to a measured reliability problem, not the starting architecture.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Workflow = you wrote the control flow. Agent = the model decides the control flow, one tool call at a time.
 - Five named workflow patterns: prompt chaining, routing, parallelization, orchestrator–workers, evaluator–optimizer — use the simplest one that fits before reaching for a full agent.
@@ -700,7 +780,7 @@ ok  	agent	1.56s
 - Side-effecting tools require human approval before execution; read-only tools are the only safe default for auto-execution.
 - Tool results are untrusted input (prompt-injection surface), exactly like retrieved RAG context — never instructions to follow just because a tool returned them.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Structured Outputs and Tool Calling]], [[LLM Fundamentals]]
 - **Next:** [[LangChain and LangGraph]], [[Model Context Protocol (MCP)]]

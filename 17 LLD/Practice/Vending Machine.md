@@ -25,7 +25,29 @@ updated: 2026-11-13
 > - Change comes from the real, finite coin counts, so it needs a bounded search, not greedy.
 > - Classic mistake: greedy change-making with a finite coin box, which refuses sales that are possible.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A vending machine takes coins, lets you pick a snack and drops it out with your change. The same button acts differently depending on what the machine is doing. Pressing "cancel" when idle does nothing; after you put coins in, it gives them back. Each of these situations is a **state**, like idle, has money or dispensing. The **State pattern** puts each state's behaviour in its own small piece of code.
+
+```mermaid
+flowchart LR
+    A["Idle"] -- "coin" --> B["Has money"]
+    B -- "pick item" --> C["Dispensing"]
+    C -- "done + change" --> A
+    B -- "cancel" --> A
+```
+
+Everything else in this note is just these 3 questions:
+1. Which states exist, and what does each button do in each?
+2. How do you give exact change?
+3. What happens on a jam?
 
 **The problem in one story.** You put Rs 100 into a vending machine and pick a Rs 40 drink.
 The machine must give the drink and Rs 60 change, or, if it cannot, give all your money back.
@@ -69,7 +91,7 @@ It breaks down because the clerk can improvise change, while the machine must co
 > [!tip] Remember
 > Money stays in escrow until the item drops; any failure refunds it all.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design a vending machine that accepts coins and notes, lets the user choose a product,
@@ -88,7 +110,7 @@ exact change unavailable, and a jammed dispenser.
 5. Write `makeChange` over the real coin counts, then `vend` with the jam refund.
 6. Test each transition, change-making with a finite box, and the jam path.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 ### Questions to ask (with assumed answers)
 
@@ -115,7 +137,7 @@ exact change unavailable, and a jammed dispenser.
 
 - Real hardware drivers (hidden behind `Dispenser`), the card or UPI gateway, receipts, loyalty, multi-item carts.
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 |---|---|
@@ -126,7 +148,7 @@ exact change unavailable, and a jammed dispenser.
 
 The hardest use case is **select in the has-money state**: validate slot, stock and balance, find change, dispense, and roll back on a jam. Code that first.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
@@ -139,7 +161,7 @@ The hardest use case is **select in the has-money state**: validate slot, stock 
 
 Modelling insight: keep **escrow separate from the coin box**. Inserted coins join the box only after a successful dispense, so cancel and jam refunds always work, and change is computed from box plus escrow.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -190,7 +212,7 @@ stateDiagram-v2
 ```
 - Composition from Machine to Slot; exactly one current State, replaced on every transition; the Dispenser is injected, so tests pass a fake that succeeds, jams or blocks.
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 The machine itself is an in-memory component, so its API is the Go method set; `*Machine` in Step 8 implements it:
 
@@ -218,9 +240,11 @@ PUT  /machines/{id}/coins            body: {denomination, count}
 GET  /machines/{id}/slots                                      -> 200 [{code, product, price, qty}]
 ```
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
 
 One machine needs no database; the state lives in the device. A fleet backend keeps inventory and sales:
+
+**In plain words:** Tables a fleet backend would keep for slots and sales. One machine on its own needs no database.
 
 ```sql
 CREATE TABLE slots (
@@ -269,7 +293,7 @@ type SaleRepo interface {
 }
 ```
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 |---|---|---|
@@ -284,7 +308,7 @@ Patterns not used, and why:
 - No Factory for states: states are empty structs, and `hasMoneyState{}` is clearer than a factory (KISS).
 - Change-making is a method, not yet an interface: there is one algorithm today; extract the interface when a second one appears (YAGNI).
 
-## Folder structure
+## Folder structure 🟡
 
 The code in Step 8 is printed as one file so it reads top to bottom. In the round, split it like this:
 
@@ -306,7 +330,7 @@ cmd/demo/main.go  -> builds slots and coin box, injects the real dispenser
 - `service_test.go`: fake dispensers `okMotor`, `jamMotor` and a slow motor.
 - `cmd/demo/main.go`: wiring only.
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > Aim for about 150 lines in the room.
@@ -345,6 +369,8 @@ Two design points are worth saying out loud in the interview:
 8. Success: commit escrow into the coin box, remove the change coins, reset the balance, `Qty--`, and move to the resting state (`idle`, or `out_of_stock` if every slot is empty).
 
 `Buy(ctx, code, coins...)` is the app flow: validate the denominations, lock, reject with `ErrBusy` if a keypad session or a dispense holds money, insert through the state, call `vend`, and on any failure cancel in the same call so the refund comes back with the error.
+
+**In plain words:** The full machine. Start with `Buy`, then the state checks, then the change-making and jam handling.
 
 ```go
 package vending
@@ -694,7 +720,7 @@ func (m *Machine) StateName() string {
 }
 ```
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 |---|---|
@@ -705,6 +731,8 @@ func (m *Machine) StateName() string {
 | `TestConcurrentBuyExactWinners` | 100 concurrent `Buy` calls (retrying on `ErrBusy`) on 5 items: exactly 5 sold, 95 `ErrOutOfStock` |
 
 All five pass under `go test -race` (Go 1.24.4, run three times). The old greedy `makeChange` fails the greedy-trap row with `ErrExactChange`.
+
+**In plain words:** Tests for each state, the full flow, a jam and many buyers racing for the last item.
 
 ```go
 package vending
@@ -887,7 +915,7 @@ func TestConcurrentBuyExactWinners(t *testing.T) {
 }
 ```
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | What happens | How the design handles it |
 |---|---|---|
@@ -915,7 +943,7 @@ func TestConcurrentBuyExactWinners(t *testing.T) {
 - Trusting greedy change-making with a finite coin box.
 - Using `float64` for money; checking stock and decrementing it without a lock.
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 |---|---|
@@ -935,7 +963,7 @@ func TestConcurrentBuyExactWinners(t *testing.T) {
 - **DP instead of greedy.** O(denominations x value x count) with values in GCD units; for change up to Rs 500 that is tiny, and it never refuses change that exists.
 - **`Buy` reuses the State methods instead of a separate code path.** One set of rules serves the keypad and the app.
 
-## Drawing
+## Drawing 🟢
 
 ![[Vending Machine LLD Drawing.excalidraw]]
 
@@ -976,7 +1004,7 @@ sequenceDiagram
     end
 ```
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- Why the State pattern instead of a switch in every method?
 > Five modes times four actions is twenty cases. State types keep each mode's rules together, make invalid actions return typed errors in one obvious place, and let you add a maintenance state without editing every method. A switch is fine for two states.
@@ -993,13 +1021,13 @@ sequenceDiagram
 > [!question]- How does a fleet backend stop an app retry from vending twice?
 > A unique idempotency key on `sales` returns the first result to the retry, and `UPDATE slots SET qty = qty - 1 WHERE ... AND qty > 0` sells the last item to exactly one request.
 
-## Interview explanation
+## Interview explanation 🔴
 
 ```text
 I model the machine with the State pattern: a State interface with Insert, Select and Cancel, implemented by idle, has-money, dispensing, out-of-stock and out-of-service, and the Machine just delegates to the current state under one mutex. Has-money is the important one: it validates slot, stock and balance, then checks that change can be made from the coin box plus escrow before dispensing, so exact-change failures never take the user's money. Change-making is a bounded search over the real coin counts, because greedy fails with a finite box. Inserted coins sit in escrow until the dispenser confirms, so cancel and a jam can always refund them, and a jam moves the machine out of service until an operator repairs it. The mutex is released while the motor turns, and the dispensing state answers every other action with ErrBusy, so two buyers can never get the last item; in a fleet backend I would use a conditional UPDATE with qty greater than zero and an idempotency key on sales. Payment methods, change-making and alerts plug in as Adapter, Strategy and Observer.
 ```
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - `Machine` delegates every action to the current `State`; only state methods, `vend` and the operator actions (`Restock`, `Repair`) assign `m.state`.
 - Validate slot, stock, balance, change, and refuse before the motor turns; escrow until the item drops.
@@ -1008,7 +1036,7 @@ I model the machine with the State pattern: a State interface with Insert, Selec
 - Jam: refund all, stock unchanged, out of service until repair.
 - Fleet: conditional `qty > 0` update plus an idempotency key on sales.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[State Machines in Go]], [[Parking Lot]]
 - **Next:** [[Library Management]]

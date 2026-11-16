@@ -27,7 +27,28 @@ updated: 2026-11-13
 > - A returned copy is held for the first member in the FIFO reservation queue, and that hold expires after N days.
 > - Classic mistake: computing fines as `now.Sub(due) / 24h`, which charges nothing for 23 hours late; count calendar days instead.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A library has books, and each book can have several physical **copies** on the shelf. A member borrows one copy, not the idea of the book. When all copies are out, a member can reserve the book and wait in a queue. When a copy comes back, it is held for the first person in the queue for a few days. Returning late costs a fine. Most of the design is keeping "book" and "copy" separate.
+
+```mermaid
+flowchart LR
+    A["Book: Dune"] --> B["Copy 1: on loan"]
+    A --> C["Copy 2: on shelf"]
+    B -- "returned" --> D["Held for next in queue"]
+```
+
+Everything else in this note is just these 3 questions:
+1. Why split a book from its copies?
+2. How do loans, returns and fines work?
+3. How does the reservation queue hand a copy to the right person?
 
 **The problem in one story.**
 A library owns 3 copies of a popular novel.
@@ -74,7 +95,7 @@ Where it breaks: a restaurant does not fine you for staying late, and a library 
 > [!tip] Remember
 > Search and reserve titles, borrow copies; claim the last copy atomically, serve the queue in order, and count fines in calendar days.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design a library system where members can search books, borrow copies, return copies,
@@ -93,7 +114,7 @@ and handle a member losing a copy.
 5. Add the fine strategy and hold expiry with an injected clock.
 6. Test the last-copy race, the queue order, fines across midnight, and hold expiry.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 ### Questions to ask (with assumed answers)
 
@@ -121,7 +142,7 @@ and handle a member losing a copy.
 
 - Paying fines, member sign-up, several branches, search ranking, renewals (a follow-up).
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 |---|---|
@@ -131,7 +152,7 @@ and handle a member losing a copy.
 
 The hardest use cases are **BorrowBook** (limit, held-copy priority, last-copy race) and **ReturnBook** handing the copy to the queue. Code those first.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
@@ -147,7 +168,7 @@ The hardest use cases are **BorrowBook** (limit, held-copy priority, last-copy r
 
 Modelling insight: **separate Book from BookCopy.** A count field on Book cannot say "copy C1 is held for Asha until Friday" or "copy C2 is lost".
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -187,7 +208,7 @@ stateDiagram-v2
     Lost --> [*]
 ```
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 ```text
 GET    /books?q=kleppmann                     -> 200 [{isbn, title, author, category, available}]
@@ -215,7 +236,9 @@ type LibraryService interface {
 var _ LibraryService = (*Library)(nil) // compile-time check
 ```
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
+
+**In plain words:** Tables for books, copies, loans and reservations. A copy's status column says where it is right now.
 
 ```sql
 CREATE TABLE books (
@@ -316,7 +339,7 @@ type ReservationRepo interface {
 }
 ```
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 |---|---|---|
@@ -326,7 +349,7 @@ type ReservationRepo interface {
 | [[Repository and Unit of Work]] | `BookRepo`, `CopyRepo`, `LoanRepo`, `ReservationRepo` | Swap maps for Postgres without touching rules |
 | Not used | State objects for the copy ([[State Machines in Go]]); [[Chain of Responsibility and Pipelines]] for borrow checks | An enum is enough while no action behaves very differently per state; two borrow rules do not need a chain until unpaid-fine and tier checks arrive |
 
-## Folder structure
+## Folder structure 🟡
 
 The code in Step 8 is printed as one file so it reads top to bottom. In the round, split it like this:
 
@@ -348,7 +371,7 @@ cmd/demo/main.go  -> builds Library with PerDayFine, an email Notifier, the libr
 - `service.go`: the `sync.RWMutex` and every use case.
 - `cmd/demo/main.go`: wiring only.
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > Aim for about 150 lines in the room.
@@ -384,6 +407,8 @@ Three rules worth stating, each with a test:
 `SearchBooks(ctx, query)`: a read lock, a case-insensitive substring match on title, author or category, sorted by title; an empty query is `ErrEmptyQuery`.
 
 `ExpireHolds(ctx)`: lock, run `holdOrShelve` on every copy whose `HeldUntil` has passed, collect the members to notify, unlock, then notify them.
+
+**In plain words:** The full library. Start with `BorrowBook` and `ReturnBook`, then the hold logic that gives a returned copy to the next person.
 
 ```go
 package library
@@ -690,7 +715,7 @@ func (l *Library) dequeue(isbn, memberID string) {
 }
 ```
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 |---|---|
@@ -701,6 +726,8 @@ func (l *Library) dequeue(isbn, memberID string) {
 | `TestConcurrentLastCopy` | 50 goroutines, 1 copy: exactly 1 winner, 49 `ErrNoCopyAvailable` |
 
 All five pass under `go test -race` (Go 1.24.4).
+
+**In plain words:** Tests with a fake clock and a fake notifier to check fines, holds and who gets told a book is ready.
 
 ```go
 package library
@@ -944,7 +971,7 @@ func TestConcurrentLastCopy(t *testing.T) {
 }
 ```
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | What happens | How the design handles it |
 |---|---|---|
@@ -974,7 +1001,7 @@ func TestConcurrentLastCopy(t *testing.T) {
 - Calling notification code while holding the mutex.
 - Forgetting the Lost state, so a lost copy silently counts as available or as an open loan forever.
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 |---|---|
@@ -995,7 +1022,7 @@ func TestConcurrentLastCopy(t *testing.T) {
 - **Lost charge = fine + book price.** One simple rule; a replacement-cost strategy if a library needs it.
 - **Holds expire through a scheduler call, not a timer per copy.** `ExpireHolds` is easy to test with the injected clock; a hold can outlive `HeldUntil` by up to one scheduler interval.
 
-## Drawing
+## Drawing 🟢
 
 ![[Library Management LLD Drawing.excalidraw]]
 
@@ -1030,7 +1057,7 @@ sequenceDiagram
     Note over L: if B never comes, ExpireHolds passes C1 to the next member or the shelf
 ```
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- Why separate Book from BookCopy?
 > You search and reserve a title, but you lend, hold and lose a physical copy. With only a count on Book you cannot say which copy is held for whom, which barcode is lost, or which copy has an open loan.
@@ -1047,13 +1074,13 @@ sequenceDiagram
 > [!question]- What happens to a hold that nobody collects?
 > `ExpireHolds`, run by a scheduler, finds holds past `HeldUntil`, gives the copy to the next waiting member (notifying them after unlocking) or puts it back on the shelf. The member who did not collect loses the turn.
 
-## Interview explanation
+## Interview explanation 🔴
 
 ```text
 The key modelling decision is separating Book, the catalog entry by ISBN that you search and reserve, from BookCopy, the physical item that is borrowed, held or lost. BorrowBook checks the member's limit and picks a copy held for that member or else any available copy, all inside one lock, or in SQL with a SKIP LOCKED claim and a unique index on open loans, so the last copy can never be issued twice. ReturnBook closes the loan and calculates the fine through a FineStrategy, counting calendar days late in the library's time zone; if someone is waiting in the FIFO reservation queue, the copy is held for the queue head, who leaves the queue, and a Notifier is called after releasing the lock. A hold that is not collected within a few days passes to the next member or back to the shelf. A lost copy closes the loan, charges the late fine plus the book price, and moves to a terminal Lost state so it is never lent again. Search is a read-locked substring match on title, author and category, which I would move to a real search index at scale.
 ```
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - Book is the title; BookCopy is the item; Loan links one member to one copy.
 - Borrow: limit, then a copy held for me, else any available copy, all under one lock.
@@ -1062,7 +1089,7 @@ The key modelling decision is separating Book, the catalog entry by ISBN that yo
 - Lost = fine + price, terminal; notify after unlocking (an outbox in production).
 - Postgres: `SKIP LOCKED` claim plus `uq_open_loan`.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Vending Machine]], [[Strategy and Template Method]], [[Observer and Event Bus]]
 - **Next:** [[Meeting Room Scheduler]]

@@ -30,7 +30,39 @@ The code that compiled and passed tests in 2024 now fails to build, or builds bu
 
 A container fixes this by shipping the Go 1.21 toolchain's *output* (a compiled binary) together with the exact base OS layer and libraries it was built and tested against, as one artifact. Nothing about the new engineer's laptop — its Go version, its library versions, its OS — can leak into how that artifact runs.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+"It works on my machine" is the oldest problem in software. Your laptop and the server have different versions of things.
+A **container** packs your app together with everything it needs: code, libraries, settings.
+That pack is called an **image**. The same image runs the same way on your laptop, in testing, and in production.
+
+```mermaid
+flowchart LR
+    L["Laptop"] --> I["One image"]
+    I --> T["Test server"]
+    I --> P["Production"]
+```
+
+A container is not a full virtual computer. It is a normal program that is walled off so it only sees its own files.
+That is why containers start in under a second and you can run dozens on one machine.
+
+```mermaid
+flowchart LR
+    VM["VM: own full OS,<br/>slow to start"] --- CT["Container: shares the host's OS core,<br/>starts in ~1 s"]
+```
+
+The rest of this note is just these 3 questions:
+1. What problem did containers solve?
+2. How is a container different from a virtual machine?
+3. How does one image give the same result everywhere?
+
 
 **The problem in one story.**
 Your Go service runs fine on your laptop.
@@ -74,7 +106,7 @@ Where it breaks: real shipping boxes are fully sealed; software containers share
 > [!tip] Remember
 > A container is just a normal Linux process with a fenced-off view of the machine and its own packaged files.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Before containers, deploying meant replicating a server's exact state by hand or with a configuration-management tool: install this OS package at this version, this language runtime, this library, set these environment variables, open these ports. Four places had to agree: a developer's laptop, a teammate's laptop, the CI runner, and production. They rarely did.
 
@@ -86,7 +118,7 @@ Multiply this by every dependency and every machine, and "works on my machine" b
 
 Containers close the gap by making the environment part of the shipped artifact instead of part of the target machine.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A container is **a normal operating-system process that cannot see most of the machine it is running on.**
 
@@ -103,7 +135,9 @@ Every room (container) shares the same building's foundation, plumbing, and elec
 
 A VM, by contrast, is a separate building with its own foundation, plumbing, and electrical grid — a full guest OS and kernel — which is why it costs far more to stand up and run.
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words:** you write a recipe (Dockerfile), build it into an image, push it to a shared store (registry), and anyone can pull and run the exact same thing.
 
 ```mermaid
 flowchart TB
@@ -137,7 +171,9 @@ flowchart LR
 
 The image is identified by a content hash (its digest), not just a name. Pulling that digest in CI and in production fetches byte-identical layers — there is no "rebuild for production" step where a version could silently drift, because the thing that runs in production is the thing that was already built and tested.
 
-## 4. Worked example
+## 4. Worked example 🟡
+
+**In plain words:** two people, two machines, one image: they get the same app because the image carries everything with it.
 
 Two developers, Priya and Sam, both run the same image, `myapi:3f2a9c` (a digest-pinned tag), on different host operating systems:
 
@@ -158,7 +194,7 @@ This is the concrete payoff: the thing both developers and production run is bit
 
 Label: **estimate** — these vary enormously by image size and VM image, but the order-of-magnitude gap (seconds-to-minutes vs. milliseconds, gigabytes vs. megabytes) is the documented reason containers replaced VMs for per-service isolation.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -167,7 +203,7 @@ Label: **estimate** — these vary enormously by image size and VM image, but th
 | Bare metal / direct install | App runs directly on the host OS, no isolation layer | Maximum performance, single-tenant hardware you fully control | No portability, no isolation between apps on the same host |
 | WebAssembly (Wasm) sandboxes | App compiled to Wasm, run in a Wasm runtime's sandbox | Very fast cold starts for simple, language-agnostic, CPU-bound functions | Smaller ecosystem, limited syscall/network access without extra runtimes |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Containers share the host kernel, so a kernel exploit can, in principle, cross container boundaries — a VM's hardware-enforced isolation is stronger. Multi-tenant, hostile-workload platforms often still put a VM (or a sandboxed runtime like gVisor/Kata) around groups of containers.
 - A container needs a Linux-kernel-compatible host. Running Linux containers on macOS or Windows works only because Docker Desktop first starts a small Linux VM for you — see the deep dive.
@@ -175,7 +211,7 @@ Label: **estimate** — these vary enormously by image size and VM image, but th
 - Containers do not remove the need to manage state. A container's own filesystem is ephemeral; databases and files that must survive a restart still need volumes or external storage (see [[Docker 06 - Volumes and Bind Mounts]]).
 - For a single, trusted, long-lived service with no need for portability or per-service isolation, a container adds an extra build and runtime layer for little benefit — a systemd-managed process can be simpler.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** every major cloud platform (AWS ECS/EKS/Fargate, Google Cloud Run/GKE, Azure Container Apps/AKS) runs workloads as containers; CI systems (GitHub Actions, GitLab CI) run each job inside a container for a clean, reproducible environment.
 - **Failure modes → fixes:**
@@ -184,7 +220,7 @@ Label: **estimate** — these vary enormously by image size and VM image, but th
   - "It worked before I added volumes" → state leaking across container restarts in ways the image didn't account for; isolate what must persist.
 - **What to monitor:** image digest actually deployed (not just the tag), container restart count, OOM-kill count from cgroup limits, and build time as a proxy for how bloated the image has become.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why Docker Desktop needs a VM on macOS and Windows.** Linux containers rely on Linux-specific kernel namespaces and cgroups; macOS's XNU kernel and Windows's NT kernel don't have them. Docker Desktop starts one small Linux VM (historically via HyperKit/Virtualization.framework on macOS, WSL2 on Windows) and runs the actual containers as Linux processes inside that single VM. From the outside this looks like "Docker just works" on a Mac, but there is in fact one VM boot happening — it's just shared across every container you start, not one VM per container, which is why it is still far cheaper than running separate VMs per service.
 
@@ -197,7 +233,7 @@ Label: **estimate** — these vary enormously by image size and VM image, but th
 
 A single-host `docker run` and a Kubernetes-scheduled pod both end up starting the same kind of OCI-compliant isolated process; Kubernetes just decides *which* host and *how many* replicas.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Is a container a lightweight virtual machine?
 > No. A VM virtualizes hardware and boots its own kernel; a container is an isolated process that uses the host's single kernel. That's why containers start in milliseconds and cost megabytes, while VMs take tens of seconds or more and cost gigabytes.
@@ -217,7 +253,7 @@ A single-host `docker run` and a Kubernetes-scheduled pod both end up starting t
 > [!question]- Why do we still need Kubernetes if containers already give us portability?
 > A single host running `docker run` has no answer for "that host just died" or "we need 50 replicas across 10 machines." Kubernetes schedules containers across a fleet, restarts failed ones, and load-balances traffic to them — portability at the single-container level doesn't give you fleet-level scheduling or failover.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - A container is an isolated **process**, not a mini VM: it shares the host's one kernel via namespaces and cgroups.
 - VMs virtualize hardware and boot a guest kernel each; containers don't, which is the whole speed/size difference.

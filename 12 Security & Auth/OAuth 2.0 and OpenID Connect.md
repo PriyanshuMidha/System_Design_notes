@@ -27,7 +27,39 @@ updated: 2026-11-13
 > - OIDC adds the **ID token**: a signed, machine-readable answer to "who is this user", separate from the access token that says "what can this app do".
 > - Classic mistake: treating OAuth as a login protocol. OAuth proves *authorization*; only OIDC's ID token proves *authentication*.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Say a trip app wants to read your Google Calendar.
+The bad way: you give the trip app your Google password. Now it can do anything as you.
+**OAuth** is the good way: Google asks you "allow trip app to read your calendar?", and then gives the app a limited key.
+
+```mermaid
+flowchart LR
+    U["You"] -- "yes, read calendar only" --> G["Google"] -- "limited key" --> T["Trip app"]
+    T -- "key" --> C["Your calendar"]
+```
+
+The app never sees your password, and you can cancel the key any time.
+**OpenID Connect** (OIDC) adds one more thing: a signed note saying who you are. That is what "Login with Google" uses.
+
+```mermaid
+flowchart LR
+    O["OAuth"] --> K["access token: what the app may do"]
+    I["OIDC = OAuth + ID token"] --> W["ID token: who the user is"]
+```
+
+The rest of this note is just these 3 questions:
+1. Who are the players, and what is the main login flow (code + PKCE)?
+2. What are scopes, claims, access tokens and ID tokens?
+3. Which small checks (state, nonce, PKCE) stop real attacks?
+
 
 **The problem in one story.**
 You want a photo-printing site to read your Google Photos.
@@ -73,7 +105,7 @@ Where it breaks: a key card does not prove who you are to anyone else; that iden
 > [!tip] Remember
 > OAuth hands out limited passes (authorization); OpenID Connect adds a signed ID token saying who the user is (authentication).
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 StayPlanner, a trip-planning app, wants a feature: "Import busy slots from your Google Calendar." The crude way to build this is to ask the user for their Google password, store it, and log in as them whenever the import job runs.
 
@@ -85,7 +117,7 @@ That design has three concrete problems:
 
 OAuth 2.0 replaces "hand over the password" with "redirect the user to Google, let them approve a specific, named scope (`calendar.readonly`), and give StayPlanner a token that only does that, only for a while, and that Google can revoke on its own without touching the user's password."
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a **valet key**: a car key that starts the engine and goes 20 mph but cannot open the trunk or glovebox. The valet never gets the owner's real key, the car dealer (not the valet) decided exactly what the valet key can do, and the owner can deactivate it without re-cutting their own key.
 
@@ -95,9 +127,11 @@ Think of a **valet key**: a car key that starts the engine and goes 20 mph but c
 - The **car** is the resource server (Google Calendar's API).
 - The **valet key itself** is the access token: limited, time-boxed, revocable, and never the owner's real credential.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Roles and channels
+
+**In plain words:** four players: you (owner), the app asking, the login server (Google), and the place holding your data. "Front channel" means through your browser; "back channel" means server to server.
 
 | Role | Who it is in the example | Job |
 | --- | --- | --- |
@@ -112,6 +146,8 @@ Two channels matter throughout OAuth:
 - **Back channel**: a direct HTTPS call from the client's server straight to the authorization server, never touching the browser. The code-for-token exchange happens here.
 
 ### Authorization Code + PKCE, step by step
+
+**In plain words:** the browser carries a short one-time code back to the app. The app swaps that code for tokens, and proves it is the same app that started the flow.
 
 This is the flow OAuth 2.1 and RFC 9700 require for **every** client, confidential or public:
 
@@ -139,6 +175,8 @@ Step 2 and step 4–5 are front channel: the authorization request and the code 
 
 ### The attack PKCE stops
 
+**In plain words:** if someone steals the one-time code on the way back, it is useless to them. Only the app holding the matching secret can cash it in.
+
 Without PKCE, step 7 would only need the `code`. Anything that can observe the front channel — a logging proxy, a malicious app registered with the same custom URL scheme on mobile, a referrer leak — can steal the code and redeem it itself:
 
 ```mermaid
@@ -162,10 +200,18 @@ The attacker has the code but not the `code_verifier`, which never left the legi
 
 ### Confidential vs. public clients
 
+```mermaid
+flowchart LR
+    S["Server app: can keep a secret"] --> C["Confidential client"]
+    B["Browser / mobile app: can't keep a secret"] --> P["Public client: uses PKCE only"]
+```
+
 - **Confidential client**: a server-side app (StayPlanner's backend) that can hold a `client_secret` safely. It authenticates itself at the token endpoint with that secret.
 - **Public client**: a mobile app or single-page app (SPA) that ships its binary or JS to the user's device. Anything embedded in it can be extracted, so it has **no** usable secret. PKCE was built for this case and, since RFC 9700, is required for confidential clients too, as defense in depth.
 
 ### Scopes vs. claims
+
+**In plain words:** scopes are what the app asks to do ("read calendar"). Claims are facts inside a token ("user is ana@x.com").
 
 These are two different lists and the most common point of confusion:
 
@@ -173,6 +219,8 @@ These are two different lists and the most common point of confusion:
 - **Claims** are facts about the authenticated user, carried *inside* the ID token (and sometimes the userinfo endpoint): `sub`, `email`, `email_verified`, `name`. A scope like `openid email` tells the authorization server which claims to *include*; the claims themselves are the payload, not the request.
 
 ### ID token vs. access token
+
+**In plain words:** the ID token is for the app to learn who you are. The access token is for calling an API. Never mix them up.
 
 | | Access token | ID token |
 | --- | --- | --- |
@@ -190,6 +238,8 @@ A client should **never** send the ID token to an API as a bearer credential, an
 - **`nonce`**: a value OIDC carries inside the ID token itself. The client generates it, sends it in the authorization request, and checks it against the `nonce` claim in the returned ID token. It stops replay of an old, previously-issued ID token being submitted as if it were fresh.
 
 ### Other grants
+
+**In plain words:** other flows for special cases: machine-to-machine, TV-style devices. The old password and implicit flows are retired.
 
 ```mermaid
 flowchart TD
@@ -209,7 +259,7 @@ flowchart TD
 - **Refresh token**: redeems a long-lived refresh token for a new access token without the user re-authenticating. Covered in depth, including rotation and reuse detection, in [[Access and Refresh Tokens]].
 - **Deprecated: Implicit grant** returned the access token directly in the redirect URL fragment, with no code and no back channel, so the token itself traveled the front channel and leaked into browser history, referrer headers, and server logs. **Deprecated: ROPC** (Resource Owner Password Credentials) had the client collect the user's password and POST it directly, defeating the entire point of OAuth. OAuth 2.1 and RFC 9700 remove the implicit grant and disallow ROPC for new clients: use Authorization Code + PKCE for anything with a browser, and the device grant for anything without one.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -363,7 +413,7 @@ When step 11's resource call is instead `GET /userinfo` (an OIDC login, not a Ca
 
 Store `(issuer, sub) → local_user_id` and look up by that pair on every login.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Grant | How it works | Use when | Cost / risk |
 | --- | --- | --- | --- |
@@ -377,13 +427,13 @@ Store `(issuer, sub) → local_user_id` and look up by that pair on every login.
 > [!warning] Interview trap
 > "OAuth is how Google login works" is half right and the half that is wrong matters. OAuth alone only proves the client has limited access to an API. The part that proves who logged in — the ID token, the `nonce`, the `/userinfo` endpoint — is OpenID Connect, a separate specification layered on top.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - A first-party monolith with its own username/password login and server-side sessions does not need OAuth internally — it adds a redirect hop, a second server to trust, and a consent screen for a problem (your own login) that a signed session cookie already solves. Reach for [[Sessions and Cookies]] there, and for OAuth only when a *separate* service or a *third-party* identity provider is genuinely involved.
 - Device Authorization trades user convenience for server load: the device polls the token endpoint every few seconds until the user approves, so a flood of unapproved TV logins is a real capacity planning input.
 - Validating access tokens by introspection (RFC 7662) adds a network round trip to the authorization server on every request unless the result is cached; a local JWT access token avoids that call but makes revocation harder (see [[JWT - Structure, Validation and Pitfalls]]).
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
   - "Login with Google / GitHub / Microsoft" buttons are OIDC, using Authorization Code + PKCE.
@@ -401,7 +451,7 @@ Store `(issuer, sub) → local_user_id` and look up by that pair on every login.
   - Refresh-token redemption rate and reuse-detection triggers (see [[Access and Refresh Tokens]]).
   - Time between `/authorize` and `/token` calls for a given `state` — an unusually long gap suggests the code sat somewhere it should not have.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Discovery and JWKS.** OIDC providers publish a discovery document at `/.well-known/openid-configuration` listing their endpoints and signing key set (JWKS) location. Clients fetch and cache the JWKS, keyed by `kid`, and refresh it (with a cache-miss retry) when they see an unknown `kid` — this is how key rotation happens without a deploy on the client side. See [[JWT - Structure, Validation and Pitfalls]] for the signature-verification mechanics this feeds.
 - **Refresh token rotation and reuse detection.** Each refresh exchange returns a *new* refresh token and invalidates the old one. If the old (already-rotated) refresh token is ever presented again, that is a signal it was stolen and used by someone else before the legitimate client's next refresh — the authorization server should revoke the entire token family, not just the one token.
@@ -420,7 +470,7 @@ stateDiagram-v2
 - **Confidential client authentication at the token endpoint.** A plain `client_secret` is a long-lived shared secret that can leak from config or logs. RFC 9700 recommends `private_key_jwt`: the client signs a short-lived JWT assertion with its own private key instead of sending a secret at all — the same client-assertion mechanism covered in [[Service-to-Service Auth - API Keys, HMAC, mTLS]].
 - **Go libraries for this in practice.** `golang.org/x/oauth2` implements the client side of the standard grants (code exchange, token refresh); `coreos/go-oidc` adds OIDC discovery, JWKS caching, and ID token verification on top of it. The hand-written checks in this note's worked example are what those libraries do internally — useful to know, rarely worth reimplementing in a production client.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Is OAuth a login protocol?
 > No. OAuth proves a client has limited, scoped access to a resource — it says nothing about who the user is. OpenID Connect adds that: the ID token, signed by the authorization server, is the piece that proves authentication. "Login with Google" is OIDC, not bare OAuth.
@@ -446,7 +496,7 @@ stateDiagram-v2
 > [!question]- Trap: your SPA needs to call a third-party API directly from the browser. Where do you store the access token?
 > Nowhere in the browser, if you can avoid it. Since the implicit grant is gone, the recommended shape is a Backend-for-Frontend: the SPA talks to its own backend over an HttpOnly session cookie, and that backend holds the real OAuth tokens server-side and proxies the calls. Storing tokens in `localStorage` or JS-reachable memory exposes them to any XSS on the page.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - OAuth = scoped, revocable, expiring access, not a password hand-off; OIDC = the identity layer (ID token) on top of it.
 - Authorization Code + PKCE is the one flow to use for anything with a browser, confidential or public client.

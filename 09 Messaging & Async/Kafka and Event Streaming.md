@@ -25,7 +25,43 @@ updated: 2026-11-13
 > - Durability comes from replication: `replication.factor=3`, `acks=all`, `min.insync.replicas=2`.
 > - Classic mistake: thinking more consumers always means more speed. Consumers beyond the partition count sit idle.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (producing, consuming, storage, replication), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Kafka is a giant shared notebook that only grows at the bottom.
+Senders write events at the end, like "rider 7 is at this spot".
+Readers read from top to bottom, each at their own speed.
+Reading does not erase anything, so many teams can read the same events.
+Each reader keeps a bookmark, called an **offset**: "I read up to line 1,042".
+To handle huge traffic, the notebook is split into many side-by-side pages, called **partitions**.
+Old lines are torn out after a while, by default after 7 days.
+
+```mermaid
+flowchart LR
+    P["Senders"] -- "add at the end" --> L[("Notebook: line 0, 1, 2 ... 1,042")]
+    L --> A["Team A, bookmark at 1,042"]
+    L --> B["Team B, bookmark at 980"]
+```
+
+```mermaid
+flowchart LR
+    P["Senders"] --> P0[("Page 0")]
+    P --> P1[("Page 1")]
+    P --> P2[("Page 2")]
+    P0 & P1 & P2 --> G["Readers split the pages"]
+```
+
+The rest of this note is just these 3 questions:
+1. Which page does each event go to, and why does that matter for order?
+2. How do readers share pages and remember where they stopped?
+3. How does Kafka keep data safe when a server dies?
+
 
 **The problem in one story.**
 A taxi app records every ride: where it started, where it ended, how much it cost.
@@ -71,7 +107,7 @@ Where it breaks: a real book has one page order, but Kafka has many pages (parti
 > [!tip] Remember
 > Kafka is a durable, partitioned log: writers append, readers keep their own offset, and order holds only within a partition.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A ride-hailing app emits 50,000 location and trip events per second. Five teams need them: pricing (real time), fraud (real time), the data warehouse (hourly), a machine-learning feature store, and a new team that wants last week's data to backfill a model.
 
@@ -86,7 +122,18 @@ A log fixes all three:
 - Every team is a separate **consumer group** with its own position in the log.
 - Events stay for the retention period (7 days by default, `retention.ms=604800000`), so the new team starts from an offset of a week ago.
 
-## 2. Mental model
+**One stream, five readers, no extra copies:**
+
+```mermaid
+flowchart LR
+    P["App: ~50,000 events/s"] --> K[("Kafka topic<br/>kept 7 days")]
+    K --> A["Pricing (live)"]
+    K --> B["Fraud (live)"]
+    K --> C["Warehouse (hourly)"]
+    K --> D["New team: starts from last week"]
+```
+
+## 2. Mental model 🟢
 
 Think of a **ledger book with several numbered pages running in parallel** (the partitions).
 
@@ -104,7 +151,19 @@ Terms used below:
 - **Consumer group:** a set of consumers sharing one bookmark per partition.
 - **Lag:** the log end offset minus the group's committed offset: how far behind the group is.
 
-## 3. How it works
+**Bookmarks per team, per page:**
+
+```mermaid
+flowchart TB
+    subgraph Topic["topic orders"]
+        P0["Page 0: offsets 0..500"]
+        P1["Page 1: offsets 0..430"]
+    end
+    G1["Group 'billing'<br/>P0 at 500, P1 at 430"] --- Topic
+    G2["Group 'analytics'<br/>P0 at 120, P1 at 90 (lag)"] --- Topic
+```
+
+## 3. How it works 🟡
 
 ```mermaid
 flowchart LR
@@ -132,6 +191,8 @@ flowchart LR
 
 ### Producing
 
+**In plain words:** the sender picks a page (partition), packs events into small bundles, and waits for enough servers to say "saved" before it calls the write done.
+
 1. The producer picks a partition. With a key, the Java client's default is `toPositive(murmur2(keyBytes)) % numPartitions`, so the same key always goes to the same partition while the partition count stays the same.
    Without a key, since Kafka 3.3 (KIP-794) the client fills a batch for one partition and then moves on ("uniform sticky"), which gives bigger batches than round-robin.
 2. Records are grouped into **batches** per partition. `batch.size` (default 16,384 bytes) caps a batch; `linger.ms` lets the producer wait a few milliseconds to fill it. Batches are compressed as a unit (`compression.type` = `lz4`, `zstd`, `snappy` or `gzip`).
@@ -143,6 +204,8 @@ flowchart LR
 5. **Idempotent producer** (`enable.idempotence=true`, default since Kafka 3.0 together with `acks=all`): the broker tags each producer with an id and each batch with a sequence number per partition, and drops a retried batch it already has. Retries no longer create duplicates or reorder records.
 
 ### Consuming
+
+**In plain words:** readers in one team split the pages between them, read a batch, do the work, then move their bookmark forward.
 
 A consumer group's members agree on who reads which partitions (**assignment**), then loop: `poll()` a batch, process it, **commit** the offset of the next record to read. Committed offsets are stored in the internal topic `__consumer_offsets`.
 
@@ -177,6 +240,8 @@ sequenceDiagram
 
 ### Storage and retention
 
+**In plain words:** each page is stored as a set of files on disk; old files are thrown away after a set time, or squeezed so only the newest value per key stays.
+
 - A partition is a directory of **segments** (`log.segment.bytes`, default 1 GiB) plus offset and time index files. Only the active segment is written; old segments are deleted or compacted whole.
 - **Delete retention:** remove segments older than `retention.ms` or beyond `retention.bytes`.
 - **Log compaction** (`cleanup.policy=compact`): keep at least the latest record for each key. A record with a null value (a **tombstone**) deletes the key after `delete.retention.ms` (default 24 h). Used for changelogs and "current state of each entity" topics, including `__consumer_offsets` itself.
@@ -184,14 +249,18 @@ sequenceDiagram
 
 ### Replication and the controller
 
+**In plain words:** every page is copied to a few servers; one is the boss that takes writes, and if it dies, a fully caught-up copy takes over.
+
 - The leader tracks the **ISR**. A follower that falls behind for longer than `replica.lag.time.max.ms` (default 30 s) is removed from it.
 - A record is **committed** once every ISR member has it; consumers only see records up to that point (the **high watermark**).
 - If the leader dies, the controller picks a new leader from the ISR. `unclean.leader.election.enable=false` (the default) refuses to elect an out-of-sync replica, choosing unavailability over data loss.
 - **KRaft:** cluster metadata (topics, partitions, leaders, ISR) lives in a Raft-replicated metadata log run by controller nodes (see [[Consensus - Raft and Paxos]]). Kafka 4.0 removed ZooKeeper support entirely.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** one worked case on a napkin: which page a key goes to, how many copies exist, and how many must agree before a write counts.
 
 ```text
 topic orders: 6 partitions, RF=3, min.insync.replicas=2, producer acks=all
@@ -208,6 +277,8 @@ broker 3 also dies: ISR = 1 < 2 -> producers get NotEnoughReplicas, reads still 
 The partition numbers above are real: they come from the Go `PartitionFor` below, which reproduces Kafka's partitioner bit for bit.
 
 ### Go: Kafka's partitioner and a committing consumer
+
+**In plain words:** a Go model, not a real client: it shows how a key picks a page, how pages are split between readers, and why a crash after work but before saving the bookmark means a repeat.
 
 This is an in-memory model, not a client. It shows three things you can test without a broker: the exact key-to-partition function, a range assignment, and how committing after processing gives redelivery.
 
@@ -484,6 +555,8 @@ func TestTwoGroupsReadIndependently(t *testing.T) {
 
 ### In a real cluster
 
+**In plain words:** these are the real command-line calls to create a topic and check how far behind each reader team is.
+
 Creating the topic and checking lag looks like this (representative output, Kafka 4.0 CLI tools; no broker was run for this note):
 
 ```bash
@@ -501,7 +574,7 @@ billing  orders  2          977             1402            425   b2-91aa...    
 
 Partition 2's lag of 425 while the others are near zero points to a slow consumer `b2` or a hot key on partition 2, not to a cluster-wide problem.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | System | Model | Ordering | Retention / replay | Best fit | Cost |
 | --- | --- | --- | --- | --- | --- |
@@ -512,7 +585,7 @@ Partition 2's lag of 425 while the others are near zero points to a slow consume
 | Redis Streams | Log in one Redis key, consumer groups with pending lists | Per stream | Trimmed with `MAXLEN` / `MINID`; memory-bound | Small volumes, already running Redis; see [[Redis as a Queue - Lists, Streams and Pub-Sub]] | Memory cost, single-key throughput limits |
 | RabbitMQ / SQS | Queues: delete on ack | Per queue (best effort) or FIFO groups | No replay after ack | Task distribution, per-message routing; see [[Queues vs Streams and Broker Comparison]] | No history; fan-out needs copies |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Parallelism is capped by partitions.** A group with 6 partitions uses at most 6 consumers. Raising the partition count later remaps keys (74.9% in the measurement above for 6 → 8).
 - **Head-of-line blocking.** One slow or failing record blocks every later record in its partition for that group. There is no per-message ack or redelivery delay as in SQS; you build retries with retry topics and a dead letter topic (see [[Dead Letter Queues and Poison Messages]]).
@@ -523,7 +596,7 @@ Partition 2's lag of 425 while the others are near zero points to a slow consume
 	- Request/response between two services: use HTTP or gRPC.
 	- You need per-message priority or routing rules: RabbitMQ or SQS fit better.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Kafka was built at LinkedIn and open-sourced in 2011. Common uses: CDC pipelines with Debezium ([[Transactional Outbox and CDC]]), log and metrics transport ([[Case Study - Metrics and Logging Platform]]), event-driven microservices, and stream processing with Kafka Streams or Flink ([[Stream Processing Basics]]).
 - **Failure modes → fixes:**
@@ -540,7 +613,7 @@ Partition 2's lag of 425 while the others are near zero points to a slow consume
 	- Rebalance count and duration per group.
 	- Disk usage per broker against retention.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why it is fast:** sequential appends to segment files, the OS page cache instead of an in-process cache, batching and compression end to end (the broker stores the producer's compressed batch as is), and zero-copy transfer (`sendfile`) from page cache to socket for plaintext connections. TLS disables zero-copy because the bytes must be encrypted in user space.
 - **High watermark vs log end offset.** The leader's log may hold records not yet copied to all ISR members. Consumers read only up to the high watermark, so they never see a record that a leader failover could lose.
@@ -551,7 +624,16 @@ Partition 2's lag of 425 while the others are near zero points to a slow consume
 - **Consumer offset semantics.** The committed offset is the *next* offset to read, not the last processed one, so a manual commit must send `last + 1`. Committing `last` is a classic off-by-one: after a restart the last record is processed again.
 - **Compaction is not instant.** The cleaner only compacts closed segments, and the head of the log can hold several versions of a key. A compacted topic gives "at least the latest value per key", never "only".
 
-## 9. Interview questions
+**Readers only see what is safe** (the high watermark):
+
+```mermaid
+flowchart LR
+    L["Leader log: 0..105"] --> HW["Copied to all in-sync followers: 0..100<br/>(high watermark = 100)"]
+    HW --> C["Consumers read only up to 100"]
+    L --> N["101..105 not shown yet:<br/>could be lost on failover"]
+```
+
+## 9. Interview questions 🔴
 
 > [!question]- How does Kafka guarantee ordering, and where does it stop?
 > Records with the same key go to the same partition, and a partition is an append-only log read in offset order by one consumer of a group. So order holds per partition (per key), never across partitions. Changing the partition count, or retries without the idempotent producer, can break it.
@@ -574,7 +656,7 @@ Partition 2's lag of 425 while the others are near zero points to a slow consume
 > [!question]- What changed with KRaft?
 > Kafka stores its own metadata in a Raft-replicated log on controller nodes instead of ZooKeeper. It means one system to run, faster controller failover and support for many more partitions. Kafka 4.0 removed ZooKeeper mode entirely.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Topic = partitions; partition = append-only log; offset = position; order only per partition.
 - Key → `murmur2(key) % partitions`; changing the partition count remaps most keys.

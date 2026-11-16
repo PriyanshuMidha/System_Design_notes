@@ -29,7 +29,37 @@ updated: 2026-11-13
 > - Aurora's storage is the shared, replicated layer (6 copies, 3 AZs) underneath both the writer and all readers, so promoting a reader to writer is fast because the data is already there.
 > - RDS Proxy sits between your app and the database to pool connections and bridge app traffic across a failover without every connection needing its own retry logic.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Running your own database server means patching, backups and fixing it at 3 am.
+**RDS** is AWS running the database for you (Postgres, MySQL and more). You still design tables and queries.
+**Aurora** is AWS's own faster version, where the data storage is shared across buildings.
+
+```mermaid
+flowchart LR
+    Y["You: schema, queries, indexes"] --- A["AWS: patches, backups, failover"]
+```
+
+For safety you keep a standby copy in another building (AZ). If the main one dies, AWS switches to the standby in about a minute.
+Your app must handle that minute by retrying its connection.
+
+```mermaid
+flowchart LR
+    P["Primary dies"] --> F["AWS promotes standby<br/>(~1 min)"] --> D["Same DNS name now points to new primary"] --> R["App reconnects"]
+```
+
+The rest of this note is just these 3 questions:
+1. What setups exist (Multi-AZ, read replicas, Aurora)?
+2. What does a failover look like from your app's side?
+3. How do backups, proxies, security and upgrades work?
+
 
 **The problem in one story.**
 Your app keeps orders in a Postgres database on one server.
@@ -74,7 +104,7 @@ Where it breaks: a backup cashier takes over in seconds, but RDS failover takes 
 > [!tip] Remember
 > Standby = safety for the same data; replicas = more reads; Aurora = shared storage under both.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Running Postgres yourself means you own OS patching, Postgres minor-version upgrades, taking and testing backups, provisioning storage before you run out, and building a failover procedure before the primary actually dies at 3 a.m.
 
@@ -85,7 +115,7 @@ Most of that work is identical across every team that runs Postgres, so RDS and 
 - Aurora charges separately for compute (per-instance, similar to RDS) and for storage/IO (storage ~$0.10/GB-month, plus per-million-IO charges), which can cost more than provisioned RDS storage on IO-heavy workloads but removes the need to provision storage size and IOPS up front.
 - RDS Multi-AZ failover is **typically 60–120 seconds**, measured as the window between the standby detecting the primary is unreachable and the endpoint DNS resolving to the new primary; Aurora failover is typically **under 30 seconds**, because Aurora replicas share storage with the writer and need only be promoted, not rehydrated.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 ```mermaid
 flowchart TB
@@ -110,15 +140,19 @@ flowchart TB
 - The **synchronous standby** exists purely so a write is not considered durable until it's also on a second AZ; it is otherwise invisible to the app and never serves a query.
 - **Read replicas** are a separate, asynchronous copy for scaling reads; because replication is async, a replica can be seconds behind the primary — a classic bug is reading your own just-written row from a replica and not seeing it yet.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Multi-AZ deployment types
+
+**In plain words:** one standby that only waits, or a setup with two standbys that can also serve reads. Both are for surviving a building outage.
 
 - **Multi-AZ DB instance** (the classic model): one primary, one synchronous standby in another AZ, standby is not readable. On failure, RDS promotes the standby, and the writer endpoint's CNAME is updated to point at it.
 - **Multi-AZ DB cluster** (newer, for MySQL/Postgres): one writer plus **two readable standbys**, replicated with a quorum-based protocol instead of plain synchronous replication, giving both faster failover (typically under 35 seconds) and usable read capacity from the standbys — a middle ground between the classic Multi-AZ instance and Aurora.
 - **Read replicas**: asynchronous, can be cross-region, can be promoted to a fully standalone primary (breaking replication permanently) but are not an automatic-failover target the way a Multi-AZ standby is.
 
 ### Failover, from the app's point of view
+
+**In plain words:** for about a minute, connections fail. Then the same hostname points to the new primary. Retry with backoff and you're fine.
 
 ```mermaid
 sequenceDiagram
@@ -147,6 +181,8 @@ A driver that silently keeps retrying the *same* dead TCP connection, or that pi
 
 ### Aurora
 
+**In plain words:** all Aurora servers share one storage layer spread over 3 AZs. That makes replicas cheap and failover fast.
+
 Aurora decouples compute from storage: all instances (one writer, up to 15 readers) share a single **distributed storage volume replicated 6 ways across 3 AZs**, with writes considered durable once **4 of 6** copies acknowledge.
 
 Because every reader already has (nearly) the same data as the writer through this shared storage layer rather than through row-by-row replication, promoting a reader to writer on failover means repointing the writer role, not rehydrating a standby from a replication stream — which is why Aurora failover is typically faster than classic RDS Multi-AZ.
@@ -155,6 +191,8 @@ Aurora also auto-heals corrupted storage segments in the background using the ot
 
 ### RDS Proxy
 
+**In plain words:** a middleman that keeps a pool of database connections, so thousands of app connections don't swamp the database.
+
 RDS Proxy sits between your app and the database as a connection pooler and a failover-aware layer:
 
 - Pools and multiplexes many app-side connections onto fewer actual database connections, so a fleet of Lambda functions or short-lived containers doesn't each open its own connection and exhaust the database's `max_connections`.
@@ -162,6 +200,8 @@ RDS Proxy sits between your app and the database as a connection pooler and a fa
 - Required for IAM database authentication at scale in some setups, since it can cache and refresh the short-lived IAM auth tokens on the app's behalf.
 
 ### Backups, PITR, and storage
+
+**In plain words:** AWS keeps daily snapshots plus a running log, so you can restore to almost any second in the last few days.
 
 - **Automated backups** take a daily snapshot plus continuous transaction log shipping, giving **point-in-time recovery** to any second within the retention window (1–35 days) — PITR always restores to a **new** instance, it does not roll back the existing one in place.
 - **Manual snapshots** persist until you delete them, independent of the retention window, and can be shared or copied cross-region.
@@ -177,11 +217,13 @@ RDS Proxy sits between your app and the database as a connection pooler and a fa
 
 ### Blue/green deployments
 
+**In plain words:** AWS builds a full copy, you upgrade the copy, then switch over in about a minute.
+
 For major version upgrades or risky schema changes, **RDS Blue/Green Deployments** create a full replica environment ("green") kept in sync with production ("blue") via logical replication, let you test and validate it in isolation, then do a near-zero-downtime switchover that promotes green and repoints the endpoint — safer than an in-place major-version upgrade because you can abandon the green environment if validation fails, with blue completely untouched.
 
 This is a deploy-level strategy; see [[Rollback and Safe Migrations]] for how the schema-migration side of that switchover should be sequenced.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -298,7 +340,7 @@ The backoff schedule (50/100/200/400ms, each randomized to roughly half to one-a
 
 A fixed 1-second retry loop instead of exponential backoff would have taken a similar number of attempts here but would hammer the new primary with a synchronized retry burst if many app instances failed over at once; the jitter spreads that burst out instead.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -309,7 +351,7 @@ A fixed 1-second retry loop instead of exponential backoff would have taken a si
 | Aurora | Shared 6-way replicated storage, writer + up to 15 readers | High write throughput, fast failover, read scaling to many replicas | Compute + storage/IO priced separately |
 | RDS Proxy in front of any of the above | Connection pooling + failover-aware routing | Many short-lived app connections (Lambda, containers), smoothing failovers | Hourly charge per vCPU of the underlying instance |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Multi-AZ (classic) doubles compute cost for an invisible standby that serves zero reads — if you need read scaling, that cost is better spent on read replicas or a Multi-AZ DB cluster instead.
 - Read replica lag means "read my own write" can silently fail if the app reads right after writing; route read-after-write-sensitive queries to the primary, or poll the replica's replication lag metric before trusting it for that request.
@@ -317,7 +359,7 @@ A fixed 1-second retry loop instead of exponential backoff would have taken a si
 - No host access means no custom kernel tuning, no installing arbitrary extensions beyond what RDS/Aurora whitelists, and no SSH-based debugging — a workload that genuinely needs that control belongs on self-managed EC2, not RDS.
 - Encryption must be chosen at creation — if you forgot it, there is no in-place toggle, only snapshot-copy-restore, which has its own downtime/cutover planning.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** most AWS-hosted backends that chose managed Postgres/MySQL run either Aurora (when write throughput or read-replica count matters) or Multi-AZ RDS (simpler topologies, predictable moderate load); RDS Proxy is common wherever the compute tier is Lambda or a frequently-scaling container fleet.
 - **Failure modes → fixes:**
@@ -327,7 +369,7 @@ A fixed 1-second retry loop instead of exponential backoff would have taken a si
   - Unencrypted instance discovered in production → plan a maintenance window for snapshot-copy-restore-to-encrypted; it cannot be toggled live.
 - **What to monitor:** `CPUUtilization`, `FreeableMemory`, `DatabaseConnections` vs `max_connections`, `ReplicaLag`, `DiskQueueDepth`/`ReadLatency`/`WriteLatency`, and failover events in the RDS event subscription.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why Aurora failover is faster than classic Multi-AZ.** Classic Multi-AZ synchronous replication keeps a full second copy of the data files up to date via block-level replication; promoting it still means that standby needs to finish applying any in-flight WAL and start accepting connections as a fresh primary, which plus DNS propagation lands in the 60-120 second range.
 
@@ -337,7 +379,7 @@ A fixed 1-second retry loop instead of exponential backoff would have taken a si
   This tolerates losing an entire AZ (2 of 6 copies) without losing write availability, and losing up to 3 of 6 without losing read availability — a stronger loss tolerance than a single synchronous standby, which has exactly one other copy to lose before you're down to the primary alone.
 - **DNS caching is the usual hidden cause of "failover didn't work for us".** RDS endpoint CNAMEs have a short TTL by design, but some connection pools, container base images, and JVM DNS caches override or ignore DNS TTLs; the fix is almost always at that caching layer (respect TTL, or force periodic re-resolution), not in RDS itself.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What's the actual difference between a Multi-AZ standby and a read replica?
 > The Multi-AZ standby exists purely for durability and failover — it's synchronous, invisible to the app, and never serves a query. A read replica is asynchronous, serves real read traffic, and can lag behind the primary by seconds. Multi-AZ answers "how do we survive losing the primary"; read replicas answer "how do we scale reads".
@@ -359,7 +401,7 @@ A fixed 1-second retry loop instead of exponential backoff would have taken a si
 > [!question]- Why can't you just enable encryption on an existing unencrypted RDS instance?
 > RDS encryption is a property of the storage volume set at creation and cannot be toggled afterward. The only path is to take a snapshot, copy it with encryption enabled, restore a new instance from the encrypted copy, and cut the app over to the new endpoint — which needs its own maintenance window and cutover plan.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Multi-AZ standby = HA, never serves reads; read replica = read scaling, async, can lag.
 - Writer endpoint's DNS flips on failover; your driver/pool must detect the dead connection and re-resolve, not just retry the same socket.

@@ -29,7 +29,29 @@ updated: 2026-11-13
 > - The one rule: decide under the lock, make network calls (DB claim, 3PL) with no lock held, then re-check under the lock before saving.
 > - Classic mistake: calling the 3PL while holding the service mutex, so one slow vendor call freezes every accept and reject in the city.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code) and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs) and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A shop has packed your order and needs a rider to carry it. The system looks for free riders near the shop. It picks the best one and marks them busy at once, so no other order can grab the same rider. Then it sends them an **offer** that they must accept within about 20 seconds. If they say no or stay silent, the system frees them and tries the next rider. The "mark busy only if still free" step is called a **compare-and-set**. If no rider is found in time, it can book an outside courier instead.
+
+```mermaid
+flowchart LR
+    A["Order packed"] --> B["Find free riders nearby"]
+    B --> C["Hold best rider"]
+    C --> D["Offer, 20 s to accept"]
+    D -- "no reply" --> B
+```
+
+Everything else in this note is just these 3 questions:
+1. How do you find nearby free riders quickly?
+2. How do you hold one rider so two orders never share them?
+3. What happens when a rider declines or never answers?
 
 **The problem in one story.**
 A grocery order is packed and waiting at the store.
@@ -75,7 +97,7 @@ Where it breaks: the radio dispatcher is one person, so two calls never collide;
 > [!tip] Remember
 > Claim the rider atomically, offer with a deadline, and never hold a lock across a network call.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 An order is ready at a dark store. Assign a delivery partner within 1 km of the store.
@@ -98,7 +120,7 @@ Code the core assign method and Accept / Reject with a timeout.
 
 What it really tests: a **race on a shared resource** (two orders must never get the same rider), a fallback chain with an external system behind an adapter, an offer state machine with deadlines, and **lock scope**: calling the 3PL while holding the service mutex would let one slow vendor call freeze every accept and reject in the city.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 Questions to ask, with the assumptions this design makes:
 
@@ -131,7 +153,7 @@ Questions to ask, with the assumptions this design makes:
 
 **Out of scope:** route optimisation, payouts, ratings, serviceability (checked at checkout), maps internals.
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 | --- | --- |
@@ -144,7 +166,7 @@ Questions to ask, with the assumptions this design makes:
 
 The use case to code: **Start → offer → Accept / Reject / expire**, ending in a 3PL booking or the retry queue.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 | --- | --- | --- |
@@ -163,7 +185,7 @@ Two modelling insights.
 
 **The order has a phase**: only the goroutine that moved an order to `searching` may advance it, so a reject and the expiry sweeper can never run two searches for one order.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -256,7 +278,7 @@ stateDiagram-v2
   parked --> cancelled: Cancel
 ```
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 ```text
 POST /partners/{id}/online | /offline
@@ -279,7 +301,9 @@ POST /webhooks/3pl/{provider}     {tracking_id, status, lat, lng}   (verify the 
 | `Cancel(orderID) error` | Before assignment only; `ErrAlreadyAssigned` after |
 | `(*Assigner).Assign(ctx, order) (Assignment, error)` | Direct assignment without offers: nearest rider, else 3PL |
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
+
+**In plain words:** Tables for riders, orders and offers. The rider's status column is what the safe 'free to busy' update checks.
 
 ```sql
 CREATE TABLE delivery_partners (
@@ -416,7 +440,7 @@ cmd/demo/main.go    -> wiring: Fleet (30 s stale), radii 1/2/3 km, PorterAdapter
 - `assigner.go` knows the order of the fallback chain; `offer.go` adds the human-in-the-loop part.
 - `thirdparty.go` is the only file that knows the vendor's API shape.
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 | --- | --- | --- |
@@ -431,7 +455,7 @@ cmd/demo/main.go    -> wiring: Fleet (30 s stale), radii 1/2/3 km, PorterAdapter
 
 Not used: a Singleton `Fleet` (it is injected, so each test builds a fresh one), and one struct per offer state (five statuses and a guard check are clearer).
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > **Write in the room (about 150 lines):** `Location`, `Partner`, `Order`, `Assignment`, `Candidate`; `Fleet` with `GoOnline`, `Nearby`, `TryClaim`, `Release`; `HaversineM`; `RankingStrategy` + `NearestFirst`; `Assigner.Assign` and `claimNearest`; `Offer`, `OfferStatus` and `OfferService` with `Start`, `Accept`, `Reject`, `ExpireDue` and `advance`.
@@ -450,6 +474,8 @@ Not used: a Singleton `Fleet` (it is injected, so each test builds a fresh one),
 > If the order was cancelled meanwhile, the code undoes its work: it frees the claimed rider or cancels the 3PL trip. See [[Concurrency for LLD]] for the general rule.
 
 Complete package, Go 1.24, standard library only. `HaversineM` is the same function the [[Inventory Order Assignment (Dark Store)]] solution uses; in a real codebase both import it from one `geo` package instead of keeping two copies.
+
+**In plain words:** The complete package. Start with `Assign`, which finds candidates, holds one and sends the offer; the timeouts and retries come after.
 
 ```go
 package dispatch
@@ -1029,7 +1055,7 @@ sequenceDiagram
   end
 ```
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 | --- | --- |
@@ -1044,6 +1070,8 @@ sequenceDiagram
 | `TestCancelDuring3PLCallUndoesBooking` | a cancel that lands during the 3PL call ends in `ErrOrderCancelled` and a `CancelTrip` |
 
 All pass with `go vet` and `go test -race` on Go 1.24.4 (measured: 88.8% statement coverage).
+
+**In plain words:** Fake riders and a fake outside courier so the tests can force declines, timeouts and two orders racing for one rider.
 
 ```go
 package dispatch
@@ -1362,7 +1390,7 @@ func TestCancelDuring3PLCallUndoesBooking(t *testing.T) {
 }
 ```
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | Risk | Handling |
 | --- | --- | --- |
@@ -1381,7 +1409,7 @@ func TestCancelDuring3PLCallUndoesBooking(t *testing.T) {
 | Nobody anywhere | Order waits forever | Parked with `next_retry_at`, ops dashboard, surge incentive |
 | Customer far from the store | A very long trip | Serviceability is validated at checkout, not at dispatch |
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 | --- | --- |
@@ -1448,7 +1476,7 @@ Common mistakes:
 - Vendor SDK types leaking into the domain
 - Holding a lock across the 3PL call
 
-## Drawing
+## Drawing 🟢
 
 ![[Delivery Partner Assignment LLD Drawing.excalidraw]]
 
@@ -1463,7 +1491,7 @@ Redraw it from memory, then add the one thing it predates: the decide, call, re-
 - [ ] The atomic claim SQL and `deliveries.order_id UNIQUE`
 - [ ] The lock released before the 3PL call, and the re-check after it
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- How do you stop two orders from getting the same rider?
 > Make "is the rider free?" and "take the rider" one atomic step: `UPDATE ... SET status='busy' WHERE id=$1 AND status='available'`, or `TryClaim` under the fleet mutex. If the row count is 0, another order won, so try the next candidate instead of failing.
@@ -1483,7 +1511,7 @@ Redraw it from memory, then add the one thing it predates: the decide, call, re-
 > [!question]- Greedy nearest-rider dispatch or a batched matching?
 > Greedy is simple and has no waiting, but one round can strand an order that only one rider could serve. Batching collects orders for a few seconds and solves a minimum-cost assignment (the Hungarian algorithm, O(n³) in its modern form), trading a short delay for better global matches.
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - Claim = conditional update `available → busy`; 0 rows means try the next candidate.
 - Offer = separate row with `expires_at`; accept only `WHERE status='pending' AND expires_at >= now()`.
@@ -1493,7 +1521,7 @@ Redraw it from memory, then add the one thing it predates: the decide, call, re-
 - Redis GEO for the latest point, a last-seen set for staleness, Kafka for history.
 - Extensions: broadcast offers, ETA ranking, batching, Hungarian matching per round.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Concurrency for LLD]], [[State Machines in Go]], [[Adapter]], [[Inventory Order Assignment (Dark Store)]]
 - **Next:** [[Notification Service]], [[Testing LLD Code]]

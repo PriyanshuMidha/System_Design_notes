@@ -31,7 +31,39 @@ updated: 2026-11-13
 > - Algorithm: round robin for equal backends and short requests, least request for uneven work, consistent hash when the key must stick.
 > - Default answer: managed L7 (ALB) at the edge, an API gateway only if you need its features, and no mesh until pain proves you need one.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (12). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how each piece works), 4 (worked example), 5, 6 and 9 (drills).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 10 and 11. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+One server cannot take all your traffic, so you run many copies.
+Something must stand at the front and send each request to a copy that is free and healthy. That is a **load balancer**.
+Behind it you may add an **API gateway**: one front door that checks logins, limits abuse and routes each request to the right service.
+Inside, your services also call each other. A **service mesh** puts a small helper next to each service to handle those calls (retries, encryption, metrics).
+Each layer adds power, but also cost and things that can break. Add one only when you need it.
+
+```mermaid
+flowchart LR
+    U["Users"] --> LB["Load balancer<br/>(picks a healthy copy)"]
+    LB --> GW["API gateway<br/>(login, limits, routing)"]
+    GW --> S["Services<br/>(mesh helpers inside)"]
+```
+
+```mermaid
+flowchart LR
+    LB["Load balancer"] --> A["Copy 1 ok"]
+    LB --> B["Copy 2 ok"]
+    LB -. "stops sending" .-> C["Copy 3 down"]
+```
+
+The rest of this note is just these 3 questions:
+1. Which kind of balancer do you need (DNS, L4 or L7)?
+2. When do you need a gateway or a BFF?
+3. When is a service mesh worth its cost?
 
 **The problem in one story**
 
@@ -80,7 +112,7 @@ Where it breaks: a greeter cannot hold a phone call open for an hour, but an L4 
 > [!tip] Remember
 > Start with one managed L7 balancer; add a gateway or a mesh only when a real need names it.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A product starts with one server. Then traffic grows and the interviewer asks "how do you spread load?". The honest answer has several layers, and candidates often pile every layer into the diagram without saying why.
 
@@ -96,7 +128,7 @@ If you cannot name the problem a box solves, leave it out of the diagram.
 > [!tip] Remember
 > A box earns its place by solving a named problem. Every extra hop adds latency, cost and a failure point.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of an **airport**.
 
@@ -119,7 +151,7 @@ flowchart TD
     S1 -->|"mTLS, retries"| S2["Service B + mesh proxy"]
 ```
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 DNS load balancing
 
@@ -179,6 +211,8 @@ flowchart LR
 Capabilities: path and host routing, TLS termination, HTTP/2 and gRPC, WebSocket upgrade, retries, header rewriting, weighted canary splits, and per-request balancing. Cost: it parses every request, so it costs more CPU and adds a little latency than L4.
 
 ### 3.4 The products
+
+**In plain words:** These are the real tools you will hear named. Each one sits at a layer: L4 only sees addresses and ports, L7 can read the web request itself.
 
 | Product | Layer | Notes |
 | --- | --- | --- |
@@ -291,6 +325,8 @@ What it costs: extra latency per hop (typically sub-millisecond to a few ms per 
 
 ### 3.9 Mesh: when and when not
 
+**In plain words:** A mesh pays off with many services and many teams. With a handful of services, a few good libraries do the same job with far less to run.
+
 ```mermaid
 flowchart TD
     M1{"More than ~30 services<br/>or strict zero-trust needs?"}
@@ -308,9 +344,11 @@ Reasons against: fewer than about 30 services (a heuristic, not a law), a single
 
 ### 3.10 Where client-side balancing fits
 
+**In plain words:** Instead of a middleman, the caller keeps a list of servers and spreads its own calls. One less hop, but every client must do it right.
+
 In gRPC, the client can hold a list of backends and balance itself, so no central balancer sits in the middle. The list comes from [[Service Discovery]] (DNS, Consul, Kubernetes endpoints, or xDS). It saves a hop but needs a smart client in every language. A mesh sidecar is client-side balancing moved into a proxy.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 **Prompt.** Food delivery app: iOS, Android, web, restaurant dashboards and a partner API. 25 services, 3,500 read RPS at peak, WebSocket tracking, gRPC between services.
 
@@ -339,9 +377,11 @@ flowchart TD
     SVC --> DB[("Databases")]
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### 5.1 L4 vs L7 vs DNS across dimensions
+
+**In plain words:** The three ways to spread traffic, compared on speed, smarts and cost.
 
 Numbers are rough estimates unless marked documented.
 
@@ -361,6 +401,8 @@ Numbers are rough estimates unless marked documented.
 
 ### 5.2 Gateway, BFF and mesh
 
+**In plain words:** Gateway is the front door for outside traffic. A BFF is a small helper made for one app screen. A mesh handles traffic between your own services.
+
 | Dimension | API gateway | BFF | Service mesh |
 | --- | --- | --- | --- |
 | Traffic | North-south (external to internal) | North-south, per client | East-west (service to service) |
@@ -370,7 +412,7 @@ Numbers are rough estimates unless marked documented.
 | Failure mode | Single choke point, config sprawl | Duplicated logic | Control plane outage, sidecar overhead, hard debugging |
 | Wrong choice when | One service and one client | One client type | Few services, one language |
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 - **Hops vs features.** Each layer adds latency and failure modes. Layer only what you can justify.
 - **Managed vs self-run.** ALB and NLB cost money but need no patching. Envoy or Nginx give control and cost operator time.
@@ -381,7 +423,7 @@ Numbers are rough estimates unless marked documented.
 > [!tip] Remember
 > The balancer, the gateway and the mesh are themselves services. Each needs redundancy, capacity planning and monitoring.
 
-## 7. In production
+## 7. In production 🔴
 
 **Real-life examples.**
 
@@ -417,33 +459,67 @@ flowchart LR
 
 Say: "DNS picks the region, a managed L7 balancer terminates TLS and routes by path, a gateway handles auth and rate limits, and least-request balancing spreads requests. I'd add a mesh only if mTLS or polyglot policy becomes a requirement."
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### 8.1 Power of two choices
 
+**In plain words:** Pick two servers at random and send to the less busy one. This simple trick spreads load almost as well as checking every server.
+
 Pick two backends at random and send the request to the one with fewer in-flight requests. Mitzenmacher showed this reduces the maximum load dramatically compared with purely random choice, without needing a global view. It is why many independent balancers can share a fleet with no coordination, and why Envoy's least request uses it.
 
+```mermaid
+flowchart LR
+    R["Request"] --> P["Pick 2 servers at random"]
+    P --> A["Server A: 5 in flight"]
+    P --> B["Server B: 2 in flight"]
+    B --> W["Send to B"]
+```
+
 ### 8.2 Health checks: active and passive
+
+**In plain words:** Active checks ping each server on a timer. Passive checks watch real traffic and kick out servers that keep failing.
 
 Active checks probe an endpoint on a schedule. Passive checks (Envoy outlier detection, Nginx `max_fails`) eject a backend that returns errors in real traffic. Use both. A readiness check should reflect ability to serve (dependencies reachable), but not so strict that a shared dependency outage marks every backend unhealthy and takes the whole fleet out.
 
 ### 8.3 Timeout alignment
 
+**In plain words:** Each inner layer must give up sooner than the layer outside it. Otherwise the outer layer quits and the inner one keeps working for nobody.
+
 Set timeouts so inner ones are shorter than outer ones: client 10 s, gateway 8 s, service-to-service 3 s, DB 1 s. If the inner timeout is longer, the outer layer gives up and retries while the inner work continues, doubling load. See [[Timeouts, Retries and Backoff]].
 
+```mermaid
+flowchart LR
+    C["Client<br/>10 s"] --> G["Gateway<br/>8 s"]
+    G --> S["Service call<br/>3 s"]
+    S --> D["DB<br/>1 s"]
+```
+
 ### 8.4 Preserving the client IP
+
+**In plain words:** A proxy hides the user's real address behind its own. Pass the real one along in a header so you can still log and rate-limit by it.
 
 L7 proxies replace the source IP with their own. Pass the original in `X-Forwarded-For` (trust only the last known proxy hops) or the PROXY protocol. NLB preserves the client IP for instance targets by default; for IP targets it depends on the preserve-client-IP setting and protocol (check the AWS docs), and rate limiting or geo rules depend on this.
 
 ### 8.5 Stickiness
 
+**In plain words:** Sending a user to the same server every time feels handy, but it hides state and makes scaling harder. Keep servers stateless instead.
+
 Cookie or IP stickiness pins a user to one backend. It hides statefulness (sessions held in memory) and makes scaling and draining harder. Prefer stateless services with shared session storage. Where affinity is a true need (WebSocket, cache locality) use consistent hashing and accept redistribution on membership change ([[Scaling WebSockets]]).
 
 ### 8.6 The mesh retry trap
 
+**In plain words:** If three layers each retry three times, one failed call turns into 27. Retry in one layer only.
+
 Mesh retries are easy to enable globally. With 3 layers each retrying 3 times, one failing request can become 27 attempts against an already struggling service. Use a retry budget (a percentage of requests) and retry only idempotent calls.
 
-## 9. Real-life drills: scenario to choice to why
+```mermaid
+flowchart LR
+    A["Gateway retries 3x"] --> B["Service A retries 3x"]
+    B --> C["Service B retries 3x"]
+    C --> D["Sick service gets<br/>3 x 3 x 3 = 27 calls"]
+```
+
+## 9. Real-life drills: scenario to choice to why 🟡
 
 | # | Scenario | Pick | Why | Say in the interview |
 | --- | --- | --- | --- | --- |
@@ -460,7 +536,7 @@ Mesh retries are easy to enable globally. With 3 layers each retrying 3 times, o
 | 11 | Multi-region failover | DNS with health-checked records and low TTL | Region-level steering | "DNS picks the region; failover time is bounded by TTL, so I keep it low." |
 | 12 | Zero-downtime deploy | Connection draining plus readiness checks | Avoid dropped requests | "Deregister, drain in-flight requests, then terminate." |
 
-## 10. How to say it in the interview
+## 10. How to say it in the interview 🔴
 
 - Layers: "DNS steers to a region, a managed L7 balancer terminates TLS and routes by path, a gateway enforces auth and limits."
 - Algorithm: "Round robin is fine for equal, short requests. With uneven work I'd use least request, and for cache affinity consistent hashing."
@@ -468,7 +544,7 @@ Mesh retries are easy to enable globally. With 3 layers each retrying 3 times, o
 - Mesh: "I'd defer a mesh. If we reach dozens of services across languages with an mTLS requirement, I'd adopt one and set retry budgets."
 - Failure: "All balancers are multi-AZ, health-checked, with draining on deploy and aligned timeouts."
 
-## 11. Interview questions
+## 11. Interview questions 🔴
 
 > [!question]- L4 or L7 load balancer?
 > L7 when you need path or host routing, HTTP features, gRPC per-request balancing or WebSocket upgrades. L4 when you need raw throughput, static IPs, non-HTTP protocols or to preserve the client IP. Often both are stacked: L4 in front of L7 proxies.
@@ -491,7 +567,7 @@ Mesh retries are easy to enable globally. With 3 layers each retrying 3 times, o
 > [!question]- Who load-balances the load balancer?
 > Managed LBs are multi-AZ by design. Self-run ones use VRRP pairs, anycast or ECMP, and DNS across multiple balancer IPs. See [[Load Balancing]].
 
-## 12. Cheat sheet
+## 12. Cheat sheet 🟢
 
 - DNS steers regions; L4 spreads connections; L7 routes requests.
 - gRPC needs L7 or client-side balancing.
@@ -502,7 +578,7 @@ Mesh retries are easy to enable globally. With 3 layers each retrying 3 times, o
 - Align timeouts inward-shorter; budget retries.
 - Drain connections on deploy; run every layer redundantly.
 
-## Links
+## Links 🟢
 
 - Before this: [[Load Balancing]], [[Forward and Reverse Proxies - L4 vs L7]], [[DNS - Resolution, Records and Caching]]
 - Tools: [[Nginx]], [[AWS 06 - Load Balancing (ALB vs NLB)]], [[AWS 09 - Route 53 and ACM]], [[TLS and HTTPS]]

@@ -32,7 +32,29 @@ updated: 2026-11-13
 > - Refunds are a `CancellationPolicy` strategy: free until 48 hours before check-in, then the first night is kept; or non-refundable.
 > - Classic mistakes: counting the check-out day as a night, checking nights one by one with separate locks, and holds that never expire.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A hotel sells nights, not rooms. If you stay from the 10th to the 12th, you use the nights of the 10th and the 11th. The check-out day is not a night. So the system keeps a counter for each room type for each night, like "deluxe, 10th: 3 left". Booking a stay means taking one from every night of the stay, all together or not at all. While you pay, the rooms are kept aside for a few minutes; that is a **hold**.
+
+```mermaid
+flowchart LR
+    A["Stay: 10th to 12th"] --> B["Night of 10th: -1"]
+    A --> C["Night of 11th: -1"]
+    B --> D["Both ok? Book. Else: none"]
+    C --> D
+```
+
+Everything else in this note is just these 3 questions:
+1. How do you count rooms per night?
+2. How do you take a multi-night stay all-or-nothing?
+3. How do holds, payments and cancellations work?
 
 **The problem in one story.**
 A small hotel has 2 Deluxe rooms.
@@ -78,7 +100,7 @@ Where it breaks: a shop holds one item, while a hotel hold must grab every night
 > [!tip] Remember
 > A stay is a set of nights; check every night, then reserve every night, in one atomic step, and let holds expire.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design a hotel booking system. A hotel has room types (Deluxe, Suite), each with a number of rooms
@@ -98,7 +120,7 @@ The hotel must never sell more rooms than it has, even with many guests booking 
 5. Add `Confirm` (idempotent), `ReleaseHold`, `Cancel` with the policy.
 6. Test overlaps, back-to-back stays, partial failure, expiry, idempotent confirm, refunds, and 60 concurrent guests under `-race`. Then show the PostgreSQL schema with the guarded update and the exclusion constraint.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 ### Questions to ask (with assumed answers)
 
@@ -130,7 +152,7 @@ The hotel must never sell more rooms than it has, even with many guests booking 
 - Payments, room assignment at check-in, housekeeping, loyalty points, channel managers (Booking.com sync).
 - Search across many hotels by city and price (the system design side).
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 |---|---|
@@ -141,7 +163,7 @@ The hotel must never sell more rooms than it has, even with many guests booking 
 
 The hardest use case is **PlaceHold** under concurrency across several nights. Code it first, then the expiry, then confirm and cancel.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
@@ -159,7 +181,7 @@ Modelling insights:
 - **Held and booked are separate counters.** Expiry only touches `held`, confirmation moves `held` to `booked`, and reports can show both.
 - **The hold remembers its booking ID.** That makes `Confirm` idempotent without a separate key table.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -215,7 +237,7 @@ classDiagram
 - **Composition** (hotel to room types and night rows): created and owned by the hotel. **Aggregation** (hotel to holds and bookings): they would live in storage.
 - **Association** (hold to booking): by ID, which is what makes confirm idempotent. **Dependency on an interface** for the policy.
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 ```text
 GET  /hotels/{id}/availability?type=DLX&checkIn=2026-12-10&checkOut=2026-12-12   -> 200 {free: 3}
@@ -242,9 +264,11 @@ var _ BookingService = (*Hotel)(nil) // compile-time check
 
 `410 Gone` on an expired hold tells the payment flow to refund: the money arrived after the rooms were released. API-level retries and keys are covered in [[Idempotency and Idempotency Keys]].
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
 
 ### Model A: counters per room type and night (what the code does)
+
+**In plain words:** One row per room type per night, holding how many are sold and held. A stay updates several of these rows together.
 
 ```sql
 CREATE TABLE room_types (
@@ -368,7 +392,7 @@ type HoldRepo interface {
 }
 ```
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 |---|---|---|
@@ -383,7 +407,7 @@ Patterns not used, and why:
 - No pricing strategy in the code: one flat rate is the stated scope. Seasonal and weekend rates would be the second strategy, applied per night (Step 10).
 - No per-night lock objects: one mutex makes "all nights or none" trivial. Fine-grained locks would need a fixed lock order to avoid deadlock, as the SQL version does.
 
-## Folder structure
+## Folder structure 🟡
 
 ```text
 hotel/
@@ -395,7 +419,7 @@ hotel/
   hotel_test.go   -> overlap, partial failure, expiry, idempotency, refund table, concurrency
 ```
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > Aim for about 180 lines in the room.
@@ -428,6 +452,8 @@ Expiry is checked with `!now.Before(ExpiresAt)`, so a hold is dead at exactly it
 
 > [!tip] Exercise: weekend pricing
 > Add a `RatePlan` interface with `NightPrice(roomType, night Date) int64`, and a `WeekendRate` that charges 125 percent on Friday and Saturday nights. `PlaceHold` then sums the price night by night instead of `nights x rate`. Watch the refund: `FreeUntil` keeps "the first night", which is no longer `Amount / nights`, so the booking must store the per-night prices.
+
+**In plain words:** The full booking service. Start with `Nights`, then `Hold`, then `Confirm` and `Cancel`.
 
 ```go
 package hotel
@@ -726,7 +752,7 @@ func (h *Hotel) Cancel(ctx context.Context, bookingID string) (Booking, error) {
 }
 ```
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 |---|---|
@@ -739,6 +765,8 @@ func (h *Hotel) Cancel(ctx context.Context, bookingID string) (Booking, error) {
 | `TestConcurrentHoldsNeverOverbook` | 60 guests, 3 rooms, overlapping 2-night stays, half confirming at once: no night has `booked + held > total` |
 
 All seven pass under `go test -race` (Go 1.24.4, also with `-count=3`), and `go vet` is clean.
+
+**In plain words:** A fake clock so the tests can expire holds and check refunds under the cancellation rules.
 
 ```go
 package hotel
@@ -946,7 +974,7 @@ func TestConcurrentHoldsNeverOverbook(t *testing.T) {
 }
 ```
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | What happens | How the design handles it |
 |---|---|---|
@@ -971,7 +999,7 @@ func TestConcurrentHoldsNeverOverbook(t *testing.T) {
 - Holds without expiry, or expiry that runs only from a cron job so the in-memory path never sees it.
 - A refund computed with `float64`, or a policy hard-coded with `if hotel == ...`.
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 |---|---|
@@ -990,7 +1018,7 @@ Tradeoffs chosen:
 - **Lazy sweep on every call.** No background goroutine to stop in tests; the cost is O(live holds) per call, fine for a few hundred holds. A heap or a job scales further.
 - **Hold then confirm versus book then pay.** Holding first means a guest never pays for a room that is gone; the cost is rooms briefly unavailable to others during checkout.
 
-## Drawing
+## Drawing 🟢
 
 ```mermaid
 sequenceDiagram
@@ -1026,7 +1054,7 @@ stateDiagram-v2
     Confirmed --> [*]: stay happens
 ```
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- Why model inventory per night instead of per booking?
 > Two stays conflict only on the nights they share, and a stay needs room on every one of its nights.
@@ -1053,13 +1081,13 @@ stateDiagram-v2
 > [!question]- How do you make Confirm safe to retry?
 > The hold stores the booking ID when it is confirmed. A second call finds it and returns the same booking without touching inventory. At the API level the payment callback also carries an idempotency key, and in SQL the conditional update on `status = 'held'` returns 0 rows for the second attempt.
 
-## Interview explanation
+## Interview explanation 🔴
 
 ```text
 I model inventory per room type per night, with total, booked and held counters, and a stay as the half-open range of nights [checkIn, checkOut), so the check-out day is free for the next guest. Booking is two steps: PlaceHold checks every night has enough free rooms and then reserves every night, both under one lock, so it is all or nothing; the hold expires after ten minutes and expired holds are swept back before any read or write. Confirm moves held to booked and is idempotent because the hold remembers its booking ID; a confirm on an expired hold fails and the payment is refunded. Cancellation asks a CancellationPolicy strategy for the refund, such as free until 48 hours before check-in, then the first night is kept. In PostgreSQL I lock the night rows in date order, run a guarded UPDATE with a CHECK constraint as the backstop, and when rooms are specific I use an exclusion constraint on room_id and a daterange so overlapping stays are rejected by the database itself. Money is int64 paise and the clock is injected.
 ```
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - Stay = nights in `[checkIn, checkOut)`; inventory key = (room type, night); `free = total - booked - held`.
 - PlaceHold: check all nights, then reserve all, under one lock; partial failure changes nothing.
@@ -1068,7 +1096,7 @@ I model inventory per room type per night, with total, booked and held counters,
 - Refund = `CancellationPolicy.Refund(booking, now)`; no cancel after check-in time.
 - SQL: lock night rows `ORDER BY night FOR UPDATE`, guarded `UPDATE`, `CHECK (booked + held <= total)`; specific rooms: `EXCLUDE USING gist (room_id WITH =, stay WITH &&)` with `btree_gist`, error 23P01.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Strategy and Template Method]], [[Concurrency for LLD]], [[Movie Ticket Booking]], [[Ride Sharing]]
 - **Next:** [[Order Book Matching Engine]]

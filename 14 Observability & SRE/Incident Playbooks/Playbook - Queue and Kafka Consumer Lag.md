@@ -44,7 +44,39 @@ flowchart LR
 
 The whole playbook asks one question repeatedly: why is C smaller than P, and what is the cheapest way to make it larger or make P smaller?
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3, then the on-call part (First 5 minutes, Diagnosis flowchart, Investigation steps, Fixes), then 4, 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Some work doesn't need to happen right away, like sending an email after an order.
+So the app drops a note into a **queue** and moves on. Kafka is a popular queue.
+A separate worker program, the **consumer**, picks up notes and does the work.
+If notes arrive faster than the worker can handle them, a pile builds up.
+The size of that pile is the **lag**. Big lag = work done late, like emails 40 minutes late.
+
+```mermaid
+flowchart LR
+    P["App adds notes:<br/>1,000 a second"] --> Q["Queue (pile grows)"]
+    Q --> C["Worker handles<br/>800 a second"]
+```
+
+The pile only shrinks when the worker is faster than the arrivals. The gap tells you how long it takes to catch up.
+
+```mermaid
+flowchart LR
+    L["Pile: 120,000 notes"] --> G["Worker 200 a second<br/>faster than arrivals"]
+    G --> T["Caught up in<br/>about 10 minutes"]
+```
+
+The rest of this note is just these 3 questions:
+1. Is the worker slow, stuck, or just outnumbered?
+2. How do you make the pile shrink right now?
+3. How do you stop the pile from building next time?
 
 **The problem in one story.**
 Every order your shop takes drops a message into a queue: "send confirmation email".
@@ -87,7 +119,7 @@ Where it breaks: Kafka does not empty the bin when you read; it keeps the log an
 > [!tip] Remember
 > Lag is a rate problem: if consumers are slower than producers, the backlog never clears on its own.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Picture a post office sorting desk. Letters arrive in a bin, clerks take letters out, process them, and mark them done.
 
@@ -115,7 +147,7 @@ The analogy breaks down in one place: a Kafka log is not emptied when you read i
 > [!tip] Remember
 > Lag is the gap between "written" and "done". Always ask what business action is waiting in that gap.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of three quantities: **log-end offset** (where the producers are), **committed offset** (where the consumers are), and **time** (how fast each moves). Lag is the distance between the first two. The trend of lag is the difference of the two speeds.
 
@@ -141,6 +173,8 @@ If you scale consumers to process 7,000 per second, net drain is 3,000 per secon
 
 ### What can limit the consume rate
 
+**In plain words:** the worker can be slowed by its own code, by a slow database it calls, or by having too few copies running.
+
 ```mermaid
 flowchart TD
     A["Consume rate = messages finished per second"] --> B["Per-message time<br/>code plus downstream calls"]
@@ -154,9 +188,11 @@ flowchart TD
 > [!tip] Remember
 > Consume rate = parallelism x (1 / time per message) minus time lost. Every cause of lag attacks one of those three terms.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Step 1: how lag is measured
+
+**In plain words:** Kafka knows the newest note's number and the last number the worker said it finished. Lag is the gap between the two.
 
 1. Each consumer group stores its **committed offset** per partition (in the `__consumer_offsets` topic for Kafka).
 2. The broker knows the **log-end offset** per partition.
@@ -166,6 +202,8 @@ flowchart TD
 Lag in messages is not lag in time. 100,000 messages of lag on a topic doing 50,000 per second is two seconds. The same lag on a topic doing 10 per second is nearly three hours. Always convert to time: `lag / consume_rate`.
 
 ### Step 2: the consumer poll loop and where it can stall
+
+**In plain words:** the worker repeats: grab a batch, handle it, say "done". If any step hangs, the pile grows.
 
 ```mermaid
 stateDiagram-v2
@@ -181,6 +219,8 @@ stateDiagram-v2
 A Kafka consumer must call `poll()` again within `max.poll.interval.ms` (default 300000 ms, five minutes). If processing a batch takes longer, the group coordinator assumes the consumer is dead, removes it, and triggers a **rebalance**. Separately, a background heartbeat thread must reach the broker within `session.timeout.ms`. These are two different failure clocks, and confusing them is a common diagnosis mistake.
 
 ### Step 3: why rebalances hurt
+
+**In plain words:** when a worker joins or leaves, Kafka pauses everyone to reshuffle who reads what. During the pause nothing is handled.
 
 ```mermaid
 sequenceDiagram
@@ -201,6 +241,14 @@ With the classic **eager** protocol, every rebalance revokes all partitions and 
 
 ### Step 4: the parallelism ceiling
 
+**In plain words:** each part of a topic (a partition) can be read by only one worker. With 12 parts, worker 13 sits idle.
+
+```mermaid
+flowchart LR
+    T["Topic: 12 partitions"] --> W["12 workers:<br/>1 partition each"]
+    T --> X["Worker 13:<br/>nothing to read"]
+```
+
 Within one consumer group, a partition is read by at most one consumer. A topic with 12 partitions can use at most 12 active consumers in a group. A thirteenth consumer sits idle. So "just add pods" works only up to the partition count.
 
 > [!warning] Common mistake
@@ -209,7 +257,7 @@ Within one consumer group, a partition is read by at most one consumer. A topic 
 > [!tip] Remember
 > Lag has exactly two fixes: make each message faster, or run more parallel consumers (bounded by partitions).
 
-## First 5 minutes
+## First 5 minutes 🟡
 
 1. **Confirm and size it.** Is lag growing, flat, or shrinking? Which group, which topic, which partitions? Run the PromQL in the investigation steps below or `kafka-consumer-groups.sh --describe`. A lag graph that is a growing ramp is an incident. A sawtooth that clears is normal batch behavior.
 2. **Find the business impact.** Which flow waits on this topic: emails, payments, inventory? Set severity using that, per [[Incident Response]].
@@ -222,7 +270,7 @@ Within one consumer group, a partition is read by at most one consumer. A topic 
    - If a downstream dependency is the bottleneck: do not scale consumers, because that makes the downstream worse. See [[Playbook - Database Overload and Connection Exhaustion]].
 5. **Communicate.** Post "Consumer lag on orders-events, about 40 minutes of delay on order emails, mitigation in progress, next update in 15 minutes." Name the retention deadline if one is near.
 
-## Diagnosis flowchart
+## Diagnosis flowchart 🟡
 
 ```mermaid
 flowchart TD
@@ -239,9 +287,11 @@ flowchart TD
     Q5 -->|"CPU saturated"| A6["Consumer code or too few pods<br/>go to Cause A and D"]
 ```
 
-## Investigation steps
+## Investigation steps 🟡
 
 ### Step 0: look at the numbers (always do this first)
+
+**In plain words:** check the graphs first: how big is the pile, is it growing, and which parts of the topic have it.
 
 PromQL below assumes the common `kafka_exporter` (danielqsj) metric names: `kafka_consumergroup_lag`, `kafka_consumergroup_current_offset`, and `kafka_topic_partition_current_offset`. Other exporters name metrics differently, so adjust labels to your setup. These are label names from that exporter: `consumergroup`, `topic`, `partition`.
 
@@ -301,6 +351,8 @@ The `--describe` output has columns `GROUP TOPIC PARTITION CURRENT-OFFSET LOG-EN
 
 ### Cause A: consumers are slow (downstream or code)
 
+**In plain words:** each note takes longer than before, usually because something the worker calls got slow.
+
 **Why it happens:** each message takes longer, usually because a dependency is slow (database lock, third party API, DNS) or the code changed (new synchronous call, bigger payload, N+1 query).
 
 **Check:**
@@ -335,6 +387,8 @@ psql -c "select state, wait_event_type, wait_event, count(*) from pg_stat_activi
 
 ### Cause B: a stuck consumer or a poison message
 
+**In plain words:** one bad note makes the worker crash or hang. Everything behind it waits.
+
 **Why it happens:** one message makes the handler panic, loop forever, or block on a lock. With ordered, single-threaded per-partition processing, everything behind it waits. If the consumer retries the same message forever, the offset never advances.
 
 **Check:**
@@ -357,6 +411,8 @@ If goroutines or threads are blocked rather than erroring, capture a dump: `curl
 
 ### Cause C: rebalance storm
 
+**In plain words:** workers keep joining and leaving, so Kafka keeps pausing everyone to reshuffle.
+
 **Check:**
 
 ```bash
@@ -378,6 +434,8 @@ kubectl get events --sort-by=.lastTimestamp | grep -i order-emailer | tail
 
 ### Cause D: too few consumers or a producer spike
 
+**In plain words:** either more notes than usual are coming in, or not enough workers are running.
+
 **Check:**
 
 ```bash
@@ -397,6 +455,15 @@ A producer jump after a deploy, a campaign, a retry loop, or a backfill job poin
 
 ### Cause E: hot partition and key skew
 
+**In plain words:** one part of the topic gets most of the notes, so one worker is swamped while the others are idle.
+
+```mermaid
+flowchart LR
+    K["Most notes have<br/>the same key"] --> P3["Partition 3: huge pile"]
+    P3 --> W3["Worker 3 swamped"]
+    O["Other partitions:<br/>tiny piles"] --> I["Other workers idle"]
+```
+
 **Check:** the skew PromQL above. Then sample which key dominates: consume a few hundred messages from the hot partition and count keys.
 
 ```bash
@@ -408,9 +475,13 @@ kafka-console-consumer.sh --bootstrap-server broker:9092 --topic orders --partit
 
 ### Cause F: broker or network trouble
 
+**In plain words:** the problem is in Kafka's own servers, not in your worker.
+
 Brokers under-replicated, a leader election, or a disk full on a broker makes fetches slow for some partitions. Check `kafka-topics.sh --describe --under-replicated-partitions`, broker disk and request latency dashboards, and `ss -tn state established '( dport = :9092 )' | wc -l` from the consumer host. If lag appears on partitions led by one broker, escalate to the platform team.
 
 ### Other brokers, same method
+
+**In plain words:** other queue systems have the same idea of a pile. Only the commands differ.
 
 | Broker | Lag signal | Quick command |
 |---|---|---|
@@ -421,7 +492,7 @@ Brokers under-replicated, a leader election, or a disk full on a broker makes fe
 
 For SQS, a rising `ApproximateNumberOfMessagesNotVisible` with a flat visible count means messages are being received but not deleted: your visibility timeout is shorter than your processing time, so messages reappear and get processed twice. For RabbitMQ, a high `messages_unacknowledged` with consumers present means consumers hold messages without acking (prefetch too high, or handlers stuck).
 
-## Fixes
+## Fixes 🟡
 
 | Cause | Immediate fix | Proper fix | Prevention |
 |---|---|---|---|
@@ -445,7 +516,7 @@ kafka-consumer-groups.sh --bootstrap-server broker:9092 --group order-emailer --
 
 `--to-latest` skips every unprocessed message, which is only acceptable for data that is safe to lose (for example a stale metrics feed). For emails or payments, skipping means customers never get the message. `--to-earliest` or `--to-datetime` replays, which requires idempotent consumers (see [[Delivery Semantics and Exactly-Once]]).
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 **Scenario:** an order platform has a topic `orders` with 12 partitions and an `order-emailer` group of 12 pods sending confirmation emails. Normal lag is under 500 messages. Normal produce rate is 800 per second.
 
@@ -476,7 +547,7 @@ At a net drain of 800 per second that takes about 371 seconds, roughly 6 minutes
 
 Pod restarts, cold caches and a slower first few minutes stretch this, which is why the walkthrough says lag reached zero at 14:30.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ```mermaid
 flowchart TD
@@ -498,7 +569,7 @@ flowchart TD
 | Message loss when lagging | Data deleted at retention even if unread | Deleted at retention period | Broker may block publishers under memory alarm |
 | Best lag metric | Offset lag and time lag | Age of oldest message | Ready plus unacked count |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 | Choice | Benefit | Cost |
 |---|---|---|
@@ -514,7 +585,7 @@ flowchart TD
 
 If the queue carries data where order across partitions does not matter and per-message work is trivial, prefer a work queue such as SQS with many consumers over Kafka.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Alert on lag trend and age, not only size.** Page on "oldest unprocessed message is older than X minutes" and on `deriv(lag) > 0` sustained for 10 minutes. A raw "lag > 100,000" alert is wrong for both high and low volume topics.
 - **Define an SLO in time.** For example, "95 percent of order events are processed within 60 seconds." See [[SLIs, SLOs, SLAs and Error Budgets]].
@@ -524,7 +595,7 @@ If the queue carries data where order across partitions does not matter and per-
 - **Load test the consumer** at 2x peak produce rate, including a downstream slowdown, before launch. See [[Performance Engineering and Capacity Planning]].
 - **Use static membership** (`group.instance.id`) and cooperative-sticky assignment so rolling deploys do not stop the world.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why adding partitions is risky.** Kafka picks a partition with `hash(key) mod partitions`. Increasing the count changes where a key lands.
 
@@ -546,7 +617,7 @@ Diagnose by reading the exception text, not by guessing.
 
 **Estimate, not measured:** a single Kafka partition on commodity brokers can usually sustain tens of thousands of small messages per second, so consumer processing time, not broker throughput, is normally the limit. Treat that as a rough planning figure and verify with your own benchmark.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Consumer lag is rising on a Kafka topic. Walk me through how you respond.
 > First, check whether lag is actually growing (derivative) and convert it to time. Check what changed: deploy, config, traffic, partitions. Compare produce rate and consume rate to separate "too much input" from "slow consumers".
@@ -573,7 +644,7 @@ Diagnose by reading the exception text, not by guessing.
 > [!question]- Scaling consumers made the incident worse. How is that possible?
 > If the bottleneck is a downstream dependency such as a database, more consumers add more concurrent load, push connection pools and locks to their limits, and slow every call further. Fix or protect the dependency first, or limit concurrency.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Lag = log-end offset minus committed offset. Convert to time: `lag / consume_rate`.
 - Growing lag means produce rate exceeds consume rate. Compare the two rates first.
@@ -586,7 +657,7 @@ Diagnose by reading the exception text, not by guessing.
 - Make handlers idempotent so replays and redeliveries are safe.
 - SQS: `ApproximateAgeOfOldestMessage` plus visibility timeout. RabbitMQ: ready plus unacked.
 
-## Post-incident checklist
+## Post-incident checklist 🟡
 
 - [ ] Write the timeline with real numbers: when lag began, detection time, mitigation time, drain time.
 - [ ] Quantify impact: delayed messages, oldest age, any data loss or duplicates.

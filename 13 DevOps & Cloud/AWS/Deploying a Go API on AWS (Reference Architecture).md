@@ -26,7 +26,37 @@ updated: 2026-11-13
 > - Secrets and config are **injected at deploy time** (ECS task definition + Secrets Manager/SSM), never baked into the image.
 > - Classic mistake: architecture diagrams that stop at "and then it's deployed," skipping the AZ layout, the security-group chain, and what happens when any one box dies.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This note puts all the AWS pieces together into one real setup for a Go API.
+A request flows through a chain: name lookup, CDN and firewall, load balancer, your containers, then the database.
+
+```mermaid
+flowchart LR
+    U["User"] --> R["Route 53"] --> CF["CloudFront + WAF"] --> ALB["ALB"] --> E["ECS Fargate (Go)"] --> DB["RDS / cache / queue"]
+```
+
+Every piece runs in at least 2 buildings (AZs), so one outage doesn't take you down.
+Each layer only lets in traffic from the layer just in front of it.
+Deploys, secrets, logs and rollback are planned from day one, not after the first outage.
+
+```mermaid
+flowchart LR
+    I["Internet"] --> P["Public: ALB only"] --> A["Private: app"] --> D["Isolated: database"]
+```
+
+The rest of this note is just these 3 questions:
+1. What is the full request path and network layout?
+2. How are security, config, scaling and deploys wired in?
+3. What happens in a real failover, and what does it cost?
+
 
 **The problem in one story.**
 You built a Go API that works on your laptop.
@@ -74,7 +104,7 @@ Where it breaks: a restaurant can't instantly clone cooks, but autoscaling can a
 > [!tip] Remember
 > Every box in the diagram can fail, so every box needs a copy in another AZ and a health check in front.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A single EC2 instance running a Go binary works until it doesn't: the instance's AZ has a power event, or the process crashes, or traffic triples during a sale, and there is no plan B.
 
@@ -82,7 +112,7 @@ This note is the plan B, assembled in advance: every AWS note this folder covers
 
 Concretely, this reference architecture answers five questions an interviewer — or an incident — will ask: Where does a request go on the happy path? What happens when one AZ disappears? Where do secrets come from? How does a bad deploy get undone? And roughly what does this cost per month?
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture three concentric rings, each one only trusting the ring just inside it:
 
@@ -92,9 +122,11 @@ Picture three concentric rings, each one only trusting the ring just inside it:
 
 Every arrow between rings is also a security-group rule and a potential health check. If you can draw the three rings and what crosses between them, you can draw this whole architecture from memory.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### End-to-end request path and VPC/AZ layout
+
+**In plain words:** follow one request from the user's browser to the database. Each box is a service with its own note.
 
 ```mermaid
 flowchart TB
@@ -145,6 +177,8 @@ Isolated subnets hold RDS and ElastiCache, with no route to the internet in eith
 
 ### Security-group chain
 
+**In plain words:** each layer's guard says "only let in the layer in front of me". The database only accepts the app; the app only accepts the ALB.
+
 ```mermaid
 flowchart LR
     Internet((Internet)) -- "443" --> ALBSG["ALB security group<br/>ingress: 0.0.0.0/0:443"]
@@ -159,6 +193,8 @@ A Network ACL at the subnet boundary is a second, stateless layer most teams lea
 
 ### Config, secrets, and health checks
 
+**In plain words:** plain settings come from env vars, secrets come from Secrets Manager at start-up, and health URLs tell the ALB who is ready.
+
 The ECS task definition pulls plain config from environment variables set directly in the task definition (region, log level, feature flags) and secrets (DB password, API keys) from AWS Secrets Manager or SSM Parameter Store **by reference** — the task execution role is granted `secretsmanager:GetSecretValue` for exactly those ARNs, and the value is injected into the container's environment at start time, never written to the image or to Terraform state in plaintext.
 
 See [[Secrets Management]] for the rotation and access-pattern details this reuses rather than repeats.
@@ -169,13 +205,15 @@ Health checks exist at two layers with different meanings:
 
 ### Scaling, observability, CI/CD and rollback
 
+**In plain words:** more tasks when busy, logs and metrics to CloudWatch, deploys by pipeline, and an automatic undo if health checks fail.
+
 ECS service auto scaling adds tasks on a target-tracking policy (CPU, or `ALBRequestCountPerTarget`); RDS read replicas and ElastiCache absorb read and cache load separately from compute scaling.
 
 Every layer reports into CloudWatch — see [[AWS 10 - CloudWatch]] for the metrics/alarms/EMF mechanics this architecture relies on for its alarms and dashboards, and [[Distributed Tracing with OpenTelemetry]] for request-level tracing across the ALB → ECS → RDS hops.
 
 CI/CD builds one container image per commit, pushes it to ECR, and updates the ECS service to a new task definition revision; [[CI-CD Pipelines (GitHub Actions for Go)]] covers the pipeline itself, [[Deployment Strategies - Rolling, Blue-Green, Canary]] covers how traffic shifts to the new revision, and [[Rollback and Safe Migrations]] covers undoing a bad deploy and the database-migration ordering that makes rollback safe in the first place.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -188,6 +226,8 @@ flowchart LR
 ```
 
 ### A concrete failover: RDS Multi-AZ, numbers and code
+
+**In plain words:** the database switches to its standby in about a minute. The Go code shows how to retry so users barely notice.
 
 **Numbers (documented, AWS RDS User Guide):** an RDS Multi-AZ failover — triggered by an AZ outage, a patch, or a manual failover test — typically completes in **60-120 seconds**, during which the writer endpoint's DNS name resolves to nothing healthy.
 
@@ -320,6 +360,8 @@ The schedule itself (200ms, 400ms, 800ms, ... capped at 20s, ±20% jitter) matte
 
 ### Rough monthly cost (estimate, ap-south-1, 2026-11, illustrative traffic)
 
+**In plain words:** a ballpark bill. The load balancer, NAT gateway and database are the big items.
+
 | Component | Shape | Estimated monthly cost |
 | --- | --- | --- |
 | ECS Fargate | 4 tasks × 0.5 vCPU / 1 GB, 24/7 | ~$60 |
@@ -363,7 +405,7 @@ These are the failures that show up first when a new service goes to this archit
 | ALB returns 503 with healthy-looking tasks | Security group blocks ALB → app traffic on the container port | Confirm the app security group's ingress rule names the ALB security group, not a stale CIDR |
 | ECS service never reaches steady state, events show `CannotPullContainerError` | Task execution role lacks ECR pull permission, or the image tag doesn't exist in ECR | Grant `ecr:GetDownloadUrlForLayer`/`ecr:BatchGetImage` to the execution role; confirm the CI pipeline actually pushed that tag |
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Variant | Compute | Use when | Trade-off |
 | --- | --- | --- | --- |
@@ -374,14 +416,14 @@ These are the failures that show up first when a new service goes to this archit
 | Add CloudFront in front of the ALB | Edge CDN + WAF | Public API with static assets, or needing DDoS/bot protection at the edge | Extra cache-invalidation and WAF-rule complexity |
 | Multi-region active-passive | A second full stack in another region | RPO/RTO requirements stricter than Multi-AZ provides | Cross-region replication lag, much higher cost and complexity |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - This architecture is overbuilt for a side project or an internal tool with five users — a single EC2 instance (or even Lambda) behind a simple ALB is cheaper and simpler until there's a real availability requirement to justify the NAT gateways, Multi-AZ RDS, and the rest.
 - Multi-AZ doubles your compute and database cost for availability, not performance — don't expect it to make anything faster, only more survivable.
 - The security-group chain (ALB → app → DB) adds a layer of indirection that makes local reproduction of "why can't my service reach the database" genuinely harder to debug than a flat network; VPC Reachability Analyzer and clear naming conventions earn their keep here.
 - CloudFront and WAF are optional for an internal API with no public static assets and no need for edge-level bot filtering — adding them without a reason to is extra surface to operate and pay for.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** this Route 53 → ALB → ECS Fargate → RDS/ElastiCache shape is the default AWS reference architecture referenced across AWS's own Well-Architected guidance and is what most mid-size SaaS companies run before any team-specific Kubernetes or multi-region investment; the SQS queue is the standard escape hatch for anything that shouldn't block the request (emails, webhooks, image processing).
 - **Failure modes → fixes:**
@@ -395,7 +437,7 @@ These are the failures that show up first when a new service goes to this archit
   S3 versioning plus cross-region replication covers object storage the same way.
 - **Dev/staging/prod parity:** the same Terraform modules (see [[Infrastructure as Code with Terraform]]) provision all three environments with different variable values (instance sizes, `desired_count`, Multi-AZ on/off for dev) — never a hand-maintained, drifted-apart staging environment that "mostly" matches prod.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why the standby doesn't take read traffic:** an RDS Multi-AZ standby (the classic, non-cluster form) is a synchronous replication target purely for failover, not a readable replica — reading from it isn't possible.
 
@@ -406,7 +448,7 @@ These are the failures that show up first when a new service goes to this archit
 - **Readiness vs liveness under load, not just at startup:** a task under heavy GC pressure or a database connection-pool exhaustion event can still answer a trivial liveness ping while genuinely unable to serve real requests — a readiness check worth trusting exercises a cheap but real dependency (e.g. `SELECT 1` with a short timeout), not just "process is running."
 - **Cost vs availability isn't binary:** Single-AZ NAT (one gateway instead of two) halves the NAT cost at the price of all AZ-b egress traffic crossing an AZ boundary to reach AZ-a's NAT gateway during normal operation, and losing egress entirely if AZ-a goes down — a real trade-off some teams accept for non-critical environments and reject for production.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Walk me through what happens to a request from DNS lookup to database read.
 > Route 53 resolves the domain to the ALB (optionally via CloudFront first). The ALB's listener matches the request to a target group and forwards it to a healthy ECS Fargate task in one of the private subnets.
@@ -445,7 +487,7 @@ These are the failures that show up first when a new service goes to this archit
 >
 > Lowering either costs more: tighter backup cadence, a warm cross-region standby instead of cold snapshots, and lower Route 53 TTLs ahead of time so a DNS failover actually takes effect quickly.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Request path: Route 53 → (CloudFront/WAF) → ALB → ECS Fargate (Go) → RDS/ElastiCache/SQS.
 - Multi-AZ means at least two AZs for compute and a synchronous standby for the database; it buys survivability, not speed.

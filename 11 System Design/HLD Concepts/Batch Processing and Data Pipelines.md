@@ -27,7 +27,41 @@ updated: 2026-11-13
 > - Data lands in a **lake** (cheap files), a **warehouse** (fast SQL) or a **lakehouse** (files with table features). **CDC** moves changes from your production database without loading it.
 > - Interview trap: reaching for streaming when "yesterday's numbers by 6 a.m." is the real requirement. Batch is cheaper and simpler.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5 (variants).
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Some work does not need an answer right now. "Yesterday's sales per city" can wait until morning.
+So you collect the data all day and process it in one big go. That big go is a **batch job**.
+The data is too big for one computer. So you cut it into slices, and many computers each handle one slice at the same time.
+
+```mermaid
+flowchart LR
+    A["All of yesterday's data<br/>(too big for one machine)"] --> B["Cut into slices"]
+    B --> C["Many machines work<br/>at the same time"]
+    C --> D["Add up the results"]
+    D --> E["Report ready by 6 a.m."]
+```
+
+Some steps must wait for others. "Build revenue" must wait for "load orders". A chain of steps like that is a **pipeline**.
+Machines crash, so steps get re-run. A good step gives the same result if you run it twice.
+
+```mermaid
+flowchart LR
+    A["Load orders"] --> C["Build daily revenue"]
+    B["Load users"] --> C
+    C --> D["Report table"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you split the work and bring matching data back together?
+2. How do you chain the steps and run them safely every day?
+3. Where does the data land, and when should you use streaming instead?
 
 **The problem in one story**
 
@@ -76,7 +110,7 @@ Where it breaks: vote counting runs once, while pipelines rerun daily and must s
 > [!tip] Remember
 > Split the data, process the parts in parallel, shuffle to group by key, and make every step safe to rerun.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Think of the end-of-month bank statement. The bank does not recompute your balance after each coffee. It collects the month's transactions and, in one run, produces every customer's statement. Many questions are like this: reports, billing, recommendations, search indexes, ML training sets, fraud models.
 
@@ -91,7 +125,7 @@ So we **copy data out** to a separate analytics system and process it in bulk, i
 > [!tip] Remember
 > Batch exists to move heavy, wide, slow-to-compute work off the live system and run it in parallel.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 ### 2.1 A big kitchen with an assembly line
 
@@ -125,7 +159,7 @@ flowchart LR
 > [!tip] Remember
 > Split by partition, shuffle by key, retry by task, schedule by DAG.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 MapReduce: the original mental model
 
@@ -292,7 +326,7 @@ sequenceDiagram
 > [!tip] Remember
 > Idempotent + interval-based = retries and backfills are safe.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Daily revenue pipeline for a food-delivery company
 
@@ -357,7 +391,7 @@ Late data: recompute last 7 days nightly
 > [!tip] Remember
 > Keep raw data immutable, make transforms functions of (raw, interval), and every fix becomes "re-run".
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### 5.1 ETL vs ELT
 
@@ -385,6 +419,8 @@ flowchart LR
 
 ### 5.2 Lake, warehouse and lakehouse
 
+**In plain words:** A lake is a cheap big folder of files. A warehouse is a fast, strict SQL database for reports. A lakehouse is the cheap folder with table rules added on top.
+
 | | Data lake | Data warehouse | Lakehouse |
 | --- | --- | --- | --- |
 | Storage | Files on object storage (S3), any format | Managed columnar tables | Open files (Parquet) plus a table layer |
@@ -404,6 +440,8 @@ flowchart TD
 
 ### 5.3 Batch vs streaming
 
+**In plain words:** Batch is like washing all the dishes at night. Streaming is washing each plate the moment you finish eating. One is cheap and simple, the other is fast but needs constant work.
+
 | | Batch | Streaming |
 | --- | --- | --- |
 | Latency | Minutes to hours | Seconds or less |
@@ -415,6 +453,8 @@ flowchart TD
 Real answers are often **both**: stream for fast, approximate numbers; batch to recompute the exact truth. See [[Stream Processing Basics]] and [[Case Study - Ad Click Aggregation]].
 
 ### 5.4 Lambda vs Kappa
+
+**In plain words:** Lambda runs two systems side by side (one slow and exact, one fast and rough). Kappa runs only the fast one and replays old data through it when it needs to fix things.
 
 - **Lambda:** a batch layer (accurate, slow) plus a speed layer (fast, approximate), merged at query time. Downside: two code paths that must agree.
 - **Kappa:** one streaming code path; reprocess by replaying the log from the start. Downside: replaying months of data through a stream engine can be slow and costly.
@@ -439,6 +479,8 @@ flowchart LR
 
 ### 5.5 Engines for the "T" and OLAP
 
+**In plain words:** These are the tools that do the actual crunching. Pick by where your data lives and who writes the code (engineers in Spark, analysts in SQL).
+
 | Tool | Best at | Note |
 | --- | --- | --- |
 | Spark | Large batch ETL, ML prep, also streaming | General purpose; needs tuning |
@@ -450,7 +492,7 @@ flowchart LR
 > [!tip] Remember
 > Pick by latency need first (batch vs stream), then by data shape (lake, warehouse, lakehouse).
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Do not use batch** when the business needs results in seconds: fraud decisions, live inventory, rate limits. Use streaming or the serving database.
 - **Do not use streaming** when a daily report is fine. Stream state, late events and exactly-once semantics cost engineering effort every week.
@@ -460,7 +502,7 @@ flowchart LR
 - **Warehouse vs lake:** a warehouse is easier for analysts but costly for raw data; a lake is cheap but needs governance. A lakehouse tries to give both and adds table maintenance chores.
 - **Immutable raw vs privacy:** keeping raw data forever conflicts with GDPR erasure. Plan for deletion in raw files (table formats with row-level delete, or tokenize PII before landing).
 
-## 7. In production
+## 7. In production 🔴
 
 - **Public examples:** Google built MapReduce (2004) for indexing and log analysis; Spark came from UC Berkeley's AMPLab and is widely used for ETL; Airbnb created Apache Airflow, now a common orchestrator; LinkedIn's Kafka feeds both stream and batch consumers; Uber and Netflix have written about lakehouse-style table formats (Hudi came from Uber, Iceberg from Netflix). These attributions are well documented on the projects' own sites.
 - **Metrics to watch:** job duration vs the SLA, freshness (time since the last successful partition), rows in vs out, rows rejected by quality gates, retries per task, skew (max task time over median), shuffle bytes, small-file count.
@@ -486,15 +528,28 @@ flowchart TD
     F -- no --> H["Check publish step and<br/>BI cache"]
 ```
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### 8.1 Why shuffle is the bottleneck
+
+**In plain words:** In a shuffle, every worker has to send a little bit of data to every other worker. That is a huge number of tiny network trips, so this step is usually the slowest.
 
 Every wide step does the following: each map task partitions its output by key into R buckets, writes them to local disk, and each of R reduce tasks pulls its bucket from every one of M map tasks.
 
 That is **M × R small transfers**. With M = 5,000 and R = 5,000 that is 25 million fetches. Real engines reduce this with sort-based shuffle (one file per map task with an index), push-based or external shuffle services, and by coalescing partitions. Fewer and larger partitions reduce the count, but too few lose parallelism.
 
+```mermaid
+flowchart LR
+    M1["Map task 1"] --> R1["Reduce task 1"]
+    M1 --> R2["Reduce task 2"]
+    M2["Map task 2"] --> R1
+    M2 --> R2
+    N["Every map talks to every reduce:<br/>M x R network trips"]
+```
+
 ### 8.2 Fault tolerance without replication of results
+
+**In plain words:** If a worker dies, you do not need a backup copy of its output. You just run the same step again on the same input, and you get the same answer.
 
 Batch frameworks recover by **recomputation**. Because tasks are deterministic and inputs are immutable, a lost output is rebuilt from lineage. Long lineage chains are cut by **checkpointing** (write to durable storage). This is why non-deterministic code (random numbers, `now()`, calling an external API) is dangerous in tasks: a retry gives different output.
 
@@ -502,21 +557,44 @@ Seed randomness, pass the run time as a parameter, and treat API calls as a sepa
 
 ### 8.3 Exactly-once output
 
+**In plain words:** Steps may run more than once. The trick is to make only one run "count": write to a temp place first, then swap it in with one quick move.
+
 True exactly-once in a distributed job is built from at-least-once execution plus an idempotent or atomic commit. Spark and similar engines write task outputs to a temporary location and the driver commits the job by renaming or by writing table-format metadata in one atomic step.
 
 Table formats (Delta, Iceberg, Hudi) make this safer on object storage, where rename is not atomic, by using a transaction log or manifest pointer. Say: "at-least-once compute, atomic commit, idempotent keys."
 
+```mermaid
+flowchart LR
+    A["Task attempt 1"] --> T1["temp folder 1"]
+    B["Task attempt 2 (retry)"] --> T2["temp folder 2"]
+    T2 -- "only the winner is<br/>committed (one quick swap)" --> F["Final table"]
+    T1 -. "thrown away" .-> X["Deleted"]
+```
+
 ### 8.4 Event time vs processing time
+
+**In plain words:** A sale at 11:58 p.m. may only reach you at 12:05 a.m. Count it on the day it happened, not the day it arrived.
 
 A record carries two clocks: when it happened (**event time**) and when you processed it (**processing time**). Reports must group by event time, but data arrives late (mobile app offline for 2 hours). Batch handles this by reprocessing a trailing window; streaming handles it with watermarks and allowed lateness.
 
 Define the lateness you accept (for example 7 days) and what happens after it (drop, or write a correction).
 
+```mermaid
+flowchart LR
+    E["Sale happens<br/>11:58 p.m., Nov 12<br/>(event time)"] --> D["Network delay"]
+    D --> P["Arrives 12:05 a.m., Nov 13<br/>(processing time)"]
+    P --> R["Counted in Nov 12's report"]
+```
+
 ### 8.5 Slowly changing dimensions
+
+**In plain words:** When a customer moves city, you must choose: rewrite history, or keep both the old and new city with dates.
 
 A customer changes city. Do past orders show the old city or the new one? **SCD Type 1** overwrites (history lost); **Type 2** adds a new row with `valid_from` and `valid_to` so history is preserved. In batch pipelines, Type 2 is common for dimensions like customer, restaurant and price.
 
 ### 8.6 CDC details
+
+**In plain words:** CDC means reading the database's own diary of changes, so you copy every change without slowing the database down.
 
 - **Log-based CDC** (Debezium on MySQL binlog or PostgreSQL WAL) reads the same log used for replication, so it adds little load and sees every commit in order, including deletes.
 - **Initial snapshot** copies existing rows, then streaming of changes takes over from a recorded log position. Get this handover wrong and you lose or duplicate rows.
@@ -542,13 +620,15 @@ sequenceDiagram
 
 ### 8.7 Cost levers
 
+**In plain words:** Most of the bill is storage and compute time. Store smaller files, read less, and turn machines off when idle.
+
 - Store as compressed Parquet: often several times smaller than CSV or JSON (the ratio depends on the data).
 - Use lifecycle rules: move old raw data to cheaper storage tiers.
 - Prune partitions and select only needed columns; in pay-per-scan warehouses, this is a direct bill reduction.
 - Use spot or preemptible instances for batch workers; batch tolerates task retries well.
 - Compute only what changed (incremental models).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Design a pipeline that produces daily business reports from many sources.
 > Ingest by CDC and file drops into an immutable raw zone (object storage, partitioned by date). Transform with Spark or warehouse SQL into curated tables, per date interval, idempotently (partition overwrite or MERGE). Orchestrate as a DAG with retries, sensors and quality gates; publish by atomic partition swap. Support backfills by re-running intervals; handle late data by reprocessing the last N days.
@@ -571,7 +651,7 @@ sequenceDiagram
 > [!question]- What is a backfill and what can go wrong?
 > Re-running a pipeline for past dates after a fix. Risks: non-idempotent jobs creating duplicates, overloading sources, overwriting data consumers already use, and old data failing new schema rules. Mitigate with idempotent overwrites, concurrency limits, off-peak windows and shadow tables compared before swapping.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Batch = bounded input, high throughput, results later; run in parallel by partition.
 - Narrow ops pipeline; wide ops shuffle; shuffle is the expensive step.
@@ -584,7 +664,7 @@ sequenceDiagram
 - Lambda = batch + speed; Kappa = replay one stream.
 - Do not use a cluster for data that fits on one machine.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Stream Processing Basics]], [[Partitioning and Sharding]], [[Time-Series and Columnar Storage]]
 - **Next:** [[Transactional Outbox and CDC]], [[Case Study - Ad Click Aggregation]], [[Case Study - Metrics and Logging Platform]]

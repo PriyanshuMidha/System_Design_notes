@@ -30,7 +30,37 @@ updated: 2026-11-13
 > - **Autoscale** on a signal that leads to pain (CPU, requests per pod, queue depth), not one that lags.
 > - **Multi-region** only for latency or disaster-recovery targets that one region cannot meet, because it multiplies cost and data complexity.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (12). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (each decision), 4 (worked example), 5, 6 and 9 (drills).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 10 and 11. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your code has to run somewhere. It can run on a rented machine, in a **container** (a sealed box with your code and everything it needs), or as a small function the cloud starts for you.
+When traffic grows, you either buy a bigger machine or run more copies. More copies is usually the way to go.
+Copies are easy only if they keep no memory of users between requests. Keep that memory in a database or cache instead.
+A helper called an **autoscaler** adds copies when load goes up and removes them when it goes down.
+New versions go out a little at a time, so a bad release hurts only a few users.
+
+```mermaid
+flowchart LR
+    A["Before: one server<br/>falls over at 10x traffic"] --> B["After: many identical copies<br/>behind a load balancer"]
+```
+
+```mermaid
+flowchart LR
+    L["Load goes up"] --> AS["Autoscaler"]
+    AS --> C["Adds copies"]
+    C --> D["Shared database<br/>keeps the state"]
+```
+
+The rest of this note is just these 3 questions:
+1. Where should the code run (machine, container, function)?
+2. How do you add capacity (bigger or more), and when?
+3. How do you ship new versions safely?
 
 **The problem in one story.**
 You wrote a food ordering service and it runs on one server.
@@ -77,7 +107,7 @@ Where it breaks: new cooks take minutes to arrive, while software copies can sta
 > [!tip] Remember
 > Start simple and stateless, add copies to scale, and add Kubernetes, serverless or microservices only when a real need forces it.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An interviewer says "design a food ordering backend for 50,000 requests per second at peak". Candidates who jump straight to "Kubernetes, 40 microservices, three regions" lose points, because they never said why. Candidates who say "one service, three pods, a database" lose points for ignoring the load.
 
@@ -91,7 +121,7 @@ This guide gives you a short set of questions that lead to a concrete choice, an
 > [!tip] Remember
 > The goal is not the most modern stack. It is the cheapest stack that meets the stated load, latency and availability, with a named path to the next stage.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of **transport for a company**.
 
@@ -113,7 +143,7 @@ flowchart TD
     Q2 -->|"Dozens of services,<br/>platform team exists"| K8S["Kubernetes (EKS/GKE)"]
 ```
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 The four compute options
 
@@ -354,7 +384,7 @@ flowchart TD
 | Canary | 1% then 10% then 100% with metric gates | Stop and route back | Needs good metrics |
 | Feature flag | Ship dark, enable per cohort | Toggle off | Flag hygiene |
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 **Prompt.** Food delivery app, 2 million orders per day, peak 3x average, 80% of traffic in India, p99 under 500 ms, 99.95% availability.
 
@@ -383,9 +413,11 @@ flowchart TD
     PG -. "async backup" .-> DR[("Warm standby region")]
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### 5.1 Compute comparison across dimensions
+
+**In plain words:** The same four options, scored side by side: how fast they start, how much they cost, and how much work they need from you.
 
 Numbers are rough, documented or estimated, as marked.
 
@@ -405,6 +437,8 @@ Numbers are rough, documented or estimated, as marked.
 
 ### 5.2 Monolith vs microservices
 
+**In plain words:** One big app is easier to build and debug. Many small apps let many teams ship on their own, but add network calls and more things to run.
+
 | Dimension | Modular monolith | Microservices |
 | --- | --- | --- |
 | Consistency | One database transaction | Sagas and eventual consistency ([[Saga Pattern]]) |
@@ -415,7 +449,7 @@ Numbers are rough, documented or estimated, as marked.
 | Failure mode | One bug can take everything down | Cascading failures without timeouts and circuit breakers ([[Circuit Breaker]]) |
 | Wrong choice when | 100+ engineers collide on one repo | Team under ~15 engineers (heuristic, not a law) |
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 - **Simplicity vs headroom.** Fewer moving parts break less, but you must have a named path to the next stage (move the hot module out, add replicas, add a region).
 - **Cost vs elasticity.** Serverless is cheap at low volume and expensive at high, steady volume. Reserved or savings-plan VMs and containers are cheapest for a steady baseline.
@@ -426,7 +460,7 @@ Numbers are rough, documented or estimated, as marked.
 > [!tip] Remember
 > Say the trade-off in one sentence at the same time as the choice. It is the single most scored behaviour.
 
-## 7. In production
+## 7. In production 🔴
 
 **Real-life examples.**
 
@@ -461,21 +495,35 @@ flowchart LR
 
 Say: "Stateless app tier on containers, horizontally scaled behind a load balancer across three AZs, state in Postgres, Redis and a queue. One region first; here is how it grows."
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### 8.1 Why scale-up first for databases
 
+**In plain words:** Splitting a database across machines is hard and loses joins and transactions. A bigger machine needs zero code change, so try that first.
+
 A relational primary gives you transactions and joins. Sharding takes them away or makes them expensive. A big instance costs money but zero application change, so exhaust it (plus replicas and caching) before sharding. The scale-up limit is real: the largest instance still has a ceiling, and a single node is a failure domain.
 
+```mermaid
+flowchart LR
+    A["DB getting slow"] --> B["Bigger machine,<br/>read replicas, cache"]
+    B -- "still not enough" --> C["Only then: shard<br/>(split the data)"]
+```
+
 ### 8.2 Requests and limits in Kubernetes
+
+**In plain words:** Kubernetes plans space based on what each app says it needs, not what it really uses. Ask for too much and the cluster looks full while machines sit idle.
 
 The scheduler places pods using **requests**, not limits. If every pod requests 1 CPU but uses 0.1, the cluster looks full while nodes idle, and autoscalers based on CPU utilisation percentages compute against the request. Right-size requests from measured usage, and do not set CPU limits blindly because throttling raises tail latency.
 
 ### 8.3 Cold-start mitigation
 
+**In plain words:** A function that has been idle takes a moment to wake up. You can keep a few warm (and pay for them), or make the wake-up lighter.
+
 Provisioned concurrency keeps warm instances ready (you pay for them), smaller deployment packages and lighter runtimes reduce init time, and keeping initialization outside the handler reuses connections across invocations.
 
 ### 8.4 Capacity headroom arithmetic
+
+**In plain words:** Divide peak traffic by what one copy can handle, then add spare copies for failures and spikes.
 
 If one pod handles 600 RPS at the p99 target and peak is 3,500 RPS, you need ceil(3500/600) = 6 pods.
 
@@ -484,11 +532,20 @@ If one pod handles 600 RPS at the p99 target and peak is 3,500 RPS, you need cei
 
 This N+1 or AZ-loss sizing is what interviewers want to hear. See [[Back-of-the-Envelope Estimation]].
 
+```mermaid
+flowchart LR
+    P["Peak: 3,500 RPS"] --> D["One pod: 600 RPS"]
+    D --> N["Need 6 pods"]
+    N --> H["Add spares for<br/>a lost zone and spikes"]
+```
+
 ### 8.5 Stateful workloads on Kubernetes
+
+**In plain words:** You can run a database on Kubernetes, but then backups, copies and upgrades become your job. A managed database usually saves you that pain.
 
 StatefulSets give stable identity and storage, but running a database on Kubernetes shifts replication, backup and upgrade work to you. Prefer a managed database unless you have a reason not to.
 
-## 9. Real-life drills: scenario to choice to why
+## 9. Real-life drills: scenario to choice to why 🟡
 
 | # | Scenario | Pick | Why | Say in the interview |
 | --- | --- | --- | --- | --- |
@@ -504,7 +561,7 @@ StatefulSets give stable identity and storage, but running a database on Kuberne
 | 10 | Nightly report job | Scheduled container task or Lambda | Runs rarely | "No always-on fleet for a once-a-day job." |
 | 11 | Risky release of pricing logic | Canary plus feature flag | Limit blast radius | "5% canary gated on error rate and p99, with a flag to turn it off." |
 
-## 10. How to say it in the interview
+## 10. How to say it in the interview 🔴
 
 - Open with the requirement, then the choice: "At 70 orders per second peak this is a modest load, so I'll keep it simple: a modular monolith on containers behind a load balancer."
 - Name the trade-off: "The cost of this is a shared release train; if teams collide, I'd extract the busiest bounded context first."
@@ -512,7 +569,7 @@ StatefulSets give stable identity and storage, but running a database on Kuberne
 - Stateless line: "I'll keep the app tier stateless, with sessions in Redis and files in S3, so I can scale by adding pods."
 - Multi-region line: "I'll start with three AZs in one region. Going multi-region is a cost and write-consistency decision, so I'd only do it for a stated RTO or latency target."
 
-## 11. Interview questions
+## 11. Interview questions 🔴
 
 > [!question]- When would you choose Kubernetes over ECS Fargate?
 > When you have many services (roughly 15+), a platform team to run it, and need ecosystem features such as operators, service mesh, GitOps or multi-cloud portability. For a handful of services, Fargate gives containers without cluster management.
@@ -535,7 +592,7 @@ StatefulSets give stable identity and storage, but running a database on Kuberne
 > [!question]- Traffic grows 10x. What do you do?
 > Find the bottleneck by measurement, scale the stateless tier out, add cache and read replicas, move work to queues, then scale up the DB, and finally shard. Re-check autoscaling limits and quotas, and load test.
 
-## 12. Cheat sheet
+## 12. Cheat sheet 🟢
 
 - Default: stateless containers behind a load balancer in 3 AZs.
 - VM for special needs, Fargate for most, Kubernetes for many services plus a platform team, Lambda for bursty and short.
@@ -546,7 +603,7 @@ StatefulSets give stable identity and storage, but running a database on Kuberne
 - Multi-region is a cost and write-consistency decision; justify it with RTO, RPO or latency.
 - Canary plus feature flags for risky changes.
 
-## Links
+## Links 🟢
 
 - Before this: [[Scaling Basics]], [[Cloud Computing Basics]], [[System Design Interview Framework]]
 - Compute: [[AWS 04 - Compute Choices - EC2, ECS-Fargate, EKS, Lambda]], [[AWS 05 - ECS, Fargate and ECR]], [[Kubernetes Fundamentals]], [[Docker 01 - Why Containers]]

@@ -23,7 +23,34 @@ updated: 2026-11-13
 > - Keep the **blast radius** small: one instance, one AZ, a single-digit percentage of traffic, with an automatic abort tied to an SLO.
 > - A chaos experiment validates resilience mechanisms you already believe you have (timeouts, retries, circuit breakers, failover) — it does not replace unit or load testing, and it is not useful without observability and on-call already in place.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Big systems break in small ways all the time: a server dies, a network gets slow, a database stops answering.
+You hope your system copes. Hope is not proof.
+**Chaos engineering** means breaking things on purpose, in a careful way, to see what really happens.
+You first write down what "healthy" looks like as a number, like "99% of orders succeed". That is the **steady state**.
+Then you inject one small fault, watch the number, and stop at once if it drops too far.
+If the number holds, you have proof. If not, you found a weak spot before a real outage did.
+
+```mermaid
+flowchart LR
+    H["Measure healthy number"] --> F["Inject one small fault"] --> W{"Number still OK?"}
+    W -- "yes" --> P["Proof it copes"]
+    W -- "no" --> S["Stop, fix the weak spot"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you run a safe experiment?
+2. Which faults should you try, and with which tools?
+3. How do you keep the damage small (the blast radius)?
+
 
 **The problem in one story.**
 Your house has a smoke alarm, and you trust it.
@@ -67,7 +94,7 @@ Where it breaks: a fire drill uses no real fire, while chaos experiments inject 
 > [!tip] Remember
 > Chaos engineering is a small, controlled, measured experiment that proves your safety nets work, not random breaking.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A checkout service has a documented retry-with-backoff policy for calls to its payment provider, a circuit breaker, and a fallback to a cached price. Nobody has ever actually unplugged the payment provider's connection to see what happens.
 
@@ -75,7 +102,14 @@ A chaos experiment that injects a 100% failure rate on that one dependency, for 
 
 It might show that the circuit breaker's threshold is misconfigured and every request hangs for the full client timeout instead, which is exactly the finding you want before a real payment-provider outage happens in production, not during one.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    A["Timeout set in code"] --> B{"Ever tested with a slow DB?"}
+    B -- "no" --> C["Hangs during real outage"]
+    B -- "yes, via chaos" --> D["Fails fast, users see fallback"]
+```
+
+## 2. Mental model 🟢
 
 A chaos experiment is a scientific experiment, not random destruction:
 
@@ -92,7 +126,7 @@ flowchart LR
 
 The loop never starts with "inject everywhere, see what breaks" — it starts with a falsifiable prediction ("checkout success rate stays above 99.5% if the payment provider returns errors"), and only grows in scope once the smaller version has passed.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ```mermaid
 sequenceDiagram
@@ -115,6 +149,8 @@ sequenceDiagram
 
 ### The five principles
 
+**In plain words: measure health, guess what will happen, break one real-world thing, do it in real traffic if safe, and keep it small.**
+
 1. **Define steady state** as a measurable output metric (not an internal signal like CPU) — something a business or user actually cares about.
 2. **Hypothesize** that steady state holds in both the control group and the experimental (faulted) group.
 3. **Vary real-world events**: the fault types that actually occur — hardware failure, network partition, dependency errors, traffic spikes — not arbitrary code bugs.
@@ -122,6 +158,8 @@ sequenceDiagram
 5. **Automate and minimize blast radius**: an abort condition tied to real SLOs, so a bad experiment can't become its own incident.
 
 ### Fault catalogue
+
+**In plain words: a menu of things you can break: servers, network, disks, clocks, other services.**
 
 | Category | Example faults |
 | --- | --- |
@@ -132,6 +170,8 @@ sequenceDiagram
 | Application | Duplicate messages, poison messages in a queue, slow DB query injection |
 
 ### Blast-radius control
+
+**In plain words: every experiment needs a size limit, a time limit and a big red stop button.**
 
 Every experiment should have:
 
@@ -145,6 +185,8 @@ Running this first in staging, then at 1% of production traffic, then higher, is
 
 ### Tools
 
+**In plain words: tools that inject faults for you, mostly on Kubernetes or AWS.**
+
 - **Chaos Mesh** — Kubernetes-native, CRD-based (`PodChaos`, `NetworkChaos`, `StressChaos`); experiments are declarative YAML applied to a cluster.
 - **LitmusChaos** — CNCF, also Kubernetes-native (`ChaosExperiment`/`ChaosEngine` CRDs via a hub of pre-built experiments); a declarative alternative to Chaos Mesh with a similar scope.
 - **Gremlin** — SaaS, UI-driven, supports host and container-level attacks plus a "halt all" safety switch.
@@ -153,9 +195,11 @@ Running this first in staging, then at 1% of production traffic, then higher, is
 
 ### What an experiment validates
 
+**In plain words: chaos proves your safety features (timeouts, retries, fallbacks) really work.**
+
 Timeouts actually firing instead of hanging indefinitely, retries with jitter instead of a retry storm, circuit breakers opening and the fallback path actually working, autoscaling reacting in time, failover to a secondary actually completing, and — critically — that the alerts you expect to fire during a real incident actually do fire during the experiment.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -300,7 +344,7 @@ alert fired: "payment-provider-error-rate-high" at 00:01:40 (within SLO)
 
 Labeled **representative output** because no chaos-tooling cluster is available in this environment; the shape (small, bounded dip in the steady-state metric, breaker opening promptly, alert firing inside the expected window) is what a well-configured fallback and breaker should produce.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Tool/technique | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -310,14 +354,14 @@ Labeled **representative output** because no chaos-tooling cluster is available 
 | Toxiproxy | TCP proxy injecting latency/loss/resets in front of a dependency | Local dev, CI integration tests, lightweight single-service experiments | Doesn't orchestrate cluster-wide or infra-level faults |
 | Game days | Scheduled, team-run exercise combining several of the above with people on call | Rehearsing incident response itself, not just the system's resilience | Needs real people's time; run infrequently (quarterly is common) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Without observability (metrics, logs, traces) already in place, you can't tell whether the steady state held — fix observability gaps first.
 - Without an on-call and incident process, an aborted-badly experiment becomes an unmanaged incident; chaos engineering assumes the operational basics already exist.
 - Running large-blast-radius experiments directly in production before proving smaller ones hold up is how a chaos experiment itself causes an outage — always escalate scope gradually.
 - A system with low traffic or few real users may get more value from load testing and code review first; chaos engineering pays off most once the basic resilience mechanisms (timeouts, retries, circuit breakers) already exist and need validating under real conditions, not when they don't exist yet.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Netflix's Chaos Monkey (the originating tool, random instance termination) and the broader Simian Army; e-commerce and ticketing platforms run scheduled game days before known high-traffic events, combining dependency-failure injection with load testing.
 - **Failure modes → fixes:**
@@ -326,7 +370,12 @@ Labeled **representative output** because no chaos-tooling cluster is available 
   - Alert that should fire during the experiment doesn't → the alert's query or threshold has a gap; fix it before trusting it in a real incident.
 - **What to monitor during an experiment:** the steady-state business metric (checkout success rate, booking completion rate), the abort-condition metric, and whether the expected alerts actually fire.
 
-## 8. Deep dive
+```mermaid
+flowchart LR
+    S1["1 pod in staging"] --> S2["1 pod in prod, 5 min"] --> S3["10% of prod"] --> S4["Regular game day"]
+```
+
+## 8. Deep dive 🔴
 
 **Steady state must be a business-facing metric, not an infrastructure one.** "CPU usage" or "pod count" tell you the system is doing something, not that it's doing its job.
 
@@ -342,7 +391,7 @@ This turns a subset of chaos engineering into a correctness check rather than an
 
 Otherwise the same gap resurfaces the next time the same dependency actually fails in production, and the experiment's cost (the engineering time, the controlled risk taken) was wasted.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the steady-state hypothesis, and why must it be a business metric?
 > It's the measurable signal that should stay normal throughout the experiment — for example, checkout success rate staying above 99.5%. It must be business-facing (not an infrastructure metric like CPU) because the point of the experiment is to prove the system still does its job for users, not merely that it's technically running.
@@ -362,7 +411,7 @@ Otherwise the same gap resurfaces the next time the same dependency actually fai
 > [!question]- Is chaos engineering a replacement for load testing?
 > No — they validate different things. Load testing proves capacity under expected, failure-free conditions at a given traffic rate. Chaos engineering proves resilience mechanisms (timeouts, retries, breakers, failover) actually work when a dependency or instance genuinely fails. A mature test strategy runs both.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Five principles: steady-state hypothesis (business metric), vary real-world events, run in production-like conditions, automate, minimize blast radius.
 - Fault catalogue: pod/instance kill, latency, packet loss, dependency errors, AZ/region loss, clock skew.
@@ -371,7 +420,7 @@ Otherwise the same gap resurfaces the next time the same dependency actually fai
 - Prerequisites: observability and on-call already working — chaos engineering validates, it doesn't substitute for them.
 - An experiment's findings only count once turned into a tracked, owned fix.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Load and Performance Testing]], [[Testing Async and Event-Driven Systems]]
 - **Next:** [[Testing in CI-CD, Flaky Tests and Testing in Production]]

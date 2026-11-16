@@ -28,7 +28,34 @@ updated: 2026-11-13
 > - For streams with millions of distinct keys, a **Count-Min Sketch** (a small table of counters that never undercounts) plus a **min-heap of size K** finds the heavy hitters in fixed memory.
 > - Time windows (daily, weekly, last hour) are separate keys or tumbling windows that are merged, never one ever-growing counter.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A leaderboard shows the top players and your own rank.
+Sorting 10 million players on every page view is far too slow.
+Instead you keep the players in a list that stays sorted as scores change. In Redis this is a **sorted set**.
+Asking "who is in the top 100?" or "what is my rank?" is then fast.
+
+```mermaid
+flowchart LR
+    S["New score"] --> Z["Sorted set<br/>(always in order)"]
+    Z --> T["Top 100"]
+    Z --> R["My rank"]
+```
+
+"Top songs from billions of plays" is a different job: too many items to count exactly.
+So you count roughly with a tiny grid of counters, and keep only the best K in a small list (a **heap**).
+
+So the rest of this note is just these 3 questions:
+1. How do you keep exact ranks for millions of players?
+2. How do you find the top K in a stream too big to count exactly?
+3. What happens when one sorted set is not enough?
 
 **The problem in one story.**
 A mobile game has 10 million players, and scores change every second.
@@ -72,7 +99,7 @@ Where it breaks: a league has 20 teams, a game may have millions of players, so 
 > [!tip] Remember
 > Exact ranks come from a sorted set; huge streams use a small sketch plus a heap of size K.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 A game has 25 million players. After each match it must show the player's new global rank, and the home screen shows the top 100. The obvious SQL works on a small table:
 
@@ -99,7 +126,7 @@ The streaming variant is different: "top 100 songs in the last hour" over 50,000
 - Leaderboard is exact; trending top-K may be approximate (a small error in counts is acceptable, a missing true top item is not).
 - Scores must not be forged: only the game server submits them.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A leaderboard is a **ladder that re-sorts itself**: when your score changes, you slide to your new rung, and your rung number is your rank. A sorted set is that ladder with an index: it can tell you your rung without counting the rungs one by one.
 
@@ -111,7 +138,15 @@ Terms:
 - **Heavy hitter:** an item whose frequency is above some share of the stream.
 - **Tumbling window:** fixed, non-overlapping time buckets (for example each minute).
 
-## 3. How it works - high-level design
+```mermaid
+flowchart LR
+    E["Stream of plays"] --> CMS["Rough counter grid"]
+    CMS --> Q{"Count beats the<br/>smallest in top K?"}
+    Q -- "yes" --> H["Swap into top-K list"]
+    Q -- "no" --> D["Ignore"]
+```
+
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart LR
@@ -183,7 +218,7 @@ sequenceDiagram
     A-->>C: top 100
 ```
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -197,6 +232,8 @@ trending: plays -> per-partition [CMS + heap(K)] per minute -> merger sums 60 mi
 Numbers to say aloud: 10k score updates per second at peak, one ZSET of 25 M players is a couple of gigabytes, and a Count-Min Sketch with 0.1% error is about 2,700 × 5 counters.
 
 ### Estimates
+
+**In plain words:** rough sums: how many players, how many score updates per second, and how much memory the sorted set needs.
 
 All inputs are **estimates** for this exercise; Redis per-entry memory is an approximation, measure it with `MEMORY USAGE` on real data.
 
@@ -218,6 +255,8 @@ The top-100 query alone is cheap but extremely popular, so it is cached in the A
 
 ### API
 
+**In plain words:** submit a score, get the top N, and get my rank.
+
 ```http
 POST /internal/v1/scores                      (game servers only, mTLS)
 {"match_id": "m81", "player_id": "p7", "points": 1500, "ended_at": "2026-11-04T19:20:05Z"}
@@ -234,6 +273,8 @@ GET /v1/trending/songs?window=1h              -> [{"song_id": "s1", "plays_estim
 Clients never submit scores. The score endpoint is internal, authenticated with mTLS (see [[Service-to-Service Auth - API Keys, HMAC, mTLS]]).
 
 ### Data model
+
+**In plain words:** scores are saved in a normal database for safety; the sorted set in Redis is a fast copy built from it.
 
 ```sql
 -- PostgreSQL 17: the source of truth. Redis can be rebuilt from it.
@@ -268,6 +309,8 @@ Redis keys:
 **Ties.** Redis orders equal scores by member name (lexicographically), which is arbitrary for players. To rank "first to reach it" higher, pack points and time into one score. A score is a float64, which holds every integer up to 2^53 exactly, so the packed value must stay below that.
 
 ### Go: packed scores and stream top-K
+
+**In plain words:** the code packs score and time into one number so ties break fairly, and keeps a rough counter grid plus a small "best K" list.
 
 The package below has the score packing used by the workers and a Count-Min Sketch with a size-K min-heap for trending items. It compiles and passes `go vet` and `go test -race` on Go 1.24.
 
@@ -484,7 +527,7 @@ func TestScoreBreaksTiesByEarliestTime(t *testing.T) {
 
 Reading the packed score back: `points = uint64(score) >> 32`. With 200,000 plays across 50,000 song IDs, the sketch never undercounted, and fewer than 1% of keys exceeded the `εN = 200` bound, as the theory promises.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -497,7 +540,7 @@ Reading the packed score back: `points = uint64(score) >> 32`. With 200,000 play
 | Redis Stack `TOPK` (HeavyKeeper) | Server-side heavy-hitter structure (`TOPK.ADD`, `TOPK.LIST`) | You run Redis Stack and want top-K without custom code | Approximate; needs Redis Stack or Redis 8+, not available in Redis 7.x without the module |
 | Exact batch job | Spark or SQL `GROUP BY ... ORDER BY count DESC LIMIT K` over the day | Reports, billing, reconciliation of the streaming answer | Hours of delay |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Do not shard before you need to.** One ZSET handles tens of millions of members and tens of thousands of operations per second; sharding turns a single `ZREVRANK` into a scatter-gather over every shard.
 - **Redis is a derived copy.** Keep scores durable in PostgreSQL (or Kafka with compaction) so a lost Redis node is rebuilt, not mourned. Redis persistence (AOF) helps but is not the source of truth.
@@ -505,7 +548,16 @@ Reading the packed score back: `points = uint64(score) >> 32`. With 200,000 play
 - **Sketches are wrong for money and for small cardinalities.** If there are only 10,000 distinct items, an exact hash map is small and exact. Use sketches when distinct keys are in the millions and approximate answers are acceptable.
 - **Friends leaderboards are not slices of the global ZSET.** For 300 friends, fetch their scores with `ZMSCORE lb:global f1 f2 ...` and sort in the API; do not build a ZSET per user.
 
-## 7. In production
+```mermaid
+flowchart TD
+    Q{"Need exact ranks?"} -- "yes" --> Z["Sorted set (ZSET)"]
+    Q -- "no, huge stream" --> S["Sketch + heap"]
+    Z --> F{"Fits one Redis node?"}
+    F -- "yes" --> ONE["Keep one ZSET"]
+    F -- "no" --> SH["Shard it (by player hash<br/>or by score range)"]
+```
+
+## 7. In production 🔴
 
 - **Failure modes → fixes:**
 	- Cheating with forged scores → only game servers submit scores; validate against match records; flag outliers; never trust client values.
@@ -520,7 +572,7 @@ Reading the packed score back: `points = uint64(score) >> 32`. With 200,000 play
 	- Drift between Redis and PostgreSQL on a sample of players.
 	- For trending: sketch error estimate (εN) and overlap with the nightly exact batch top-K.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Why a skip list can return a rank.** Each forward pointer in a Redis skip-list node stores a *span*: how many level-0 nodes it jumps over. Walking from the head to a member and adding the spans of the pointers taken gives the member's rank in `O(log N)` expected time, without visiting the members in between.
 
@@ -546,7 +598,7 @@ Heavy hitters are items above some share `φ` of the stream; choose `ε` well be
 
 **Precision of packed scores.** Redis stores sorted-set scores as IEEE 754 double-precision floats. With 21 bits of points and 32 bits of time, the packed integer stays below 2^53 and every value is exact. A design that packs 32-bit points and 32-bit time (64 bits) would silently lose the low bits, and ties would break incorrectly.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How do you get a player's rank among 25 million in real time?
 > Keep scores in a Redis sorted set and call `ZREVRANK`. The skip list stores spans, so rank is `O(log N)`, about 25 levels for 25 M members. A SQL `count(*)` of higher scores reads every row above the player.
@@ -569,7 +621,7 @@ Heavy hitters are items above some share `φ` of the stream; choose `ε` well be
 > [!question]- A worker replays score events after a crash. What goes wrong?
 > `ZINCRBY` double-counts. Dedupe first: insert `(match_id, player_id)` with `ON CONFLICT DO NOTHING` and update Redis only for new rows. `ZADD GT` for best-score boards is already idempotent.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 A 45-minute script:
 

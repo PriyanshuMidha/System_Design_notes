@@ -26,7 +26,28 @@ updated: 2026-11-13
 > - A `visited` set of directories reached through symlinks stops cycles; a max depth stops the walk early.
 > - Classic mistakes: one search function with a growing list of flag parameters, and following symlinks without a visited set (an infinite loop).
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your computer stores files inside folders, and folders inside folders. That shape is a tree. A search tool like `find` walks that tree and checks each file against your rules, like "ends in .go and is smaller than 1 MB". In the design, files and folders share one common type, which is called the **Composite** pattern. Your rules are also built as a small tree of checks joined by AND, OR and NOT. Then searching is just walking one tree and asking the other tree "does this file match?".
+
+```mermaid
+flowchart LR
+    A["Folder tree"] --> W["Walk every file"]
+    R["Rule tree: AND, OR, NOT"] --> W
+    W --> M["Matching files"]
+```
+
+Everything else in this note is just these 3 questions:
+1. How do you model files and folders as one tree?
+2. How do you build rules that can be combined?
+3. How do you walk huge trees safely and in parallel?
 
 **The problem in one story.**
 You want every `.go` file under 1 MB in a big project folder.
@@ -72,7 +93,7 @@ Where it breaks: a library has no aisle that leads back to an earlier aisle; sym
 > [!tip] Remember
 > Two trees: walk the file tree, ask the filter tree about each file, and keep a visited set for symlinks.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design a file search system like Unix `find`. Given a root directory, return all files
@@ -93,7 +114,7 @@ depth, and do not loop forever on symlink cycles.
 
 What it really tests: modeling a tree uniformly ([[Composite]]), modeling filter logic as composable objects (Specification and Interpreter) instead of a growing `if` chain, and safe traversal: cycles, depth limits, permission errors and cancellation. Time box: 10 minutes for requirements and entities, 10 for APIs, 25 to 40 for code, 10 for edge cases.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 | Question to ask | Assumption |
 | --- | --- |
@@ -109,7 +130,7 @@ What it really tests: modeling a tree uniformly ([[Composite]]), modeling filter
 - **Non-functional:** never loop forever and never crash on bad input; cancellable through `ctx`; deterministic output order; safe for concurrent searches on one read-only tree; a parallel walk for huge trees whose output is still deterministic.
 - **Out of scope:** content search (grep), indexes (`locate`), file watching, parentheses in queries, actions such as `-exec` and `-delete`.
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 | --- | --- |
@@ -119,7 +140,7 @@ What it really tests: modeling a tree uniformly ([[Composite]]), modeling filter
 
 The hardest use case, the one to code: **walk the tree with DFS or BFS, a max depth and symlink cycle protection, apply a composed filter to each file, and collect matches and skipped directories.**
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 | --- | --- | --- |
@@ -133,7 +154,7 @@ The hardest use case, the one to code: **walk the tree with DFS or BFS, a max de
 
 The modeling insight: **there are two trees.** The data tree (Directory to children) is a Composite. The query tree (`And(Ext, Not(Size))`) is also a Composite, of filters, which is the Interpreter pattern. The walker joins them. A new filter never touches traversal code, and a new traversal never touches filters.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -187,7 +208,7 @@ classDiagram
 - **Association** (`Symlink --> Node`): a link points at a node it does not own, and that node can be an ancestor, which makes a cycle.
 - **Aggregation** (`And`, `Or`, `Not` over `Filter`): combinators hold sub-filters that could be reused. In Go every leaf and combinator is a `FilterFunc` closure, the idiomatic way to write small specifications.
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 As a service over an index (optional; this is mainly a library or CLI):
 
@@ -199,13 +220,13 @@ GET /v1/search?root=/repo&q=ext%3D.go%20AND%20size%3C1048576&order=bfs&maxDepth=
 
 The Go API is the exported surface of the Step 8 code: constructors `NewDir`, `NewFile`, `NewSymlink`; filters `NameGlob`, `ExtensionIs`, `SizeLessThan`, `SizeGreaterThan`, `And`, `Or`, `Not`, and `Parse` (the Interpreter); walkers `Search` (in-memory tree), `SearchFS` (any `fs.FS`) and `ParallelSearch` (bounded workers). All walkers return `Result{Matches, Skipped}`.
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
 
 Nothing is persisted: the "storage" is the file-system tree, and a search only reads it. The storage port is the tree source: the in-memory Composite for tests and `fs.FS` for real data. `SearchFS` accepts any `fs.FS`, so `os.DirFS("/repo")` (real disk), `fstest.MapFS` (tests) and a zip archive all work unchanged.
 
 If the interviewer pushes toward `locate`-style indexed search, that is a different design: a `files(path PRIMARY KEY, name, ext, size, mtime)` table with indexes on `ext` and `size`, rebuilt by a crawler, where the filter tree is translated into a `WHERE` clause.
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 | --- | --- | --- |
@@ -216,7 +237,7 @@ If the interviewer pushes toward `locate`-style indexed search, that is a differ
 
 Not used, on purpose: a full Strategy interface with two traversal classes (DFS and BFS differ by one line; an enum keeps it simple until a third order appears), and Visitor (there is only one operation over the nodes; Visitor pays off with many, such as size totals, printing and deleting).
 
-## Folder structure
+## Folder structure 🟡
 
 The code in Step 8 is printed as two files so it reads top to bottom. In the round, split it like this:
 
@@ -235,7 +256,7 @@ cmd/find/main.go      -> flags -> Parse -> SearchFS(os.DirFS(root)) -> print pat
 - `filter.go` and `parser.go` hold all query logic: a new filter such as `ModifiedAfter` goes there.
 - `search.go`, `walk_fs.go` and `parallel.go` are the only files that know about depth, cycles and order.
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > **Write in the room (about 150 lines):** `Node`, `File`, `Directory`, `Symlink`; `Filter` + `FilterFunc`; `NameGlob`, `ExtensionIs`, `SizeLessThan`, `SizeGreaterThan`; `And`, `Or`, `Not`; `Order`, `Options`, `Match`, `Result`; and `Search`.
@@ -285,6 +306,8 @@ flowchart TD
 ```
 
 That is the filter tree `Parse` builds for `ext=.go AND NOT size>1048576 OR name=*.md`: OR binds loosest, so it is the root.
+
+**In plain words:** Files, folders and links, the rule types, and the search walk. Start with `Node`, then the filters, then `Search`.
 
 ```go
 package filesearch
@@ -591,6 +614,8 @@ On a tree, where no directory was added under two parents, the result equals the
 
 `ParallelSearch` keeps no `visited` set, so a directory shared by two parents is listed under both, while `Search` lists it once.
 
+**In plain words:** The same search on a real disk, plus a parallel version that uses many goroutines and can be stopped early.
+
 ```go
 package filesearch
 
@@ -720,7 +745,7 @@ func (w *parWalker) walk(p string, d *Directory, depth int) Result {
 }
 ```
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 | --- | --- |
@@ -733,6 +758,8 @@ func (w *parWalker) walk(p string, d *Directory, depth int) Result {
 | `TestConcurrentSearchesOnSharedTree` | 50 goroutines, mixed DFS and BFS, on one tree: all find exactly 4, race-free |
 | `TestParallelSearchEqualsSequentialDFS` | 1, 2 and 8 workers, 20 runs each, equal the sequential result for 3 depth settings |
 | `TestSearchFS` | `fstest.MapFS` with and without a depth limit, a missing root, and a real temp directory through `os.DirFS` |
+
+**In plain words:** Tests that build a small fake tree and check exactly which paths each query returns.
 
 ```go
 package filesearch
@@ -991,7 +1018,7 @@ func TestSearchFS(t *testing.T) {
 
 Run in a scratch module with Go 1.24.4: `go vet` clean, `go test -race` passes all tests. `go test -run='^$' -fuzz=FuzzParse -fuzztime=15s` found no failing input.
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | What happens | How the design handles it |
 | --- | --- | --- |
@@ -1007,7 +1034,7 @@ Run in a scratch module with Go 1.24.4: `go vet` clean, `go test -race` passes a
 | Hidden files (`.env`) | `path.Ext(".env")` is `".env"` | Documented; `name=.*` finds hidden files |
 | Concurrent searches | A race if the tree mutates | The tree is read-only during a search; each search owns its frontier and `visited`. Mutating the tree while searches run would need a `sync.RWMutex` on `Directory` |
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 | --- | --- |
@@ -1027,7 +1054,7 @@ Choices made:
 - Results collected into a slice, which is simple for the interview, with streaming for production-sized trees
 - Skip unreadable directories instead of failing the whole search
 
-## Drawing
+## Drawing 🟢
 
 ![[File Search LLD Drawing.excalidraw]]
 
@@ -1035,7 +1062,7 @@ The drawing has three parts: the Composite (`Node` with File, Directory and Syml
 
 Redraw it from memory: the interface and its three implementations (mark the one that can create a cycle), the expression tree for a three-term query, the loop with its guards in order (depth, visited, denied), and where `visited` lives (one per search) and why pruned directories are not marked.
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- Why model filters as objects instead of one function with flags?
 > Each rule is a `Filter`, and `And`, `Or`, `Not` combine them into a tree (Specification). A new rule is one constructor; traversal code never changes. The parser builds the same tree from a string, so the Go API and the query language share one evaluator.
@@ -1061,13 +1088,13 @@ Redraw it from memory: the interface and its three implementations (mark the one
 >
 > Seeds run on every `go test`; `-fuzz` explores new inputs. Behind an HTTP API, also cap the query length, because each `NOT` adds one level of recursion in the parser and in `Match`.
 
-## Interview explanation
+## Interview explanation 🔴
 
 ```text
 I model the file system as a Composite: File, Directory and Symlink all implement Node, so the walker treats them uniformly. Filters are Specifications with one Match(file) method: small leaves like ExtensionIs and SizeLessThan, plus And, Or and Not combinators, so "ext=.go AND size<1048576" is just a filter tree, and a small recursive-descent parser builds the same tree from a string and validates every term up front. The search is one loop over a frontier: popping from the end gives DFS, popping from the front gives BFS. It enforces the max depth, records permission-denied directories in a Skipped list and keeps going, and keeps a visited set of directories so symlink cycles end. On a real disk the same filters run over io/fs.WalkDir, which does not follow links inside the tree; following them needs os.ReadDir plus os.Stat, with the visited set keyed by device and inode.
 ```
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - Two trees: the data tree (Composite of Node) and the query tree (Specification and Interpreter of Filter).
 - One loop: pop from the end for DFS, at `head` for BFS; zero popped slots and compact the queue.
@@ -1077,7 +1104,7 @@ I model the file system as a Composite: File, Directory and Symlink all implemen
 - Parallel: fork-join with one slot per child, try-acquire tokens, join in child order for deterministic output.
 - Parser: precedence NOT > AND > OR, validate terms up front, fuzz it.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Composite]], [[Strategy and Template Method]], [[Logging Library]]
 - **Next:** [[ATM]], [[Iterator and range-over-func]] for a streaming result, [[Concurrency for LLD]] for worker pools

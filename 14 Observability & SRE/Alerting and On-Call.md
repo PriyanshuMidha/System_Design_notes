@@ -33,7 +33,38 @@ flowchart LR
 
 CPU at 85% might be a batch job finishing on schedule — nobody should be woken up for it. A sustained 8% error rate means real users are getting real failures right now — that pages. A slowly filling disk is real but not urgent at 3 a.m. — that's a ticket for tomorrow.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+An **alert** is a message that wakes a human up to fix something.
+If alerts fire for things that don't matter, people start ignoring them. Then they miss the one that does.
+So alert on what users feel (errors, slowness), not on internal causes (high CPU).
+
+```mermaid
+flowchart LR
+    C["Cause: CPU 85%"] -. "maybe fine" .-> U["Users OK?"]
+    S["Symptom: 5% of checkouts fail"] --> P["Page someone"]
+```
+
+A good alert asks: would a person need to act on this right now, at 3 am?
+Every paging alert links to a **runbook**: a short page saying what to check and what to do.
+
+```mermaid
+flowchart LR
+    F["Alert fires"] --> A["On-call acknowledges"] --> R["Opens runbook"] --> M["Mitigates"] --> Rs["Resolved + reviewed"]
+```
+
+The rest of this note is just these 3 questions:
+1. What makes an alert rule good?
+2. How do burn-rate alerts catch real problems fast without crying wolf?
+3. How do you run on-call and keep alerts clean over time?
+
 
 **The problem in one story.**
 Your phone buzzes at 3 a.m. with "CPU is high".
@@ -79,7 +110,7 @@ Where it breaks: a smoke alarm has one sensor; a service alert can (and should) 
 > [!tip] Remember
 > Page on what users feel, ticket on what will hurt later, and give every page a runbook.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A service alerts on "CPU > 80%" and "disk > 85%" and "GC pause > 100ms." All three fire during a Tuesday afternoon batch job that runs every week, is fully expected, and causes zero user impact.
 
@@ -87,15 +118,17 @@ The on-call engineer gets paged, checks dashboards, finds nothing wrong, goes ba
 
 **Measured (illustrative):** teams that migrate from cause-based thresholds to symptom-based, SLO-burn alerting commonly report their page volume dropping by an order of magnitude while they catch the same or more real incidents, because they stop paging on things that were never actually breaking anything for a user — this is the standard motivation cited in the SRE workbook's alerting chapter, not a number measured in this vault.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Ask of every potential alert: **"if a human saw this happen right now, at 3 a.m., would they need to act before morning?"** If the answer only matters in aggregate over days (disk slowly filling, a non-critical dependency slowly degrading), it's a ticket.
 
 If a user is being actively harmed right now, it's a page. Everything else — "this is interesting, keep an eye on it" — is a dashboard, not an alert at all.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Alert anatomy
+
+**In plain words:** every alert needs a condition, how long it must hold, how serious it is, and a link to what to do.
 
 Every alert rule (Prometheus `alerting rule` shown, but the fields generalize) needs:
 
@@ -122,6 +155,16 @@ Every alert rule (Prometheus `alerting rule` shown, but the fields generalize) n
 - **`runbook` annotation**: a URL with the first five minutes of triage already written down. An alert without one makes the page itself the bottleneck.
 
 ### Static thresholds vs multi-window multi-burn-rate
+
+**In plain words:** instead of a fixed line, ask "how fast are we spending our error budget?". Check a short and a long window together so blips don't page you.
+
+```mermaid
+flowchart LR
+    L["Long window (1 h): burning fast?"] --> Both{"Both yes?"}
+    S["Short window (5 min): still burning?"] --> Both
+    Both -- "yes" --> P["Page"]
+    Both -- "no" --> Q["Stay quiet"]
+```
 
 A flat threshold ("page if error rate > 1% for 5 minutes") has an unavoidable trade-off: a short window pages fast but flaps on noise; a long window is stable but pages slowly on a real, fast-moving outage.
 
@@ -199,11 +242,15 @@ groups:
 
 ### Precision, recall, flapping and hysteresis
 
+**In plain words:** precision = how many alerts were real. Recall = how many real problems got an alert. Flapping is an alert switching on and off; a buffer zone stops it.
+
 An alert's **precision** is "of the times it fired, how many were real problems"; its **recall** is "of the real problems, how many did it catch." Pushing threshold tighter raises recall but hurts precision (more false pages); the multi-window design above is specifically chosen to keep both high at once.
 
 **Flapping** — an alert repeatedly firing and resolving within minutes — is usually a threshold sitting exactly at the noise floor; fix it with `for:`, a wider window, or **hysteresis** (fire at one threshold, only resolve once it drops back below a lower one, so a value oscillating around a single line doesn't retrigger every few seconds).
 
 ### Alertmanager: grouping, inhibition, silences, routing
+
+**In plain words:** one alert pipe that bundles related alerts, hides follow-on noise, mutes during maintenance, and sends each alert to the right team.
 
 ```mermaid
 flowchart LR
@@ -258,6 +305,8 @@ An alert that pages without a runbook forces the responder to reconstruct, from 
 
 ### Blackbox probes and the dead-man's-switch
 
+**In plain words:** a probe tests your service from outside like a user. A dead-man's-switch is an alert that should always fire; if it stops, your alerting is broken.
+
 A **blackbox/synthetic probe** calls your service from outside, the way a real user would, catching failures your own metrics can't see (DNS misconfiguration, a certificate that expired, a load balancer silently dropping all traffic). The **dead-man's-switch** (often literally named `Watchdog`) is an alert that is *always* firing by design, routed to a receiver that pages if the notification stream itself ever stops — it exists purely to prove the alerting pipeline is alive, because an alerting system that's down looks identical to "everything is fine."
 
 ### Async-system alerts
@@ -273,9 +322,11 @@ Queue- and job-based systems need their own symptom alerts, since they don't hav
 
 A weekly or biweekly review of the last period's pages, asking **for every page: was this actionable?** Alerts that paged but required no action get tuned (wider window, different threshold) or deleted outright. An alerting system is a living thing that needs active pruning, not a one-time setup — an alert that made sense for last year's traffic pattern can be pure noise for this year's.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Go: multi-window burn-rate decision logic
+
+**In plain words:** the burn-rate math as a small Go function, so you can test an alert rule before trusting it.
 
 The arithmetic behind the PromQL above, as a small, tested Go function — useful for a CLI dry-run of a proposed policy, or a unit test proving a new SLO's thresholds behave as expected before shipping them as Prometheus rules. It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
 
@@ -393,7 +444,7 @@ func TestEvaluate_NothingBurningIsNone(t *testing.T) {
 
 **Tested:** `go vet ./...` clean; `go test -race ./...` → `ok alertburn 1.5s`, all four tests pass (Go 1.24.4, scratch module, 2026-11-07).
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | How it decides to page | Catches blips? | Catches slow burns? |
 | --- | --- | --- | --- |
@@ -402,14 +453,14 @@ func TestEvaluate_NothingBurningIsNone(t *testing.T) {
 | Cause-based threshold (CPU, disk, queue depth alone) | Infra metric crosses a line | N/A — doesn't measure user impact at all | No — a resource can be "fine" for days before it becomes a symptom, or "high" and never become one |
 | Blackbox/synthetic probe | External health check fails | Yes, for anything reachable externally | No — not continuous enough to measure slow budget burn |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Burn-rate alerting requires an SLO to already exist (see [[SLIs, SLOs, SLAs and Error Budgets]]); it's not a replacement for having one, it's built on top of one.
 - A brand-new, low-traffic service doesn't have enough request volume for burn-rate math to be statistically meaningful over a 5-minute window — a handful of real-user requests can swing the ratio wildly. Widen the short window or fall back to a coarser static threshold until traffic grows.
 - More alert tiers (page/ticket, multiple windows) means more rules to maintain and more combinations to reason about; a tiny, low-stakes internal tool may not justify more than one simple threshold.
 - Alerting purely on the SLO's top-line SLI can miss a localized problem (one region, one tenant) that's too small to move the aggregate burn rate — pair burn-rate alerts with narrower, lower-severity alerts scoped by cohort for that case.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Prometheus + Alertmanager is the de facto open-source stack for exactly this pipeline; PagerDuty and Opsgenie implement the escalation-policy and on-call-schedule layer on top of whatever fires the alert; Grafana's unified alerting and Datadog Monitors implement the same rule/routing model against different backends.
 - **Failure modes → fixes:**
@@ -419,7 +470,7 @@ func TestEvaluate_NothingBurningIsNone(t *testing.T) {
   - Alert volume creeping up over months → the paging-hygiene review catches this before on-call burnout does.
 - **What to monitor:** pages per week per rotation, percentage of pages judged actionable in the hygiene review, MTTA (time to acknowledge) and its distribution, and the count of silences currently active (a growing pile of silences is usually alerts nobody fixed, muted instead).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Cutting pages by 80% without missing outages (a common interview prompt).** Start from the paging-hygiene review: for every alert that fired in the last quarter, classify it as "actionable" or not. Delete or widen the window on every alert where a human looked, found nothing wrong, and closed it — this alone typically removes most noise.
 
@@ -432,7 +483,7 @@ func TestEvaluate_NothingBurningIsNone(t *testing.T) {
 - **Multi-tenant and per-cohort alerting.** A top-line burn-rate alert averages across all traffic; a single large, broken tenant can be invisible if its traffic share is small relative to total volume. A second tier of alerts scoped `by (tenant)` with a much higher bar (page only if one tenant's own burn rate is extreme) catches this without multiplying noise for the common case.
 - **Alert-as-code.** Treating alerting rules as version-controlled YAML (Prometheus rule files, reviewed in pull requests, linted with `promtool check rules`) is what makes the owner/runbook/severity discipline enforceable at scale instead of relying on everyone remembering to fill them in by hand in a UI.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why alert on symptoms instead of causes?
 > A cause (high CPU, a growing queue) may or may not ever become a user-facing problem — it can resolve itself, or be expected (a scheduled batch job). A symptom (elevated error rate, high latency, fast error-budget burn) means a user is being harmed right now. Paging on causes trains the on-call engineer to ignore pages, because most of them require no action.
@@ -452,7 +503,7 @@ func TestEvaluate_NothingBurningIsNone(t *testing.T) {
 > [!question]- Trap: a service has had zero pages for six months. Is that good?
 > Not necessarily — it might mean the service genuinely has no symptom-worthy problems, or it might mean the alerts are miscalibrated (thresholds too loose, an SLO target set too generously, or a broken notification route) and real problems are going undetected. A senior answer checks the dead-man's-switch is firing, confirms the SLO burn history actually shows near-zero burn (not just "no pages"), and only then calls it good.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Page on symptoms (error rate, latency, budget burn); ticket or dashboard on causes (CPU, disk, queue depth alone).
 - Multi-window multi-burn-rate: both a short and a long window must agree — fast detection without flapping.

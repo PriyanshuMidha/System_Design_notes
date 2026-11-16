@@ -31,7 +31,42 @@ updated: 2026-11-13
 > - The balancer itself must be redundant (a pair, anycast, or a managed service).
 > - Trap: an L4 balancer cannot spread gRPC or HTTP/2 traffic well, because many requests share one long-lived connection.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (L4 vs L7, algorithms, health checks), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your app runs on 3 copies of the same server, so it can handle more users.
+But users only know one address. Someone must decide which copy gets each request.
+That someone is the **load balancer**: a traffic cop that sits in front of your servers.
+
+```mermaid
+flowchart LR
+    U["Users"] --> LB["Load balancer<br/>(one address)"]
+    LB --> S1["Server 1"]
+    LB --> S2["Server 2"]
+    LB --> S3["Server 3"]
+```
+
+It spreads requests so no single server gets crushed.
+It keeps asking each server "are you OK?". That ping is called a **health check**.
+If a server stops answering, the load balancer stops sending it work. Users never notice.
+
+```mermaid
+flowchart LR
+    LB["Load balancer"] -- "ok" --> S1["Server 1"]
+    LB -. "no answer: skip it" .-> S2["Server 2 (down)"]
+    LB -- "ok" --> S3["Server 3"]
+```
+
+The rest of this note is just these 3 questions:
+1. What can the load balancer see (only the address, or the whole web request)?
+2. How does it pick which server gets the next request?
+3. How do you add or remove servers without dropping requests?
 
 **The problem in one story.**
 Your app becomes popular and one server can no longer keep up.
@@ -76,7 +111,7 @@ Where it breaks: a host sees every table, but many real balancers each see only 
 > [!tip] Remember
 > A load balancer is one front door that sends each request to a healthy server, so you can add, lose or replace servers without clients noticing.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 The invoice API runs on three pods, each good for about 800 requests per second (RPS). Clients hard-code pod 1's IP address.
 
@@ -86,7 +121,7 @@ The invoice API runs on three pods, each good for about 800 requests per second 
 
 A load balancer gives clients one stable address, spreads the 2,000 RPS as about 667 per pod, stops sending to a pod that fails its health check, and lets you add pod 4 by registering it.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A host at a busy restaurant. Guests do not pick a table; the host does. A good host:
 
@@ -95,9 +130,11 @@ A host at a busy restaurant. Guests do not pick a table; the host does. A good h
 - lets a waiter whose shift is ending finish the tables they already have, but gives them no new ones (**connection draining**);
 - seats regulars with the waiter who knows their order (**sticky sessions**), which works until that waiter is off sick.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Where load balancers sit
+
+**In plain words:** a big app often has more than one load balancer: one at the front door for the internet, and more inside, between your own services.
 
 ```mermaid
 flowchart LR
@@ -116,6 +153,14 @@ Large sites stack layers: DNS picks a region, a fast L4 tier spreads TCP connect
 
 ### L4 vs L7
 
+**In plain words:** an L4 balancer reads only the "envelope" (address and port) and is very fast. An L7 balancer opens the letter (the web request) and can route by URL or header, but does more work.
+
+```mermaid
+flowchart LR
+    R["Request"] --> L4["L4: sees IP + port only<br/>fast, any protocol"]
+    R --> L7["L7: sees URL, headers, cookies<br/>smart routing, more work"]
+```
+
 | | L4 (transport layer) | L7 (application layer) |
 | --- | --- | --- |
 | Sees | Source and destination IP and port, TCP/UDP | Full HTTP: method, path, headers, cookies, body |
@@ -129,6 +174,8 @@ The owning note for the proxy layers themselves is [[Forward and Reverse Proxies
 
 ### Algorithms
 
+**In plain words:** these are the rules for "who gets the next request". Simple turns (round robin) work when all servers are equal. Smarter rules look at who is least busy.
+
 | Algorithm | How it picks | Use when | Weakness |
 | --- | --- | --- | --- |
 | Round robin | Next backend in order | Equal backends, similar request cost | Ignores slow or busy backends |
@@ -141,6 +188,8 @@ The owning note for the proxy layers themselves is [[Forward and Reverse Proxies
 | IP hash / consistent hash (ring hash, Maglev) | Hash a key (client IP, user ID, URL) to a backend | Cache affinity, sticky routing without cookies | Hot keys; see [[Consistent Hashing]] |
 
 ### Health checks, draining and slow start
+
+**In plain words:** check servers often, stop sending work to sick ones, let a leaving server finish what it has, and ease a new server in slowly.
 
 - **Active checks:** the LB calls `GET /healthz` every few seconds; after N failures it marks the backend down, after M successes it marks it up.
 - **Passive checks (outlier detection):** the LB watches real traffic and ejects a backend that returns, for example, 5 consecutive 5xx responses (Envoy's documented default for `consecutive_5xx`), then retries it later.
@@ -169,13 +218,21 @@ sequenceDiagram
 
 ### Sticky sessions vs external state
 
+**In plain words:** "sticky" means the same user always goes to the same server. Easy, but if that server dies, the user loses their session. Better: keep session data in a shared store so any server can serve anyone.
+
+```mermaid
+flowchart LR
+    A["Sticky: user -> always Server 2<br/>Server 2 dies = session lost"]
+    B["Shared store: user -> any server<br/>-> session in Redis"]
+```
+
 Sticky sessions (a cookie such as AWS's `AWSALB`, or an IP hash) send a user back to the same backend.
 
 They hide in-memory session state but break when that backend dies, unbalance load when a few users are heavy, and fight autoscaling.
 
 The cleaner design keeps the app tier stateless and stores sessions in Redis or a signed token ([[Scaling Basics]], [[Sessions and Cookies]]). Stickiness remains useful as an optimisation, for example to keep a user's local cache warm.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -189,6 +246,8 @@ gRPC:   L7 or client-side LB, never plain L4
 ```
 
 ### Two algorithms in Go
+
+**In plain words:** two small pickers. One gives turns by weight, so bigger servers get more. The other picks two servers at random and sends to the less busy one.
 
 Smooth weighted round robin (the Nginx algorithm) and power of two choices over outstanding requests. The random source is injected so the test is deterministic. The code passes `go vet` and `go test -race` on Go 1.24.
 
@@ -369,6 +428,11 @@ One extra random sample nearly removes the imbalance. Mitzenmacher's analysis ex
 
 ### Tracing one deploy
 
+```mermaid
+flowchart LR
+    A["Mark pod-1 leaving"] --> B["LB stops new requests"] --> C["pod-1 finishes its 40 requests"] --> D["pod-1 shuts down"] --> E["New pod eased in slowly"]
+```
+
 1. The deploy tool marks `pod-1` for removal; Kubernetes sets it not-ready and the LB deregisters it.
 2. The LB stops sending new requests to `pod-1`; its 40 in-flight requests continue.
 3. `pod-1` receives `SIGTERM`, stops accepting new connections, and Go's `http.Server.Shutdown` waits for the 40 requests to finish.
@@ -376,7 +440,7 @@ One extra random sample nearly removes the imbalance. Mitzenmacher's analysis ex
 
 Without step 2 (or with a shutdown that exits immediately), those 40 requests become 502 errors on every deploy.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Where balancing happens | How | Use when | Cost |
 | --- | --- | --- | --- |
@@ -387,7 +451,7 @@ Without step 2 (or with a shutdown that exits immediately), those 40 requests be
 | Client-side (look-aside) | Client gets the backend list from [[Service Discovery]] or xDS and picks | gRPC and service-to-service calls | Logic in every client; needs a discovery system |
 | Sidecar / service mesh | An Envoy next to each pod does the client-side work | Many services, many languages | Extra hop and operational weight |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Another hop.** Each LB adds latency (sub-millisecond inside a data centre) and is one more thing that can fail or be misconfigured.
 - **Sticky sessions trade balance for convenience.** Prefer stateless backends.
@@ -395,7 +459,7 @@ Without step 2 (or with a shutdown that exits immediately), those 40 requests be
 - **Retries at the LB can amplify an outage.** Retrying every 5xx on another backend doubles load exactly when the system is struggling; use retry budgets ([[Timeouts, Retries and Backoff]]).
 - **For two servers in one office, DNS round robin or a single Nginx is enough.** A multi-tier LB stack only pays off with many backends or many services.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** AWS ALB (L7), NLB (L4, preserves client IP, static IPs) and GWLB (for inline security appliances, using GENEVE); Google Maglev (software L4 with consistent hashing); Envoy (L7 with `ROUND_ROBIN`, `LEAST_REQUEST`, `RING_HASH`, `MAGLEV`, `RANDOM` policies); Nginx (`round robin` by default, `least_conn`, `ip_hash`, `hash ... consistent`, `random two least_conn`); HAProxy; Kubernetes Services (kube-proxy with iptables or IPVS, which is L4).
 - **Client IP:** an L7 proxy adds `X-Forwarded-For` (and `X-Forwarded-Proto`); an L4 balancer that does not preserve the source IP can send the PROXY protocol header (v1 text, v2 binary) so the backend still learns it. Trust these headers only from your own proxies.
@@ -409,7 +473,7 @@ Without step 2 (or with a shutdown that exits immediately), those 40 requests be
 	- Thundering herd onto a recovered backend → slow start.
 - **What to monitor:** RPS, 4xx and 5xx per backend, latency per backend (p99), healthy host count, active and new connections, surge queue length and spillover (classic ELB) or rejected connections, and the max/average request ratio across backends.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why P2C works with stale information.** Many independent balancers each with a slightly stale view of backend load all herd onto the "least loaded" backend if they pick the global minimum. Sampling two at random keeps the choice spread out while still avoiding the worst backends, which is why Envoy uses it for `LEAST_REQUEST`.
 - **EWMA and the fast-failure trap.** A latency-aware balancer prefers the fastest backend; a backend that returns errors in 1 ms looks fastest of all. Combine latency scoring with error-rate ejection.
@@ -420,7 +484,7 @@ Without step 2 (or with a shutdown that exits immediately), those 40 requests be
 - **Global vs regional.** Global balancing chooses a region (DNS latency or geo routing, anycast) and must handle region failover and data residency; regional balancing spreads load across zones and instances. Cross-zone balancing evens load but can add inter-zone data transfer cost on some clouds.
 - **The LB as a protection layer.** L7 proxies are a natural place for rate limits, request size limits and load shedding; see [[Rate Limiting - Algorithms and Distributed Design]] and [[Load Shedding and Graceful Degradation]].
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the difference between an L4 and an L7 load balancer?
 > L4 routes connections using IP and port, without reading the payload: fast, protocol-agnostic, preserves client IP. L7 parses HTTP and routes each request by path, host or header, terminates TLS, and can retry or rewrite. Use L4 for raw throughput and non-HTTP traffic, L7 for HTTP APIs.
@@ -443,7 +507,7 @@ Without step 2 (or with a shutdown that exits immediately), those 40 requests be
 > [!question]- How do you make the load balancer itself highly available?
 > Run a pair with a floating virtual IP (VRRP via keepalived), an anycast fleet, or a managed multi-zone LB, and put several LB IPs behind DNS. Never a single LB instance.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - L4 = connections by IP:port (NLB, IPVS, Maglev). L7 = HTTP requests by path/header (ALB, Envoy, Nginx).
 - Equal backends → round robin; uneven work → least outstanding / P2C; affinity → ring hash or Maglev.

@@ -37,7 +37,43 @@ updated: 2026-11-13
 > - Lambda's weakness is two codebases that must give the same answer. Kappa's weakness is long replays and retention cost.
 > - Numbers here are rough estimates unless a source is named.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the decision steps), 4 (worked example) and 5 (comparison and drills).
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Data keeps arriving: orders, clicks, payments.
+You can wait, collect a big pile, and process it later. That is **batch**.
+Or you can handle each event the moment it arrives. That is **stream**.
+Batch is simpler and easier to get exactly right. Stream gives fresh answers in seconds but is harder to run.
+Sometimes code has a bug and you must fix old results. So you keep all raw events in a log you can replay.
+
+```mermaid
+flowchart LR
+    Q{"How fresh must<br/>the answer be?"} -- "tomorrow is fine" --> B["Batch"]
+    Q -- "seconds" --> S["Stream"]
+    Q -- "both" --> L["Both, or one stream<br/>that can replay"]
+```
+
+Lambda and Kappa are just two names for "both":
+- **Lambda** = run a batch system and a stream system side by side.
+- **Kappa** = run only the stream system, and replay the log to fix old results.
+
+```mermaid
+flowchart LR
+    E["Events"] --> LOG["Replayable log"]
+    LOG --> ST["Stream job"]
+    LOG -. "replay after a bug fix" .-> ST
+```
+
+The rest of this note is just these 3 questions:
+1. How fresh must the answer be?
+2. How will you recompute history when the code changes?
+3. Which tool fits, and how do you handle late events?
 
 **The problem in one story.**
 A food delivery app collects every order as it happens.
@@ -83,7 +119,7 @@ Where it breaks: re-washing last month's laundry is impossible, but a data syste
 > [!tip] Remember
 > Ask how stale an answer may be and how you will recompute history; that picks batch, stream or both.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Take a food delivery app. The finance team wants "revenue per restaurant per day" to pay restaurants. The operations team wants "orders waiting more than 10 minutes in the last 5 minutes" to dispatch help. The fraud team wants "this card was used in 3 cities in 2 minutes" before the order is accepted.
 
@@ -96,7 +132,7 @@ In an HLD round, the interviewer listens for whether you pick the freshness firs
 > [!tip] Remember
 > The question is never "batch or stream?" in general. It is "how stale may this answer be, and how will I recompute it when the logic changes?"
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a **laundromat versus a conveyor-belt dry cleaner**.
 
@@ -122,7 +158,7 @@ flowchart LR
 > [!tip] Remember
 > Batch has an end and can be re-run. A stream has no end, so correctness has to be built in as state, time and replay.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Step 1: how fresh must the answer be?
 
@@ -298,9 +334,11 @@ flowchart TD
 > [!tip] Remember
 > Pick the least powerful tool that meets the freshness and state needs.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** One app, two needs: a live dashboard for operations and exact daily numbers for finance. Watch how each need picks its own path.
 
 Design: **"orders analytics for a food delivery app"** with a ops dashboard (live) and finance payouts (exact).
 
@@ -347,9 +385,11 @@ sequenceDiagram
     S->>D: replace yesterday's zone counts (optional)
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### The full comparison
+
+**In plain words:** Same question, three speeds. Batch is slow but simple, micro-batch is in between, true stream is fastest but hardest.
 
 | Dimension | Batch (Spark, warehouse) | Micro-batch (Spark SS) | True stream (Flink, Kafka Streams) |
 | --- | --- | --- | --- |
@@ -367,7 +407,15 @@ sequenceDiagram
 
 Figures marked "estimate" are rough orders of magnitude, not benchmarks.
 
+```mermaid
+flowchart LR
+    B["Batch<br/>minutes to hours late<br/>simplest"] --> M["Micro-batch<br/>seconds late"]
+    M --> T["True stream<br/>under a second<br/>hardest to run"]
+```
+
 ### Real systems (conservative)
+
+**In plain words:** These are publicly known examples of who used which style. Use them as proof points in an interview, not as exact numbers.
 
 - **Lambda**: described by Nathan Marz in the book above, and widely adopted around 2012 to 2016 with Hadoop plus Storm. Twitter's open-source Summingbird was built to run one job definition on both batch and stream for this reason.
 - **Kappa idea**: Jay Kreps, who built Kafka at LinkedIn, argued in 2014 that a replayable log removes the need for a separate batch path.
@@ -386,6 +434,8 @@ flowchart TD
 
 ### Scenario drills
 
+**In plain words:** Practice cases. Read the scenario, guess the pick, then check the "why" column.
+
 | Scenario | Pick | Why | Say in the interview |
 | --- | --- | --- | --- |
 | Restaurant payouts | Nightly batch from the lake | Exactness, refunds, audit, nobody needs it faster | "Money is a batch problem; I close the day, then compute once." |
@@ -399,7 +449,7 @@ flowchart TD
 | Search index update when a product changes | CDC to Kafka to indexer, with weekly full reindex | Incremental plus a safety net | "Stream for freshness, batch rebuild fixes drift." |
 | Schema bug found in last week's data | Replay from Kafka if within retention, else batch backfill from lake | Depends on where history lives | "Retention length is a design decision I state up front." |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Do not stream what a batch can do.** Always-on state, checkpoints, and watermarks cost engineering time.
 - **Do not trust a stream alone for money.** Pair it with a batch reconciliation or a ledger.
@@ -409,7 +459,7 @@ flowchart TD
 - **Exactly-once is not free.** It needs a replayable source, checkpoints, and an idempotent or transactional sink. See [[Delivery Semantics and Exactly-Once]].
 - **Back-pressure:** a slow sink must slow the source, not drop data. See [[Backpressure and Flow Control]].
 
-## 7. In production
+## 7. In production 🔴
 
 - **Monitor lag, not just errors:** consumer lag per partition (`kafka-consumer-groups.sh --bootstrap-server <broker:9092> --describe --group <group>`; the script has no `.sh` suffix in some packaged installs), end-to-end event-time latency, checkpoint duration and size, and watermark lag.
 - **Idle partition trap:** one quiet partition stalls the watermark for the whole job. Configure idleness handling.
@@ -419,7 +469,7 @@ flowchart TD
 - **Cost:** a 24 by 7 cluster for a once-a-day answer is the most common waste.
 - **Backfills:** run to a new table, validate, switch readers; do not write into the live table.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Why exactly-once in a stream is a combination, not a switch
 
@@ -449,13 +499,24 @@ If the sink cannot do transactions or idempotent writes, you get at-least-once, 
 
 ### Why batch is easier to make correct
 
+**In plain words:** A batch run has a clear start and end. If it fails, throw the output away and run it again. A stream never stops, so mistakes are harder to undo.
+
 A batch job has a start and an end, so a failed run is thrown away and rerun with the same input. The output replaces the old partition atomically. No windows, no watermarks, no late data: the "late" file simply belongs to the next run. That is why finance stays on batch.
+
+```mermaid
+flowchart LR
+    A["Run for Nov 12 fails halfway"] --> B["Throw away partial output"]
+    B --> C["Rerun with same input"]
+    C --> D["Swap in the Nov 12 result<br/>in one step"]
+```
 
 ### Choosing by data size and state
 
+**In plain words:** A stream job keeps running totals in memory. If those totals get too big to fit, a stream may be the wrong tool.
+
 State in a stream lives in memory or an embedded store (RocksDB in Flink) and is checkpointed. If state per key times keys exceeds what the cluster can hold, either window it, expire it with TTL, or reduce what is stored (counts, sketches; see [[Bloom Filters and Probabilistic Data Structures]]).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- When would you choose batch over stream?
 > When the answer may be hours old, when correctness or audit matters more than speed (payouts, tax), when data is already in a warehouse, or when the team cannot operate an always-on cluster. Batch is cheaper and reprocessing is just a rerun.
@@ -484,7 +545,7 @@ State in a stream lives in memory or an embedded store (RocksDB in Flink) and is
 > [!question]- How do you get exactly-once results from a pipeline?
 > Replayable source, checkpoints that snapshot state with offsets, and a transactional or idempotent sink. Without an idempotent sink it is at-least-once and you dedupe downstream.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 | Need | Pick |
 | --- | --- |
@@ -501,7 +562,7 @@ State in a stream lives in memory or an embedded store (RocksDB in Flink) and is
 - **Say it like this:** "I pick by freshness and correctness. The stream gives seconds-fresh approximate numbers; the nightly batch from the lake gives the exact ones, and I reconcile them."
 - **Always mention:** retention for replay, late data, idempotent sink, reconciliation.
 
-## Links
+## Links 🟢
 
 - Concepts: [[Stream Processing Basics]], [[Batch Processing and Data Pipelines]], [[Kafka and Event Streaming]], [[Delivery Semantics and Exactly-Once]], [[Transactional Outbox and CDC]], [[Clocks and Ordering]], [[Backpressure and Flow Control]], [[Time-Series and Columnar Storage]].
 - Case studies: [[Case Study - Ad Click Aggregation]], [[Case Study - Metrics and Logging Platform]], [[Case Study - Leaderboard and Top-K]].

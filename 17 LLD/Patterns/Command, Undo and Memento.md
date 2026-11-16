@@ -26,7 +26,34 @@ updated: 2026-11-13
 > - Undo uses either an inverse (`Undo()` on each command) or a memento (a snapshot of the state taken before the change).
 > - Classic mistakes: a new edit must clear the redo stack, and a snapshot must deep-copy slices and maps, not just copy the struct.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then the rest of this "Start here" section, sections 1, 2 and the cheat sheet (10). Skip the big code blocks on a first pass. Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works, with the small whiteboard code), section 4 (the full worked example) and sections 5 and 6 (variants and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Normally, code just does things right away.
+A **command** is "do this" written down as a value, like a note on a to-do list.
+Because it is written down, you can keep it, put it in a queue, try it again later, or log it.
+If each note also says how to reverse itself, you get undo.
+A **memento** is the other way to undo: take a snapshot before the change, and put it back to undo.
+Ctrl+Z in a text editor is the everyday example.
+
+```mermaid
+flowchart LR
+    A["Action"] --> B["Saved as a command"] --> C["Run now<br/>or queue it"]
+    B --> D["Undo later<br/>(reverse or snapshot)"]
+```
+
+The code below is long because it shows queues, retries and undo together. Read the section headings first; each block maps to one box above.
+The rest of this note is just these 3 questions:
+1. When is a plain function enough, and when do you need a command struct?
+2. How do undo and redo work with two stacks?
+3. When should you snapshot (memento) instead of reversing?
+
 
 **The problem in one story.**
 You type in a text editor and press Ctrl+Z to undo.
@@ -70,7 +97,7 @@ Where it breaks: you cannot "undo" a cooked meal, and some real commands (sendin
 > [!tip] Remember
 > A command is "do this" stored as a value; undo comes from an inverse or a deep-copied snapshot, and a new edit clears redo.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Two problems that a direct function call cannot solve:
 
@@ -79,7 +106,7 @@ Two problems that a direct function call cannot solve:
 
 Command solves the first problem by making the request a value. Undo solves the second, either with commands that carry their own inverse or with Memento snapshots when no cheap inverse exists.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A restaurant order ticket. The waiter writes the order on a ticket and clips it to the rail.
 
@@ -94,9 +121,11 @@ The cook picks it up when free. The ticket can wait in line, be read by anyone, 
 
 **Memento** is a save-game. Before the boss fight you save; if it goes badly you load the save. The game (the **originator**) writes the save file (the **memento**), and the menu that lists save slots (the **caretaker**) stores the files without reading them.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Object or closure
+
+**In plain words:** In Go a small function that remembers its data is already a command. Use a struct only when you must save it, inspect it or undo it.
 
 A closure is a command: it captures its data and its receiver, and it runs when called. `errgroup.Group.Go(func() error)` and `time.AfterFunc(d, f)` both take closure commands. Use a **struct** instead when the command must be:
 
@@ -105,6 +134,8 @@ A closure is a command: it captures its data and its receiver, and it runs when 
 - **undone** (it needs a second method, `Undo`).
 
 ### Queueing, retries and the dead-letter queue
+
+**In plain words:** Commands wait in a queue, workers run them, failures are tried again, and ones that keep failing are parked in a separate "dead-letter" queue for a human.
 
 ```mermaid
 sequenceDiagram
@@ -153,6 +184,8 @@ stateDiagram-v2
 ```
 
 ### Undo and redo with two stacks
+
+**In plain words:** Think of two piles of paper: done actions go on the undo pile; undone ones move to the redo pile. A brand-new action throws the redo pile away.
 
 ```mermaid
 classDiagram
@@ -214,11 +247,15 @@ An inverse command must record, at `Do` time, everything its `Undo` needs. `Dele
 
 ### Memento: snapshot instead of inverse
 
+**In plain words:** When an action is hard to reverse, take a photo of the state before it and put the photo back to undo.
+
 When an operation has no cheap inverse ("apply this template", "reformat the document"), save the state before it and restore it on undo. `Draft.Save` returns a `Snapshot` whose fields are unexported, so code outside the package can store it but not read or change it. The `Caretaker` keeps a capped stack of snapshots.
 
 The one rule that matters in Go: **a snapshot must not share storage with the live object.** Assigning a struct copies its slice headers and map references, not their contents. `Save` therefore clones the slice and the map; `slices.Clone` and `maps.Clone` are shallow, which is deep enough here only because the elements are strings.
 
 ### Whiteboard version
+
+**In plain words:** The bare idea: commands that can do and undo, plus two stacks for history.
 
 The bare idea: commands with `Do`/`Undo` and a history with two stacks. The full version in section 4 adds the production concerns.
 
@@ -282,7 +319,9 @@ func main() {
 }
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
+
+**In plain words:** One program with a cancel-order command, a worker that retries it, an undo history, and a draft that can snapshot itself. Read it one type at a time.
 
 The code contains the `CancelOrder` command and the `Draft` memento, plus the worker, the undo history and the caretaker.
 
@@ -570,6 +609,9 @@ func main() {
 }
 ```
 
+
+**In plain words:** These are the tests. They check retries, the dead-letter queue, undo and redo, and that a snapshot does not change when the live draft does.
+
 ```go
 // main_test.go
 package main
@@ -775,7 +817,7 @@ The second `Process` call printed nothing because the key `cancel:o-42` was alre
 | Redo | Insert | Delete | `hello world` |
 | Redo | Insert, Delete | — | `hello` |
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Variant | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -789,7 +831,7 @@ The second `Process` call printed nothing because the key `cancel:o-42` was alre
 
 **Command log.** Appending every executed envelope (who, when, type, payload) to an append-only table gives an audit trail for free. It records **intents**, which may have been rejected; [[Event Sourcing]] records **facts** that already happened. A [[CQRS]] command is the same idea at the architecture level: a named, serializable request to change state, handled by exactly one handler.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **A direct call that runs now, once, in process, needs no command.** Wrapping `svc.Cancel(ctx, id)` in a struct and an invoker adds a type and an indirection for nothing.
 - **Do not reach for a struct when a closure works.** If the work never leaves the process and is never inspected, `func(ctx) error` is the whole pattern.
@@ -797,7 +839,7 @@ The second `Process` call printed nothing because the key `cancel:o-42` was alre
 - **Inverse commands vs Memento is memory vs complexity.** Inverses are cheap to store but every command needs a correct inverse, and a bug in one corrupts every later undo. Snapshots are trivially correct but cost the size of the state each time. Many editors mix them: inverses for keystrokes, snapshots for bulk operations.
 - **Undo across systems is not undo.** Once a command has sent an email or charged a card, the "inverse" is a new compensating action (a refund), with its own failure modes. That is the [[Saga Pattern]], not an undo stack.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- `os/exec.Cmd` is a command object: you configure `Path`, `Args`, `Env` and `Dir`, then call `Run` or `Start`. The docs say a `Cmd` cannot be reused after `Run`, `Output` or `CombinedOutput`.
@@ -815,7 +857,7 @@ The second `Process` call printed nothing because the key `cancel:o-42` was alre
 	- Unbounded undo history eats memory in a long session → cap both stacks.
 - **What to monitor:** queue depth and the age of the oldest job, retries and DLQ arrivals per command type, duplicate deliveries skipped, and execution latency per type.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **Making the idempotency claim real.** The in-memory `claim` is atomic within one process. Across processes, store the key in the same database transaction as the side effect, so either both happen or neither does (PostgreSQL 17):
 
@@ -846,7 +888,7 @@ If the side effect lives in another system (a payment provider), pass the same k
 
 **Undo assumes one writer.** Inverse commands replay against the state they were recorded on. With concurrent editors, an undo can reverse someone else's later change; collaborative editors transform operations against each other (operational transforms or CRDTs) instead of using a plain stack.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- When is Command worth it instead of calling the function directly?
 > When the call must happen later, elsewhere, more than once, or be reversible: queues, schedulers, retries, audit logs, undo. If it runs now, once, in process, call the function. In Go, a closure is already a command; use a struct when you must serialize, inspect or undo it.
@@ -866,7 +908,7 @@ If the side effect lives in another system (a payment provider), pass the same k
 > [!question]- Is `snap := *draft` a valid memento? (trap)
 > Only if `Draft` has no slices, maps or pointers. Struct assignment copies the slice header and the map reference, so later in-place edits show up in the "snapshot". Clone them, and remember that `slices.Clone` and `maps.Clone` are shallow.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Command = a request as a value; roles: client, command, invoker, receiver.
 - In Go, start with `func(ctx) error`; use a struct to serialize, inspect or undo.
@@ -877,7 +919,7 @@ If the side effect lives in another system (a payment provider), pass the same k
 - Snapshots must clone slices and maps; `slices.Clone` and `maps.Clone` are shallow.
 - Real Go: `exec.Cmd`, `errgroup.Go`, `time.AfterFunc`, asynq tasks, River jobs, PostgreSQL savepoints.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Interfaces]], [[Chain of Responsibility and Pipelines]], [[Design Patterns Overview and Chooser]]
 - **Next:** [[Iterator and range-over-func]], [[Background Workers and Job Queues]]

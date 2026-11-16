@@ -28,7 +28,38 @@ updated: 2026-11-13
 > - Serve images through a **CDN** with a long cache time. Because images are immutable, each variant has a content-based URL that never changes.
 > - Feed generation reuses the hybrid push and pull design: push post IDs to ordinary followers, pull for celebrities.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A photo app stores two very different kinds of data.
+The photo itself is big. It goes into cheap, huge file storage called **object storage** (like Amazon S3).
+The facts about the photo (who posted it, caption, likes) are small. They go into a normal database.
+The phone uploads the photo straight to object storage using a short-lived upload link, so the app servers never carry the heavy bytes.
+
+```mermaid
+flowchart LR
+    P["Phone"] -- "1. ask for upload link" --> A["App server"]
+    P -- "2. upload bytes" --> S["Object storage"]
+    P -- "3. save post info" --> A --> DB["Database"]
+```
+
+Viewers get photos from a **CDN**: copies kept on servers close to them, so pictures load fast.
+
+```mermaid
+flowchart LR
+    S["Object storage"] --> C["CDN copy near you"] --> V["Viewer's phone"]
+```
+
+So the rest of this note is just these 3 questions:
+1. How do you upload big files reliably on a bad network?
+2. How do you make and serve the right image size for each screen?
+3. How do you build each person's feed of photos?
 
 **The problem in one story.**
 You take a photo on a shaky train network and post it.
@@ -74,7 +105,7 @@ Where it breaks: a lab does not need to show your prints to 300 friends within s
 > [!tip] Remember
 > Metadata in the database, bytes in object storage, served by CDN, uploaded directly by the client.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 People want to share photos with friends and see what friends shared. The technical challenge is volume: a modest app with 200 million daily users produces petabytes of images a year, and every one of those users opens the app many times a day. Photos are big (megabytes), but the feed needs thousands of them per second to feel instant.
 
@@ -99,7 +130,7 @@ People want to share photos with friends and see what friends shared. The techni
 > [!tip] Remember
 > Say out loud on the whiteboard: "photos are blobs, so the database holds only pointers." It tells the interviewer you know where the bytes go.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture a **photo lab with a shop front**. You (the client) walk to the back door of a huge warehouse (object storage) with a stamped pass (the presigned URL) and drop your photo yourself, so the shop clerk (the app server) never carries heavy boxes.
 
@@ -122,7 +153,7 @@ flowchart LR
 > [!tip] Remember
 > Bytes go client to storage to CDN to client. Metadata goes through the app. Two separate roads.
 
-## 3. How it works - high-level design
+## 3. How it works - high-level design 🟡
 
 ### The big picture
 
@@ -171,6 +202,8 @@ flowchart TB
 
 ### Step-by-step: uploading a photo
 
+**In plain words:** get a link, upload the bytes straight to storage, then tell the app "done"; resizing happens after.
+
 1. The client asks `POST /v1/media` with the file size and content type. The server checks auth and a quota.
 2. The server creates a media record with status `pending` and returns a **presigned URL** (or several for multipart upload) that is valid for about 15 minutes.
 3. The client uploads the bytes straight to object storage. For large files it sends 5-10 MB parts and can retry failed parts.
@@ -204,6 +237,8 @@ sequenceDiagram
 
 ### Step-by-step: viewing the feed
 
+**In plain words:** get a list of post IDs, fill in their details, and load the pictures from the CDN.
+
 1. The client calls `GET /v1/feed?cursor=...&limit=20`.
 2. The feed service reads the user's list of post IDs from the feed cache.
 3. It merges recent posts from any celebrities the user follows (pull side).
@@ -230,7 +265,7 @@ sequenceDiagram
     N-->>C: bytes (cache hit)
 ```
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -248,6 +283,8 @@ Metadata: 100M x 365 x 5 yr = 182.5B rows x 300 B = ~55 TB
 ```
 
 ### Estimates (all inputs are assumptions, so all results are estimates)
+
+**In plain words:** rough sums: photos per day, storage per year, and how many image views per second.
 
 | Quantity | Arithmetic | Result |
 | --- | --- | --- |
@@ -271,6 +308,8 @@ Metadata: 100M x 365 x 5 yr = 182.5B rows x 300 B = ~55 TB
 - Most stored data is rarely viewed after the first week. Move old originals to cheaper storage tiers (section 8.5).
 
 ### API
+
+**In plain words:** ask for an upload link, create a post, read the feed, like a photo.
 
 ```http
 POST /v1/media
@@ -300,6 +339,8 @@ Content-Type: application/json
 See [[Idempotency and Idempotency Keys]] and [[Pagination, Filtering and Sorting]].
 
 ### Data model
+
+**In plain words:** users, posts, follows and likes in the database; the image files in object storage.
 
 ```mermaid
 erDiagram
@@ -371,9 +412,11 @@ Store each variant under a key such as `img/{hash prefix}/{content_hash}_{size}.
 5. A fan-out worker reads Asha's 800 followers and pushes the post ID onto each follower's feed list. Asha is not a celebrity, so push is chosen.
 6. A follower opens the app. The feed service returns the post with `https://cdn.example.com/img/ab/ab12..._640.jpg`. The first viewer in the region causes a CDN miss; the next thousand are CDN hits.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Upload path
+
+**In plain words:** ways to get the bytes from the phone into storage, and the trade-offs of each.
 
 | Option | How | Strengths | Weaknesses |
 | --- | --- | --- | --- |
@@ -385,6 +428,8 @@ See [[File Upload Architecture]] and [[File Uploads and Object Storage]].
 
 ### Image processing
 
+**In plain words:** when to make the smaller sizes: right after upload, or the first time someone asks.
+
 | Option | When processed | Strengths | Weaknesses |
 | --- | --- | --- | --- |
 | Eagerly on upload (chosen for standard sizes) | A worker makes all variants right after upload | Fast first view; predictable cost | Wastes work on sizes nobody requests |
@@ -392,6 +437,8 @@ See [[File Upload Architecture]] and [[File Uploads and Object Storage]].
 | Hybrid | Eagerly make 2-3 common sizes, lazily make the rest, cache in CDN | Balances both | More moving parts |
 
 ### Feed strategy
+
+**In plain words:** copy new posts into followers' lists ahead of time, or gather them when the feed opens.
 
 | Option | Summary | Note |
 | --- | --- | --- |
@@ -403,6 +450,8 @@ The full treatment is in [[Case Study - News Feed]]; the general push-versus-pul
 
 ### Image formats
 
+**In plain words:** newer image formats look the same at fewer bytes, but not every phone supports them.
+
 | Format | Quality per byte | Support | Use |
 | --- | --- | --- | --- |
 | JPEG | Baseline | Universal | Safe default |
@@ -411,7 +460,7 @@ The full treatment is in [[Case Study - News Feed]]; the general push-versus-pul
 
 Serve the best format the client advertises in its `Accept` header, and cache each format as its own object.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Presigned direct upload over proxying bytes because** it keeps terabytes off the app tier and scales with the storage service. Price: the server cannot inspect bytes inline, so validation happens afterward and rejected files must be cleaned up.
 - **Object storage over a database blob column because** a database is priced and tuned for small rows, and images would bloat backups and replication. Price: you maintain a pointer and must keep the two consistent (section 7).
@@ -424,7 +473,15 @@ Serve the best format the client advertises in its `Accept` header, and cache ea
 > [!warning] Common mistake
 > Saving the post row before the file is safely uploaded. If the upload then fails, you have a post pointing at nothing. Mark media `pending` first, and only create the visible post when the object is confirmed.
 
-## 7. In production
+```mermaid
+flowchart LR
+    U["Upload starts"] --> P["Post marked 'pending'"]
+    P --> F{"File safely stored?"}
+    F -- "yes" --> L["Post goes live"]
+    F -- "no" --> X["Never shown; cleaned up later"]
+```
+
+## 7. In production 🔴
 
 - **Instagram (public engineering posts):** the 2012 sharding post describes PostgreSQL with many logical shards mapped to fewer physical servers, and 64-bit IDs that embed a timestamp, a shard ID and a sequence number so IDs are generated inside the database without a central service.
 
@@ -442,7 +499,7 @@ Serve the best format the client advertises in its `Accept` header, and cache ea
 	- *Inconsistent metadata and storage:* a daily reconciliation job lists objects and rows, flags orphans and deletes them after a grace period.
 - **What to monitor (targets are estimates):** upload success rate above 99%, time from upload to `ready` under 10 seconds at p95, CDN hit ratio above 95%, image p99 time to first byte, feed fan-out lag, queue depth for image workers, and storage growth per day.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### 8.1 Reliable uploads on bad networks
 
@@ -496,6 +553,8 @@ Key points:
 
 ### 8.3 Serving images: CDN, sizes and cache keys
 
+**In plain words:** pick the right size for the screen, and use file names that never change so the CDN can keep them forever.
+
 1. The metadata contains a list of variant keys, not full URLs. The service builds URLs with the CDN host, so you can switch CDN vendors.
 2. The client picks the smallest variant at least as wide as its screen slot (device pixels matter).
 3. The CDN caches by full URL. Because each URL is immutable, set a one-year cache lifetime.
@@ -514,6 +573,8 @@ flowchart LR
 See [[CDN and Edge]].
 
 ### 8.4 Likes and views: counters without hot rows
+
+**In plain words:** one famous photo gets thousands of likes a minute; do not make them all update one row. Batch them.
 
 A photo from a celebrity can get 50,000 likes a minute. An `UPDATE posts SET like_count = like_count + 1` on one row serializes on a lock and becomes a hot spot.
 
@@ -548,6 +609,8 @@ flowchart LR
 
 ### 8.6 Privacy, deletion and abuse
 
+**In plain words:** hide a deleted photo right away, then clean up its files and CDN copies later.
+
 - **Deleting a photo:** mark the post `deleted` immediately (hides it everywhere because hydration checks it), then a background job removes objects and variants, and a CDN purge handles any cached copies. Remember backups and legal retention.
 - **Private accounts:** the feed service checks the viewer follows the author at read time; image URLs are signed.
 - **Abuse:** hash-match uploads against known-bad lists, run a classifier, rate-limit uploads per user ([[Rate Limiting - Algorithms and Distributed Design]]), and queue reports for review.
@@ -555,7 +618,7 @@ flowchart LR
 > [!tip] Remember
 > The hard parts here are not exotic. They are: keep bytes out of your servers, make uploads resumable, make URLs immutable so the CDN does the work, and never put a hot row on the like counter.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why not store images in the database?
 > A database is tuned for small rows and transactional access. Multi-megabyte blobs inflate backups, replication and cache memory, and make the database the bandwidth bottleneck. Object storage is cheaper per byte, built for durability, and serves through a CDN. Keep only the object key and metadata in the database.
@@ -585,7 +648,7 @@ flowchart LR
 > [!question]- What if traffic grows 10 times?
 > Image bytes scale with the CDN and object store, so add CDN capacity, a shield tier and more regions. Metadata needs more shards (by author ID) and more read replicas or cache. Fan-out needs more workers and a lower celebrity threshold. Image workers scale by queue depth. The first thing to watch is origin egress and fan-out lag.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 A 45-minute script:
 

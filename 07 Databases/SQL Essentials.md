@@ -66,7 +66,44 @@ updated: 2026-11-13
 > - Joins multiply rows: joining a one-to-many table before summing double-counts money.
 > - Values always go in as parameters (`$1`), never by string concatenation.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2, the first four parts of section 3 (schema, clause order, joins, grouping) and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add the rest of section 3 (windows, CTEs, NULL, constraints, upserts), section 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A database keeps your data in **tables**: grids of rows and columns, like a spreadsheet.
+SQL is the language you use to ask those tables questions.
+You say *what* you want, for example "clients who owe more than 1,000 rupees".
+You do not say *how* to find it; the database works that out.
+
+```mermaid
+flowchart LR
+    Q["your question in SQL"] --> D["database works out how"]
+    D --> R["small answer table"]
+```
+
+Most questions need two tables at once, like invoices and clients.
+Gluing them together on a shared column is called a **join**.
+Then you can group rows (one group per client) and add up each group.
+
+```mermaid
+flowchart LR
+    I["invoices"] --> J["join on client_id"]
+    C["clients"] --> J
+    J --> G["group by client,<br/>add up amounts"]
+```
+
+Two things trip up almost everyone: empty values (`NULL`), and joins that quietly copy rows so totals come out too big.
+
+The rest of this note is just these 4 questions:
+1. In what order does the database apply the parts of a query?
+2. How do joins and grouping turn many rows into an answer?
+3. Why does `NULL` behave so strangely?
+4. How do you send user values to SQL safely?
 
 **The problem in one story.**
 Your company keeps clients, invoices and payments in a database.
@@ -113,7 +150,7 @@ Where it breaks: the kitchen never changes your order, but SQL rules like `NULL`
 > [!tip] Remember
 > Describe the result you want, pass values as parameters, and watch out for `NULL` and joins that multiply rows.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps' collections page asks: *which clients owe money on overdue invoices, and how late are they?*
 
@@ -123,7 +160,19 @@ For a report over a 10-million-row `invoices` table it means pulling about 1.5 G
 
 SQL sends the question to the data instead. The server filters, joins and adds up next to the storage, then returns three rows. Because the query states only the result, the same text keeps working when you add an index or the table grows tenfold: the planner simply picks a new way to run it.
 
-## 2. Mental model
+**Loop in Go vs ask in SQL, as a picture.**
+
+```mermaid
+flowchart LR
+    subgraph Without SQL
+    A["pull 10M rows<br/>(about 1.5 GB)"] --> B["loop in Go"] --> C["3 numbers"]
+    end
+    subgraph With SQL
+    D["send the question"] --> E["database adds up<br/>next to the data"] --> F["3 rows back"]
+    end
+```
+
+## 2. Mental model 🟢
 
 - A **table** (a *relation* in Codd's 1970 model) holds **rows** that share the same **columns**. Each row is one fact: "invoice INV-102 belongs to client 10 and is overdue".
 - A **query** is a pipeline of steps that each take a table and return a table: build rows (`FROM`, `JOIN`), drop rows (`WHERE`), fold rows into groups (`GROUP BY`), drop groups (`HAVING`), compute output columns (`SELECT`), sort (`ORDER BY`), cut (`LIMIT`).
@@ -131,9 +180,11 @@ SQL sends the question to the data instead. The server filters, joins and adds u
 
 **Analogy:** a query is a recipe for a spreadsheet. "Match these two sheets on client id, delete rows that are not overdue, pivot by client, keep pivots above ₹0, sort by amount." You hand over the recipe; the kitchen chooses the knives.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The running schema
+
+**In plain words:** four small tables used in every example: clients, their invoices, the lines on each invoice, and payments.
 
 A trimmed InvoiceOps schema with four tables. The full DDL is in [[SQL Essentials - Go]]; the production version with tenant-safe keys is in [[Relational Schema Design]]. Columns ending in `_minor` hold money as integer **minor units** (paise): ₹1,500.00 is `150000`.
 
@@ -178,6 +229,8 @@ INV-102 has two line items (₹1,500 logo and ₹1,000 brand guide) and one paym
 
 ### Logical processing order
 
+**In plain words:** you write SELECT first, but the database reads FROM first. Knowing the real order explains most "why can't I use that name here?" errors.
+
 You write `SELECT … FROM … WHERE …`, but PostgreSQL defines the result as if the clauses ran in this order:
 
 ```mermaid
@@ -194,6 +247,8 @@ What follows from it (PostgreSQL 17):
 - The order is **logical**. The planner may push filters below joins, reorder inner joins, or read an index in sorted order so no sort runs, as long as the result is the same. See [[Query Plans and EXPLAIN]].
 
 ### Joins
+
+**In plain words:** a join lines up rows from two tables that share a value, like matching each invoice to its client by client id.
 
 | Join (clients `c`, invoices `i`)                       | Keeps                                             | Rows on the sample      |
 | ------------------------------------------------------ | ------------------------------------------------- | ----------------------- |
@@ -241,6 +296,8 @@ LEFT JOIN invoices i ON i.client_id = c.id AND i.status = 'overdue';
 
 ### Grouping and aggregates
 
+**In plain words:** sort rows into piles (one per client), then count or add up each pile. Each pile becomes one output row.
+
 A `LEFT JOIN` from clients to invoices, grouped by client, shows the difference between the two counts. The full query (with `FILTER` columns) and its output table are in [[SQL Essentials - Go]]. The key lines:
 
 ```sql
@@ -266,6 +323,8 @@ With the `FILTER` columns, the representative open balances are 150000 (Acme Cor
 - `FILTER (WHERE …)` aggregates a subset of each group without a second query.
 
 ### Window functions
+
+**In plain words:** like grouping, but you keep every row and add a column such as "running total" or "rank within this client".
 
 A window function computes over a set of rows related to the current row, like `GROUP BY` that keeps every row.
 
@@ -325,6 +384,8 @@ WHERE rn = 1;
 
 ### Subqueries and CTEs
 
+**In plain words:** a query inside a query. A CTE (`WITH name AS (...)`) just gives that inner query a name so the big query reads top to bottom.
+
 - **Scalar subquery:** returns one value, e.g. `(SELECT max(paid_at) FROM payments p WHERE p.invoice_id = i.id)`. It is *correlated*: it refers to the outer row.
 - **`IN` / `EXISTS`:** a semi-join. `EXISTS` stops at the first match.
 - **Derived table:** a subquery in `FROM`, as in the latest-invoice query above.
@@ -342,6 +403,8 @@ flowchart LR
 The anchor yields `{10}`, the first step adds `{11}`, the second step finds nothing and recursion stops. Representative output (PostgreSQL 17): `group_open_minor = 230000` (150000 from INV-102 plus 80000 from INV-103). If the data could contain a cycle, add PostgreSQL 14's `CYCLE id SET is_cycle USING path` clause.
 
 ### NULL and three-valued logic
+
+**In plain words:** NULL means "we don't know". Asking "is unknown equal to 5?" gives "don't know", not yes or no, and "don't know" rows get dropped.
 
 A comparison with NULL is neither true nor false but **UNKNOWN**.
 
@@ -382,6 +445,8 @@ WHERE NOT EXISTS (SELECT 1 FROM clients ch WHERE ch.parent_id = c.id);
 
 ### Constraints
 
+**In plain words:** rules the database enforces for you, like "this can't be empty" or "no two rows with the same email". Break one and the write is refused.
+
 | Constraint             | Rejects                                                       | SQLSTATE on violation         |
 | ---------------------- | ------------------------------------------------------------- | ----------------------------- |
 | `NOT NULL`             | a missing value                                               | 23502 not_null_violation      |
@@ -393,6 +458,8 @@ WHERE NOT EXISTS (SELECT 1 FROM clients ch WHERE ch.parent_id = c.id);
 Your Go code should map these codes to API errors (23505 → 409 Conflict). Which invariants to encode is a design question for [[Relational Schema Design]]; why they matter for correctness is in [[Transactions and ACID]].
 
 ### Writing: RETURNING, upserts and MERGE
+
+**In plain words:** handy write tricks: get the new id back straight away, and "insert, or update if it already exists" in one safe step.
 
 ```sql
 -- RETURNING hands back generated values in the same round trip
@@ -435,9 +502,11 @@ WHEN NOT MATCHED THEN INSERT (workspace_id, name, email) VALUES (s.workspace_id,
 RETURNING merge_action(), c.id;
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the smallest query that answers "who owes us money": join, filter, group, total.
 
 The whole collections question fits in one statement: join, filter, group, filter groups, sort.
 
@@ -454,6 +523,8 @@ ORDER  BY owed_minor DESC;
 The full version below adds tenant filters, lateness buckets, the traced execution order and a safe query builder.
 
 ### The collections query, traced
+
+**In plain words:** one bigger real query, followed row by row so you can see each clause change the table.
 
 The full SQL (about 19 lines: a CTE of open invoices, a join, a group, a `HAVING`, two window functions) is in [[SQL Essentials - Go]]. Here is what each clause does to the six sample invoices.
 
@@ -488,6 +559,8 @@ Two details are worth checking against the trace. INV-104 is not late yet (−18
 
 ### Building SQL safely from Go
 
+**In plain words:** never glue user text into SQL. Put `$1` in the SQL and pass the value separately, so it can only ever be a value.
+
 Values must travel as **parameters** (`$1`, `$2`). Drivers such as pgx send the SQL text and the values in separate protocol messages by default, so a value can never become SQL. Column names and `ASC`/`DESC` cannot be parameters, so the builder maps user input to fixed fragments from a whitelist and ends every sort with the unique `id`.
 
 ```mermaid
@@ -515,7 +588,7 @@ WHERE workspace_id = $1 AND status = $2 ORDER BY due_date DESC, id DESC LIMIT $3
 
 A sort key outside the whitelist (`"due_date; DROP TABLE invoices"`) is rejected before any SQL exists. Runnable Go version: [[SQL Essentials - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 The same question can often be written several ways. They differ in NULL behaviour and in the plans they allow.
 
@@ -533,7 +606,7 @@ The same question can often be written several ways. They differ in NULL behavio
 | Totals next to detail      | window function                            | aggregate over a window, rows kept                  | running totals, shares, ranks              | sorts per partition                                               |
 |                            | join to a grouped subquery                 | aggregate once, join back                           | other engines lack the window you need     | an extra join                                                     |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Push work to the database when it shrinks data.** Filtering and aggregating 10 million rows into 3 belongs in SQL. Business rules with many branches belong in Go, where they can be unit tested; a 200-line query nobody can change is a liability.
 - **CTEs are for readability, not speed.** Since PostgreSQL 12 they are usually inlined. `MATERIALIZED` makes the CTE an optimization fence: good for an expensive step used twice, bad when the outer filter could have pushed into it.
@@ -541,7 +614,15 @@ The same question can often be written several ways. They differ in NULL behavio
 - **`SELECT *` in application code** breaks when columns are added or reordered and fetches columns you do not need, including large ones.
 - **Dialects differ.** MySQL 8.0 has `ON DUPLICATE KEY UPDATE` instead of `ON CONFLICT` and no `RETURNING`. Portable SQL is a goal only if you really plan to switch engines.
 
-## 7. In production
+**OFFSET vs keyset paging, as a picture.** OFFSET is like reading a book from page 1 every time to reach page 1,000; keyset is like a bookmark.
+
+```mermaid
+flowchart LR
+    O["OFFSET 19980 LIMIT 20"] --> O2["read 20,000 rows,<br/>throw away 19,980"]
+    K["WHERE id > last_seen<br/>LIMIT 20"] --> K2["jump to bookmark,<br/>read 20 rows"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:**
 	- PostgreSQL, MySQL, SQL Server, Oracle and SQLite all speak SQL, with different upsert, `RETURNING` and `LIMIT` syntax.
@@ -561,7 +642,7 @@ The same question can often be written several ways. They differ in NULL behavio
 	- Error rates by SQLSTATE class: class 23 (integrity) and 40 (rollbacks).
 	- `log_min_duration_statement` for slow statements.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why `NOT IN` is also slow.** Because of its NULL semantics, the planner cannot turn `NOT IN (subquery)` into an anti-join. It becomes a hashed SubPlan when the subquery result fits in `work_mem`, otherwise a plain SubPlan that rescans the subquery per outer row, which is quadratic. `NOT EXISTS` becomes a Hash or Merge Anti Join.
 - **ON CONFLICT under concurrency.** Postgres inserts *speculatively*: it probes the arbiter index, and if another transaction is inserting the same key it waits for that transaction to finish, then re-checks. In Read Committed the docs guarantee one of the two outcomes, insert or update. If the conflicting row comes from a transaction your snapshot cannot see, the `UPDATE` still applies to it, although no version of that row is visible to your statement.
@@ -570,7 +651,7 @@ The same question can often be written several ways. They differ in NULL behavio
 - **Logical order vs plan.** Inner joins commute, so the planner chooses the join order itself. `join_collapse_limit` (default 8) caps how many explicit `JOIN`s it reorders freely, and from `geqo_threshold` (default 12) relations it switches to a genetic search. Outer joins restrict reordering, which is one reason an innocent `LEFT JOIN` can change a plan.
 - **Three-valued logic in constraints.** Because `CHECK` passes on UNKNOWN, a constraint that must hold even when values are missing needs `NOT NULL` too, or an explicit `IS NOT NULL` inside the check.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Trap: `SELECT name FROM clients WHERE id NOT IN (SELECT parent_id FROM clients)` returns no rows, although most clients have no children. Why?
 > `parent_id` contains NULLs. `x NOT IN (…, NULL)` expands to `x <> … AND x <> NULL`, and `x <> NULL` is UNKNOWN, so the whole condition is never TRUE. Use `NOT EXISTS (SELECT 1 FROM clients ch WHERE ch.parent_id = c.id)`, which is NULL-safe and planned as an anti-join.
@@ -593,7 +674,7 @@ The same question can often be written several ways. They differ in NULL behavio
 > [!question]- Why does `WHERE paid_at::date = '2026-11-01'` ignore the index on paid_at, and what else is wrong with it?
 > The index stores `paid_at` values, not `paid_at::date`, so the planner cannot search it; use a half-open range on the raw column. The cast also uses the session's `TimeZone`, so the "day" moves with the connection's setting. Name the zone in the range bounds.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Logical order: FROM/JOIN → WHERE → GROUP BY → HAVING → SELECT (windows) → DISTINCT → ORDER BY → LIMIT.
 - NULL makes comparisons UNKNOWN: `WHERE` keeps only TRUE, `CHECK` rejects only FALSE. Use `IS NULL`, `IS DISTINCT FROM`, `coalesce`.
@@ -604,7 +685,7 @@ The same question can often be written several ways. They differ in NULL behavio
 - Parameters for values, a whitelist for identifiers; always end `ORDER BY` with a unique column.
 - Keep the column bare in predicates: no casts or functions on it, no type mismatches.
 
-## Links
+## Links 🟢
 
 - **Before this:** nothing required. This note opens [[07 Databases MOC]].
 - **Next:** [[Relational Schema Design]], [[Transactions and ACID]], [[Indexing Fundamentals]]
@@ -660,7 +741,7 @@ Where it breaks: the kitchen never changes your order, but SQL rules like `NULL`
 > [!tip] Remember
 > Describe the result you want, pass values as parameters, and watch out for `NULL` and joins that multiply rows.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps' collections page asks: *which clients owe money on overdue invoices, and how late are they?*
 
@@ -670,7 +751,7 @@ For a report over a 10-million-row `invoices` table it means pulling about 1.5 G
 
 SQL sends the question to the data instead. The server filters, joins and adds up next to the storage, then returns three rows. Because the query states only the result, the same text keeps working when you add an index or the table grows tenfold: the planner simply picks a new way to run it.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 - A **table** (a *relation* in Codd's 1970 model) holds **rows** that share the same **columns**. Each row is one fact: "invoice INV-102 belongs to client 10 and is overdue".
 - A **query** is a pipeline of steps that each take a table and return a table: build rows (`FROM`, `JOIN`), drop rows (`WHERE`), fold rows into groups (`GROUP BY`), drop groups (`HAVING`), compute output columns (`SELECT`), sort (`ORDER BY`), cut (`LIMIT`).
@@ -678,7 +759,7 @@ SQL sends the question to the data instead. The server filters, joins and adds u
 
 **Analogy:** a query is a recipe for a spreadsheet. "Match these two sheets on client id, delete rows that are not overdue, pivot by client, keep pivots above ₹0, sort by amount." You hand over the recipe; the kitchen chooses the knives.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The running schema
 
@@ -982,7 +1063,7 @@ WHEN NOT MATCHED THEN INSERT (workspace_id, name, email) VALUES (s.workspace_id,
 RETURNING merge_action(), c.id;
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -1062,7 +1143,7 @@ WHERE workspace_id = $1 AND status = $2 ORDER BY due_date DESC, id DESC LIMIT $3
 
 A sort key outside the whitelist (`"due_date; DROP TABLE invoices"`) is rejected before any SQL exists. Runnable Go version: [[SQL Essentials - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 The same question can often be written several ways. They differ in NULL behaviour and in the plans they allow.
 
@@ -1080,7 +1161,7 @@ The same question can often be written several ways. They differ in NULL behavio
 | Totals next to detail      | window function                            | aggregate over a window, rows kept                  | running totals, shares, ranks              | sorts per partition                                               |
 |                            | join to a grouped subquery                 | aggregate once, join back                           | other engines lack the window you need     | an extra join                                                     |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Push work to the database when it shrinks data.** Filtering and aggregating 10 million rows into 3 belongs in SQL. Business rules with many branches belong in Go, where they can be unit tested; a 200-line query nobody can change is a liability.
 - **CTEs are for readability, not speed.** Since PostgreSQL 12 they are usually inlined. `MATERIALIZED` makes the CTE an optimization fence: good for an expensive step used twice, bad when the outer filter could have pushed into it.
@@ -1088,7 +1169,7 @@ The same question can often be written several ways. They differ in NULL behavio
 - **`SELECT *` in application code** breaks when columns are added or reordered and fetches columns you do not need, including large ones.
 - **Dialects differ.** MySQL 8.0 has `ON DUPLICATE KEY UPDATE` instead of `ON CONFLICT` and no `RETURNING`. Portable SQL is a goal only if you really plan to switch engines.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- PostgreSQL, MySQL, SQL Server, Oracle and SQLite all speak SQL, with different upsert, `RETURNING` and `LIMIT` syntax.
@@ -1108,7 +1189,7 @@ The same question can often be written several ways. They differ in NULL behavio
 	- Error rates by SQLSTATE class: class 23 (integrity) and 40 (rollbacks).
 	- `log_min_duration_statement` for slow statements.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why `NOT IN` is also slow.** Because of its NULL semantics, the planner cannot turn `NOT IN (subquery)` into an anti-join. It becomes a hashed SubPlan when the subquery result fits in `work_mem`, otherwise a plain SubPlan that rescans the subquery per outer row, which is quadratic. `NOT EXISTS` becomes a Hash or Merge Anti Join.
 - **ON CONFLICT under concurrency.** Postgres inserts *speculatively*: it probes the arbiter index, and if another transaction is inserting the same key it waits for that transaction to finish, then re-checks. In Read Committed the docs guarantee one of the two outcomes, insert or update. If the conflicting row comes from a transaction your snapshot cannot see, the `UPDATE` still applies to it, although no version of that row is visible to your statement.
@@ -1117,7 +1198,7 @@ The same question can often be written several ways. They differ in NULL behavio
 - **Logical order vs plan.** Inner joins commute, so the planner chooses the join order itself. `join_collapse_limit` (default 8) caps how many explicit `JOIN`s it reorders freely, and from `geqo_threshold` (default 12) relations it switches to a genetic search. Outer joins restrict reordering, which is one reason an innocent `LEFT JOIN` can change a plan.
 - **Three-valued logic in constraints.** Because `CHECK` passes on UNKNOWN, a constraint that must hold even when values are missing needs `NOT NULL` too, or an explicit `IS NOT NULL` inside the check.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Trap: `SELECT name FROM clients WHERE id NOT IN (SELECT parent_id FROM clients)` returns no rows, although most clients have no children. Why?
 > `parent_id` contains NULLs. `x NOT IN (…, NULL)` expands to `x <> … AND x <> NULL`, and `x <> NULL` is UNKNOWN, so the whole condition is never TRUE. Use `NOT EXISTS (SELECT 1 FROM clients ch WHERE ch.parent_id = c.id)`, which is NULL-safe and planned as an anti-join.
@@ -1140,7 +1221,7 @@ The same question can often be written several ways. They differ in NULL behavio
 > [!question]- Why does `WHERE paid_at::date = '2026-11-01'` ignore the index on paid_at, and what else is wrong with it?
 > The index stores `paid_at` values, not `paid_at::date`, so the planner cannot search it; use a half-open range on the raw column. The cast also uses the session's `TimeZone`, so the "day" moves with the connection's setting. Name the zone in the range bounds.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Logical order: FROM/JOIN → WHERE → GROUP BY → HAVING → SELECT (windows) → DISTINCT → ORDER BY → LIMIT.
 - NULL makes comparisons UNKNOWN: `WHERE` keeps only TRUE, `CHECK` rejects only FALSE. Use `IS NULL`, `IS DISTINCT FROM`, `coalesce`.
@@ -1151,7 +1232,7 @@ The same question can often be written several ways. They differ in NULL behavio
 - Parameters for values, a whitelist for identifiers; always end `ORDER BY` with a unique column.
 - Keep the column bare in predicates: no casts or functions on it, no type mismatches.
 
-## Links
+## Links 🟢
 
 - **Before this:** nothing required. This note opens [[07 Databases MOC]].
 - **Next:** [[Relational Schema Design]], [[Transactions and ACID]], [[Indexing Fundamentals]]

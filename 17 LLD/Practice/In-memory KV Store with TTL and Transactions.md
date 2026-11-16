@@ -29,7 +29,29 @@ updated: 2026-11-13
 > - `ROLLBACK` pops one layer; an inner `COMMIT` merges into its parent; the outermost `COMMIT` applies all writes in one critical section, so other sessions see all or nothing.
 > - Concurrency: one mutex on the store, one per session, and a fixed lock order (session before store) so there is no deadlock.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs) and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Think of a tiny Redis: a box of name-value pairs kept in memory. You can save a value, read it back and delete it. A value can have a **TTL**, a time to live, after which it is gone. You can also start a **transaction** with BEGIN, make changes, then keep them with COMMIT or throw them away with ROLLBACK. Transactions can sit inside other transactions. Each one is just a layer of changes stacked on top of the real data.
+
+```mermaid
+flowchart LR
+    A["Real data"] --> B["BEGIN: layer 1"]
+    B --> C["BEGIN: layer 2"]
+    C -- "ROLLBACK" --> B
+    B -- "COMMIT" --> A
+```
+
+Everything else in this note is just these 3 questions:
+1. How do keys expire on time?
+2. How do nested transactions stack and undo?
+3. How do you keep it safe when many users use it at once?
 
 **The problem in one story.**
 A web app stores login sessions so users stay signed in.
@@ -75,7 +97,7 @@ Where it breaks: paper never expires, while every key here may carry a deadline 
 > [!tip] Remember
 > Store absolute expiry times, delete expired keys on read and in the background, and keep transactions as a stack of small maps.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design an in-memory key-value store with:
@@ -97,7 +119,7 @@ it passes, even if nobody reads them again. Many clients use the store at once.
 5. Add the locks and state the lock order.
 6. Test TTL at the exact boundary, the sweeper, nested rollback, inner commit then outer rollback, and many concurrent sessions under `-race`.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 ### Questions to ask (with assumed answers)
 
@@ -129,7 +151,7 @@ it passes, even if nobody reads them again. Many clients use the store at once.
 - Replication, sharding and persistence (see [[Case Study - Key-Value Store]]).
 - A network protocol; a command parser is a short follow-up.
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 |---|---|
@@ -140,7 +162,7 @@ it passes, even if nobody reads them again. Many clients use the store at once.
 
 The hardest use case is a **read inside nested transactions** that must see the right version: the newest layer that mentions the key, a tombstone meaning "deleted", or the store.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
@@ -152,7 +174,7 @@ The hardest use case is a **read inside nested transactions** that must see the 
 
 Modelling insight: **a transaction layer stores only differences**. Copying the whole store on `BEGIN` is O(size) per `BEGIN` and is the most common wrong answer. **A delete inside a transaction must be a tombstone**, not a missing entry, because "missing" means "look further down" while the delete means "stop, it is gone".
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -193,7 +215,7 @@ classDiagram
     op *-- entry
 ```
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 A text protocol in the style of the classic interview problem, with one connection per session:
 
@@ -222,7 +244,7 @@ func (x *Session) Rollback() error // ErrNoTransaction
 func (x *Session) Commit() error   // ErrNoTransaction
 ```
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
 
 Everything is in memory; there is no repository. What the store keeps:
 
@@ -236,7 +258,7 @@ Memory estimate: a layer costs only the keys written inside it, so `BEGIN` follo
 
 Durability, if asked: append every committed write to a log file and replay it on start, and take periodic snapshots so replay stays short. This is the Redis RDB and AOF idea ([[Redis Persistence - RDB and AOF]]); the commit path would write the whole outermost layer as one log record so a crash never leaves half a transaction.
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 |---|---|---|
@@ -251,7 +273,7 @@ Patterns not used, and why:
 - No Memento snapshot of the whole store per `BEGIN`: correct but O(size) memory and time per transaction.
 - No min-heap of expiry times: it gives exact, ordered expiry, but each update to a key's TTL needs an index into the heap, and lazy expiry plus sampling is enough for correctness. The heap is the right choice when expiry callbacks must fire on time (see [[Task Scheduler (delayed and recurring jobs)]]).
 
-## Folder structure
+## Folder structure 🟡
 
 ```text
 kvstore/
@@ -262,7 +284,7 @@ kvstore/
 cmd/kvcli/main.go -> line parser: SET/GET/DELETE/TTL/BEGIN/ROLLBACK/COMMIT
 ```
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > Aim for about 220 lines in the room.
@@ -304,6 +326,8 @@ Lock order: a session method takes `x.mu`, then may take `store.mu`. No store me
 
 > [!tip] Exercise: a `COUNT value` command
 > The classic variant asks for "how many keys currently hold this value". Add `counts map[string]int` to the store, update it in `put` and `remove`, and decide what `COUNT` returns inside a transaction. The honest answer needs the layers too: walk the layers to adjust the committed count for keys they overwrite. Write the test with a tombstone in it.
+
+**In plain words:** The store and the session. A session keeps a stack of change layers; reads look at the top layer first, then down to the real data.
 
 ```go
 package kvstore
@@ -582,9 +606,11 @@ func (x *Session) Commit() error {
 }
 ```
 
-## Test cases
+## Test cases 🟡
 
 A fake clock built on `atomic.Int64` is safe to read from the janitor goroutine. Run with `go test -race ./...` (Go 1.24.4, all pass).
+
+**In plain words:** A fake clock you move by hand, so tests can expire keys instantly and check nested commits and rollbacks.
 
 ```go
 package kvstore
@@ -805,7 +831,7 @@ func TestConcurrentSessions(t *testing.T) {
 - `TestTTLInsideTransaction` shows TTLs are absolute: a key set with a 30 s TTL and committed 31 s later is already expired.
 - `TestConcurrentSessions` runs 50 sessions with nested transactions while the janitor sweeps; under `-race` there are no data races and every committed key is present.
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | What happens | How the design handles it |
 |---|---|---|
@@ -830,7 +856,7 @@ func TestConcurrentSessions(t *testing.T) {
 - Storing a relative TTL and recomputing it at commit.
 - `RWMutex` with lazy deletion inside `Get` under the read lock: a write under a read lock is a data race.
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 |---|---|
@@ -850,7 +876,7 @@ Tradeoffs chosen:
 - **Layered maps over snapshots.** `BEGIN` is O(1), memory is proportional to writes, and reads pay O(depth), which is tiny in practice.
 - **Sampled sweep over a heap.** No index maintenance on every `SET`; expiry timing is approximate, but correctness comes from lazy expiry on read.
 
-## Drawing
+## Drawing 🟢
 
 ```mermaid
 sequenceDiagram
@@ -887,7 +913,7 @@ Redraw it from memory:
 - [ ] Inner commit merges into the parent; outermost commit applies under one lock
 - [ ] The lock order: session, then store
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- Why both lazy and active expiry?
 > Lazy expiry alone is correct (an expired key is never returned) but leaks memory for keys that are written once and never read again. Active expiry alone either scans everything (slow, long lock holds) or misses keys between sweeps. Together, reads are always correct and the sampled sweep reclaims memory in small, bounded steps. Redis documents the same combination.
@@ -913,7 +939,7 @@ Redraw it from memory:
 > [!question]- How do you test TTL without sleeping?
 > Inject `now func() time.Time`. Tests use a fake clock and advance it by exact durations, including the exact expiry instant. Only the janitor test uses real time, for the ticker, and it waits with a deadline rather than a fixed sleep.
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - `entry{val, exp}`; TTL becomes an absolute time at `SET`; plain `SET` clears the TTL.
 - Lazy expiry in the single read path; active expiry samples a `withTTL` set in bounded rounds.
@@ -923,7 +949,7 @@ Redraw it from memory:
 - Read committed and last writer wins unless you add version checks.
 - Injected clock; `!now.Before(exp)` means expired at the exact instant.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Concurrency for LLD]], [[Command, Undo and Memento]], [[ATM]]
 - **Next:** [[Task Scheduler (delayed and recurring jobs)]]

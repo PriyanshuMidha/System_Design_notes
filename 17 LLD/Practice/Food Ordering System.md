@@ -30,7 +30,27 @@ updated: 2026-11-13
 > - Refunds go into an outbox (a pending-work row written together with the status change, sent later by a relay with retries); a timer auto-rejects orders the restaurant ignores.
 > - Classic mistakes: computing the total from the live menu, and calling the refund gateway inline right after setting `REJECTED`.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+You open a food app, pick a restaurant and add dishes to your cart. The cart is a draft: you can change it freely, and it belongs to one restaurant only. When you check out, the app makes an **order** and freezes the prices at that moment. The order then moves through fixed steps: placed, accepted, cooking, picked up, delivered. Only certain moves are allowed, like you cannot deliver before cooking. That set of allowed moves is a **state machine**.
+
+```mermaid
+flowchart LR
+    A["Cart, editable"] -- "checkout" --> B["Order placed"]
+    B --> C["Accepted"] --> D["Cooking"] --> E["Picked up"] --> F["Delivered"]
+```
+
+Everything else in this note is just these 3 questions:
+1. Why keep the cart and the order as two different things?
+2. Which order status moves are allowed, and who may make them?
+3. How do you make payment and retries safe?
 
 **The problem in one story.**
 You add a pizza and a cola to your cart and tap "Place order" twice because the app feels slow.
@@ -78,7 +98,7 @@ Where it breaks: a paper slip has no "only the kitchen may mark it ready" rule; 
 > [!tip] Remember
 > Freeze the cart, snapshot the prices, charge once per key, and move status only through the transition table.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design a food ordering app (Swiggy / Zomato style). Restaurants list menus. A user adds
@@ -103,7 +123,7 @@ It also tests whether payment, delivery and notifications stay behind interfaces
 
 Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 to 40 for code, 10 for edge cases.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 | Question to ask | Assumption |
 | --- | --- |
@@ -119,7 +139,7 @@ Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 
 - **Non-functional:** no double order or double charge; no lock held during network calls; a refund is never lost, even if the gateway is down; one status at a time with atomic transitions; providers are swappable.
 - **Out of scope:** search, ratings, taxes, live tracking, scheduled and group orders.
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 | --- | --- |
@@ -132,7 +152,7 @@ Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 
 
 The hardest use cases: `PlaceOrder` (validate, snapshot, charge once under concurrent retries, never lose the cart) and `UpdateStatus` through the role-checked state machine, with the refund outbox behind it.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 | --- | --- | --- |
@@ -146,7 +166,7 @@ The hardest use cases: `PlaceOrder` (validate, snapshot, charge once under concu
 
 The modeling insight is **MenuItem versus OrderLine**. The menu item is live; the order line is a frozen copy of name and price. Computing an order total from the live menu would rewrite history and make refunds wrong. Likewise, **a cart is not an order**: the cart is a disposable draft, and the order is created once, atomically, at checkout.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -228,7 +248,7 @@ stateDiagram-v2
     CANCELLED --> [*]
 ```
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 ```text
 GET    /v1/restaurants/{id}/menu
@@ -243,7 +263,9 @@ POST   /v1/partner/orders/{id}/status    {"to":"PICKED_UP"} (partner); 409 inval
 
 Go surface (full code in Step 8): `AddToCart`, `PlaceOrder(ctx, userID, idemKey)`, `UpdateStatus(ctx, orderID, by, to)`, `ExpireUnaccepted(ctx) int` (SLA job), `ProcessRefunds(ctx) int` (outbox relay), `GetOrder`, `RefundStatus`, `Subscribe`.
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
+
+**In plain words:** Tables for restaurants, menu items, carts, orders and order lines. Order lines copy the price at checkout so later menu changes do not touch old orders.
 
 ```sql
 CREATE TABLE restaurants (
@@ -359,7 +381,7 @@ type MenuRepository interface {
 
 The Step 8 code keeps these as maps inside `Service` behind one mutex, so the mutex plays the role of the unique key and the guarded update. The `WHERE status = $from` guard is optimistic concurrency control, compared in [[Locking - Optimistic vs Pessimistic]].
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 | --- | --- | --- |
@@ -373,7 +395,7 @@ The Step 8 code keeps these as maps inside `Service` behind one mutex, so the mu
 
 Not used: a class per state (states have no behavior beyond "which edges, for whom", so a table is shorter and easier to review) and an async event bus in the core (synchronous listeners after unlock show the idea; production publishes through an outbox too).
 
-## Folder structure
+## Folder structure 🟡
 
 The code in Step 8 is printed as one file with `// ---- file.go ----` markers. In the round, split it like this:
 
@@ -395,7 +417,7 @@ cmd/demo/main.go   -> wiring: repositories, adapter, assigner, listeners, HTTP h
 - `ports.go` holds everything external, as interfaces.
 - `service.go` and `jobs.go` are the only files that take locks, and neither calls a port while holding one.
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > **Write in the room (about 150 lines):** `MenuItem`, `Cart`, `OrderStatus`, `Actor`, `OrderLine`, `Order`; the transition table with `canMove`; `PaymentGateway`; `Service` with `AddToCart`, `PlaceOrder`, `buildDraftLocked`, `chargeAndSave`, `transitionLocked` and `UpdateStatus`.
@@ -448,6 +470,8 @@ How it works:
    A restaurant accept and the expiry race under one lock (or the SQL status guard): whichever commits first wins and the other gets `ErrInvalidTransition`.
 
    A sweeper beats one `time.AfterFunc` per order because timers are lost on restart, while the `WHERE status = 'PLACED' AND created_at < ...` query is not.
+
+**In plain words:** The whole service. Start with `PlaceOrder`, then `UpdateStatus` with its allowed moves, then `ExpireUnaccepted`, which cancels orders nobody accepted in time.
 
 ```go
 package food
@@ -911,7 +935,7 @@ func (s *Service) notify(ctx context.Context, o Order, from OrderStatus) {
 }
 ```
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 | --- | --- |
@@ -926,6 +950,8 @@ func (s *Service) notify(ctx context.Context, o Order, from OrderStatus) {
 | `TestCancelDuringAssignKeepsRiderOffCancelledOrder` | A cancel that lands while the rider is being assigned wins: no rider on the cancelled order, one refund, and the accept still reports its own edge |
 | `TestConcurrentDoubleTapSameKey` | 50 goroutines, same key: one order ID, one charge |
 | `TestConcurrentDifferentKeysOneCartOneWinner` | 50 goroutines, different keys, one cart: one order, 49 losers, one charge |
+
+**In plain words:** Fake payment and rider assignment so the tests can check every status move and many people checking out at once.
 
 ```go
 package food
@@ -1327,7 +1353,7 @@ func TestConcurrentDifferentKeysOneCartOneWinner(t *testing.T) {
 
 Run in a scratch module with Go 1.24.4: `go vet` clean and `go test -race -count=3` passes all eleven tests.
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | What happens | How the design handles it |
 | --- | --- | --- |
@@ -1349,7 +1375,7 @@ Run in a scratch module with Go 1.24.4: `go vet` clean and `go test -race -count
 | Customer cancels while the rider is being assigned | A rider attached to a cancelled order | Re-check the status after `Assign` returns; record the rider only if still ACCEPTED, otherwise release them |
 | Slow listener (SMS) | Slows the API | Notify runs after unlock; production publishes to a queue |
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 | --- | --- |
@@ -1370,7 +1396,7 @@ Choices made:
 - A sweeper for the SLA instead of per-order timers
 - Waiters on the same key get the real result and respect `ctx`
 
-## Drawing
+## Drawing 🟢
 
 ![[Food Ordering System LLD Drawing.excalidraw]]
 
@@ -1380,7 +1406,7 @@ The drawing predates two changes in the code: its "take cart (delete)" box is no
 
 Redraw from memory with those included: the 8 states and 8 edges with their actors, the PlaceOrder steps and which one runs without the lock (Charge), MenuItem versus OrderLine, the three ports and the pattern each one is, and the two database guards plus the refund outbox row.
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- How do you stop a double tap from charging twice?
 > An idempotency key per checkout. The first call registers a pending result for `user|key`; concurrent calls with the same key wait for it and return the same order. The key also goes to the gateway, and `UNIQUE (user_id, idempotency_key)` is the database backstop.
@@ -1400,13 +1426,13 @@ Redraw from memory with those included: the 8 states and 8 edges with their acto
 > [!question]- Why never compute the order total from the menu?
 > Menu prices change. An order must keep what the customer saw and paid, or receipts, refunds and disputes are wrong. `OrderLine` stores the name and unit price at checkout.
 
-## Interview explanation
+## Interview explanation 🔴
 
 ```text
 I split the design into a cart, a mutable draft pinned to one restaurant, and an order, created once at checkout with a price snapshot in OrderLines. PlaceOrder takes an idempotency key: under a lock I check for an existing or in-flight result for that key, validate that the restaurant is open and the items are available, snapshot the prices and freeze the cart, then charge through a PaymentGateway adapter outside the lock and save the order as PLACED. Retries and double taps never charge twice, and a failed payment just unfreezes the same cart. Status changes go through a transition table that also checks the actor: only the restaurant can accept, the customer can cancel only before PREPARING, and a SYSTEM actor rejects orders the restaurant ignores past the SLA. Reject and cancel write a refund row in the same step as the status change, and a relay retries it with backoff until the gateway confirms. Rider assignment is a strategy and notifications are observers, both called after the lock is released. In a database I back this with UNIQUE (user_id, idempotency_key), a guarded UPDATE ... WHERE status = $from, and the refund_outbox table.
 ```
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - Cart is a draft pinned to one restaurant; the order is created once with an `OrderLine` price snapshot.
 - `PlaceOrder`: key lookup, validate, snapshot, freeze cart, charge without the lock, save, delete cart.
@@ -1416,7 +1442,7 @@ I split the design into a cart, a mutable draft pinned to one restaurant, and an
 - Side effects (assign, notify) run after unlock; production adds the outbox for events too.
 - SQL: `UNIQUE (user_id, idempotency_key)`, `UPDATE ... WHERE status = $from`, `refund_outbox`.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[State Machines in Go]], [[Cart Checkout with Coupons]], [[Delivery Partner Assignment]]
 - **Next:** [[Pub-Sub Message Queue]], [[Digital Wallet and Ledger]]

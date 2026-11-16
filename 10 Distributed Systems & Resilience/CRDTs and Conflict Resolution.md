@@ -32,7 +32,40 @@ updated: 2026-11-13
 > - Counters, sets, registers, maps and even text sequences have CRDT versions; each has a built-in policy (for example, add wins over remove).
 > - Classic mistake: thinking CRDTs remove the need to think about semantics. They guarantee convergence, not that the merged value is what the business wanted.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Two phones edit the same shopping list while both are offline.
+When they come back online, their lists are different. That is a **conflict**.
+
+```mermaid
+flowchart LR
+    A["Phone A adds milk"] --> M{"Merge"}
+    B["Phone B adds eggs"] --> M
+    M --> R["Final list = ?"]
+```
+
+The easy fix is "the newest edit wins". But then one person's edit is silently lost.
+A **CRDT** is a special kind of data (counter, set, list) built so that merging always works.
+Any two copies, merged in any order, end up the same. Nobody needs to ask a central server.
+
+```mermaid
+flowchart LR
+    A["A: milk"] --> M["Merge = union"]
+    B["B: eggs"] --> M
+    M --> R["milk, eggs on both phones"]
+```
+
+The rest of this note is just these 3 questions:
+1. What simple rules can pick a winner, and what do they lose?
+2. How do CRDTs merge without losing edits?
+3. What can CRDTs never promise, like "stock never below zero"?
 
 **The problem in one story.** Two friends edit the same shopping list on their phones while on a flight with no internet. One adds "milk", the other removes "eggs" and adds "bread". When they land, both phones sync. What should the final list be, and will both phones show the same thing?
 
@@ -71,7 +104,7 @@ flowchart LR
 > [!tip] Remember
 > A CRDT guarantees every replica ends up the same; you still decide whether that result is right.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A shopping list app syncs between a phone and a laptop. Both are offline on a train:
 
@@ -90,7 +123,7 @@ The same problem appears at much larger scale: a like counter written in Mumbai 
 
 Wherever writes are accepted on more than one replica to stay available during a network partition (the "A" choice in [[CAP and PACELC]]), something has to merge them.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of each replica's state as a point that can only move **up** in a partial order, and merge as "take the smallest point above both". For a grow-only counter, each replica keeps its own tally, and merge takes the maximum per replica:
 
@@ -108,9 +141,19 @@ Terms used below:
 - **Join-semilattice:** the math behind state-based CRDTs: a set of states with a merge ("join") that is commutative (`a ⊔ b = b ⊔ a`), associative (`(a ⊔ b) ⊔ c = a ⊔ (b ⊔ c)`) and idempotent (`a ⊔ a = a`).
 - **Tombstone:** a marker that something was deleted, kept so the deletion can be merged.
 
-## 3. How it works
+```mermaid
+flowchart LR
+    A["Copy A: count 3"] --> M["Merge: take the bigger per phone"]
+    B["Copy B: count 5"] --> M
+    M --> R["Both now agree"]
+    R -. "can only move up" .-> R
+```
+
+## 3. How it works 🟡
 
 ### Strategies, from simplest to richest
+
+**In plain words:** from "newest wins" (simple, loses data) to "keep both and let a smart type merge" (more work, loses nothing).
 
 ```mermaid
 flowchart TD
@@ -130,6 +173,8 @@ flowchart TD
 
 ### State-based vs operation-based CRDTs
 
+**In plain words:** you either send your whole copy and the other side merges it, or you send each small change and the other side replays it.
+
 | Kind | Replicas exchange | Requirement on the network | Example |
 | --- | --- | --- | --- |
 | State-based (CvRDT, convergent) | Whole states, merged with join | None: messages may be lost, duplicated or reordered, as long as states eventually spread | G-Counter as a map of per-replica counts |
@@ -138,7 +183,15 @@ flowchart TD
 
 State-based is easiest to get right, because merge tolerates any delivery. Op-based sends less data but needs a reliable causal broadcast layer underneath.
 
+```mermaid
+flowchart TB
+    S["State-based"] --> S1["Send whole copy"] --> S2["Other side merges"]
+    O["Operation-based"] --> O1["Send each change once"] --> O2["Other side replays it"]
+```
+
 ### The common types
+
+**In plain words:** a few ready-made shapes, like a counter that only goes up, cover most real needs.
 
 - **G-Counter (grow-only):** a map `replica → count`. Increment your own entry; value = sum; merge = per-replica max.
 - **PN-Counter:** two G-Counters, one for increments (P) and one for decrements (N); value = P − N.
@@ -169,9 +222,11 @@ sequenceDiagram
 
 The phone's remove only tombstoned the tag it had seen. The laptop's new tag `(laptop,1)` was invisible to it, so the remove does not cover it.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** each phone keeps its own count; the total is the sum; merging means taking the bigger number per phone.
 
 A grow-only counter in one screen:
 
@@ -201,6 +256,8 @@ func (g GCounter) Merge(o GCounter) {
 Why not a single shared number with "add the other side's number"? Because syncing twice would double-count. Per-replica max is idempotent; addition is not.
 
 ### Go: counters, a register and an OR-Set
+
+**In plain words:** working versions of the main CRDT types, with tests that prove merging in any order gives the same result.
 
 Four state-based CRDTs. The tests check the three merge laws on random histories (seeded, so deterministic), the like counter from section 2, a stock counter that goes down, a deterministic LWW tie-break, and the shopping-list scenario. They pass `go vet` and `go test -race` on Go 1.24.
 
@@ -476,9 +533,11 @@ func TestORSetConvergesInAnyMergeOrder(t *testing.T) {
 
 The like-counter numbers: Mumbai counted 120 and Frankfurt 80 while partitioned. After two exchanges in opposite directions and one duplicate exchange, both report 200. With a plain integer and "add what the other side sent", the duplicate exchange would double-count: Mumbai receiving Frankfurt's 80 twice would show 280.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Conflict-resolution strategies
+
+**In plain words:** a side-by-side list of ways to settle a clash, and what each one costs.
 
 | Strategy | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -490,6 +549,8 @@ The like-counter numbers: Mumbai counted 120 and Frankfurt 80 while partitioned.
 
 ### CRDT types at a glance
 
+**In plain words:** a quick lookup of each type: what it stores, how it merges.
+
 | Type | State | Merge | Policy and cost |
 | --- | --- | --- | --- |
 | G-Counter | replica → count | per-replica max | Only grows; one entry per replica ever seen |
@@ -499,7 +560,7 @@ The like-counter numbers: Mumbai counted 120 and Frankfurt 80 while partitioned.
 | OR-Set | element → tags, tombstones | union both | Add wins; tombstones grow until garbage-collected |
 | Sequence (RGA, YATA) | elements with unique ordered ids | union, ordered by ids | Per-character metadata; interleaving of concurrent inserts |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Invariants across replicas are impossible.** A PN-Counter cannot guarantee "stock never below zero" or "balance never negative": two regions can each sell the last unit. Such rules need coordination (a home leader, consensus, or escrow: pre-split the stock between regions).
 - **Metadata grows.** Per-replica counters grow with the number of replicas ever seen; OR-Set tags and tombstones grow with every add and remove. Garbage-collecting tombstones safely needs to know every replica has seen them, which is a coordination step.
@@ -507,7 +568,7 @@ The like-counter numbers: Mumbai counted 120 and Frankfurt 80 while partitioned.
 - **Merge is not meaning.** Two people concurrently editing a price from ₹100 to ₹120 and to ₹90 give a register with one winner or two siblings; no CRDT knows which is right.
 - **Do not use CRDTs** when there is a single writer per key anyway, or when you need uniqueness (usernames), balances or any invariant that spans replicas.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- **Redis Enterprise Active-Active** databases replicate across regions using CRDT-based types: counters, sets, strings, hashes and others each have documented conflict rules.
@@ -526,9 +587,11 @@ The like-counter numbers: Mumbai counted 120 and Frankfurt 80 while partitioned.
 	- CRDT metadata size per key (tombstones, tags, replica entries).
 	- For LWW: clock offset between nodes.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Why the three laws matter
+
+**In plain words:** messages arrive late, twice or out of order; the three laws mean none of that changes the final answer.
 
 Anti-entropy (background sync, often via gossip, see [[Failure Detection, Gossip and Membership]]) delivers states late, repeatedly and in any order. Commutativity handles reordering, associativity handles batching (merging A into B then into C equals merging in any grouping), and idempotence handles duplicates.
 
@@ -554,7 +617,7 @@ LWW is only as good as its clock. With physical clocks, a node whose clock runs 
 
 To sell 100 seats from two regions without coordination per sale, split the quota: 50 rights in Mumbai, 50 in Frankfurt. Each region sells locally within its rights and asks the other to transfer rights when it runs low. Local decisions stay safe, and coordination happens only on transfers. This is how a counter-like value can respect a lower bound.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What makes a data type a CRDT?
 > For state-based CRDTs: states form a join-semilattice, updates only move state up, and merge is the join, which is commutative, associative and idempotent. Then any replicas that received the same updates converge, whatever the order or duplication of syncs. Op-based CRDTs instead require concurrent operations to commute and rely on reliable causal delivery.
@@ -577,7 +640,7 @@ To sell 100 seats from two regions without coordination per sale, split the quot
 > [!question]- CRDT or OT for a collaborative editor?
 > Production OT systems use a central server to order and transform operations, which is fine for online editing (Google Docs). CRDTs (Yjs, Automerge) work peer-to-peer and offline, at the cost of per-character metadata. Pick CRDTs when offline or peer-to-peer editing matters.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Conflicts come from accepting concurrent writes on more than one replica.
 - Options: avoid (home leader), LWW, siblings + app merge, CRDT.

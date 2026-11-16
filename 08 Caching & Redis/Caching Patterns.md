@@ -25,7 +25,39 @@ updated: 2026-11-13
 > - **Refresh-ahead:** hot keys are reloaded before they expire, so users rarely see a miss.
 > - Whatever the pattern, a cache outage must degrade to "slower", not "down".
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2, the first part of section 3 (cache-aside) and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add the rest of section 3 (the other four patterns), 4 (the Go code and tests), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A cache is a fast notebook of answers in front of a slow database.
+Two jobs need an owner: filling the notebook when an answer is missing, and fixing it when data changes.
+A **caching pattern** is just a fixed plan for who does those two jobs, and when.
+The most common one is **cache-aside**: your code checks the notebook first, and on a miss reads the database and writes the answer into the notebook.
+
+```mermaid
+flowchart LR
+    A["app"] --> C{"in cache?"}
+    C -- "yes" --> R["return it"]
+    C -- "no" --> D["read database"] --> S["save in cache"] --> R
+```
+
+For writes, the safe default is: update the database, then delete the cached copy, so the next read fetches fresh data.
+
+```mermaid
+flowchart LR
+    W["update"] --> DB["write database"]
+    DB --> X["delete cache key"]
+```
+
+The rest of this note is just these 3 questions:
+1. Who fills the cache on a miss: your code or a library?
+2. On a write, do you update the cache, delete it, or let it expire?
+3. What happens when the cache is slow, down, or swamped with misses?
 
 **The problem in one story.**
 You decided to put a cache in front of your database.
@@ -69,7 +101,7 @@ Where it breaks: a board can be read by everyone at once without crashing; a cac
 > [!tip] Remember
 > Default to cache-aside: read cache, on miss load DB and fill; on write update DB, then delete the key.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 "Put Redis in front of the database" leaves the important questions open. Take InvoiceOps, a multi-tenant invoicing API (Go + PostgreSQL) whose dashboard endpoint aggregates invoices and payments for one workspace. The aggregation takes about 120 ms (an estimate for a few thousand invoice rows), and the dashboard is opened about 300 times per second at peak.
 
@@ -80,7 +112,7 @@ Where it breaks: a board can be read by everyone at once without crashing; a cac
 
 Each pattern below is a different set of answers.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a **personal assistant** (the cache) in front of a **records office** (the database).
 
@@ -90,9 +122,11 @@ Think of a **personal assistant** (the cache) in front of a **records office** (
 - **Write-behind:** the assistant says "done" right away and files your change at the records office later.
 - **Refresh-ahead:** the assistant re-checks popular answers shortly before their notes expire.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Cache-aside (lazy loading)
+
+**In plain words:** your code does it all: look in the cache, and on a miss fetch from the database and save the result.
 
 ```mermaid
 sequenceDiagram
@@ -118,11 +152,25 @@ sequenceDiagram
 
 ### Read-through
 
+**In plain words:** same idea as cache-aside, but a library does the fetching for you, so every caller follows the same rules.
+
 The application calls `cache.Get(key)` and the cache layer runs a **loader** on a miss. The logic is the same as cache-aside, but it lives in a library or a caching proxy, so every caller gets the same miss handling, coalescing and TTLs.
 
 Examples: a Go wrapper with a loader function, Caffeine's `LoadingCache` in Java, or a caching proxy in front of a service. Redis itself does not load from your database.
 
+**Read-through, as a picture.** The app only ever talks to the cache layer.
+
+```mermaid
+flowchart LR
+    A["app"] --> L["cache library"]
+    L -- "hit" --> A
+    L -- "miss: runs loader" --> D["database"]
+    D --> L
+```
+
 ### Write-through
+
+**In plain words:** every change is written to the database and the cache together, so the cache is warm right after a write.
 
 ```mermaid
 sequenceDiagram
@@ -142,6 +190,8 @@ sequenceDiagram
 - **It is not strong consistency.** The two writes are not one transaction. If the database commit succeeds and the cache write fails (or the process crashes in between), the cache is stale. Two concurrent writers can also apply their cache writes in the opposite order to their database commits. Keep a TTL as a safety net, or delete instead of set.
 
 ### Write-behind (write-back)
+
+**In plain words:** the cache says "done" at once and writes to the database later. Fast, but if the cache dies first, those changes are lost.
 
 ```mermaid
 sequenceDiagram
@@ -165,11 +215,23 @@ sequenceDiagram
 
 ### Refresh-ahead
 
+**In plain words:** reload popular answers just before they expire, so users of those keys almost never wait.
+
 A background job (or the read path, once a key passes, say, 80% of its TTL) reloads hot keys before they expire. Users of hot keys almost never see a miss, at the cost of reloading keys that might not be read again.
 
 It works best for a small, known set of hot keys, such as the home page's top lists. Probabilistic early refresh and serving stale data during a rebuild belong to [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
 
-## 4. Worked example
+**Refresh-ahead, as a picture.**
+
+```mermaid
+flowchart LR
+    K["hot key, TTL 60 s"] --> T{"older than 48 s<br/>(80% of TTL)?"}
+    T -- "yes" --> B["reload in background"]
+    T -- "no" --> S["serve as is"]
+    B --> F["fresh copy before<br/>anyone sees a miss"]
+```
+
+## 4. Worked example 🟡
 
 Cache-aside for product reads, with the four protections a production version needs:
 
@@ -179,6 +241,8 @@ Cache-aside for product reads, with the four protections a production version ne
 4. **Delete on write:** `Update` commits to the database first, then deletes the key.
 
 ### Whiteboard version
+
+**In plain words:** the shortest cache-aside read and write you could put on a whiteboard.
 
 ```go
 func (r *Repo) Get(ctx context.Context, id int64) (Product, error) {
@@ -199,6 +263,8 @@ func (r *Repo) Get(ctx context.Context, id int64) (Product, error) {
 ```
 
 ### Full code (Go 1.24, go-redis v9.7.0, x/sync v0.10.0)
+
+**In plain words:** the production version: tells "not in cache" apart from "cache broken", merges duplicate misses, and falls back to the database if Redis fails.
 
 ```go
 // Package patterns implements cache-aside reads with request coalescing,
@@ -333,6 +399,8 @@ Points worth saying out loud in a review:
 - `Update` returns the `Del` error. If the delete fails, the TTL is the safety net; for stronger guarantees, drive invalidation from the database's change stream instead (see [[Cache Invalidation, TTL and Consistency]]).
 
 ### Tests (pass `go vet` and `go test -race`; the last one ran against a real Redis 8.2)
+
+**In plain words:** tests that prove 100 requests missing at once cause only 1 database read, and that a broken cache only slows things down.
 
 ```go
 package patterns
@@ -528,11 +596,13 @@ Result: all six tests passed with `-race`. In `TestConcurrentMissesCoalesce`, 10
 
 ### The InvoiceOps dashboard, end to end
 
+**In plain words:** all the pieces combined for one real screen: how it reads, how it writes, and what happens when Redis is down.
+
 - **Read:** cache-aside on `dashboard:{workspace_id}:summary:v2`, TTL 30 s plus jitter, request coalescing.
 - **Write:** recording a payment commits the payment and the invoice balance in one PostgreSQL transaction, then deletes the dashboard key (or publishes `invoice.updated`, whose consumer deletes it).
 - **Freshness contract:** the dashboard may be up to 30 s stale, and the response carries `last_updated_at` so the UI can say so. The payment confirmation page does **not** read the cache.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Pattern | Read path | Write path | On cache failure | Use when | Main risk |
 | --- | --- | --- | --- | --- | --- |
@@ -544,6 +614,8 @@ Result: all six tests passed with `-race`. In `TestConcurrentMissesCoalesce`, 10
 | Two-level (L1 + Redis) | In-process, then Redis, then DB | Delete in Redis and broadcast an L1 eviction | L1 keeps serving until its TTL | Very hot keys, latency-critical reads | Instances disagree for up to the L1 TTL |
 
 ### Two-level caching with pub/sub invalidation
+
+**In plain words:** a tiny cache inside each app server plus the shared Redis cache. When data changes, a broadcast tells every server to drop its local copy.
 
 ```mermaid
 sequenceDiagram
@@ -568,6 +640,8 @@ Redis 6+ also offers client-side caching with server-assisted invalidation (`CLI
 
 ### Choosing a serialisation format
 
+**In plain words:** how to turn your Go struct into bytes for the cache: JSON is easy to read, binary formats are smaller and faster.
+
 | Format | Size | Speed in Go | Schema evolution | Notes |
 | --- | --- | --- | --- | --- |
 | JSON | Largest | Slowest of the three with `encoding/json` | Add fields freely; readers ignore unknown ones | Readable in `redis-cli`; easiest to debug |
@@ -576,7 +650,7 @@ Redis 6+ also offers client-side caching with server-assisted invalidation (`CLI
 
 Whatever the format, put a schema version in the key (`:v1`) so a deploy that changes the shape never decodes old bytes.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Cache-aside** is the safest default because the cache can vanish without losing data. Its weakness is the miss path: the first reader after expiry pays full price, and the delete-then-refill sequence has a race.
 - **Write-through** only helps if written data is read soon. For write-heavy data that is rarely read, it doubles write cost for nothing.
@@ -584,7 +658,7 @@ Whatever the format, put a schema version in the key (`:v1`) so a deploy that ch
 - **Refresh-ahead** wastes work on keys that cool down. Limit it to an explicit hot list.
 - **Do not cache** permission checks, balances or anything a user acts on immediately after a write, unless the read path can prove freshness (for example, by version).
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Facebook's memcache deployment is the classic cache-aside system with delete-on-write (*Scaling Memcache at Facebook*, NSDI 2013). The AWS Redis caching whitepaper and ElastiCache docs describe lazy loading and write-through, and suggest adding a TTL to write-through writes as well, so entries that are never read or that miss an update still age out. (The AWS caching best-practices page phrases its rule as a TTL on every key except those updated by write-through; this vault keeps a TTL on every key as the safer default.)
 - **Failure modes → fixes:**
@@ -594,7 +668,7 @@ Whatever the format, put a schema version in the key (`:v1`) so a deploy that ch
 	- Write-behind flush falls behind → alert on queue depth and the age of the oldest unflushed write.
 - **What to monitor:** hit ratio per key prefix; cache errors and timeouts (fallbacks); database QPS from the miss path; `singleflight` shared-result rate; tombstone count; for write-behind, pending writes and flush lag.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why delete beats set on write.** Writer 1 commits price 399, writer 2 commits price 349. If each then *sets* the cache, the network can deliver writer 1's set last, leaving 399 in the cache while the database says 349, until the TTL. Deleting is idempotent and order-insensitive: whichever delete arrives last, the key is gone, and the next reader loads 349.
 - **The remaining race.** A reader that missed *before* the write can still fill the old value *after* the delete. Facebook's fix is **leases**; other fixes are versioned values or delayed double delete. These are the subject of [[Cache Invalidation, TTL and Consistency]].
@@ -602,7 +676,7 @@ Whatever the format, put a schema version in the key (`:v1`) so a deploy that ch
 - **Read-through ownership.** Moving the loader into a shared cache service centralises coalescing and TTL policy, but every team's database access now runs through that service. Most Go shops keep a small read-through wrapper as a library rather than a separate service.
 - **Coalescing scope.** `singleflight` only coalesces within one process. With 40 instances, a hot-key expiry can still trigger 40 queries. That is usually fine; when it is not, use a distributed rebuild lock or serve stale while one instance refreshes (see [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]).
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Which caching pattern would you use for a dashboard summary, and why?
 > Cache-aside with a short TTL plus jitter, delete-on-write when invoices or payments change, and request coalescing. The dashboard tolerates seconds of staleness, the database stays the source of truth, and losing Redis only slows the page. Show `last_updated_at` so users know the age.
@@ -625,7 +699,7 @@ Whatever the format, put a schema version in the key (`:v1`) so a deploy that ch
 > [!question]- How do you keep an in-process L1 cache consistent across 20 instances?
 > You cannot make it strongly consistent cheaply. Give L1 a short TTL that bounds staleness, and broadcast invalidations (Redis Pub/Sub or `CLIENT TRACKING`) so most changes propagate in milliseconds. Pub/Sub can drop messages during reconnects, so the TTL is the real guarantee.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Cache-aside: read cache → miss → read DB → set with TTL; write DB → delete key.
 - Read-through and write-through move the same steps into a cache layer.
@@ -635,7 +709,7 @@ Whatever the format, put a schema version in the key (`:v1`) so a deploy that ch
 - Production must-haves: coalescing, a short cache timeout with DB fallback, negative caching with a short TTL, a TTL on every key.
 - Two-level caches: the L1 TTL bounds staleness; Pub/Sub only speeds it up.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Caching Fundamentals]], [[Redis Fundamentals]]
 - **Next:** [[Cache Invalidation, TTL and Consistency]], [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]], [[Redis in Go]]

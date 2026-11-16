@@ -27,7 +27,39 @@ updated: 2026-11-13
 > - Every type has O(N) commands (`HGETALL`, `SMEMBERS`, `LRANGE 0 -1`) that become dangerous when the key is big.
 > - Classic mistake: storing a whole object as one JSON string and rewriting it to change one field, or storing each field as its own top-level key.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2, 3.1 (pick by the question) and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3.2 and 3.3, section 4 (memory numbers and Go code), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Redis is a very fast store that keeps data in memory, under names called **keys**.
+A key does not have to hold plain text.
+It can hold a list, a set of unique items, a mini table of fields (a **hash**), or a list kept sorted by score (a **sorted set**).
+Each shape answers one kind of question in a single fast command.
+So the trick is to start from the question, then pick the shape.
+
+```mermaid
+flowchart LR
+    Q["your question"] --> P["pick the shape"]
+    P --> C["one fast command"]
+```
+
+```mermaid
+flowchart TD
+    Q1["what rank is player 42?"] --> Z["sorted set"]
+    Q2["change one field of a profile"] --> H["hash"]
+    Q3["last 20 items viewed"] --> L["list"]
+    Q4["has this user voted?"] --> S["set"]
+```
+
+The rest of this note is just these 3 questions:
+1. Which Redis type fits which question?
+2. How much memory does each choice cost?
+3. Where does each type break down at large size?
 
 **The problem in one story.**
 You build a game and need a leaderboard: "what rank is player 42?"
@@ -74,7 +106,7 @@ Where it breaks: in a kitchen you can see everything at once; in Redis, reading 
 > [!tip] Remember
 > Start from the question you will ask, then pick the Redis type whose command answers it in O(1) or O(log N).
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A ticketing app needs five features on top of its database:
 
@@ -88,7 +120,19 @@ If everything is a plain string, each feature fights the storage: you read and r
 
 Redis offers a different structure for each shape of question, with the work done inside the server in O(1) or O(log N).
 
-## 2. Mental model
+**Plain strings vs the right type, as a picture.**
+
+```mermaid
+flowchart LR
+    subgraph Plain string
+    A["GET whole JSON"] --> B["change one field in app"] --> C["SET whole JSON back"]
+    end
+    subgraph Hash
+    D["HSET user:42 city Pune"]
+    end
+```
+
+## 2. Mental model 🟢
 
 Think of Redis types as **the containers in a kitchen**:
 
@@ -100,7 +144,7 @@ Think of Redis types as **the containers in a kitchen**:
 - **Stream** = a receipt roll: append-only entries with IDs, readable by several teams who each remember where they stopped.
 - **Bitmap / HyperLogLog / Geo** = clever ways of using the jar (string) or ordered bag (sorted set) to store huge amounts in little space.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Pick by the question
 
@@ -121,6 +165,8 @@ flowchart TD
 
 ### 3.2 The types, one by one
 
+**In plain words:** one row per Redis type: how it is built inside, its main commands and how fast they are, and a typical key name.
+
 | Type | Internals (small → large) | Key commands and cost | Typical key pattern |
 | --- | --- | --- | --- |
 | **String** | `int`, `embstr` (≤ 44 bytes), `raw` | `GET`/`SET`/`INCR`/`APPEND` O(1); `GETRANGE` O(len) | `cache:product:42`, `views:event:9` |
@@ -139,6 +185,8 @@ Two more that exist but are niche: **bitfield** (`BITFIELD`, many small packed i
 Pub/Sub is not a type: it stores nothing. Lists, streams and Pub/Sub as messaging tools are compared in [[Redis as a Queue - Lists, Streams and Pub-Sub]].
 
 ### 3.3 Small values use compact encodings
+
+**In plain words:** small collections are packed tightly into one block of memory. Past a size limit Redis switches to a roomier layout that uses much more memory.
 
 Redis stores small collections as one flat **listpack** (a contiguous byte array) and switches to a pointer-based structure once a threshold is crossed. Measured on Redis 8.2:
 
@@ -163,9 +211,11 @@ stateDiagram-v2
     Listpack --> [*]: DEL / key expires
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the five features from section 1, each as one or two Redis commands.
 
 ```text
 Profile        -> Hash   user:<id>      HSET name/city/plan/score, HINCRBY score
@@ -181,6 +231,8 @@ Memory check (100,000 unique visitors, measured):
 ```
 
 ### Memory: the same data in three layouts
+
+**In plain words:** the same 10,000 users stored three ways, with the memory each way really used.
 
 Measured on Redis 8.2 by `INFO memory` before and after loading 10,000 users with three short fields (`name`, `city`, `age`):
 
@@ -198,6 +250,8 @@ Per-key overhead (the keyspace entry, the object header, the allocator) is what 
 
 ### Memory: exact vs approximate uniques
 
+**In plain words:** counting unique visitors exactly takes megabytes; a good guess (within about 1%) takes about 12 KB.
+
 Measured on Redis 8.2 with 100,000 distinct IDs `user:1` … `user:100000`:
 
 | Structure | Result | Memory (`MEMORY USAGE`) |
@@ -209,6 +263,8 @@ Measured on Redis 8.2 with 100,000 distinct IDs `user:1` … `user:100000`:
 The documented HyperLogLog standard error is 0.81%, and its size stays about 12 KB whether you add a thousand or a billion items. A bitmap is exact but only fits dense integer IDs: its size depends on the highest ID, not on how many bits are set.
 
 ### Go code (Go 1.24, go-redis v9)
+
+**In plain words:** each feature written in Go, with tests that ran against a real Redis.
 
 ```go
 // Package structures maps three everyday features to the Redis type that fits.
@@ -370,7 +426,7 @@ func TestUniqueVisitorsWithinHLLError(t *testing.T) {
 
 Measured: `go test -race ./structures/` against Redis 8.2 passed. The HyperLogLog test logged `union estimate 30099 for 30000 true (0.33% off)`: `PFCOUNT` over two keys counted the union without double-counting the 10,000 shared visitors.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 The data-choice table (use case → type):
 
@@ -397,7 +453,7 @@ Strings vs hashes vs JSON for objects:
 | Hash | `HGETALL` | `HSET`/`HINCRBY`, atomic | one level only | yes, `HEXPIRE` since 7.4 |
 | JSON type | `JSON.GET` | `JSON.SET key $.a.b` | yes | no |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Big collections turn O(N) commands into outages.** `HGETALL` on a 2-million-field hash or `SMEMBERS` on a 5-million-member set blocks the server and floods the network. Use `HSCAN`/`SSCAN`/`ZSCAN`, or split the key (`followers:42:0` … `followers:42:15`). See [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
 - **Lists are bad at the middle.** `LINDEX` and `LINSERT` walk the list. If you need random access by position, a sorted set by index or a hash is better.
@@ -407,7 +463,7 @@ Strings vs hashes vs JSON for objects:
 - **Cluster and multi-key commands:** `SINTER`, `PFCOUNT a b`, `BITOP` and `ZUNIONSTORE` need all keys in the same hash slot in Redis Cluster; use hash tags like `uv:{event9}:mon`. See [[Redis Replication, Sentinel and Cluster]].
 - **When a simpler option wins:** if the data needs ad-hoc filters ("users in Pune on the gold plan"), use the database or a search index, not a hand-built set per filter.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** leaderboards on sorted sets, capped feeds on lists, HyperLogLog for unique counts in analytics dashboards, geo sets for nearby search; full designs are in [[Redis Use Cases]] and [[Case Study - Leaderboard and Top-K]].
 - **Failure modes and fixes:**
@@ -416,9 +472,11 @@ Strings vs hashes vs JSON for objects:
 	- Deleting a huge collection with `DEL`: use `UNLINK`, or enable `lazyfree-lazy-user-del` (measured default `no` on Redis 8.2).
 - **What to monitor:** `redis-cli --bigkeys` and `--memkeys` on a replica, `SLOWLOG` for O(N) commands, the size distribution of your largest keys, `used_memory` growth per key prefix.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### 8.1 Sorted set internals
+
+**In plain words:** a big sorted set is two things kept in step: a lookup table for "what is Asha's score?" and a sorted ladder for "who is 10th?".
 
 A large sorted set is two structures kept in sync:
 - a **hash table** from member to score, so `ZSCORE` is O(1);
@@ -428,6 +486,8 @@ Members with equal scores are ordered by member bytes, so ties are deterministic
 
 ### 8.2 HyperLogLog in one paragraph
 
+**In plain words:** a counting trick: rare patterns in the hashed items tell you roughly how many different items you have seen, without storing them.
+
 Each item is hashed. The hash's low bits pick one of 16,384 registers; the rest of the bits give the length of the run of zero bits. Each register keeps the maximum it has seen.
 
 Long runs of zeros are rare, so the maxima estimate how many distinct items were hashed, and averaging over 16,384 registers (with a harmonic mean and corrections) gives the ~0.81% error.
@@ -435,6 +495,8 @@ Long runs of zeros are rare, so the maxima estimate how many distinct items were
 16,384 registers × 6 bits = 12 KB. Small HLLs use a sparse encoding and are much smaller. Two HLLs merge by taking the register-wise maximum, which is why `PFCOUNT a b` gives the union.
 
 ### 8.3 Geo is a sorted set
+
+**In plain words:** locations are turned into one number where nearby places get nearby numbers, then stored in a sorted set.
 
 `GEOADD` converts (longitude, latitude) into a 52-bit interleaved geohash and stores it as the score. Points close together share score prefixes, so a radius search becomes a few score-range scans on the neighbouring geohash boxes, followed by an exact distance filter.
 
@@ -444,7 +506,7 @@ Measured on Redis 8.2: three drivers added with `GEOADD`; `GEOSEARCH drivers FRO
 
 Before Redis 7.4 only whole keys could expire. Since 7.4, `HEXPIRE`, `HPEXPIRE` and `HTTL` set a TTL per hash field, which fits "one hash of per-device tokens, each with its own expiry".
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How do you model a leaderboard with 10 million players, and what is the cost of "what is my rank"?
 > One sorted set: `ZINCRBY lb <delta> <player>` on each score change, `ZREVRANGE lb 0 9 WITHSCORES` for the top 10, `ZREVRANK lb <player>` for a rank. Rank is O(log N) thanks to the skip list's spans. Memory is the main cost; shard by time window (`lb:2026-w45`) so old boards expire.
@@ -464,7 +526,7 @@ Before Redis 7.4 only whole keys could expire. Since 7.4, `HEXPIRE`, `HPEXPIRE` 
 > [!question]- Which data-structure commands are dangerous in production?
 > The O(N) ones on big keys: `HGETALL`, `SMEMBERS`, `LRANGE 0 -1`, `ZRANGE 0 -1`, `SINTER` of large sets, and `DEL` of a huge key. Replace them with the `*SCAN` family, bounded ranges and `UNLINK`.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - String: one value or counter (`INCR`); Hash: object fields (`HSET`, `HINCRBY`).
 - List: capped feeds (`LPUSH` + `LTRIM`); Set: exact unique members and set maths.
@@ -475,7 +537,7 @@ Before Redis 7.4 only whole keys could expire. Since 7.4, `HEXPIRE`, `HPEXPIRE` 
 - Small collections use listpack/intset; crossing the threshold is one-way.
 - Keep keys small and bounded; walk big ones with `*SCAN`.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Redis Fundamentals]], [[Redis Hands-on Setup with Go]]
 - **Next:** [[Redis Use Cases]], [[Case Study - Leaderboard and Top-K]]

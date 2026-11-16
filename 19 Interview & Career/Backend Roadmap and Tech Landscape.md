@@ -22,7 +22,43 @@ updated: 2026-11-13
 > - This vault's 19 numbered folders are one path through the layers, roughly in learning order.
 > - This note is a map, not a tutorial: every layer links to the folder that actually teaches it.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Backend work covers many topics. Without a map, it is easy to learn them in a random order and miss whole areas.
+
+This note is that map. Think of a backend system as **layers**. A request passes through some of them, and others sit around it.
+
+```mermaid
+flowchart LR
+    C["Client"] --> A["API layer"] --> B["Business logic"] --> D["Database"]
+```
+
+The request path: the client calls your API, your code runs the business rules, and the data is read or saved in a database.
+
+Around that path: **caching** (keep copies to answer faster), messaging (hand slow work to a queue), infrastructure (where it all runs), and observability (how you see what is happening).
+
+```mermaid
+flowchart TD
+    P["Request path"] --- Ca["Caching"]
+    P --- Q["Messaging / queues"]
+    P --- I["Infra: where it runs"]
+    P --- O["Observability: see it"]
+```
+
+Each layer maps to one folder in this vault, so you always know what to read next.
+
+The rest of this note is just these 3 questions:
+1. What are the layers, and what does each one do?
+2. In what order should you learn them?
+3. What does a senior engineer need to know about each?
+
 
 **The problem in one story.**
 You can build a small Go service that saves data to Postgres.
@@ -68,7 +104,7 @@ Where it breaks: a city map is fixed; the tech in each layer changes every few y
 > [!tip] Remember
 > Learn the layers first, the tools second; know your language and main data store deeply, recognise the rest.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A new backend engineer who only knows "Go + Postgres" can ship a CRUD service but will stall in an SDE-3 interview the moment the conversation turns to "how would this handle 10x traffic" or "what happens when the queue backs up."
 
@@ -78,7 +114,7 @@ Conversely, a candidate who has only read about these layers in the abstract (wi
 
 This note exists to give both the map (what layers exist, in what order to learn them) and the honest depth bar (deeply known vs. only recognised), concretely in terms of this vault's folders.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture a backend system as a stack of layers a request passes through, plus several layers that surround the stack rather than sitting inside the request path:
 
@@ -87,7 +123,9 @@ Picture a backend system as a stack of layers a request passes through, plus sev
 
 An SDE-3 candidate is expected to reason about every layer in both directions: what it does when it works, and what breaks when it doesn't.
 
-## 3. How it works
+## 3. How it works 🟡
+
+**In plain words:** Each layer below links to the folder that teaches it.
 
 ```mermaid
 flowchart TD
@@ -127,7 +165,9 @@ Layers the old infographic left out entirely, each still worth a "recognise" lev
 - object-oriented and low-level design ([[17 LLD MOC]]);
 - AI engineering / LLM-backed features ([[18 AI Engineering MOC]]), which is now common enough in backend roles to show up in interviews.
 
-## 4. Worked example
+## 4. Worked example 🟡
+
+**In plain words:** Follow one real request, step by step, and see which folder owns each step.
 
 Trace one request end to end through the layers, naming the folder that owns each step: a client calls `POST /v1/orders` on an order service.
 
@@ -142,7 +182,14 @@ Trace one request end to end through the layers, naming the folder that owns eac
 
 No single folder "is" this feature; the feature is the whole table acting together.
 
-## 5. Variants and comparison
+```mermaid
+flowchart LR
+    R["POST /v1/orders"] --> API["API layer"] --> L["Order logic"] --> DB["Save to database"] --> K["Publish 'order created'<br/>to a queue"] --> OBS["Trace + metrics"]
+```
+
+## 5. Variants and comparison 🟡
+
+**In plain words:** Different learning orders, depending on what you already know.
 
 | Learning path | Order | Best for | Cost |
 |---|---|---|---|
@@ -150,19 +197,25 @@ No single folder "is" this feature; the feature is the whole table acting togeth
 | **Interview sprint** | [[SDE-3 Readiness Checklist]] only, folder by folder on weak areas | Someone already working as a backend engineer, prepping in under a month | Fast, but assumes real production experience to fall back on |
 | **Go builder path** | 04 → 06 → 17 (LLD), returning to data/messaging/distributed as needed | Someone learning Go itself alongside backend concepts | Slower on system design, faster on "can you code it" |
 
-## 6. Trade-offs and when not to use
+```mermaid
+flowchart LR
+    N{"Where are you?"} -- "new to backend" --> T["Go top to bottom"]
+    N -- "have job experience" --> S["Start from the<br/>SDE-3 checklist gaps"]
+```
+
+## 6. Trade-offs and when not to use 🟡
 
 - Following the table strictly, top to bottom, is slow if you already have production experience in some layers — skip to the [[SDE-3 Readiness Checklist]] and only backfill the folders it flags as weak.
 - The table gives recognisable tool names (Kafka, Kubernetes), not a vendor recommendation: this vault teaches the concept each tool represents (a log-based broker, a container orchestrator), not that specific vendor's API surface.
 - Treating this note as a syllabus to memorize, rather than a map to navigate, defeats its purpose — the depth lives in the linked folders, never here.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** almost every production backend at scale touches most of these layers; a payments service, a feed service and a chat service differ mainly in which layer (data consistency, fan-out, ordering) is their hardest problem.
 - **Failure modes → fixes:** the most common SDE-3 interview failure is treating one layer (usually the data layer) as the whole system and never mentioning caching, messaging or observability at all — a senior answer always touches at least three layers.
 - **What to monitor:** none directly — this is a navigation note. Each folder's own notes cover what to monitor for that layer (e.g. [[14 Observability & SRE MOC]] for SLOs and alerting).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 The original "Backend Burger" framing (client request → routing → business logic → database, as stacked burger layers) is a request-flow diagram, not a tech-landscape map — it describes one request moving through one service, not the set of skills a backend engineer needs.
 
@@ -199,7 +252,7 @@ flowchart TD
     F14 --> F19
 ```
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Name three layers a feed-ranking service touches besides "the database."
 > Caching (ranked results per user, short TTL), messaging (fan-out of new posts to followers' feeds, often async), and observability (latency and staleness SLOs on the ranking pipeline). A senior answer names the layer and what specifically it does for this feature, not just its name.
@@ -218,7 +271,7 @@ flowchart TD
 > [!question]- When is it fine to only "recognise" a layer rather than know it deeply?
 > When the layer is outside your team's ownership boundary and you are not expected to operate it — e.g. a backend engineer usually only needs to recognise Kubernetes concepts (pod, deployment, rollout) well enough to reason about *why* a deploy failed, not to author Helm charts, unless platform engineering is the role.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Ten layers: language, API protocol, business logic, data stores, caching, messaging, distributed systems, deployment/infra, observability, testing — plus security, architecture, LLD and AI engineering around the edges.
 - This vault's primary stack: Go 1.24, PostgreSQL 17, Redis, Kafka/RabbitMQ.
@@ -226,7 +279,7 @@ flowchart TD
 - A senior answer to "design X" always names at least three of these layers, not just the data layer.
 - Use [[SDE-3 Readiness Checklist]] to turn this map into a tracked, per-folder checklist.
 
-## Links
+## Links 🟢
 
 - **Before this:** none — this is an entry point.
 - **Next:** [[SDE-3 Readiness Checklist]]

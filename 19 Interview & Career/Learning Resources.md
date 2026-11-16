@@ -23,7 +23,38 @@ updated: 2026-11-13
 > - Courses taught in Java still work for LLD, but translate them to Go and add what they skip (concurrency, DB invariants, idempotency).
 > - Links were collected from older notes and were not re-checked on the date above; if one is dead, search the title on the same site.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "How to use a resource" and the Go language list. Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add the lists for APIs, databases, cloud, AI engineering and LLD.
+> - 🔴 **Interview / SDE-3 prep?** Add the backend course syllabus map at the end. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+There is too much to learn from. Search for any topic and you get dozens of videos, courses and books.
+
+Starting a long course from hour one is the usual trap. You get tired and learn little.
+
+```mermaid
+flowchart LR
+    S["Search 'Kafka'"] --> M["40 videos, 10 courses"] --> T["Start a 12-hour course"] --> Q["Quit at hour 2"]
+```
+
+This note works the other way. Read the vault note first. Then open only the one part of a course or book that matches it. Then write a little code yourself.
+
+```mermaid
+flowchart LR
+    N["1. Read the vault note"] --> P["2. One matching part<br/>of the source"] --> C["3. Rebuild it in code"] --> A["4. Write your own<br/>interview answer"]
+```
+
+Below, every resource is listed by topic, with what to use it for and which note it backs up.
+
+The rest of this note is just these 3 questions:
+1. How do you use a resource without wasting hours?
+2. Which sources are best for each topic?
+3. How do older courses map to the notes in this vault?
+
 
 **The problem in one story.**
 You want to learn Kafka, so you search and get 40 videos, 10 courses and 3 books.
@@ -63,14 +94,14 @@ Where it breaks: a librarian checks the book is still there, but these links wer
 > [!tip] Remember
 > Note first, one section of the source second, your own code third.
 
-## How to use a resource
+## How to use a resource 🟢
 
 1. Read the vault note for the topic until the end of its worked example.
 2. Open only the matching section of the source below, not the whole course.
 3. Rebuild the example in a scratch module and add one test.
 4. Write one interview answer in your own words in the note's question callouts.
 
-## Go language
+## Go language 🟢
 
 **Official (start here):**
 
@@ -106,6 +137,8 @@ Where it breaks: a librarian checks the book is still there, but these links wer
 
 ### Course coverage checklist: Go Bootcamp
 
+**In plain words:** A tick list of what the Go course covers, mapped to the vault note for each topic.
+
 The owner followed the Udemy course *Go Bootcamp: With gRPC and Protocol Buffers (HTTP/S, HTTP2)*. Its public curriculum lists these topics. Use them as a checklist that the vault covers each one; ticks are not tracked here.
 
 - Setup: Go toolchain, playground, editor, Git → [[04 Go Language MOC]]
@@ -118,7 +151,9 @@ The owner followed the Udemy course *Go Bootcamp: With gRPC and Protocol Buffers
 - gRPC: server and client, TLS, streaming, deadlines, metadata, reflection, `grpcurl`, gateway, combined REST and gRPC → [[gRPC Services in Go]], [[gRPC Streaming in Go]], [[Serving REST and gRPC Together]]
 - Load tools `wrk`, `h2load`, `ghz` → [[Load Testing]]
 
-## APIs, gRPC and Protocol Buffers
+## APIs, gRPC and Protocol Buffers 🟡
+
+**In plain words:** Each table row is one source, what it is good for, and which note it backs up.
 
 | Resource | Use it for | Backs up |
 | --- | --- | --- |
@@ -130,7 +165,7 @@ The owner followed the Udemy course *Go Bootcamp: With gRPC and Protocol Buffers
 | [Tech School: the complete gRPC course (article series)](https://dev.to/techschoolguru/the-complete-grpc-course-protobuf-go-java-2af6) | Longer project-style course | [[gRPC Services in Go]] |
 | [Tech School: gRPC intro video (title not re-checked)](https://www.youtube.com/watch?v=VtX9w8uKvEk) | Why gRPC and HTTP/2, in one video | [[gRPC]] |
 
-## Databases and caching
+## Databases and caching 🟡
 
 | Resource | Use it for | Backs up |
 | --- | --- | --- |
@@ -141,7 +176,7 @@ The owner followed the Udemy course *Go Bootcamp: With gRPC and Protocol Buffers
 
 **Book:** *Designing Data-Intensive Applications* (Martin Kleppmann) for replication, partitioning, transactions and stream processing; read it alongside [[07 Databases MOC]] and [[10 Distributed Systems & Resilience MOC]].
 
-## Containers, cloud and observability
+## Containers, cloud and observability 🟡
 
 | Resource | Use it for | Backs up |
 | --- | --- | --- |
@@ -149,14 +184,14 @@ The owner followed the Udemy course *Go Bootcamp: With gRPC and Protocol Buffers
 | [OpenTelemetry Go docs](https://opentelemetry.io/docs/languages/go/) | SDK setup, traces and metrics | [[Distributed Tracing with OpenTelemetry]] |
 | [OpenTelemetry Go instrumentation libraries](https://opentelemetry.io/docs/languages/go/libraries/) | Ready-made instrumentation for `net/http`, gRPC, SQL | [[Distributed Tracing with OpenTelemetry]] |
 
-## AI engineering
+## AI engineering 🟡
 
 | Resource | Use it for | Backs up |
 | --- | --- | --- |
 | [Pinecone Python SDK: upsert and query vectors](https://sdk.pinecone.io/python/how-to/vectors/upsert-and-query.html) | The shape of a vector-DB write and search | [[RAG Pipeline]] |
 | [Pinecone TypeScript SDK: metadata filtering](https://sdk.pinecone.io/typescript/documents/data-operations_metadata-filtering.html) | Filtering search results by metadata | [[Advanced RAG Patterns]] |
 
-## LLD and design
+## LLD and design 🟡
 
 | Resource | Use it for | Backs up |
 | --- | --- | --- |
@@ -173,6 +208,8 @@ The owner followed the Udemy course *Go Bootcamp: With gRPC and Protocol Buffers
 **Books:** *Design Patterns* (Gamma, Helm, Johnson, Vlissides) as the reference for intent; *Head First Design Patterns* (Freeman and Robson) for a gentler first read; *The Pragmatic Programmer* (Hunt and Thomas) for DRY and orthogonality.
 
 ### CodeWithAryan course map
+
+**In plain words:** The course uses Java, but the ideas are the same. Each module points to the matching note here.
 
 The course is taught in Java. Each module maps to one vault note:
 
@@ -194,7 +231,7 @@ The course is taught in Java. Each module maps to one vault note:
 
 **What Java LLD courses usually skip, so study it here:** concurrency and race tests ([[Concurrency for LLD]]), invariants enforced in the database ([[Locking - Optimistic vs Pessimistic]]), and idempotent retries ([[Idempotency and Idempotency Keys]]).
 
-## Backend course syllabus (Advanced Backend + AI)
+## Backend course syllabus (Advanced Backend + AI) 🔴
 
 The owner's earlier study plan followed a two-part backend course. Its syllabus, mapped to the vault:
 
@@ -207,7 +244,7 @@ The owner's earlier study plan followed a two-part backend course. Its syllabus,
 | 4. AI | LLM fundamentals, LangChain, LangGraph, agents, prompt engineering, RAG, embeddings, vector DBs, semantic search, document processing, chat with PDFs and websites | [[18 AI Engineering MOC]] |
 | 5. Cloud | AWS deployment, CI/CD, ECR and ECS, production best practices | [[AWS 05 - ECS, Fargate and ECR]], [[CI-CD Pipelines (GitHub Actions for Go)]], [[Deploying a Go API on AWS (Reference Architecture)]] |
 
-## Links
+## Links 🟢
 
 - **Before this:** [[19 Interview & Career MOC]], [[Backend Roadmap and Tech Landscape]]
 - **Next:** [[SDE-3 Readiness Checklist]], [[LLD Round Playbook]]

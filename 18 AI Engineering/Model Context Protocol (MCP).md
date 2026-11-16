@@ -25,7 +25,46 @@ updated: 2026-11-13
 > - Content a server returns (a resource's text, a tool's result) is data the model reads, never an instruction the host must obey — this is why MCP and prompt-injection defence are the same conversation (see [[Guardrails and LLM Security]]).
 > - MCP is the transport for tools; it does not replace the model's own tool-calling mechanics from [[Structured Outputs and Tool Calling]] — the host still turns the model's tool-call request into an MCP `tools/call`.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+An AI app often needs outside helpers: a database, a wiki, GitHub. Without a common plug, every app writes its own adapter for every helper.
+
+**MCP** (Model Context Protocol) is that common plug, like USB for AI tools. Write one helper, and any app that speaks MCP can use it.
+
+```mermaid
+flowchart LR
+    subgraph Before
+      A1["App 1"] --> T1["Own DB adapter"]
+      A2["App 2"] --> T2["Another DB adapter"]
+    end
+    subgraph After
+      B1["App 1"] --> S["One MCP server<br/>for the DB"]
+      B2["App 2"] --> S
+    end
+```
+
+There are three parts. The **host** is the AI app. The **server** is the helper program that offers tools. Inside the host, one small **client** talks to each server.
+
+```mermaid
+flowchart LR
+    H["Host: AI app<br/>(with clients inside)"] -- "what can you do?" --> S["MCP server"]
+    S -- "tools: search, create_issue" --> H
+```
+
+The server only offers tools. The host still decides what the model may use. Anything a server sends back is data, never orders.
+
+The rest of this note is just these 3 questions:
+1. What does a server offer, and how do they talk?
+2. How does a connection start, run and end?
+3. How do you run MCP safely in production?
+
 
 **The problem in one story.**
 Your AI assistant needs to read from a database, search a wiki, and open GitHub issues.
@@ -69,7 +108,7 @@ Where it breaks: plugging in a USB device does not let it read your files by its
 > [!tip] Remember
 > MCP standardizes how an AI app finds and calls tools; it does not decide which tools are safe to use.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Say your Go backend has an agent that needs to read from Postgres, search internal Confluence pages, and create Jira tickets.
 
@@ -83,7 +122,7 @@ Any MCP host — Claude Code, Claude Desktop, your own Go backend, a teammate's 
 
 It is the same move LSP made for editor-to-language-tooling integrations: `N` editors × `M` languages collapses from `N×M` integrations to `N+M`.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of an MCP server as a plugin that runs out-of-process from the AI application. The **host** (your chat app, IDE, or agent backend) opens one **client** connection per server it wants to use. Each client talks to exactly one server over one transport.
 
@@ -106,9 +145,11 @@ flowchart LR
 
 The model never talks to a server directly. It only ever emits a tool-call request in its own output (the mechanics in [[Structured Outputs and Tool Calling]]); the host's MCP client turns that into an MCP `tools/call` JSON-RPC request, sends it to the right server, and feeds the result back to the model as a tool result message.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Primitives
+
+**In plain words:** A server can offer three things: actions (tools), things to read (resources), and ready-made prompts.
 
 | Primitive | Who decides to use it | What it is |
 | --- | --- | --- |
@@ -118,11 +159,22 @@ The model never talks to a server directly. It only ever emits a tool-call reque
 
 That "who decides" column matters for guardrails: tools are the one primitive the *model* can trigger autonomously, which is exactly why least-privilege tool scoping is the load-bearing control (see [[Guardrails and LLM Security]]).
 
+```mermaid
+flowchart LR
+    S["MCP server"] --> T["Tools<br/>model asks to run"]
+    S --> R["Resources<br/>app attaches to read"]
+    S --> P["Prompts<br/>user picks a template"]
+```
+
 ### The message layer: JSON-RPC 2.0
+
+**In plain words:** Every message is a small JSON note: "please do X" and later "here is the answer to X".
 
 Every MCP message is a JSON-RPC 2.0 request, response or notification: `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{...}}` in, `{"jsonrpc":"2.0","id":1,"result":{...}}` or `{"jsonrpc":"2.0","id":1,"error":{...}}` out. Notifications (no `id`) carry events like "my tool list changed" without expecting a reply.
 
 ### Lifecycle: initialize → operate → shut down
+
+**In plain words:** Like a phone call: say hello and agree on rules, talk, then hang up.
 
 ```mermaid
 sequenceDiagram
@@ -143,6 +195,8 @@ sequenceDiagram
 
 ### Transports
 
+**In plain words:** The road the messages travel on: a local pipe (stdio) for programs on your machine, or HTTP for remote servers.
+
 MCP defines the message *content*; a transport carries the bytes.
 
 - **stdio**: the host spawns the server as a **subprocess** and talks over its stdin/stdout. Each JSON-RPC message is one line of UTF-8 JSON, newline-terminated, with no embedded newlines.
@@ -161,7 +215,15 @@ MCP defines the message *content*; a transport carries the bytes.
 
   Treat an MCP server's OAuth scope as another least-privilege boundary, on top of the host-side tool scoping in [[Guardrails and LLM Security]].
 
+```mermaid
+flowchart LR
+    H["Host"] -- "stdio: local pipe" --> L["Server on same machine"]
+    H -- "Streamable HTTP" --> R["Remote server<br/>(with login / OAuth)"]
+```
+
 ### Discovery is the model's safety net, not a guarantee
+
+**In plain words:** A server saying "I have these tools" is a menu, not permission. Your app still decides what is allowed.
 
 `tools/list` exists so the host — and by extension the model — only ever sees tools the server actually chose to expose right now.
 
@@ -169,9 +231,17 @@ But "the server offered it" is not "the host should allow it": a well-behaved ho
 
 A server is an external, sometimes third-party process; its tool list is input, not authorization.
 
-## 4. Worked example
+```mermaid
+flowchart LR
+    A["Server offers<br/>10 tools"] --> F{"Host policy:<br/>who may use what?"}
+    F --> B["Model sees<br/>only 3 tools"]
+```
+
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** Strip away everything else, and one tool call is just a JSON request in and a JSON reply out.
 
 The entire protocol surface for one tool call, with no transport, no schema validation, no error codes:
 
@@ -519,7 +589,9 @@ ok  	mcp	1.509s
 
 In production you would use the official SDK (`github.com/modelcontextprotocol/go-sdk`, or Anthropic's own Go SDK's MCP connector support — verify current package names before depending on either) instead of hand-rolling the envelope, for schema validation, cancellation, progress notifications and the auth flow this teaching version omits.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
+
+**In plain words:** Pick stdio for tools on your own machine, and HTTP for shared remote servers.
 
 | Transport | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -533,14 +605,14 @@ In production you would use the official SDK (`github.com/modelcontextprotocol/g
 | OpenAPI-described REST APIs + an adapter | A generic layer turns an OpenAPI spec into tool-call schemas | You already have REST APIs and want tool access without writing new servers |
 | MCP | A standard protocol and message set; servers run out-of-process | Multiple AI hosts need the same tools, or you want to use third-party MCP servers (e.g. for Slack, GitHub, your DB) without writing an adapter |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Extra process, extra hop.** Every tool call round-trips through a client and a server process instead of calling a Go function directly — real latency for a tool a single app could call in-process.
 - **A server you did not write is a supply-chain dependency.** It runs with whatever permissions you grant its process or its OAuth token, and its tool descriptions are untrusted strings the model reads at prompt-assembly time. Audit a third-party server before connecting it, and pin or vendor it rather than always pulling the latest version (see "tool-poisoning" below).
 - **stdio has no fine-grained auth.** If a server needs different data access per user, stdio's one-process-per-connection model is the wrong shape; use Streamable HTTP with OAuth scopes per user.
 - **For one app with a handful of tools it owns**, skip MCP and call the functions directly — the protocol earns its complexity when multiple hosts or teams share the same capability.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Claude Desktop, Claude Code and VS Code's agent mode are MCP hosts; official and community MCP servers exist for GitHub, Slack, Google Drive, Postgres, Sentry and many SaaS tools; Anthropic, Microsoft and the broader ecosystem jointly steward the spec.
 - **Failure modes → fixes:**
@@ -550,7 +622,7 @@ In production you would use the official SDK (`github.com/modelcontextprotocol/g
   - **Cross-server data leakage**: a result from a sensitive server (internal DB) flows, via the model's context, into a tool call on a public server (a public GitHub issue) — fix with per-session scoping of which servers can see which other servers' outputs, or by not connecting both in the same session for a given user.
 - **What to monitor:** tool-call counts and error rates per server; p99 latency per server connection; `initialize` capability mismatches; rate of `tools/list` content changing between sessions (version-pinning drift); denied-by-scope tool calls (a leading indicator of either a misconfigured scope or an attempted escalation).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why JSON-RPC 2.0 and not gRPC or plain REST?** JSON-RPC's request/response/notification trio maps directly onto "call a tool and get a result" / "the server's tool list changed" without inventing new semantics, and it is trivially transportable over both a process pipe (stdio) and HTTP — a single message format, two transports, rather than a transport-specific wire format each.
 - **Sampling and roots.** Two less-common capabilities complete the picture: **sampling** lets a server ask the *host's* LLM to complete a prompt on the server's behalf (useful for a server that wants an LLM call without holding its own API key) — the host still mediates and can refuse.
@@ -562,7 +634,7 @@ In production you would use the official SDK (`github.com/modelcontextprotocol/g
 - **Statelessness of the underlying model call.** MCP gives the *host* durable state (the open connections, the negotiated capabilities) but the model call itself is still the stateless request/response described in [[LLM Fundamentals]] — "memory" of earlier tool results is still just conversation history the host resends, same as any other turn.
 - **Versioning.** `protocolVersion` is negotiated at `initialize`; a host and server that don't share a supported version should fail the connection explicitly rather than guess at compatibility, the same defensive instinct as API versioning anywhere else.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What problem does MCP solve that a bespoke per-tool integration doesn't?
 > It turns `N` AI applications × `M` tools from `N×M` bespoke integrations into `N` hosts plus `M` servers, each speaking one protocol. Any MCP host can use any MCP server without custom glue code.
@@ -585,7 +657,7 @@ In production you would use the official SDK (`github.com/modelcontextprotocol/g
 > [!question]- When would you *not* reach for MCP?
 > When one application owns a small, fixed set of tools it will never share with another host — a direct in-process function call is simpler and has no transport or process overhead. MCP earns its cost when multiple hosts, teams or third-party servers need to interoperate.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Three roles: host (the AI app), client (one per server connection), server (exposes tools/resources/prompts).
 - Everything is JSON-RPC 2.0: request/response/notification, over stdio or Streamable HTTP.
@@ -596,7 +668,7 @@ In production you would use the official SDK (`github.com/modelcontextprotocol/g
 - Treat tool descriptions and tool results as untrusted content, exactly like retrieved documents.
 - Pin server versions; a tool description can change underneath you ("rug-pull").
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Structured Outputs and Tool Calling]], [[Calling LLM APIs from Go]]
 - **Next:** [[Guardrails and LLM Security]], [[AI Agents and Agentic Workflows]]

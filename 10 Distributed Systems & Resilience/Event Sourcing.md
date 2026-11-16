@@ -27,7 +27,40 @@ updated: 2026-11-13
 > - Queries are served by projections (read models) built from the events, which makes event sourcing almost always paired with CQRS.
 > - Classic mistake: using Kafka alone as the event store. It cannot append "only if this invoice is still at version 7".
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Most apps store only the current state, like "invoice paid: 50,000".
+When it changes, the old value is overwritten and gone.
+If a customer asks "how did we get here?", you have no answer.
+
+```mermaid
+flowchart LR
+    A["paid = 20,000"] -- "overwrite" --> B["paid = 50,000"]
+    B -. "history lost" .-> X["?"]
+```
+
+**Event sourcing** stores every change as a fact instead, like a bank statement.
+Each fact is an **event**, such as "InvoiceIssued" or "PaymentRecorded 20,000".
+To get the current state, you replay the events in order and add them up.
+The list of events is the truth. Every table you read from is built from it.
+
+```mermaid
+flowchart LR
+    E1["Issued 50,000"] --> E2["Paid 20,000"] --> E3["Paid 30,000"]
+    E3 --> S["Replay = fully paid"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you save events and rebuild state from them?
+2. How do you keep that fast when there are thousands of events?
+3. What gets hard later: changing event shapes, deleting personal data, queries?
 
 **The problem in one story.**
 Your bank app shows a balance of ₹2,000.
@@ -72,7 +105,7 @@ Where it breaks: chess moves never change meaning, but business event formats ev
 > [!tip] Remember
 > Store what happened, not what is; current state is just a replay of the events.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps stores invoices as rows: `status = 'paid', paid = 50000`. A customer disputes an invoice: "We paid ₹30,000 on 3 March and ₹20,000 on 9 March, and then you voided and reissued it." The row only says `paid`. The `updated_at` column says when it last changed, not what happened before.
 
@@ -88,7 +121,15 @@ Event sourcing turns this around. The history **is** the data:
 
 "Status = paid" is computed from these three rows. Nothing can change state without leaving an event, so the audit trail cannot drift, and you can answer "what did this invoice look like on 5 March?" by replaying up to that date.
 
-## 2. Mental model
+```mermaid
+flowchart LR
+    Q["Customer: we paid twice!"] --> R["Row says: paid 50,000"]
+    R --> N["No way to check"]
+    Q --> E["Event list"]
+    E --> Y["Paid 20,000 on 3 Mar, 30,000 on 9 Mar"]
+```
+
+## 2. Mental model 🟢
 
 A bank statement. The bank does not store "balance = ₹12,400" and overwrite it; it stores every deposit and withdrawal, and the balance is the sum. A chess game is the same: the list of moves is the record, and the board is what you get when you replay them.
 
@@ -101,9 +142,11 @@ Terms used below:
 - **Projection:** a read model built by folding events into a shape made for queries (see [[CQRS]]).
 - **Snapshot:** a saved copy of state at version N, so a load can start there instead of at event 1.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The command cycle
+
+**In plain words:** load the past events, decide what new events the command causes, then save them only if nobody else wrote in the meantime.
 
 ```mermaid
 sequenceDiagram
@@ -137,6 +180,8 @@ Three rules make this work:
 
 ### Loading with snapshots
 
+**In plain words:** every so often, save the state so far. Next time, start from that saved point and replay only the newer events.
+
 A long-lived aggregate (a bank account with 40,000 transactions) would be slow to replay on every command. Take a snapshot every N events and fold only the tail:
 
 ```mermaid
@@ -155,15 +200,19 @@ A snapshot is a cache. It can be deleted at any time and rebuilt from events, so
 
 ### Designing events
 
+**In plain words:** name events as things that already happened in business words, like PaymentRecorded, not "row updated".
+
 - **Past tense and business-meaningful:** `PaymentRecorded`, not `InvoiceUpdated` or `SetPaidColumn`. An event should say why something changed.
 - **Small and specific:** one fact per event. A giant `InvoiceChanged` with every field forces every consumer to diff.
 - **Versioned:** carry a schema version, because events are kept forever and the code reading them will change (see [[Event Schemas and Schema Registry]]).
 - **Self-contained enough:** include the data a projector needs (the amount, the currency), but not copies of other aggregates' state that will go stale.
 - **No secrets or raw personal data:** events are immutable and replicated everywhere; see the GDPR section below.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** current state is just all events folded together, one by one, starting from empty.
 
 State is a fold over events:
 
@@ -195,6 +244,8 @@ func Replay(events []Event) Account {
 Everything else (expected versions, snapshots, upcasting) exists to make this fold safe under concurrency, fast for long streams and stable as the code evolves.
 
 ### Go: an event-sourced invoice
+
+**In plain words:** a working in-memory event store and an invoice built from events, with snapshots and a version check.
 
 An in-memory event store with expected-version appends and snapshots, an invoice aggregate whose decisions return events, a repository that retries on version conflicts, and an upcaster that reads schema-version-1 events (which had no currency) as version 2. It passes `go vet` and `go test -race` on Go 1.24.
 
@@ -534,6 +585,8 @@ func TestOldEventsAreUpcastOnRead(t *testing.T) {
 
 ### The same store in PostgreSQL 17
 
+**In plain words:** one append-only table. A unique rule on (stream, version) stops two writers from both adding version 8.
+
 A relational event store is a single append-only table. The unique constraint is the expected-version check:
 
 ```sql
@@ -564,9 +617,11 @@ ORDER BY version;
 
 Revoke `UPDATE` and `DELETE` on the table from the application role so "append-only" is enforced by the database, not by convention. `global_position` gives projectors one feed to follow, with the same caveat as any identity column: positions are allocated before commit, so a projector following it must handle commit-order gaps (see the deep dive in [[CQRS]]).
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Where to store events
+
+**In plain words:** compare stores by one key feature: can it refuse a write if someone else wrote first?
 
 | Option | Append with expected version | Read one aggregate | Subscriptions | Notes |
 | --- | --- | --- | --- | --- |
@@ -578,6 +633,8 @@ Revoke `UPDATE` and `DELETE` on the table from the application role so "append-o
 
 ### Event sourcing vs neighbours
 
+**In plain words:** how storing events compares with plain tables, audit logs and change data capture.
+
 | Approach | Source of truth | History | Cost |
 | --- | --- | --- | --- |
 | State + audit table | Current-state rows | Separate, can drift | Low |
@@ -585,7 +642,7 @@ Revoke `UPDATE` and `DELETE` on the table from the application role so "append-o
 | Event sourcing | The event log | Complete by construction | High: projections, versioning, replays |
 | Temporal tables (system-versioned) | Current rows + row history | Row-level, not business intent | Low to medium, database-specific |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Every query needs a projection.** "List invoices over ₹1 lakh" cannot be answered from streams; you need [[CQRS]] read models and their lag.
 - **Events are forever.** A badly named or badly shaped event lives in the store for years; every reader must handle every version ever written.
@@ -595,7 +652,7 @@ Revoke `UPDATE` and `DELETE` on the table from the application role so "append-o
 - **Use it** for ledgers and wallets, audit-heavy domains (billing, insurance claims, healthcare orders), workflows where "how did we get here?" matters, and temporal queries ("state as of 31 March").
 - **Do not use it** for CRUD screens, settings, catalogues and anything where history has no business value. Event sourcing is a per-aggregate decision, not a whole-system one: an event-sourced ledger can sit next to plain tables.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Accounting ledgers are the original event-sourced systems: journal entries are never edited, corrections are new entries (see [[Practice/Digital Wallet and Ledger]]).
@@ -613,9 +670,11 @@ Revoke `UPDATE` and `DELETE` on the table from the application role so "append-o
 	- Projection lag per projector, and replay time for each.
 	- Aggregate load latency.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Upcasting and schema evolution
+
+**In plain words:** old events never change, so when their shape changes, you convert them on the fly while reading.
 
 Events written in 2023 must still load in 2027. Options, from cheapest:
 
@@ -625,7 +684,16 @@ Events written in 2023 must still load in 2027. Options, from cheapest:
 
 Never edit stored events in place: projections already built from them, and every downstream consumer that saw them, would disagree with the store.
 
+```mermaid
+flowchart LR
+    O["Old event, v1 shape"] --> U["Upcaster converts on read"]
+    U --> N["v2 shape"]
+    N --> A["App only knows v2"]
+```
+
 ### GDPR erasure and crypto-shredding
+
+**In plain words:** you cannot delete from the log, so you encrypt personal data per person and throw away the key when asked.
 
 GDPR Article 17 gives a person the right to have their personal data erased, but the event log is immutable. Two patterns:
 
@@ -633,6 +701,8 @@ GDPR Article 17 gives a person the right to have their personal data erased, but
 - **Crypto-shredding.** Encrypt personal fields inside events with a per-person key held in a key store. To erase, delete the key: the ciphertext in every event, backup and replica becomes unreadable. Projections must treat "cannot decrypt" as "erased".
 
 ### Why Kafka alone is a weak event store
+
+**In plain words:** Kafka cannot say "only write if this invoice is still at version 7", and that check is the heart of event sourcing.
 
 - **No conditional append.** Kafka cannot reject a write because the invoice moved past version 7, so two handlers can both append on stale state. (Kafka's idempotent producer prevents duplicates from retries; it does not provide per-key optimistic concurrency.)
 - **No efficient per-aggregate read.** To load one invoice you read its whole partition and filter.
@@ -652,7 +722,7 @@ Projectors must be idempotent, because subscriptions deliver at least once (see 
 
 Replaying events must rebuild state, not resend emails or recharge cards. Keep side effects out of `apply`; trigger them from a dedicated subscriber that records which events it has handled.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the difference between event sourcing and keeping an audit log?
 > With an audit log, current-state rows are the truth and the log is a side record that can drift or be skipped. With event sourcing, the events are the truth and state is derived from them, so the history is complete by construction and can be replayed into any new view.
@@ -675,7 +745,7 @@ Replaying events must rebuild state, not resend emails or recharge cards. Keep s
 > [!question]- When would you not use event sourcing?
 > For CRUD data with no business value in its history: settings, catalogues, profiles. The costs (projections, versioning, replays, eventual consistency of reads) only pay off when history, audit or temporal queries matter. Apply it per aggregate, not system-wide.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Store events, derive state by folding; the log is the source of truth.
 - One stream per aggregate; append with expected version for optimistic concurrency.

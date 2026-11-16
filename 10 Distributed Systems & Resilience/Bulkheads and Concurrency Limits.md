@@ -29,7 +29,39 @@ updated: 2026-11-13
 > - Size the cap from rate × latency with headroom; put timeouts on everything so slots come back.
 > - Classic mistake in Go: "goroutines are cheap, so there is no pool to exhaust". The pools are your connections, your database and your memory.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your service talks to a few other services, like payments and search.
+Each call to them takes up a worker for as long as it waits.
+If one of them gets slow, its calls pile up and grab every worker you have.
+
+```mermaid
+flowchart LR
+    A["All 100 workers"] --> B["Slow search service"]
+    C["Payments calls"] -. "no worker left" .-> X["Fail"]
+```
+
+A **bulkhead** fixes this. You give each service its own small share of workers, like separate rooms on a ship.
+The **concurrency limit** is the size of that share: how many calls may wait at the same time.
+When search is slow, only search's room fills up. Payments still has its own room.
+
+```mermaid
+flowchart LR
+    S["Search room: 20 slots, full"] --> B["Slow search"]
+    P["Payments room: 30 slots, free"] --> Q["Payments works"]
+```
+
+The rest of this note is just these 3 questions:
+1. Why does one slow service eat all your workers?
+2. How do you build a separate room for each service?
+3. How big should each room be?
 
 **The problem in one story.** A restaurant kitchen has 10 cooks. One dish, a slow-roasted special, suddenly takes an hour instead of ten minutes. If every cook can start that dish, soon all 10 are stuck at the oven and nobody makes salads or soup.
 
@@ -70,7 +102,7 @@ flowchart LR
 > [!tip] Remember
 > Give every dependency its own small, capped share of capacity, so one slow call can only drown its own compartment.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 The old notes' interview explanation still holds: *a service has 100 worker threads and an external API starts taking 10 seconds instead of 100 ms; threads pile up, new requests wait, p99 latency rises, and health checks may fail.* Here is the same story in numbers, using **Little's Law**: `L = λ × W`, where `L` is the average number of requests in the system, `λ` the arrival rate and `W` the average time each spends inside.
 
@@ -92,7 +124,7 @@ Go has no request thread pool, so the failure looks different but ends the same 
 - **Database pool.** If a handler opens a transaction before calling recommendations, every stuck request also holds one of the `sql.DB` connections. Other handlers then wait inside `database/sql` for a free connection (visible as `DBStats.WaitCount`).
 - **Health checks** wait on the same resources, the load balancer marks the pod unhealthy, and traffic shifts to the remaining pods, which fail the same way.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 The name comes from ships. A hull is split into watertight compartments by walls called bulkheads. A hole floods one compartment, and the ship stays afloat.
 
@@ -102,9 +134,21 @@ When recommendations hang, their 200 slots fill and further recommendation calls
 
 The limit is the size of the compartment. Too small and you reject healthy traffic; too large and the compartment is the whole ship.
 
-## 3. How it works
+```mermaid
+flowchart TB
+    subgraph Ship["One ship, many walls"]
+        A["Room 1: flooded"]
+        B["Room 2: dry"]
+        C["Room 3: dry"]
+    end
+    A -. "water stays here" .-> A
+```
+
+## 3. How it works 🟡
 
 ### How a slow dependency exhausts a service
+
+**In plain words:** every waiting call holds a worker. Make the calls 100 times slower and you need 100 times more workers, which you do not have.
 
 ```mermaid
 sequenceDiagram
@@ -138,6 +182,8 @@ The fixes listed in the old notes still apply, each at a different layer:
 
 ### Bulkheads per dependency
 
+**In plain words:** give each service you call its own fixed number of slots, so one slow service can only fill its own slots.
+
 ```mermaid
 flowchart LR
     IN["incoming requests<br/>1,000 req/s"] --> H["handlers"]
@@ -166,6 +212,8 @@ A bulkhead can be built at several levels. They combine:
 
 ### Thread-per-request, event loop and Go's scheduler
 
+**In plain words:** different runtimes run out of different things (threads, memory, connections), but every one of them runs out of something when calls wait too long.
+
 | Model | How waiting on I/O behaves | What exhausts first |
 | --- | --- | --- |
 | Thread-per-request (Tomcat, classic Java) | Each waiting call blocks an OS thread; pool default 200 | The thread pool: new requests queue at the connector |
@@ -177,12 +225,21 @@ The lesson: cheap waiting (Go, virtual threads, Node) moves the bottleneck from 
 
 ### Sizing a limit
 
+**In plain words:** the limit is roughly "calls per second times how long each call takes", plus a bit of spare room.
+
 - **I/O-bound calls:** `limit ≈ target rate × normal latency × headroom`. For 1,000 req/s at 100 ms p99 with 2× headroom: `1,000 × 0.1 × 2 = 200`.
 - **CPU-bound work:** about the number of cores (`runtime.GOMAXPROCS(0)`). More workers only add context switching. Before Go 1.25, `GOMAXPROCS` in a container defaulted to the host's CPU count, not the container's CPU limit (teams used `go.uber.org/automaxprocs`); since Go 1.25 the runtime reads the cgroup CPU limit.
 - **Downstream capacity wins.** If Postgres allows 100 connections (`max_connections` default) and you run 10 pods, each pod's `MaxOpenConns` must be at most about 10, minus room for migrations and admin sessions.
 - **Waiting versus rejecting.** A short wait for a slot (a few milliseconds) smooths bursts; a long wait just rebuilds the unbounded queue. Reject when the wait would exceed what the caller can afford.
 
-## 4. Worked example
+```mermaid
+flowchart LR
+    R["1,000 calls per second"] --> M["x 0.1 s per call"]
+    M --> N["= 100 calls waiting at once"]
+    N --> H["+ spare room = limit of about 200"]
+```
+
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -237,6 +294,8 @@ func LimitDB(db *sql.DB) {
 ```
 
 ### The bulkhead type
+
+**In plain words:** this is the full, production-grade version of the simple slot counter above. Read the comments, not every line.
 
 The production version adds an optional bounded wait, context cancellation, gauges and counters for metrics, and Little's Law as a helper for sizing. The wait timer is injected (`after`), so tests never sleep.
 
@@ -477,6 +536,8 @@ The same scenario as section 1, with the bulkheads from the flowchart (recommend
 
 ### Bounded fan-out and weighted admission
 
+**In plain words:** one request that starts 50 small calls also needs a cap, or that single request can flood a service on its own.
+
 A single request that fans out (fetch 50 items) needs a limit too, or one request can spawn thousands of goroutines. `errgroup.SetLimit` makes `g.Go` block while the limit is reached. `semaphore.Weighted` admits work by cost, for example letting a full export take 10 units of a 20-unit budget.
 
 ```go
@@ -601,7 +662,7 @@ func TestExportsWeighted(t *testing.T) {
 }
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -612,7 +673,7 @@ func TestExportsWeighted(t *testing.T) {
 | Mesh thresholds (Envoy) | Proxy caps connections, pending and active requests per cluster | Polyglot fleets; uniform policy | Coarse; no business-aware fallback |
 | Adaptive concurrency limit (AIMD, Vegas, Gradient) | Limit moves with measured latency | Latency and capacity vary a lot | More complex; needs good signals ([[Load Shedding and Graceful Degradation]]) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Fixed limits drift.** A limit sized for 100 ms latency is too small after a dependency legitimately slows to 200 ms, and you start rejecting healthy traffic. Revisit limits with capacity planning, or use adaptive limits.
 - **Partitioning wastes capacity.** Slots reserved for payments sit idle while search is busy. Bulkheads buy isolation with utilisation.
@@ -621,7 +682,7 @@ func TestExportsWeighted(t *testing.T) {
 - **A bulkhead without a fallback** still returns errors; the gain is that the errors stay inside one feature.
 - **Not a replacement for timeouts.** A bulkhead with no timeout fills with hung calls and stays full forever.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Tomcat's `maxThreads` (default 200) and `acceptCount` (default 100) are a server-level bulkhead and queue.
@@ -642,7 +703,7 @@ func TestExportsWeighted(t *testing.T) {
 	- Open file descriptors (`process_open_fds`) against the limit.
 	- A goroutine profile (`/debug/pprof/goroutine?debug=1`) during incidents, which groups stuck goroutines by stack and shows where they wait.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Little's Law holds for any stable system**, whatever the arrival distribution, as long as averages are measured over the same period. Use it backwards for incidents: if 5,000 goroutines are stuck and the rate is 500 req/s, the average wait is 10 s, which usually matches some timeout.
 - **Why latency is the trigger, not errors.** A dependency that fails fast (connection refused in 1 ms) costs almost nothing per call. A dependency that hangs costs a slot for the whole timeout. That is why a slow dependency is more dangerous than a dead one, and why bulkheads and timeouts come before breakers.
@@ -652,7 +713,7 @@ func TestExportsWeighted(t *testing.T) {
 - **Fairness.** A plain channel semaphore does not guarantee FIFO order among waiters; `semaphore.Weighted` is FIFO, and a large waiting request blocks smaller ones behind it until it fits. Choose deliberately.
 - **Adaptive limits** treat the limit like TCP's congestion window: increase it while latency stays near the baseline, decrease it when latency rises or calls fail. That ties the bulkhead to what the dependency can really handle now, instead of what it could handle when someone wrote the config.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- A dependency's latency goes from 100 ms to 10 s. Why does your whole service go down, even pages that do not use it?
 > By Little's Law in-flight work rises 100×. Stuck requests hold goroutines, memory, sockets and often DB connections, so shared pools run out and unrelated handlers and health checks wait too. Per-dependency bulkheads plus timeouts keep the damage inside that dependency.
@@ -675,7 +736,7 @@ func TestExportsWeighted(t *testing.T) {
 > [!question]- What changes with Java 21 virtual threads compared with a Tomcat thread pool?
 > Blocking calls no longer pin an OS thread, so the 200-thread ceiling disappears, much like Go. That removes the accidental limit, so you must add explicit ones (semaphores, pool sizes) or a slow dependency exhausts connections and memory instead.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Little's Law: in flight = rate × latency; 1,000 req/s × 10 s = 10,000.
 - Slow is worse than dead: a hang holds a slot for the full timeout.

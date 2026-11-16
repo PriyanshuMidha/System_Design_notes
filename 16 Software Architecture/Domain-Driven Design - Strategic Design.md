@@ -42,7 +42,32 @@ flowchart LR
 
 Billing stays free to add a `partially_paid` status tomorrow without Accounting's ledger model ever needing to change — the anticorruption layer (ACL) absorbs that, translating only "an invoice just became Paid" into "post this fact", and nothing else crosses the boundary.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+In a big business, the same word means different things to different teams.
+To sales, a "customer" is a lead. To billing, a "customer" is someone with an unpaid invoice.
+If one code model tries to serve both, it becomes a mess.
+**DDD** (Domain-Driven Design) says: split the business into areas, and give each area its own model and its own words.
+Each such area is a **bounded context**. Inside it, one word has one meaning.
+Then you draw how the contexts talk to each other. That drawing is the **context map**.
+
+```mermaid
+flowchart LR
+    S["Sales context<br/>customer = lead"] -- "translate" --> B["Billing context<br/>customer = payer"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you split a business into areas worth different effort?
+2. How do you draw and name the boundaries?
+3. How do contexts talk without leaking into each other?
+
 
 **The problem in one story.**
 Billing says an "invoice" can be edited until it is paid.
@@ -83,7 +108,7 @@ Where it breaks: countries rarely redraw borders; bounded contexts get split and
 > [!tip] Remember
 > One word, one meaning, per bounded context; translate at the borders.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A single shared `Invoice` type, used by every team and every context in a growing company, accumulates fields for every context's needs: a `discount_reason` field Sales needs, a `gl_account` field Accounting needs, a `dunning_level` field Collections needs.
 
@@ -93,7 +118,7 @@ Strategic DDD's answer is not "one correct model" but "as many models as there a
 
 Billing's invoice, Accounting's ledger entry, and Collections' dunning case can all legitimately describe the same real-world paper document without being the same type in code — because each team's rules about it really are different, and forcing one shared type hides that instead of expressing it.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture the business domain as a country, and bounded contexts as the countries on the map, each with its **own language** for the same underlying concepts — the way "football" means two different sports depending on which country you're in.
 
@@ -101,9 +126,11 @@ A context map is the diplomatic relations between those countries: who is upstre
 
 The key discipline: **the language changes at the boundary, and that's fine.** A word crossing a context boundary is expected to be translated, not preserved. Trying to keep one universal vocabulary company-wide is what produces the bloated shared model in the first place.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 Subdomains: where to spend effort
+
+**In plain words: rank business areas: the core that makes you money, the support work, and the generic stuff you can buy.**
 
 Before drawing any boundaries, DDD asks you to rank parts of the business by how much competitive value they create:
 
@@ -112,6 +139,11 @@ Before drawing any boundaries, DDD asks you to rank parts of the business by how
 - **Generic subdomain** — solved problems every company has: authentication, file storage, email delivery. Buy or use an off-the-shelf library/service; don't reinvent it.
 
 This ranking is a business judgment, not a technical one, and it changes over time — what's generic for one company can be core for another (identity is generic for InvoiceOps, but it's the entire core domain for an IdP vendor).
+
+```mermaid
+flowchart LR
+    CO["Core<br/>build it well"] --- SU["Supporting<br/>build it simply"] --- GE["Generic<br/>buy or reuse"]
+```
 
 ### 3.2 Bounded context
 
@@ -139,6 +171,8 @@ flowchart TD
 Subdomains (problem space) and bounded contexts (solution space) are not forced into a 1:1 mapping: the core domain here split into two contexts (Billing and Accounting) because they genuinely need different models and different rates of change, even though both serve the one core subdomain.
 
 ### 3.3 Ubiquitous language
+
+**In plain words: the team and the code use exactly the same words for the same things.**
 
 Inside a bounded context, the team and the code use exactly the same words, with exactly the same meaning, in conversation, in the ticket tracker, and in the type names.
 
@@ -180,11 +214,18 @@ If the "shared" surface grows past a handful of types, or one team starts changi
 
 ### 3.5 EventStorming (how teams find these boundaries)
 
+**In plain words: a sticky-note workshop where experts list everything that happens in the business, in order.**
+
 EventStorming is a workshop format, not a diagram notation: domain experts and engineers stand at a wall covered in paper (physical or virtual) and populate it with orange sticky notes for **domain events** ("Invoice Sent", "Payment Received", "Invoice Overdue") in the order they happen, then add commands (blue), actors (yellow), and external systems (pink) around them.
 
 Clusters of events that share vocabulary and change together, with clear "but here the word means something else" seams between clusters, are where bounded-context boundaries get proposed — the technique turns "where should the boundary go?" from an architectural guess into something the whole room can see and argue about together, before any code exists.
 
-## 4. Worked example
+```mermaid
+flowchart LR
+    E1["Invoice drafted"] --> E2["Invoice sent"] --> E3["Payment received"] --> E4["Invoice paid"]
+```
+
+## 4. Worked example 🟡
 
 The context map above translates directly into Go packages: Billing and Accounting never import each other, and a dedicated `acl` package is the *only* code allowed to depend on both, exactly because translating between two models is its entire job.
 
@@ -343,7 +384,7 @@ func TestLedgerPostIsIdempotentPerRef(t *testing.T) {
 
 **Measured:** this package set (3 packages, 3 tests) passed `go vet ./...` and `go test -race ./...` on Go 1.24.4.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Context-map pattern | Who has power | Use when |
 | --- | --- | --- |
@@ -355,14 +396,14 @@ func TestLedgerPostIsIdempotentPerRef(t *testing.T) {
 | Open host service / published language | Upstream, serving many consumers | One context has several downstream consumers who shouldn't each build their own integration |
 | Separate ways | Neither — no integration | The coordination cost exceeds the cost of a little duplicated logic |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Drawing a bounded context has a real cost: a translation layer at every boundary, and often a service boundary and a team boundary to go with it. For a small domain with one team, splitting into contexts purely for DDD's sake adds ceremony without the growth problem it solves.
 - Getting the subdomain classification wrong is expensive in the other direction: treating a core domain like a generic one ("just buy it") underinvests in the thing that differentiates the business; treating a generic subdomain like a core one burns engineering time reinventing authentication.
 - Bounded contexts are not required to map 1:1 to microservices. A modular monolith (see [[Modular Monolith]]) can hold several bounded contexts as separate packages with no network boundary between them — the context boundary is about the model and language, the deployment boundary is a separate decision.
 - EventStorming needs real domain experts in the room; run without them, it's just engineers guessing at boundaries with sticky notes, which defeats the point.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Evans' original book (2003) and Vernon's *Implementing Domain-Driven Design* (2013) are the field's reference texts; most large e-commerce and fintech platforms that split into dozens of services (Amazon's internal service boundaries are the most cited example) describe arriving at those boundaries through something like subdomain/bounded-context analysis, whether or not they used DDD's vocabulary for it.
 - **Failure modes → fixes:**
@@ -372,14 +413,14 @@ func TestLedgerPostIsIdempotentPerRef(t *testing.T) {
   - Ubiquitous language used in conversation but not in code (`status == 3` instead of `Overdue`) → the model silently drifts from what the business actually means; fix by naming the type, constant or method after the exact word the domain expert used.
 - **What to monitor:** this is a modeling discipline, not a runtime system — the proxy signals are how often a PR touches two contexts' models in the same commit (a sign the boundary leaked), how many "wait, which invoice do you mean?" conversations happen in planning, and whether new team members can describe their context's vocabulary without needing another team's help.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why the same word is allowed to mean different things.** This is the idea newcomers resist hardest: it feels like a naming inconsistency to fix. It isn't — "Invoice" in Billing (mutable, has a lifecycle) and "Invoice" (as a `LedgerEntry`) in Accounting (immutable, posted once) are different *concepts* that happen to share an English word because they both ultimately describe the same real-world paper. Forcing one type to serve both meanings is what produces the anemic, bloated shared model DDD exists to avoid.
 - **Context boundaries versus service boundaries versus team boundaries.** These three often align but are conceptually independent: a context boundary is about where the model and vocabulary change; a service boundary is about independent deployment (see [[Monolith vs Microservices]]); a team boundary is about who owns the code (Conway's law pulls these toward alignment over time, but they don't have to start aligned). A modular monolith deliberately keeps context boundaries without service boundaries.
 - **Picking the ACL side.** The anticorruption layer conventionally lives on the *downstream* side — the side with less power to dictate the shape of data crossing the boundary — because it is the side protecting its own model from a shape it doesn't control. In the worked example, Accounting is downstream of Billing, so the `acl` package sits logically on Accounting's side of the boundary even though in this small demo it's its own package depended on by neither context directly.
 - **Context maps change.** A customer–supplier relationship earned through trust can degrade to conformist if the upstream team stops prioritizing the downstream's needs; a conformist relationship to a vendor can be upgraded to an ACL once the integration proves painful enough to justify the translation cost. The map is a living document, revisited the same way an ADR is — see [[Architecture Decision Records]] for recording *why* a context relationship changed.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is a bounded context, in one sentence?
 > A boundary inside which one model and one vocabulary are internally consistent — the same term can mean something entirely different once you cross into another bounded context, and that's expected, not a bug.
@@ -405,7 +446,7 @@ func TestLedgerPostIsIdempotentPerRef(t *testing.T) {
 > [!question]- How would you split a monolith like InvoiceOps into services?
 > Start from subdomains, not from the code's existing module boundaries: rank the business by value (core: invoicing and payment reconciliation; supporting: notifications; generic: identity) to see where independent scaling or ownership is actually worth the coordination cost. Then find bounded contexts inside the core — here, Billing and Accounting split because their models and rates of change genuinely differ, even though both serve one core subdomain — and only turn a bounded context into a separate service once you need independent deployment, scaling or failure isolation (see [[Monolith vs Microservices]]); a modular monolith lets the same context boundaries exist as packages first, with zero network calls, so the split can be validated before paying for distribution.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Bounded context = a boundary where one word has one meaning; crossing it, meanings are expected to change.
 - Subdomain (core/supporting/generic) is a business-value ranking that tells you where to invest; bounded context is a code/model boundary. They needn't be 1:1.
@@ -415,7 +456,7 @@ func TestLedgerPostIsIdempotentPerRef(t *testing.T) {
 - DDD boundaries ≠ service boundaries ≠ team boundaries — they often align, but each is a separate decision (modeling, deployment, ownership).
 - A shared "common domain types" package across contexts is almost always evidence the contexts weren't really separated.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]
 - **Next:** [[Domain-Driven Design - Tactical Patterns in Go]]

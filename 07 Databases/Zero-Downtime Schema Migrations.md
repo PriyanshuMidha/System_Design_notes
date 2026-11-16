@@ -28,7 +28,41 @@ updated: 2026-11-13
 > - Every DDL statement runs with a short `lock_timeout`, so it gives up instead of blocking traffic.
 > - Classic mistake: renaming or dropping a column in one deploy while old app pods still read it.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (which changes are safe), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your app is live, and you want to change the shape of a table, say rename a column.
+That change is called a **migration**.
+The trouble: while you deploy, old and new copies of your app run side by side for a few minutes.
+If the old copy asks for a column you just removed, its requests fail.
+
+```mermaid
+flowchart LR
+    S["rename name to full_name"] --> O["old app asks for name"]
+    O --> F["error for users"]
+```
+
+There is a second trap. Some changes need a **lock**, a "wait, I'm busy" sign on the table.
+While a change waits for its lock, every other query on that table waits behind it.
+
+The fix is three small moves instead of one big one: add the new thing, slowly move everything over, then remove the old thing.
+
+```mermaid
+flowchart LR
+    A["1. add new column"] --> B["2. move code and data"]
+    B --> C["3. drop old column"]
+```
+
+The rest of this note is just these 3 questions:
+1. Which changes are safe to run while the app is live?
+2. How do you move code and data over without breaking the old app?
+3. What do you do when a change gets stuck waiting for a lock?
 
 **The problem in one story.**
 Your app is live and you need to rename a column from `name` to `full_name`.
@@ -71,7 +105,7 @@ Where it breaks: a real bridge has no lock queue; in a database, even a quick ch
 > [!tip] Remember
 > Every schema change must work with both the old and the new app version, and every DDL gets a short `lock_timeout`.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps runs 6 pods behind a rolling deploy, and `invoices` has 20 million rows. A developer ships:
 
@@ -86,9 +120,18 @@ On PostgreSQL 17 this is a catalog-only change that finishes in milliseconds. It
 3. Every new query on `invoices` (plain `SELECT`s too) conflicts with the *waiting* `ACCESS EXCLUSIVE` request, so it queues **behind the ALTER**.
 4. All pool connections fill with stuck queries, health checks fail, and the API is down until the analytics query ends.
 
+**The lock queue, as a picture.** Think of a single-lane road: one slow truck (the report), then a car that wants the whole road to itself (the ALTER), and everyone else stuck behind the car.
+
+```mermaid
+flowchart LR
+    R["slow report<br/>(7 min, holds a light lock)"] --> A["ALTER waits<br/>(wants exclusive lock)"]
+    A --> Q["every new query waits<br/>behind the ALTER"]
+    Q --> D["pool full, API down"]
+```
+
 The second outage class is code: renaming `total` to `total_minor` in one step breaks the old pods, which still `SELECT total`, for the whole length of the rolling deploy.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 ```mermaid
 flowchart LR
@@ -111,7 +154,7 @@ Treat the schema like a public API with two clients at once: the app version tha
 
 Changing a busy table is like repainting a road lane while traffic keeps moving. You open the new lane first, move the cars over, and only then close the old lane. And you never park a roller across all lanes, even for a second, at rush hour without a plan to back off.
 
-## 3. How it works
+## 3. How it works 🟡
 
 **The lock queue.** PostgreSQL grants locks in queue order. A waiting strong lock blocks the weaker requests behind it:
 
@@ -176,9 +219,11 @@ stateDiagram-v2
 
 A failed build leaves an `INVALID` index. Queries ignore it, but it still costs write overhead (and a unique one still enforces uniqueness). Drop it and retry, or `REINDEX INDEX CONCURRENTLY` it. Only one concurrent build can run per table at a time.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** a rename done in three small deploys: add the new column, copy data across in small bites, then drop the old column once nobody reads it.
 
 The bare idea for a column rename, one step per deploy:
 
@@ -289,7 +334,9 @@ ALTER TABLE invoices DROP CONSTRAINT invoices_total_minor_nn;
 
 **Contract.** v3 reads the new column and still writes both, so rolling back to v2 stays safe. Migration 0014 drops `NOT NULL` from `total` so that v4 can stop writing it. Migration 0015 drops `total` once nobody will roll back to v3.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
+
+**In plain words:** the tools below all do the same job (run change scripts in order and remember which ran). They differ in style: plain SQL files, Go code, or "describe the end state and let the tool work out the steps".
 
 | Tool or technique | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -304,7 +351,7 @@ ALTER TABLE invoices DROP CONSTRAINT invoices_total_minor_nn;
 
 Up/down versus forward-only: down files help in development. In production a down that drops a filled column destroys data, so most teams **roll forward** with a new migration.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Expand/contract costs deploys.** One rename becomes 4 or 5 releases and a week of dual code. For a table with 1,000 rows and a maintenance window, a single locked `ALTER` is fine.
 - **Dual writes can drift.** A code path that writes only the old column leaves NULLs or stale values. Backfill `WHERE new IS NULL`, and reconcile before switching reads.
@@ -313,7 +360,16 @@ Up/down versus forward-only: down files help in development. In production a dow
 - **`CREATE INDEX CONCURRENTLY` is slower** than a plain build (two scans plus waits), and can stall behind one long transaction.
 - **Rollback is not symmetric.** You can roll the *app* back while the schema stays expanded. Rolling the *schema* back after data has moved usually loses data. Plan forward fixes, and keep a point-in-time backup for real mistakes ([[Backup, PITR and Disaster Recovery]]).
 
-## 7. In production
+**Rolling back, as a picture.** Rolling back the app is easy; rolling back the schema after data moved usually loses data, so teams fix forward.
+
+```mermaid
+flowchart LR
+    P["problem after deploy"] --> A["roll back the app<br/>(safe, schema stays expanded)"]
+    P --> S["undo the schema<br/>(risky, may lose data)"]
+    P --> F["new migration that fixes it<br/>(usual choice)"]
+```
+
+## 7. In production 🔴
 
 - **Real systems:**
 	- GitHub built gh-ost for online MySQL changes.
@@ -353,7 +409,7 @@ The API queries are blocked by the **ALTER** (41388), not by the analytics query
 	- golang-migrate stopped halfway and marked the version dirty → fix the schema by hand, then `migrate force <version>`.
 - **What to monitor:** lock waits (`wait_event_type = 'Lock'`), replica `replay_lag`, migration duration against the rehearsal, `pg_stat_progress_create_index` for long index builds, and API error rate during each deploy.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why `ADD COLUMN … DEFAULT` is instant since PostgreSQL 11.** The non-volatile default is evaluated once and stored in the column's catalog entry (`pg_attribute.attmissingval`). Old rows that lack the column read the stored value; new and rewritten rows store it for real. A volatile default (`gen_random_uuid()`, `clock_timestamp()`) must differ per row, so it still rewrites the table. `now()` is only *stable*, so `DEFAULT now()` is instant, and every old row gets the timestamp of the `ALTER`.
 - **Why `SET NOT NULL` can skip the scan.** Since PostgreSQL 12, a **validated** `CHECK (col IS NOT NULL)` already proves there are no NULLs. Validation runs under `SHARE UPDATE EXCLUSIVE`, so the long part never blocks traffic.
@@ -363,7 +419,7 @@ The API queries are blocked by the **ALTER** (41388), not by the analytics query
 - **Swapping a primary key from `integer` to `bigint`** is the same dance with more steps. Add `id_new bigint` and fill it for new rows with a trigger (`NEW.id_new := NEW.id`). Backfill it, make it `NOT NULL` with the CHECK trick, and build a unique index concurrently. Then, in one short transaction, drop the old key, add `PRIMARY KEY USING INDEX`, and rename the columns. Foreign keys that point at it have to move too.
 - **Rehearse.** Restore last night's snapshot to a scratch instance, run the migration and the backfill, and time every lock and batch. Numbers from a 1,000-row dev database say nothing about 20 million rows.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How can a 5 ms `ALTER TABLE ADD COLUMN` take the site down?
 > It needs `ACCESS EXCLUSIVE`. If any transaction holds even an `ACCESS SHARE` lock (a long `SELECT`), the `ALTER` waits, and every later query on that table queues behind the waiting `ALTER`. Set `lock_timeout` (for example 2 s) so the `ALTER` gives up and retries, and keep long queries off the primary.
@@ -386,7 +442,7 @@ The API queries are blocked by the **ALTER** (41388), not by the analytics query
 > [!question]- How do you backfill 200 million rows without hurting production?
 > Batches by primary-key range, each its own short transaction, with `WHERE new_col IS NULL` so reruns are safe. Pause between batches, throttle on replica lag, and checkpoint the last ID to resume. Leave the column unindexed during the backfill so updates can be HOT, and let autovacuum keep up.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Outages come from **locks** (the queue behind a waiting `ACCESS EXCLUSIVE`) and from **code** (old pods reading a renamed or dropped column).
 - `SET lock_timeout = '2s'` on every DDL, plus retries.
@@ -397,7 +453,7 @@ The API queries are blocked by the **ALTER** (41388), not by the analytics query
 - Expand → dual write → backfill → switch reads → stop old writes → contract.
 - Roll forward; keep PITR for real mistakes.
 
-## Links
+## Links 🟢
 
 - **Runnable Go version:** [[Zero-Downtime Schema Migrations - Go]]
 - **Before this:** [[Relational Schema Design]], [[Transactions and ACID]], [[Locking - Optimistic vs Pessimistic]]

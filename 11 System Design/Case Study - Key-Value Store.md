@@ -27,7 +27,37 @@ updated: 2026-11-13
 > - Healing happens in three layers: hinted handoff, read repair and Merkle-tree anti-entropy.
 > - Each node stores data in an LSM tree: commit log, memtable, SSTables, compaction, Bloom filters.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A key-value store is like a giant dictionary: give it a key, get back a value.
+When there are billions of keys, they do not fit on one machine, so they are spread over many.
+A hash of the key decides which machines hold it. This layout is called a **hash ring**.
+Each key is copied to 3 machines, so one crash loses nothing.
+A write or read does not wait for all 3. It waits for "enough" of them, for example 2 of 3. That "enough" is a **quorum**.
+
+```mermaid
+flowchart LR
+    C["put cart:42"] --> R["Hash ring picks<br/>3 machines"]
+    R --> A["A: ok"]
+    R --> B["B: ok"]
+    R --> X["C: slow"]
+    A --> Q["2 of 3 ok: done"]
+    B --> Q
+```
+
+Copies can disagree for a while. Background jobs compare them and fix differences.
+
+So the rest of this note is just these 3 questions:
+1. How do you decide which machines store a key?
+2. How many copies must answer before a read or write counts?
+3. How do copies that disagree get fixed?
 
 **The problem in one story.**
 A map in a program stores `name -> value` and finds it instantly.
@@ -73,7 +103,7 @@ Where it breaks: a library rarely updates a book in two branches at the same mom
 > [!tip] Remember
 > Hash keys to pick nodes, keep N copies, wait for enough of them to answer, and repair differences in the background.
 
-## 1. Why it exists - requirements
+## 1. Why it exists - requirements 🟢
 
 A single Redis or PostgreSQL instance holds a few hundred GB and fails as a unit. A shopping cart, session store or user-profile cache that must take 100k operations per second, hold 10 TB and **never reject a write because one machine died** needs the data spread and copied across many machines.
 
@@ -92,7 +122,7 @@ A single Redis or PostgreSQL instance holds a few hundred GB and fails as a unit
 
 **Out of scope**: secondary indexes, range scans across keys, multi-key transactions, cross-region replication (mentioned at the end).
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture a **library spread over many branch buildings**. Every book (key) has a catalogue number that says which three branches keep a copy (replication by consistent hashing). To lend a book you only need two of the three branches to agree (quorum).
 
@@ -100,7 +130,15 @@ If one branch is closed, a neighbouring branch keeps a note "return this to bran
 
 The core decision is the **CAP and PACELC choice** ([[CAP and PACELC]]): during a network partition, keep accepting writes on both sides and reconcile later (AP, Dynamo, Cassandra, Riak), or refuse writes on the minority side to keep one true value (CP, etcd, DynamoDB's per-partition Paxos, TiKV). Even without a partition, quorum size trades latency for consistency.
 
-## 3. How it works - high-level design
+```mermaid
+flowchart LR
+    W["Write for branch C"] --> C{"Branch C open?"}
+    C -- "yes" --> S["Store at C"]
+    C -- "no" --> N["Neighbour keeps a note<br/>(hinted handoff)"]
+    N -- "C reopens" --> S
+```
+
+## 3. How it works - high-level design 🟡
 
 ```mermaid
 flowchart TB
@@ -174,7 +212,7 @@ sequenceDiagram
     CO-)D: read repair: write [book, pen] {A:2}
 ```
 
-## 4. Worked example - estimates, API and data model
+## 4. Worked example - estimates, API and data model 🟡
 
 ### Whiteboard version
 
@@ -194,6 +232,8 @@ GET /v1/kv/{key}  -> value(s) + X-Context
 ```
 
 ### Estimates (inputs are assumptions; results are estimates)
+
+**In plain words:** rough sums: how much data, how many machines, and how many requests each one handles.
 
 | Quantity | Arithmetic | Result |
 | --- | --- | --- |
@@ -215,6 +255,8 @@ Without them, the whole 1 TB would be streamed into one replacement node from th
 At the same 50 MB/s that is about 5.6 hours (1,000,000 MB / 50 MB/s = 20,000 s), during which those ranges run with one fewer replica.
 
 ### API
+
+**In plain words:** just get, put and delete, plus a small "version" token passed back and forth.
 
 ```http
 GET /v1/kv/cart:42?consistency=quorum
@@ -240,6 +282,8 @@ Content-Type: application/octet-stream
 
 ### Key schema (one record on disk)
 
+**In plain words:** what one stored entry looks like: the key, the value and a few small fields for version and expiry.
+
 | Field | Size | Purpose |
 | --- | --- | --- |
 | `key` | up to 256 B | Partition key; its hash picks the ring position |
@@ -249,6 +293,8 @@ Content-Type: application/octet-stream
 | `value` | up to 100 KB | Opaque bytes |
 
 ### Code: vector clocks and sibling reconciliation
+
+**In plain words:** each value carries a small version stamp. The code compares stamps to tell "newer" from "written at the same time", and keeps both copies in the second case.
 
 The coordinator and the client both need one operation: given several versions, drop those that another version dominates and return the rest. The test replays the classic shopping-cart case from the Dynamo paper.
 
@@ -404,7 +450,7 @@ func TestQuorumOverlaps(t *testing.T) {
 4. The client merges them (set union: `[book, pen, cup]`) and writes back with the merged context `{A:1, B:1, C:1}`; coordinator A bumps it to `{A:2, B:1, C:1}`, which dominates both siblings. Later reads return one value.
 5. With last-write-wins instead, the later timestamp would win and either the pen or the cup would silently disappear. That is the whole argument for vector clocks in a cart.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Design | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -422,14 +468,22 @@ func TestQuorumOverlaps(t *testing.T) {
 | 1 | 1 | Fastest and most available; reads may be stale (eventual consistency) |
 | 1 | 3 | Fast writes; reads block if any replica is down |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Leaderless over leader-based because** the requirement is "never reject a write". The price is conflict handling: siblings, read repair and anti-entropy. If the requirement is "never lose a concurrent update to a bank balance", pick a leader-based CP design instead (or no KV store at all).
 - **Sloppy quorum plus hinted handoff over strict quorum because** it keeps writes available when the preference list is unhealthy. The price: `W + R > N` no longer guarantees overlap, because W acks may come from stand-in nodes outside the preference list.
 - **LSM over B-tree because** writes are frequent and sequential appends are cheap; the price is read and space amplification, controlled by Bloom filters and compaction ([[Storage Engines - B-tree vs LSM and WAL]]).
 - **When not to build one:** if data fits on one PostgreSQL 17 or Redis primary with a replica, use that. If you need range scans, secondary indexes or transactions, a KV store is the wrong tool; use a relational or [[Distributed SQL]] database. Managed services (DynamoDB, Cassandra-compatible clouds) usually beat running your own cluster.
 
-## 7. In production
+```mermaid
+flowchart TD
+    Q{"Fits on one database<br/>with a replica?"} -- "yes" --> P["Use PostgreSQL or Redis"]
+    Q -- "no" --> R{"Must never reject a write?"}
+    R -- "yes" --> L["Leaderless store (this note)"]
+    R -- "no" --> LB["Leader-based store"]
+```
+
+## 7. In production 🔴
 
 - **Well-documented real systems:**
 	- *Amazon Dynamo (2007 paper):* consistent hashing with virtual nodes, N/R/W quorums with a common configuration of (3, 2, 2), vector clocks with client-side reconciliation for the shopping cart, sloppy quorum and hinted handoff, Merkle trees for anti-entropy, gossip-based membership.
@@ -444,9 +498,11 @@ func TestQuorumOverlaps(t *testing.T) {
 	- *Compaction falling behind* → read latency rises with SSTable count, disk fills. Alert on pending compactions, keep disk below about 50% for size-tiered compaction.
 - **SLOs and monitoring (targets):** p99 read and write latency per consistency level; unavailable-quorum error rate; hints pending; repair age per token range; SSTables per read; pending compactions; disk usage per node; gossip "down" events.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### 8.1 Healing: hints, read repair and Merkle trees
+
+**In plain words:** three ways to fix copies that disagree: leave a note for a down machine, fix on read, and compare in the background.
 
 Three mechanisms cover different time scales.
 1. **Hinted handoff (seconds to hours).** A stand-in node stores writes meant for a down replica and replays them when gossip reports it up again. It is fast but bounded by the hint window and lost if the stand-in dies.
@@ -456,7 +512,16 @@ Three mechanisms cover different time scales.
    - For a range of 1 billion keys split into 2^15 leaves, a single differing key costs about 15 levels of hash comparisons plus streaming one leaf, instead of comparing a billion keys.
    - This is the only mechanism that fixes cold, never-read keys.
 
+```mermaid
+flowchart LR
+    H["Hinted handoff"] --> T1["minutes"]
+    RR["Read repair"] --> T2["on each read"]
+    M["Merkle tree compare"] --> T3["hours / nightly"]
+```
+
 ### 8.2 Adding a node without downtime
+
+**In plain words:** a new machine takes over small slices of keys from its neighbours, a bit at a time.
 
 A new node takes 256 virtual-node tokens. For each token it becomes the owner of a slice previously owned by its clockwise neighbour, so it streams that slice from the current replicas while they keep serving.
 
@@ -466,6 +531,8 @@ Because vnodes are spread around the ring, all 32 existing nodes contribute abou
 
 ### 8.3 What quorums do not give you
 
+**In plain words:** "2 of 3 agree" sounds strong, but some edge cases can still return old data.
+
 `W + R > N` is often quoted as "strong consistency". It is weaker:
 - With **sloppy quorums**, the W acks may come from stand-ins, so a later read quorum may not overlap.
 - A write that **failed** (fewer than W acks) may still be present on some replicas and appear in later reads.
@@ -474,7 +541,7 @@ Because vnodes are spread around the ring, all 32 existing nodes contribute abou
 
 For compare-and-set or "exactly one owner" semantics, use consensus ([[Consensus - Raft and Paxos]]), as etcd and DynamoDB's conditional writes do.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why N=3, W=2, R=2?
 > Three replicas survive one failure with room for a second; W=2 and R=2 overlap in at least one replica (2 + 2 > 3), and both reads and writes still succeed with one replica down. It is the common default from the Dynamo paper and Cassandra's `QUORUM`.
@@ -497,7 +564,7 @@ For compare-and-set or "exactly one owner" semantics, use consensus ([[Consensus
 > [!question]- How is this different from DynamoDB?
 > The Dynamo paper describes a leaderless store with vector clocks. The DynamoDB service uses leader-based Multi-Paxos replication per partition across three availability zones, which is why it can offer strongly consistent reads and conditional writes.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 A 45-minute interview script:
 - **0-5 min, requirements:** get, put, delete, TTL; 10B keys, 1 KB values; 100k reads/s, 50k writes/s; always writable; p99 under 10 ms; ask "AP or CP?".

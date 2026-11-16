@@ -28,7 +28,28 @@ updated: 2026-11-13
 > - Delete applies the expense's stored deltas with a minus sign; simplify pays the biggest debtor to the biggest creditor until everyone is at zero.
 > - Classic mistake: re-running the split to delete (rules or rounding may have changed), or using floats so a paisa disappears.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Friends on a trip pay for things at different times. Splitwise keeps track of who owes whom. Each expense is split equally, by exact amounts or by percentages. The app keeps one **net balance** per person: what they paid minus their share. All the nets in a group always add up to zero. At the end, it suggests the fewest payments to settle up, which is called **simplifying debts**.
+
+```mermaid
+flowchart LR
+    A["Alice paid ₹300 for 3"] --> B["Alice: +200"]
+    A --> C["Bob: -100"]
+    A --> D["Cara: -100"]
+```
+
+Everything else in this note is just these 3 questions:
+1. How are different split types handled?
+2. How do net balances stay correct?
+3. How do you settle with the fewest payments?
 
 **The problem in one story.** Four friends go on a trip.
 One pays for the hotel, another for dinner, a third for the taxi, and not everyone shares every bill.
@@ -70,7 +91,7 @@ It breaks down because a notebook can be erased and rewritten freely, while here
 > [!tip] Remember
 > Integer paise, shares that sum exactly to the total, and nets that always sum to zero.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design Splitwise-like expense sharing. Users create groups and add expenses.
@@ -95,7 +116,7 @@ It also tests the balance model (one net per user per group), reversibility (del
 
 Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 to 40 for code, 10 for edge cases.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 | Question to ask | Assumption |
 | --- | --- |
@@ -111,7 +132,7 @@ Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 
 - **Non-functional:** shares and payers each sum to the total exactly, so nets sum to zero; the same input always gives the same output; concurrent adds lose no update; a retried add is counted once; creating a group never destroys an existing one.
 - **Out of scope:** receipts, comments, notifications, recurring expenses.
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 | --- | --- |
@@ -121,7 +142,7 @@ Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 
 
 The hardest use case: `AddExpense` (normalise payers, pick the strategy, split exactly, validate membership, apply deltas atomically). `SimplifyDebts` is the algorithm to explain. Code both.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 | --- | --- | --- |
@@ -135,7 +156,7 @@ Two modeling insights. First, **store one net per user per group, not a pairwise
 
 Second, **an expense stores its computed maps**: delete reverses those exact numbers and never re-runs the strategy, whose rounding could change between versions.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -184,7 +205,7 @@ classDiagram
 
 A group aggregates users (a user can be in many groups) and owns its expenses. The three split types implement `SplitStrategy`; equal and percent delegate the leftover paise to a `Rounding` function, a second, smaller strategy.
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 ```text
 POST   /groups                              -> {name, member_ids}; 409 if the ID exists
@@ -198,7 +219,9 @@ POST   /groups/{id}/settlements             -> {from, to, amount_paise}
 
 Go surface (full code in Step 8): `CreateGroup` (returns `ErrGroupExists`), `AddExpense(ctx, AddExpenseRequest) (Expense, error)`, `DeleteExpense`, `Settle`, `GetBalances`, `SimplifyDebts`, and `NewSplitStrategy(SplitType)` as the factory.
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
+
+**In plain words:** Tables for groups, expenses, who paid and who owes. Balances can always be rebuilt from these rows.
 
 ```sql
 CREATE TABLE users  (id TEXT PRIMARY KEY, name TEXT NOT NULL);
@@ -275,7 +298,7 @@ type GroupRepository interface {
 
 In the Step 8 code the in-memory "repository" is the maps inside `Service`, so everything compiles as one package.
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 | --- | --- | --- |
@@ -287,7 +310,7 @@ In the Step 8 code the in-memory "repository" is the maps inside `Service`, so e
 
 Not used: a State pattern (an expense is only active or deleted, so a flag is enough) and a global balance sheet (balances live per group inside an injected service).
 
-## Folder structure
+## Folder structure 🟡
 
 The code in Step 8 is printed as one file so it reads top to bottom. In the round, split it like this:
 
@@ -306,7 +329,7 @@ cmd/demo/main.go   -> wiring: repositories, service, HTTP handlers
 - `service.go` owns validation, membership, the lock and the balance deltas.
 - `simplify.go` works on a copy of the balances and never holds the lock while computing.
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > **Write in the room (about 150 lines):** `SplitStrategy`, `EqualSplit`, `ExactSplit`, `PercentSplit`, `floorShares`, `SortedOrder`, `NewSplitStrategy`; `AddExpenseRequest`, `Expense`, `Transfer`; `Service` with `CreateGroup`, `AddExpense`, `DeleteExpense`, `applyDeltas`, `GetBalances` and `SimplifyDebts`.
@@ -340,6 +363,8 @@ How it works:
 
    The idempotency key is scoped the same way as in SQL: `(group, RequestID)`, so a reused key in another group never returns the wrong group's expense.
 6. **`SimplifyDebts`** copies the nets (no lock held while computing), matches the biggest creditor with the biggest debtor (ties by user ID), moves `min(credit, debt)`, and repeats. Each step zeroes at least one person, so there are at most n−1 transfers.
+
+**In plain words:** The full service. Start with the split types, then `AddExpense`, then `SimplifyDebts`.
 
 ```go
 package splitwise
@@ -778,7 +803,7 @@ flowchart LR
     c -- "1" --> b((b +1))
 ```
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 | --- | --- |
@@ -789,6 +814,8 @@ flowchart LR
 | `TestMultiplePayers` | a pays 600 and b 400 of a 1000 dinner for four: nets +350/+150/−250/−250, 3 transfers, delete zeroes everyone |
 | `TestIdempotentAdd` | The same `RequestID` twice gives one expense, counted once; the same key in another group is a new expense |
 | `TestConcurrentAdd` | 50 goroutines: no lost update, exact nets, 2 transfers |
+
+**In plain words:** Tests for each split type, rounding, simplifying and many people adding expenses at once.
 
 ```go
 package splitwise
@@ -1003,7 +1030,7 @@ func TestConcurrentAdd(t *testing.T) {
 
 Run in a scratch module with Go 1.24.4: `go vet` clean and `go test -race -count=1` passes all seven tests.
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | What happens | How the design handles it |
 | --- | --- | --- |
@@ -1021,7 +1048,7 @@ Run in a scratch module with Go 1.24.4: `go vet` clean and `go test -race -count
 | A member leaves with a non-zero net | Money disappears | Block removal until their net is zero |
 | Overflow | `total × weight` must fit in int64 | Weights are at most 10000, so totals up to about 9.2 × 10^14 paise are safe; say so |
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 | --- | --- |
@@ -1045,7 +1072,7 @@ Run in a scratch module with Go 1.24.4: `go vet` clean and `go test -race -count
 
 Choices made: nets over a pairwise ledger (O(participants) updates, a simple invariant); a running balance table over recomputing (fast reads, expense rows remain the source of truth); soft delete with exact reversal; greedy simplify (deterministic, at most n−1 transfers, not always the minimum); one mutex, then per-group locks if contention appears.
 
-## Drawing
+## Drawing 🟢
 
 ![[Splitwise LLD Drawing.excalidraw]]
 
@@ -1053,7 +1080,7 @@ The drawing shows the entities (Group, User, Expense, Share, `SplitStrategy` wit
 
 Redraw from memory: the strategy and factory, where each validation error comes from, the nets for the three-expense example, and why delete reverses stored shares instead of re-splitting.
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- Why int64 paise and not float64 rupees?
 > Binary floating point cannot represent 0.1 exactly, so sums drift and two paths can disagree by a paisa. Integers in the smallest unit are exact; every split floors and then hands out the leftover explicitly, so shares sum to the total every time.
@@ -1073,13 +1100,13 @@ Redraw from memory: the strategy and factory, where each validation error comes 
 > [!question]- What goes wrong if CreateGroup overwrites an existing ID, and how does SQL prevent it?
 > Assigning the map entry unconditionally replaces the group and wipes all its balances without an error. The code returns `ErrGroupExists` instead; in PostgreSQL the primary key on `groups.id` makes the second insert fail instead of overwriting.
 
-## Interview explanation
+## Interview explanation 🔴
 
 ```text
 I keep money as int64 paise and make splitting a Strategy: equal, exact and percent each return a map of user to share, chosen by a small factory from the API string. Exact amounts must sum to the total and percents, in basis points, to 10000. For equal and percent I floor every share and hand out the leftover paise explicitly, in sorted user order or by largest remainder, so shares always sum to the total. Each group keeps one net balance per user: AddExpense normalises the payers, checks every payer and participant is a member, then adds what each payer paid and subtracts each share, under one lock or in one transaction with relative updates, so the nets always sum to zero. The expense stores its payer and share maps, so delete applies exactly those deltas negated, and a deleted flag makes a retry harmless. Simplify debts is a greedy loop that matches the biggest debtor with the biggest creditor, which gives at most n minus one transfers; the true minimum is NP-hard.
 ```
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - Money: `int64` paise; percent in basis points (10000 = 100%).
 - Split = Strategy plus Factory; leftover paise via a `Rounding` (sorted order or largest remainder).
@@ -1089,7 +1116,7 @@ I keep money as int64 paise and make splitting a Strategy: equal, exact and perc
 - Simplify: biggest debtor pays biggest creditor; at most n−1 transfers; minimum is NP-hard.
 - Multi-currency: per-currency nets, or convert the total once with a stored integer rate.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[Strategy and Template Method]], [[Factory and Abstract Factory]], [[Movie Ticket Booking]]
 - **Next:** [[Food Ordering System]], [[Digital Wallet and Ledger]] (double-entry money movement)

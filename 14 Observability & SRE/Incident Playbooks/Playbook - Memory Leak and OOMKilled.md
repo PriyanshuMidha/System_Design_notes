@@ -29,7 +29,43 @@ updated: 2026-11-13
 > - Two heap profiles taken minutes apart and diffed answer "what grew" better than reading code.
 > - Prevention is a memory limit with headroom, `GOMEMLIMIT` below that limit, bounded caches and queues, and an alert that fires on the trend, not only on the kill.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how an OOM kill happens), 4 (first 5 minutes and the incident), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Every running app uses **memory** (RAM) to hold the things it is working on.
+In Kubernetes, each app gets a fixed amount it may use. That is its **limit**.
+A **memory leak** is when an app keeps grabbing memory and never gives it back.
+Memory use creeps up and up, slowly, for hours.
+When it hits the limit, the system kills the app at once. That is **OOMKilled** (Out Of Memory, killed).
+The app restarts with clean memory, creeps up again, and dies again.
+
+```mermaid
+flowchart LR
+    S["App starts:<br/>200 MB"] --> G["Creeps up<br/>for hours"]
+    G --> L["Hits 1 GB limit"]
+    L --> K["Killed, restarts"]
+    K --> S
+```
+
+Not every memory problem is a leak. Sometimes the app just needs more for a big job, or the limit is set too low.
+
+```mermaid
+flowchart LR
+    M["Memory high"] --> A["Keeps climbing, never drops:<br/>a leak"]
+    M --> B["Jumps on big requests:<br/>a spike"]
+    M --> C["Flat but near the top:<br/>limit too small"]
+```
+
+The rest of this note is just these 3 questions:
+1. Is it a leak, a spike, or a limit that is too small?
+2. How do you stop the crashes right now?
+3. Which code is holding the memory?
 
 **The problem in one story.**
 Your order service runs fine all morning.
@@ -74,7 +110,7 @@ Where it breaks: you can see hotel guests, but you can only see heap memory thro
 > [!tip] Remember
 > Memory that only grows is a leak; mitigate first (rollback, more room, more pods), then diff two heap profiles to find it.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Memory incidents are slow, quiet and then sudden. A service leaks 20 MB a minute, nobody notices for hours, and then pods restart every few minutes at peak traffic.
 
@@ -102,7 +138,7 @@ flowchart LR
 > [!tip] Remember
 > The pod dying is the last step of the story. The first signs are rising latency and rising memory long before.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a pod as a hotel room with a fixed number of guests allowed (the memory limit). A **leak** is guests who check in but never check out. A **spike** is a convention arriving for one night.
 
@@ -114,6 +150,8 @@ Where the analogy breaks down: guests in a hotel are visible, but heap memory is
 
 ### The three situations
 
+**In plain words:** three problems end the same way (the app gets killed). The shape of the memory graph tells you which one it is.
+
 | Situation | Memory shape | Cause | Typical fix |
 | --- | --- | --- | --- |
 | Leak | Rises with time, drops only on restart | Goroutines stuck, unbounded map, pinned slices, listeners never removed | Fix the code |
@@ -123,7 +161,7 @@ Where the analogy breaks down: guests in a hotel are visible, but heap memory is
 > [!warning] Common mistake
 > Raising the limit and calling it fixed. If the shape is a leak, a bigger limit only makes the pod die later and at a worse time.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### How an OOM kill actually happens
 
@@ -163,6 +201,8 @@ sequenceDiagram
 
 ### Container OOM versus node eviction
 
+**In plain words:** either your app crossed its own limit, or the whole machine ran low and Kubernetes pushed some apps off. Different cause, different fix.
+
 | | Container OOMKilled | Pod evicted |
 | --- | --- | --- |
 | Who decides | Kernel, cgroup limit | kubelet, node memory pressure |
@@ -172,6 +212,8 @@ sequenceDiagram
 | Where to look | `kubectl describe pod` | `kubectl describe node`, Conditions: `MemoryPressure` |
 
 ### Which number to trust
+
+**In plain words:** there are several "memory used" numbers and they disagree. The one the killer looks at is the one that matters.
 
 Several memory numbers exist and they disagree. This is the most common source of confusion during an incident.
 
@@ -194,7 +236,7 @@ flowchart TD
     F -- "No" --> H["Non-heap: cgo, mmap, off-heap buffers, fragmentation"]
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### First 5 minutes
 
@@ -219,6 +261,8 @@ kubectl scale deployment/orders -n prod --replicas=10
 ```
 
 ### Real-world-style incident timeline
+
+**In plain words:** a made-up but realistic incident, step by step, so you can see the playbook in order.
 
 A checkout service in Go, 6 pods, memory limit 1 GiB. This is an illustrative scenario, not a real incident.
 
@@ -263,7 +307,7 @@ flowchart TD
     F --> P["Postmortem"]
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Diagnosis flowchart: from symptom to cause
 
@@ -284,6 +328,8 @@ flowchart TD
 
 ### Investigation steps for each likely cause
 
+**In plain words:** one row per suspect: where to look, what to type, and what the answer means.
+
 | Cause | Where to look | Command or query | What the result means |
 | --- | --- | --- | --- |
 | Goroutine leak | `go_goroutines` flat-lining up | `curl 'localhost:6060/debug/pprof/goroutine?debug=2' \| less` | Thousands of goroutines at the same stack line: that line is blocked forever |
@@ -294,6 +340,8 @@ flowchart TD
 | Node pressure | Node conditions | `kubectl describe node NODE \| grep -A5 Conditions` | `MemoryPressure True` means evictions, not OOMKilled |
 
 ### Dashboards and PromQL
+
+**In plain words:** ready-made graph queries: memory over time, restarts, and how close each pod is to its limit.
 
 ```promql
 # Containers killed for OOM in the last hour (kube-state-metrics)
@@ -320,6 +368,8 @@ go_memstats_heap_inuse_bytes{job="orders"}
 > Alerting on `container_memory_usage_bytes`. It includes page cache, so it looks full on healthy services that read a lot of files. Use the working set.
 
 ### Commands on the pod and node
+
+**In plain words:** commands to see why a pod died and to grab a memory snapshot while it is still running.
 
 ```bash
 # Live usage per container
@@ -362,9 +412,11 @@ sequenceDiagram
     You->>You: top: biggest growth is the leak site
 ```
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 ### Fixes: immediate, proper, prevention
+
+**In plain words:** quick fix today, real fix this week, and a guard so it doesn't happen again.
 
 | Level | Action | Cost |
 | --- | --- | --- |
@@ -373,6 +425,8 @@ sequenceDiagram
 | Prevention | `GOMEMLIMIT` at about 90 percent of the limit; memory request equal to limit; LRU caps; trend alert; load test with memory graphs | Some engineering time |
 
 ### Setting limits
+
+**In plain words:** a limit protects the other apps on the machine, but too low a limit kills yours. The table weighs the choices.
 
 | Choice | Benefit | Risk |
 | --- | --- | --- |
@@ -383,9 +437,11 @@ sequenceDiagram
 > [!warning] Common mistake
 > A scheduled restart cron as the permanent fix. It hides the leak, and the leak speed will change with traffic until it kills the pod between restarts.
 
-## 7. In production
+## 7. In production 🔴
 
 ### Go: GOMEMLIMIT and the limit
+
+**In plain words:** tell Go how much memory it may use, so it cleans up harder before the system kills it.
 
 Set `GOMEMLIMIT` so the garbage collector works harder before the kernel steps in. For a 1 GiB limit, use about 900 MiB. It is a soft limit on memory the Go runtime manages (heap, stacks, runtime structures); cgo allocations and mmapped files are not counted, so leave headroom.
 
@@ -410,6 +466,8 @@ env:
 
 ### Alerts that catch it early
 
+**In plain words:** alert when memory gets close to the limit or keeps climbing, before the first kill.
+
 | Alert | Fires when | Why |
 | --- | --- | --- |
 | `PodOOMKilled` | Increase in OOM restarts above 0 | You want to know on the first one |
@@ -419,9 +477,11 @@ env:
 
 See [[Alerting and On-Call]] for how to keep these actionable.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Why the kernel kills the "wrong" process
+
+**In plain words:** the system picks who to kill by a score. Sometimes an innocent app scores higher than the real culprit.
 
 The kernel scores processes by memory use and an adjustable score (`oom_score_adj`). Kubernetes sets higher scores for BestEffort and Burstable pods so they die first on node pressure.
 
@@ -431,13 +491,26 @@ In a multi-process container (an app plus a sidecar script), a small helper proc
 
 ### Why RSS stays high after the heap shrinks
 
+**In plain words:** Go frees memory inside the app first and hands it back to the system slowly. The graph can stay high for a while.
+
 Go releases freed memory to the OS lazily (the scavenger returns it in the background). After a spike, RSS can stay elevated while the heap is healthy. This is not a leak. Check `go_memstats_heap_released_bytes` and the gap between heap in use and RSS. See [[Runtime - Memory Allocator and Garbage Collector]].
 
 ### Memory that pprof cannot see
 
+**In plain words:** the Go memory tool only sees memory Go itself handed out. Some memory comes from other places it can't see.
+
 The heap profile only knows Go allocations. Memory from cgo, `mmap`ed files, goroutine stacks (see the goroutine profile), and runtime internals show up as RSS but not in `inuse_space`. If the heap profile is small and RSS is large, look at `go_memstats_stacks_inuse_bytes`, the thread count (`go_threads`), and any cgo library.
 
 ### Common Go leak patterns
+
+**In plain words:** most Go leaks are the same few mistakes: a stuck background task, a map that only grows, or a timer never stopped.
+
+```mermaid
+flowchart LR
+    G["Start a goroutine"] --> W["Waits on a channel"]
+    W --> N["Nobody ever sends<br/>or closes it"]
+    N --> L["Stuck forever:<br/>memory never freed"]
+```
 
 1. **Goroutine blocked on a channel** that nobody will ever send to or close. Fix: pass `context.Context`, use `select` with `ctx.Done()`.
 2. **Unbounded map or slice** used as a cache or a dedupe set. Fix: LRU with a cap, TTL, or an external cache like Redis.
@@ -448,9 +521,19 @@ The heap profile only knows Go allocations. Memory from cgo, `mmap`ed files, gor
 
 ### Cascading failure arithmetic
 
+**In plain words:** when one copy dies, the others take its share of work. They fill up faster and can die too.
+
+```mermaid
+flowchart LR
+    S["6 pods share load"] --> D["1 pod killed"]
+    D --> M["5 pods take 20% more each"]
+    M --> F["They hit the limit sooner"]
+    F --> D
+```
+
 If 6 pods each handle 1/6 of traffic and one dies, the other 5 take 20 percent more each. A leak that grows with traffic then moves the next pod's kill time earlier. This is why you scale out first and diagnose after.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- A pod is OOMKilled every 6 hours. What do you do in the first 10 minutes?
 > Confirm the reason with `kubectl describe pod` (Last State Terminated, OOMKilled, 137), check how many pods are affected, and look for a recent deploy or traffic change. Mitigate: roll back if a deploy lines up, otherwise scale out or temporarily raise the limit. Only then take two heap profiles 10 minutes apart and diff them with `pprof -base`.
@@ -470,7 +553,7 @@ If 6 pods each handle 1/6 of traffic and one dies, the other 5 take 20 percent m
 > [!question]- What would you set to make Go behave well in a 1 GiB container?
 > A memory request equal to the limit, `GOMEMLIMIT` around 900 MiB so the GC reacts before the kernel does, and a bounded cache and concurrency. Also a trend alert on the working set. `GOMEMLIMIT` does not fix a leak.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Exit code 137 with reason `OOMKilled` is a memory kill; verify with `kubectl describe pod`.
 - First 5 minutes: confirm scope, check what changed, mitigate (rollback or scale or raise limit), communicate.

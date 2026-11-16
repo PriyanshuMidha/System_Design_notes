@@ -23,7 +23,37 @@ updated: 2026-11-13
 > - Keep the app tier stateless and push state into a few purpose-built stores; the stores are where the hard trade-offs live.
 > - Trap: "highly available" or "scalable" without a number means nothing.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (requirements, quality targets, building blocks), 4 (whiteboard and availability maths) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Writing code makes one feature work. System design is deciding how the whole thing holds up when real life hits.
+Real life means: lots of users at once, a disk that dies, a deploy in the middle of the day.
+First you write down what the app must do (the features) and how well it must do it (fast, always up, never lose data).
+"How well" is called the **non-functional requirements**, and it always comes with numbers.
+Then you pick building blocks to meet those numbers: load balancer, app servers, cache, database, queue.
+
+```mermaid
+flowchart LR
+    A["One box: app + database"] -- "grows up into" --> B["Load balancer -> many app servers<br/>-> cache -> database + replica"]
+```
+
+A part that keeps no data between requests is **stateless**: you can copy it freely. Parts that hold data (the database) are hard to copy, so they need the most care.
+
+```mermaid
+flowchart LR
+    U["Users"] --> LB["Load balancer"] --> APP["App servers (stateless, copy freely)"] --> DB[("Database (stateful, handle with care)")]
+```
+
+The rest of this note is just these 3 questions:
+1. What exactly must the system do, and how well (with numbers)?
+2. Which building blocks give you that?
+3. What does each choice cost you (speed, money, correctness)?
 
 **The problem in one story.**
 You build a small shop website on one computer, and it works.
@@ -69,7 +99,7 @@ Where it breaks: a kitchen grows slowly; software traffic can jump 10 times in m
 > [!tip] Remember
 > Start from requirements with numbers, then pick building blocks, and say what each trade-off costs.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A team builds an invoice service on one virtual machine: Go API and PostgreSQL on the same box. It works for 200 customers. Then three things happen in one quarter:
 
@@ -79,7 +109,7 @@ A team builds an invoice service on one virtual machine: Go API and PostgreSQL o
 
 None of these is a coding bug. They are **design** gaps: one machine is a single point of failure, there is no headroom for peaks, and durability was never specified. System design is the discipline of deciding, before the incident, how much of each quality the system needs and which components buy it.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of designing a restaurant kitchen rather than cooking one dish.
 
@@ -93,9 +123,11 @@ Two vocabulary pairs you will use in every design:
 - **Stateless vs stateful.** A stateless component keeps nothing between requests that another copy could not also serve (a Go API that reads the session from Redis). You can add or kill copies freely. A stateful component owns data (PostgreSQL, Kafka, Redis); copying it means [[Replication]] and splitting it means [[Partitioning and Sharding]].
 - **Read-heavy vs write-heavy.** A URL shortener does about 100 reads per write, so caches and replicas fix it. A metrics ingester does mostly writes, so batching, queues and partitioning fix it. The read:write ratio decides the whole architecture.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Requirements first
+
+**In plain words:** before drawing boxes, write three lists: what users can do, how well it must work (with numbers), and what you will not build yet.
 
 | Kind | Question it answers | Example (invoice service) |
 | --- | --- | --- |
@@ -104,6 +136,8 @@ Two vocabulary pairs you will use in every design:
 | Out of scope | What will we not build now? | Multi-currency tax, offline mobile mode |
 
 ### Quality attributes and their units
+
+**In plain words:** "fast", "reliable" and "scalable" mean nothing until you put a number on them. This table gives each word its unit.
 
 | Attribute | Definition | Unit and typical target |
 | --- | --- | --- |
@@ -120,6 +154,8 @@ Availability and durability are different. A system can be down for an hour (ava
 The formal way to write these targets is an SLI (what you measure) and an SLO (the target for it); see [[SLIs, SLOs, SLAs and Error Budgets]].
 
 ### The building-block catalogue
+
+**In plain words:** most systems are built from the same dozen parts. This map shows what each one is for.
 
 ```mermaid
 flowchart LR
@@ -154,6 +190,8 @@ flowchart LR
 
 ### A request's lifecycle through the stack
 
+**In plain words:** follow one click from the phone, through every box, to the database and back.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -183,7 +221,7 @@ sequenceDiagram
 
 Each hop adds latency and a failure point. Most design work is deciding which hops a given request must take and which it can skip.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -199,6 +237,19 @@ NFRs on the side: p99 < 200 ms, 99.9%, 2k RPS peak, RPO 0 for payments
 ```
 
 ### Availability is arithmetic
+
+**In plain words:** parts in a chain multiply their risk, so more steps means less uptime. Spare copies side by side cut the risk, because all of them must fail at once.
+
+```mermaid
+flowchart LR
+    subgraph chain["In a chain: 99.9% x 99.9% = 99.8%"]
+        A1["LB"] --> A2["App"] --> A3["DB"]
+    end
+    subgraph spare["Side by side: down only if both are down"]
+        B1["App copy 1"]
+        B2["App copy 2"]
+    end
+```
 
 A request that passes through components **in series** succeeds only if all of them are up, so you multiply. **Redundant** copies fail only if all copies are down at once. This Go code computes both; it passes `go vet` and `go test -race` on Go 1.24.
 
@@ -294,7 +345,14 @@ Three lessons for the invoice service:
 2. **Redundancy helps, if failures are independent.** Two API instances at 99% each give 1 − 0.01² = 99.99%. Two instances in the same rack on the same bad deploy are not independent, which is why real gains come from separate zones and staged rollouts.
 3. **Pick the target before the architecture.** 99.9% can tolerate a 10-minute manual database failover a few times a year. 99.99% (4 minutes a month) cannot, so it forces automatic failover; see [[High Availability and Failover]].
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
+
+```mermaid
+flowchart TD
+    Q{"Mostly reads or writes?"} -- "reads" --> R["Cache, CDN, read replicas"]
+    Q -- "writes" --> W["Batching, queues, partitioning"]
+    Q -- "money / seats" --> T["Relational DB, idempotency, ledgers"]
+```
 
 Systems fall into a few shapes, and the shape decides the first components you reach for.
 
@@ -314,14 +372,14 @@ Systems fall into a few shapes, and the shape decides the first components you r
 | Simplicity vs scalability | One database, no sharding yet | Most products below about 10k writes/s (estimate; depends on hardware and query shape) |
 | Throughput vs latency | Batch writes, wait to fill a batch | Kafka producer `linger.ms` |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Do not design for scale you do not have.** A single PostgreSQL primary with a replica serves most products for years. Microservices, Kafka and sharding each add operational cost before they add value.
 - **Every extra hop costs latency and availability** (see the series rule). A cache that is down must not take the request path down with it.
 - **Stateless is a property you maintain.** One in-memory session map or local file upload quietly makes an instance stateful and breaks load balancing.
 - **Strong guarantees cost money.** Synchronous cross-region replication gives zero data loss and adds a cross-region round trip (often 50-150 ms, estimate) to every write.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** The canonical stack above is how most web products are built: a CDN (CloudFront, Cloudflare), a managed load balancer (AWS ALB), containers on ECS or Kubernetes, PostgreSQL or MySQL, Redis, a queue (SQS or Kafka), and S3 for files.
 - **Failure modes → fixes:**
@@ -331,7 +389,7 @@ Systems fall into a few shapes, and the shape decides the first components you r
 	- Deploy kills in-flight requests → graceful shutdown and connection draining; see [[Graceful Shutdown and Health Checks]].
 - **What to monitor:** the four golden signals per component (latency, traffic, errors, saturation), and the SLO burn rate for each user-facing journey.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Availability by requests, not minutes.** Many SLOs are written as "good requests ÷ total requests" rather than uptime. A system that fails 1% of requests all day is 99% available even though it was never "down".
 - **Correlated failure breaks the parallel formula.** `Parallel` assumes independence. Shared power, a shared bad config, a shared dependency (DNS, an identity provider) or a retry storm make replicas fail together. This is why cloud regions are split into availability zones with separate power and networking.
@@ -339,7 +397,7 @@ Systems fall into a few shapes, and the shape decides the first components you r
 - **Durability is replication plus independence plus repair.** Eleven nines come from storing data across devices and facilities and repairing lost copies quickly; a replica alone is not a backup, because deletes and bad migrations replicate too (see [[Backup, PITR and Disaster Recovery]]).
 - **State is the hard part.** Stateless tiers scale by adding copies. Stateful tiers need [[Replication]], [[Partitioning and Sharding]] and [[Consistent Hashing]], and each brings consistency questions. Most interview deep dives end up in the data layer.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- What is the difference between functional and non-functional requirements?
 > Functional requirements are what the system does ("users can shorten a URL"). Non-functional requirements are how well it does it, with numbers: "p99 redirect under 50 ms, 99.99% available, 10k writes/s". The non-functional ones decide the architecture; two systems with the same features can need very different designs.
@@ -359,7 +417,7 @@ Systems fall into a few shapes, and the shape decides the first components you r
 > [!question]- How does the read:write ratio change the design?
 > Read-heavy systems scale with caches, CDNs and replicas. Write-heavy systems need batching, queues, append-only storage and partitioning, because caches do not absorb writes. Always ask for the ratio early.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Requirements first: functional, non-functional with numbers, and out of scope.
 - Units: nines for availability, p99 ms for latency, RPS for throughput, nines for durability.

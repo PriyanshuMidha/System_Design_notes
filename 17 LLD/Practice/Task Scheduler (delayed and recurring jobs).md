@@ -27,7 +27,28 @@ updated: 2026-11-13
 > - **Graceful shutdown**: stop dispatching, let running jobs finish, and cancel their contexts only when the shutdown deadline expires.
 > - Classic mistakes: one `time.AfterFunc` goroutine per job with no way to list or cancel them, a scan of all jobs every second, and `time.Sleep` in tests.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, the rest of this section, the Problem statement, Steps 1 to 3, the Drawing and the Cheat sheet. Skip the code for now. That is a full first pass.
+> - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
+> - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs) and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A task scheduler runs a piece of code at a set time, once or again and again. Think of a phone alarm app with many alarms. All jobs sit in a list sorted by the next run time; the data structure for this is a **min-heap**. One loop looks at the earliest job and sleeps until it is due. When it wakes, it runs the job, and if the job repeats, it puts it back with the next time.
+
+```mermaid
+flowchart LR
+    A["Jobs sorted by time"] --> B["Sleep until earliest"]
+    B --> C["Run job"]
+    C -- "repeats" --> A
+```
+
+Everything else in this note is just these 3 questions:
+1. How does the heap keep the next job on top?
+2. How does one loop sleep and wake correctly?
+3. How do repeats, cancels and restarts work?
 
 **The problem in one story.** An app must send a reminder email in 10 minutes, clean old files every hour, and retry a failed payment at 3 pm.
 Thousands of such jobs wait, each with its own time.
@@ -71,7 +92,7 @@ It breaks down because helpers here can be cancelled mid-task through a context,
 > [!tip] Remember
 > One heap, one timer for the earliest job, one dispatcher deciding when, and a bounded pool of workers doing what.
 
-## Problem statement
+## Problem statement 🟢
 
 ```text
 Design an in-process task scheduler. Callers submit jobs that run once at a given
@@ -91,7 +112,7 @@ was busy or paused, and a graceful shutdown that lets running jobs finish.
 5. Add the worker pool, cancellation, the missed-run policy and shutdown.
 6. Test with a fake clock: ordering, both missed-run policies, cancel, no overlap, panic recovery, shutdown, and 50 concurrent schedule/cancel calls under `-race`.
 
-## Step 1: Clarify requirements
+## Step 1: Clarify requirements 🟢
 
 ### Questions to ask (with assumed answers)
 
@@ -124,7 +145,7 @@ was busy or paused, and a graceful shutdown that lets running jobs finish.
 - Persistence, leases and exactly-once across instances (discussed in Steps 6 and 10).
 - Priorities between jobs that are due at the same time (ties run in submit order).
 
-## Step 2: Actors and use cases
+## Step 2: Actors and use cases 🟢
 
 | Actor | Use case |
 |---|---|
@@ -137,7 +158,7 @@ was busy or paused, and a graceful shutdown that lets running jobs finish.
 
 The hardest use case is the **dispatcher loop**: it must sleep exactly until the next due job, wake early when a sooner job is scheduled, and never hold the lock while it waits for a free worker.
 
-## Step 3: Entities
+## Step 3: Entities 🟢
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
@@ -151,7 +172,7 @@ The hardest use case is the **dispatcher loop**: it must sleep exactly until the
 
 Modelling insight: the job is the caller's value, the **entry is the scheduler's state** about it. Keeping `index` on the entry is what makes `Cancel` O(log n): `heap.Remove(&pq, e.index)` instead of a linear search. The entry also carries the job's `context`, so cancelling stops a run that has already started.
 
-## Step 4: Relationships
+## Step 4: Relationships 🟡
 
 ```mermaid
 classDiagram
@@ -224,7 +245,7 @@ stateDiagram-v2
 - **Aggregation** (heap to entry): entries enter and leave the heap; a one-shot entry stays in `byID` while it runs, so `Cancel` can still reach its context.
 - **Dependency on an interface** (scheduler to clock): injected, so the same code runs on real and fake time.
 
-## Step 5: APIs and public methods
+## Step 5: APIs and public methods 🟡
 
 ```text
 POST   /jobs              body: {id, runAt, everySeconds, policy, handler}  -> 201 {id, nextRunAt}
@@ -248,9 +269,11 @@ var _ JobScheduler = (*Scheduler)(nil) // compile-time check
 
 Typed errors map to status codes: `ErrDuplicateID` to 409, `ErrInvalidJob` to 400, `ErrNotFound` to 404, `ErrClosed` to 503.
 
-## Step 6: Storage and repositories
+## Step 6: Storage and repositories 🟡
 
 In memory, the heap is the store. To survive restarts and run on several instances, the jobs move into a table and each instance claims due rows with a lease.
+
+**In plain words:** A jobs table so the schedule survives a restart and can be shared by several machines.
 
 ```sql
 CREATE TABLE jobs (
@@ -299,7 +322,7 @@ type JobRepo interface {
 - `FOR UPDATE SKIP LOCKED` is the same claim pattern as in [[Parking Lot]]; the general trade-offs are in [[Locking - Optimistic vs Pessimistic]].
 - An instance that crashes mid-run leaves a lease that expires; a sweeper puts the row back to `scheduled`. That makes execution **at-least-once**, so handlers must be idempotent ([[Idempotency and Idempotency Keys]]).
 
-## Step 7: Patterns
+## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 |---|---|---|
@@ -315,7 +338,7 @@ Patterns not used, and why:
 - No State-pattern classes for the job lifecycle: the states carry no per-state behaviour, so `index`, `inFlight` and the context are enough ([[State Machines in Go]] is for transitions with rules).
 - No goroutine per job: 100,000 delayed jobs would mean 100,000 sleeping goroutines and timers, with no single place to list, count or cancel them.
 
-## Folder structure
+## Folder structure 🟡
 
 ```text
 scheduler/
@@ -327,7 +350,7 @@ scheduler/
 cmd/demo/main.go    -> New(RealClock{}, 4, logResult), signal.NotifyContext, Shutdown on SIGTERM
 ```
 
-## Step 8: Core code
+## Step 8: Core code 🟡
 
 > [!tip] What to code in a 60-minute round
 > Aim for about 180 lines in the room.
@@ -363,6 +386,8 @@ cmd/demo/main.go    -> New(RealClock{}, 4, logResult), signal.NotifyContext, Shu
 > Such a hang shows up only now and then, for example in a `go test -race -count=20` run.
 > 
 > An absolute deadline cannot drift that way. The same race exists with real time when the process is paused between the two calls, but there it only delays the run slightly.
+
+**In plain words:** The full scheduler. Start with `Schedule` and the dispatcher loop, then cancel and the repeat logic.
 
 ```go
 package scheduler
@@ -702,7 +727,7 @@ func (s *Scheduler) Shutdown(ctx context.Context) error {
 }
 ```
 
-## Test cases
+## Test cases 🟡
 
 | Test | Proves |
 |---|---|
@@ -716,6 +741,8 @@ func (s *Scheduler) Shutdown(ctx context.Context) error {
 | `TestConcurrentScheduleAndCancel` | 50 goroutines schedule, half cancel their own job: exactly the 25 survivors run |
 
 All tests pass under `go test -race -count=50` (Go 1.24.4). The fake clock's `WaitForTimer` waits until the dispatcher has armed a timer for a given time, so `Advance` never races the dispatcher. `recorder.waitN` waits for results before `Shutdown`, so a shutdown cannot stop the dispatcher before it dispatched what the test expects.
+
+**In plain words:** A fake clock and fake timers so tests can jump time forward and check exactly when each job runs.
 
 ```go
 package scheduler
@@ -1111,7 +1138,7 @@ func TestConcurrentScheduleAndCancel(t *testing.T) {
 }
 ```
 
-## Step 9: Edge cases
+## Step 9: Edge cases 🔴
 
 | Edge case | What happens | How the design handles it |
 |---|---|---|
@@ -1136,7 +1163,7 @@ func TestConcurrentScheduleAndCancel(t *testing.T) {
 - Calling `time.Now()` directly and sleeping in tests: slow and flaky.
 - Forgetting that a recurring job's next time is computed from the **scheduled** slot, not from when the run finished, which makes the schedule drift.
 
-## Step 10: Tradeoffs and extensions
+## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 |---|---|
@@ -1158,7 +1185,7 @@ Tradeoffs chosen:
 
 The system-level version (durable schedules, sharding, exactly-once claims across a fleet) is [[Case Study - Distributed Job Scheduler]].
 
-## Drawing
+## Drawing 🟢
 
 ```mermaid
 sequenceDiagram
@@ -1193,7 +1220,7 @@ Redraw it from memory:
 - [ ] Both missed-run policies on a timeline 10, 20, 30, 40 with a wake-up at 35
 - [ ] Shutdown in three steps: stop, drain, wait or cancel
 
-## Interview questions
+## Interview questions 🔴
 
 > [!question]- Why a min-heap and one timer instead of one timer per job?
 > The heap gives the earliest job in O(1) and insert or remove in O(log n), and one goroutine sleeps until the head is due. A timer per job scatters state across many callbacks: you cannot list jobs, shutdown cannot wait for them, and cancelling races with firing. With a heap there is one place that owns all the state.
@@ -1220,7 +1247,7 @@ Redraw it from memory:
 > [!question]- How does this become a scheduler for a fleet of instances?
 > Jobs live in a table indexed on `next_run_at`. Each instance claims due rows with `FOR UPDATE SKIP LOCKED` and a lease, runs them, and writes the next slot only if it still owns the lease. A crashed instance's lease expires and another instance picks the job up, so delivery is at-least-once and handlers must be idempotent.
 
-## Cheat sheet
+## Cheat sheet 🟢
 
 - Min-heap by `next`, ties by `seq`; `index` on the entry for O(log n) cancel.
 - One dispatcher: pop due, reschedule recurring from the scheduled slot, arm one timer, send outside the lock.
@@ -1231,7 +1258,7 @@ Redraw it from memory:
 - Shutdown = stop, drain, wait, cancel contexts on deadline.
 - Inject the clock with absolute-deadline timers; never sleep in tests.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[LLD Interview Method]], [[Concurrency for LLD]], [[Command, Undo and Memento]]
 - **Next:** [[17 LLD/Practice/Circuit Breaker|Circuit Breaker]]

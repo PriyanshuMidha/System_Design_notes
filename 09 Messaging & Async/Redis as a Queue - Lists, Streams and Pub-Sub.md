@@ -26,7 +26,40 @@ updated: 2026-11-13
 > - Everything is at least once, and an acked write can still be lost on failover or with `appendfsync everysec`. Handlers must be idempotent.
 > - Choose Kafka, RabbitMQ or SQS when you need long retention, replay at scale, or data bigger than RAM.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (lists, streams, pub/sub, delayed jobs), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Redis is a very fast store that keeps data in memory.
+Many teams already run it for caching, so they also use it as a job queue.
+Redis gives three tools for this, and they behave very differently.
+A **list** is a simple pile: push jobs in, pop them out. But a popped job is lost if the worker crashes.
+A **stream** is a kept logbook where workers must sign off each job, so lost jobs can be handed to someone else.
+**Pub/Sub** is a live radio: if nobody is listening right now, the message is gone.
+
+```mermaid
+flowchart LR
+    Q[("List")] -- "pop" --> W["Worker crashes"]
+    W --> X["Job lost forever"]
+```
+
+```mermaid
+flowchart LR
+    S[("Stream")] -- "read" --> W["Worker crashes"]
+    W --> P["Job stays on 'not signed off' list"]
+    P --> O["Another worker claims it"]
+```
+
+The rest of this note is just these 3 questions:
+1. How do you make a list queue safe against crashes?
+2. How do streams and consumer groups track who has what?
+3. When should you stop using Redis and pick a real broker?
+
 
 **The problem in one story.**
 Your web app must send 2,000 emails a minute, but sending one takes time.
@@ -70,7 +103,7 @@ Where it breaks: unlike a paper logbook, Redis lives in RAM, so a crash or failo
 > [!tip] Remember
 > Lists for simple jobs (with `BLMOVE`), Streams for reliable queues with acks, Pub/Sub only for live broadcast.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A team already runs Redis for caching and needs a queue for 2,000 email jobs per minute.
 
@@ -81,15 +114,36 @@ That is two orders of magnitude more than this team needs.
 
 The catch is that the obvious Redis queue is not reliable, and the most obvious "messaging" command, `PUBLISH`, is not a queue at all. This note shows which structure to use and how to close the gaps. Data-structure basics are in [[Redis Data Structures and When to Use Each]].
 
-## 2. Mental model
+**Which Redis tool for which need:**
+
+```mermaid
+flowchart TD
+    N{"What do you need?"} -- "simple job queue" --> L["List + 'in progress' list"]
+    N -- "retries, many workers,<br/>see stuck jobs" --> S["Stream + consumer group"]
+    N -- "live updates, loss is ok" --> P["Pub/Sub"]
+    N -- "run at a time later" --> Z["Sorted set by time"]
+```
+
+## 2. Mental model 🟢
 
 - **List queue:** a pile of envelopes. A worker takes the bottom one. If the worker drops it on the way, it is gone, unless the worker first moves it to its own "in progress" tray.
 - **Stream:** a numbered logbook. Entries stay in the book. Each team (consumer group) has a bookmark and a list of entries handed out but not signed off (the PEL). A supervisor can reassign unsigned entries from an absent member.
 - **Pub/Sub:** a radio broadcast. Whoever is tuned in hears it; nobody can rewind.
 
-## 3. How it works
+**The three mental models, drawn:**
+
+```mermaid
+flowchart LR
+    L["List = pile of envelopes"] --> L2["Take one; drop it and it is gone"]
+    S["Stream = logbook + bookmarks"] --> S2["Sign off each entry"]
+    P["Pub/Sub = radio"] --> P2["No rewind"]
+```
+
+## 3. How it works 🟡
 
 ### List queue and the lost-job problem
+
+**In plain words:** popping a job removes it from Redis, so a crash right after loses it. The fix is to move the job to your own "in progress" list instead.
 
 ```text
 producer:  LPUSH jobs:email '{"id":"j1"}'
@@ -127,6 +181,8 @@ Measured on Redis 8.2.1:
 - Lists have no retry counter, no delay and no dead-letter. You build them: a retry count inside the payload, a sorted set for delays, a `jobs:email:dead` list.
 
 ### Streams with consumer groups
+
+**In plain words:** a stream keeps every entry; each group hands entries to workers, remembers who has which, and lets someone else take over an entry left too long.
 
 ```mermaid
 sequenceDiagram
@@ -208,6 +264,8 @@ Read it line by line: c1 got both entries and acked only the first.
 
 ### Pub/Sub
 
+**In plain words:** Pub/Sub is live only: it sends to whoever is connected right now and keeps nothing, so it is not a queue.
+
 ```text
 127.0.0.1:6394> PUBLISH news hello
 (integer) 0          <- number of subscribers that received it: nobody was listening, so it is gone
@@ -222,6 +280,8 @@ Read it line by line: c1 got both entries and acked only the first.
 
 ### Delayed jobs with a sorted set
 
+**In plain words:** store each job with its run time as the score; a poller moves jobs whose time has come into the real queue.
+
 ```text
 127.0.0.1:6394> ZADD jobs:delayed 1762250700 job-7 1762250460 job-8      (score = run_at, unix seconds)
 (integer) 2
@@ -233,9 +293,11 @@ Read it line by line: c1 got both entries and acked only the first.
 
 Several pollers may see the same due job; only the one whose `ZREM` returns 1 enqueues it. Production libraries do "move due jobs to the ready list" in a Lua script so the read, remove and push are one atomic step.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the two safe patterns on one napkin: move-then-remove for lists, and read-ack-claim for streams.
 
 ```text
 LIST (reliable):
@@ -256,6 +318,8 @@ STREAM:
 ```
 
 ### Code: both reliable patterns in Go, tested against a real Redis
+
+**In plain words:** Go code for both safe patterns, with tests that run against a real Redis on your machine.
 
 Written with `github.com/redis/go-redis/v9` (v9.7.0). The tests run against a throwaway Redis 8.2 on port 6394 and skip if none is running.
 
@@ -534,7 +598,7 @@ Run with `go test -race ./redisq` (Go 1.24, Redis 8.2.1 on :6394): both tests pa
 
 One go-redis detail surfaced while testing: `BLMove` with a timeout under 1 s logs "minimal supported value is 1s - truncating to 1s", so the test uses 1 s.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | Durable? | Ack and redelivery | Fan-out | Retention and replay | Use when |
 | --- | --- | --- | --- | --- | --- |
@@ -562,7 +626,7 @@ In Node, **BullMQ** offers delayed and repeatable jobs, priorities, rate limitin
 
 Both still deliver at least once.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Memory-bound.** Every pending job and every stream entry lives in RAM. A downstream outage that builds a 50-million-job backlog can push Redis into `maxmemory`, where the eviction policy may delete your queue keys (use `noeviction` on a Redis that holds queues) or writes fail.
 - **Durability is weaker than a broker's.** With `appendfsync everysec` (the default when AOF is on; measured default on this server), a crash can lose about the last second of acknowledged writes. Without AOF, an RDB snapshot can be minutes old. See [[Redis Persistence - RDB and AOF]].
@@ -570,7 +634,7 @@ Both still deliver at least once.
 - **One stream is one key, so one shard.** In Redis Cluster a hot stream does not spread across nodes; you shard by hand (`orders:{0}`..`orders:{15}`) and lose cross-shard order.
 - **Choose something else when** you need multi-day retention or data larger than memory (Kafka, Pulsar), many independent consumer groups replaying history (Kafka), per-partition ordering at high throughput with rebalancing handled for you (Kafka), complex routing (RabbitMQ), or zero operations on AWS with DLQ built in (SQS). See [[Queues vs Streams and Broker Comparison]].
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Sidekiq (Ruby), BullMQ (Node) and asynq (Go) all run job queues on Redis at large scale. Redis Streams are common as a lightweight event bus inside one product, and for activity feeds and IoT ingestion where retention is hours.
 - **Failure modes → fixes:**
@@ -583,7 +647,7 @@ Both still deliver at least once.
 	- Duplicates after reclaim or failover → idempotent handlers ([[Delivery Semantics and Exactly-Once]], [[Idempotency and Idempotency Keys]]).
 - **What to monitor:** `XLEN` and `XINFO GROUPS` (`pending`, `lag`, `last-delivered-id` per group), oldest PEL entry idle time (`XPENDING` extended), DLQ stream length, `LLEN` of ready and processing lists, `used_memory` vs `maxmemory`, replication offset gap, and `client_recent_max_output_buffer` for Pub/Sub.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 **How streams are stored.** A stream is a radix tree whose nodes are listpacks holding many entries (`stream-node-max-entries`, default 100, measured on this server).
 
@@ -607,7 +671,17 @@ For per-entity order, shard streams by entity key and give each shard one consum
 
 **Exactly-once is still not available.** Between "handler finished" and "`XACK` reached Redis" a crash leads to redelivery. Redis transactions cannot include your database write. Store the processed entry ID in your database in the same transaction as the effect, and skip IDs already seen.
 
-## 9. Interview questions
+**Atomic dead-lettering, one step:**
+
+```mermaid
+flowchart LR
+    E["Entry failed too many times"] --> M["MULTI"]
+    M --> A["XADD {orders}:dlq"]
+    M --> B["XACK {orders}"]
+    A & B --> X["EXEC: both or neither"]
+```
+
+## 9. Interview questions 🔴
 
 > [!question]- Why is `LPUSH` + `BRPOP` not a reliable queue, and how do you fix it with lists alone?
 > `BRPOP` removes the job as it hands it over, so a worker crash before finishing loses it. Use `BLMOVE ready processing:<worker> RIGHT LEFT` so the job moves atomically into a processing list, `LREM` it after success, and on restart (or with a reaper for shared lists) move leftovers back to ready.
@@ -627,7 +701,7 @@ For per-entity order, shard streams by entity key and give each shard one consum
 > [!question]- Your team wants Redis Streams for an event log that 6 services read, with 30-day replay. Good idea?
 > Probably not. Thirty days of events in RAM is expensive, one stream is one shard, and there is no tiered storage. Kafka (or a managed log) keeps data on disk, partitions it, and is built for many groups replaying. Redis Streams fit hours of retention and modest volume.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Lists: `LPUSH` + `BLMOVE` to a processing list + `LREM`; recover leftovers; no retries or DLQ built in.
 - Streams: `XADD ... MAXLEN ~ N`, `XGROUP CREATE ... $ MKSTREAM`, `XREADGROUP ... >`, `XACK`, `XPENDING`, `XAUTOCLAIM`; DLQ by delivery count.

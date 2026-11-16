@@ -51,7 +51,37 @@ sequenceDiagram
     end
 ```
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A website needs to check your password, but it should never keep the password itself.
+Instead it keeps a scrambled version, called a **hash**. You can make a hash from a password, but you can't turn a hash back into the password.
+
+```mermaid
+flowchart LR
+    P["password: sunshine1"] --> H["slow hash + salt"] --> S["stored: $argon2id$..."]
+```
+
+At login, the site hashes what you typed and compares it with the stored hash. Same result means right password.
+Each password also gets its own random **salt** (a few random bytes mixed in). So two people with the same password get different hashes.
+The hash is made slow on purpose. One login waits a tiny bit, but a thief trying billions of guesses waits for years.
+
+```mermaid
+flowchart LR
+    T["Thief steals the table"] --> G["Guesses: 1 per ~0.1 s<br/>per password"] --> X["Years, not seconds"]
+```
+
+The rest of this note is just these 3 questions:
+1. Which slow hash to use, and with what settings?
+2. What are salt and pepper, and how do you compare safely?
+3. How do you protect the login form itself (rate limits, lockout, MFA)?
+
 
 **The problem in one story.**
 A website's database gets stolen.
@@ -96,7 +126,7 @@ Where it breaks: real shredding is fast; a password hash is made slow on purpose
 > [!tip] Remember
 > Never store passwords; store a salted, deliberately slow hash and compare in constant time.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Suppose a database of 10 million user rows leaks, each storing `SHA256(password)` with no salt. SHA-256 is designed to be *fast* — that is exactly the wrong property for password storage. A single consumer GPU computes roughly 10 billion SHA-256 hashes per second.
 
@@ -110,13 +140,15 @@ Each password also gets its own random salt. Without a salt, two users who both 
 
 With a unique salt per password, the attacker must redo the expensive computation for every single row, even for repeated passwords.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the hash function as a lock that is deliberately slow to pick, and the salt as making every lock a different shape even if two people chose the "same" key. A pepper is a master factor the locksmith (the server) keeps in their own safe, never handed out with the lock itself (the database) — so stealing the lock (the database) alone is not enough; you also need the thing in the safe.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Algorithm choice and parameters
+
+**In plain words:** pick one of three slow hash tools (argon2id first). The numbers in the table just say how slow and how much memory each guess must cost.
 
 | Algorithm | OWASP 2025 minimum | Mechanism | Notes |
 | --- | --- | --- | --- |
@@ -129,10 +161,14 @@ Memory-hardness is the key property that separates argon2id/scrypt from bcrypt a
 
 ### Salt and pepper
 
+**In plain words:** salt is a random extra stored next to each hash, so every password is unique. Pepper is one secret kept outside the database, so a stolen database alone is not enough.
+
 - **Salt:** a random value (16 bytes is standard) generated per password with a cryptographically secure source (`crypto/rand`, never `math/rand`), stored alongside the hash (it does not need to be secret — its job is uniqueness, not secrecy).
 - **Pepper:** one secret value for the whole application, stored in config or a secrets manager — never in the database next to the hashes it protects. Mixed in via HMAC (not plain concatenation, to avoid length-extension ambiguity) before the password reaches the hash function. A pepper means a database-only leak (SQL injection, a stolen backup) is not enough on its own to start guessing; the attacker also needs the application's secret store.
 
 ### Constant-time comparison and user enumeration
+
+**In plain words:** compare hashes in a way that always takes the same time, and give the same answer for "wrong email" and "wrong password". Otherwise attackers learn which emails exist.
 
 The final comparison between a freshly computed hash and the stored one must run in constant time (`subtle.ConstantTimeCompare`, never `==` or `bytes.Equal`), so that an attacker cannot use response-timing differences to learn how many leading bytes of a guess matched.
 
@@ -151,9 +187,11 @@ flowchart TD
     R -- no --> ERR["401 'invalid email or password'\n(identical for both branches)"]
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Go: argon2id with salt, pepper, and rehash-on-login
+
+**In plain words:** this code hashes on signup, checks on login, and upgrades old weak hashes when the user logs in next.
 
 ```go
 // Package pwhash hashes and verifies passwords with Argon2id, encoded in the
@@ -380,6 +418,15 @@ func TestDummyHashIsWellFormed(t *testing.T) {
 
 ### Rehash-on-login
 
+**In plain words:** computers get faster, so yesterday's settings get weak. When a user logs in, you have their real password for a moment, so you hash it again with today's settings.
+
+```mermaid
+flowchart LR
+    L["Login OK"] --> C{"Hash uses old settings?"}
+    C -- "yes" --> N["Hash again with new settings, save"]
+    C -- "no" --> D["Done"]
+```
+
 Parameters that were adequate in 2020 (lower memory, fewer iterations) become weak as hardware improves. Storing the parameters *inside* the PHC string (as the code above does) lets the server detect a weak hash on a successful login and transparently re-hash the password with current parameters — the user never has to reset anything, because the plaintext password is available at the exact moment of a successful login and nowhere else:
 
 ```mermaid
@@ -390,7 +437,7 @@ flowchart LR
     Rehash --> Done
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Approach | Mechanism | Use when | Cost |
 | --- | --- | --- | --- |
@@ -400,13 +447,13 @@ flowchart LR
 | PBKDF2-HMAC-SHA256 | Simple iterated HMAC | FIPS-140 compliance requirement | Not memory-hard; needs a much higher iteration count to compensate, and even then is more GPU-crackable per guess than argon2id |
 | Passkeys / WebAuthn | No shared secret at all: a device-bound key pair, server stores only a public key | Phishing-resistant login is the priority | No password to steal or hash at all, but needs platform/browser support and a fallback for devices without it |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Memory-hard hashing costs real server RAM per concurrent login (19 MiB × concurrent logins). At very high login throughput this is a genuine capacity-planning input, not a rounding error — budget for peak concurrent logins, and consider a login rate limit as the real defense against a volumetric attack rather than lowering the hash parameters.
 - A pepper adds operational cost (one more secret to manage and rotate) for a benefit that only matters if the database leaks *without* the application's secret store also leaking — still a very common real-world pattern (SQL injection, a stolen backup) that peppers specifically defend against.
 - Passwords are not the only option: passkeys (WebAuthn/FIDO2) remove the shared-secret problem entirely by storing only a public key server-side, and TOTP or a push-based authenticator adds a strong second factor on top of whichever first factor you keep. New systems should offer passkeys/WebAuthn as a first-class option, not an afterthought, because they eliminate password-specific risk (credential stuffing, phishing, reuse) rather than mitigating it.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** 1Password and Bitwarden use argon2id to derive the vault key from a master password. Signal uses argon2id for key derivation. Microsoft and GitHub have driven adoption of WebAuthn/passkeys as a primary login method for high-value accounts.
 - **Failure modes → fixes:**
@@ -418,6 +465,8 @@ flowchart LR
 
 ### Account lockout vs rate limiting
 
+**In plain words:** locking an account after 5 tries lets attackers lock out real users. Slowing down attempts (rate limiting) blocks guessing without that harm.
+
 | | Account lockout | Rate limiting |
 | --- | --- | --- |
 | Mechanism | N consecutive failures locks the account until reset/support | Caps attempts per IP, per account, or both, over a time window (see [[Rate Limiting - Algorithms and Distributed Design]] for the algorithms) |
@@ -426,7 +475,7 @@ flowchart LR
 
 Pure lockout is itself an attack vector: an attacker who wants to deny a specific user access just needs their email and a handful of wrong-password attempts. Rate limiting the login endpoint (per IP, per account, and the combination) with backoff avoids creating that self-inflicted denial-of-service path while still slowing down guessing.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **MFA shapes.** TOTP (RFC 6238: a 6-digit code derived from a shared secret and the current 30-second time step) is simple and offline-capable but phishable (a fake login page can relay the code in real time). WebAuthn/passkeys bind the credential to the origin at the protocol level — a phishing site on the wrong domain cannot complete the challenge even if the user is fooled into trying, because the browser itself enforces the origin check before any credential is used. This is why passkeys are called phishing-resistant and TOTP is not.
 - **Breach checks without sending the password.** The Have I Been Pwned Pwned Passwords API uses k-anonymity: the client sends only the first 5 hex characters of the password's SHA-1 hash, the service returns all suffixes matching that prefix, and the client checks locally whether its full hash is in the returned set. Neither the password nor its full hash ever leaves the client/server performing the check.
@@ -434,7 +483,7 @@ Pure lockout is itself an attack vector: an attacker who wants to deny a specifi
 - **Legacy hash migration.** Moving an existing user base from an old, weaker hash (say, salted SHA-256) to argon2id without forcing a mass password reset: wrap the old hash — store `argon2id(oldSHA256Hash)` — or, more commonly, verify against the old scheme on next login and transparently re-hash with argon2id at that moment (the same rehash-on-login mechanism, generalized to "migrate from any old scheme" rather than only "upgrade old argon2id parameters").
 - **NIST SP 800-63B guidance** de-emphasizes forced periodic password rotation and arbitrary complexity rules (a password that must contain a digit and a symbol) in favor of length (8+ characters minimum, longer encouraged) and a breach check — rotation policies historically pushed users toward predictable incrementing patterns ("Password1", "Password2") that are easier, not harder, to guess.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why is SHA-256 the wrong choice for hashing passwords, even with a salt?
 > SHA-256 is designed to be fast, which is the opposite of what password hashing needs. A GPU computes roughly 10 billion SHA-256 hashes per second; a salt stops one rainbow table from cracking every row at once, but it does nothing to slow down cracking any individual row. A memory-hard, deliberately slow function like argon2id is needed to make each guess expensive regardless of salting.
@@ -457,7 +506,7 @@ Pure lockout is itself an attack vector: an attacker who wants to deny a specifi
 > [!question]- Why is TOTP considered weaker than WebAuthn/passkeys against phishing, even though both are "a second factor"?
 > TOTP is just a time-based code; a phishing page can relay it to the real site in real time (an adversary-in-the-middle proxy), because nothing binds the code to the origin the user intended. WebAuthn/passkeys bind the credential to the requesting origin at the protocol level, so the browser itself refuses to complete the challenge on the wrong domain — phishing resistance is built into the protocol, not dependent on user vigilance.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Never store plaintext or a fast general-purpose hash (SHA-256, MD5) — use a slow, memory-hard function.
 - argon2id (OWASP minimum: m=19 MiB, t=2, p=1) is the default choice for new systems; bcrypt (cost ≥10, 72-byte limit) and scrypt (N=2^17,r=8,p=1) remain acceptable.

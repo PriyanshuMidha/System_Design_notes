@@ -24,7 +24,40 @@ updated: 2026-11-13
 > - Consumers must therefore be idempotent, and per-entity order holds only if the relay keeps it.
 > - Classic mistake: "publish after commit" in the request handler. A crash between the two loses the event forever.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (write path, outbox table, relay designs), 4 (worked example) and 5-6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+When an order is placed, you must do two things: save it in the database, and tell other services.
+These are two separate systems, so a crash between them leaves them out of sync.
+Save first and crash: the order exists but nobody hears about it.
+Tell first and crash: others act on an order that was never saved.
+The fix: save the order and the message in the same database step, in a table called the **outbox**.
+A small helper program, the **relay**, reads the outbox and sends the messages to the broker.
+Reading the database's own change log instead of the table is called **CDC** (change data capture).
+
+```mermaid
+flowchart LR
+    A["Save order"] --> X["crash"] --> B["Never sent:<br/>nobody knows"]
+```
+
+```mermaid
+flowchart LR
+    A["One DB step:<br/>order + outbox row"] --> R["Relay reads outbox"]
+    R --> K[("Broker")]
+    K --> C["Billing, email, search"]
+```
+
+The rest of this note is just these 3 questions:
+1. What goes in the outbox, and why in the same transaction?
+2. Should the relay poll the table or read the database log?
+3. How do you deal with the duplicates the relay will sometimes send?
+
 
 **The problem in one story**
 You order a pizza online. The shop saves your order in its database.
@@ -69,7 +102,7 @@ Where it breaks: a real clerk rarely posts a letter twice, but a relay can, so r
 > [!tip] Remember
 > Commit the event with the data in one transaction, publish it later, and make consumers ignore duplicates.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An order service handles `POST /orders`. It must insert the order and publish `OrderPlaced` so that billing, email and search react.
 
@@ -88,7 +121,19 @@ That still loses about 1.7 events a day (2,000 × 86,400 × 10⁻⁸ ≈ 1.7), a
 
 Distributed transactions (two-phase commit, XA) across PostgreSQL and Kafka are not an option: Kafka does not take part in XA, and 2PC adds a blocking coordinator anyway.
 
-## 2. Mental model
+**The dual-write problem, both ways:**
+
+```mermaid
+flowchart TB
+    subgraph A["Commit, then publish"]
+        A1["COMMIT order"] --> A2["crash"] --> A3["Event lost:<br/>billing never charges"]
+    end
+    subgraph B["Publish, then commit"]
+        B1["Publish event"] --> B2["INSERT fails"] --> B3["Phantom order charged"]
+    end
+```
+
+## 2. Mental model 🟢
 
 Write the letter and drop it into the office **out-tray** in the same motion as filing the paperwork. A mail clerk empties the out-tray later.
 
@@ -100,9 +145,20 @@ If the clerk is sick, letters wait in the tray; they are never lost. If the cler
 	- **Log tailing (CDC):** a reader of the database's write-ahead log (WAL, the append-only file the database writes every change to before applying it; see [[Storage Engines - B-tree vs LSM and WAL]]). Debezium is the common tool.
 - **Idempotent consumer:** the recipient who ignores a letter with a reference number it has already handled (owned by [[Delivery Semantics and Exactly-Once]]).
 
-## 3. How it works
+**The office out-tray, drawn:**
+
+```mermaid
+flowchart LR
+    F["File paperwork +<br/>drop letter in out-tray<br/>(one motion)"] --> T[("Out-tray")]
+    T --> C["Clerk posts letters later"]
+    C -- "forgot to remove one" --> D["Sent twice:<br/>receiver ignores repeats"]
+```
+
+## 3. How it works 🟡
 
 ### The write path
+
+**In plain words:** one transaction writes the order and its message together; the relay sends the message later, so either both happen or neither does.
 
 ```mermaid
 sequenceDiagram
@@ -133,6 +189,8 @@ Crash analysis:
 
 ### The outbox table
 
+**In plain words:** a plain table with one row per message to send: who it is about, what kind of event, the payload, and when it was sent.
+
 ```sql
 CREATE TABLE outbox (
     id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -153,6 +211,8 @@ CREATE INDEX outbox_unsent ON outbox (id) WHERE published_at IS NULL;
 `gen_random_uuid()` is built into PostgreSQL since version 13. `event_id` travels with the message (as a header or inside the payload) so that the consumer has a stable key to deduplicate on; see [[Idempotency and Idempotency Keys]].
 
 ### Two relay designs
+
+**In plain words:** the relay either asks the table "anything new?" every second, or reads the database's own change log as it is written.
 
 ```mermaid
 flowchart LR
@@ -200,9 +260,11 @@ With `route.by.field=aggregate_type` the default topic is still `outbox.event.<v
 
 With CDC the application can even delete the outbox row in the same transaction right after inserting it: the WAL still holds the insert, so Debezium publishes it, and the table never grows.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** one order request, step by step: write both rows in one go, then the relay sends and marks the row as sent.
 
 ```text
 POST /orders {id: o-1, amount: 49900}
@@ -220,6 +282,8 @@ outbox lag = rows with published_at IS NULL = 0
 The rule to remember: **the relay may publish twice, never zero times, and never out of order for one aggregate.**
 
 ### Go: a polling relay with an in-memory database
+
+**In plain words:** a Go model of the whole pattern: one atomic write, a relay that keeps order, and tests that crash at the worst moments.
 
 The relay below stops at the first failed publish. That keeps order: if event 2 fails, event 3 must not go out ahead of it. `MemDB` stands in for PostgreSQL; one mutex plays the part of one transaction, so `PlaceOrder` writes both rows atomically.
 
@@ -501,6 +565,8 @@ Run with `go vet ./... && go test -race ./...` (Go 1.24): all four tests pass, a
 
 ### What it looks like in PostgreSQL
 
+**In plain words:** the real SQL to watch: how many messages are waiting, and how old the oldest one is.
+
 Outbox lag, the first number to put on a dashboard (representative output, PostgreSQL 17):
 
 ```sql
@@ -531,7 +597,7 @@ WHERE slot_type = 'logical';
  debezium_ord | t      | 184 kB
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -545,7 +611,7 @@ WHERE slot_type = 'logical';
 > [!warning] Interview trap
 > "Use Kafka transactions" does not solve the dual write. Kafka transactions make a set of Kafka writes (and consumer offset commits) atomic. PostgreSQL is not part of that transaction, so the order row and the event can still disagree.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Duplicates are guaranteed to happen eventually.** Every consumer needs an inbox table or another idempotency check. If a consumer cannot be made idempotent, the outbox alone is not enough.
 - **Latency.** Polling adds up to one interval of delay. CDC is usually lower but has its own batching. Neither suits a response the caller must wait for; use a synchronous call there.
@@ -556,7 +622,7 @@ WHERE slot_type = 'logical';
 	- There is no database write at all: there is nothing to make atomic.
 	- The consumer is in the same database: just write to its table in the same transaction.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- Debezium's PostgreSQL and MySQL connectors with the Outbox Event Router are the common open-source CDC relay.
@@ -577,7 +643,7 @@ WHERE slot_type = 'logical';
 	- For CDC: slot lag in bytes (`pg_wal_lsn_diff`), whether the slot is `active`, and connector status.
 	- Consumer dedupe hits: a sudden rise means the relay is replaying.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **The identity-gap trap.** A relay that remembers "last published id = 500" and then queries `WHERE id > 500` can skip events. Identity values are handed out at `INSERT` time, but transactions commit in a different order:
 	1. Transaction A takes id 501.
@@ -596,7 +662,21 @@ WHERE slot_type = 'logical';
 - **Inbox on the consumer side.** The mirror pattern: the consumer inserts `event_id` into an `inbox` table in the same transaction as its own side effect, with a unique constraint. A duplicate fails the insert and is skipped. Details live in [[Delivery Semantics and Exactly-Once]].
 - **Payload: fat or thin?** A fat event carries the full order state (consumers need no callback). A thin event carries only the id and type (consumers call back, which can read newer state than the event). Most outboxes carry enough state for the main consumers, versioned with a schema; see [[Event Schemas and Schema Registry]].
 
-## 9. Interview questions
+**The identity-gap trap, drawn:**
+
+```mermaid
+sequenceDiagram
+    participant A as Tx A
+    participant B as Tx B
+    participant R as Relay (WHERE id > mark)
+    A->>A: takes id 501 (not committed)
+    B->>B: takes id 502, commits
+    R->>R: publishes 502, mark = 502
+    A->>A: commits 501
+    Note over R: 501 is never published
+```
+
+## 9. Interview questions 🔴
 
 > [!question]- Why can't you just publish to Kafka right after the database commit?
 > The process can die between the two steps. The commit is durable and the event is lost, and no retry happens because the retrying process is gone. The outbox moves the event into the same local transaction, so a crash leaves both or neither.
@@ -619,7 +699,7 @@ WHERE slot_type = 'logical';
 > [!question]- Can you skip the outbox and just run CDC on the `orders` table?
 > Yes, for replicating state (search index, cache, warehouse). But consumers then couple to your internal columns, and a row change does not say *why* it changed. An outbox lets you publish a deliberate, versioned event contract.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Dual write = DB + broker with no shared transaction; both orders of operations lose or invent events.
 - Outbox: business row + event row in one local transaction; a relay publishes later.

@@ -25,7 +25,37 @@ updated: 2026-11-13
 > - A full validation checklist has six checks: signature, allowed algorithm, `iss`, `aud`, `exp`/`nbf` with leeway, and (if you issue them) `jti` against a denylist.
 > - Revoking a single JWT early is the hard problem JWTs do not solve for free; short expiry plus a refresh token is the usual answer (see [[Access and Refresh Tokens]]).
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+A **JWT** (JSON Web Token) is a small text pass a server gives you after login.
+It says things like "user 42, expires at 9:00". Those facts are called **claims**.
+The server signs the pass. Anyone can read it, but nobody can change it without breaking the signature.
+
+```mermaid
+flowchart LR
+    H["header"] --- P["claims: user 42, exp 9:00"] --- S["signature"]
+```
+
+Any server that has the right key can check the pass without asking a database. That is why JWTs are popular with many servers.
+The danger is in checking it badly: trusting the algorithm the token names, or forgetting to check the expiry.
+
+```mermaid
+flowchart LR
+    T["Token arrives"] --> A{"Signature OK<br/>with MY key + algorithm?"} --> E{"Not expired?<br/>Right issuer/audience?"} --> U["Trust the claims"]
+```
+
+The rest of this note is just these 3 questions:
+1. What is inside a JWT?
+2. Which signing method, and how do servers get the public keys?
+3. What must every verifier check, and which attacks happen when it doesn't?
+
 
 **The problem in one story.**
 Your API runs on 20 servers behind a load balancer.
@@ -69,7 +99,7 @@ Where it breaks: anyone can read the wristband print (JWTs are signed, not encry
 > [!tip] Remember
 > A JWT is signed, not secret: pin the algorithm, check `iss`, `aud` and `exp`, and keep it short-lived.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 An API running behind a load balancer on 20 stateless pods needs to know who is calling on every request. A server-side session keyed by a session ID means every pod either shares one session store (a network hop and a single point of failure on every request) or sticks a client to one pod (breaks autoscaling and rolling deploys).
 
@@ -77,7 +107,7 @@ A JWT moves the session data into the request itself: the client sends `Authoriz
 
 The cost is that the token now carries its own expiry and claims, and the server can no longer just "delete the session row" to log someone out early; see [[Access and Refresh Tokens]] for how real systems close that gap.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 A JWT is a **boarding pass**, not a sealed envelope. The airline (the issuer) prints your name, flight, seat and a tamper-evident mark (the signature) on it. Anyone can read a boarding pass — the gate agent, you, a stranger glancing at your phone — but only someone holding the airline's stamp could have produced a valid one.
 
@@ -85,9 +115,11 @@ If you scribble "first class" onto economy seat 32B, the stamp no longer matches
 
 That is the one fact every JWT bug traces back to: **encoded, not encrypted**. Never put a password, a secret, or anything you would not want visible in a browser extension's network tab into a JWT payload.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Structure
+
+**In plain words:** three chunks of text joined by dots: a header (how it was signed), the claims (the facts), and the signature (the tamper seal).
 
 ```mermaid
 flowchart LR
@@ -105,6 +137,8 @@ The header names the algorithm and, for asymmetric signing, a key id (`kid`) tel
 Keep the payload small and free of secrets — it is fully readable by anyone holding the token.
 
 ### HS256 vs RS256/EdDSA, and JWKS
+
+**In plain words:** HS256 uses one shared password to sign and check. RS256/EdDSA use a private key to sign and a public key to check, so checkers can't forge passes. JWKS is just a URL that lists the public keys.
 
 - **HS256** (HMAC-SHA256): one shared secret signs and verifies. Simple, but every verifier must hold the secret, so any verifying service could also forge tokens. Fine for a single service that both issues and checks its own tokens.
 - **RS256** (RSA) and **EdDSA** (Ed25519): the issuer holds a private key and signs; every other service verifies with the matching **public** key. This is the right choice once more than one service needs to verify tokens, because a compromised verifier cannot forge new ones.
@@ -133,6 +167,8 @@ sequenceDiagram
 
 ### Validation checklist
 
+**In plain words:** go through this list on every token. Skipping even one item is a real hole.
+
 A verifier that skips any of these has a real vulnerability, not a theoretical one:
 
 1. **Pin the allowed algorithm(s) in verifier code**, never read `alg` from the token to decide how to check it.
@@ -143,6 +179,8 @@ A verifier that skips any of these has a real vulnerability, not a theoretical o
 6. If the service tracks revocation, check **`jti`** against a denylist or the user's token version.
 
 ### Attacks that skipping step 1 enables
+
+**In plain words:** if you let the token pick its own algorithm, an attacker can pick "none" or trick you into using the public key as a password.
 
 ```mermaid
 sequenceDiagram
@@ -175,7 +213,7 @@ A third live risk is **`kid`/`jku` injection**: a malicious `kid` like `../../de
 
 The fix is the same shape as the others — never let the token tell the verifier where to find the key; the verifier's own configuration names the trusted JWKS URL, and `kid` only selects among keys that URL already returned.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
 
@@ -191,6 +229,8 @@ _, err := parser.ParseWithClaims(raw, claims, keyFunc)
 ```
 
 ### Full version
+
+**In plain words:** the complete Go verifier with tests. The whiteboard version above is the part to remember.
 
 Built and tested in a scratch module with `github.com/golang-jwt/jwt/v5` on Go 1.24; `go vet` and `go test -race` both pass.
 
@@ -329,7 +369,7 @@ func TestKeyConfusionAttackRejected(t *testing.T) {
 
 **Measured:** `go test -race ./jwt/...` on Go 1.24.4 — 5 tests, all pass: valid round trip, expired token rejected, wrong audience rejected, `alg=none` forgery rejected, RS256/HS256 key-confusion forgery rejected (2026-11-07).
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Scheme | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -342,13 +382,13 @@ func TestKeyConfusionAttackRejected(t *testing.T) {
 > [!warning] Interview trap
 > "JWTs are more secure than sessions" is not a real claim — they trade a lookup for a revocation problem. Pick JWTs for statelessness and cross-service verification, not for security per se.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Revocation is the real cost.** A plain JWT remains valid until `exp` no matter what the server does, because nothing is "deleted" on logout. Fixes: keep access-token `exp` short (5–15 min), pair with a refresh token (see [[Access and Refresh Tokens]]), or maintain a `jti` denylist or a per-user token version checked on each request — both of which add back the lookup JWTs were meant to avoid.
 - **Size and cost.** A JWT with a handful of claims runs 200–500 bytes, sent on every request in a header; a session cookie is a short opaque ID. At high request volume this is real, if small, bandwidth and CPU (RSA/EdDSA verification) overhead versus a cache lookup.
 - **When a session is simply better:** a single monolith, low request volume, or a requirement for instant, certain revocation (banking logout, admin-disable-user) — use server-side sessions or an opaque token and skip the added complexity.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:** Auth0, Okta and Keycloak issue RS256/EdDSA access and ID tokens with JWKS endpoints; AWS Cognito and Firebase Auth do the same; most OIDC providers (see [[OAuth 2.0 and OpenID Connect]]) use JWTs for ID tokens by specification.
 - **Failure modes → fixes:**
@@ -358,7 +398,7 @@ func TestKeyConfusionAttackRejected(t *testing.T) {
   - Secrets in the payload show up in logs or a browser extension → payload is never encrypted; audit what goes into claims during code review.
 - **What to monitor:** 401 rate by cause (expired vs bad signature vs wrong audience), JWKS fetch latency and cache-miss rate, denylist size and lookup latency, and a spike in tokens with unknown `kid` (possible rotation bug or attack probing).
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why `aud` matters even with one issuer.** If the same authorization server issues tokens for both `orders-api` and `payments-api`, a token meant for the (lower-trust) orders service must not be accepted by payments. Without an `aud` check, a token leaked to or stolen from orders-api works everywhere that issuer is trusted — this is exactly the class of bug OWASP API Security Top 10 2023 names under API2 Broken Authentication.
 - **The revocation problem, properly.** Three real strategies, in order of operational cost: (1) accept the delay — keep `exp` to 5–15 minutes and let the natural expiry be the revocation; (2) a `jti` denylist in Redis with TTL equal to the token's remaining lifetime, checked on every request — brings back a lookup but only for the (rare) revoked set; (3) a per-user `token_version` claim, bumped in the user record on logout-everywhere or password change, checked against the current stored version — one lookup per request again, but cheap and simple to reason about. There is no way to get instant, free revocation from a bare JWT; something must be checked server-side.
@@ -366,7 +406,7 @@ func TestKeyConfusionAttackRejected(t *testing.T) {
 - **Clock skew and leeway.** Distributed systems never have perfectly synced clocks; 20–60 seconds of leeway on `exp`/`nbf` absorbs normal NTP drift without materially extending the attack window on a stolen token.
 - **Minimal claims, by design.** Every byte in the payload is sent on every request and is fully readable; keep it to what authorization actually needs (`sub`, `role` or scopes, tenant id) and resolve anything larger (full user profile) by a lookup keyed on `sub`.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Is a JWT encrypted?
 > No. It is base64url-encoded and signed. Anyone holding the token can decode and read every claim; the signature only proves the claims were not altered. Never put secrets in the payload.
@@ -389,7 +429,7 @@ func TestKeyConfusionAttackRejected(t *testing.T) {
 > [!question]- Your service's JWKS endpoint starts returning 5xx. What happens to already-cached keys, and what should the verifier do?
 > A verifier with a reasonable JWKS cache keeps using its last-known-good keys and continues verifying tokens signed with them; it should log the fetch failure and alert, but must not fail-open (accept everything) just because it cannot refresh. New keys introduced during the outage (from a rotation) will fail to verify until the JWKS endpoint recovers — an argument for a generous overlap window during rotation.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - `header.payload.signature`, each base64url; **signed, not encrypted** — never put secrets in the payload.
 - Pin the accepted algorithm(s) in verifier code. Never let the token's `alg` header decide how it gets checked.

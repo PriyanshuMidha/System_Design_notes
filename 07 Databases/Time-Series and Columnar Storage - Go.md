@@ -19,12 +19,29 @@ updated: 2026-11-13
 
 # Time-Series and Columnar Storage - Go
 
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then "Before the code", "What this code shows", Step 1 and "How the pieces fit". Stop there.
+> - 🟡 **Know the basics?** Add Steps 2 to 8 and the Tests.
+> - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This file is the hands-on twin of [[Time-Series and Columnar Storage]]. Time-series data is just readings with a time stamp, like "CPU was 41% at 10:00:05". There is a lot of it, and it is very repetitive. A **column store** keeps each field in its own list (all times together, all values together), so a sum reads only the list it needs. Because each list is so regular, it shrinks a lot with simple tricks: store only the change between times, store only the bits that changed between values, and store "paid x 500" instead of "paid" 500 times. The Go code builds those three tricks; the SQL at the end shows the same ideas in ClickHouse, Postgres and TimescaleDB. Read it top to bottom: each step is a short Concept, the code, then a walkthrough.
+
+```mermaid
+flowchart LR
+    R["rows: time, cpu, status"] --> C["split into columns"]
+    C --> T["times: store only the changes"]
+    C --> V["values: store only changed bits"]
+    C --> S["status: paid x 500"]
+```
+
 > [!summary] TL;DR
 > Go implementations of the three column encodings a time-series store relies on (delta-of-delta timestamps, Gorilla XOR floats, run-length encoding), plus the ClickHouse, PostgreSQL and TimescaleDB SQL for the InvoiceOps analytics design. It is the runnable companion of [[Time-Series and Columnar Storage]].
 >
 > Each piece of code is introduced by the idea it implements and followed by a numbered walkthrough, and the tests explain what every size check proves.
 
-## Before the code
+## Before the code 🟢
 
 - **Slices of numbers** (`[]int64`, `[]float64`): one slice per column is the whole idea of a column store in memory.
 - **Varints** (`binary.AppendVarint`, `binary.Uvarint`): store small numbers in fewer bytes; zigzag makes small negative numbers small too.
@@ -33,7 +50,7 @@ updated: 2026-11-13
 - **Sentinel errors** (`errors.New`): one `errCorrupt` value returned when encoded input is malformed.
 - **What to run**: concatenate the Go blocks into `colenc.go` and `colenc_test.go`, then `go vet ./... && go test -race -v ./...`.
 
-## What this code shows
+## What this code shows 🟢
 
 | Code | Theory concept | Where the theory explains it |
 | --- | --- | --- |
@@ -70,7 +87,7 @@ flowchart TD
     LZ["math/bits LeadingZeros64, TrailingZeros64"] --> EF
 ```
 
-## Setup
+## Setup 🟢
 
 - Module layout: one package `colenc` with `colenc.go` and `colenc_test.go`.
 - Go 1.24 (uses the built-in `min`, `for range n` and `slices`), standard library only.
@@ -85,11 +102,13 @@ go mod init colenc
 go vet ./... && go test -race -v ./...
 ```
 
-## Code
+## Code 🟡
 
 The code implements delta-of-delta timestamps (with zigzag varints, a simpler cousin of Gorilla's bit-bucket scheme), Gorilla XOR floats, and run-length encoding. The size checks in the Tests section measure how well each one compresses.
 
 ### Step 1: row store versus column store
+
+**In plain words:** a row store is a stack of forms, one per event; a column store is one list per question. To total one column you only pick up that one list.
 
 **Concept.** The first idea in [[Time-Series and Columnar Storage#Row layout vs column layout]] is that the physical layout decides how much data a query reads. A row store keeps each event together, so summing one field still drags every other field through memory. A column store keeps each field together, so the same sum reads only the slices it names.
 
@@ -151,6 +170,8 @@ func paidTotal(c EventColumns) (sum int64) {
 3. The function touches 2 of the 20 columns, so it reads roughly a tenth of the data a row scan would.
 
 ### Step 2: delta-of-delta timestamps
+
+**In plain words:** readings arrive every 10 seconds, so the gap barely changes. Store the gap's change, which is almost always 0, and 0 costs almost nothing.
 
 **Concept.** Timestamps in a metric series are almost evenly spaced, as in [[Time-Series and Columnar Storage#Delta-of-delta on timestamps]]. The first difference (delta) between neighbours is nearly constant, so the difference of deltas (delta-of-delta) is mostly zero, and zero is the cheapest number to encode. The code stores the first timestamp, the first delta, then only delta-of-delta values as signed varints.
 
@@ -278,6 +299,8 @@ The second half rebuilds each timestamp.
 
 ### Step 3: a bit writer and reader
 
+**In plain words:** Go can write whole bytes but not single bits, so this is a tiny helper that writes and reads one bit at a time.
+
 **Concept.** Gorilla's output is not byte aligned: a single repeated value costs one bit, so the encoder needs to write one bit, then five, then 64. Go's standard library has no bit-level writer, so the code defines two small helpers.
 
 See [[Time-Series and Columnar Storage#Gorilla XOR on float values]] for why the format needs them. The alternative is a `bytes.Buffer` per field, which would waste up to seven bits per value and destroy the compression.
@@ -352,6 +375,8 @@ func (r *bitReader) readBits(n uint) (uint64, error) {
 4. `v = v<<1 | uint64(bit)` appends the bit to the result, so the first bit read becomes the highest bit of `v`.
 
 ### Step 4: Gorilla XOR floats
+
+**In plain words:** two readings in a row are nearly the same number, so most of their bits match. Store only the few bits that differ.
 
 **Concept.** Gauge values such as CPU or temperature change slowly, so neighbouring values share most of their 64 bits. XOR of two equal values is zero; XOR of two close values has long runs of leading and trailing zero bits, and only the middle "meaningful" bits differ.
 
@@ -550,6 +575,8 @@ The tail reads the meaningful bits and applies them.
 
 ### Step 5: run-length encoding
 
+**In plain words:** instead of writing "paid" 500 times, write "paid x 500". It works best when equal values sit next to each other.
+
 **Concept.** A column of low-cardinality strings such as invoice status stores the same value many times in a row once the table is sorted by it, as in [[Time-Series and Columnar Storage#Run-length encoding and the sort key]]. RLE replaces each stretch of equal values with one (value, count) pair.
 
 The design choice is that RLE only pays off for adjacent equal values, so the table's sort key decides the compression ratio. The alternative, a dictionary that maps each string to a small integer, works without sorting but still stores one integer per row; real engines combine the two.
@@ -610,6 +637,8 @@ func DecodeRLE(runs []Run) []string {
 2. The result equals the original column in the same order, which `TestRLE` checks.
 
 ### Step 6: ClickHouse tables and the rollup
+
+**In plain words:** the same ideas in a real column database: the sort order you choose decides how well data squeezes and how much a query can skip.
 
 **Concept.** The design in [[Time-Series and Columnar Storage#4.1 InvoiceOps analytics store in ClickHouse]] keeps PostgreSQL as the OLTP database and feeds ClickHouse through CDC and Kafka. The `ORDER BY` of a MergeTree table is its sort key and its sparse index at once, so it decides both RLE-style compression and which reads can skip data.
 
@@ -699,6 +728,8 @@ The `-State` functions store partial aggregates; the `-Merge` functions combine 
 
 ### Step 7: PostgreSQL partitioning and BRIN
 
+**In plain words:** for smaller data you can stay on Postgres: one table per month, plus a tiny index that only remembers the oldest and newest time in each chunk of the table.
+
 **Concept.** At tens of millions of rows a separate store is often not worth running, as [[Time-Series and Columnar Storage#4.2 The same idea at modest volume: PostgreSQL partitioning and BRIN]] explains. PostgreSQL 17 handles time-ordered data well with declarative partitioning and a BRIN index (block range index: a tiny index that stores min and max per range of heap pages).
 
 Because rows arrive in time order, each block range covers a narrow time window, so BRIN is effective and tiny. The alternative, a B-tree on the timestamp, indexes every row and costs hundreds of megabytes.
@@ -769,6 +800,8 @@ A query on one week of November reads only the November partition (partition pru
 
 ### Step 8: TimescaleDB
 
+**In plain words:** a Postgres add-on that does step 7 for you automatically.
+
 **Concept.** TimescaleDB, described in [[Time-Series and Columnar Storage#TimescaleDB]], keeps PostgreSQL and automates the pattern from step 7. A hypertable looks like one table but is split into chunks, each an ordinary PostgreSQL table covering one time interval.
 
 Old chunks are compressed into a columnar layout, and continuous aggregates are incrementally refreshed rollups. The trade-off against ClickHouse is lower peak scan speed for full SQL, transactions and one operational system.
@@ -822,7 +855,15 @@ SELECT add_retention_policy('invoice_events', INTERVAL '90 days');
 2. The policy refreshes the window from 3 days ago to 1 hour ago every 15 minutes, so late data inside the window is corrected.
 3. The retention policy drops whole chunks older than 90 days, a metadata operation rather than a delete.
 
-## How the pieces fit
+**Why sorting matters for RLE, as a picture** 🟢
+
+```mermaid
+flowchart LR
+    U["unsorted: paid, open, paid, open"] --> U2["4 runs, no saving"]
+    S["sorted: open, open, paid, paid"] --> S2["2 runs: open x2, paid x2"]
+```
+
+## How the pieces fit 🟢
 
 The encoders trade CPU for size in different ways, and each assumes something about the data. Knowing the assumption tells you when the technique stops working.
 
@@ -836,7 +877,7 @@ The encoders trade CPU for size in different ways, and each assumes something ab
 
 In a real columnar file each column chunk is encoded separately, and a general-purpose compressor such as ZSTD runs on top of the specialized encoding. The specialized step makes the data more regular, and the general step squeezes what is left.
 
-## Design decisions
+## Design decisions 🔴
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -854,7 +895,7 @@ In a real columnar file each column chunk is encoded separately, and a general-p
 | `-State` and `-Merge` rollup | Store final sums | Correct under repeated inserts and merges, but reads must `GROUP BY` |
 | BRIN plus partitions in PostgreSQL | B-tree on time | Tiny index and fast retention, but only works on time-correlated data |
 
-## Tests
+## Tests 🟡
 
 The tests check round trips and sizes: timestamps compress more than 6x, a constant float series costs exactly one bit per value (137 bytes for 1,001 values), special float values survive, and sorting a column before RLE reduces the number of runs. A round trip proves correctness; a size check proves the compression claim of the theory note.
 
@@ -889,6 +930,8 @@ The fixture is 1,000 samples, 15 seconds apart, with 1 second of extra delay aft
 
 ### TestTimestampsRoundTripAndSize
 
+**In plain words:** pack the times, unpack them, get exactly the same times back, and the packed form is much smaller.
+
 Property: decoding the encoded timestamps returns exactly the input, and the encoding is smaller than one sixth of the raw 8 bytes per value. This matters because a lossy or barely smaller encoding would make the whole technique pointless.
 
 | Input | Expected |
@@ -915,6 +958,8 @@ func TestTimestampsRoundTripAndSize(t *testing.T) {
 A failure of the round trip means encoder and decoder disagree about the format, so data would be silently corrupted. A failure of the size check means the deltas are not collapsing to zero, for example because the delta bookkeeping was broken.
 
 ### TestFloatsRoundTrip
+
+**In plain words:** every kind of number series comes back bit for bit, even the weird ones like NaN.
 
 Property: every kind of float series survives encoding bit for bit, including empty, single-element, constant, counter-like, noisy and special values. Bit equality is used because `NaN != NaN` and `0 == -0.0` would hide bugs under `==`.
 
@@ -972,6 +1017,8 @@ A failure names the case and index. A wrong `-0.0` or `Inf` points at a bit-widt
 
 ### TestConstantSeriesCostsOneBitPerValue
 
+**In plain words:** if the value never changes, each reading costs just one bit.
+
 Property: a constant series costs exactly one bit per value after the header, which is the lower bound the theory promises.
 
 | Input | Expected size |
@@ -991,6 +1038,8 @@ func TestConstantSeriesCostsOneBitPerValue(t *testing.T) {
 A failure means the encoder writes more than the `0` control bit for repeated values, so the fast path is not taken.
 
 ### TestRLE
+
+**In plain words:** equal neighbours collapse into one pair, and sorting first makes fewer pairs.
 
 Property: runs collapse equal neighbours, decoding restores the column, and sorting first reduces the number of runs. This is the code form of "the sort key decides the compression".
 
@@ -1104,7 +1153,7 @@ Measured on the test data above:
 
 The last row is the lesson: Gorilla works because real gauges change slowly. Random noise in the low mantissa bits leaves almost nothing to remove. The Gorilla paper reports an average of 1.37 bytes per (timestamp, value) pair on Facebook's production data, which is documented, not measured here.
 
-## Pitfalls in the code
+## Pitfalls in the code 🔴
 
 - Varints are signed zigzag values: a negative delta-of-delta (a late sample) is legal but may take 2 bytes, so jitter costs more than the ideal 1 byte.
 - `EncodeFloats` caps the leading-zero count at 31 because the field has 5 bits; a value with more leading zeros simply stores a few extra zero bits.
@@ -1114,7 +1163,7 @@ The last row is the lesson: Gorilla works because real gauges change slowly. Ran
 - RLE only wins when equal values are adjacent. On an unsorted column it can be larger than the raw data.
 - The SQL blocks are not executed here. Their syntax follows ClickHouse, PostgreSQL 17 and TimescaleDB 2.13 or later.
 
-## Exercises
+## Exercises 🔴
 
 1. Change the jitter in `sampleTimestamps` from every 100 samples to every 10 samples and predict whether the encoded size doubles, stays near 1,027 B, or grows by more than 2x. Run the test to check.
 2. Replace `counter(500)` with a counter that increases by exactly `1.0` and predict whether bits per value goes up or down compared with 11.26. Explain it with the XOR window.
@@ -1124,7 +1173,7 @@ Hints. For exercise 1, ten times as many jitters means ten times as many non-zer
 
 For exercise 3, alternating values never repeat next to each other, so there are 1,000 runs and no saving at all; after sorting there are 2.
 
-## Links
+## Links 🟢
 
 - **Theory:** [[Time-Series and Columnar Storage]]
 - **Before this:** [[Storage Engines - B-tree vs LSM and WAL]], [[Partitioning and Sharding]], [[Index Types and Index Design]]

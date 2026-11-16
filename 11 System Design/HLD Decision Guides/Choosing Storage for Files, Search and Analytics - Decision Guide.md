@@ -33,7 +33,38 @@ updated: 2026-11-13
 > - The primary database stays the source of truth. Search indexes and warehouses are derived copies you can rebuild.
 > - Keep the derived stores honest by feeding them from a log (change data capture), not by dual writes.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (12). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the eight decisions), 4 (e-commerce example), 5, 6 and 9 (drills).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 10 and 11. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your main database is great at one job: saving and reading orders and users safely.
+It is bad at three other jobs: holding big files, fuzzy text search, and huge reports.
+Big files like photos go to **object storage** (think of a giant, cheap online folder, like S3).
+Text search goes to a **search index** (like Elasticsearch), built for "find shoes, even if I typo it".
+Big reports go to a **warehouse**, built to add up billions of rows fast.
+The main database stays the one source of truth. The others are copies fed from it.
+
+```mermaid
+flowchart LR
+    A["Before: one database<br/>does everything"] --> B["Slow search, huge DB,<br/>reports slow down checkout"]
+```
+
+```mermaid
+flowchart LR
+    DB["Main database<br/>(the truth)"] --> S["Search index"]
+    DB --> W["Warehouse"]
+    APP["App"] --> O["Object storage<br/>for photos"]
+```
+
+The rest of this note is just these 3 questions:
+1. Where do files live, and how do they reach users fast?
+2. How do you do search, and keep it in sync with the database?
+3. Where do reports and big analysis run?
 
 **The problem in one story**
 
@@ -80,7 +111,7 @@ Where it breaks: a real library has one copy of each record, while derived store
 > [!tip] Remember
 > Files to object storage, words to a search index, big sums to a warehouse; the primary DB stays the truth.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A typical product starts with one PostgreSQL database. Then three things happen.
 
@@ -91,7 +122,7 @@ Each problem has a different access pattern. Files are written once and read by 
 > [!tip] Remember
 > Match the store to the access pattern, and keep one source of truth.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Picture a company with three rooms. The **filing warehouse** (object storage) holds boxes you fetch by label. The **library index** (search engine) tells you which books mention a word, ranked by relevance. The **accounting office** (warehouse) answers questions about totals across years. The **front desk** (OLTP database) handles live customer transactions and keeps the master records.
 
@@ -110,7 +141,7 @@ flowchart LR
     DB -. "stores key and metadata only" .-> OBJ
 ```
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Decision 1: object, block or file storage?
 
@@ -226,6 +257,8 @@ flowchart TD
 
 ### Decision 5: keeping the search index in sync
 
+**In plain words:** Do not have the app write to both the database and the search index, because one write can fail. Let the search index follow the database's own change log.
+
 Dual writes (write DB, then write index in app code) fail when one write succeeds and the other fails. Prefer a log.
 
 ```mermaid
@@ -283,6 +316,8 @@ A row store reads whole rows, which is perfect for fetching one order. A column 
 
 ### Decision 7: which warehouse?
 
+**In plain words:** All warehouses add up big tables fast. Pick based on your cloud, how you want to pay, and how much tuning you want to do.
+
 ```mermaid
 flowchart TD
     W["Need analytics at scale"] --> A{"Need sub-second dashboards<br/>on fresh streaming data,<br/>self-managed OK?"}
@@ -328,7 +363,7 @@ Use a lake when you have many varied sources, huge volumes where warehouse stora
 > [!tip] Remember
 > Lake for cheap, raw, many consumers. Warehouse for fast, curated, SQL-first reporting.
 
-## 4. Worked example: an e-commerce product platform
+## 4. Worked example: an e-commerce product platform 🟡
 
 Requirements: product images, catalog search, and a daily sales dashboard, for 5M products and 1M orders per day.
 
@@ -361,7 +396,7 @@ Lake      : Parquet/Iceberg on S3 for raw + ML
 Rule      : DB = truth, everything else = rebuildable copy
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Need | Pick | Alternative | Why |
 | --- | --- | --- | --- |
@@ -378,7 +413,7 @@ Rule      : DB = truth, everything else = rebuildable copy
 
 See [[Case Study - Metrics and Logging Platform]] and [[Case Study - Search Autocomplete]] for end-to-end designs.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Object storage** has no in-place edits and higher first-byte latency than disks. Do not use it for databases or hot random-write workloads.
 - **CDN** gives stale content until the TTL expires or you purge. Skip it for per-user data.
@@ -387,7 +422,7 @@ See [[Case Study - Metrics and Logging Platform]] and [[Case Study - Search Auto
 - **Data lakes** without table formats and governance turn into swamps. Skip them if one warehouse suffices.
 - **CDC pipelines** add lag and a failure mode to watch. Accept it knowingly.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Dropbox** stored file blocks on S3 at first, then built its own storage system, Magic Pocket, to cut cost and gain control at huge scale (Dropbox engineering blog, 2016). Smaller companies rarely reach the point where that pays.
 - **Netflix** operates Open Connect appliances inside ISPs, and created Apache Iceberg for lake tables.
@@ -405,29 +440,54 @@ What to monitor:
 | S3 request errors and incomplete multipart uploads | Prevents silent failures and wasted storage |
 | Drift: counts in DB versus index versus warehouse | Catches sync bugs |
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Object storage consistency and durability
+
+**In plain words:** Object stores keep many copies of each file across buildings, so losing a file is extremely rare. S3 now also shows your new upload right away.
 
 S3 gives strong read-after-write consistency for new objects and overwrites since December 2020. Durability of 11 nines is a design goal based on redundant storage across facilities. It protects against hardware loss, not against your own bad delete, so enable versioning and consider object lock for important data. See [[AWS 07 - S3]].
 
 ### Why columnar scans are fast
 
+**In plain words:** Storing each column together means a "sum of price" reads only the price column, and similar values squeeze down small.
+
 Columns of the same type compress well (run-length, dictionary, delta encoding). Queries read only needed columns. Engines process data in vectorized batches. Partitioning and sort keys let them skip files and blocks using min/max statistics. This is why a billion-row aggregate can finish in seconds.
 
 ### Search indexes are derived state
 
+**In plain words:** The search index is a copy you can always rebuild from the database. So build a new one on the side and switch over, instead of fixing the old one in place.
+
 Because the index can be rebuilt from the source, treat it as disposable. Design a full reindex path, build into a new index and swap an alias, so mapping changes do not cause downtime. See [[Search Engines and Inverted Indexes]].
+
+```mermaid
+flowchart LR
+    DB["Database"] --> N["Build new index v2<br/>on the side"]
+    N --> AL["Switch alias<br/>products -> v2"]
+    AL --> D["Delete old v1"]
+```
 
 ### Handling deletes and privacy
 
+**In plain words:** When a user asks to be deleted, every copy must go: database, search, warehouse, lake and backups. Plan this early.
+
 Deletion requests must reach every copy: database, search index, warehouse, lake and backups. Plan a deletion pipeline early. Lakes with Iceberg or Hudi support row-level deletes, plain Parquet files need rewrites.
+
+```mermaid
+flowchart LR
+    R["Delete user 42"] --> DB["Database"]
+    R --> S["Search index"]
+    R --> W["Warehouse and lake"]
+    R --> B["Backups<br/>(expire or crypto-shred)"]
+```
 
 ### Cost levers
 
+**In plain words:** Move old files to cheaper storage, let the CDN serve most downloads, and make reports read less data.
+
 Object storage tiers (infrequent access, archive) cut cost for old data. CDN offload reduces origin egress. Warehouses reward partitioning and selecting only needed columns. Estimate volume first with [[Back-of-the-Envelope Estimation]].
 
-## 9. Scenario drills: scenario, choice, why
+## 9. Scenario drills: scenario, choice, why 🟡
 
 | Scenario | Choice | Why | Say in the interview |
 | --- | --- | --- | --- |
@@ -442,7 +502,7 @@ Object storage tiers (infrequent access, archive) cut cost for old data. CDN off
 | ML training data | Lake of Parquet on S3 | Cheap, raw, many consumers | "Open formats let several engines read the same data." |
 | Backups and audit archive | Object storage with archive tier and object lock | Cheap, durable, tamper-resistant | "Lifecycle rules move old data to cold storage." |
 
-## 10. How to say it in the interview
+## 10. How to say it in the interview 🔴
 
 - "Files go to object storage with presigned URLs so bytes never pass through our servers. The database keeps the key and metadata. A CDN serves them."
 - "For search I would start with PostgreSQL full-text search. We need facets and typo tolerance at 5 million products, so I move to OpenSearch."
@@ -450,7 +510,7 @@ Object storage tiers (infrequent access, archive) cut cost for old data. CDN off
 - "Analytics must not hit the OLTP primary. I replicate to a columnar warehouse and accept minutes of lag."
 - "The trade-off is operational: each extra store needs monitoring and a sync path, so I add one only when a measured limit demands it."
 
-## 11. Interview questions
+## 11. Interview questions 🔴
 
 > [!question]- Why not store images in the database?
 > Blobs bloat tables, backups and replication, and a database is a costly place to serve bytes. Object storage is cheaper, scales out, and pairs with a CDN. Keep the key and metadata in the database.
@@ -470,7 +530,7 @@ Object storage tiers (infrequent access, archive) cut cost for old data. CDN off
 > [!question]- Should a CDN cache private files?
 > Only with signed URLs or cookies and short expiry, so the CDN checks authorization. Never cache per-user responses under a shared URL.
 
-## 12. Cheat sheet
+## 12. Cheat sheet 🟢
 
 - Files: object storage, presigned uploads, CDN, metadata in the database.
 - Block for database disks, file storage for shared mounts, object for everything else.
@@ -481,7 +541,7 @@ Object storage tiers (infrequent access, archive) cut cost for old data. CDN off
 - ClickHouse for fast fresh dashboards, BigQuery for no ops, Snowflake for elastic isolation, Redshift on AWS.
 - Lake for raw, cheap, many consumers. Warehouse for curated reporting.
 
-## Links
+## Links 🟢
 
 - Deep notes, storage: [[SQL vs NoSQL]], [[Search Engines and Inverted Indexes]], [[Time-Series and Columnar Storage]], [[Storage Engines - B-tree vs LSM and WAL]], [[Materialized Views and Denormalization]], [[Backup, PITR and Disaster Recovery]], [[Index Types and Index Design]]
 - Deep notes, distributed systems: [[Multi-Region Architecture]], [[CQRS]], [[Event Sourcing]]

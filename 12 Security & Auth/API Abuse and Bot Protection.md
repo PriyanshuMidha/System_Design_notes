@@ -23,7 +23,39 @@ updated: 2026-11-13
 > - Login and OTP endpoints need stricter, separate limits from the rest of the API, because they are the ones attackers hit hardest.
 > - Classic mistake: blocking the first suspicious signal outright. That both creates false positives against real users and teaches the attacker exactly which signal tripped the alarm.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Some traffic follows every rule but still hurts you. Think of bots buying all concert tickets in 2 seconds.
+This is **API abuse**: valid requests, bad intent, huge volume.
+A **bot** is a script pretending to be many users, often from thousands of different IP addresses.
+
+```mermaid
+flowchart LR
+    B["1 attacker, 10,000 IPs"] --> API["Your login / checkout API"]
+    U["Real users"] --> API
+```
+
+No single wall stops it. So you stack several checks, each catching what the last one missed.
+
+```mermaid
+flowchart LR
+    R["Request"] --> E["Edge / WAF"] --> L["Rate limits"] --> S["Risk score"] --> C["Challenge<br/>(CAPTCHA, MFA)"] --> A["App"]
+```
+
+You look at behaviour over time, not one request: too many failures, too fast, from the same device.
+
+The rest of this note is just these 3 questions:
+1. What kinds of abuse exist (stuffing, scraping, fake signups, cost attacks)?
+2. How do you limit and score traffic on many keys at once?
+3. When do you challenge, slow down, or block?
+
 
 **The problem in one story.**
 A concert sells tickets at 10:00 AM.
@@ -68,7 +100,7 @@ Where it breaks: a bouncer sees faces, but a server only sees signals that bots 
 > [!tip] Remember
 > Abuse requests look valid one at a time; you catch them by combining signals across many requests and responding in steps, not with one hard block.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 A ticketing platform opens sales for a popular concert at 10:00 AM. Within seconds, bots using thousands of residential proxy IPs have bought most of the floor section, reselling tickets at a markup minutes later.
 
@@ -80,13 +112,15 @@ Both attacks used perfectly valid requests: correct JSON, a real (if automated) 
 
 That is what this note is about — the layer above "is this request well-formed," which [[OWASP API Security Top 10]]-style validation already handles.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a nightclub's door policy, not a single bouncer but several checks in sequence: an ID check (authentication), a dress code (basic request validation), a headcount limit per hour (rate limiting), a bouncer watching for group behavior that looks like trouble before anyone does anything wrong (risk signals and velocity rules), and a manager who can eject someone retroactively once a pattern becomes clear (post-hoc detection and account action). No single person at the door catches everything; the combination does.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Defense in depth
+
+**In plain words:** several cheap checks in a row. The first ones are fast and rough, the later ones are slower and smarter.
 
 ```mermaid
 flowchart LR
@@ -107,6 +141,8 @@ The risk engine combines signals the first two layers do not see individually. O
 
 ### The threat catalog
 
+**In plain words:** a list of the common bad patterns, what each looks like in your logs, and the main tool against it.
+
 | Attack | What it looks like | Primary defense |
 | --- | --- | --- |
 | Credential stuffing | Many login attempts, one leaked password list, spread across accounts and IPs | Per-account + per-IP login throttles, breached-password check, MFA |
@@ -121,6 +157,19 @@ The risk engine combines signals the first two layers do not see individually. O
 This maps onto OWASP API Security Top 10 (2023) **API4: Unrestricted Resource Consumption** (the cost attacks: scraping, expensive queries, OTP pumping) and **API6: Unrestricted Access to Sensitive Business Flows** (the business-logic attacks: scalping, card testing, fake signups) — both categories exist because the requests are individually valid and only the pattern is wrong.
 
 ### Rate limits per dimension
+
+**In plain words:** limit by IP alone and attackers just switch IPs. So count per account, per device and per IP at the same time.
+
+```mermaid
+flowchart LR
+    R["Login try"] --> I{"IP over limit?"}
+    I -- "no" --> A{"Account over limit?"}
+    A -- "no" --> D{"Device over limit?"}
+    D -- "no" --> OK["Allow"]
+    I -- "yes" --> X["Slow down / block"]
+    A -- "yes" --> X
+    D -- "yes" --> X
+```
 
 A single rate limit (say, per IP) is trivially defeated by rotating IPs. Production systems key limits on multiple dimensions at once and require all of them to pass:
 
@@ -140,6 +189,8 @@ flowchart TD
 An attacker rotating IPs still hits the per-account limit on the account they are targeting; an attacker rotating accounts (fake signups) still hits the per-IP or per-device limit. Requiring all dimensions to clear raises the cost of evasion substantially above any single limit.
 
 ### Progressive challenges and login hardening
+
+**In plain words:** start soft (small delay), then get stricter (CAPTCHA, extra login step) only when something looks off. Real users rarely feel it.
 
 Login endpoints get stricter, separate handling from the rest of the API, because credential stuffing concentrates there:
 
@@ -168,15 +219,19 @@ Hardening specific to login: check new passwords (and flag existing ones) agains
 
 ### Detection signals
 
+**In plain words:** clues that add up to "this is a bot": too many fails, too fast, odd device, IP from a data center.
+
 - **Velocity rules:** request or failure counts over a rolling window, per dimension (the `FailedLoginsLast15m` / `FailedLoginsFromIP15m` style counters in the worked example below).
 - **Device fingerprinting and behavioral signals:** canvas/font fingerprint stability, mouse movement or keystroke timing entropy (bots tend to be too fast or too mechanically uniform), consistent device ID across sessions.
 - **Honeypot fields:** a form field hidden from real users (no label, `display:none`, excluded from tab order) that only an automated form-filler sets.
 - **Edge signals:** IP/ASN reputation (data-center ranges, known proxy/VPN exit nodes), TLS fingerprinting (JA3/JA4 — the specific cipher suite and extension order a TLS client offers, which differs between a real browser and most HTTP client libraries).
 - **Anomaly dashboards:** aggregate views (signups per minute, login failure rate, checkout velocity) that catch a pattern no single request-level rule was written for yet.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** the risk engine is just a few if-statements over signals you already have. No magic.
 
 The core of a risk engine is not a clever algorithm, it is a short, readable decision over the signals you already have:
 
@@ -326,7 +381,7 @@ func TestLoginDoesNotRevealEnumeration(t *testing.T) {
 
 **Measured:** `go test -race ./...` on this package, Go 1.24.4, darwin/arm64, 2026-11-07: 7 tests, all pass — clean-signal allow, repeated-account-failure challenge, credential-stuffing-burst block, bad-IP-reputation block, new-device-plus-risky-IP challenge, honeypot detection, and the enumeration-resistance check above.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Layer | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -339,14 +394,14 @@ func TestLoginDoesNotRevealEnumeration(t *testing.T) {
 > [!warning] Interview trap
 > "We rate-limit by IP, so we're protected against credential stuffing" ignores that attackers run these attacks from thousands of residential-proxy IPs specifically to stay under any single IP's limit. The per-account counter — not the per-IP one — is what actually catches one account being hammered from many different IPs; both dimensions are necessary, and neither is sufficient alone.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - Every layer adds friction or cost somewhere: CAPTCHA costs real users time and conversion, strict rate limits risk false positives against legitimate bursty use (a mobile app retrying after a network blip), and a risk engine is ongoing tuning work, not a one-time setup.
 - Blocking outright on a single signal is usually wrong: it creates false positives (shared corporate NAT IPs, VPN users) and gives an attacker clean feedback on exactly which signal to avoid next time. Prefer a challenge or a shadow-ban (let the request appear to succeed while quietly discarding or down-ranking it) when confidence is not yet high.
 - A low-traffic internal tool with no public signup and no payment flow often does not need the full pipeline — basic auth plus simple per-API-key rate limits may be proportionate; the full defense-in-depth stack earns its cost on public, high-value, or adversarial-traffic surfaces.
 - False positives need an owner and an appeal path. A legitimate user wrongly blocked with no recourse is a support and trust cost that can outweigh the abuse it prevented.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
   - Cloudflare Turnstile and Google reCAPTCHA provide managed, mostly invisible proof-of-human challenges used across most large consumer platforms.
@@ -364,7 +419,7 @@ func TestLoginDoesNotRevealEnumeration(t *testing.T) {
   - Signups, OTP sends, and checkout attempts per minute, with alerting on sudden multiples of baseline.
   - False-positive signal: support tickets and appeal outcomes for blocked legitimate users.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Why generic error responses must also match in timing, not just text.** A login handler that checks "does this username exist" before "is the password correct" can leak existence through response latency even with an identical message, if the username-lookup path is slower (or faster) than the password-hash-and-compare path. The fix is to always perform a password hash comparison (even against a dummy hash when the username does not exist) so the response time is close to constant regardless of which check actually failed.
 - **Shadow-banning vs. hard blocking.** For medium-confidence abuse (not yet certain, but suspicious), many platforms let the request appear to succeed — a scraper keeps getting "200 OK" responses, but with stale or synthetic data — rather than returning an error that confirms detection to the attacker and invites them to adapt. This trades some implementation complexity for intelligence: the attacker does not learn what tripped the system.
@@ -372,7 +427,7 @@ func TestLoginDoesNotRevealEnumeration(t *testing.T) {
 - **Business-logic abuse is not a validation bug.** API6 (Unrestricted Access to Sensitive Business Flows) exists because "add to cart" and "submit order" are both perfectly valid API calls — the abuse is in the *rate and pattern* of valid calls, which is why this defense lives above request validation and closer to the rate-limiting and risk layers, not in a schema check.
 - **False positives are a cost, measure them as one.** A detection system tuned only against a "caught" metric, with no corresponding measurement of legitimate users wrongly challenged or blocked, will drift toward being too aggressive over time, since every tightened threshold looks like a win on the one metric being watched.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why isn't a single IP-based rate limit enough to stop credential stuffing?
 > Credential stuffing tools distribute requests across thousands of residential-proxy or botnet IPs specifically to stay under any one IP's threshold. A per-account counter catches the same account being targeted from many IPs; only combining both dimensions (and ideally device/API-key dimensions too) raises the cost of evasion meaningfully.
@@ -392,7 +447,7 @@ func TestLoginDoesNotRevealEnumeration(t *testing.T) {
 > [!question]- How does OWASP API Security Top 10 (2023) categorize scraping and scalping differently from a SQL injection bug?
 > Scraping and scalping fall under API4 (Unrestricted Resource Consumption) and API6 (Unrestricted Access to Sensitive Business Flows): the requests are individually valid and would pass any input-validation or injection check. The defense is about rate and pattern across many valid requests, not about rejecting any single malformed one.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Abuse traffic is valid traffic at the wrong volume or pattern — defend with behavior over time, not single-request validation.
 - Layer defenses: edge WAF → gateway rate limits (per IP/account/device/key/tenant) → risk engine → progressive challenge → account action → audit log.

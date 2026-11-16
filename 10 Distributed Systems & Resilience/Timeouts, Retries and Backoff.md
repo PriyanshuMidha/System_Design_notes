@@ -28,7 +28,41 @@ updated: 2026-11-13
 > - Limit retries per request (about 3 attempts) and per client (a budget of about 10% extra load), and retry at one layer only.
 > - Classic mistake: immediate retries in every layer, which multiply load on an already failing service.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your service calls another service. Sometimes the answer never comes.
+A **timeout** is how long you wait before giving up.
+Without one, your code can wait forever and pile up stuck work.
+
+```mermaid
+flowchart LR
+    Y["Your service"] -- "call" --> O["Other service"]
+    Y --> T{"Waited 300 ms?"}
+    T -- "yes" --> G["Give up"]
+```
+
+Many failures are short, like a server restarting. So trying again often works. That is a **retry**.
+But if thousands of clients retry at once, they knock the server down again.
+So each retry waits longer than the last (that is **backoff**), plus a small random extra, so clients do not all retry at the same moment.
+
+```mermaid
+flowchart LR
+    A["Try 1 fails"] --> W1["Wait about 0.1 s"]
+    W1 --> B["Try 2 fails"] --> W2["Wait about 0.2 s"]
+    W2 --> C["Try 3 works"]
+```
+
+The rest of this note is just these 3 questions:
+1. How long should you wait, and how does the time limit pass between services?
+2. Which errors are worth retrying?
+3. How do you space and limit retries so they help instead of hurt?
 
 **The problem in one story.** You phone a friend and nobody picks up.
 You do not hold the phone forever: after a while you hang up (a timeout).
@@ -73,7 +107,7 @@ Where it breaks: a shop never charges you twice for knocking, but a non-idempote
 > [!tip] Remember
 > Always time out, retry only safe and transient failures, wait exponentially longer with random jitter, and cap the total.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Most failures between services are short: a pod restarting, a dropped packet, a leader election that takes a second. Retrying a moment later usually succeeds. But two naive habits turn short failures into outages.
 
@@ -87,7 +121,7 @@ Now add layers. If the browser, the API gateway and the backend service each mak
 
 **Measured in this note's test** (`TestJitterSpreadsAStorm`, seeded PCG random, 1,000 clients, 3 retries each, 100 ms base): without jitter the busiest 10 ms window receives **1,000** retries; with full jitter the busiest window receives **158**.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a crowded shop whose door jams for a minute.
 
@@ -97,9 +131,11 @@ Think of a crowded shop whose door jams for a minute.
 - **Jitter:** each customer picks a random time within that wait, so they come back one by one, not as a crowd.
 - **Retry budget:** the shop lets only a few people re-try at once; the rest are told to come back later.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Step 1: timeouts everywhere, as a budget
+
+**In plain words:** the user's request has one total time limit, and each call down the chain gets only what is left of it.
 
 A timeout bounds one attempt. A **deadline** bounds the whole user request, and is passed down so that every hop knows how much time is left. In Go the deadline lives in the `context.Context`; in gRPC it travels in the `grpc-timeout` header, and the server's handler receives a context that expires at the same moment as the caller's.
 
@@ -115,7 +151,16 @@ Layers of timeouts on a Go HTTP client:
 
 On the server side, `http.Server` has `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout` and `IdleTimeout`. All default to zero, which means no limit; a server without `ReadHeaderTimeout` can be held open by slow clients (Slowloris).
 
+```mermaid
+flowchart LR
+    G["Gateway: 1,000 ms total"] --> C["Checkout starts: 980 ms left"]
+    C --> P["Payments try 1 times out: 680 ms left"]
+    P --> B["Payments try 2: 616 ms left"]
+```
+
 ### Step 2: decide whether the error is retryable
+
+**In plain words:** retry short, temporary errors on calls that are safe to repeat. Never retry "bad request" or "card declined".
 
 Retry when the failure is **transient** and the operation is **idempotent** (repeating it has the same effect as doing it once). A non-idempotent POST is retryable only if it carries an idempotency key that the server deduplicates ([[Idempotency and Idempotency Keys]]).
 
@@ -133,7 +178,18 @@ Two subtleties:
 - **408 and 429 are 4xx but retryable.** 429 means "you are sending too fast"; retry after the time in `Retry-After`, never sooner. See [[Rate Limiting - Algorithms and Distributed Design]].
 - **gRPC `DEADLINE_EXCEEDED` is ambiguous.** The server may have done the work, and if the deadline was the caller's overall budget, there is no time left to retry. Retry it only for idempotent calls, with a per-attempt timeout shorter than the overall deadline.
 
+```mermaid
+flowchart TB
+    E["Call failed"] --> T{"Temporary error? 503, reset, timeout"}
+    T -- "no: 400, 404, card declined" --> S["Stop, return error"]
+    T -- "yes" --> I{"Safe to repeat?"}
+    I -- "no key, not idempotent" --> S
+    I -- "yes" --> R["Retry with backoff"]
+```
+
 ### Step 3: back off, with jitter
+
+**In plain words:** wait a bit longer after each failure, and pick a random time within that wait so clients spread out.
 
 Let `base` be the first wait and `cap` the longest. For retry number `n` (starting at 0) the **ceiling** is `min(cap, base × 2^n)`. Brooker's AWS article compares three ways to pick the actual wait:
 
@@ -174,13 +230,17 @@ sequenceDiagram
 
 ### Step 4: bound the total
 
+**In plain words:** cap the number of tries per request and the share of extra traffic retries may add.
+
 - **Per request:** a maximum number of attempts (3 is common; gRPC caps `maxAttempts` at 5) and the overall deadline.
 - **Per client:** a **retry budget**. The Google SRE book recommends keeping retries below about 10% of requests per client, so that a total outage adds at most 10% load rather than tripling it. gRPC's retry throttling does this with a token bucket.
 - **Per system:** retry at one layer only, usually the one closest to the failing dependency, or at the edge where the user can be told. Inner layers fail fast and return a clear error.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** about 20 lines: growing wait with a cap, random spread, stop when the deadline is gone.
 
 The essentials in about 20 lines: capped exponential backoff, full jitter, a cancellable sleep, and no sleep after the last attempt. Randomness is passed in so tests can fix it.
 
@@ -218,6 +278,8 @@ func Retry(ctx context.Context, r *rand.Rand, op func(context.Context) error) er
 
 ### A deadline budget, traced
 
+**In plain words:** follow one 1-second checkout request and watch how much time each service down the chain gets.
+
 A user request to `POST /checkout` has a 1 s deadline at the gateway. The checkout service calls payments, whose p99.9 latency is 250 ms (estimate for this example).
 
 | Time | Event | Remaining budget |
@@ -235,6 +297,8 @@ If attempt 2 had also timed out at 684 ms, a third attempt would need up to 200 
 The code below makes the simpler check: it returns the error instead of sleeping when the chosen backoff alone would outlive the deadline. A stricter version would also reserve time for the next attempt (backoff + per-attempt timeout ≤ remaining).
 
 ### Production version
+
+**In plain words:** the full retry helper with error checks, retry budgets and metrics. Skim the comments first.
 
 `Do` adds what the whiteboard version leaves out:
 
@@ -668,7 +732,7 @@ retry_budget: 10%        # per client
 idempotent_only: true    # or the request carries an idempotency key
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Strategy | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -681,7 +745,7 @@ idempotent_only: true    # or the request carries an idempotency key
 | Hedged request | Send a second copy if the first is slower than about p95; take the first answer | Idempotent reads with long tails | Extra load (a few percent if the hedge is delayed to p95) |
 | Queue-based retry | Message goes back to a queue with a delay (SQS visibility timeout, Kafka retry topics), then a DLQ | Async work that can wait minutes | Ordering is lost; needs idempotent consumers |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Retries add load exactly when the dependency is weakest.** A retry budget or a [[10 Distributed Systems & Resilience/Circuit Breaker|Circuit Breaker]] must cap them.
 - **Retries add latency.** Each attempt plus backoff eats the user's deadline. For interactive calls, often 1 retry is right; for background jobs, many slow retries via a queue are fine.
@@ -691,7 +755,7 @@ idempotent_only: true    # or the request carries an idempotency key
 - **Timeouts that are too short** cause their own failures: if the timeout is below the dependency's normal p99, 1% of healthy calls fail and get retried, adding load for nothing.
 - **Hedging doubles work** if done naively (hedge at once); delay the hedge until about p95 latency and cancel the loser.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real systems:**
 	- gRPC's service config supports `retryPolicy` (maxAttempts, initialBackoff, maxBackoff, backoffMultiplier, retryableStatusCodes), `hedgingPolicy`, and retry throttling with a token bucket. Servers can push back with the `grpc-retry-pushback-ms` trailer.
@@ -712,7 +776,7 @@ idempotent_only: true    # or the request carries an idempotency key
 	- Budget-exhausted count and time spent in backoff.
 	- Latency of first attempts versus retried requests.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 - **Choosing a timeout from data.** Start from the dependency's latency distribution under normal load: a per-attempt timeout a little above p99.9 rarely cuts off healthy calls. Then check it fits the budget: `attempts × timeout + total backoff ≤ caller's deadline − own work`. Re-measure after the dependency changes.
 - **Deadline propagation versus fixed timeouts.** Fixed per-hop timeouts can add up to more than the user waits: a gateway giving up at 1 s while the service below still waits 5 s on a database wastes 4 s of work.
@@ -727,7 +791,7 @@ idempotent_only: true    # or the request carries an idempotency key
 - **Retries and circuit breakers together.** Order them so the breaker sees every attempt and the retry loop stops when the breaker is open: `retry(breaker(timeout(call)))`. Treat `ErrOpen` as permanent in the retry loop. See [[10 Distributed Systems & Resilience/Circuit Breaker|Circuit Breaker]].
 - **Server-side cooperation.** The server can reject early with 503 + `Retry-After` when overloaded, return a distinct "do not retry" error for overload deep in the stack (the SRE book's pattern), and deduplicate by idempotency key. Client politeness and server protection are two halves of one design.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why exponential backoff with jitter rather than a fixed delay?
 > A fixed delay keeps clients that failed together in step, so they hit the recovering service in synchronized waves. Exponential backoff reduces the rate of retries over time, and jitter spreads each wave over a window. Full jitter, `random(0, min(cap, base·2^n))`, is the usual default.
@@ -750,7 +814,7 @@ idempotent_only: true    # or the request carries an idempotency key
 > [!question]- What are hedged requests and when are they safe?
 > After waiting about the p95 latency, send a second copy of the request to another replica and use whichever answers first, cancelling the other. They cut tail latency for idempotent reads at the cost of a few percent extra load. Never hedge non-idempotent writes.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Timeout on every remote call; Go's default HTTP client has none.
 - One deadline per user request, created at the edge and passed down in `context`.
