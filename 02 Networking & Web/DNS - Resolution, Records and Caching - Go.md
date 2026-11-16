@@ -39,7 +39,7 @@ In plain words: Go can look up a domain name for you, but it forgets the answer 
 | --- | --- | --- |
 | `CachingResolver.Lookup` | Application-level caching Go doesn't provide on its own | [[DNS - Resolution, Records and Caching#Caching layers, TTL, and negative caching]] |
 | `entry.expires` | TTL-bounded freshness, the same idea every cache layer implements | [[DNS - Resolution, Records and Caching#Caching layers, TTL, and negative caching]] |
-| `realResolverExample` (`PreferGo`, custom `Dial`) | The pure-Go vs cgo resolver split, and pointing at a specific server | [[DNS - Resolution, Records and Caching#4. Worked example]] |
+| `realResolverExample` (`PreferGo`, custom `Dial`) | The pure-Go vs cgo resolver split, and pointing at a specific server | [[DNS - Resolution, Records and Caching#4. Worked example 🟡]] |
 | `TestCacheHitSuppressesUpstreamQuery` | Proof the cache actually suppresses a redundant query within the TTL, and requeries after it | [[DNS - Resolution, Records and Caching#Caching layers, TTL, and negative caching]] |
 
 ## Setup 🟢

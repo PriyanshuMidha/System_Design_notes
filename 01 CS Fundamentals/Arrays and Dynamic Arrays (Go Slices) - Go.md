@@ -40,8 +40,8 @@ This file is the runnable half of [[Arrays and Dynamic Arrays (Go Slices)]]. The
 | Code | Concept in [[Arrays and Dynamic Arrays (Go Slices)]] |
 | --- | --- |
 | `NextCap` | The documented growth formula, [[Arrays and Dynamic Arrays (Go Slices)#append and growth, step by step]] |
-| `Insert`, `Delete` | O(n) middle insert/delete by shifting, [[Arrays and Dynamic Arrays (Go Slices)#4. Worked example]] |
-| `RowMajorIndex` | Flat row-major 2-D layout, [[Arrays and Dynamic Arrays (Go Slices)#4. Worked example]] |
+| `Insert`, `Delete` | O(n) middle insert/delete by shifting, [[Arrays and Dynamic Arrays (Go Slices)#4. Worked example 🟡]] |
+| `RowMajorIndex` | Flat row-major 2-D layout, [[Arrays and Dynamic Arrays (Go Slices)#4. Worked example 🟡]] |
 | `TestAliasing` | Two slices sharing a backing array, and the full slice expression that stops it, [[Arrays and Dynamic Arrays (Go Slices)#Aliasing: two tickets, one lot]] |
 | `TwoSumSorted`, `MaxWindowSum`, `PrefixSums`/`RangeSum`, `MaxSubArray`, `MinEatingSpeed` | The five classic interview patterns the theory note's cheat sheet points to here |
 
@@ -103,7 +103,7 @@ flowchart LR
 
 **In plain words:** to squeeze a value into the middle of a packed row, everything after it has to shuffle one spot over — like people sliding down a full bench to make room.
 
-**Concept.** `Insert` and `Delete` are the code form of the "shift the elements after the gap" picture in [[Arrays and Dynamic Arrays (Go Slices)#4. Worked example]]: there's no way to make or close a gap in contiguous memory without moving everything on one side of it.
+**Concept.** `Insert` and `Delete` are the code form of the "shift the elements after the gap" picture in [[Arrays and Dynamic Arrays (Go Slices)#4. Worked example 🟡]]: there's no way to make or close a gap in contiguous memory without moving everything on one side of it.
 
 `RowMajorIndex` is the one-line arithmetic behind the flat-array 2-D layout diagram in the same section.
 
@@ -142,7 +142,7 @@ func RowMajorIndex(row, col, width int) int {
 
 1. `Insert` first grows the slice by one slot (`append(s, zero)`, a throwaway placeholder), then `copy(s[i+1:], s[i:])` shifts everything from index `i` onward one place to the right, then writes `v` into the now-empty slot `i`.
 2. `copy` is used rather than a manual loop because Go's `copy` correctly handles overlapping source and destination ranges (it copies in the safe direction internally).
-3. `Delete` does the mirror operation: shift everything after `i` one place left, then truncate the slice by one and clear the vacated last slot so a reference type there doesn't keep a dead object alive (a subtle garbage-collector interaction — see [[Arrays and Dynamic Arrays (Go Slices)#4. Worked example]]'s aliasing-leak trap for the same idea applied to sub-slices).
+3. `Delete` does the mirror operation: shift everything after `i` one place left, then truncate the slice by one and clear the vacated last slot so a reference type there doesn't keep a dead object alive (a subtle garbage-collector interaction — see [[Arrays and Dynamic Arrays (Go Slices)#4. Worked example 🟡]]'s aliasing-leak trap for the same idea applied to sub-slices).
 4. `RowMajorIndex` is pure arithmetic: row `r`, column `c`, width `w` maps to flat index `r*w + c` — row 0 occupies indices `0..w-1`, row 1 occupies `w..2w-1`, and so on.
 
 ### Step 3: aliasing and the full slice expression

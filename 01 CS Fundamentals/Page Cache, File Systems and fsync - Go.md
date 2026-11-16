@@ -37,8 +37,8 @@ updated: 2026-11-13
 
 | Code | Concept in [[Page Cache, File Systems and fsync]] |
 | --- | --- |
-| `WriteAppendSync` | The durable-append pattern: write, then `fsync` before telling the caller it's safe, [[Page Cache, File Systems and fsync#4. Worked example]] |
-| `WriteAppendNoSync` | A write that only reaches the page cache, [[Page Cache, File Systems and fsync#1. Why it exists]] |
+| `WriteAppendSync` | The durable-append pattern: write, then `fsync` before telling the caller it's safe, [[Page Cache, File Systems and fsync#4. Worked example 🟡]] |
+| `WriteAppendNoSync` | A write that only reaches the page cache, [[Page Cache, File Systems and fsync#1. Why it exists 🟢]] |
 | `f.Sync()` call | The `fsync(2)` syscall itself, [[Page Cache, File Systems and fsync#fsync vs fdatasync vs O_DIRECT]] |
 | `TestWriteAppendSyncDurableAndReadable` | Proves the bytes are readable back; cannot prove durability across a real power loss from inside a test |
 
@@ -64,7 +64,7 @@ That is the entire point: durability is one explicit call away, and skipping it 
 
 ### Step 1: the durable append
 
-**Concept.** `WriteAppendSync` implements the durable-append pattern from [[Page Cache, File Systems and fsync#4. Worked example]]: open for append, write the record, then call `Sync()` before telling the caller it is safe to proceed.
+**Concept.** `WriteAppendSync` implements the durable-append pattern from [[Page Cache, File Systems and fsync#4. Worked example 🟡]]: open for append, write the record, then call `Sync()` before telling the caller it is safe to proceed.
 
 This is the same shape a database uses after appending a record to its write-ahead log.
 
@@ -96,7 +96,7 @@ func WriteAppendSync(path string, data []byte) error {
 
 1. `os.O_APPEND|os.O_CREATE|os.O_WRONLY` opens the file positioned to always write at the end (atomically, per `open(2)`'s append semantics), creating it if it doesn't exist.
 2. `defer f.Close()` runs after `Sync()` either way — closing a file does not itself force a flush, so the `Sync()` call above is still required even with the deferred close.
-3. `f.Write(data)` is the fast path: it copies `data` into the page cache and returns, per [[Page Cache, File Systems and fsync#1. Why it exists]].
+3. `f.Write(data)` is the fast path: it copies `data` into the page cache and returns, per [[Page Cache, File Systems and fsync#1. Why it exists 🟢]].
 4. `f.Sync()` is Go's wrapper around the `fsync(2)` syscall — it blocks until the kernel confirms this file's dirty pages (and its metadata) are physically on the device, which is the one line that turns "written" into "durable."
 
 ```mermaid
@@ -116,7 +116,7 @@ sequenceDiagram
 
 ### Step 2: the non-durable append, for contrast
 
-**Concept.** `WriteAppendNoSync` is deliberately the "wrong" version, kept in the same package specifically so the two can be compared directly: it implements [[Page Cache, File Systems and fsync#1. Why it exists]]'s point that a successful `write()` only guarantees visibility to other readers, not survival across a crash.
+**Concept.** `WriteAppendNoSync` is deliberately the "wrong" version, kept in the same package specifically so the two can be compared directly: it implements [[Page Cache, File Systems and fsync#1. Why it exists 🟢]]'s point that a successful `write()` only guarantees visibility to other readers, not survival across a crash.
 
 There is no good reason to prefer this version for durability-critical data — it exists here only as the control case.
 

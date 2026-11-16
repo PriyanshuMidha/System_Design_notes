@@ -36,7 +36,7 @@ updated: 2026-11-13
 | Code | Concept in the theory note |
 | --- | --- |
 | `node`, `Trie`, `Insert`, `Search`, `StartsWith` | A node per character, shared prefixes share a path ([[Tries, Suffix Trees and Suffix Arrays#3.1 Tries]]) |
-| `Autocomplete` | Bounded traversal of the subtree below a prefix node ([[Tries, Suffix Trees and Suffix Arrays#9. Interview questions]]) |
+| `Autocomplete` | Bounded traversal of the subtree below a prefix node ([[Tries, Suffix Trees and Suffix Arrays#9. Interview questions 🔴]]) |
 | `suffixarray.New`, `Lookup` | The practical suffix-array alternative to a suffix tree ([[Tries, Suffix Trees and Suffix Arrays#3.4 Suffix arrays (the practical alternative)]]) |
 
 ```mermaid
@@ -55,7 +55,7 @@ flowchart LR
 
 ### Step 1: the node shape
 
-**Concept.** The theory note's whiteboard sketch uses a `map[byte]*node` per node for clarity ([[Tries, Suffix Trees and Suffix Arrays#4. Worked example]]).
+**Concept.** The theory note's whiteboard sketch uses a `map[byte]*node` per node for clarity ([[Tries, Suffix Trees and Suffix Arrays#4. Worked example 🟡]]).
 
 That's simple but slow: a map lookup costs more than an array index, and allocates on every new node.
 

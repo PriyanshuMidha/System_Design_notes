@@ -29,7 +29,41 @@ updated: 2026-11-13
 > - The deep dives are courier matching and order consistency: the two places a mistake costs money.
 > - Every figure below is an assumption stated to the interviewer, not a measured fact.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the minute-by-minute transcript and decision points), 4 (deep dive spoken, wrap-up) and 5.
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+This note is a full sample answer to "design a food delivery app", spoken minute by minute.
+The app looks like one thing, but it is really three jobs.
+Job one: show menus fast. Menus rarely change, so they come from a **cache** (a fast saved copy).
+Job two: take orders and money safely. Nothing may be lost or charged twice, so orders go in a normal SQL database.
+Job three: match a rider and show them moving on the map, live. Rider positions change every few seconds, so they live in fast memory.
+The jobs talk through **events**: short "this happened" messages like "order paid".
+
+```mermaid
+flowchart LR
+    B["Browse menus<br/>(fast, cached)"] --> O["Place order and pay<br/>(safe, SQL)"]
+    O -- "event: order paid" --> D["Match rider,<br/>track live"]
+```
+
+```mermaid
+flowchart LR
+    R["0-6 min: what to build"] --> E["6-10: sizes"]
+    E --> A["10-17: API, data"]
+    A --> H["17-27: design"]
+    H --> DD["27-47: deep dive"]
+    DD --> W["47-60: scale, wrap-up"]
+```
+
+The rest of this note is just these 3 questions:
+1. What do you say in each block of minutes?
+2. Which choice do you make at each decision point, and why?
+3. How do you handle scale, failures and follow-up questions?
 
 **The problem in one story.**
 You open a food app, scroll restaurants, order a biryani, pay, and watch a rider move on a map.
@@ -74,7 +108,7 @@ Where it breaks: a real counter clerk can just shout to the kitchen; services mu
 > [!tip] Remember
 > Split the app into browse, order and deliver; give each the store and guarantees it needs, and justify every choice with a number.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Reading about decisions in isolation (cache vs no cache, queue vs stream) does not teach you how to chain them under a clock. This note shows one design where each choice constrains the next.
 
@@ -85,7 +119,7 @@ A mock that shows only the final diagram would hide exactly this reasoning, whic
 > [!tip] Remember
 > Decisions are connected. State the consequence of each one on the next.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Treat the app as **three small systems sharing an order id**.
 
@@ -114,11 +148,13 @@ flowchart LR
     Order -->|"order_id event"| Deliver
 ```
 
-## 3. How it works
+## 3. How it works 🟡
 
 The transcript below is what you would say. Times assume a 60-minute round.
 
 ### Minutes 0-6: Requirements
+
+**In plain words:** Before drawing anything, agree on what the app must do and how big and fast it must be.
 
 **Say:** "Let me clarify scope before designing."
 
@@ -138,6 +174,8 @@ Questions asked and the answers assumed:
 **Why these numbers:** the interviewer can change them; every later choice cites them.
 
 ### Minutes 6-10: Estimates
+
+**In plain words:** Rough maths, rounded numbers. The goal is to find which part is heavy, not to be exact.
 
 ```mermaid
 flowchart LR
@@ -159,6 +197,8 @@ flowchart LR
 > The surprising number is the courier pings. Say so; it sets up the deep dive.
 
 ### Minutes 10-17: API and data model
+
+**In plain words:** List the few calls the app makes, and the main tables behind them.
 
 ```text
 GET  /v1/restaurants?lat=&lng=&q=&cursor=    -> list (cacheable)
@@ -195,6 +235,8 @@ Choice: relational SQL. Reason: orders need transactions and unique constraints 
 
 ### Minutes 17-27: High-level design
 
+**In plain words:** Draw the boxes for browse, order and deliver, and how they connect.
+
 ```mermaid
 flowchart LR
     APP["Customer, restaurant<br/>and courier apps"] --> CDN["CDN<br/>images"]
@@ -227,6 +269,8 @@ Walkthrough, numbered:
 6. Each state change updates the order row and notifies the customer.
 
 ### Decision points, one by one
+
+**In plain words:** Each block below is one choice: the options, the pick, why, and what it costs.
 
 Each block: alternatives, choice, reason, cost, where to read more.
 
@@ -378,9 +422,11 @@ Cost: up to 5 minutes of stale display. Read: [[Caching Patterns]], [[Cache Inva
 > [!warning] Common mistake
 > Trusting cached prices at checkout. Show from cache, charge from the source of truth.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** The whole design in one small sketch.
 
 ```text
 FLOWS  browse (cache) | order (SQL + saga) | deliver (RAM geo index)
@@ -396,6 +442,8 @@ FAIL   Kafka down -> outbox grows, checkout still works | geo node down -> couri
 
 ### The deep dive, spoken (minutes 27-47)
 
+**In plain words:** Pick the two riskiest parts (rider matching and order safety) and talk through them out loud.
+
 "The riskiest parts are dispatch and order consistency.
 
 First, dispatch. We get 40 k pings per second, so I keep only the latest position in RAM, sharded by city.
@@ -407,6 +455,8 @@ If the update affects zero rows, another order got them and I try the next. A co
 Second, order consistency. The client sends an idempotency key; a unique constraint on the key in `payment_attempts` means retries cannot double-charge. The order row and outbox row commit together, so an event is never lost. Consumers are idempotent because delivery is at least once. If the restaurant rejects or no courier appears in 10 minutes, a compensating refund runs."
 
 ### Minutes 47-55: Scale, failure, security, observability
+
+**In plain words:** Now ask "what breaks at 10 times the load, or when a part dies?" and fix each answer.
 
 ```mermaid
 flowchart TD
@@ -429,13 +479,15 @@ Read: [[Load Shedding and Graceful Degradation]], [[Timeouts, Retries and Backof
 
 ### Minutes 55-60: Wrap-up
 
+**In plain words:** Sum up in a few sentences, name the costs you accepted, and say what you would do next.
+
 "We split the product into browse, order and deliver. Menus come from cache; orders are in Postgres with an outbox that feeds Kafka; couriers live in an in-memory geo index sharded by city.
 
 The two key trade-offs: async saga over a synchronous chain (accepting intermediate states), and in-memory soft state over durable location storage (accepting a short loss on restart).
 
 First to break at 10x is the orders primary, fixed by sharding by customer. Next I would add surge-aware dispatch scoring and multi-region failover."
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 How the design changes with the prompt:
 
@@ -454,7 +506,7 @@ Alternative designs that are also acceptable:
 | Full microservices + Kafka (this mock) | Many teams, independent scaling needs |
 | Orchestrated workflow engine instead of choreographed saga | Complex, long-running order flows needing visibility ([[Workflow Engines and Durable Execution]]) |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Kafka is heavy.** At a few hundred orders per second a Postgres-backed queue or SQS would do; say so and name the trigger (multiple consumers, replay).
 - **Choreography gets hard to follow.** Beyond about five steps, an orchestrator gives one place to see the state.
@@ -462,7 +514,7 @@ Alternative designs that are also acceptable:
 - **City as shard key** gives locality but uneven load; mega-cities need sub-sharding.
 - **The saga leaks intermediate states** to users; the UI must show them honestly.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real practice:** companies in this space publish engineering posts on geo indexing and dispatch (for example Uber's H3 index, open source at h3geo.org); treat those as inspiration and cite when you use them.
 - **Failure modes and fixes:**
@@ -473,21 +525,43 @@ Alternative designs that are also acceptable:
   - Poison event blocks a partition: dead letter queue ([[Dead Letter Queues and Poison Messages]]).
 - **What to watch:** outbox lag, consumer lag, time to assign, payment error rate, cache hit rate, geo index size per city, WebSocket connection count.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Matching: nearest is not always best
+
+**In plain words:** The closest rider may be stuck in traffic or already busy. Pick the rider who can reach the restaurant soonest.
 
 Rank by estimated time to pickup (traffic aware), restaurant preparation time, courier load (batching), and fairness. Offering to one courier at a time is slow; offering to the top three and taking the first accept is faster but wastes courier attention. State the trade-off.
 
 ### Ordering inside one order
 
+**In plain words:** Send all events of one order down the same lane, so "placed" always comes before "paid".
+
 Keying Kafka by `order_id` keeps all events of one order in one partition, so consumers see PLACED before PAID. Across orders there is no ordering and none is needed ([[Message Ordering and Partition Keys]]).
+
+```mermaid
+flowchart LR
+    E1["PLACED (order 42)"] --> K["Key = order_id"]
+    E2["PAID (order 42)"] --> K
+    K --> P["Same partition:<br/>PLACED read before PAID"]
+```
 
 ### Refunds and unknown payment outcomes
 
+**In plain words:** If the payment call times out, you do not know if it worked. Retry with the same key so it cannot charge twice, and check later with a cleanup job.
+
 If the payment call times out, the result is unknown. Retry with the same idempotency key (the provider returns the first result), and run a reconciliation job comparing provider records to ours ([[Case Study - Payment System]]).
 
+```mermaid
+flowchart LR
+    A["Pay call times out"] --> B["Retry with same<br/>idempotency key"]
+    B --> C["Provider returns<br/>the first result"]
+    A --> D["Nightly reconcile job<br/>fixes any leftovers"]
+```
+
 ### Data layout summary
+
+**In plain words:** One table showing where each kind of data lives and how long it is kept.
 
 | Data | Store | Key | Durable? | Retention |
 | --- | --- | --- | --- | --- |
@@ -497,7 +571,7 @@ If the payment call times out, the result is unknown. Retry with the same idempo
 | Courier location | Redis geo per city | courier_id | No | 15 s expiry |
 | Events | Kafka | order_id | Yes | 7 days (assumed) |
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why not store courier locations in the orders database?
 > 40 k writes per second of data that is stale after seconds would compete with money-critical order writes. Location is soft state: keep only the latest position in memory, sharded by city, and let couriers re-ping after a restart.
@@ -517,7 +591,7 @@ If the payment call times out, the result is unknown. Retry with the same idempo
 > [!question]- Trap: "just use a distributed transaction across payment, restaurant and courier."
 > Payment providers do not participate in two-phase commit and it blocks on failures. Use a saga with compensating actions (refund, release courier) and idempotent steps.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Three flows: browse (cache), order (SQL + saga), deliver (RAM geo index).
 - Key numbers: 175 orders per second peak, 3,500 menu reads, 40 k pings per second (assumptions).
@@ -528,7 +602,7 @@ If the payment call times out, the result is unknown. Retry with the same idempo
 - Show menu from cache, charge from the source of truth.
 - 10x: shard orders by customer, more partitions and geo shards.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[HLD Round - Complete Step-by-Step Guide]], [[System Design Interview Framework]], [[Back-of-the-Envelope Estimation]]
 - **Case studies to read next:** [[Case Study - Ride Sharing and Proximity]], [[Case Study - Payment System]], [[Case Study - Notification System]]

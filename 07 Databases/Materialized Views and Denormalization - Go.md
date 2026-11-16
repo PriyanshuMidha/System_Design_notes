@@ -51,7 +51,7 @@ This note implements each of them, from the slowest query through the three main
 | `Rollup.Apply` | idempotent asynchronous rollup from at-least-once events ([[Materialized Views and Denormalization#4.5 Asynchronous rollup in Go, with idempotency and a drift check]]) |
 | `Rollup.Drift` | drift check against a full recomputation |
 | `processed_events` SQL | the same idempotent apply inside Postgres |
-| `workspace_totals_slots` | splitting a hot summary row into slots ([[Materialized Views and Denormalization#8. Deep dive]]) |
+| `workspace_totals_slots` | splitting a hot summary row into slots ([[Materialized Views and Denormalization#8. Deep dive 🔴]]) |
 
 ```mermaid
 sequenceDiagram
@@ -552,7 +552,7 @@ COMMIT;
 
 **In plain words:** one busy row is like one cash register for the whole store — everyone queues. Splitting it into 16 rows is opening 16 registers; at closing time you add up all 16 drawers.
 
-**Concept.** A single summary row is a serial bottleneck: every transaction that updates it waits for the previous one's row lock ([[Materialized Views and Denormalization#8. Deep dive]]).
+**Concept.** A single summary row is a serial bottleneck: every transaction that updates it waits for the previous one's row lock ([[Materialized Views and Denormalization#8. Deep dive 🔴]]).
 
 At 200 invoices per second and about 5 ms per commit (an estimate), one row caps throughput near 200 per second. Splitting the row into 16 slots spreads the writers over 16 locks, at the cost of a read that sums 16 rows.
 

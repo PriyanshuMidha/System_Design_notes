@@ -24,7 +24,39 @@ updated: 2026-11-13
 > - Say every decision as "I pick X over Y because Z, and the cost is W".
 > - A working simple design first; complexity only when a number demands it.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the nine steps), 4 (worked example) and 5 (what is scored, red flags, follow-ups).
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+In a system design round, the interviewer names an app ("design a food delivery app") and gives you about 45 minutes.
+There is no single right answer. They watch how you think.
+The trap is drawing boxes right away. You then build the wrong thing and run out of time.
+So you follow the same steps every time: ask what it must do, guess the size, sketch a simple design, then go deep on the hardest part.
+Every box you draw should point back to a need or a number. Every choice should come with its cost: "I pick X over Y because Z, and it costs W". That is called a **trade-off**.
+
+```mermaid
+flowchart LR
+    A["Ask: what must it do?"] --> B["Guess the size"]
+    B --> C["Simple design"]
+    C --> D["Go deep on the<br/>hardest part"]
+    D --> E["Wrap up"]
+```
+
+```mermaid
+flowchart LR
+    X["Bad: draw boxes first"] --> Y["Wrong design,<br/>no time left"]
+    P["Good: ask, size, then draw"] --> Q["Time spent on<br/>what matters"]
+```
+
+The rest of this note is just these 3 questions:
+1. What do you do in each step, and for how many minutes?
+2. What does a strong answer look like on a real example?
+3. What do interviewers score at SDE-2, SDE-3 and Staff level?
 
 **The problem in one story**
 
@@ -71,7 +103,7 @@ Where it breaks: a doctor has a lab, but you only have estimates, so you must sa
 > [!tip] Remember
 > Every box traces back to a requirement or a number; say "X over Y because Z, cost W".
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Imagine two candidates asked to "design Instagram".
 
@@ -85,7 +117,7 @@ Companies use the HLD round because it is the closest cheap simulation of a desi
 > [!tip] Remember
 > The interviewer is not grading a drawing. They are grading the conversation that produced it.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of the round as **plan, build, stress, defend**.
 
@@ -107,7 +139,7 @@ flowchart LR
     D -. "what if 10x?" .-> S
 ```
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The timebox
 
@@ -355,9 +387,11 @@ The four golden signals from the Google SRE book are latency, traffic, errors an
 
 Script: "To summarise, we built X with A, B and C. The two key trade-offs were P over Q and R over S. The first thing to break at 10 times is T, and I would fix it with U. Monitoring: these three SLIs. If I had another week: V."
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** The whole food delivery answer in one small sketch you could draw in the last 2 minutes.
 
 ```text
 0-5    REQ   features(3-5) | NFR (p99, 99.9x, consistency) | scale (DAU, peak) | out of scope
@@ -396,9 +430,11 @@ The honest note on measured limits shows judgement.
 
 Answer structure: re-estimate, find the first bottleneck, fix, check side effects (hot keys, connection counts, cost), prove with a load test.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### What interviewers score by level
+
+**In plain words:** The same answer is judged more strictly as the level goes up. Senior levels must lead the talk and name the costs on their own.
 
 | Dimension | SDE-2 | SDE-3 | Staff |
 | --- | --- | --- | --- |
@@ -414,6 +450,8 @@ This table is a rule of thumb from common industry practice, not a published rub
 
 ### Red flags and the fix
 
+**In plain words:** These are the habits that quietly sink a round. Each comes with a simple fix.
+
 | Red flag | What it looks like | Fix |
 | --- | --- | --- |
 | Buzzword stacking | "Kafka, Redis, Cassandra, k8s" in minute 3 | Name the requirement before each component |
@@ -426,6 +464,8 @@ This table is a rule of thumb from common industry practice, not a published rub
 
 ### Common follow-ups and short answers
 
+**In plain words:** Questions you will almost surely hear, with the shape of a good short answer.
+
 | Follow-up | Answer shape |
 | --- | --- |
 | "What if a region goes down?" | Active-passive or active-active, RTO and RPO, data replication lag ([[Multi-Region Architecture]]) |
@@ -435,7 +475,14 @@ This table is a rule of thumb from common industry practice, not a published rub
 | "How do you handle a hot partition?" | Detect, split the key, local cache ([[Hot Keys and Hot Partitions]]) |
 | "How do you deploy safely?" | Canary, feature flag, backward compatible migrations ([[Zero-Downtime Schema Migrations]]) |
 
-## 6. Trade-offs and when not to use
+```mermaid
+flowchart LR
+    Q["Follow-up question"] --> A["Name the bottleneck"]
+    A --> B["Give 2 options"]
+    B --> C["Pick one, say why<br/>and what it costs"]
+```
+
+## 6. Trade-offs and when not to use 🟡
 
 - **The 9-step flow is a default, not a script.** If the interviewer opens with "go deep on the matching algorithm", follow them and fold the other steps in later.
 - **Depth beats breadth** once the simple design stands. Two dives with options and costs beat six boxes named.
@@ -443,7 +490,7 @@ This table is a rule of thumb from common industry practice, not a published rub
 - **Do not pre-build for 100x.** State the trigger instead: "I will shard when write QPS passes what a load test shows one primary sustains".
 - **Do not use a technology to look current.** A queue you can explain beats a streaming platform you cannot.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real design reviews** follow this order: context, requirements, numbers, options, decision, risks, monitoring. See [[Architecture Decision Records]].
 - **Practice loop that works:** one problem per sitting against a timer; redraw from memory next day; explain one failure end to end; compare one alternative.
@@ -453,9 +500,11 @@ This table is a rule of thumb from common industry practice, not a published rub
   - Lost track mid-dive: say "let me restate where we are" and recap in two sentences.
 - **What to track across practice runs:** time per phase, number of explicit trade-off sentences, number of boxes you could not justify.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Phrasing bank
+
+**In plain words:** Ready-made sentences for each moment of the round, so you sound clear and calm.
 
 | Moment | Say this |
 | --- | --- |
@@ -469,6 +518,8 @@ This table is a rule of thumb from common industry practice, not a published rub
 
 ### Choosing the deep dive by problem type
 
+**In plain words:** Each kind of system has one part most likely to break. Spend your deep-dive time there.
+
 | System type | Usual riskiest part | Typical options |
 | --- | --- | --- |
 | Feeds and timelines | Fan-out | Push, pull or hybrid ([[Case Study - News Feed]]) |
@@ -479,7 +530,17 @@ This table is a rule of thumb from common industry practice, not a published rub
 | Pipelines | Late and duplicate events | Windows, idempotent sinks ([[Case Study - Ad Click Aggregation]]) |
 | Rate limiting | Distributed counters | Token bucket in Redis ([[Rate Limiting - Algorithms and Distributed Design]]) |
 
+```mermaid
+flowchart LR
+    F["Feed app"] --> F1["Fan-out and ranking"]
+    B["Booking app"] --> B1["Double booking, locks"]
+    C["Chat app"] --> C1["Live connections, ordering"]
+    P["Payments"] --> P1["Exactly-once, idempotency"]
+```
+
 ### Consistency decision in one picture
+
+**In plain words:** Ask "what goes wrong if a user sees old data?" If the answer is "money or safety", pick strong; otherwise eventual is fine.
 
 ```mermaid
 flowchart TD
@@ -491,7 +552,7 @@ flowchart TD
 
 See [[Consistency Models]] and [[CAP and PACELC]] for the theory behind each branch.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Walk me through how you start a design interview.
 > Clarify functional scope (3 to 5 features), non-functional targets with numbers (latency, availability, consistency), scale (DAU, peak, read to write ratio) and out of scope. Write them down, assume what is unspecified and say so. Then estimate only the numbers that change a decision.
@@ -511,7 +572,7 @@ See [[Consistency Models]] and [[CAP and PACELC]] for the theory behind each bra
 > [!question]- Trap: the interviewer asks "why not just use microservices from the start?"
 > Because splitting costs network calls, partial failure, distributed transactions and operational overhead. Start with a modular service and split when a stated reason appears: independent scaling, team ownership, different release cadence, or fault isolation.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Timebox: requirements 5, estimates 3-4, API and data 5-8, HLD 8-10, deep dives 15-20, reliability 5, wrap-up 4-5.
 - Ask 6-8 requirement questions; write them; assume the rest out loud.
@@ -522,7 +583,7 @@ See [[Consistency Models]] and [[CAP and PACELC]] for the theory behind each bra
 - Always say failure, security, observability (four golden signals).
 - SDE-3 = drive, quantify, operate, keep it simple.
 
-## Links
+## Links 🟢
 
 - **Before this:** [[System Design Interview Framework]], [[Back-of-the-Envelope Estimation]], [[Scaling Basics]]
 - **Next:** [[HLD Round - Full Worked Mock (Food Delivery App)]] applies every step to one design

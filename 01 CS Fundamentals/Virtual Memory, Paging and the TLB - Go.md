@@ -39,7 +39,7 @@ updated: 2026-11-13
 | `Event`, `TLBHit`, `TLBMiss`, `MinorFault`, `MajorFault` | The four possible outcomes of a translation ([[Virtual Memory, Paging and the TLB#The translation path]]) |
 | `pte`, `MMU`, `NewMMU` | One process's page table plus a bounded pool of physical frames ([[Virtual Memory, Paging and the TLB#Multi-level page tables]]) |
 | `MMU.Translate` | The TLB-then-page-table-then-fault decision tree ([[Virtual Memory, Paging and the TLB#The translation path]]) |
-| `MMU.allocateFrame` | Eviction and swap-out once the process is at its frame cap ([[Virtual Memory, Paging and the TLB#6. Trade-offs and when not to use]]) |
+| `MMU.allocateFrame` | Eviction and swap-out once the process is at its frame cap ([[Virtual Memory, Paging and the TLB#6. Trade-offs and when not to use 🟡]]) |
 | `lruTLB` | The TLB as a small, fixed-capacity, evicting cache ([[Virtual Memory, Paging and the TLB#The TLB is just a small, fast cache]]) |
 
 ```mermaid
@@ -202,7 +202,7 @@ func (m *MMU) handleFault(vp, vaddr uint64, entry *pte, existed bool) (paddr uin
 
 ### Step 5: allocating (and evicting) physical frames
 
-**Concept.** This is where the theory note's "the hotel only has so many rooms" idea becomes concrete: once `maxFrames` is reached, giving a new page a frame means taking one away from some other page first ([[Virtual Memory, Paging and the TLB#6. Trade-offs and when not to use]]).
+**Concept.** This is where the theory note's "the hotel only has so many rooms" idea becomes concrete: once `maxFrames` is reached, giving a new page a frame means taking one away from some other page first ([[Virtual Memory, Paging and the TLB#6. Trade-offs and when not to use 🟡]]).
 
 ```go
 // allocateFrame hands back a free frame, evicting the oldest-mapped page

@@ -40,9 +40,9 @@ updated: 2026-11-13
 
 | Code piece | Theory concept it demonstrates | Theory section |
 | --- | --- | --- |
-| `measureConcurrency` helper | Firing N concurrent client requests and timing the whole batch | [[HTTP-1.1 vs HTTP-2 vs HTTP-3#1. Why it exists]] |
-| `http.Transport{MaxConnsPerHost: 1}` client | Forcing HTTP/1.1 onto exactly one connection, so its request queue has nowhere to hide | [[HTTP-1.1 vs HTTP-2 vs HTTP-3#2. Mental model]] |
-| `httptest.Server{EnableHTTP2: true}` | HTTP/2 multiplexing many streams over that same single-connection constraint | [[HTTP-1.1 vs HTTP-2 vs HTTP-3#3. How it works]] |
+| `measureConcurrency` helper | Firing N concurrent client requests and timing the whole batch | [[HTTP-1.1 vs HTTP-2 vs HTTP-3#1. Why it exists 🟢]] |
+| `http.Transport{MaxConnsPerHost: 1}` client | Forcing HTTP/1.1 onto exactly one connection, so its request queue has nowhere to hide | [[HTTP-1.1 vs HTTP-2 vs HTTP-3#2. Mental model 🟢]] |
+| `httptest.Server{EnableHTTP2: true}` | HTTP/2 multiplexing many streams over that same single-connection constraint | [[HTTP-1.1 vs HTTP-2 vs HTTP-3#3. How it works 🟡]] |
 | The two timing assertions | The measured gap between serial and parallel that section 1's table reports | [[HTTP-1.1 vs HTTP-2 vs HTTP-3#Whiteboard version]] |
 
 ## Setup 🟢
@@ -129,7 +129,7 @@ func measureConcurrency(t *testing.T, client *http.Client, url string, n int, de
 
 **In plain words:** build two tiny local servers that answer the same slow way, one speaking HTTP/1.1 on a single line, one speaking HTTP/2 — so any speed difference can only come from the protocol.
 
-**Concept.** This implements [[HTTP-1.1 vs HTTP-2 vs HTTP-3#2. Mental model]]'s "one room, one entrance" picture directly.
+**Concept.** This implements [[HTTP-1.1 vs HTTP-2 vs HTTP-3#2. Mental model 🟢]]'s "one room, one entrance" picture directly.
 
 The *same* handler (sleep 50ms, reply) is served two ways: once through an HTTP/1.1 client capped to one connection (`MaxConnsPerHost: 1`), once through an HTTP/2 server negotiated over TLS.
 

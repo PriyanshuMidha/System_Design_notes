@@ -42,7 +42,41 @@ flowchart LR
     F --> G["Postmortem<br/>fix the missing guard"]
 ```
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (first 5 minutes, flowchart, investigation steps A to D, fixes), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your app uses services run by other companies: payments, SMS, maps, login. These are **third-party dependencies**, or vendors.
+You don't control them. Sometimes they break.
+A vendor that is *down* fails fast, so you see errors quickly.
+A vendor that is *slow* is worse. Your app waits and waits, and the waiting requests pile up.
+Soon your whole site is slow, even pages that never call that vendor.
+
+```mermaid
+flowchart LR
+    U["Users"] --> A["Your app"]
+    A -- "waits 30 s each" --> V["Slow payment vendor"]
+    A -. "waiting piles up" .-> X["Whole site slow"]
+```
+
+You can't fix their system. You can only protect yours: wait less (a **timeout**), stop calling for a while (a **circuit breaker**), and offer a simpler version of the feature.
+
+```mermaid
+flowchart LR
+    A["Your app"] --> T{"Vendor answered<br/>within 2 s?"}
+    T -- "yes" --> OK["Normal"]
+    T -- "no" --> D["Give up fast,<br/>show a simpler option"]
+```
+
+The rest of this note is just these 3 questions:
+1. Is it really the vendor, or is it us?
+2. How do you stop their problem from spreading to your whole app?
+3. How do you recover safely when they come back?
 
 **The problem in one story.**
 Your shop uses an outside company to take card payments.
@@ -86,7 +120,7 @@ Where it breaks: a supplier's delay does not make your kitchen freeze, but a slo
 > [!tip] Remember
 > You cannot fix the vendor; cap the wait, stop calling, fall back, and tell users the truth.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Every modern product leans on vendors you do not control: a payment service provider (PSP), an SMS or email gateway, a maps or geocoding API, a KYC check, an auth provider. When one of them has a bad hour, your dashboards go red even though you deployed nothing.
 
@@ -104,7 +138,7 @@ The hard part is human, not technical. Engineers keep digging through their own 
 > [!tip] Remember
 > A vendor outage is an incident for you even if the root cause is entirely theirs. Customers do not see the vendor, they see your product failing.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of your service as a restaurant and the vendor as the only supplier of one ingredient.
 
@@ -135,9 +169,11 @@ The key insight: **the blast radius of a dependency should be the feature that u
 > [!tip] Remember
 > You are not fixing the vendor. You are shrinking the blast radius to one feature.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### First 5 minutes
+
+**In plain words:** find out which features use the vendor, protect the rest of the app, and tell people. Don't wait for the vendor to confirm.
 
 1. **Confirm the problem and the blast radius.** Which endpoints, which percentage of users, is money or data at risk? Open the RED dashboard (rate, errors, duration) filtered to the outbound client. Declare severity using your table in [[Incident Response]]; a payment outage is usually SEV1 or SEV2.
 2. **Check what changed.** Did you deploy, change a vendor API key, rotate a secret, change a timeout, or hit a vendor rate limit? Many "vendor outages" are your own expired key, a rate limit (HTTP 429) or an IP allow-list change. Check the vendor's status page, their status RSS or X account, and your team's vendor Slack channel.
@@ -170,7 +206,11 @@ flowchart TD
 
 ### Investigation steps
 
+**In plain words:** four checks: is the vendor failing, is it failing fast or slow, are our retries making it worse, and is it secretly our fault.
+
 #### A. Is the vendor slow or failing from our side?
+
+**In plain words:** look at your own graphs for calls to that vendor: how many fail and how long they take.
 
 Break one request into phases from inside a production pod. Use a pod that runs on the same network path as your service.
 
@@ -210,6 +250,8 @@ Reading it: if one `dependency` label spikes and the others stay flat, the vendo
 
 #### B. Is the vendor failing fast or slowly?
 
+**In plain words:** fast failures are easy to handle. Slow ones tie up your app, so they need a short timeout.
+
 This decides how fast your own service will fall over. Fast failure is annoying; slow failure is deadly.
 
 ```promql
@@ -232,6 +274,8 @@ Thousands of goroutines in `net/http.(*persistConn).roundTrip` or `net.(*conn).R
 
 #### C. Are our retries making it worse?
 
+**In plain words:** if every failed call is retried, you send the sick vendor even more traffic.
+
 ```promql
 # Retry attempts as a ratio of first attempts
 sum(rate(outbound_requests_total{dependency="psp",attempt!="1"}[5m]))
@@ -242,6 +286,8 @@ sum(rate(outbound_requests_total{dependency="psp",attempt="1"}[5m]))
 A ratio of 2 means each user request becomes 3 vendor calls (1 first attempt plus 2 retries); a ratio of 3 means 4 calls. Cap it now (flag or config), because an overloaded vendor cannot recover while you hammer it. See [[Timeouts, Retries and Backoff]].
 
 #### D. Is it us after all? (auth, limits, network)
+
+**In plain words:** an expired key, a hit usage limit, or our own network can look exactly like a vendor outage.
 
 ```bash
 kubectl get events --sort-by=.lastTimestamp | tail -20
@@ -255,6 +301,8 @@ kubectl top pods -l app=checkout
 - `connection refused` from one node only: check egress NAT and security groups for that node group.
 
 ### Fixes
+
+**In plain words:** quick fix today, real fix this week, and a guard so the next vendor problem hurts less.
 
 | Level | Action | Example |
 | --- | --- | --- |
@@ -285,7 +333,7 @@ stateDiagram-v2
 > [!tip] Remember
 > Fix in three layers: stop the bleeding now, remove the missing guard this week, and rehearse the failure so it is boring next time.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 **A payment provider degrades during a sale (fictional, but typical).** `ShopLoop` is an e-commerce service. It calls a PSP to authorise card payments. A sale starts at 12:00.
 
@@ -331,7 +379,7 @@ sequenceDiagram
 > [!warning] Common mistake
 > Replaying a payment queue without idempotency keys. If the vendor did process some "failed" requests, replay charges those customers twice. Always send the same `Idempotency-Key` for retries of the same logical payment.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 Different vendor types call for different degraded behaviour.
 
@@ -355,7 +403,7 @@ Different vendor types call for different degraded behaviour.
 | Wrong answers | 200s with bad data | Very high: silent corruption | Validation, reconciliation |
 | Rate limiting you | 429s | Medium: caused by your retries | Retry budget, backoff |
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 - **Short timeouts** protect you but can cut off requests that would have succeeded. Pick the timeout from the vendor's p99 plus margin, not from hope.
 - **A secondary vendor** gives real resilience but costs integration effort, extra contract fees and two sets of behaviour to test. It is worth it for payments and OTP, not for analytics.
@@ -364,7 +412,7 @@ Different vendor types call for different degraded behaviour.
 - **Caching vendor responses** (maps, prices, flags) hides short outages but risks stale data.
 - **When not to degrade:** if correctness matters more than availability (for example, a regulatory KYC check), fail closed with a clear message rather than skipping the check.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Per-vendor dashboards.** One panel group per dependency: error ratio, p99, breaker state, queue depth, retry ratio. The on-call should see "PSP red" in under 10 seconds.
 - **Synthetic probes** that call the vendor's sandbox or health endpoint every minute from your network. You often learn of the outage before their status page does.
@@ -374,7 +422,16 @@ Different vendor types call for different degraded behaviour.
 - **Game days.** Blackhole a vendor in staging (iptables, a proxy that adds latency, a mock returning 503) and confirm the guards behave.
 - **Egress allow-lists.** Some vendors allow only fixed IPs. A NAT change then looks like a vendor outage. Keep the list in version control.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
+
+**In plain words:** a vendor that says "no" quickly costs you little. A vendor that makes you wait ties up your workers, and soon none are free for anything else.
+
+```mermaid
+flowchart LR
+    F["Down: fails in 10 ms"] --> F1["Workers free again fast"]
+    S["Slow: answers in 30 s"] --> S1["Workers stuck waiting"]
+    S1 --> S2["No workers left for<br/>other pages"]
+```
 
 **Why slow beats down in damage.** Little's Law says concurrent requests in the system equals arrival rate times time in system (L = lambda x W).
 
@@ -394,7 +451,18 @@ flowchart LR
 
 The fix is retries at one layer only, plus a **retry budget** (for example, retries may be at most 10 percent of normal traffic), as described in the SRE book's cascading failures chapter.
 
+**In plain words:** give each vendor its own small group of workers, like separate rooms in a ship. If one floods, the others stay dry.
+
+```mermaid
+flowchart LR
+    A["Your app"] --> P1["10 workers for payments"]
+    A --> P2["5 workers for SMS"]
+    P2 -. "SMS hangs: only<br/>these 5 get stuck" .-> X["Payments still work"]
+```
+
 **Bulkheads.** Give each dependency its own connection pool or concurrency semaphore. When the SMS gateway hangs, it can exhaust only its 50 slots, not the shared pool the PSP and database use. See [[Bulkheads and Concurrency Limits]].
+
+**In plain words:** a call you gave up on may still have worked on their side. Send a unique ID with each call so a retry can't charge twice.
 
 **Idempotency during recovery.** The danger window is a request that timed out on your side but succeeded on the vendor's side. Without an idempotency key your retry creates a second charge.
 
@@ -404,7 +472,7 @@ With a stable key per logical payment, the vendor returns the original result. A
 
 **Dependency inventory.** Many outages surprise teams because a transitive vendor (a CDN script, a font host, an analytics tag, a feature flag SDK) is on the critical path of page load. Keep a list of every third party and mark each as critical, degradable or optional. Load optional ones asynchronously with timeouts.
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Your payment provider is returning slow responses and your whole service is degrading. What do you do?
 > Confirm it is the vendor with a `curl -w` timing from a pod and outbound error and latency metrics.
@@ -428,7 +496,7 @@ With a stable key per logical payment, the vendor returns the original result. A
 > [!question]- How would you design to survive this before it happens?
 > Treat every vendor as an unreliable network call: deadlines on every call, a circuit breaker and bulkhead per vendor, an async queue for money-moving or non-urgent work, a secondary vendor for critical paths, cached fallbacks, per-vendor dashboards, synthetic probes and regular game days that inject latency.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Scope first: only vendor-calling endpoints red means a dependency problem.
 - Prove it: `curl -sS -o /dev/null -w 'dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\n' URL` from a pod.

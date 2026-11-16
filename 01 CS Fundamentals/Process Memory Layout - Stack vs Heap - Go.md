@@ -63,7 +63,7 @@ flowchart LR
 
 ### Step 1: two functions the compiler treats differently
 
-**Concept.** The theory note's whole claim is that a value's *provable lifetime*, not its type or syntax, decides stack vs heap ([[Process Memory Layout - Stack vs Heap#3. How it works]]).
+**Concept.** The theory note's whole claim is that a value's *provable lifetime*, not its type or syntax, decides stack vs heap ([[Process Memory Layout - Stack vs Heap#3. How it works 🟡]]).
 
 The clearest way to prove that isn't to assert it — it's to write the smallest possible pair of functions where one value obviously can't escape and one obviously must, and then ask the compiler itself what it decided.
 

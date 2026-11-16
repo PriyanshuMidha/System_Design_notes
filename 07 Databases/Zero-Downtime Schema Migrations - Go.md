@@ -52,8 +52,8 @@ Schema changes that avoid long locks are mostly SQL, but the one step that needs
 
 | Code | Concept in [[Zero-Downtime Schema Migrations]] |
 | --- | --- |
-| `Store.BackfillRange` | One batch is one short transaction: `UPDATE ... WHERE id >= $1 AND id < $2 AND total_minor IS NULL` ([[Zero-Downtime Schema Migrations#4. Worked example]]) |
-| `Store.ReplicaLag` | Throttling on `pg_stat_replication.replay_lag` so reads on replicas do not go stale ([[Zero-Downtime Schema Migrations#7. In production]]) |
+| `Store.BackfillRange` | One batch is one short transaction: `UPDATE ... WHERE id >= $1 AND id < $2 AND total_minor IS NULL` ([[Zero-Downtime Schema Migrations#4. Worked example 🟡]]) |
+| `Store.ReplicaLag` | Throttling on `pg_stat_replication.replay_lag` so reads on replicas do not go stale ([[Zero-Downtime Schema Migrations#7. In production 🔴]]) |
 | `Run` and the returned `next` | A resumable job: a checkpoint id lets a rerun continue where it stopped |
 | `waitForReplicas`, `Pause` | Pausing between batches so vacuum and replicas keep up |
 | `fakeStore` in the tests | An in-memory table that counts writes per id to prove each row is written once |
@@ -89,7 +89,7 @@ go test -race ./...
 
 **In plain words:** one small UPDATE that fills only rows in a short id range, and only rows that are still empty, so running it twice does no harm.
 
-**Concept.** This is the "migrate" step of expand, migrate, contract ([[Zero-Downtime Schema Migrations#4. Worked example]]). Updating 20 million rows in one statement would hold row locks for the whole run, produce a huge burst of WAL, and make replicas lag. Instead each statement touches a small id range.
+**Concept.** This is the "migrate" step of expand, migrate, contract ([[Zero-Downtime Schema Migrations#4. Worked example 🟡]]). Updating 20 million rows in one statement would hold row locks for the whole run, produce a huge burst of WAL, and make replicas lag. Instead each statement touches a small id range.
 
 The `total_minor IS NULL` condition makes the statement idempotent: a rerun skips rows that are already filled, which is what makes the job safe to interrupt. The alternative is a single `UPDATE` in one transaction, which is simpler but is the classic way to cause an outage.
 
@@ -181,7 +181,7 @@ classDiagram
 
 **In plain words:** check delay, do one batch, rest, repeat. If stopped, it hands back the id to start from next time.
 
-**Concept.** `Run` is the loop of the worked example in [[Zero-Downtime Schema Migrations#4. Worked example]]: check lag, run one batch, pause, repeat. It returns the id where a rerun should resume, which is the checkpoint. Checking the context between batches, never inside one, means a stop leaves every batch either fully committed or never started.
+**Concept.** `Run` is the loop of the worked example in [[Zero-Downtime Schema Migrations#4. Worked example 🟡]]: check lag, run one batch, pause, repeat. It returns the id where a rerun should resume, which is the checkpoint. Checking the context between batches, never inside one, means a stop leaves every batch either fully committed or never started.
 
 The alternative is to persist a checkpoint row in the database after each batch; returning `next` keeps the loop free of extra state and leaves the choice of where to store it to the caller.
 
@@ -240,7 +240,7 @@ stateDiagram-v2
 
 **In plain words:** before each batch, ask "are the copies keeping up?" If not, wait instead of piling on more work.
 
-**Concept.** Every updated row is a new row version, so a backfill produces a lot of WAL, and replicas that cannot replay it fast enough serve stale reads ([[Zero-Downtime Schema Migrations#7. In production]]). The loop therefore reads the lag before each batch and sleeps until it is acceptable.
+**Concept.** Every updated row is a new row version, so a backfill produces a lot of WAL, and replicas that cannot replay it fast enough serve stale reads ([[Zero-Downtime Schema Migrations#7. In production 🔴]]). The loop therefore reads the lag before each batch and sleeps until it is acceptable.
 
 This is feedback control: the job runs as fast as the slowest replica allows. A fixed sleep alone would either be too slow when the system is idle or too fast when it is busy. The lag check costs one cheap query per batch.
 

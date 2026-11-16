@@ -37,7 +37,38 @@ updated: 2026-11-13
 > - Need zero operations on AWS and simple task distribution: SQS (with SNS for fan-out).
 > - Every durable broker is at-least-once in practice. Design the consumer to be idempotent.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (12). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (both models, the flowchart), 4 (worked example), 5, 6 and 9 (drills).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 10 and 11. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Checkout must tell email, the warehouse and analytics that an order happened.
+If checkout calls each one directly, checkout breaks whenever any of them is slow or down.
+So checkout drops a message in a middle box and moves on. Others pick it up when ready. That middle box is a **broker**.
+Brokers come in two kinds. A **queue** (SQS, RabbitMQ) hands each message to one worker, then deletes it, like a to-do pile.
+A **log** (Kafka) keeps every message in order for days, and many readers can each read it, and even re-read it, like a newspaper archive.
+
+```mermaid
+flowchart LR
+    A["Before: checkout calls<br/>email, warehouse, analytics"] --> B["One slow service<br/>breaks checkout"]
+```
+
+```mermaid
+flowchart LR
+    C["Checkout"] --> Q["Broker"]
+    Q --> E["Email"]
+    Q --> W["Warehouse"]
+    Q --> AN["Analytics"]
+```
+
+The rest of this note is just these 3 questions:
+1. Is your message a task to do once, or a fact to keep and replay?
+2. Which product fits, given your team and your cloud?
+3. How do you handle order, retries and duplicates?
 
 **The problem in one story.**
 A shop's checkout service must tell the email service, the warehouse and the analytics team that an order happened.
@@ -82,7 +113,7 @@ Where it breaks: an archive never loses issues, but a log also deletes old messa
 > [!tip] Remember
 > Decide queue (tasks) or log (events you keep and replay) first; then pick the product, and always make consumers idempotent.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 You run a food delivery app. When an order is placed, six things must happen: charge the card, notify the restaurant, assign a driver, email a receipt, update analytics, and update the search ranking. If checkout calls all six directly, it is slow, and a failure in the email service breaks ordering.
 
@@ -97,7 +128,7 @@ This note gives you a fast way to choose, with the reasons.
 > [!tip] Remember
 > Queue means "work to be done once". Log means "facts that happened, to be read by anyone, any time within retention".
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 **A queue is a restaurant ticket rail.** The cook takes a ticket off the rail; it is gone. Two cooks never cook the same ticket. If a cook drops it, it goes back on the rail.
 
@@ -120,9 +151,11 @@ flowchart LR
     end
 ```
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The two models, step by step
+
+**In plain words:** A queue is a to-do pile: take a card, do it, throw it away. A log is an archive: everyone reads at their own pace and nothing is thrown away until it expires.
 
 **Queue (SQS standard as the example):**
 
@@ -167,6 +200,8 @@ sequenceDiagram
 
 ### The decision flowchart
 
+**In plain words:** Follow the yes/no questions. Most answers come down to "task queue" or "event log".
+
 ```mermaid
 flowchart TD
     S["Need async messaging"] --> R{"Need replay or reprocess history?"}
@@ -195,6 +230,8 @@ flowchart TD
 
 ### Guarantees and ordering in plain words
 
+**In plain words:** Order is kept only inside one lane. Put all messages for the same order or user in the same lane.
+
 **Ordering.** Kafka guarantees order within a partition, so use the entity id (order id, user id) as the key and all events for that entity stay in order. SQS FIFO guarantees order per **message group id**.
 
 RabbitMQ keeps order within one queue with one consumer, but order is lost when several consumers or redeliveries are involved. SQS standard gives best-effort order only. See [[Message Ordering and Partition Keys]].
@@ -203,7 +240,7 @@ RabbitMQ keeps order within one queue with one consumer, but order is lost when 
 
 **Example with numbers:** a consumer processes 1,000 payments, then crashes before committing the offset for the last 40. After restart, those 40 are processed again. If "charge card" is not idempotent, 40 customers are charged twice.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 **Scenario: choose brokers for the food delivery app.** Four needs, each decided with the flowchart.
 
@@ -241,9 +278,11 @@ This is not over-engineering: three brokers each match a different shape. A smal
 > [!warning] Common mistake
 > Using the broker as a database, for example reading Kafka to answer "what is the status of order 42" by scanning. Keep a database for state and use the broker to move changes.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### The comparison table
+
+**In plain words:** The brokers side by side. Numbers are rough sizes, not promises.
 
 Throughput and latency figures are rough, public or estimated, and depend on message size, replication and hardware. Treat them as orders of magnitude and benchmark your workload.
 
@@ -267,6 +306,8 @@ Throughput and latency figures are rough, public or estimated, and depend on mes
 
 ### Kafka vs RabbitMQ in one picture
 
+**In plain words:** RabbitMQ is a smart post office that routes and deletes. Kafka is a long tape that keeps everything and lets readers rewind.
+
 ```mermaid
 flowchart LR
     subgraph K["Kafka: smart consumer, dumb broker"]
@@ -285,11 +326,15 @@ flowchart LR
 
 ### Redis Streams and NATS: the lightweight logs
 
+**In plain words:** Small, simple logs for when Kafka is too much. Fine for moderate traffic and short history.
+
 Use **Redis Streams** when you already run Redis, volume is moderate, and a few minutes to hours of history in RAM is enough. See [[Redis as a Queue - Lists, Streams and Pub-Sub]]. Redis Pub/Sub alone is fire-and-forget: a subscriber that is offline misses messages.
 
 Use **NATS** for very low latency service-to-service messaging. Core NATS is at most once. **JetStream** adds persistence, acks and replay.
 
 ### Cloud managed options
+
+**In plain words:** Let the cloud run the broker for you. Less power to tune, much less work at 3 a.m.
 
 - **SQS** for task queues, **SNS** to fan out to many SQS queues or Lambdas, **EventBridge** for event routing between AWS services and SaaS ([[AWS SQS, SNS and EventBridge]]).
 - **Google Pub/Sub** for a global, fully managed topic with at-least-once delivery, ordering keys and optional exactly-once.
@@ -306,7 +351,7 @@ flowchart LR
     QE -. "after N failures" .-> DLQ[("DLQ")]
 ```
 
-## 6. Trade-offs
+## 6. Trade-offs 🟡
 
 | Choice | You gain | You pay |
 | --- | --- | --- |
@@ -321,6 +366,8 @@ flowchart LR
 
 ### When not to use a broker at all
 
+**In plain words:** If the caller needs the answer right now, or traffic is tiny, a direct call or a database table may be enough.
+
 - The caller needs the answer now (use a synchronous call, with timeouts and retries).
 - Volume is tiny and you already have Postgres: a `jobs` table with `SELECT ... FOR UPDATE SKIP LOCKED` can serve a modest job queue. See [[Background Jobs and Worker Pools]].
 - You need workflow state across many steps: a workflow engine such as Temporal fits better. See [[Workflow Engines and Durable Execution]].
@@ -328,9 +375,11 @@ flowchart LR
 > [!warning] Common mistake
 > Choosing Kafka for a few hundred jobs a minute because "it is the standard". You inherit partitions, consumer-group rebalances and head-of-line blocking (one slow message holds up the rest of its partition) for no benefit.
 
-## 7. In production
+## 7. In production 🔴
 
 ### Real company examples
+
+**In plain words:** Public stories of who used which broker, for what.
 
 | Company | Broker use | Source note |
 | --- | --- | --- |
@@ -346,6 +395,8 @@ flowchart LR
 
 ### Failure modes and fixes
 
+**In plain words:** The usual ways brokers go wrong, what you will see, and how to fix it.
+
 | Problem | Symptom | Fix |
 | --- | --- | --- |
 | Poison message | Same message fails and loops forever, queue blocks | Max receive count, then DLQ; alert on DLQ depth |
@@ -359,6 +410,8 @@ flowchart LR
 
 ### Metrics to watch
 
+**In plain words:** The one number that matters most is lag: how far behind the readers are.
+
 - Kafka: consumer group lag per partition (`kafka-consumer-groups.sh --bootstrap-server <host:9092> --describe --group <group>`), under-replicated partitions, request latency.
 - RabbitMQ: queue depth (ready and unacked), consumer utilisation, memory and disk alarms.
 - SQS: `ApproximateNumberOfMessagesVisible`, `ApproximateAgeOfOldestMessage`, DLQ depth.
@@ -366,9 +419,11 @@ flowchart LR
 
 See [[Backpressure and Flow Control]] for what to do when producers outrun consumers.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Why a partition limits parallelism
+
+**In plain words:** In Kafka, one lane is read by only one reader in a group. Twelve lanes means at most twelve busy readers, no matter how many you add.
 
 In Kafka one partition is read by at most one consumer in a group. With 12 partitions, a 20-consumer group has 8 idle members. So partition count is your parallelism ceiling and is hard to reduce later. Choose it from target throughput divided by per-partition throughput, then add headroom (an estimate-based exercise; measure your own).
 
@@ -385,19 +440,48 @@ flowchart LR
     C4["Consumer 4 (idle: more consumers than partitions)"]
 ```
 
+```mermaid
+flowchart LR
+    T["Topic: 12 partitions"] --> G["20 consumers in a group"]
+    G --> B["12 busy"]
+    G --> I["8 idle"]
+```
+
 ### Ordering plus retries
+
+**In plain words:** If message 1 fails and message 2 goes through, order is broken. You must either wait on message 1 or accept the break.
 
 If message 1 fails and is retried while message 2 succeeds, order is broken. Options: stop consuming that key until it succeeds (Kafka pause, SQS FIFO blocks the group), or make handlers commutative with version numbers. This is why strict order and independent retry are in tension.
 
+```mermaid
+flowchart LR
+    M1["Msg 1 fails"] --> R["Retry later"]
+    M2["Msg 2 succeeds"] --> X["Now 2 is done before 1:<br/>order broken"]
+    R --> X
+```
+
 ### Exactly-once, honestly
+
+**In plain words:** True "exactly once" only works inside Kafka. Once you touch a database or send an email, use "at least once" plus duplicate checks.
 
 Kafka transactions give atomic read-process-write between Kafka topics. When a side effect lives outside (database, email), the practical recipe is at-least-once plus an idempotent handler, for example a unique `event_id` with an insert-if-absent check. See [[Delivery Semantics and Exactly-Once]].
 
+```mermaid
+flowchart LR
+    K["Message (may arrive twice)"] --> C{"Seen this id?"}
+    C -- "yes" --> S["Skip"]
+    C -- "no" --> D["Do the work +<br/>save id together"]
+```
+
 ### Schemas
+
+**In plain words:** Messages are read years later by new code. Agree on a message shape and only change it in safe ways, like adding optional fields.
 
 A log is read years later by code that did not exist when it was written. Use a schema registry and compatible evolution (add optional fields, never reuse tags). See [[Event Schemas and Schema Registry]].
 
 ### Choosing by operational ability
+
+**In plain words:** Pick a broker your team can actually run. A small team is better off with a managed service.
 
 A good senior answer includes who will run it. A three-person team on AWS is better served by SNS and SQS or MSK than by a self-run Kafka cluster, even if Kafka is technically better for the workload.
 
@@ -413,7 +497,7 @@ flowchart TD
     C -- no --> D["Light: Redis Streams or NATS"]
 ```
 
-## 9. Scenario drills (scenario, choice, why)
+## 9. Scenario drills (scenario, choice, why) 🟡
 
 | # | Scenario | Pick | Why | What to say in the interview |
 | --- | --- | --- | --- | --- |
@@ -430,7 +514,7 @@ flowchart TD
 | 11 | Audit log kept 30 days, replayable | Kafka with retention, or Kinesis | Retention and replay | "Retention is a configuration, and consumers can rewind." |
 | 12 | Small startup, 200 jobs per minute, already on Postgres | Postgres jobs table with SKIP LOCKED, or SQS | A full broker is more than needed | "I'd start with what we already operate, and move when a measured limit shows up." |
 
-## 10. How to say it in the interview
+## 10. How to say it in the interview 🔴
 
 Use this skeleton:
 
@@ -449,7 +533,7 @@ Phrases that score well:
 
 Phrases to avoid: "exactly-once, no problem", "Kafka is always faster", "just use a queue" with no failure plan.
 
-## 11. Interview questions
+## 11. Interview questions 🔴
 
 > [!question]- When would you choose RabbitMQ over Kafka?
 > When you need rich routing (topic and header exchanges), per-message priorities, TTLs, delayed retry, or request/reply, and the throughput is moderate. RabbitMQ's broker tracks each message and routes it by rules. If you also need replay and very high throughput, choose Kafka (or RabbitMQ Streams for a log inside RabbitMQ).
@@ -469,7 +553,7 @@ Phrases to avoid: "exactly-once, no problem", "Kafka is always faster", "just us
 > [!question]- Your Kafka consumer lag keeps rising. What do you do?
 > Check whether the handler is slow (a dependency, a database call), and fix that first. If handlers are fine, add consumers up to the partition count. If you are already at that cap, increase partitions (which changes key-to-partition mapping for new data) or batch the work. Also look for one hot partition and rebalance storms.
 
-## 12. Cheat sheet
+## 12. Cheat sheet 🟢
 
 - Queue: tasks, delete on ack. Log: events, retained, replayable, one offset per group.
 - Kafka: replay, throughput, per-partition order, parallelism equals partitions, heavy ops.
@@ -480,7 +564,7 @@ Phrases to avoid: "exactly-once, no problem", "Kafka is always faster", "just us
 - Everything is at-least-once: idempotent consumers and an outbox.
 - Say: shape, needs, pick, guarantee, cost.
 
-## 13. Links
+## 13. Links 🟢
 
 - Before this: [[Queues vs Streams and Broker Comparison]], [[Event-Driven Architecture Basics]], [[System Design Interview Framework]]
 - Brokers: [[Kafka and Event Streaming]], [[AWS SQS, SNS and EventBridge]], [[Redis as a Queue - Lists, Streams and Pub-Sub]]
@@ -490,7 +574,7 @@ Phrases to avoid: "exactly-once, no problem", "Kafka is always faster", "just us
 - Compare with: [[Choosing a Database - Decision Guide]]
 - Map: [[09 Messaging & Async MOC]]
 
-## Links
+## Links 🟢
 
 ### Watch on YouTube
 

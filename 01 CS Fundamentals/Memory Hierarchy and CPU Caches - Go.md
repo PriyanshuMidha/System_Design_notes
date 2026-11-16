@@ -38,7 +38,7 @@ updated: 2026-11-13
 
 | Code | Concept in [[Memory Hierarchy and CPU Caches]] |
 | --- | --- |
-| `Counters` | The packed layout where 8 counters share 64-byte lines, [[Memory Hierarchy and CPU Caches#4. Worked example]] |
+| `Counters` | The packed layout where 8 counters share 64-byte lines, [[Memory Hierarchy and CPU Caches#4. Worked example 🟡]] |
 | `PaddedCounters` / `paddedCounter` | The false-sharing fix: one counter per cache line, same section |
 | `TestCountersAreCorrect` | False sharing is a performance bug, not a correctness bug — both layouts must compute the right answer |
 | `BenchmarkUnpadded` / `BenchmarkPadded` | The measured 0.92x (about 9% faster) padded result in the worked example |
@@ -74,7 +74,7 @@ Both types expose the same two methods, `Incr` and `Get`, so the only difference
 
 ### Step 1: the packed layout
 
-**Concept.** This implements the "before" side of [[Memory Hierarchy and CPU Caches#4. Worked example]]: `N` plain `int64` counters packed into one slice.
+**Concept.** This implements the "before" side of [[Memory Hierarchy and CPU Caches#4. Worked example 🟡]]: `N` plain `int64` counters packed into one slice.
 
 Because a `[]int64` is contiguous memory and each element is 8 bytes, eight consecutive counters fit in one 64-byte cache line.
 

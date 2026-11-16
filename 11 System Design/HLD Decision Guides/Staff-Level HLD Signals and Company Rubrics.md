@@ -29,7 +29,38 @@ updated: 2026-11-13
 > - Company formats differ (product-flavored, infra-flavored, behavioral overlay), but each wants requirements, numbers, trade-offs and failure thinking.
 > - Treat company-specific claims as hints, not facts. Ask your recruiter what the round looks like.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3 (the seven steps), 4 (worked example) and 5 (red flags, follow-ups).
+> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Three people get the same design question and draw almost the same boxes.
+Yet one is hired at a junior-senior level, one at senior, and one at Staff.
+The difference is how they think and talk, not how many boxes they draw.
+A senior engineer explains each choice with numbers and says what breaks. A Staff engineer also leads the talk: sets the scope, plans version 1 and version 2, and plans the move from the old system to the new one.
+Interviewers look for these behaviours. They call them **signals**, and they write them down against a **rubric** (a scoring sheet).
+
+```mermaid
+flowchart LR
+    A["Working design"] --> B["+ numbers, trade-offs,<br/>failures (senior)"]
+    B --> C["+ leads the talk, v1 to v2,<br/>migration, cost (Staff)"]
+```
+
+```mermaid
+flowchart LR
+    V["Vague question"] --> S["You set the scope"]
+    S --> P["Plan v1 now,<br/>v2 later"]
+    P --> M["Say how to migrate"]
+```
+
+The rest of this note is just these 3 questions:
+1. What does each level look like in the room?
+2. How do you show Staff signals (scope, evolution, migration, cost)?
+3. How do different companies run and score the round?
 
 **The problem in one story.**
 Three engineers get the same question: "design a food delivery app".
@@ -70,7 +101,7 @@ Where it breaks: in an interview you must show all three hats yourself, in under
 > [!tip] Remember
 > Higher levels are scored on handling ambiguity and reasoning about trade-offs, not on drawing more boxes.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Two candidates draw almost the same diagram for "design a food delivery app". One gets hired as SDE-2, the other is rejected for SDE-3, and a third would have been offered Staff. The diagrams were not the difference.
 
@@ -84,7 +115,7 @@ Candidates preparing for SDE-3 often do not know what the interviewer is writing
 > [!tip] Remember
 > The level is read from how you decide and lead, not from what you draw.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a **building project**. The SDE-2 is a skilled builder: give a blueprint and they build it well. The SDE-3 is the site engineer: they check the blueprint for load, choose materials, and spot what will crack.
 
@@ -101,7 +132,7 @@ flowchart LR
 > [!tip] Remember
 > Scope of ambiguity handled rises with each level. Respond to vague by asking, then deciding.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### Step 1: the signals by level
 
@@ -274,9 +305,11 @@ Short phrases to use:
 - "Reversibility: a queue between services is easy to change; a primary key choice is not. I will spend time on the second."
 - "First quarter ships ordering and tracking; payouts reuse the existing ledger."
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### Whiteboard version
+
+**In plain words:** A full Staff-style answer to "design a notification platform", showing every signal in one go.
 
 Prompt: "Design the notification platform for a company with several teams sending emails, SMS and push."
 
@@ -323,9 +356,11 @@ sequenceDiagram
     Note over Team,Old: Rollback = flag off, legacy still works
 ```
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 ### Red flags and recoveries
+
+**In plain words:** Mistakes that cost you the level, and a quick line to recover if you catch yourself.
 
 | Red flag | Why it hurts at this level | Recovery |
 | --- | --- | --- |
@@ -339,6 +374,8 @@ sequenceDiagram
 | Jargon without reasons | Buzzword signal | Say "I pick X over Y because Z, cost W" |
 
 ### Common Staff-level follow-ups
+
+**In plain words:** Questions Staff candidates hear often, and the shape of a strong answer.
 
 | Follow-up | Answer shape |
 | --- | --- |
@@ -358,7 +395,7 @@ flowchart TD
     C --> D["State what you monitor to know it is working"]
 ```
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Do not perform Staff behaviors at the cost of fundamentals.** A missing estimate or an unhandled failure mode costs more than a missing migration plan.
 - **Do not claim ownership of things you do not know.** Say "I would confirm with the payments team".
@@ -366,14 +403,14 @@ flowchart TD
 - **Do not over-explain scope cuts.** One sentence per cut, then move on.
 - **Do not apply the Staff checklist to a 30-minute SDE-2 round.** Match depth to the level of the role and the time given.
 
-## 7. In production
+## 7. In production 🔴
 
 - **Real design reviews** use the same signals: context, requirements, numbers, options, decision, rollout, risks, monitoring. See [[Architecture Decision Records]] and [[Production Readiness Review]].
 - **Real migrations** use the dual-write and shadow sequence above, with a diff job and a rollback flag.
 - **Real Staff work** is mostly alignment: writing the design doc, getting other teams to agree on contracts, and sequencing so something ships early.
 - **Practice routine:** after each mock, write one line per scorecard area: what I showed, what I missed. Repeat with one area as the focus.
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### Reading hints from the interviewer
 
@@ -392,9 +429,20 @@ When a hint arrives, say "that changes my assumption", restate the new requireme
 
 ### Making trade-offs reversible
 
+**In plain words:** Some choices are hard to undo (like a partition key). Some are easy (like a cache size). Spend your care on the hard ones.
+
 Staff candidates classify decisions as **one-way doors** (hard to undo: primary keys, partition keys, public API contracts, data retention) and **two-way doors** (easy to undo: cache choice, queue vendor behind an interface). Spend time on one-way doors; decide two-way doors fast. This phrase is widely used in engineering writing and is a compact way to show judgment.
 
+```mermaid
+flowchart LR
+    D["A decision"] --> Q{"Easy to undo?"}
+    Q -- "no: one-way door<br/>(keys, public API, retention)" --> S["Slow down,<br/>think hard, write it down"]
+    Q -- "yes: two-way door<br/>(cache size, instance type)" --> F["Decide fast,<br/>change later"]
+```
+
 ### A 45-minute plan that shows the signals
+
+**In plain words:** How to split 45 minutes so every signal gets shown at least once.
 
 | Minutes | Activity | Signal shown |
 | --- | --- | --- |
@@ -405,7 +453,16 @@ Staff candidates classify decisions as **one-way doors** (hard to undo: primary 
 | 34 to 40 | 10 times growth, failure, v2 trigger | Scaling and reliability |
 | 40 to 45 | Rollout and migration, risks, summary | Staff extras |
 
-## 9. Interview questions
+```mermaid
+flowchart LR
+    A["0-6: scope"] --> B["6-10: numbers"]
+    B --> C["10-16: simple v1"]
+    C --> D["16-34: two deep dives"]
+    D --> E["34-40: growth, failure"]
+    E --> F["40-45: migration, wrap-up"]
+```
+
+## 9. Interview questions 🔴
 
 > [!question]- What separates SDE-3 from Staff in a design round?
 > Both choose well between options with numbers. Staff also frames and scopes the problem on their own, sequences the work as v1 then v2 with explicit triggers, plans migration and rollback, and talks about cost, ownership and cross-team impact.
@@ -425,7 +482,7 @@ Staff candidates classify decisions as **one-way doors** (hard to undo: primary 
 > [!question]- How should you prepare for different companies' rounds?
 > Practice the general framework, then ask the recruiter what the round looks like. Add the flavor: product vs infrastructure emphasis for some, leadership-principle stories for others, real-time and marketplace problems for others. Do not rely on rumors about internal rubrics.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 | Level | Show this |
 | --- | --- |
@@ -437,7 +494,7 @@ Staff candidates classify decisions as **one-way doors** (hard to undo: primary 
 - **Company advice:** use public prep material from the recruiter; do not trust forum rubrics.
 - **Always:** state assumptions, estimate, name the riskiest part, end with risks and monitoring.
 
-## Links
+## Links 🟢
 
 - Core: [[HLD Round - Complete Step-by-Step Guide]], [[System Design Interview Framework]], [[HLD Trade-offs Master Cheat Sheet]], [[HLD Round - Full Worked Mock (Food Delivery App)]].
 - Supporting: [[Back-of-the-Envelope Estimation]], [[Zero-Downtime Schema Migrations]], [[Multi-Region Architecture]], [[SLIs, SLOs, SLAs and Error Budgets]], [[Production Readiness Review]], [[Architecture Decision Records]].

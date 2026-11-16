@@ -43,7 +43,7 @@ This file is the hands-on twin of [[Consistent Hashing]]. It builds a working ha
 | Code | Concept in [[Consistent Hashing]] |
 | --- | --- |
 | `wb.Ring` (whiteboard) | The ring as a sorted array plus binary search, [[Consistent Hashing#3.1 The ring is a sorted array]] and [[Consistent Hashing#3.2 Lookup is a binary search]] |
-| `position` | Placing servers and keys on the same circle; hash quality, [[Consistent Hashing#8. Deep dive]] |
+| `position` | Placing servers and keys on the same circle; hash quality, [[Consistent Hashing#8. Deep dive 🔴]] |
 | `Ring.Add` with `vnodes` | Virtual nodes, [[Consistent Hashing#3.5 Virtual nodes]] |
 | `Ring.Get` | Lookup with wrap-around, §3.2 |
 | `Ring.Remove` | Removing a node gives its arcs to its successors, [[Consistent Hashing#3.4 Removing a node]] and [[Consistent Hashing#3.6 When a node dies, vnodes spread its load]] |
@@ -152,7 +152,7 @@ The full version adds virtual nodes, removal, collision handling, replica lookup
 
 The struct therefore keeps three things: how many vnodes per node, the sorted positions, and a map from position back to the physical node. A `sync.RWMutex` protects them because lookups are frequent and changes are rare.
 
-SHA-256 is slow but mixes its output well, so similar names such as `a#1` and `a#2` land far apart; cheaper hashes like CRC32 or FNV can clump them ([[Consistent Hashing#8. Deep dive]]).
+SHA-256 is slow but mixes its output well, so similar names such as `a#1` and `a#2` land far apart; cheaper hashes like CRC32 or FNV can clump them ([[Consistent Hashing#8. Deep dive 🔴]]).
 
 ```go
 package ring
@@ -585,7 +585,7 @@ ok  	ring	2.035s
 | `--- PASS ... (0.47s)` | The comparison test is the slowest because it hashes 100,000 keys with SHA-256 twice. |
 | `ok ring 2.035s` | The package passed under the race detector. |
 
-The measured table in [[Consistent Hashing#4. Worked example]] compares several hash functions and vnode counts. The exact percentages depend on the key names and the vnode naming scheme, so expect numbers near 20% moved rather than identical ones.
+The measured table in [[Consistent Hashing#4. Worked example 🟡]] compares several hash functions and vnode counts. The exact percentages depend on the key names and the vnode naming scheme, so expect numbers near 20% moved rather than identical ones.
 
 ## Pitfalls in the code 🔴
 

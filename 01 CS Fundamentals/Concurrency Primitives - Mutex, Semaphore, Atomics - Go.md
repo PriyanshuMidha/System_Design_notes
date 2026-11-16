@@ -40,12 +40,12 @@ This file is the runnable half of [[Concurrency Primitives - Mutex, Semaphore, A
 
 | Code | Concept in the theory note |
 | --- | --- |
-| `Counter.Inc` / `Value` | A mutex serializes a critical section ([[Concurrency Primitives - Mutex, Semaphore, Atomics#3. How it works]]) |
+| `Counter.Inc` / `Value` | A mutex serializes a critical section ([[Concurrency Primitives - Mutex, Semaphore, Atomics#3. How it works 🟡]]) |
 | `AtomicCounter.Inc` / `Value` | A single hardware instruction, no blocking ([[Concurrency Primitives - Mutex, Semaphore, Atomics#Atomics and compare-and-swap]]) |
 | `AtomicCounter.IncIfLessThan` | A manual CAS retry loop — the ABA-aware building block ([[Concurrency Primitives - Mutex, Semaphore, Atomics#The ABA problem: why CAS is harder than it looks]]) |
 | `Semaphore`, `NewSemaphore`, `Acquire`, `Release` | A buffered channel as a counting semaphore ([[Concurrency Primitives - Mutex, Semaphore, Atomics#Semaphores]]) |
 | `AccountStore.TransferConsistentOrder` | A fixed global lock order breaks circular wait ([[Concurrency Primitives - Mutex, Semaphore, Atomics#Deadlock]]) |
-| `TestChannelHappensBefore` | The Go memory model's channel send/receive happens-before edge ([[Concurrency Primitives - Mutex, Semaphore, Atomics#8. Deep dive]]) |
+| `TestChannelHappensBefore` | The Go memory model's channel send/receive happens-before edge ([[Concurrency Primitives - Mutex, Semaphore, Atomics#8. Deep dive 🔴]]) |
 
 ```mermaid
 flowchart LR

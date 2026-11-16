@@ -130,7 +130,7 @@ flowchart LR
 
 **In plain words:** the same table plus real-world settings: 3 copies per data centre, and files grouped by day so a whole old day can be deleted at once.
 
-**Concept.** The production table adds the choices from [[Wide-Column Stores and Cassandra#5. Variants and comparison]] and the replica placement from [[Wide-Column Stores and Cassandra#3.1 Placement: tokens and replicas]]. `NetworkTopologyStrategy` puts 3 replicas in each data centre. Time-window compaction groups data written on the same day into the same SSTable files, so when the 365-day TTL expires, a whole file can be dropped instead of rewriting it.
+**Concept.** The production table adds the choices from [[Wide-Column Stores and Cassandra#5. Variants and comparison 🟡]] and the replica placement from [[Wide-Column Stores and Cassandra#3.1 Placement: tokens and replicas]]. `NetworkTopologyStrategy` puts 3 replicas in each data centre. Time-window compaction groups data written on the same day into the same SSTable files, so when the 365-day TTL expires, a whole file can be dropped instead of rewriting it.
 
 Size-tiered or leveled compaction would mix old and new rows and keep rewriting them.
 

@@ -37,7 +37,7 @@ updated: 2026-11-13
 
 | Code | Concept in [[How a Computer Runs a Program]] |
 | --- | --- |
-| `CPU` struct | Registers and the program counter as the only directly-addressable state, [[How a Computer Runs a Program#2. Mental model]] |
+| `CPU` struct | Registers and the program counter as the only directly-addressable state, [[How a Computer Runs a Program#2. Mental model 🟢]] |
 | `Instr` / `Opcode` | An instruction as a fixed-shape value: opcode plus operands, [[How a Computer Runs a Program#1.1 The CPU understands only one thing]] |
 | `Run`'s `for` loop | The fetch-decode-execute cycle itself, [[How a Computer Runs a Program#3.1 The fetch-decode-execute cycle]] |
 | the `switch` inside `Run` | Decode (which case) + execute (the case body) in one place | 
@@ -85,7 +85,7 @@ There is no assembler, no linker, no loader here — only the fetch-decode-execu
 
 **In plain words:** first we define the nouns — what one instruction looks like, and what the CPU remembers between instructions (its 8 registers and the program counter).
 
-**Concept.** This is [[How a Computer Runs a Program#2. Mental model]]'s "eight sticky notes and a pointer finger" made literal as Go types.
+**Concept.** This is [[How a Computer Runs a Program#2. Mental model 🟢]]'s "eight sticky notes and a pointer finger" made literal as Go types.
 
 `CPU` holds exactly the state that survives between instructions — registers and the program counter — matching the note's claim that registers are the CPU's only directly-addressable storage.
 

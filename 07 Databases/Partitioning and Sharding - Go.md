@@ -54,7 +54,7 @@ flowchart LR
 | --- | --- |
 | Range, list and hash DDL | The three partitioning kinds, [[Partitioning and Sharding#3.1 Partitioning inside PostgreSQL]] |
 | `LogicalShard` | Hashing a key to a fixed number of logical shards, [[Partitioning and Sharding#3.4 Sharding across machines]] |
-| `Map.Route` and `NewMap` | The shard map and router, §3.4 and [[Partitioning and Sharding#4. Worked example]] |
+| `Map.Route` and `NewMap` | The shard map and router, §3.4 and [[Partitioning and Sharding#4. Worked example 🟡]] |
 | `Map.Freeze` and `Map.Flip` | The freeze-and-flip step of an online move, §4 |
 | `TestMoveTouchesOneLogicalShard` | A move changes the owner of exactly one logical shard, [[Partitioning and Sharding#8.1 Why many logical shards]] |
 | `TestSequentialIDsSpreadEvenly` | Hash routing avoids the hot-shard anti-pattern, [[Partitioning and Sharding#3.6 The user-ID range example is a hot-shard anti-pattern]] |
@@ -232,7 +232,7 @@ DROP TABLE audit_logs_2025_12;   -- or archive it to object storage first
 
 **In plain words:** the whole sharding idea in a few lines: hash the key into a fixed bucket, then look up which database holds that bucket.
 
-**Concept.** This is the smallest form of the idea in [[Partitioning and Sharding#4. Worked example]]: a key is hashed to one of a fixed number of logical shards, and a table maps each logical shard to a database.
+**Concept.** This is the smallest form of the idea in [[Partitioning and Sharding#4. Worked example 🟡]]: a key is hashed to one of a fixed number of logical shards, and a table maps each logical shard to a database.
 
 Because the hash and the shard count never change, moving data is a single table update rather than a rehash of every key. The alternative, `hash(key) % numberOfDatabases`, ties placement to the server count, so adding a server moves almost every key.
 
@@ -375,7 +375,7 @@ func NewMap(databases ...string) *Map {
 
 **In plain words:** moving a bucket is like moving house: keep living there while you pack (copy), stop new deliveries for a minute (freeze), then change the address (flip).
 
-**Concept.** The online move in [[Partitioning and Sharding#4. Worked example]] has three phases: copy the data while writes continue, freeze writes for a short final drain, then flip the owner. `Route` implements the read and write rule, `Freeze` starts the cut-over and `Flip` finishes it.
+**Concept.** The online move in [[Partitioning and Sharding#4. Worked example 🟡]] has three phases: copy the data while writes continue, freeze writes for a short final drain, then flip the owner. `Route` implements the read and write rule, `Freeze` starts the cut-over and `Flip` finishes it.
 
 Reads can safely keep using the old owner during the freeze because the old database still has all the data. Writes must fail fast instead of queuing, so a stuck move cannot pile up requests.
 
@@ -676,7 +676,7 @@ ok  	shard	1.655s
 
 ## Pitfalls in the code 🔴
 
-- **`Freeze` is not enough.** It stops new routing only. A write routed just before the freeze can still land after the final drain, so each database must also enforce shard ownership itself (the `shard_owner` check in [[Partitioning and Sharding#4. Worked example]]).
+- **`Freeze` is not enough.** It stops new routing only. A write routed just before the freeze can still land after the final drain, so each database must also enforce shard ownership itself (the `shard_owner` check in [[Partitioning and Sharding#4. Worked example 🟡]]).
 - **Reads during a freeze use the old owner.** That is correct until the flip; after the flip, reads must go to the new owner, so the router has to refresh its cached map by version.
 - **`Map` holds `[1024]string` arrays by value.** Never copy a `Map`; it contains a mutex. Always use the pointer from `NewMap`.
 - **`NewMap` panics with no databases** (division by zero in `ls%len(databases)`). Validate the input in real code.

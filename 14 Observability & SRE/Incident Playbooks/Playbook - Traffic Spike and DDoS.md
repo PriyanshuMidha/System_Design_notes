@@ -24,7 +24,42 @@ updated: 2026-11-13
 > - **Scaling out is not always the fix.** If the database is the bottleneck, adding web pods makes it worse.
 > - **Protect the money path.** Checkout and login stay alive; recommendations and search may degrade.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (15). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add section 3, the on-call steps (4, 5, 6), fixes (7), the worked example (8), and 9-10.
+> - 🔴 **Interview / SDE-3 prep?** Add 11, 12 and 13. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Your site is built to handle a normal amount of visitors.
+Sometimes 10 times more arrive in one minute. That is a **traffic spike**.
+It can be good news: a sale, or a famous person sharing your link.
+It can be an attack: someone floods you with junk requests to knock you over. That is a **DDoS**.
+It can even be your own apps retrying failed calls in a loop.
+All three look the same at first: lots of requests, slow pages, errors.
+
+```mermaid
+flowchart LR
+    S["10x traffic"] --> R["Real customers?"]
+    S --> A["Attacker?"]
+    S --> O["Our own retries?"]
+```
+
+Each needs a different fix, so the first job is to tell them apart.
+
+```mermaid
+flowchart LR
+    R["Real customers"] --> R1["Add capacity,<br/>queue the extras"]
+    A["Attacker"] --> A1["Block at the edge"]
+    O["Our retries"] --> O1["Turn retries down"]
+```
+
+The rest of this note is just these 3 questions:
+1. Who is sending all this traffic?
+2. How do you keep the site up right now?
+3. How do you get ready so the next spike is boring?
 
 **The problem in one story.**
 Your shop starts a flash sale and traffic jumps ten times in one minute.
@@ -68,7 +103,7 @@ Where it breaks: in a store you can see who is who; online, bots look like users
 > [!tip] Remember
 > Classify the traffic first, block at the outermost layer, and scale only what can actually scale.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 Symptoms the on-call sees:
 
@@ -83,7 +118,7 @@ Example for this note: ShopRight runs a flash sale at 12:00. Normal load is 800 
 > [!tip] Remember
 > A spike has three possible faces: wanted, unwanted, or self-inflicted. The fix differs for each.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a nightclub on a night with a queue around the block.
 
@@ -106,7 +141,7 @@ flowchart LR
     APP -. "degrade features" .-> X3[Optional work skipped]
 ```
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### The three attack families
 
@@ -121,6 +156,8 @@ flowchart LR
 **Why it matters:** an L7 flood will not show up as a saturated network link, so teams that only watch bandwidth miss it.
 
 ### Spike or attack: telling them apart
+
+**In plain words:** real customers browse normally and buy things. Attackers hit the same page over and over from odd places.
 
 ```mermaid
 flowchart TD
@@ -141,7 +178,7 @@ flowchart TD
 > [!tip] Remember
 > Compare the request mix to a normal day. Real users browse then buy; bots hammer one URL.
 
-## 4. First 5 minutes
+## 4. First 5 minutes 🟡
 
 1. **Confirm and size it.** Open the traffic dashboard. Is req/s up, and which status codes (`5xx`, `429`) are rising? Which regions, services and endpoints are affected? Is checkout alive?
 2. **Check what changed.** Last deploy, config or feature-flag change, marketing campaign, push notification, partner integration, upstream outage that could cause retries. Ask the marketing channel directly.
@@ -152,7 +189,7 @@ flowchart TD
    4. Only then scale out, and only the tier that is actually saturated.
 4. **Communicate.** Declare the severity per [[Incident Response]], open the incident channel, name the Incident Commander, post a status-page update ("degraded performance, investigating") within about 10 minutes, and repeat every 15-30 minutes.
 
-## 5. Diagnosis flowchart
+## 5. Diagnosis flowchart 🟡
 
 ```mermaid
 flowchart TD
@@ -170,9 +207,11 @@ flowchart TD
     C -->|"Everything fine but clients retry"| L["Retry storm: add jitter, circuit breakers"]
 ```
 
-## 6. Investigation steps by cause
+## 6. Investigation steps by cause 🟡
 
 ### 6.1 Is it real traffic? Dashboards and PromQL
+
+**In plain words:** compare today with the same hour last week, and see which pages get the extra traffic.
 
 Assume the standard HTTP metrics `http_requests_total{service,path,status}` and `http_request_duration_seconds_bucket` (names depend on your instrumentation; see [[Metrics and Prometheus]]).
 
@@ -197,6 +236,8 @@ What it means: a spike multiple of 10 with one path taking 80% of requests point
 
 ### 6.2 Who is sending it? Access logs
 
+**In plain words:** sort the request log by IP address, country and browser type. Attacks usually stand out.
+
 ```bash
 # Top client IPs in the last 10000 nginx log lines (combined log format, IP is field 1)
 tail -n 10000 /var/log/nginx/access.log | awk '{print $1}' | sort | uniq -c | sort -rn | head -20
@@ -212,6 +253,8 @@ What it means: if 20 IPs account for 60% of requests, block them. If thousands o
 
 ### 6.3 Network and connection table (host or node)
 
+**In plain words:** check whether the machines are running out of open connections, not just CPU.
+
 ```bash
 ss -s                                   # socket summary: estab, synrecv, timewait
 ss -tn state syn-recv | wc -l           # half-open connections
@@ -224,6 +267,8 @@ sysctl net.ipv4.tcp_syncookies          # 1 = SYN cookies enabled when queue ove
 What it means: thousands of `syn-recv` sockets with a falling `estab` count indicates a SYN flood. `conntrack -C` close to `nf_conntrack_max` explains random packet drops (`dmesg | grep conntrack` shows "table full, dropping packet").
 
 ### 6.4 Kubernetes and the app tier
+
+**In plain words:** check whether your app copies are full, restarting, or waiting to scale up.
 
 ```bash
 kubectl top pods -n shop --sort-by=cpu | head
@@ -244,6 +289,8 @@ What it means: a goroutine count that grows with request rate and sits in `net/h
 
 ### 6.5 Database and cache
 
+**In plain words:** more app copies mean more database connections. Make sure the database isn't the part that breaks.
+
 ```sql
 -- PostgreSQL: how many connections and what are they doing?
 SELECT state, count(*) FROM pg_stat_activity GROUP BY state ORDER BY 2 DESC;
@@ -262,15 +309,19 @@ What it means: many `active` or `idle in transaction` connections near `max_conn
 
 ### 6.6 Latency by hop
 
+**In plain words:** time each step of the request to see where the extra traffic causes waiting.
+
 ```bash
 curl -s -o /dev/null -w "dns:%{time_namelookup} connect:%{time_connect} tls:%{time_appconnect} ttfb:%{time_starttransfer} total:%{time_total}\n" https://shop.example.com/
 ```
 
 What it means: a large `connect` time points at the network or LB queue, a large `ttfb` with a normal connect points at the application or database.
 
-## 7. Fixes
+## 7. Fixes 🟡
 
 ### Immediate (minutes)
+
+**In plain words:** the fastest moves to stay up: block bad traffic, slow down heavy users, and turn off non-essential features.
 
 | Cause | Action |
 | --- | --- |
@@ -314,6 +365,8 @@ Start such rules in `Count` mode if you have time, to check for false positives,
 
 ### Proper fix (days)
 
+**In plain words:** put a protective layer (CDN and firewall) in front of everything, and hide your real servers behind it.
+
 - Put every public endpoint behind a CDN/WAF; keep the origin's IP private (allow only CDN ranges in the security group).
 - Rate limit per client and per user at the gateway, see [[Rate Limiting - Algorithms and Distributed Design]].
 - Add load shedding with priority classes, see [[Load Shedding and Graceful Degradation]].
@@ -327,7 +380,7 @@ Start such rules in `Count` mode if you have time, to check for false positives,
 - Agree on a degradation ladder ahead of time (what turns off first, second, third).
 - Rehearse the DDoS runbook, including the provider's emergency contact.
 
-## 8. Worked example: ShopRight flash sale incident
+## 8. Worked example: ShopRight flash sale incident 🟡
 
 Times are illustrative.
 
@@ -368,7 +421,7 @@ sequenceDiagram
     App-->>CDN: Cached for 20 s
 ```
 
-## 9. Variants and comparison
+## 9. Variants and comparison 🟡
 
 | Situation | Look like | Best first action | Wrong first action |
 | --- | --- | --- | --- |
@@ -379,7 +432,7 @@ sequenceDiagram
 | Retry storm | Requests per client rise after errors | Fix upstream, backoff and jitter | More capacity (it amplifies) |
 | Credential stuffing | Spike on `/login`, high 401 rate | Per-account and per-IP limits, MFA | Caching |
 
-## 10. Trade-offs
+## 10. Trade-offs 🟡
 
 - **Aggressive blocking** protects the origin but may block real users behind shared NAT or mobile carrier IPs. Prefer challenges to hard blocks when unsure.
 - **Caching** cuts load but serves slightly stale data and may leak personalized data if keys are wrong.
@@ -387,7 +440,7 @@ sequenceDiagram
 - **Load shedding** drops some valid requests on purpose so the rest succeed. Document which ones.
 - **Always-on DDoS protection** costs more than on-demand but reacts in seconds.
 
-## 11. In production
+## 11. In production 🔴
 
 - Alert on the ratio to last week's same hour, not just an absolute number.
 - Dashboards: req/s by path, 5xx ratio, p99, DB connections, cache hit ratio, HPA replicas against max, LB active connections.
@@ -408,9 +461,18 @@ flowchart LR
     E --> F
 ```
 
-## 12. Deep dive
+## 12. Deep dive 🔴
 
 ### Why scaling out can backfire
+
+**In plain words:** more app copies each open their own database connections. The database can run out even if the apps are fine.
+
+```mermaid
+flowchart LR
+    A["8 pods x 20 connections<br/>= 160"] --> S["Scale to 40 pods"]
+    S --> B["40 x 20 = 800 connections"]
+    B --> DB[("DB allows 200:<br/>DB falls over")]
+```
 
 If each web pod holds 20 database connections and you go from 8 to 40 pods, you demand 800 connections from a database configured for `max_connections = 200`.
 
@@ -418,9 +480,13 @@ New pods queue for connections, request time rises, health checks fail, pods res
 
 ### SYN cookies
 
+**In plain words:** a Linux trick that lets a server survive a flood of fake "hello" messages without running out of memory.
+
 With `net.ipv4.tcp_syncookies=1`, when the SYN backlog overflows the kernel encodes connection state in the sequence number of the SYN-ACK instead of storing it, so a flood cannot exhaust memory. The cost is that some TCP options are lost on the cookie path. It is a standard Linux defense, but it does nothing against bandwidth floods.
 
 ### Amplification and why upstream filtering is needed
+
+**In plain words:** attackers trick other servers into sending you huge replies. The flood is too big for your own network, so it must be blocked before it reaches you.
 
 In reflection attacks (DNS, NTP, memcached) the attacker spoofs your IP as the source of small requests; large replies from third-party servers land on you. The packets are filtered only before they reach your link, which is why scrubbing sits at the provider or CDN.
 
@@ -437,6 +503,15 @@ flowchart LR
 
 ### Slow attacks
 
+**In plain words:** instead of many requests, the attacker opens connections and sends data very slowly, so they stay open and hog your server.
+
+```mermaid
+flowchart LR
+    A["Attacker opens<br/>1,000 connections"] --> S["Sends 1 byte<br/>every 10 s"]
+    S --> F["Server's connection<br/>slots all taken"]
+    F --> U["Real users can't get in"]
+```
+
 Slowloris keeps connections open by sending headers very slowly. Defenses are tight `ReadHeaderTimeout` and `ReadTimeout` on the server (in Go `http.Server`) and reverse proxy limits for header and body timeouts.
 
 ```go
@@ -451,9 +526,11 @@ srv := &http.Server{
 
 ### Retry amplification
 
+**In plain words:** if every layer retries 3 times, one failure can turn into 27 calls at the bottom. Retry in one place only.
+
 If each of 3 layers retries 3 times, one user failure produces up to 27 calls on the bottom service. Retry budgets and jitter keep the multiplier low; see [[Timeouts, Retries and Backoff]] and [[Circuit Breaker]].
 
-## 13. Interview questions
+## 13. Interview questions 🔴
 
 > [!question]- Traffic jumps 10x and latency spikes. What do you do first?
 > Confirm the metric and blast radius, check recent changes and campaigns, then classify the traffic (real, attack, or retry storm) using path mix and client distribution. Mitigate before diagnosing: edge rate limiting or caching, shed non-critical work, scale only the saturated tier. Announce the incident and keep the checkout path alive.
@@ -470,7 +547,7 @@ If each of 3 layers retries 3 times, one user failure produces up to 27 calls on
 > [!question]- What is a retry storm and how do you stop one?
 > When a dependency fails and many clients retry at once, retries multiply the load and keep the dependency down. Stop by fixing or isolating the failing service, using exponential backoff with jitter, retry budgets, circuit breakers and load shedding.
 
-## 14. Post-incident checklist
+## 14. Post-incident checklist 🟡
 
 - [ ] Timeline written and verified from logs.
 - [ ] Blast radius quantified (requests failed, users affected, revenue, SLO burn).
@@ -480,7 +557,7 @@ If each of 3 layers retries 3 times, one user failure produces up to 27 calls on
 - [ ] Provider and contact details verified.
 - [ ] Customer communication follow-up sent.
 
-## 15. Cheat sheet
+## 15. Cheat sheet 🟢
 
 - Classify first: wanted, hostile, or self-inflicted.
 - Edge first: WAF, CDN, rate limits stop traffic before it costs you.

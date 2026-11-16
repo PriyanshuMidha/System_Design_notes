@@ -42,7 +42,7 @@ This file is the hands-on half of the N+1 note. It shows the bug and the fix as 
 
 | Code | Concept in the theory note |
 | --- | --- |
-| `ListNaive` | The 1 + N loop ([[N+1 Query Problem#1. Why it exists]]) |
+| `ListNaive` | The 1 + N loop ([[N+1 Query Problem#1. Why it exists 🟢]]) |
 | `ListBatched` | Collect IDs, compact, chunk, one query per chunk, stitch in a map, fail on a missing client ([[N+1 Query Problem#The batching steps]]) |
 | `PGStore.ClientsByIDs` | `= ANY($2)` with one array parameter and a tenant filter ([[N+1 Query Problem#The difference on the wire]]) |
 | `WithQueryCount` and `QueryCounter` | Detecting N+1 per request with a pgx tracer |
@@ -77,11 +77,11 @@ Where a file is long, it is cut into consecutive pieces; read them in order and 
 
 | Step | File | Idea | Theory section |
 | --- | --- | --- | --- |
-| 1 | `store.go` | The repository interface the handler depends on | [[N+1 Query Problem#1. Why it exists]] |
-| 2 | `store.go` | The naive loop: 1 + N queries | [[N+1 Query Problem#1. Why it exists]] |
+| 1 | `store.go` | The repository interface the handler depends on | [[N+1 Query Problem#1. Why it exists 🟢]] |
+| 2 | `store.go` | The naive loop: 1 + N queries | [[N+1 Query Problem#1. Why it exists 🟢]] |
 | 3 | `store.go` | The batched handler: collect, compact, chunk, stitch | [[N+1 Query Problem#The batching steps]] |
 | 4 | `pgstore.go` | One array parameter on the wire | [[N+1 Query Problem#The difference on the wire]] |
-| 5 | `counter.go` | Counting queries per request | [[N+1 Query Problem#7. In production]] |
+| 5 | `counter.go` | Counting queries per request | [[N+1 Query Problem#7. In production 🔴]] |
 | 6 | `loader.go` | A DataLoader without an event loop | [[N+1 Query Problem#How a DataLoader works without an event loop]] |
 | 7 | `wb/` | The whiteboard version | [[N+1 Query Problem#Whiteboard version]] |
 
@@ -93,7 +93,7 @@ The recurring theme is that the fix changes the shape of the work, not the speed
 
 **Concept.** The N+1 problem lives in the gap between "what the handler wants" (invoices with client names) and "what the repository offers" (one lookup per ID).
 
-The handler therefore depends on a `Store` interface with both a single lookup (`GetClient`) and a batch lookup (`ClientsByIDs`), so the same handler logic can run against the naive loop, the batched version, or a fake that counts queries ([[N+1 Query Problem#1. Why it exists]]).
+The handler therefore depends on a `Store` interface with both a single lookup (`GetClient`) and a batch lookup (`ClientsByIDs`), so the same handler logic can run against the naive loop, the batched version, or a fake that counts queries ([[N+1 Query Problem#1. Why it exists 🟢]]).
 
 The alternatives are a concrete `*pgxpool.Pool` in the handler, which cannot be tested without a database, or an ORM relation, which hides the query count. The interface was chosen so that a test can assert the number of queries, which is the property that matters.
 
@@ -150,7 +150,7 @@ classDiagram
 
 **In plain words:** this is the bug on purpose — the line inside the loop makes one trip to the database per invoice, like a waiter walking to the kitchen once per dish.
 
-**Concept.** This is the textbook N+1: one query for the page, then a query inside the loop for each row ([[N+1 Query Problem#1. Why it exists]]). It is correct, and it is fast on a developer laptop with five rows, which is why it ships.
+**Concept.** This is the textbook N+1: one query for the page, then a query inside the loop for each row ([[N+1 Query Problem#1. Why it exists 🟢]]). It is correct, and it is fast on a developer laptop with five rows, which is why it ships.
 
 The cost is N round trips, each paying network latency, a pool checkout and a query parse. It is kept in the code on purpose, as the baseline that the tests compare the batched version against.
 
@@ -329,7 +329,7 @@ The same query as an sqlc declaration is in [[N+1 Query Problem]].
 
 ### Step 5: counting queries per request
 
-**Concept.** The cheapest way to find N+1 in a running service is to count queries per request and alert when the count is large ([[N+1 Query Problem#7. In production]]).
+**Concept.** The cheapest way to find N+1 in a running service is to count queries per request and alert when the count is large ([[N+1 Query Problem#7. In production 🔴]]).
 
 A pgx `QueryTracer` is called at the start of every query, and a counter stored in the request context lets the tracer attribute each query to its request.
 

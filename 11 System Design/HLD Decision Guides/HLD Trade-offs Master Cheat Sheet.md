@@ -27,7 +27,36 @@ updated: 2026-11-13
 > - There is no best option, only the option whose weak spot your system does not touch.
 > - Use this note as a fast lookup during prep. When a row is not enough, open the linked guide.
 
-## Start here: the basics
+## Start here: the basics 🟢
+
+> [!info] How to read this note (pick your level)
+> - 🟢 **New to this?** Read "From zero" below, then sections 1, 2, 3.1 (the five questions) and the cheat sheet (10). Stop there, that is a full first pass.
+> - 🟡 **Know the basics?** Add the rest of section 3 (the choice tables), 4 (worked example), 5 and 6.
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+**From zero, in 60 seconds** 🟢
+
+Designing a system is a long list of forks in the road. SQL or NoSQL? Queue or stream? Cache or not?
+No option is the best. Each one is good at some things and bad at others.
+Picking one means giving something up. That give-and-take is a **trade-off**.
+So you never just name a tool. You say what your system needs, what you pick, and what it costs you.
+This note is a map of the common forks, with the usual pick for each.
+
+```mermaid
+flowchart LR
+    N["What the system needs<br/>(numbers, how fresh)"] --> P["Your pick"]
+    P --> C["The cost you accept"]
+```
+
+```mermaid
+flowchart LR
+    W["Weak answer:<br/>'I use Kafka'"] --> S["Strong answer:<br/>'Kafka, because we need replay;<br/>we accept running a cluster'"]
+```
+
+The rest of this note is just these 3 questions:
+1. Which five questions decide almost every choice?
+2. For each family (stores, queues, caches, APIs and more), what is the usual pick?
+3. How do choices affect each other?
 
 **The problem in one story.**
 In a design interview, you keep hitting forks in the road: SQL or NoSQL? Queue or stream? Cache or not?
@@ -73,7 +102,7 @@ Where it breaks: vehicles are chosen once, but system choices interact, so one p
 > [!tip] Remember
 > There is no best option, only the one whose weak spot your system does not touch; always say the requirement and the cost.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 In a 45-minute design round you make 20 to 30 decisions. A candidate who stops 40 seconds on each choice to recall the trade-offs runs out of time. A candidate who has the trade-offs memorised as short rules spends the time on the interesting parts: the bottleneck, the failure, the scaling story.
 
@@ -81,7 +110,7 @@ Take "design a chat app". Within ten minutes you must have chosen a transport (W
 
 The eight decision guides go deep on one family each. This page is the index and the summary: read it first, dive into a guide when a row is unfamiliar.
 
-## 2. Mental model
+## 2. Mental model 🟢
 
 Think of a toolbox with labelled drawers. You do not invent a screwdriver each time; you look at the screw. Each drawer here is a decision family (data store, broker, cache), and each tool has a "use it when" label and a "do not use it when" label.
 
@@ -99,7 +128,7 @@ flowchart LR
 > [!tip] Remember
 > Requirement, choice, cost. Say all three every time.
 
-## 3. How it works
+## 3. How it works 🟡
 
 ### 3.1 The five questions behind almost every choice
 
@@ -133,6 +162,8 @@ The thresholds (10k writes per second, 1 to 5 TB per node) are rough rules of th
 
 ### 3.2 Data store choices
 
+**In plain words:** Read each row as "if you see this need, pick this store, and watch out for this".
+
 | If you see | Pick | Because | Watch out for | Guide |
 | --- | --- | --- | --- | --- |
 | Money, orders, inventory, joins, constraints | Relational (PostgreSQL, MySQL) | ACID transactions and constraints protect invariants | Vertical limit; sharding is painful later | [[Choosing a Database - Decision Guide]] |
@@ -150,6 +181,8 @@ Why the first row wins by default: relational databases give you transactions, c
 
 ### 3.3 SQL versus NoSQL in one table
 
+**In plain words:** SQL is safe and flexible to query. NoSQL scales out easily but you must plan your queries up front.
+
 | Question | Leans SQL | Leans NoSQL |
 | --- | --- | --- |
 | Need multi-row transactions? | Yes | No, or single-key only |
@@ -163,6 +196,8 @@ The honest summary: SQL is the default, NoSQL is a deliberate trade of query fle
 
 ### 3.4 Messaging and async choices
 
+**In plain words:** A queue hands out jobs once. A stream (log) keeps history that many readers can replay.
+
 | If you see | Pick | Because | Watch out for | Guide |
 | --- | --- | --- | --- | --- |
 | Event log, replay, many independent consumers, high throughput | Kafka | Durable partitioned log; consumers track offsets | Ordering only inside a partition; operational weight | [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]] |
@@ -173,6 +208,8 @@ The honest summary: SQL is the default, NoSQL is a deliberate trade of query fle
 | Failing messages block the queue | Dead-letter queue | Isolates poison messages | Needs an alert and a replay path | [[Dead Letter Queues and Poison Messages]] |
 
 ### 3.5 Sync versus async, push versus pull
+
+**In plain words:** Sync means wait for the answer; async means drop a note and move on. Push means do the work early; pull means do it when asked.
 
 | Decision | Choose the first when | Choose the second when | Cost to name |
 | --- | --- | --- | --- |
@@ -222,6 +259,8 @@ sequenceDiagram
 
 ### 3.6 Caching choices
 
+**In plain words:** Where to keep fast copies, and how to stop them going stale.
+
 | If you see | Pick | Because | Watch out for | Guide |
 | --- | --- | --- | --- | --- |
 | Read-heavy, tolerates short staleness | Cache-aside with TTL | Simple, app controls what is cached | Stale reads; stampede on expiry | [[Choosing a Caching Strategy - Decision Guide]] |
@@ -235,6 +274,8 @@ Read the failure modes before you commit: [[Cache Failure Modes - Stampede, Aval
 
 ### 3.7 API style choices
 
+**In plain words:** How programs talk: ask and wait, keep a live line open, or get called back later.
+
 | If you see | Pick | Because | Watch out for | Guide |
 | --- | --- | --- | --- | --- |
 | Public API, many unknown clients | REST over HTTP and JSON | Universal tooling, cacheable | Over- and under-fetching | [[Choosing an API and Communication Style - Decision Guide]] |
@@ -245,6 +286,8 @@ Read the failure modes before you commit: [[Cache Failure Modes - Stampede, Aval
 | Large lists | Cursor pagination | Stable under inserts, fast on indexed key | No random page jump | [[Pagination, Filtering and Sorting]] |
 
 ### 3.8 Consistency, replication and partitioning
+
+**In plain words:** How fresh reads must be, how many copies you keep, and how you split data across machines.
 
 | If you see | Pick | Because | Watch out for | Guide |
 | --- | --- | --- | --- | --- |
@@ -272,6 +315,8 @@ flowchart TD
 
 ### 3.9 Storage for files, search and analytics
 
+**In plain words:** Files go to object storage, text search to a search index, big reports to a warehouse.
+
 | If you see | Pick | Because | Watch out for | Guide |
 | --- | --- | --- | --- | --- |
 | Images, video, backups, any large blob | Object storage (S3) | Cheap, durable, effectively unlimited | Higher latency; no in-place edit | [[Choosing Storage for Files, Search and Analytics - Decision Guide]] |
@@ -281,6 +326,8 @@ flowchart TD
 | Serve video | Chunked adaptive streaming via CDN | Adjusts to bandwidth | Transcoding pipeline cost | [[Case Study - Video Streaming]] |
 
 ### 3.10 Compute, scaling and deployment
+
+**In plain words:** Where the code runs, how you add capacity, and how you ship new versions safely.
 
 | If you see | Pick | Because | Watch out for | Guide |
 | --- | --- | --- | --- | --- |
@@ -293,6 +340,8 @@ flowchart TD
 
 ### 3.11 Load balancers, gateways and mesh
 
+**In plain words:** What sits in front of your services to spread traffic, check logins and handle calls between services.
+
 | If you see | Pick | Because | Watch out for | Guide |
 | --- | --- | --- | --- | --- |
 | Spread HTTP requests by path or header | L7 load balancer | Content-aware routing, TLS termination | More CPU per request than L4 | [[Choosing Load Balancers, Gateways and Service Mesh - Decision Guide]] |
@@ -304,6 +353,8 @@ flowchart TD
 | Uneven request cost | Least connections or weighted | Balances actual load | Round robin ignores request cost | [[Load Balancing]] |
 
 ### 3.12 The master decision flowchart
+
+**In plain words:** One big "follow the arrows" chart. Start at the top with your new part, and it points you to the right family.
 
 Read this top to bottom for a new component. Each exit names a family and its guide.
 
@@ -336,7 +387,7 @@ flowchart TD
 > [!tip] Remember
 > Sync or async first, then store, then cache, then edge. Name a cost at each exit.
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 Problem: a ride-booking app, 5 million daily users, 1 million rides per day.
 
@@ -370,7 +421,7 @@ Interview-style narration: "Rides are 120 per second at peak, so one PostgreSQL 
 
 I accept that a Redis failure loses a few seconds of positions because they are refreshed every 5 seconds anyway." See [[Case Study - Ride Sharing and Proximity]] for the full design.
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 How the same requirement can resolve differently depending on one changed fact.
 
@@ -386,7 +437,7 @@ How the same requirement can resolve differently depending on one changed fact.
 
 Reading the table: the right answer is a function of facts. Interviewers deliberately change one fact ("now users are global") to see whether your choice flips correctly.
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 Using a cheat sheet has its own failure modes.
 
@@ -404,7 +455,7 @@ Using a cheat sheet has its own failure modes.
 | Cache everything | Stale data bugs and extra failure modes | Cache measured hot paths |
 | Strong consistency everywhere | Latency and availability cost | Strong only where invariants need it |
 
-## 7. In production
+## 7. In production 🔴
 
 Real systems show these trade-offs. Details are from public engineering material; treat specifics as summaries.
 
@@ -424,9 +475,11 @@ What to monitor for each choice family:
 | Gateway or LB | 5xx rate, upstream latency, active connections |
 | Compute | CPU, memory, restarts, queue wait time |
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### 8.1 Why choices interact
+
+**In plain words:** One pick changes the others. Choose a user-based key for order, and now one very busy user can overload one machine.
 
 A partitioned log (Kafka) gives per-partition order. If you also need per-user order, the partition key must be the user id. That makes a hot user a hot partition.
 
@@ -434,19 +487,45 @@ If your database is sharded by a different key (say order id), a consumer that u
 
 The master lesson: pick the partition key once and reuse it through the log, the cache and the database wherever you can. See [[Message Ordering and Partition Keys]] and [[Hot Keys and Hot Partitions]].
 
+```mermaid
+flowchart LR
+    A["Need per-user order"] --> B["Kafka key = user_id"]
+    B --> C["One very busy user"]
+    C --> D["One hot partition"]
+```
+
 ### 8.2 PACELC in one paragraph
+
+**In plain words:** When the network breaks, you pick right-answer or always-answer. When it works, you still pick right-answer or fast-answer.
 
 CAP says that during a network partition you choose between consistency and availability. PACELC adds that even with no partition you choose between latency and consistency.
 
 That second trade-off is the one you feel daily: reading from a nearby replica is fast and maybe stale; reading from the leader is correct and maybe far. See [[CAP and PACELC]] and [[Consistency Models]].
 
+```mermaid
+flowchart LR
+    Q{"Network broken?"} -- "yes (P)" --> A["Pick: correct (C)<br/>or available (A)"]
+    Q -- "no (E)" --> B["Pick: low latency (L)<br/>or correct (C)"]
+```
+
 ### 8.3 The cost of asynchrony
+
+**In plain words:** Going async makes the system tougher, but now you need status screens, duplicate checks and ways to handle out-of-order messages.
 
 Async decouples availability and absorbs bursts, but it adds: a status path ("your report is being prepared"), duplicate handling (at-least-once delivery), ordering questions, and monitoring for lag and dead letters. If none of those are acceptable, the call should stay synchronous with timeouts and a circuit breaker. See [[Circuit Breaker]] and [[Timeouts, Retries and Backoff]].
 
 ### 8.4 Back-pressure and shedding
 
+**In plain words:** If more work comes in than you can handle, you need a rule: make callers wait, turn some away, or drop the least important work.
+
 Any choice that accepts more traffic than the slowest component can handle needs a rule for overload: bounded queues, rate limits, or load shedding. See [[Backpressure and Flow Control]] and [[Load Shedding and Graceful Degradation]].
+
+```mermaid
+flowchart LR
+    I["Too much traffic"] --> Q["Bounded queue"]
+    Q -- "full" --> R["Reject or slow callers"]
+    Q --> W["Workers at safe speed"]
+```
 
 ### Whiteboard version
 
@@ -461,7 +540,7 @@ flowchart LR
 
 Say it as: "Because [requirement], I choose [X] over [Y]. The cost is [Z]. If [fact] changed, I would switch to [Y]."
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- How do you decide between SQL and NoSQL?
 > Start from the access pattern and invariants. If you need multi-row transactions, ad hoc queries and moderate scale, use relational. If you need very high write throughput, key-based access and horizontal scale, a wide-column or key-value store fits. Name the cost: NoSQL gives up joins and flexible queries, and you model data per query.
@@ -484,7 +563,7 @@ Say it as: "Because [requirement], I choose [X] over [Y]. The cost is [Z]. If [f
 > [!question]- Why not just use microservices for everything?
 > Each service boundary adds network failures, versioning and distributed debugging. Start with a modular monolith and split when team size or scaling needs of one module demand it.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
 
 - Requirement, choice, cost: say all three.
 - Default store is relational; leave only when a measured limit forces you to.
@@ -497,7 +576,7 @@ Say it as: "Because [requirement], I choose [X] over [Y]. The cost is [Z]. If [f
 - Strong consistency only where invariants demand it.
 - For 10 times traffic: measure, cache, scale out stateless, queue slow work, partition last.
 
-## 11. Links
+## 11. Links 🟢
 
 Decision guides in this folder:
 
@@ -516,7 +595,7 @@ Foundations and next steps:
 - [[Queues vs Streams and Broker Comparison]], [[Choosing an API Style]], [[Caching Patterns]]
 - [[Case Study - News Feed]], [[Case Study - Chat System]], [[Case Study - Payment System]]
 
-## Links
+## Links 🟢
 
 ### Watch on YouTube
 

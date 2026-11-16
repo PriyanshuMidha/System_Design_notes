@@ -413,7 +413,7 @@ func (r *Router[T]) ForRead(minLSN LSN) (conn T, name string) {
 4. `r.next.Add(1) % n` picks a different starting replica for each call, safely under concurrency.
 5. The loop tries each replica once, starting at that index, and wraps around with `(start+i)%n`.
 6. `rep.replay.Load() >= minLSN` is the whole freshness rule. A replica that has not replayed the user's write does not qualify.
-7. Returning the `name` lets callers log where reads went, which feeds the fallback-rate metric from [[Replication#7. In production]].
+7. Returning the `name` lets callers log where reads went, which feeds the fallback-rate metric from [[Replication#7. In production 🔴]].
 
 ```mermaid
 flowchart TD

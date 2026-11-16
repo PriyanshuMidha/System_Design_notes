@@ -37,8 +37,8 @@ updated: 2026-11-13
 | Code | Concept in the theory note |
 | --- | --- |
 | `DSU`, `New`, `Find`, `Union`, `Connected`, `Sets` | Path compression + union by rank giving `O(α(n))` amortized ([[Union-Find and Skip Lists#3.1 Union-find: path compression and union by rank]]) |
-| `Edge`, `KruskalMST` | Sort edges, reject any that would close a cycle ([[Union-Find and Skip Lists#1. Why it exists]]) |
-| `naiveConnected`, `BenchmarkConnectedQueries` | The measured union-find vs. naive-BFS comparison ([[Union-Find and Skip Lists#7. In production]]) |
+| `Edge`, `KruskalMST` | Sort edges, reject any that would close a cycle ([[Union-Find and Skip Lists#1. Why it exists 🟢]]) |
+| `naiveConnected`, `BenchmarkConnectedQueries` | The measured union-find vs. naive-BFS comparison ([[Union-Find and Skip Lists#7. In production 🔴]]) |
 | `SkipList`, `Insert`, `Delete`, `RangeByScore` | Randomized express-lane levels, ordered by `(score, member)` like Redis's `ZSET` ([[Union-Find and Skip Lists#3.2 Skip lists: randomized levels]]) |
 
 ```mermaid
@@ -68,7 +68,7 @@ Union-find and the skip list share a package here purely because the theory note
 
 ### Step 1: the disjoint-set union
 
-**Concept.** The theory note's whiteboard sketch is parent pointers with no optimization at all ([[Union-Find and Skip Lists#4. Worked example]]).
+**Concept.** The theory note's whiteboard sketch is parent pointers with no optimization at all ([[Union-Find and Skip Lists#4. Worked example 🟡]]).
 
 The alternative kept here adds both path compression and union by rank, because the theory note is explicit that either one alone only gives `O(log n)`, not the near-constant `O(α(n))` the TL;DR promises — skipping either optimization would make every later cost claim in this file false.
 
@@ -124,7 +124,7 @@ func (d *DSU) Find(x int) int {
 
 ### Step 3: Union, by rank
 
-**Concept.** `Union` always attaches the shorter tree under the taller one, which the theory note's deep dive proves keeps any tree's height at `O(log n)` even before path compression helps ([[Union-Find and Skip Lists#8. Deep dive]]).
+**Concept.** `Union` always attaches the shorter tree under the taller one, which the theory note's deep dive proves keeps any tree's height at `O(log n)` even before path compression helps ([[Union-Find and Skip Lists#8. Deep dive 🔴]]).
 
 The alternative, "union by size" (track node count instead of rank), gives the identical asymptotic guarantee; rank is kept here only because it is the more commonly quoted version in interviews.
 
@@ -168,7 +168,7 @@ func (d *DSU) Sets() int {
 
 ### Step 4: Kruskal's minimum spanning tree
 
-**Concept.** This is the textbook reason union-find exists ([[Union-Find and Skip Lists#1. Why it exists]]): sort edges by weight, then use `Union`'s own return value as the cycle check, with no separate graph-traversal code needed.
+**Concept.** This is the textbook reason union-find exists ([[Union-Find and Skip Lists#1. Why it exists 🟢]]): sort edges by weight, then use `Union`'s own return value as the cycle check, with no separate graph-traversal code needed.
 
 ```go
 package unionfind
