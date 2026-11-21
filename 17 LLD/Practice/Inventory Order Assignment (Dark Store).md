@@ -35,6 +35,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Strategy and Template Method]]: a rule behind an interface you can swap, here "which store to try first".
+> - [[State Machines in Go]]: an order is in one named status at a time (reserved, confirmed, packed, cancelled), and only allowed moves happen.
+> - [[Repository and Unit of Work]]: storage hidden behind interfaces, so the same logic runs on in-memory maps in tests and on PostgreSQL in production.
+> - [[Concurrency for LLD]]: goroutines run at the same time; "check stock, then take it" must be one step.
+
 **From zero, in 60 seconds** 🟢
 
 You order milk and bread from a 10-minute delivery app. The order should come from one small warehouse near you, called a **dark store**, that has every item. The system looks at nearby stores, keeps those that have everything, and picks the closest. Then it takes the stock away for all items at once, so two orders cannot get the last packet. If that fails, it tries the next store. Workers on several machines may do this together, so a short-lived claim, a **lease**, decides who handles an order.
@@ -70,6 +76,10 @@ If the app double-sells that packet, or "holds" it for you and then forgets, som
 | Compare-and-set (CAS) | Change a value only if it is still what you read | `reserved → confirmed` only if still `reserved` |
 | Compensation | The undo step run when a later step fails | Release stock if saving the order fails |
 | Strategy | A swappable rule behind an interface | "Nearest store first" selector |
+| Lease | A claim on the idempotency key that runs out if the owner crashes | Key "in progress" for 1 minute |
+| Fencing (attempt number) | A counter that stops an old, slow attempt from writing after a newer one took over | Attempt 1 binds 0 rows once attempt 2 owns the key |
+| Deadlock | Two transactions each wait for a row the other holds, so both are stuck | Order A locks milk then bread, order B bread then milk |
+| Outbox | A table where events are saved in the same transaction as the change, and sent later | `refund.requested` cannot be lost |
 
 **Picture it**
 
@@ -115,13 +125,13 @@ What it tests: an **atomic multi-item reservation** (all items or none, no overs
 2. Model `Store`, `OrderItem`, `Order` and the `OrderStatus` state machine.
 3. Write `StoreSelector`: active stores within 3 km with every item, nearest first.
 4. Write `PlaceOrder`: normalize, claim the key, select stores, reserve all at one store, save.
-5. Add rollback with `context.WithoutCancel` and CAS status transitions.
+5. Add rollback with `context.WithoutCancel` (a copy of the request context that ignores the client hanging up) and CAS status transitions.
 6. Add `ExpireHolds` and `Cancel`, then test the last-packet race and retries.
 
 ## Step 1: Clarify requirements 🟢
 
 - **One store or split?** *One store (the dark-store model); split fulfilment is an extension.*
-- **Radius?** *3 km straight-line serviceable radius.*
+- **Radius?** *3 km straight-line serviceable radius (the distance a store delivers to).*
 - **When is stock taken?** *At checkout (`PlaceOrder`), held 10 minutes for payment.*
 - **Nearest store lacks one item?** *Skip it; try the next nearest store with full stock.*
 - **Retries?** *Yes, flaky mobile networks: the client sends one idempotency key per checkout tap.*
@@ -158,7 +168,7 @@ The hardest use case, and the one to code: **PlaceOrder**, which selects the nea
 | Entity | Key fields | Why it exists |
 |---|---|---|
 | `Store` | ID, Loc, Active | A dark store; the unit of fulfilment |
-| `Product` | ID, SKU, PricePaise | Catalog item, not stock |
+| `Product` | ID, SKU (the product's stock code), PricePaise | Catalog item, not stock |
 | `InventoryItem` | StoreID, ProductID, AvailableQty, ReservedQty | Stock of one product at one store: the row orders fight over |
 | `Order` | ID, UserID, StoreID, Items, TotalPaise, Status, CreatedAt | What was bought and from where |
 | `OrderItem` | ProductID, Qty, PricePaise | One line; the price is copied at order time |
@@ -166,9 +176,11 @@ The hardest use case, and the one to code: **PlaceOrder**, which selects the nea
 | `IdempotencyKey` | UserID, Key, OrderID (empty while running), Attempt, LeaseUntil | Makes retries safe; the lease lets a retry recover a key whose claimer crashed, and the attempt number fences the crashed claimer out |
 | `Event` | Name, OrderID, Amount | `order.created`, `order.cancelled`, `refund.requested` |
 
-Modelling insight: **a product is not an inventory item.** "Amul milk 500 ml" is global; stock lives per (store, product), and that row is what concurrent orders contend on. `OrderItem` copies the price, so later price changes do not change old orders.
+Modelling insight: **a product is not an inventory item.** "Amul milk 500 ml" is global; stock lives per (store, product), and that row is what concurrent orders contend on (fight over at the same moment). `OrderItem` copies the price, so later price changes do not change old orders.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know reservations, conditional decrements and the all-or-nothing rule. Next we open the box: the order state machine, the API, the PostgreSQL statements with the key lease, and the Go `PlaceOrder` code.
 
 ```mermaid
 classDiagram
@@ -225,7 +237,7 @@ stateDiagram-v2
   Cancelled --> [*]
 ```
 
-`Order` owns its items (composition) and points to one store by ID (association). `Service` depends only on interfaces, so tests use in-memory fakes and production uses PostgreSQL and a message broker.
+`Order` owns its items (composition) and points to one store by ID (association). `Service` depends only on interfaces, so tests use in-memory fakes and production uses PostgreSQL and a message broker (a server such as Kafka that passes events between services).
 
 ## Step 5: APIs and public methods 🟡
 
@@ -306,6 +318,8 @@ The reservation is one transaction per candidate store, items in `product_id` or
 
 The lease and fencing statements below (the claim, the fenced bind and the fenced release) follow the PostgreSQL 17 `INSERT ... ON CONFLICT DO UPDATE ... WHERE` and `RETURNING` syntax but have **not been executed against PostgreSQL**; only the Go version was compiled and tested.
 
+**What this code does, in plain words:** Three steps. First, claim the idempotency key (or take it over if the last claim's lease ran out) and get back an attempt number. Second, in one transaction, take each item's stock only if enough is left, save the order, and bind the key to the order only if this attempt still owns it. Third, if the attempt failed, free the key for the next retry without resetting its attempt counter.
+
 ```sql
 -- Claim the key first, in its own statement. $3 = now and $4 = now + lease, both
 -- from the injected clock. A row back means claimed (attempt = the fencing token):
@@ -340,7 +354,7 @@ UPDATE idempotency_keys SET lease_until = '-infinity'
 WHERE user_id = $1 AND key = $2 AND attempt = $3 AND order_id IS NULL;
 ```
 
-Each statement numbers its own placeholders from `$1`.
+Each statement numbers its own placeholders (the `$1`, `$2` slots filled with values at run time) from `$1`.
 
 In SQL the order insert and the key binding commit together, so neither can fail alone, and the `attempt = $4` condition makes the bind the fence: a late attempt whose lease was taken over binds 0 rows and rolls its whole reservation back.
 
@@ -389,13 +403,13 @@ cmd/demo/main.go   -> wires the Mem* repositories, NearestWithFullStock{MaxDista
 2. `ClaimKey(user, key, now, lease)`: a retry with a bound key returns that order; an unbound key inside its lease means the first request is in flight (`ErrInProgress`).
    - **Another leak to avoid:** if the process crashes after the claim and before `BindKey`, a claim with no lease stays "in progress" forever and every retry gets 409.
    - Here the claim stores `leaseUntil = now + 1 min` from the injected clock (`DefaultKeyLease`, well above the 200 ms target), and a retry that finds an unbound claim past its lease takes it over with `attempt + 1`.
-   - The crashed attempt's orphan order, if it saved one, is cancelled by the expiry job like any unpaid hold.
+   - The crashed attempt's orphan order (an order row nobody's key points to), if it saved one, is cancelled by the expiry job like any unpaid hold.
 3. `selector.Select` returns active stores within 3 km that have every item, nearest first. It reads without locks, so it can be stale.
 4. For each candidate, `reserveAll` does one conditional decrement per item; on the first failure it releases what it took and the loop tries the next store.
 5. Save the order as `reserved` with `CreatedAt` from the injected clock.
    - **Leak to avoid:** if `Save` fails, a naive version releases the stock with the request's `ctx`.
    - After a client disconnect that `ctx` is cancelled, so a real database release fails too, the error is dropped, and the units stay held forever.
-   - Here every compensation runs with `context.WithoutCancel(ctx)` (Go 1.21+), and `releaseAll` returns its failures (`errors.Join`, Go 1.20+) instead of hiding them.
+   - Here every compensation runs with `context.WithoutCancel(ctx)` (Go 1.21+), and `releaseAll` returns its failures (`errors.Join`, Go 1.20+, which bundles several errors into one) instead of hiding them.
 6. `BindKey`.
    - **Second leak to avoid:** if it fails after a successful save, a naive version returns the error and leaves the key "in progress" forever (every retry gets `ErrInProgress`) while the stock stays held until expiry.
    - Here the order is moved `reserved → cancelled` by compare-and-set, the stock is released and the key is freed, so the same key works on the next try.
@@ -449,7 +463,7 @@ sequenceDiagram
   end
 ```
 
-The store distance is the great-circle (haversine) distance; the formula is explained once in [[Geospatial Indexing]], and in a real codebase `HaversineM` lives in a shared `geo` package used by this problem and [[Delivery Partner Assignment]].
+The store distance is the great-circle (haversine: straight-line over the Earth's curve) distance; the formula is explained once in [[Geospatial Indexing]], and in a real codebase `HaversineM` lives in a shared `geo` package used by this problem and [[Delivery Partner Assignment]].
 
 **In plain words:** The complete package. Start with `PlaceOrder`, which ranks stores and reserves all items or none, then look at the lease and status code.
 
@@ -1043,7 +1057,7 @@ func total(items []OrderItem) int64 {
 | `TestCrashedClaimIsTakenOverAfterLease` | The process dies after `Save` and before `BindKey` (simulated with `runtime.Goexit` in a hook). A retry inside the lease gets `ErrInProgress`; after the lease and the expiry job, the retry succeeds, a second retry replays it, and exactly one unit of milk is held. Without the lease this test fails with "same idempotency key is still in progress" |
 | `TestLateOriginalIsFencedOut` | The first attempt is slow, not dead: a retry takes the key over before its `BindKey`. The original gets `ErrLeaseLost`, cancels its own order and returns its stock; the key keeps pointing at the retry's order |
 
-Measured: `go test -race -cover` on Go 1.24.4 passes all 14 test functions with 91.4% statement coverage, and `go test -race -count=3` passes on every run (the concurrency tests reach some branches only on some schedules).
+Measured: `go test -race -cover` (`-race` is Go's race detector; `-cover` measures how much code the tests ran) on Go 1.24.4 passes all 14 test functions with 91.4% statement coverage, and `go test -race -count=3` passes on every run (the concurrency tests reach some branches only on some schedules).
 
 **In plain words:** Fixtures with a few stores near a customer, and tests for every path, including two orders racing for the last unit.
 
@@ -1517,6 +1531,8 @@ func TestLateOriginalIsFencedOut(t *testing.T) {
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working service and its tests. Next is interview depth: the last packet, client disconnects during undo, crashed and slow attempts, payment racing expiry, refunds after cancel and split orders.
+
 | Edge case | Handling |
 |---|---|
 | Two users order the last packet | `Reserve` is check-and-decrement under one lock (SQL: `WHERE available_qty >= qty`); the loser tries the next store or gets `ErrNoStore` |
@@ -1535,7 +1551,7 @@ func TestLateOriginalIsFencedOut(t *testing.T) {
 | Cancel after payment | Stock released and `refund.requested` published with the amount |
 | Cancel called twice | The second call fails `CanMoveTo`; stock is released once |
 | Store goes offline after `Select` | `ListActive` filters; in SQL the reserve transaction also checks `stores.active` |
-| A release itself fails (DB blip) | `releaseAll` returns `ErrReleaseFailed` with the store, product and quantity; a reconciliation job compares `available + reserved` with the physical count |
+| A release itself fails (DB blip) | `releaseAll` returns `ErrReleaseFailed` with the store, product and quantity; a reconciliation job (a background check that finds and flags mismatches) compares `available + reserved` with the physical count |
 
 Common mistakes:
 
@@ -1550,7 +1566,7 @@ Common mistakes:
 
 ## Step 10: Tradeoffs and extensions 🔴
 
-- **Conditional `UPDATE` vs `SELECT ... FOR UPDATE` then `UPDATE`:** one round trip per item and no read-then-write gap; `FOR UPDATE` works but holds locks longer.
+- **Conditional `UPDATE` vs `SELECT ... FOR UPDATE` then `UPDATE`:** one round trip (one request to the database and back) per item and no read-then-write gap; `FOR UPDATE` works but holds locks longer.
 - **Reserve at checkout, not at add-to-cart:** abandoned carts would starve real buyers; the cost is a late "out of stock".
 - **Single-store fulfilment:** one reservation and one rider; some orders fail that a split could serve.
 - **Optimistic store selection:** `Select` reads without locks and the race is handled at reserve time; locking during selection would serialise every order in the area.
@@ -1559,13 +1575,13 @@ Common mistakes:
 
 **Split-order fulfilment (extension).** When no single store in range has everything: pick the nearest store covering the most items, then cover the rest from the next store.
 
-Each part becomes a `Shipment` with its own reservation; the parent order is placed only if every shipment reserves (a saga with per-shipment release as the undo).
+Each part becomes a `Shipment` with its own reservation; the parent order is placed only if every shipment reserves (a saga, a chain of steps where each has an undo, with per-shipment release as the undo).
 
 Costs: two riders and two delivery fees, two ETAs to show, and partial cancellation rules. Start by offering "remove item X" instead.
 
 | Follow-up | Change |
 |---|---|
-| Hot product (flash sale) | Stock in Redis with an atomic decrement (a Lua script for multi-item); write to the DB asynchronously |
+| Hot product (flash sale) | Stock in Redis with an atomic decrement (a Lua script, a small program Redis runs as one step, for multi-item); write to the DB asynchronously |
 | Choose by load, not distance | A new `StoreSelector` (least pending orders); no change to `Service` |
 | Many stores per city | `ListActive` becomes a geo query (PostGIS `ST_DWithin` or geohash cells) |
 | Assign a rider | A subscriber on `order.packed` calls the dispatcher ([[Delivery Partner Assignment]]) |
@@ -1624,6 +1640,26 @@ I treat stock per store and product as the contended resource. PlaceOrder first 
 - Idempotency: claim key with a lease, place, bind key fenced by the attempt number; any failure frees the key; a bind failure or lost lease cancels the order; an expired claim is taken over.
 - Compensations use `context.WithoutCancel` and report errors with `errors.Join`.
 - Status moves are compare-and-set; expiry only from `reserved`; cancel-after-payment requests a refund.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 The nearest store has milk and bread but no eggs. What happens?
+> It is skipped; the next nearest store in range that has all three items is tried.
+
+> [!question]- 🟢 What does "all-or-nothing" mean for a reservation?
+> Either every item in the order is set aside at one store, or none is; partial holds are released.
+
+> [!question]- 🟢 The user never pays. What frees the stock?
+> `ExpireHolds` cancels unpaid `reserved` orders after 10 minutes and releases their stock.
+
+> [!question]- 🟡 Why sort the order items by product ID before reserving?
+> Every request then locks rows in the same order, so two orders can never deadlock.
+
+> [!question]- 🟡 Why run the undo with `context.WithoutCancel(ctx)`?
+> If the client hung up, the request context is cancelled and a real database release would fail, leaving stock held forever.
+
+> [!question]- 🟡 Payment confirmation and the 10-minute expiry fire together. Who wins?
+> Whichever compare-and-set from `reserved` lands first; if expiry wins, `ConfirmPayment` fails and the payment service refunds.
 
 ## Links 🟢
 

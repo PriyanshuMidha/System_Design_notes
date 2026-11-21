@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Trees, BSTs and Balanced Trees]]: a tree has a root and nodes linked to it; balanced trees stay short by rotating after changes.
+> - [[Graphs and Graph Algorithms]]: a graph is points (nodes) joined by lines (edges); BFS/DFS can find what is connected.
+
 **From zero, in 60 seconds** 🟢
 
 This note covers two unrelated but interview-favorite structures.
@@ -79,6 +83,10 @@ Separately, a game leaderboard must stay sorted as scores arrive, and still answ
 | Amortized cost | Average cost per operation over a long run | most `Find`s are 1 hop |
 | Expected (probabilistic) cost | Average cost over random choices, not a promise | coin flips set skip-list levels |
 | `O(log n)` | Cost grows like the number of halvings of `n` | ~20 steps for 1,000,000 |
+| Path compression | During `Find`, point every node you passed straight at the root | next `Find` is 1 hop |
+| Union by rank | Always hang the shorter tree under the taller one | trees stay short |
+| Minimum spanning tree (MST) | The cheapest set of edges that connects every node with no loops | cheapest cable plan for 10 towns |
+| Level / `p` (skip list) | How many express lanes a node joins; `p` is the chance of going one lane higher | `p = 1/2`, like a coin flip |
 
 ### Picture it
 
@@ -122,7 +130,7 @@ In exchange, each gets code that's dramatically simpler than the "proper" altern
 
 In plain words: checking "would adding this edge create a cycle?" by re-exploring the whole graph on every single edge is wasteful, because most of that exploration repeats work already done for earlier edges.
 
-Kruskal's algorithm builds a minimum spanning tree by sorting all edges by weight and adding each one unless it would close a cycle — and "would this edge close a cycle" is exactly "are these two endpoints already in the same connected group?"
+Kruskal's algorithm builds a minimum spanning tree (the cheapest set of edges that still connects every node) by sorting all edges by weight and adding each one unless it would close a cycle — and "would this edge close a cycle" is exactly "are these two endpoints already in the same connected group?"
 
 For a graph with 100,000 edges, checking that naively (a BFS/DFS per edge) costs `O(V+E)` per check, `O(E(V+E))` overall — far too slow.
 
@@ -140,6 +148,12 @@ A **skip list** gets the same `O(log n)` expected bounds with no rebalancing at 
 
 > [!tip] Remember
 > Union-find and skip lists solve different problems; what they share is "give up a guarantee, get simpler code and still-fast amortized/expected performance."
+
+### Real-life example 🟢
+
+A fantasy-cricket or gaming app showing a live leaderboard ("you are rank 1,532") can keep scores in a Redis sorted set, which is built on a skip list: updating a score and reading "ranks 100 to 110" both stay fast with millions of players.
+On the union-find side, think of a social app grouping people into "friend circles": each new friendship merges two circles, and "are Asha and Ben connected?" must answer instantly.
+Network planners use the same union-find inside Kruskal's algorithm to pick the cheapest set of cables that connects every office.
 
 ## 2. Mental model 🟢
 
@@ -222,13 +236,30 @@ Three "express" hops plus one local hop instead of walking all 6 nodes one at a 
 
 **Why it matters:** a search starts at the top level and moves right as far as it can without overshooting, then drops down a level and repeats — exactly like taking the express train as far as possible before switching to the local for the last few stops.
 
+## Common beginner mistakes 🟢
+
+- **Writing union-find without path compression or union by rank** → a bad merge order builds a long chain and `Find` becomes `O(n)` → always add both.
+- **Calling union-find `O(1)`** → it is `O(α(n))`, which grows but stays under 5 → say "inverse Ackermann, effectively constant".
+- **Trying to "un-merge" groups with union-find** → it can only merge, never split → rebuild it, or use a different structure, when edges can be removed.
+- **Treating a skip list's `O(log n)` as a promise** → it is an average over coin flips, not a worst-case bound → use a balanced tree if you need a hard limit.
+- **Forgetting to update every level's pointers on skip-list insert** → express lanes skip the new node or point at deleted ones → remember the last node visited on each level, then splice at each.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** what each structure is for: union-find answers "same group?" and merges groups; a skip list is a sorted list with express lanes. **Next we open the box:** the two tricks that make union-find almost constant time, and how coin flips build a skip list's lanes.
 
 ### 3.1 Union-find: path compression and union by rank
 
 **In plain words:** each element stores a `parent` pointer (initially itself) and a `rank` (an upper bound on its tree's height).
 
 `Find` both answers the question *and* flattens the tree it just walked; `Union` always attaches the shorter tree under the taller one, so merging never makes the taller tree taller.
+
+**Step by step:**
+1. Start: a, b, c, d each point to themselves, rank 0.
+2. `Union(a, b)`: same rank, so hang b under a and raise a's rank to 1.
+3. `Union(c, d)`: hang d under c; c's rank becomes 1.
+4. `Union(b, d)`: `Find(b)` = a, `Find(d)` = c. Same rank 1, so hang c under a; a's rank becomes 2.
+5. `Find(d)` walks d → c → a, and path compression then points d straight at a. Next time it is 1 hop.
 
 - **`Find(x)`:** follow `parent` pointers to the root, then — this is **path compression** — reassign every node visited to point directly at the root, so the *next* `Find` on any of them is `O(1)`.
 - **`Union(x, y)`:** find both roots; if they differ, attach the lower-rank root under the higher-rank root (**union by rank**), so merging never makes the taller tree taller. If ranks are equal, pick either and bump its rank by one.
@@ -269,6 +300,13 @@ flowchart LR
 **In plain words:** every inserted node is given a height chosen by flipping a coin: start at level 1, and keep climbing to the next level while the coin keeps coming up heads (probability `p`, usually `1/2`).
 
 Taller nodes are rarer and form the express lanes; most nodes stay short.
+
+**Step by step (insert 40 into 10, 20, 30, 50):**
+1. Search for where 40 belongs, starting at the top lane and dropping down, and remember the last node you passed on each lane.
+2. Flip coins for 40's height: heads, tails → level 2.
+3. On level 1 (the bottom lane), link 40 between 30 and 50.
+4. On level 2, link 40 after the last node you passed on that lane.
+5. Done. No other node moved and nothing was rebalanced.
 
 **Picture it:**
 
@@ -325,7 +363,7 @@ The runnable version adds path compression and union by rank (which is what make
 | --- | --- | --- | --- |
 | Union-find (no optimization) | Parent pointer per element, no rank or compression | Never, in production — included for contrast | `O(n)` worst case per `Find` |
 | Union-find (rank + compression) | Attach shorter tree under taller; flatten on `Find` | Kruskal's MST, dynamic connectivity, "friend circles" | `O(α(n))` amortized — effectively constant |
-| Union-find with rollback | Same, but skips path compression (union by rank/size only) to allow undoing unions | Offline algorithms needing to undo a union (e.g. some DP-on-graph problems) | `O(log n)` per op, supports undo |
+| Union-find with rollback | Same, but skips path compression (union by rank/size only) to allow undoing unions | Offline algorithms (ones that see all the input in advance) needing to undo a union (e.g. some DP-on-graph problems) | `O(log n)` per op, supports undo |
 | Red-black / AVL tree | Strict balance invariant, enforced by rotations on every insert/delete | Worst-case guarantees matter (kernels, language runtimes) | `O(log n)` worst case, more code |
 | Skip list | Randomized express-lane pointers, no rebalancing | Sorted sets needing simple, lock-friendly code; range queries | `O(log n)` expected, `O(n)` worst case (rare) |
 | Hash table | Hash to a bucket, no ordering | Exact-match lookup only, no range queries | `O(1)` average, no order |
@@ -340,14 +378,16 @@ The runnable version adds path compression and union by rank (which is what make
 - A skip list's extra forward-pointer arrays cost more memory per node than a plain linked list or array — typically 1.5–2× the pointers of a single-level list, depending on `p`.
 - For small, mostly-static sets, a sorted slice with binary search is simpler than either a skip list or a balanced tree and just as fast in practice.
 
+> 🟡 → 🔴 **You now know** how path compression, union by rank and random skip-list levels work, and how they compare with trees and hash tables. **Next comes the advanced part:** where these run in real systems (Kruskal, compilers, Redis, RocksDB), measured numbers, and the deep reasons behind `α(n)` and Redis's `p = 1/4`.
+
 ## 7. In production 🔴
 
 - **Real systems:**
 	- Kruskal's minimum-spanning-tree algorithm (network design, clustering) is union-find's textbook use.
-	- Compilers and type systems use union-find for Hindley–Milner type unification, merging type variables known to be equal.
+	- Compilers and type systems use union-find for Hindley–Milner type unification (the type-inference method in languages like Haskell and OCaml), merging type variables known to be equal.
 	- Image-processing connected-component labeling (flood fill at scale) uses union-find to merge adjacent same-colored pixels into regions.
 	- **Redis's sorted set (`ZSET`)** is implemented as a skip list paired with a hash map (the hash map gives `O(1)` member → score lookup; the skip list gives `O(log n)` ordered range queries like `ZRANGEBYSCORE`) — see [[Redis Data Structures and When to Use Each]].
-	- LevelDB and RocksDB's in-memory `MemTable` is commonly a skip list, because it supports fast ordered inserts with simple, lock-friendly concurrent access (no rebalancing to coordinate).
+	- LevelDB and RocksDB's in-memory `MemTable` (the sorted buffer of recent writes, kept in RAM before being flushed to disk) is commonly a skip list, because it supports fast ordered inserts with simple, lock-friendly concurrent access (no rebalancing to coordinate).
 - **Failure modes → fixes:**
 	- Skipping path compression or union by rank in a quick implementation → unions degrade to a chain under adversarial input order; always implement both.
 	- Treating a skip list's `O(log n)` as a hard guarantee in a latency-sensitive path → it's an expectation over random coin flips; pick a balanced tree if you need a true worst-case bound.
@@ -401,7 +441,7 @@ Treat the result, not the proof, as interview-ready knowledge.
 > If the random level choices are unlucky (e.g., every node happens to get level 1), it degenerates to a plain linked list, `O(n)` per operation. This is a probabilistic, not a guaranteed, bound — unlike a red-black tree's strict `O(log n)` worst case. In practice, with `p = 1/2` or `1/4`, this is exponentially unlikely.
 
 > [!question]- Trap: is union-find good for "has this edge already been removed from a dynamic graph"?
-> No. Union-find only supports merging sets, not splitting them back apart efficiently. A graph where edges are both added and removed over time needs a different structure (e.g., a link-cut tree, or rebuilding union-find from scratch after removals) — recognizing this limitation is the trap.
+> No. Union-find only supports merging sets, not splitting them back apart efficiently. A graph where edges are both added and removed over time needs a different structure (e.g., a link-cut tree, an advanced structure for trees whose links change, or rebuilding union-find from scratch after removals) — recognizing this limitation is the trap.
 
 ## 10. Cheat sheet 🟢
 
@@ -412,6 +452,30 @@ Treat the result, not the proof, as interview-ready knowledge.
 - Expected height `O(log n)`, not a worst-case guarantee — unlike a red-black tree.
 - Redis `ZSET` = skip list (ordered range queries) + hash map (O(1) member → score).
 - Redis's skip list uses `p = 1/4`, trading a few more comparisons for fewer pointers per node.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What two questions does union-find answer?
+> "Are these two in the same group?" (`Find`) and "merge these two groups" (`Union`).
+
+> [!question]- What does path compression do?
+> During `Find`, it repoints every visited node straight to the root, so later lookups take 1 hop.
+
+> [!question]- How does a skip list decide a node's height?
+> By coin flips: keep going up a level while the coin says heads.
+
+🟡 Medium
+
+> [!question]- How does Kruskal's algorithm use union-find?
+> For each edge in weight order, skip it if both ends already `Find` to the same root (it would make a loop); otherwise `Union` them.
+
+> [!question]- Why does Redis use a skip list for `ZSET` instead of a balanced tree?
+> Same expected `O(log n)` with much simpler code (no rotations), and range queries are just walks along the bottom lane.
+
+> [!question]- Is union-find good when edges can also be removed?
+> No. It only merges; splitting needs a different structure or a rebuild.
 
 ## Links
 

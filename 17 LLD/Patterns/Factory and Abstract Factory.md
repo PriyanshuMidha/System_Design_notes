@@ -33,6 +33,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works, with the small whiteboard code), section 4 (the full worked example) and sections 5 and 6 (variants and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Interfaces]]: a function can return an interface, and the caller uses it without knowing the real type inside.
+> - [[Error Handling]]: return `nil, err` on failure, and use `errors.As` to read a typed error's fields.
+> - [[Strategy and Template Method]]: behaviour can be swapped by passing a different value behind the same interface.
+
 **From zero, in 60 seconds** 🟢
 
 Your code needs a "notifier", but which one: email, SMS or push?
@@ -70,6 +75,10 @@ A factory is that counter in code: you name what you want, it builds the right t
 | Product family | Objects that must come from the same provider | Razorpay charge + Razorpay refund |
 | Config | Settings read at startup that drive the choice | `PAYMENT_PROVIDER=razorpay` |
 | Typed nil | A nil pointer stored inside a non-nil interface | `var p *SMS = nil; var n Notifier = p` gives `n != nil` |
+| Registry | A map from a name to a constructor | `{"sms": NewSMSNotifier, "email": NewEmailNotifier}` |
+| `init()` | A function Go runs automatically before `main`, once per package | A driver package registers itself there |
+| Blank import | `import _ "pkg"`: load a package only for its `init()` side effects | `import _ "github.com/jackc/pgx/v5/stdlib"` |
+| Webhook | An HTTP call a provider makes to your server to report an event | Razorpay says "payment captured" |
 
 **Picture it**
 
@@ -107,12 +116,18 @@ Payments show the second problem. Checkout charges through Razorpay. Months late
 
 An **abstract factory** removes the possibility: the service receives one `ProviderFactory`, and every product it gets (payments, refunds, webhook verification) comes from the same provider.
 
+### Real-life example 🟢
+
+Picture ordering food on Swiggy and choosing how you want updates: SMS, a push notification, or WhatsApp. The order code just says "tell the user the order is on its way", and something else picks and builds the right sender for that user. Now picture paying on a shopping site that has switched payment companies: the refund has to go back through the same company that took the money. Building the right object from a simple choice is a Factory; building a whole matching set (pay, refund, verify) from one company is an Abstract Factory.
+
 ## 2. Mental model 🟢
 
 - **Factory: an order counter.** You ask for "a coffee"; the kitchen decides the machine, beans and cup. You get something that behaves like a coffee and never touch the kitchen. In Go: `NewNotifier("sms", ...)` returns a `Notifier`.
 - **Abstract factory: a furniture collection.** You choose the "Oslo" collection and receive a table, chairs and a lamp that match. You cannot get an Oslo table with a Milano chair. In Go: `NewProviderFactory(cfg)` returns a `ProviderFactory`, and its `Payments()`, `Refunds()` and `Webhooks()` all belong to one provider.
 
 The point of both is that **the choice of concrete type is made in one place**, usually from config, and everything else depends on interfaces.
+
+> 🟢 → 🟡 **You now know** that a factory is one place that picks the type, and an abstract factory hands out a matching set. **Next we open the box**: the four Go forms from a plain `switch` to a registry, how a payment family stays matched, and when registration happens.
 
 ## 3. How it works 🟡
 
@@ -121,7 +136,7 @@ Go has four common forms, from lightest to heaviest:
 1. **Simple factory function.** `NewNotifier(channel, cfg, w) (Notifier, error)` is a `switch` over a string. It returns the interface, and a typed error for an unknown name.
 2. **Factory method.** In the GoF book, a base class declares an overridable `create` method and subclasses decide the product. Go has no subclasses, so a factory method is either a method on an interface that returns a product (`ProviderFactory.Payments()`) or a constructor passed as a value (`Constructor func(io.Writer) Notifier`).
 3. **Abstract factory.** An interface whose methods are factory methods, one per product in the family. Each provider implements the whole interface.
-4. **Registry factory.** A map from name to constructor. Plug-in packages add entries from `init()`, so the factory learns new kinds without being edited. `database/sql` works this way.
+4. **Registry factory.** A map from name to constructor. Plug-in packages (packages that add a new kind when imported) add entries from `init()` (a function Go runs automatically before `main`), so the factory learns new kinds without being edited. `database/sql` works this way.
 
 The payment family from the worked example:
 
@@ -235,7 +250,16 @@ func main() {
 
 **In plain words:** One program with a notifier factory, a registry of makers, the typed-nil trap, and two payment-provider families. Read the `switch` first; everything else grows from it.
 
-One `package main` with a notifier factory, a typed error, the typed-nil trap, a registry and the Razorpay and Stripe families. The provider calls are in-memory stand-ins for the SDKs; the webhook checks use each provider's documented HMAC-SHA256 scheme, simplified for Stripe (no timestamp tolerance check). Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
+One `package main` with a notifier factory, a typed error, the typed-nil trap, a registry and the Razorpay and Stripe families. The provider calls are in-memory stand-ins for the SDKs; the webhook checks use each provider's documented HMAC-SHA256 scheme (a signature made with a shared secret, so you can tell the message really came from the provider), simplified for Stripe (no timestamp tolerance check). Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
+
+**Step by step:**
+
+1. `Notifier` is the one interface callers know. `EmailNotifier`, `PushNotifier` and `SMSNotifier` are the concrete types behind it.
+2. `NewNotifier` is the simple factory: a `switch` on the channel name builds the right type, and an unknown name returns `UnknownKindError`.
+3. `BuggyNotifier` shows the typed-nil trap on purpose, so you can see what not to do.
+4. `Registry` lets new channels plug in by name; `WhatsAppNotifier` registers itself in `init`.
+5. `ProviderFactory` is the abstract factory: `razorpay` and `stripe` each return a matching set of `Payments`, `Refunds` and `Webhooks`, and `NewProviderFactory` picks the set from `Config`.
+6. `OrderService` only sees that set, so its charge and refund always use the same provider; `main` runs each part.
 
 ```go
 package main
@@ -697,8 +721,16 @@ error: unknown payment provider "paypal"
 What to notice:
 
 - `fax` produces a typed `*UnknownKindError`, so callers can use `errors.As` and read the bad name instead of matching an error string.
-- `bad == nil is false`: `BuggyNotifier` returned a nil `*SMSNotifier` inside a non-nil `Notifier`. Calling `Send` on it would panic with a nil pointer dereference when `Send` reads `n.w`.
+- `bad == nil is false`: `BuggyNotifier` returned a nil `*SMSNotifier` inside a non-nil `Notifier`. Calling `Send` on it would panic with a nil pointer dereference (reading through a pointer that points at nothing) when `Send` reads `n.w`.
 - `TestMixingFamiliesFails` shows the bug the abstract factory prevents: a Razorpay refund of a Stripe payment.
+
+## Common beginner mistakes 🟢
+
+- **Mistake:** returning a nil `*SMSNotifier` as a `Notifier`, as `BuggyNotifier` does. → **Why it's wrong:** an interface holding a nil pointer is not nil, so `n != nil` is true and the next `Send` can crash. → **Do this instead:** return a plain `nil` on error, as `NewNotifier` does (`return nil, err`).
+- **Mistake:** copying the `switch channel` into every handler. → **Why it's wrong:** adding WhatsApp means editing many places, and one gets missed. → **Do this instead:** keep one `NewNotifier` (or one `Registry`) and call it from everywhere.
+- **Mistake:** building the refund client from a different config than the payment client. → **Why it's wrong:** a Razorpay payment cannot be refunded through Stripe, so every refund fails. → **Do this instead:** get both from one `ProviderFactory`, as `NewOrderService` does with `f.Payments()` and `f.Refunds()`.
+- **Mistake:** silently returning a default notifier for an unknown channel. → **Why it's wrong:** a typo like `"smss"` sends nothing and nobody notices. → **Do this instead:** return an error such as `UnknownKindError`.
+- **Mistake:** letting two plug-ins register the same name in the `Registry`. → **Why it's wrong:** the second one quietly replaces the first. → **Do this instead:** fail loudly on a duplicate, as `Register` does with a panic at startup.
 
 ## 5. Variants and comparison 🟡
 
@@ -707,7 +739,7 @@ What to notice:
 | Plain constructor `NewSMSNotifier` | Returns the concrete type | The caller knows which type it wants | None; this is the default in Go |
 | Simple factory function | `switch` on a name, returns the interface | 2 to 6 kinds, all in one package, chosen from config | One function to edit per new kind |
 | Local `map[string]func(io.Writer) Notifier` | A map literal built in `main` and passed in | Same as above, and tests want to swap entries | No plug-in story; nothing global |
-| Registry with `init()` | Global map; packages call `Register` from `init()` | Kinds live in packages you do not own (drivers, formats) | Global state, import side effects, panics on duplicates |
+| Registry with `init()` | Global map; packages call `Register` from `init()` | Kinds live in packages you do not own (drivers, formats) | Global state, import side effects (importing a package silently changes behaviour), panics on duplicates |
 | Factory method | Interface method or func value that creates a product | A collaborator must create objects whose type the caller chooses | One more indirection |
 | Abstract factory | Interface with one factory method per product | Several products must come from the same family | A family interface to keep in sync; every new product touches every family |
 
@@ -719,20 +751,22 @@ A factory is the exception: its whole job is to choose among types, so it must r
 
 ## 6. Trade-offs and when not to use 🟡
 
-- **One concrete type:** call its constructor. A factory that can only return one thing is ceremony.
+- **One concrete type:** call its constructor. A factory that can only return one thing is ceremony (extra code that does nothing useful).
 - **The caller already knows the type:** `NewSMSNotifier(...)` is clearer than `NewNotifier("sms", ...)`, and the compiler checks it.
 - **Kinds that never leave one package:** a `switch` or a local map is enough. A global registry with `init()` adds hidden state and import side effects for no gain.
 - **Abstract factory with one product:** it is just a factory. The family interface earns its cost only when two or more products must match.
 - **Every new product edits every family.** Adding `Payouts()` to `ProviderFactory` forces Razorpay, Stripe and every test fake to implement it. Keep the family small, or add capabilities as optional interfaces (see section 8).
 - **Factories must not run business logic.** A factory builds and validates; it does not charge, send or decide pricing.
 
+> 🟡 → 🔴 **You now know** the factory forms, how to test them with fake families, and when a plain constructor is better. **Next comes the production view**: registries and families in Go's own library (`database/sql`, `image`, `crypto`), the startup and typed-nil bugs, and how to grow a family without breaking it.
+
 ## 7. In production 🔴
 
 **Real systems:**
 
-- `database/sql`: `sql.Register(name, driver)` is a registry factory. A driver package calls it from `init()`, the program imports the package for its side effect (for pgx v5: `import _ "github.com/jackc/pgx/v5/stdlib"`), and `sql.Open("pgx", dsn)` looks the driver up by name. The pgx v5 `stdlib` package registers itself as `"pgx/v5"`, and also as `"pgx"` unless another pgx major version already took that name; it checks `sql.Drivers()` first precisely because a duplicate `Register` would panic. `sql.Register` panics if it is called twice with the same name or with a nil driver; `sql.Drivers()` lists the registered names.
+- `database/sql`: `sql.Register(name, driver)` is a registry factory. A driver package calls it from `init()`, the program imports the package for its side effect (for pgx v5: `import _ "github.com/jackc/pgx/v5/stdlib"`), and `sql.Open("pgx", dsn)` (dsn: the connection string with host, user and database) looks the driver up by name. The pgx v5 `stdlib` package registers itself as `"pgx/v5"`, and also as `"pgx"` unless another pgx major version already took that name; it checks `sql.Drivers()` first precisely because a duplicate `Register` would panic. `sql.Register` panics if it is called twice with the same name or with a nil driver; `sql.Drivers()` lists the registered names.
 - `database/sql/driver` is an abstract factory: a `driver.Driver` opens a `driver.Conn`, and the `Conn` creates its own `driver.Stmt` and `driver.Tx`. A statement from one driver can never run on another driver's connection.
-- `image.RegisterFormat`: `import _ "image/png"` registers the PNG decoder from `init()`, and `image.Decode` then picks the decoder by the file's magic bytes.
+- `image.RegisterFormat`: `import _ "image/png"` registers the PNG decoder from `init()`, and `image.Decode` then picks the decoder by the file's magic bytes (the first few bytes that identify a file type).
 - `crypto.Hash.New()`: `crypto.SHA256.New()` works only if `crypto/sha256` is linked into the binary, because that package registers itself with `crypto.RegisterHash`; otherwise `New` panics.
 
 **Where it shows up in LLD problems:**
@@ -764,13 +798,13 @@ The same trap produces non-nil `error` values: a function declared to return `er
 - Each `init()` function runs once, before `main`, after every package it imports is initialized (a package may declare several). You cannot pass config or return an error from it, so a registered constructor must be cheap and must not do I/O.
 - A lock is still needed. `init()` functions run in one goroutine, but nothing stops a later `Register` call from another goroutine. `database/sql` guards its driver map with a `sync.RWMutex`, and `Registry` here does the same.
 
-**Evolving a family with optional interfaces.** `database/sql/driver` added context support without breaking old drivers. The core `driver.Conn` interface stayed small; new abilities are separate interfaces such as `driver.ConnBeginTx` and `driver.QueryerContext`. `database/sql` checks them with a type assertion and falls back when a driver lacks them.
+**Evolving a family with optional interfaces.** `database/sql/driver` added context support without breaking old drivers. The core `driver.Conn` interface stayed small; new abilities are separate interfaces such as `driver.ConnBeginTx` and `driver.QueryerContext`. `database/sql` checks them with a type assertion (asking at run time whether a value also has another interface) and falls back when a driver lacks them.
 
 Apply the same trick to a payment family: keep `ProviderFactory` small and let a provider optionally implement `PayoutGateway`, checked with `if p, ok := f.(PayoutGateway); ok`.
 
 **Errors or panics.** A factory that reads config at run time returns an error. A factory called with constant input at startup can offer a `Must` form that panics, like `regexp.MustCompile` and `template.Must`, because a failure there is a programming error.
 
-**Factories and dependency injection.** In a service, the composition root (`main`) is the natural factory: it reads config, builds the family once and passes products into the services. If you find factories called deep inside request handlers, the construction is probably happening too late and too often.
+**Factories and dependency injection.** In a service, the composition root (`main`, the one place that builds and wires everything) is the natural factory: it reads config, builds the family once and passes products into the services. If you find factories called deep inside request handlers, the construction is probably happening too late and too often.
 
 ## 9. Interview questions 🔴
 
@@ -805,6 +839,26 @@ Apply the same trick to a payment family: keep `ProviderFactory` small and let a
 - A local map or `switch` is enough when all kinds live in one package.
 - Grow a family with optional interfaces checked by type assertion, like `database/sql/driver`.
 - Test with a fake family; validate configured names at startup.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What does a factory do that a plain constructor does not?
+> It chooses which concrete type to build (often from config) and returns it as an interface.
+
+> [!question]- 🟢 Why use an abstract factory for payments?
+> So the charge, refund and webhook parts all come from the same provider and can never be mixed.
+
+> [!question]- 🟢 The caller always wants `*SMSNotifier`. Factory or constructor?
+> Constructor. A factory that always returns one type is just ceremony.
+
+> [!question]- 🟡 Why is `n == nil` false when the factory returned a nil `*SMSNotifier` as a `Notifier`?
+> The interface holds a type (`*SMSNotifier`) and a nil value, and it is nil only when both are nil; return a literal `nil` instead.
+
+> [!question]- 🟡 What goes wrong if someone deletes `import _ "github.com/jackc/pgx/v5/stdlib"`?
+> It still compiles, but `sql.Open("pgx", ...)` fails at run time with "unknown driver", because the driver never registered.
+
+> [!question]- 🟡 How do you add `Payouts` to only some providers without breaking the others?
+> Make it an optional interface (`PayoutGateway`) and check for it with a type assertion.
 
 ## Links 🟢
 

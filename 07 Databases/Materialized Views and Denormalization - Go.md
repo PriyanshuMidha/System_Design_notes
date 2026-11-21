@@ -23,6 +23,13 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Work through the Code steps in order, then "Design decisions" and the Tests.
 > - 🔴 **Interview / SDE-3 prep?** Add "Pitfalls in the code" and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Materialized Views and Denormalization]]: the theory half. Read it first; this note is its code.
+> - [[Relational Schema Design]]: the `invoices` and `payments` tables, with money stored as whole paise (`total_minor`).
+> - [[SQL Essentials]]: you can read `GROUP BY`, `sum` and `INSERT ... ON CONFLICT`.
+> - [[Indexing Fundamentals]]: an index lets the database find a few rows without reading the whole table.
+> - [[Query Plans and EXPLAIN]]: `EXPLAIN ANALYZE` prints how a query ran, step by step, with timings.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on half of the materialized views note. It shows, with real SQL and Go you can run, how to store a precomputed answer and keep it honest: the SQL that creates and refreshes a materialized view, the before/after query plans proving the speedup, a payment update that keeps a copied column exact, and a small Go program that adds up invoice totals from a stream of change events without ever counting the same event twice. Read the theory note first if any of those words feel new; then read this top to bottom, running `go test -race` on the Go part if you want to see it work.
@@ -34,7 +41,7 @@ This file is the hands-on half of the materialized views note. It shows, with re
 - **Idempotency**: `Apply` returns `false` for an event ID it has already seen, so redelivery is harmless.
 - **Goroutines and `sync.WaitGroup`**: one test applies events, with duplicates, from many goroutines at once.
 - **SQL blocks**: the PostgreSQL parts are SQL, not Go; read them as the database side of the same design.
-- **Run**: `go vet ./... && go test -race ./...` (standard library only).
+- **Run**: `go vet ./... && go test -race ./...` (standard library only). `go vet` is Go's built-in checker for suspicious code, and `-race` turns on the race detector, which reports when two goroutines touch the same memory without a lock.
 
 ## What this code shows 🟢
 
@@ -79,6 +86,8 @@ sequenceDiagram
 - Run: `go vet ./... && go test -race ./...`.
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** what the code is for: store a slow answer, keep it fresh, and never count an event twice. **Next we open the box** step by step: the SQL that builds and refreshes the view, the plans that prove the speedup, then the Go rollup and its tests.
 
 ### Step 1: the dashboard query and the whiteboard view
 
@@ -132,6 +141,8 @@ flowchart LR
 **Concept.** The production version adds `outstanding_minor`, the money still owed, and two details that the first version leaves implicit. `WITH DATA` populates the view immediately, because a view created `WITH NO DATA` is unreadable until its first refresh and cannot be refreshed `CONCURRENTLY` until then.
 
 The index must be `UNIQUE` and cover plain column names with no `WHERE` clause, which is what makes the concurrent refresh possible: PostgreSQL needs a key to match old rows with new ones.
+
+**What this code does, in plain words:** it creates the stored answer for every workspace (count, total and unpaid money per status), fills it straight away, and adds the unique index that lets later refreshes run without blocking readers.
 
 ```sql
 CREATE MATERIALIZED VIEW workspace_dashboard AS
@@ -300,7 +311,7 @@ flowchart LR
 
 ### Step 7: the asynchronous rollup in Go
 
-When the rollup lives outside Postgres (for example a dashboard store fed by CDC), each change arrives as an event, as in [[Materialized Views and Denormalization#4.5 Asynchronous rollup in Go, with idempotency and a drift check]].
+When the rollup lives outside Postgres (for example a dashboard store fed by CDC, change data capture: reading the database's change log as a stream of row changes), each change arrives as an event, as in [[Materialized Views and Denormalization#4.5 Asynchronous rollup in Go, with idempotency and a drift check]].
 
 Delivery is at-least-once, so the same event can arrive again, and applying it twice is the classic double-counting bug. The fix is to remember which event IDs were applied.
 
@@ -311,6 +322,8 @@ In SQL that is a `processed_events` table written in the same transaction as the
 **Concept.** An `Event` carries the old and new total of one invoice, so the rollup can apply a delta without reading the invoice. The `ID` must be unique per change (for example invoice id plus version), because it is the idempotency key.
 
 Carrying deltas instead of full state makes the rollup order-insensitive, since addition commutes. The alternative is to carry the new state and overwrite, which is naturally idempotent but needs a version check to survive out-of-order delivery.
+
+**What this code does, in plain words:** two small record types. An `Event` says "invoice 7 in workspace 42 went from ₹2,500 to ₹3,000", and `Totals` is one dashboard row: how many invoices and how much money.
 
 ```go
 // Package rollup keeps an app-maintained summary table (per-workspace
@@ -353,6 +366,8 @@ type Totals struct {
 **Concept.** `Rollup` holds the two maps the SQL version stores in tables: `seen` is `processed_events` and `rows` is `workspace_totals`. One mutex guards both, because `Apply` must check the seen set and update the totals as a single step.
 
 This is the in-memory version of putting both statements in one database transaction. The alternative of two separate locks would let two consumers pass the dedupe check together and both apply the same event.
+
+**What this code does, in plain words:** the rollup is a box holding two lists, "event IDs already applied" and "totals per workspace", with one lock so only one goroutine changes them at a time.
 
 ```go
 // Rollup applies events exactly once by remembering the IDs it has seen.
@@ -449,6 +464,8 @@ func (r *Rollup) Get(ws int64) Totals {
 
 This costs a full scan of the source, which is why a real system runs it nightly or on a sample, not on every request.
 
+**What this code does, in plain words:** it adds up the real invoices again from scratch, workspace by workspace, to get the correct totals to compare against.
+
 ```go
 // Drift compares the rollup with a full recomputation from the source
 // rows (invoice id -> total_minor, per workspace) and returns the
@@ -481,6 +498,8 @@ func (r *Rollup) Drift(source map[int64]map[int64]int64) map[int64]Totals {
 A workspace present in the rollup but absent from the truth, with a non-zero row, is a phantom: events were counted for data that no longer exists.
 
 The result is the set of workspaces to repair, each with its correct row, so the caller can fix them directly.
+
+**What this code does, in plain words:** it compares the correct totals with the stored ones and returns every workspace where they differ, together with the right numbers.
 
 ```go
 	r.mu.Lock()
@@ -638,6 +657,8 @@ import (
 | 2 | edit inv-1:v2, 250,000 to 300,000 | true | 1 invoice, 300,000 |
 | 3 | edit inv-1:v2 again | false | unchanged: 1 invoice, 300,000 |
 
+**What this code does, in plain words:** it sends a create, an edit, and then the same edit again, and checks that the total is ₹3,000 (300,000 paise), not ₹3,500.
+
 ```go
 func TestApplyIsIdempotent(t *testing.T) {
 	r := New()
@@ -691,6 +712,8 @@ func TestDeleteDecrementsCount(t *testing.T) {
 | 1 | 1 invoice, 100 | invoice 1 = 100 | none |
 | 2 | 1 invoice, 500 | invoice 2 = 800 (the 500 to 800 event was lost) | 1 invoice, 800 |
 
+**What this code does, in plain words:** it builds a rollup that missed one edit on purpose, then checks that `Drift` reports only workspace 2, with the correct 800.
+
 ```go
 func TestDriftFindsMissedUpdate(t *testing.T) {
 	r := New()
@@ -717,6 +740,8 @@ func TestDriftFindsMissedUpdate(t *testing.T) {
 | Setup | Expected |
 | --- | --- |
 | 4 consumers, the same 1,000 event IDs, each worth 10 | 1,000 invoices, total 10,000 |
+
+**What this code does, in plain words:** four goroutines each push the same 1,000 events at the same time; the test checks that the result is exactly 1,000 invoices and 10,000, as if each event came once.
 
 ```go
 func TestConcurrentApplyWithDuplicates(t *testing.T) {
@@ -768,6 +793,8 @@ Reading the output line by line:
 
 ## Pitfalls in the code 🔴
 
+> 🟡 → 🔴 **You now know** how each piece works and how the tests prove it. **Next are the traps** a senior reviewer would spot: the zero-means-missing shortcut, a seen set that grows forever, and SQL that does not stop by itself after `DO NOTHING`.
+
 - **Zero means "no invoice".** `Apply` and `Drift` treat a total of 0 as absent, so a real zero-value invoice would be miscounted. Use an explicit operation field.
 - **The seen set grows forever.** In memory it is a map of every event ID; in SQL, `processed_events` needs a retention policy, which must outlast the longest possible redelivery window.
 - **SQL does not stop after `DO NOTHING`.** Without the application checking `INSERT 0 0` and rolling back, the delta is applied twice.
@@ -780,6 +807,8 @@ Reading the output line by line:
 1. In `TestApplyIsIdempotent`, change the redelivered `edit` event's ID to `inv-1:v3`. Predict `Get(7)`.
 2. In `TestConcurrentApplyWithDuplicates`, give each of the four consumers different event IDs (`fmt.Sprint(w, "-", i)`). Predict the final `Totals`.
 3. In the slot-sharded SQL, change `16` to `1`. Predict the effect on concurrent writers.
+
+**What this code does, in plain words:** the whole Go file in one place: the two types, `New`, `Apply` (skip repeats, add the change), `Get` (read one row) and `Drift` (recount and compare).
 
 > [!example]- Full file: rollup.go
 > ```go
@@ -876,6 +905,30 @@ Reading the output line by line:
 > 	return bad
 > }
 > ```
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why does `Apply` return `false` for some events?
+> The event's ID is already in the seen set, so it was applied before and is skipped.
+
+> [!question]- What does `Drift` compare?
+> Totals recomputed from the source invoices against the totals stored in the rollup.
+
+> [!question]- Why is the view refreshed every 4 minutes and not every 5?
+> The budget is 5 minutes, and a refresh itself can take up to about a minute.
+
+🟡 Medium
+
+> [!question]- Why does one mutex guard both `seen` and `rows`?
+> The duplicate check and the update must happen as one step; with two locks, two goroutines could both pass the check and apply the same event.
+
+> [!question]- In the SQL version, what must the app do when `INSERT ... ON CONFLICT DO NOTHING` reports `INSERT 0 0`?
+> Roll back, because the event is a duplicate; SQL alone would go on and add the delta again.
+
+> [!question]- Why does splitting a counter into 16 slot rows help?
+> Writers spread over 16 row locks instead of queuing on one, and reads just sum the 16 rows.
 
 ## Links
 

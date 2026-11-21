@@ -34,6 +34,13 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5 (comparison).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Transactions and ACID]]: a transaction is a group of writes that all happen or none happen.
+> - [[Isolation Levels and MVCC]]: the database keeps several dated versions of each row, so a reader sees a frozen picture while writers carry on.
+> - [[Replication]]: a replica is a copy of the data on another machine that follows every change.
+> - [[Partitioning and Sharding]]: a big table can be cut into pieces, each stored on a different server.
+> - [[Consensus - Raft and Paxos]]: a few machines can agree on the order of changes by majority vote, so losing one machine loses nothing.
+
 **From zero, in 60 seconds** 🟢
 
 A normal SQL database lives on one computer. One day your data, or your traffic, no longer fits on one computer.
@@ -77,6 +84,12 @@ Distributed SQL databases split the data for you and still run real transactions
 | Two-phase commit (2PC) | "Everyone ready? Then everyone commit" across several ranges | Prepare range 1 and 2, then commit both |
 | Timestamp / clock | A number that orders transactions in time | Tx 1 at 100, Tx 2 at 105 |
 | Serializable | Results look as if transactions ran one after another | No two people book the same seat |
+| Quorum | A majority of the copies; a write counts once a quorum has it | 2 of 3 replicas |
+| Leaseholder | The one copy of a range allowed to answer reads on its own | Replica on n1 for range 12 |
+| Write intent | A "pencil" value written by a transaction that has not committed yet | invoice 42 = paid, pending |
+| Hot spot | One range that gets most of the traffic while others sit idle | All new invoices land on the last range |
+| Clock skew | How far apart two machines' clocks are | Node A says 10:00:00.005, node B says 10:00:00.000 |
+| `40001` | The error code meaning "conflict, please run the whole transaction again" | Two payments for the same invoice at once |
 
 **Picture it**
 
@@ -105,10 +118,12 @@ Where it breaks: branches are minutes apart, but a real library has no clock pro
 
 ## 1. Why it exists 🟢
 
-InvoiceOps runs on one PostgreSQL 17 primary with two replicas. It now has 40,000 workspaces in the US, EU and India. Three problems appear:
+🟢 **Plain version:** One database server can only take so many writes, and when it dies a backup copy takes over but may lose the last moments of data. Users far away also wait longer for every write. You can split the data across many servers yourself, but then your app has to handle everything that crosses servers. Distributed SQL does that splitting for you while you keep writing normal SQL.
 
-- **Write ceiling.** All writes go to one machine. At peak month-end billing the primary runs at 85% CPU and the WAL volume saturates its disk; reads can go to replicas, writes cannot.
-- **Failover.** When the primary dies, a replica is promoted. With asynchronous replication, the last few hundred milliseconds of commits can be lost, and the switch takes tens of seconds (estimates that depend on the setup).
+InvoiceOps (the running example in these notes: an invoicing app where many customer companies share one database) runs on one PostgreSQL 17 primary with two replicas. It now has 40,000 workspaces in the US, EU and India. Three problems appear:
+
+- **Write ceiling.** All writes go to one machine. At peak month-end billing the primary runs at 85% CPU and the WAL (the log of every change, written before the tables) volume saturates its disk; reads can go to replicas, writes cannot.
+- **Failover.** When the primary dies, a replica is promoted. With asynchronous replication (the primary says "saved" before the replicas have the change), the last few hundred milliseconds of commits can be lost, and the switch takes tens of seconds (estimates that depend on the setup).
 - **Geography.** EU customers' data must live in the EU, and an EU user's write to a US primary pays roughly 80–100 ms of round trip (an estimate for a transatlantic link).
 
 The classic fix is manual sharding by `workspace_id` ([[Partitioning and Sharding]]): many PostgreSQL clusters plus routing code. It works, but transactions across shards, global unique constraints, resharding and cross-shard queries become the application's problem.
@@ -132,7 +147,25 @@ Terms used below:
 - **Write intent**: a provisional MVCC (multi-version concurrency control) value written by an uncommitted transaction.
 - **Gateway node**: whichever node the client connected to; it parses SQL and coordinates the transaction.
 
+### Real-life example: a payments app across India and abroad 🟢
+
+Think of a payments app like PhonePe that keeps every payment in a database and must never lose one.
+Roughly, at festival time the number of payments per second can outgrow what one database server can write.
+A distributed SQL database splits the payments table into many slices spread over many machines, so more machines means more writes per second.
+Each slice keeps 3 copies that vote, so if one machine dies mid-payment, the other two still hold the payment and nothing is lost.
+The app still sends ordinary SQL, but it must be ready to retry a payment when the database answers "conflict, try again".
+
+## Common beginner mistakes 🟢
+
+- **Choosing distributed SQL when one PostgreSQL server is enough** → every write gets slower and the system costs more to run → start with one primary plus replicas, and switch only when writes outgrow it.
+- **Not retrying on `40001`** → users see random "transaction failed" errors under load → wrap every transaction in a retry loop that re-runs it from `BEGIN`.
+- **Using an auto-increment id or a timestamp as the primary key** → every new row lands on the last range, so one machine does all the work → use UUIDs or put `workspace_id` first in the key.
+- **Calling an outside service inside the transaction** → a retry runs it twice, so an email or charge happens twice → do side effects after `COMMIT`.
+- **Putting the 3 copies in 3 far-apart regions without thinking** → every write waits for an ocean crossing, about 70 ms or more → keep each customer's rows in their home region.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the big picture: tables are cut into ranges, each range has 3 voting copies, and transactions can span ranges. **Next we open the box**: how ranges split and get hot, how a two-range commit survives a crash, how machines agree on time, and why retries are normal. Each subsection starts with a short step-by-step walk.
 
 ### Range sharding with Raft per range
 
@@ -153,7 +186,7 @@ flowchart TB
     end
 ```
 
-1. Every row becomes a key-value pair. The key is the table id plus the primary key, so rows are sorted by primary key, and a secondary index is just another set of keys.
+1. Every row becomes a key-value pair. The key is the table id plus the primary key (the column that uniquely names each row), so rows are sorted by primary key, and a secondary index (an extra lookup structure on another column) is just another set of keys.
 2. The sorted key space is cut into ranges. CockroachDB splits a range when it passes 512 MiB (the default `range_max_bytes`) or when it gets too much load.
 3. Each range has 3 replicas by default (configurable to 5 or more) on different nodes, ideally in different zones or regions.
 4. The gateway looks up which range holds a key (a cached range directory; [[Distributed SQL - Go]] implements one as a `Router`) and sends the request to that range's leaseholder.
@@ -162,6 +195,13 @@ flowchart TB
 ### Range splits
 
 **In plain words: when a chunk gets too fat or too busy, the database cuts it in two — like splitting an overfull binder into two binders.**
+
+**Step by step:**
+1. Range 12 holds invoice keys 1 to 5,000 and has just grown past 512 MiB (about 540 MB).
+2. The database picks a split key in the middle, say invoice 2,500.
+3. Range 12 keeps keys 1 to 2,500. A new range 58 gets keys 2,500 to 5,000.
+4. Range 58 gets its own 3 copies and its own Raft vote.
+5. The balancer may move range 58's leaseholder to a less busy machine, such as n2.
 
 A range is not fixed. When it grows past the size limit or draws too much traffic, the database cuts it in two at a key and hands one half to a different set of nodes.
 
@@ -184,7 +224,14 @@ Example: a 1 GiB table with a 512 MiB limit ends up as at least 2 ranges. Each n
 
 **In plain words: if every new row's key is "the next number", all inserts pile onto the last chunk — one machine does all the work while the rest sit idle.**
 
-Range sharding keeps nearby keys together, so range scans are efficient. The price is that a monotonically increasing key (a timestamp or a sequence) sends all inserts to the last range: a hot spot.
+**Step by step:**
+1. New invoices get ids 1001, 1002, 1003, and so on.
+2. Keys are sorted, so each new id is the biggest so far and lands in the very last range.
+3. That last range has one leaseholder, so one machine handles every insert.
+4. If instead the id is a random UUID (a 128-bit random id like `a3f9...`), new rows land all over the key space.
+5. Now every range, and so every machine, takes a share of the inserts.
+
+Range sharding keeps nearby keys together, so range scans are efficient. The price is that a monotonically increasing key (one that only ever goes up) (a timestamp or a sequence) sends all inserts to the last range: a hot spot.
 
 ```mermaid
 flowchart LR
@@ -201,11 +248,19 @@ flowchart LR
     end
 ```
 
-The fixes are UUID keys, hash-sharded indexes, or a leading `workspace_id`. YugabyteDB hash-shards the first primary-key column by default for this reason, and lets you choose range sharding with `ASC`/`DESC`.
+The fixes are UUID keys, hash-sharded indexes (the database adds a hidden hash in front of the key so neighbours spread out), or a leading `workspace_id`. YugabyteDB hash-shards the first primary-key column by default for this reason, and lets you choose range sharding with `ASC`/`DESC`.
 
 ### Transactions across ranges: two-phase commit over Raft
 
 **In plain words: write "pencil" entries on every chunk first, then flip one master switch that turns them all into "ink" at once — and the switch itself is copied to 3 machines so no single crash can lose it.**
+
+**Step by step:**
+1. You pay invoice 42. The gateway picks timestamp 100 for the transaction.
+2. It writes a pencil entry "invoice 42 = paid" on range 12. Range 12's 3 copies vote, and 2 agree.
+3. It writes a pencil entry "payment 9001" on range 31. Range 31's copies vote too.
+4. It writes the master switch, the transaction record, as `STAGING`, and lists both pencil entries. That record is also voted on.
+5. Once all three are safely voted, the payment is committed. The app hears "OK".
+6. Later, in the background, the pencil entries are turned into ink (normal values).
 
 ```mermaid
 sequenceDiagram
@@ -227,7 +282,7 @@ sequenceDiagram
     G->>R31: resolve intent into a normal value (async)
 ```
 
-This is two-phase commit ([[Two-Phase Commit]]): phase one writes intents, phase two flips the transaction record. Classic 2PC blocks if the coordinator dies between the phases, because participants hold locks and do not know the outcome.
+This is two-phase commit ([[Two-Phase Commit]]): phase one writes intents, phase two flips the transaction record. Classic 2PC blocks if the coordinator (the one machine running the commit) dies between the phases, because participants hold locks and do not know the outcome.
 
 Here the transaction record and every intent are **replicated by Raft**, so any node can read the record and finish or abort the transaction.
 
@@ -235,11 +290,18 @@ A reader that meets an intent looks up the record: committed means use the value
 
 CockroachDB's **parallel commits** (since v19.2) write the `STAGING` record at the same time as the last intents, which turns two sequential consensus rounds at commit into one. Spanner uses classic 2PC across Paxos groups, with one group's leader as coordinator.
 
-TiDB uses the Percolator protocol: a primary lock and secondary locks in TiKV, with commit decided by the primary key's lock.
+TiDB uses the Percolator protocol (Google's design for transactions on top of a key-value store): a primary lock and secondary locks in TiKV (TiDB's storage layer), with commit decided by the primary key's lock.
 
 ### What a reader does when it meets a write intent
 
 **In plain words: a reader who finds a pencil entry goes and checks the master switch — committed means "use it", aborted means "ignore it", pending means "wait or push".**
+
+**Step by step:**
+1. A reader wants invoice 42 and finds a pencil entry left by transaction T1.
+2. The entry points to T1's transaction record, so the reader looks it up.
+3. `COMMITTED`: use the new value. `ABORTED`: ignore it and read the older value.
+4. `PENDING`: wait a little, or push T1 to a later timestamp so the reader can go first.
+5. `STAGING`: check whether all of T1's listed pencil entries are safely written; if yes, T1 counts as committed.
 
 ```mermaid
 stateDiagram-v2
@@ -258,9 +320,16 @@ Example: transaction T1 has an intent on invoice 42 and then its coordinator cra
 
 **In plain words: machines must agree on what happened first, but their watches all run slightly differently — the three schemes below are three ways of coping with bad watches.**
 
+**Step by step:**
+1. Every saved value carries a timestamp, like "invoice 42 = paid at 100".
+2. A reader at timestamp 105 sees the newest value at or below 105.
+3. So everyone must agree whether a write happened at 100 or 106, even though clocks differ by a few milliseconds.
+4. Spanner uses very accurate clocks and waits out the small error. CockroachDB and YugabyteDB use normal clocks plus a counter. TiDB asks one central server for every timestamp.
+
 All of these databases use MVCC ([[Isolation Levels and MVCC]]): every value is stored with a commit timestamp, and a transaction reads the newest version at or below its read timestamp. The question is where the timestamps come from, given that server clocks drift ([[Clocks and Ordering]]).
 
 - **Spanner: TrueTime.** Google's datacentres have GPS receivers and atomic clocks. `TT.now()` returns an interval `[earliest, latest]` guaranteed to contain true time; the uncertainty ε was typically 1–7 ms in the 2012 paper. At commit, Spanner picks timestamp `s = TT.now().latest` and then **waits until `TT.now().earliest > s`** before releasing locks (commit wait, about 2ε). After that wait, any transaction that starts later in real time is guaranteed to get a larger timestamp. That property is **external consistency** (also called strict serializability).
+
 | System | Timestamp source | Needs special hardware | Price paid |
 | --- | --- | --- | --- |
 | Spanner | TrueTime interval | GPS and atomic clocks | Commit wait of about 2ε per write transaction |
@@ -273,6 +342,13 @@ All of these databases use MVCC ([[Isolation Levels and MVCC]]): every value is 
 ### An HLC keeps cause before effect
 
 **In plain words: when a machine hears from someone whose clock is ahead, it moves its own clock forward — so an effect can never get an earlier timestamp than its cause.**
+
+**Step by step:**
+1. Node A's clock says 5 ms. Node B's clock says 0 ms, so B is 5 ms behind.
+2. A saves invoice 42 at (5 ms, counter 0) and tells B.
+3. B sees a time ahead of its own, so it jumps to (5 ms, counter 1).
+4. B now saves the payment. Its wall clock still says about 0, so it bumps the counter: (5 ms, counter 2).
+5. The payment's timestamp is after the invoice's, which is the right order.
 
 Example: node A's clock reads 5 ms, node B's clock reads 0 ms. A commits invoice 42 at timestamp (5.000 ms, 0) and sends the news to B. Without help, B would stamp the payment it writes next with a time near 0 ms, earlier than the invoice it depends on.
 
@@ -290,6 +366,13 @@ sequenceDiagram
 ### Commit wait in Spanner
 
 **In plain words: Spanner knows its clock is at most a few milliseconds wrong, so it just waits those few milliseconds before saying "done" — after the wait, time has definitely passed the chosen timestamp.**
+
+**Step by step:**
+1. Spanner asks TrueTime the time. It answers "somewhere between 10.000 and 10.006".
+2. Spanner picks the top of that range, 10.006, as the commit timestamp.
+3. It saves the commit with Paxos (its voting protocol, like Raft).
+4. It keeps asking the time until even the earliest possible answer is past 10.006. That takes about 6 ms.
+5. Only then does it say "committed". Anything that starts afterwards is sure to get a bigger timestamp.
 
 ```mermaid
 sequenceDiagram
@@ -312,6 +395,13 @@ sequenceDiagram
 
 **In plain words: these databases prefer to cancel one of two clashing transactions rather than let them corrupt each other — your code must be ready to simply run the whole transaction again.**
 
+**Step by step:**
+1. Two requests try to pay invoice 42 at the same moment.
+2. The database lets both start, without locking anything for reads.
+3. At write or commit time it spots the clash and cancels one with error `40001`.
+4. Your code runs `ROLLBACK`, waits a few milliseconds with a bit of randomness, and runs the whole transaction again from `BEGIN`.
+5. On the second try the invoice is already paid, so the `UPDATE ... WHERE status = 'open'` changes nothing, and your code reports "already paid".
+
 ```mermaid
 stateDiagram-v2
     [*] --> Running: BEGIN
@@ -328,9 +418,9 @@ stateDiagram-v2
 
 CockroachDB and Spanner default to **SERIALIZABLE**. CockroachDB does it optimistically: transactions do not take read locks, and conflicts found at write or commit time cause one transaction to restart. The client sees SQLSTATE `40001` with a message such as `restart transaction: TransactionRetryWithProtoRefreshError: ... RETRY_SERIALIZABLE`.
 
-CockroachDB added `READ COMMITTED` (generally available in v24.1) for workloads that cannot handle retries. YugabyteDB's YSQL behaves as snapshot isolation by default (what PostgreSQL calls `REPEATABLE READ`; `READ COMMITTED` maps to snapshot unless the `yb_enable_read_committed_isolation` flag is set) and also supports serializable.
+CockroachDB added `READ COMMITTED` (generally available in v24.1) for workloads that cannot handle retries. YugabyteDB's YSQL behaves as snapshot isolation (each transaction reads one frozen picture of the data) by default (what PostgreSQL calls `REPEATABLE READ`; `READ COMMITTED` maps to snapshot unless the `yb_enable_read_committed_isolation` flag is set) and also supports serializable.
 
-TiDB defaults to snapshot isolation under the name `REPEATABLE READ`, with pessimistic locking the default for new clusters since v3.0.8. Aurora DSQL uses optimistic concurrency control with snapshot isolation and reports conflicts at commit.
+TiDB defaults to snapshot isolation under the name `REPEATABLE READ`, with pessimistic locking the default for new clusters since v3.0.8. Aurora DSQL uses optimistic concurrency control (no locks up front; check for clashes at commit) with snapshot isolation and reports conflicts at commit.
 
 The practical rule for every one of them: **wrap each transaction in a retry loop**, and keep anything non-transactional (HTTP calls, emails, Kafka publishes) outside it.
 
@@ -416,6 +506,15 @@ Runnable Go version: [[Distributed SQL - Go]]
 
 **In plain words: all five products use the same recipe — sorted slices, voting copies, timestamps — and differ mainly in where the timestamps come from and which wire protocol they speak.**
 
+**Do not confuse it with** 🟡
+
+| Thing | Who splits the data | Transactions across servers | Typical example |
+| --- | --- | --- | --- |
+| Distributed SQL | The database, automatically | Yes, full SQL transactions | CockroachDB, Spanner |
+| PostgreSQL with replicas | Nobody: all writes on one primary | Not needed: one server | One primary, 2 read replicas |
+| Manual sharding | Your app code, by a key like `workspace_id` | No; your code must handle them | 8 PostgreSQL clusters plus routing |
+| NoSQL key-value store | The database | Usually not, or only on one key | Cassandra, DynamoDB |
+
 | System | Sharding and replication | Timestamps | Default isolation | Wire protocol | Notes |
 | --- | --- | --- | --- | --- | --- |
 | Google Spanner | Splits, Paxos per split | TrueTime + commit wait | Serializable, externally consistent | Native APIs, GoogleSQL and a PostgreSQL dialect | Managed only; strongest guarantees |
@@ -427,21 +526,23 @@ Runnable Go version: [[Distributed SQL - Go]]
 
 ## 6. Trade-offs and when not to use 🟡
 
-- **Latency floor.** Every write waits for a quorum. In one region that is a millisecond or two; across regions it is the round trip to the second-closest replica. A single PostgreSQL primary commits with one local fsync.
-- **Retries are part of the API.** Serializable plus optimistic concurrency means hot rows (one counter, one invoice sequence per workspace) cause restart storms. Code must be idempotent and wrapped in `RunTx`; hot counters need redesign.
-- **Not every PostgreSQL feature exists.** Extensions, some index types, triggers, `LISTEN/NOTIFY`, and exact planner behaviour vary by product and version. Test your schema and ORM before committing.
+- **Latency floor.** Every write waits for a quorum. In one region that is a millisecond or two; across regions it is the round trip to the second-closest replica. A single PostgreSQL primary commits with one local fsync (forcing the data onto the disk).
+- **Retries are part of the API.** Serializable plus optimistic concurrency means hot rows (one counter, one invoice sequence per workspace) cause restart storms. Code must be idempotent (safe to run twice with the same result) and wrapped in `RunTx`; hot counters need redesign.
+- **Not every PostgreSQL feature exists.** Extensions, some index types, triggers, `LISTEN/NOTIFY`, and exact planner behaviour vary by product and version. Test your schema and ORM (the library that maps code objects to tables) before committing.
 - **Sequences and time-ordered keys hot-spot.** `SERIAL` keys and `ORDER BY created_at` primary keys send all inserts to one range. Use UUIDs or hash-sharded indexes.
 - **Cost and operations.** Three or more replicas of everything, more CPU per query (key-value encoding, consensus), and a new system to learn.
 - **When a single PostgreSQL wins.** If the write load fits on one large machine (often thousands to tens of thousands of writes per second, an estimate that depends on the workload), reads scale with replicas, and failover of a few seconds with synchronous replication is acceptable, then PostgreSQL with replicas is simpler, cheaper and faster. Consider distributed SQL when writes outgrow one primary, when you need zero-data-loss failover across zones or regions, or when data residency forces rows into specific regions within one logical database.
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how ranges, commits, clocks and retries work, and which product does what. **Next comes the senior view**: how these systems fail in production, what to watch, and the deeper reasons behind follower reads, commit wait and their place in CAP.
+
 **Real systems.** Google built Spanner for its ads backend (F1) and offers it as Cloud Spanner. CockroachDB, YugabyteDB and TiDB are open-source or source-available and run self-hosted or as managed services. Aurora DSQL is AWS's serverless option.
 
 **Failure modes and fixes:**
 
 - *Retry storms on a hot row.* Many transactions update the same row and keep restarting each other. Fix: remove the hot row (per-shard counters, an append-only ledger summed later), use `SELECT … FOR UPDATE` to queue instead of abort, or shorten transactions.
-- *Uncertainty restarts.* Reads of recently written keys restart with `ReadWithinUncertaintyIntervalError`. Fix: good clock sync (chrony or a cloud time service), and follower reads or `AS OF SYSTEM TIME` for queries that tolerate staleness.
+- *Uncertainty restarts.* Reads of recently written keys restart with `ReadWithinUncertaintyIntervalError`. Fix: good clock sync (chrony, a program that keeps the server clock in step, or a cloud time service), and follower reads or `AS OF SYSTEM TIME` for queries that tolerate staleness.
 - *Clock skew past the maximum offset.* A CockroachDB node whose clock drifts beyond the configured offset terminates to protect consistency. Fix: monitor clock offset and alert well before the limit.
 - *Hot range.* A sequential key sends all writes to one leaseholder. Fix: hash-sharded index or UUID primary key; the database can split on load but cannot split a single hot key.
 - *Leaseholder far from users.* Reads cross an ocean. Fix: regional-by-row tables, lease preferences, follower reads.
@@ -451,7 +552,7 @@ Runnable Go version: [[Distributed SQL - Go]]
 
 ## 8. Deep dive 🔴
 
-**Why Raft per range and not one Raft for the cluster.** One log would serialise every write in the cluster through one leader. Thousands of small groups spread leadership across all nodes and let each range move, split and recover independently. The cost is per-group heartbeats; CockroachDB quiesces idle ranges and coalesces heartbeats per node pair.
+**Why Raft per range and not one Raft for the cluster.** One log would serialise every write in the cluster through one leader. Thousands of small groups spread leadership across all nodes and let each range move, split and recover independently. The cost is per-group heartbeats (small "I'm alive" messages); CockroachDB quiesces (puts to sleep) idle ranges and coalesces (bundles together) heartbeats per node pair.
 
 **Follower reads and closed timestamps.** A follower can serve a consistent read at time `t` only if it knows no write at or below `t` can still arrive.
 
@@ -511,6 +612,8 @@ CockroachDB guarantees serializability and orders causally related transactions,
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** A distributed SQL database cuts each table into slices and keeps 3 voting copies of every slice on different machines. A transaction that touches several slices writes pencil entries first, then flips one safely stored switch. Machines agree on the order of changes with timestamps, using special clocks or clock tricks. Expect "please retry" errors and handle them in code. If one normal database is big enough for you, it is simpler and faster.
+
 - Tables → sorted keys → ranges (CockroachDB, 512 MiB default), tablets (YugabyteDB), regions (TiDB); 3+ replicas, Raft per range.
 - Leaseholder serves consistent reads without consensus; writes need a quorum round.
 - Cross-range transactions = 2PC with write intents and a Raft-replicated transaction record; parallel commits cut one round.
@@ -519,6 +622,30 @@ CockroachDB guarantees serializability and orders causally related transactions,
 - Multi-region writes pay a cross-region quorum; pin rows to home regions and use follower reads for stale-tolerant queries.
 - Avoid sequential keys and hot rows.
 - One PostgreSQL primary with replicas wins whenever it fits.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is a range?
+> One slice of a table's sorted keys, stored as 3 or more voting copies on different machines.
+
+> [!question]- What should your code do when it gets error `40001`?
+> Roll back and run the whole transaction again from `BEGIN`, after a short random wait.
+
+> [!question]- Why does a sequential id like 1001, 1002, 1003 cause trouble?
+> Every new row sorts to the end, so all inserts hit the last range and one machine.
+
+🟡 Medium
+
+> [!question]- Why does 2PC here not get stuck when the coordinator crashes?
+> The transaction record and every pencil entry are stored by Raft on a majority, so any node can read the record and finish or abort the transaction.
+
+> [!question]- Why does Spanner wait a few milliseconds before saying "committed"?
+> Its clock may be off by up to ε; waiting until the earliest possible time passes the commit timestamp makes later transactions always get larger timestamps.
+
+> [!question]- Three replicas in US, EU and India, leader in the US. Why is every write about 70 ms?
+> A write needs 2 of 3 copies, and the closest second copy is in the EU, about 70 ms away.
 
 ## Links 🟢
 

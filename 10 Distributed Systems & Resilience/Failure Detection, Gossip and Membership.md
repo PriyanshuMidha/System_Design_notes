@@ -36,6 +36,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Distributed Systems Fundamentals]]: over a network, a crashed machine and a very slow one look exactly the same: both are silent.
+> - [[Timeouts, Retries and Backoff]]: a timeout is how long you wait before giving up; too short causes false alarms, too long makes users wait.
+> - [[Quorums and Leaderless Replication]]: data is kept on several replicas, and a replica that missed writes must be repaired later.
+
 **From zero, in 60 seconds** 🟢
 
 In a cluster of many servers, each one needs to know which others are alive.
@@ -85,6 +90,11 @@ And everyone in the group should reach the same decision without one person bein
 | Gossip | Telling a few random peers what you know, repeatedly | Each node talks to 3 others per second |
 | Membership list | Each node's view of who is in the cluster and their state | `node47: suspect` |
 | Single point of failure | One part whose loss stops everything | A central health-check server |
+| Suspect | "Probably dead, not yet sure" | `node47: suspect` for a few seconds |
+| Incarnation number | A counter only the node itself can raise, to prove it is alive | B says "alive@6" to beat "suspect@5" |
+| Fanout | How many random peers each node tells per round | Fanout 3 |
+| Flapping | A node marked down, then up, then down again | Every GC pause marks it dead |
+| Anti-entropy | A background job that compares replicas and fixes differences | Cassandra `nodetool repair` |
 
 **Picture it**
 
@@ -113,9 +123,9 @@ Where it breaks: office rumours are rarely corrected, but SWIM lets a suspected 
 
 ## 1. Why it exists 🟢
 
-A 300-node Cassandra cluster loses a node to a kernel panic. Coordinators keep sending it reads and writes; each one waits for a timeout, latency climbs, and the client retries make it worse.
+A 300-node Cassandra cluster loses a node to a **kernel panic** (the operating system itself crashes). **Coordinators** (the nodes that forward client requests to replicas) keep sending it reads and writes; each one waits for a timeout, latency climbs, and the client retries make it worse.
 
-The cluster needs to learn, within seconds, "node 47 is down: stop routing to it, store hints for it, and replace it if it does not come back".
+The cluster needs to learn, within seconds, "node 47 is down: stop routing to it, store **hints** (writes saved for it to replay later) for it, and replace it if it does not come back".
 
 Every node needs the same answer, without a central server that would itself be a single point of failure.
 
@@ -125,22 +135,48 @@ Three separate jobs hide in that sentence:
 2. **Disseminate:** tell all other nodes, cheaply.
 3. **Agree on membership:** keep a list of members and their states that converges on every node.
 
+### Real-life example 🟢
+
+A Swiggy delivery partner's app sends its location every few seconds. That is a heartbeat.
+If the app goes quiet for a minute, Swiggy does not instantly reassign the order: the rider may just be in a lift or a tunnel.
+It first marks the rider "maybe offline", tries again, and only reassigns after a longer silence.
+Big server clusters do the same with each other: suspect first, confirm later, because silence alone cannot prove someone is gone.
+
 ## 2. Mental model 🟢
+
+🟢 **Plain version:** A good failure detector should do two things: notice every crashed node in the end, and not blame healthy nodes. You cannot fully have both quickly. A short timeout catches crashes fast but also blames nodes that just paused for a moment. A long timeout rarely blames wrongly but leaves users waiting on dead nodes.
 
 **Detector properties** (Chandra and Toueg, 1996):
 
 - **Completeness:** every crashed node is eventually suspected by every correct node.
 - **Accuracy:** correct nodes are not suspected (or, in the weaker form, eventually not suspected).
 
-You cannot have perfect accuracy and fast completeness at the same time on an asynchronous network. A short timeout catches crashes quickly and flags healthy nodes during a GC pause; a long one is accurate and slow.
+You cannot have perfect accuracy and fast completeness at the same time on an **asynchronous network** (one with no upper limit on message delay). A short timeout catches crashes quickly and flags healthy nodes during a **GC pause** (the program freezing while its memory cleaner runs); a long one is accurate and slow.
 
 **Analogy.** Rumours in an office. You do not phone all 300 colleagues when you hear news; you tell 3 people you happen to meet, each of them tells 3 more, and within a lunch break everyone knows. Before you declare that Sam has left the company because Sam missed a meeting, you ask two other people to check on Sam, and if Sam hears the rumour, Sam can say "I'm still here".
 
+## Common beginner mistakes 🟢
+
+- **Every node heartbeats every other node** → 1,000 nodes means about a million messages per interval → use gossip or SWIM, where each node talks to only a few peers.
+- **One central monitor that watches everyone** → if it dies, nobody knows who is alive → spread detection across the nodes, or back it with a highly available store.
+- **Declaring a node dead after one missed heartbeat** → a short GC pause or a dropped packet triggers needless failovers → suspect first, ask others to check, then confirm.
+- **Acting as leader because "the old leader seems dead"** → it may be alive behind a network break, giving two leaders → use a lease or consensus plus fencing.
+- **Relying on gossip alone to fix data** → gossip spreads membership news, not every missed write → run regular anti-entropy repair.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a detector can only suspect, never know, and that gossip spreads news by each node telling a few others. **Next we open the box**: plain heartbeats, the phi accrual suspicion score, the SWIM protocol, member states and how fast gossip really spreads. Each subsection starts with a short walk-through.
 
 ### Heartbeats and timeouts
 
 **In plain words:** expect a heartbeat every T seconds; if you hear nothing for a few T, suspect the node.
+
+**Step by step:**
+1. Node A sends B a heartbeat every 1 second (T = 1 s).
+2. B notes the time of each heartbeat it receives.
+3. A pauses for 4 seconds. B hears nothing.
+4. B's rule is "suspect after 3 missed beats" (k = 3), so at 3 s of silence B marks A suspect.
+5. A wakes up and sends a heartbeat at 4 s. B clears the suspicion. A was never dead: this was a false positive.
 
 The basic detector: node B expects a heartbeat from A every `T` seconds and suspects A after `k × T` of silence. All-to-all heartbeats cost `N²` messages per period; heartbeating to a central monitor costs `N` but creates a single point of failure. Gossip and SWIM keep the per-node cost constant.
 
@@ -155,17 +191,24 @@ flowchart LR
 
 **In plain words:** instead of yes or no, give a suspicion score that grows with silence, based on how regular the heartbeats normally are.
 
+**Step by step:**
+1. B keeps the last few gaps between A's heartbeats: about 1 s each.
+2. 1 s of silence is normal, so the score (phi) is low, about 0.4.
+3. After 5 s of silence the score is about 2: unusual, but A is probably still alive.
+4. After 19 s the score passes 8. The chance A is just late is tiny, so B convicts A.
+5. Node C usually sends every 3 s. The same 5 s of silence gives C a much lower score, because that is closer to C's normal rhythm.
+
 Instead of answering "dead or alive", the phi accrual detector (Hayashibara et al., 2004) outputs a suspicion level:
 
 `phi = -log10( P(the next heartbeat arrives later than now) )`
 
-It learns the distribution of recent heartbeat gaps from a sliding window. If heartbeats usually arrive every 1 s and it has been 1 s, phi is low; after 18 s, phi is high.
+It learns the distribution of recent heartbeat gaps from a **sliding window** (only the most recent gaps are kept; older ones are forgotten). If heartbeats usually arrive every 1 s and it has been 1 s, phi is low; after 18 s, phi is high.
 
 The application picks a threshold: Cassandra convicts a node when phi exceeds `phi_convict_threshold`, default 8.
 
 Because the model adapts to each node's normal rhythm, a node on a jittery link is not convicted for jitter it always has.
 
-With exponentially distributed gaps (Cassandra's approximation), `phi = elapsed / (mean × ln 10)`. For a 1 s mean gap:
+With exponentially distributed gaps (a simple statistical model of random waiting times; Cassandra's approximation), `phi = elapsed / (mean × ln 10)`. For a 1 s mean gap:
 
 | Silence | phi | Chance the node is alive and just late |
 | --- | --- | --- |
@@ -201,16 +244,23 @@ sequenceDiagram
     Note over A,D: if nobody hears "B alive@6" before the suspicion timeout, B is marked Dead
 ```
 
-1. **Probe:** every protocol period (memberlist's LAN default: 1 s), each node pings one random member.
+1. **Probe:** every protocol period (memberlist, HashiCorp's Go SWIM library, uses a LAN default of 1 s), each node pings one random member.
 2. **Indirect probe:** if no ack arrives within the probe timeout (500 ms), it asks `k` other members (3 by default) to ping the target on its behalf. This filters out a bad link between just two nodes.
 3. **Suspect:** still no ack → mark the target **Suspect**, not Dead, and gossip that.
 4. **Refute:** the suspected node, on hearing the rumour, increments its **incarnation number** and gossips "Alive" with the higher incarnation. Only the node itself may raise its incarnation.
 5. **Confirm:** if the suspicion timeout passes without a refutation, the member is marked **Dead** and removed.
-6. **Disseminate:** membership updates ride piggybacked on ping and ack messages (infection style), so there are no extra messages.
+6. **Disseminate:** membership updates ride **piggybacked** (attached for free) on ping and ack messages (infection style), so there are no extra messages.
 
 ### Member states
 
 **In plain words:** a node moves from alive to suspect to dead, and a suspect can clear its name by saying "I'm alive" with a newer number.
+
+**Step by step:**
+1. B joins the cluster as "Alive, incarnation 0". Over time it is at incarnation 5.
+2. A cannot reach B and spreads "B suspect@5".
+3. B hears this rumour about itself. It raises its own number and spreads "B alive@6".
+4. Every node compares: 6 is higher than 5, so "alive@6" wins and B is cleared.
+5. If B were really down, nobody would hear "alive@6", and after the suspicion timeout B becomes Dead.
 
 ```mermaid
 stateDiagram-v2
@@ -227,6 +277,13 @@ The merge rule that makes every node converge: Dead is final in this simplified 
 ### Gossip dissemination
 
 **In plain words:** each node passes news to a few random nodes each round, so the number who know roughly triples each round.
+
+**Step by step:**
+1. Node A learns "C has left". It tells 3 random nodes (fanout 3).
+2. Next round, those 4 nodes each tell 3 random nodes: about 16 now know.
+3. Next round about 64, then about 250, then about 1,000.
+4. Near the end, most picks hit nodes that already know, so the last few take a couple of extra rounds.
+5. For 10,000 nodes, this takes about 10 rounds: about 2 seconds at one round every 200 ms.
 
 Each round, each node that knows an update sends it to `f` random peers (the **fanout**). The number of informed nodes roughly multiplies each round, then a tail of rounds catches the last few nodes.
 
@@ -469,24 +526,34 @@ func TestRefute(t *testing.T) {
 | SWIM + Lifeguard (memberlist) | Nodes that notice they are slow (missed acks) widen their own timeouts; suspicion timeouts shrink as more peers confirm | Production SWIM | More tuning knobs |
 | Anti-entropy (Merkle trees) | Replicas compare hash trees of their data and stream only differing ranges | Repairing data after missed writes (Dynamo, Cassandra repair) | CPU and I/O to build trees; run periodically |
 
+### Failure detection versus things people confuse it with 🟡
+
+| Thing | What it answers | How it differs |
+| --- | --- | --- |
+| Health check (load balancer, Kubernetes probe) | "Should I send traffic to this server?" | One checker watches many targets; gossip detection is spread across all nodes |
+| Consensus membership (Raft, etcd) | "Who are the official voters?" | One agreed answer for a few nodes; gossip gives a fast, possibly briefly different answer for thousands |
+| Leader election | "Who is in charge now?" | Needs agreement and fencing; a detector only gives the hint that the old leader may be gone |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - **Speed vs false positives.** Lower thresholds detect crashes faster and cause more flapping during GC pauses, CPU starvation or packet loss. False suspicion is not free: it triggers re-replication, hinted handoff or failover.
-- **A detector is advice, not truth.** Never use "I think the leader is dead" as the only reason to start acting as leader. Pair detection with a lease or a consensus decision and fencing (see [[Leader Election]]).
+- **A detector is advice, not truth.** Never use "I think the leader is dead" as the only reason to start acting as leader. Pair detection with a lease (a time-limited right to act) or a consensus decision and **fencing** (rejecting commands from an old leader) (see [[Leader Election]]).
 - **Gossip is eventually consistent.** Two nodes may disagree about membership for a few rounds. That is fine for routing and monitoring and wrong for anything needing a single authoritative decision, such as which node owns a lock.
-- **Small, fixed clusters do not need SWIM.** Three to five nodes behind a consensus protocol already have heartbeats in Raft; a Kubernetes deployment already has kubelet health checks and the node lifecycle controller.
+- **Small, fixed clusters do not need SWIM.** Three to five nodes behind a consensus protocol already have heartbeats in Raft; a Kubernetes deployment already has kubelet (the agent on each Kubernetes machine) health checks and the node lifecycle controller.
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how heartbeats, phi accrual and SWIM decide who is suspect, how incarnation numbers let a node clear its name, and how gossip reaches everyone in about log N rounds. **Next comes the advanced part**: how Cassandra, Consul, Dynamo, Akka and Redis Cluster use this, the failure modes (flapping, asymmetric partitions, zombies), and the tuning formulas behind memberlist.
+
 - **Real systems:**
 	- **Cassandra:** each node gossips every second with up to three other nodes, exchanging heartbeat generations and versions per endpoint; phi accrual (threshold 8) marks peers down; Merkle-tree repair (`nodetool repair`) fixes data divergence (see [[Wide-Column Stores and Cassandra]]).
-	- **Consul and Nomad:** Serf, built on hashicorp/memberlist (SWIM + Lifeguard), runs a LAN gossip pool per datacenter and a WAN pool between server nodes. Raft among the servers holds the authoritative catalog (see [[Consensus - Raft and Paxos]]).
+	- **Consul and Nomad:** Serf, built on hashicorp/memberlist (SWIM + Lifeguard), runs a LAN gossip pool per datacenter (nodes on the same local network) and a WAN pool (across the wide-area network between sites) between server nodes. Raft among the servers holds the authoritative catalog (see [[Consensus - Raft and Paxos]]).
 	- **Dynamo (2007):** gossip for membership and ring ownership, hinted handoff for temporary failures, Merkle trees for anti-entropy (see [[Quorums and Leaderless Replication]] and [[Consistent Hashing]]).
 	- **Akka Cluster:** gossip membership plus a phi accrual detector.
-	- **Redis Cluster:** nodes exchange ping/pong over a cluster bus; a master is marked failing when a majority of masters report it unreachable within a validity window of twice the node timeout.
+	- **Redis Cluster:** nodes exchange ping/pong over a cluster bus (a separate port just for node-to-node talk); a master is marked failing when a majority of masters report it unreachable within a validity window of twice the node timeout.
 - **Failure modes → fixes:**
 	- Flapping during GC pauses or CPU saturation → raise the phi threshold or suspicion multiplier; Lifeguard-style local health awareness; fix the pauses.
-	- Asymmetric partition (A can reach B but not the reverse) → indirect probes through other nodes; require several independent suspicions.
+	- **Asymmetric partition** (A can reach B but not the reverse) → indirect probes through other nodes; require several independent suspicions.
 	- Zombie node rejoins with stale state → incarnation numbers or generation (Cassandra uses a generation number set at process start), so old state loses the merge.
 	- Gossip storm after a mass restart → rate-limit gossip, cap message size, stagger restarts.
 	- Membership disagreement causes mis-routing → clients retry on another replica; data placement tolerates it through replication and hinted handoff.
@@ -531,6 +598,30 @@ func TestRefute(t *testing.T) {
 - memberlist LAN: probe 1 s, timeout 500 ms, 3 indirect checks, gossip every 200 ms to 3 nodes.
 - Merkle trees repair data that writes and hinted handoff missed.
 - Detection is a hint; leadership needs consensus and fencing.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why can a failure detector only "suspect"?
+> A slow node and a dead node are both silent, so silence alone never proves a crash.
+
+> [!question]- What is gossip?
+> Each node repeatedly tells a few random peers what it knows, so news spreads like a rumour.
+
+> [!question]- Why not have every node heartbeat every other node?
+> It needs N × N messages: about a million per interval for 1,000 nodes.
+
+🟡 Medium
+
+> [!question]- In SWIM, why ask other nodes to ping the target before suspecting it?
+> A single bad link or a busy prober could make a healthy node look dead; indirect pings check from several places.
+
+> [!question]- B is "suspect@5". How does B clear its name?
+> It gossips "alive@6". Only B may raise its own incarnation, and the higher number wins the merge.
+
+> [!question]- Heartbeats usually come every 1 s. Is 5 s of silence enough to convict at phi threshold 8?
+> No. 5 s gives phi of about 2; it takes about 19 s of silence to pass 8.
 
 ## Links
 

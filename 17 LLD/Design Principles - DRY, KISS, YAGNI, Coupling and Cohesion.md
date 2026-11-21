@@ -36,6 +36,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[OOP in Go - Structs, Interfaces, Embedding]]: Go builds types from structs with methods, uses small interfaces to swap behaviour, and has no inheritance.
+
 **From zero, in 60 seconds** 🟢
 
 Patterns are answers. Principles are rules of thumb that tell you where code should go.
@@ -74,6 +77,10 @@ Design principles are simple rules that stop this kind of mess before it starts.
 | Coupling | How much one module must know about another | Code reading `order.Customer.Address.City` knows three types |
 | Cohesion | How well the parts of one module belong together | A `wallet` package that only handles balances |
 | Refactor | Change code structure without changing behaviour | Move a duplicated formula into one function |
+| Interface | A list of methods; any type that has them can be used | `type Saver interface { Save(o Order) error }` |
+| Invariant | A rule that must always be true | "Wallet balance is never negative" |
+| Mutex | A lock that lets only one goroutine run a piece of code at a time | `mu.Lock()` around the balance check and the debit |
+| Non-functional requirement (NFR) | How well the system must work, not what it does | "Many gates can book at the same moment" |
 
 **Picture it**
 
@@ -108,6 +115,10 @@ Take a cart checkout service in its first month.
 
 The principles are the vocabulary for spotting and naming these problems in an LLD round, before they are coded.
 
+### Real-life example: a refund window 🟢
+
+Picture a shopping app like Flipkart or Myntra with a "return within 7 days" rule. That rule shows up on the order page, in the support agent's tool and in the refund job. If it is copied into three places, the day the window becomes 10 days someone will update only two, and the app will show "Return" on a screen where the API then says no. With DRY, all three ask one `CanReturn(order)` function, so one change fixes every screen. And under YAGNI you would not build a "return policy engine" until a second, different policy actually exists.
+
 ## 2. Mental model 🟢
 
 Every piece of code answers two questions: **what does it know**, and **why would it change**?
@@ -119,11 +130,36 @@ Every piece of code answers two questions: **what does it know**, and **why woul
 
 **Analogy:** a kitchen. DRY is one recipe card per dish, not three slightly different copies. KISS is not buying a 40-piece knife set before you know what you will cook. Cohesion is keeping the spices in one cupboard; low coupling is the waiter asking the chef for a dish rather than walking in and cooking it.
 
+## Common beginner mistakes 🟢
+
+- **Merging any two blocks that look alike** → if they change for different reasons, the shared code ties them together and grows flags → first ask "would they change for the same reason?", and merge only if yes.
+- **Building an interface or engine "for later"** → you guess the shape before you have seen real cases, and usually guess wrong → write the concrete code; abstract at the third real case, or when a test needs a fake.
+- **Creating a `util` or `common` package** → it becomes a junk drawer that every package imports → put each helper next to the code that uses it.
+- **Reading another object's data and deciding for it** (`if wallet.Balance() >= x { wallet.SetBalance(...) }`) → every caller must repeat the rule and the lock → tell the owner to do it: `wallet.Debit(x)`.
+- **Treating KISS as "skip the hard parts"** → if the interviewer said many users book at once, a lock is the requirement, not extra complexity → YAGNI only cuts needs nobody stated.
+
+### Compare: principles, SOLID and patterns 🟡
+
+| Thing | What it is | Example | Note |
+| --- | --- | --- | --- |
+| Design principles (this note) | Broad rules of thumb about where knowledge goes | DRY, KISS, YAGNI, low coupling | Apply to any language or layer |
+| SOLID | Five more specific rules for types and interfaces | Single responsibility, dependency inversion | [[SOLID in Go]] |
+| Design patterns | Named, ready-made shapes for a recurring problem | Strategy for pricing rules | [[Design Patterns Overview and Chooser]] |
+
+> 🟢 → 🟡 **You now know** the five rules in one line each, and that they can pull against each other. **Next we open the box**: how to tell real duplication from look-alike code, a test for when an interface is worth adding, the kinds of coupling from loose to tight, and why "tell, don't ask" also fixes concurrency bugs.
+
 ## 3. How it works 🟡
 
 ### DRY: one authoritative representation
 
 **In plain words: DRY is about one owner per rule, not about removing every line that looks alike.**
+
+**Step by step:**
+1. You spot the same check in two places: `status == "created" || status == "reserved"` in the order page and in the admin tool.
+2. Ask: is this the same rule, and would both change for the same reason? Yes, it is "can this order be cancelled?".
+3. Is it critical (money, state, permissions)? Yes, so merge it now into one `CanCancel` function.
+4. If it were not critical, wait for a third copy before extracting.
+5. If a shared function later needs a new `true/false` flag for every caller, it was the wrong abstraction: copy it back and re-extract only the truly shared part.
 
 The Pragmatic Programmer defines DRY as "every piece of knowledge must have a single, unambiguous, authoritative representation within a system". The unit is knowledge, not text:
 
@@ -147,7 +183,13 @@ Duplication of the same knowledge is **real duplication**; similar-looking code 
 
 **In plain words: build what is needed now, in the plainest way.**
 
-- **KISS:** the simplest design that satisfies the stated use cases. In Go that means fewer types, plain structs, direct control flow, explicit errors, no reflection, and no framework layers. A useful measure in an interview: can you explain the core flow of each type in one sentence, and does every type appear in at least one use case?
+**Step by step:**
+1. Today there is one coupon, `SAVE50`. Write one `if` in `Total`.
+2. Someone suggests a `DiscountEngine` with a plugin interface. Ask the four questions below; all answers are "no", so do not build it.
+3. A second discount arrives. Add a second `if`; two cases do not yet show the shape.
+4. A third arrives. Now the shape is clear, so extract a small `Rule` type.
+
+- **KISS:** the simplest design that satisfies the stated use cases. In Go that means fewer types, plain structs, direct control flow, explicit errors, no reflection (code that inspects types while the program runs), and no framework layers. A useful measure in an interview: can you explain the core flow of each type in one sentence, and does every type appear in at least one use case?
 - **YAGNI:** do not build capability for requirements nobody has stated. Fowler calls the result **speculative generality**: hooks, parameters and interfaces with one implementation "in case we need it".
 - Rule from practice: **simple first, extensible where the requirement demands it.**
 
@@ -186,6 +228,13 @@ The "critical rule" shortcut matters: a cancellation, pricing or permission rule
 
 **In plain words: coupling is how tied two parts are; cohesion is how well one part sticks to one job.**
 
+**Step by step:**
+1. Look at what a function receives. `SendReceipt(o *Order)` gets the whole order but only needs an email address.
+2. That is stamp coupling: if `Order` changes shape, `SendReceipt` may break for no reason.
+3. Pass only what is needed: `SendReceipt(email string)`. That is data coupling, the loosest kind.
+4. Now look at the package it lives in. If `package util` also holds tax rates and retry code, cohesion is low.
+5. Move it to a package with one job, such as `package notify`.
+
 **Coupling** is how much one module must know about another to work and to change. From loosest to tightest (after Stevens, Myers and Constantine):
 
 | Kind | Example in Go | Problem |
@@ -194,12 +243,12 @@ The "critical rule" shortcut matters: a cancellation, pricing or permission rule
 | Stamp | `SendReceipt(o *Order)` when it only needs an email | Breaks when `Order` changes shape |
 | Control | `Process(o, mode string)` where `mode` picks the branch inside | Caller knows callee's internals |
 | External | Two packages both depend on the exact JSON shape of a third-party API response | A change outside your code breaks both |
-| Common | Two packages read and write a package-level `var config` | Hidden shared state, races |
-| Content | Reaching into another package's internals (only possible through `unsafe` or reflection in Go; the in-package equivalent is touching another type's fields) | Any internal change breaks you |
+| Common | Two packages read and write a package-level `var config` | Hidden shared state, races (two goroutines changing the same data at once) |
+| Content | Reaching into another package's internals (only possible through `unsafe`, Go's package for bypassing type safety, or reflection in Go; the in-package equivalent is touching another type's fields) | Any internal change breaks you |
 
 **Cohesion** is how strongly the parts of one module belong together. Best is **functional** cohesion (everything in `package pricing` computes prices). Worst is **coincidental** cohesion: `package util` or `common` holding string helpers, retry logic and tax rates. The Go blog on package names advises against `util`, `common` and `misc` for exactly this reason.
 
-**Separation of concerns** in a Go service is coupling and cohesion applied to layers:
+**Separation of concerns** (each layer handles one kind of work and nothing else) in a Go service is coupling and cohesion applied to layers:
 
 | Layer | Knows about | Must not know about |
 | --- | --- | --- |
@@ -212,6 +261,13 @@ The full request path is in [[Backend Request Lifecycle and Layering]].
 ### Law of Demeter and tell, don't ask
 
 **In plain words: talk to your direct friends only, and tell objects what to do instead of pulling out their data.**
+
+**Step by step:**
+1. The checkout code wants to take ₹175 from a wallet that holds ₹200.
+2. "Ask" style: it reads the balance, checks 200 ≥ 175, then sets the balance to 25. The rule now lives in checkout.
+3. Two checkouts do this at once: both read 200, both pass, and only one debit is recorded.
+4. "Tell" style: checkout calls `wallet.Debit(17500)`. The wallet checks and changes the balance inside one method, under one lock.
+5. The second checkout now gets `ErrInsufficientFunds` instead of a free order.
 
 The **Law of Demeter** (Lieberherr and Holland, 1989): a method should call methods only on its own object, its parameters, objects it creates, and its direct fields, not on objects returned by those. `order.Customer().Wallet().Debit(x)` breaks it: checkout now depends on the shape of `Customer` and `Wallet`.
 
@@ -237,7 +293,7 @@ sequenceDiagram
     W-->>C2: ErrInsufficientFunds
 ```
 
-In the "tell" version, the check and the update are one method, so adding a mutex (or a conditional SQL `UPDATE`) inside `Debit` fixes concurrency for every caller at once. In the "ask" version every caller must remember to lock.
+In the "tell" version, the check and the update are one method, so adding a mutex (or a conditional SQL `UPDATE`, one whose `WHERE` clause checks the rule, such as `balance >= 17500`) inside `Debit` fixes concurrency for every caller at once. In the "ask" version every caller must remember to lock.
 
 ```mermaid
 flowchart LR
@@ -249,7 +305,13 @@ flowchart LR
 
 **In plain words: build bigger things by putting small parts together, not by deep family trees of types.**
 
-The GoF book's advice, "favor object composition over class inheritance", is built into Go: there is no inheritance. Build behaviour by holding small parts (a `Service` holds a `Saver`, a `Clock`, a `[]Rule`) instead of deep "is-a" trees. The parts can be swapped and tested alone. How embedding differs from inheritance is in [[OOP in Go - Structs, Interfaces, Embedding]].
+**Step by step:**
+1. You need a checkout `Service` that saves orders, reads the time and applies discount rules.
+2. Instead of inheriting from a `BaseService`, give it three fields: a `Saver`, a `Clock` and a `[]Rule`.
+3. `main` passes the real database saver, the real clock and the real rules.
+4. A test passes an in-memory saver, a fixed clock and one rule, and checks the result.
+
+The GoF book's advice, "favor object composition over class inheritance", is built into Go: there is no inheritance. Build behaviour by holding small parts (a `Service` holds a `Saver`, a `Clock`, a `[]Rule`) instead of deep "is-a" trees (inheritance chains such as "a `PremiumUser` is a `User`"). The parts can be swapped and tested alone. How embedding differs from inheritance is in [[OOP in Go - Structs, Interfaces, Embedding]].
 
 ## 4. Worked example 🟡
 
@@ -311,14 +373,14 @@ func Total(c Cart) int64 {
 }
 ```
 
-**Pricing v2.** A second discount arrives (first order 10%, capped). It is tempting to build the rule engine now. Two cases are not yet enough to see the shape, so the honest move is a second `if`. **Pricing v3.** A third discount (bulk milk) arrives, and now the shape is clear: each rule looks at the cart and the amount still payable, and returns a discount. Three real variations justify a `Rule` type (rule of three), and the "never below zero" invariant moves into the one function that applies them (DRY).
+**Pricing v2.** A second discount arrives (first order 10%, capped). It is tempting to build the rule engine now. Two cases are not yet enough to see the shape, so the honest move is a second `if`. **Pricing v3.** A third discount (bulk milk) arrives, and now the shape is clear: each rule looks at the cart and the amount still payable, and returns a discount. Three real variations justify a `Rule` type (rule of three), and the "never below zero" invariant (the rule that must always hold) moves into the one function that applies them (DRY).
 
 | Version | Discounts | Design | Why |
 | --- | --- | --- | --- |
 | v1 | `SAVE50` | One `if` in `Total` | KISS; nothing varies |
 | v2 | + first order 10% | Two `if`s | Two cases; shape not clear yet |
-| v3 | + bulk SKU | `type Rule func(Cart, int64) int64`, `Total(c, rules...)` | Third variation; shape is now visible |
-| Not built | Plugin registry, rule DSL, priorities | — | YAGNI: no requirement |
+| v3 | + bulk SKU (stock keeping unit: one product code, here milk) | `type Rule func(Cart, int64) int64`, `Total(c, rules...)` | Third variation; shape is now visible |
+| Not built | Plugin registry, rule DSL (a mini language just for writing rules), priorities | — | YAGNI: no requirement |
 
 ### Whiteboard version
 
@@ -346,6 +408,8 @@ func Total(c Cart, rules ...Rule) int64 {
 ### Full code (tested)
 
 **In plain words: the before and after code, with tests.**
+
+**What this code does, in plain words:** `CanCancel` is the one owner of the cancel rule. `Total` adds up the cart and then applies a list of discount rules in order, never letting the amount go below zero. Each rule (`FlatCoupon`, `FirstOrderPercent`, `BulkSKU`) is just a function. `Wallet.Debit` checks and changes the balance in one method (tell, don't ask). The tests after it check the rules alone and all three together, with the sums written in the comments.
 
 ```go
 // Package pricing is the DRY/KISS/YAGNI worked example: cart discounts.
@@ -556,7 +620,7 @@ When rules need names, logging or persistence, an interface with `Discount` and 
 | --- | --- | --- | --- |
 | DRY | One owner per piece of knowledge | Business rules, formulas, state transitions, permission checks | Wrong abstractions, flag parameters, a `util` package everyone imports |
 | KISS | Simplest design that meets the use cases | Always the default, especially in a timed round | Under-design: one 500-line function, missing edge cases |
-| YAGNI | Do not build for imagined needs | Plugin systems, generic engines, extra interfaces | Ignoring stated non-functional requirements (concurrency, idempotency) |
+| YAGNI | Do not build for imagined needs | Plugin systems, generic engines, extra interfaces | Ignoring stated non-functional requirements (concurrency, idempotency, meaning a retry must not charge twice) |
 | Low coupling | Know little about other modules | Package and layer boundaries | Interfaces between every pair of types; indirection everywhere |
 | High cohesion | One module, one job | Package design, type responsibilities | Dozens of one-function packages |
 | Law of Demeter | Talk to direct collaborators only | Domain objects with rules (wallet, order) | Wrapper methods for every field on plain data structs |
@@ -586,10 +650,10 @@ And the YAGNI test the other way: a pattern is justified by a real problem.
 ## 6. Trade-offs and when not to use 🟡
 
 - **DRY vs coupling.** Every extraction couples its callers to each other through the shared code. Extract when they change together; duplicate when they change apart.
-- **DRY in tests.** Table-driven tests remove repetition, but test helpers that hide the arrange and assert steps make failures hard to read. A little repetition in tests is often clearer.
+- **DRY in tests.** Table-driven tests (one test loop over a list of input and expected-output rows) remove repetition, but test helpers that hide the arrange and assert steps make failures hard to read. A little repetition in tests is often clearer.
 - **KISS vs stated NFRs.** If the interviewer said "many gates at once", a mutex is not over-engineering; it is the requirement. YAGNI applies to *unstated* needs only.
-- **YAGNI vs expensive-to-change decisions.** Money as `int64` minor units, IDs as strings, and a clock interface cost nothing now and are expensive to retrofit. Make those choices on day one.
-- **Law of Demeter on data.** Plain data structures (DTOs, config) are meant to be read; `cfg.DB.Host` is fine. The law matters for objects that own rules.
+- **YAGNI vs expensive-to-change decisions.** Money as `int64` minor units (paise, not rupees), IDs as strings, and a clock interface cost nothing now and are expensive to retrofit (add later to code that already exists). Make those choices on day one.
+- **Law of Demeter on data.** Plain data structures (DTOs, data transfer objects that only carry fields, and config) are meant to be read; `cfg.DB.Host` is fine. The law matters for objects that own rules.
 - **Interfaces for testability.** A fake for the database or clock is a real need even with one production implementation; that is one of the four questions, not a YAGNI violation.
 
 ```mermaid
@@ -599,16 +663,18 @@ flowchart TD
     Q2 -- "no" --> K["Keep both: they only look alike"]
 ```
 
+> 🟡 → 🔴 **You now know** how to apply each principle to real Go code and how to settle the clashes between them. **Next comes the senior view**: how these rules show up in real codebases, the failure signs to watch for in code review, and the finer idea of connascence that interviewers sometimes probe.
+
 ## 7. In production 🔴
 
-- **Real systems:** the Go standard library shows cohesion by package (`net/http`, `encoding/json`, `strconv`), small interfaces that keep coupling low (`io.Reader`), and almost no `util` packages. Proverbs like "a little copying is better than a little dependency" are why many Go projects vendor or copy small helpers instead of importing a utility module.
+- **Real systems:** the Go standard library shows cohesion by package (`net/http`, `encoding/json`, `strconv`), small interfaces that keep coupling low (`io.Reader`), and almost no `util` packages. Proverbs like "a little copying is better than a little dependency" are why many Go projects vendor (keep a copy of a dependency's code inside their own repo) or copy small helpers instead of importing a utility module.
 - **Failure modes → fixes:**
 
 | Failure | Symptom | Fix |
 | --- | --- | --- |
 | Rule duplicated across handlers | UI and API disagree after a change | One function or method owns it; callers call it |
 | Wrong abstraction | Shared function with 4 boolean flags | Inline into callers, re-extract only the shared part |
-| `util` package | Every package imports it; import cycles | Move each helper next to its only real user |
+| `util` package | Every package imports it; import cycles (A imports B and B imports A, which Go refuses to build) | Move each helper next to its only real user |
 | Speculative interface | Interface with one implementation and no fake | Delete it; reintroduce when a second use appears |
 | Ask-then-act on shared state | Lost updates, negative balances | Tell the owner to do it in one method, under its lock or one SQL statement |
 | Handler with SQL | Business rule untestable without HTTP and a database | Move the rule into the service; repo behind an interface |
@@ -661,6 +727,26 @@ flowchart TD
 - Four interface questions: second implementation? test fake? external boundary? simpler caller?
 - Low coupling (pass data, not modes), high cohesion (no `util`), handler/service/repo.
 - Tell, don't ask: the owner checks and changes its own state in one method.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What does DRY ask you to keep in one place: lines of code or knowledge?
+> Knowledge, such as a business rule or a formula. Look-alike lines that change for different reasons can stay apart.
+
+> [!question]- 🟢 What is the difference between KISS and YAGNI?
+> KISS is about building what you need in the plainest way; YAGNI is about not building things nobody asked for.
+
+> [!question]- 🟢 What does high cohesion mean for a Go package?
+> Everything in it does one job, like `package pricing`; a `util` package is the opposite.
+
+> [!question]- 🟡 You see the same tax rate `18` in pricing and invoice code. Merge or keep?
+> Merge it into one constant or function: it is the same knowledge and would change for the same reason.
+
+> [!question]- 🟡 Why does "tell, don't ask" help with concurrency?
+> The check and the change live in one method of the owner, so one lock inside that method protects every caller.
+
+> [!question]- 🟡 When is an interface with only one real implementation still fine?
+> When you need a fake for it in tests (database, clock, network) or it wraps an outside, unstable service such as a payment gateway.
 
 ## Links 🟢
 

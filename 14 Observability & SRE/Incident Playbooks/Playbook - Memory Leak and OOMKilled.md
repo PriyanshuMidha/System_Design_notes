@@ -36,6 +36,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how an OOM kill happens), 4 (first 5 minutes and the incident), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Production Debugging Playbook]]: check "what changed" first, and stop the damage before hunting the cause.
+> - [[Incident Response]]: one person leads, and you post short updates on a fixed schedule.
+
 **From zero, in 60 seconds** 🟢
 
 Every running app uses **memory** (RAM) to hold the things it is working on.
@@ -85,6 +89,12 @@ It restarts, creeps up again, and dies again, while customers see errors.
 | OOMKilled / exit 137 | How Kubernetes reports that kill afterwards | `Reason: OOMKilled  Exit Code: 137` |
 | Heap profile | A snapshot of which code holds which memory | `go tool pprof heap.out` |
 | Rollback | Going back to the previous working version | Redeploy yesterday's image |
+| cgroup | The Linux feature that tracks and caps a container's resources | memory.max = 1 GiB |
+| Working set | Memory in use minus cache the system can easily drop; what the killer looks at | 950 MiB of a 1 GiB limit |
+| CrashLoopBackOff | Kubernetes waiting longer and longer before restarting a pod that keeps dying | waits up to 5 minutes |
+| Eviction | Kubernetes removing a pod because the whole machine is short of memory | `Evicted`, moved to another node |
+| Kubelet | The Kubernetes agent on each machine that starts, watches and restarts pods | records `OOMKilled` |
+| `GOMEMLIMIT` | A soft memory target that makes Go's garbage collector work harder near it | 900 MiB for a 1 GiB limit |
 
 **Picture it**
 
@@ -116,7 +126,7 @@ Memory incidents are slow, quiet and then sudden. A service leaks 20 MB a minute
 
 **Symptoms you will see:**
 - `kubectl get pods` shows `RESTARTS` climbing and status `OOMKilled` or `CrashLoopBackOff`.
-- A memory graph with a sawtooth shape: it rises for hours, drops to zero, and rises again.
+- A memory graph with a sawtooth shape (like the teeth of a saw): it rises for hours, drops to zero, and rises again.
 - Latency rises before the kill, because the garbage collector runs constantly as the heap nears the limit.
 - Evicted pods on a node (a different problem: the whole node ran short of memory).
 
@@ -137,6 +147,14 @@ flowchart LR
 
 > [!tip] Remember
 > The pod dying is the last step of the story. The first signs are rising latency and rising memory long before.
+
+### Real-life example: an order-history cache 🟢
+
+Imagine the orders service of a shopping app like Flipkart adding a small "recent orders" cache to make the app feel faster.
+The cache only adds entries and never removes them.
+All afternoon each pod's memory creeps up; at the evening sale peak, pods hit their limit and get killed one after another.
+Shoppers see errors at checkout.
+Rolling back stops it in minutes; the real fix is a cache with a size limit.
 
 ## 2. Mental model 🟢
 
@@ -161,13 +179,23 @@ Where the analogy breaks down: guests in a hotel are visible, but heap memory is
 > [!warning] Common mistake
 > Raising the limit and calling it fixed. If the shape is a leak, a bigger limit only makes the pod die later and at a worse time.
 
+## Common beginner mistakes 🟢
+
+- **Raising the memory limit and calling it fixed** → a real leak just dies later, maybe at peak → use a bigger limit only as a stopgap, and find the leak.
+- **Alerting on `container_memory_usage_bytes`** → it includes page cache, so healthy pods look full → alert on the working set.
+- **Assuming exit code 137 always means OOM** → a failed liveness probe also ends in a kill → check the reason says `OOMKilled`.
+- **Reading code to guess the leak** → leaks hide in harmless-looking lines → take two heap profiles minutes apart and diff them.
+- **A scheduled restart as the permanent fix** → it drops requests and hides the leak → bound the cache, stop the stuck goroutines.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the three shapes (leak, spike, limit too low) and that you mitigate before you diagnose. **Next we open the box**: how the kernel actually kills a container, how that differs from an eviction, which memory number to trust, and the commands and queries for each cause.
 
 ### How an OOM kill actually happens
 
 **In plain words:** Every container lives in a **cgroup**, a kernel group that tracks and caps its resources.
 
-When the container's memory reaches the cap and the kernel cannot free enough (page cache that can be dropped is freed first), the kernel's **OOM killer** picks a process in that cgroup and sends it SIGKILL.
+When the container's memory reaches the cap and the kernel cannot free enough (page cache, the kernel's copy of recently read files, can be dropped and is freed first), the kernel's **OOM killer** picks a process in that cgroup and sends it SIGKILL.
 
 SIGKILL cannot be caught, so the process gets no chance to log or flush.
 
@@ -189,12 +217,12 @@ sequenceDiagram
 
 **Steps:**
 1. The process allocates memory until the cgroup counter reaches `memory.max`.
-2. The kernel tries to reclaim. Clean page cache is dropped; anonymous memory (heap, stacks) cannot be.
+2. The kernel tries to reclaim. Clean page cache is dropped; anonymous memory (memory not backed by a file: heap, stacks) cannot be.
 3. If reclaim fails, the OOM killer sends SIGKILL to the chosen process, usually the biggest in the cgroup.
 4. The kubelet sees exit code 137 (128 + signal 9) and records `OOMKilled` in `lastState`.
 5. The kubelet restarts the container with exponential back-off. Memory resets to zero, so the leak restarts too.
 
-**Why it matters:** Exit code 137 means "killed by SIGKILL". It is usually OOM, but a failed liveness probe also ends in SIGKILL after the grace period. Always confirm the reason field.
+**Why it matters:** Exit code 137 means "killed by SIGKILL". It is usually OOM, but a failed liveness probe (Kubernetes's regular "are you alive?" check) also ends in SIGKILL after the grace period (the seconds allowed to shut down cleanly). Always confirm the reason field.
 
 > [!tip] Remember
 > 137 plus reason `OOMKilled` is a memory kill. 137 with reason `Error` may be a probe kill or a manual kill.
@@ -202,6 +230,12 @@ sequenceDiagram
 ### Container OOM versus node eviction
 
 **In plain words:** either your app crossed its own limit, or the whole machine ran low and Kubernetes pushed some apps off. Different cause, different fix.
+
+**Step by step:**
+1. Run `kubectl describe pod`. Last state `OOMKilled`, exit 137, container restarted? It crossed its own limit.
+2. Pod status `Evicted` and gone? The machine ran low.
+3. For an eviction, run `kubectl describe node` and look for `MemoryPressure`.
+4. OOMKilled → fix the app or its limit. Evicted → fix requests and limits across pods, or the node size.
 
 | | Container OOMKilled | Pod evicted |
 | --- | --- | --- |
@@ -215,12 +249,18 @@ sequenceDiagram
 
 **In plain words:** there are several "memory used" numbers and they disagree. The one the killer looks at is the one that matters.
 
+**Step by step:**
+1. Start with `container_memory_working_set_bytes`: this is what the kill decision follows.
+2. If only `usage_bytes` rises, it is page cache: normal, ignore it.
+3. If the working set rises, check Go's `heap_inuse`: rising too means heap growth, so take a heap profile.
+4. If the heap is flat, check goroutines and threads; if those are flat too, look outside the heap (cgo, mmap).
+
 Several memory numbers exist and they disagree. This is the most common source of confusion during an incident.
 
 | Metric | What it is | Use it for |
 | --- | --- | --- |
 | `container_memory_working_set_bytes` | Memory in use minus easily reclaimable cache | The number closest to what triggers kills and evictions |
-| `container_memory_rss` | Anonymous memory and swap cache | Heap and stacks, no file cache |
+| `container_memory_rss` | Anonymous memory and swap cache (pages on their way to or from swap disk) | Heap and stacks, no file cache |
 | `container_memory_usage_bytes` | Everything including page cache | Not reliable for alerts; includes cache |
 | `go_memstats_heap_inuse_bytes` | Go heap spans in use | What the Go program thinks it holds |
 | `process_resident_memory_bytes` | Process RSS | Compare with the heap to spot non-heap memory |
@@ -235,6 +275,8 @@ flowchart TD
     F -- "Yes" --> G["Goroutine or thread stacks: goroutine profile"]
     F -- "No" --> H["Non-heap: cgo, mmap, off-heap buffers, fragmentation"]
 ```
+
+(cgo means C code called from Go; mmap means memory asked for directly from the OS; fragmentation means free memory broken into pieces too small to reuse.)
 
 ## 4. Worked example 🟡
 
@@ -311,6 +353,14 @@ flowchart TD
 
 ### Diagnosis flowchart: from symptom to cause
 
+**In plain words:** decide first whether it is one container or the whole machine, then which kind of memory is growing.
+
+**Step by step:**
+1. `OOMKilled` or `Evicted`? Evicted means node pressure, a different problem.
+2. Does memory climb with time even when traffic is flat? Leak. With traffic? Spike. Flat near the limit? Limit too low.
+3. For a leak: goroutines rising → goroutine leak; heap rising → unbounded cache or map.
+4. Heap flat but RSS rising → memory outside the Go heap.
+
 ```mermaid
 flowchart TD
     A["Memory rising or OOMKilled"] --> B{"Rises with traffic or with time?"}
@@ -329,6 +379,11 @@ flowchart TD
 ### Investigation steps for each likely cause
 
 **In plain words:** one row per suspect: where to look, what to type, and what the answer means.
+
+**Step by step:**
+1. Pick the row that matches the graph shape you saw.
+2. Run the command or query in that row on one affected pod.
+3. Read the last column to decide the fix.
 
 | Cause | Where to look | Command or query | What the result means |
 | --- | --- | --- | --- |
@@ -370,6 +425,12 @@ go_memstats_heap_inuse_bytes{job="orders"}
 ### Commands on the pod and node
 
 **In plain words:** commands to see why a pod died and to grab a memory snapshot while it is still running.
+
+**Step by step:**
+1. `kubectl describe pod` to read the last termination reason.
+2. `kubectl logs --previous` to see the last lines before the kill.
+3. Port-forward to the pod's pprof port and save heap profile 1.
+4. Wait about 10 minutes, save heap profile 2, then diff them with `go tool pprof -base`.
 
 ```bash
 # Live usage per container
@@ -430,7 +491,7 @@ sequenceDiagram
 
 | Choice | Benefit | Risk |
 | --- | --- | --- |
-| Request equal to limit (for full Guaranteed QoS, CPU request must equal CPU limit too) | Last to be evicted, predictable | Wastes memory if the limit is padded |
+| Request equal to limit (for full Guaranteed QoS, Kubernetes's highest protection class, CPU request must equal CPU limit too) | Last to be evicted, predictable | Wastes memory if the limit is padded |
 | Limit much above request (Burstable) | Efficient packing | Node pressure and evictions when many pods burst together |
 | No limit | No OOMKilled for that pod | One leak can take down the whole node |
 
@@ -438,6 +499,9 @@ sequenceDiagram
 > A scheduled restart cron as the permanent fix. It hides the leak, and the leak speed will change with traffic until it kills the pod between restarts.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how a kill happens, which number to watch, and the commands to find what grew. **Next is the advanced part**: setting `GOMEMLIMIT` and limits for real services, other runtimes, early-warning alerts, and the deeper puzzles (who the kernel kills, RSS vs heap, memory pprof cannot see).
+
 
 ### Go: GOMEMLIMIT and the limit
 
@@ -460,7 +524,7 @@ env:
 
 ### Other runtimes
 
-- **JVM:** `-XX:MaxRAMPercentage=75` so the heap respects the container limit; the rest is for metaspace, threads and direct buffers. Take a heap dump with `jcmd <pid> GC.heap_dump /tmp/heap.hprof`.
+- **JVM:** `-XX:MaxRAMPercentage=75` so the heap respects the container limit; the rest is for metaspace (where the JVM keeps class data), threads and direct buffers. Take a heap dump with `jcmd <pid> GC.heap_dump /tmp/heap.hprof`.
 - **Node.js:** `--max-old-space-size=<MB>` below the container limit; take a snapshot with `--heapsnapshot-signal=SIGUSR2`.
 - **Python:** `tracemalloc` snapshot diffs; check for unbounded caches and reference cycles with `gc`.
 
@@ -487,13 +551,13 @@ The kernel scores processes by memory use and an adjustable score (`oom_score_ad
 
 Inside a single container, the largest process dies, which for a one-process container is your app.
 
-In a multi-process container (an app plus a sidecar script), a small helper process can be killed instead and the container stays "running" in a broken state.
+In a multi-process container (an app plus a sidecar script, a small helper running alongside it), a small helper process can be killed instead and the container stays "running" in a broken state.
 
 ### Why RSS stays high after the heap shrinks
 
 **In plain words:** Go frees memory inside the app first and hands it back to the system slowly. The graph can stay high for a while.
 
-Go releases freed memory to the OS lazily (the scavenger returns it in the background). After a spike, RSS can stay elevated while the heap is healthy. This is not a leak. Check `go_memstats_heap_released_bytes` and the gap between heap in use and RSS. See [[Runtime - Memory Allocator and Garbage Collector]].
+Go releases freed memory to the OS lazily (the scavenger, a background part of the Go runtime, returns it bit by bit). After a spike, RSS can stay elevated while the heap is healthy. This is not a leak. Check `go_memstats_heap_released_bytes` and the gap between heap in use and RSS. See [[Runtime - Memory Allocator and Garbage Collector]].
 
 ### Memory that pprof cannot see
 
@@ -572,6 +636,30 @@ If 6 pods each handle 1/6 of traffic and one dies, the other 5 take 20 percent m
 - [ ] Limits, requests and `GOMEMLIMIT` reviewed.
 - [ ] Regression test or load test with a memory assertion added.
 - [ ] Postmortem held, blameless, with action owners: [[Postmortems and Root Cause Analysis]].
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does OOMKilled mean?
+> The container used more memory than its limit, so the kernel killed it.
+
+> [!question]- What do you do first when pods keep getting OOMKilled after a deploy?
+> Roll back the deploy, then investigate.
+
+> [!question]- Which memory metric should alerts use?
+> `container_memory_working_set_bytes`, not `usage_bytes`.
+
+🟡 Medium
+
+> [!question]- Memory climbs all night while traffic is flat. Leak, spike, or low limit?
+> A leak: it grows with time, not with traffic.
+
+> [!question]- What is the difference between OOMKilled and Evicted?
+> OOMKilled is one container over its own limit; Evicted is the whole node short of memory.
+
+> [!question]- What `GOMEMLIMIT` would you set for a 2 GiB container?
+> About 90%, roughly 1.8 GiB; it helps the GC but does not fix a leak.
 
 ## Links
 

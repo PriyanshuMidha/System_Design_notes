@@ -38,6 +38,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[LLD Interview Method]]: the step order these notes follow: clarify, entities, APIs, storage, code, edge cases.
+> - [[Concurrency for LLD]]: goroutines run at the same time; a mutex makes "check balance, then debit" one step.
+> - [[Idempotency and Idempotency Keys]]: the client sends one ID per payment, so a retry is recognised and not done twice.
+
 **From zero, in 60 seconds** 🟢
 
 A wallet app holds money for you, like Paytm. The app never just edits a "balance" number. Instead it writes every money move into a **ledger**, which is a notebook that is only ever added to. Each move writes at least two lines: money leaves one account and enters another. The lines of one move always add up to zero. This is called **double entry**. Your balance is just the sum of your lines, so you can always check that no money appeared or vanished.
@@ -72,6 +77,11 @@ A ledger, like an accountant's book, is how the app keeps this promise.
 | Idempotency key | A unique ID per request so a retry does the work only once | `pay-7f3a` sent twice, moved once |
 | Atomic | Happens all at once or not at all | Check funds and debit together |
 | Reversal | A new transaction that undoes an old one | Alice +500, Bob -500 |
+| Invariant | A rule that must always be true | Entries of a transaction sum to 0 |
+| Lease | A short-lived claim: "I am working on this key until 10:00:30" | A crashed worker's lease runs out, another takes over |
+| Fencing | A guard that stops a worker whose lease already expired from writing | Second post with the same ID is refused |
+| Fingerprint | A short summary of a request's body | Same key, different amount: rejected |
+| Reconciliation | Checking that two records agree, and flagging any gap | Cached balance vs sum of entries |
 
 **Picture it**
 
@@ -107,7 +117,7 @@ Many payments for the same user can arrive at the same time; a balance must neve
 Support refunds of a past payment.
 ```
 
-- It tests modelling money correctly (double entry, integer minor units, immutable entries), idempotency under retries and crashes, and the concurrency rule that the balance check and the debit are one atomic step. Time box: 10 minutes for Steps 1-4, 10 for Steps 5-7 (the SQL matters here), 30 for the code, 10 for edge cases.
+- It tests modelling money correctly (double entry, integer minor units (the smallest coin, paise), immutable entries (never edited after writing)), idempotency under retries and crashes, and the concurrency rule that the balance check and the debit are one atomic step. Time box: 10 minutes for Steps 1-4, 10 for Steps 5-7 (the SQL matters here), 30 for the code, 10 for edge cases.
 
 ### Solving path
 
@@ -126,7 +136,7 @@ Support refunds of a past payment.
 - Can a user wallet go negative (overdraft)? *Assume: never. System accounts (bank settlement, fees) may.*
 - How does a client retry safely? *Assume: the client sends an `Idempotency-Key` per logical payment and reuses it on every retry.*
 - How is a refund done? *Assume: a full reversal of a past transaction, posted as a new transaction. Partial refunds are a follow-up.*
-- Must the balance be read fast? *Assume: yes, O(1) cached balance, reconciled against entries by a job.*
+- Must the balance be read fast? *Assume: yes, O(1) (one quick lookup, not a sum over every entry) cached balance, reconciled against entries by a job.*
 - Holds (authorise now, capture later)? *Assume: follow-up in Step 10.*
 - Fees? *Assume: out of scope for the code; a fee is just a third leg to a fee account.*
 
@@ -142,14 +152,14 @@ Support refunds of a past payment.
 ### Non-functional
 
 - Money is `int64` minor units (paise). No floats anywhere.
-- Exactly-once effect per idempotency key, across retries, concurrent duplicates and a crashed worker.
+- Exactly-once effect (the money moves one time, no matter how many retries) per idempotency key, across retries, concurrent duplicates and a crashed worker.
 - No user balance below zero under any interleaving.
 - Entries are immutable; history is never rewritten.
 - The clock is injected so leases and timestamps are testable.
 
 ### Out of scope
 
-- Bank and card integration (the payment gateway side), KYC and limits.
+- Bank and card integration (the payment gateway side), KYC (know-your-customer identity checks) and limits.
 - Currency conversion and interest.
 - The system-level payment architecture: see [[Case Study - Payment System]].
 
@@ -169,9 +179,9 @@ The hardest use case is **Transfer under retries and concurrency**: the same key
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
-| `account` | allowNegative, balance (cached) | Owner of money; system accounts may go negative so money can enter the system |
+| `account` | allowNegative, balance (cached) | Owner of money; system accounts (the company's own internal accounts, like bank settlement) may go negative so money can enter the system |
 | `Leg` | Account, Amount (signed) | Input to a posting: negative debits, positive credits |
-| `Entry` | Seq, TxID, Account, Amount, At | The immutable fact; the source of truth for balances |
+| `Entry` | Seq, TxID, Account, Amount, At | The immutable fact; the source of truth (the record that wins if numbers disagree) for balances |
 | `Tx` | ID (= idempotency key), Kind, ReversalOf, Entries, At | One business event; entries sum to zero |
 | `Receipt` | TxID, Kind, From, To, Amount, At, Replayed | API response; saved for replay |
 | `idemRec` | fingerprint, done, receipt, leaseUntil, token | State of one idempotency key: in progress (leased) or done |
@@ -179,9 +189,11 @@ The hardest use case is **Transfer under retries and concurrency**: the same key
 | `IdemStore` | records by key, ttl, clock, token counter | Lease and replay for idempotency keys |
 | `Wallet` | ledger, idem store | Facade: Transfer and Reverse with the idempotent envelope |
 
-Sign convention: this note uses signed amounts from the account owner's view, `+` adds to the balance and `-` removes it. Accountants say debit and credit, and for a liability account like a user wallet a credit increases it; the signed form avoids that confusion in code while keeping the double-entry rule "sum of legs = 0".
+Sign convention: this note uses signed amounts from the account owner's view, `+` adds to the balance and `-` removes it. Accountants say debit and credit, and for a liability account (money the company owes someone) like a user wallet a credit increases it; the signed form avoids that confusion in code while keeping the double-entry rule "sum of legs = 0".
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know accounts, entries, double entry and why the funds check and the debit are one step. Next we open the box: how the entities link, the API and its replay responses, the PostgreSQL schema, and the Go ledger.
 
 ```mermaid
 classDiagram
@@ -263,7 +275,7 @@ var _ WalletService = (*Wallet)(nil) // compile-time check
 
 In production the ledger is in PostgreSQL 17, and the database enforces most invariants, not only the Go code: unique transaction IDs, at most one reversal, non-zero entries and no negative user balance.
 
-The rule that a transaction's entries sum to zero is not expressible as a plain `CHECK`; the posting code enforces it, and a deferred constraint trigger or the reconciliation query catches any violation.
+The rule that a transaction's entries sum to zero is not expressible as a plain `CHECK`; the posting code enforces it, and a deferred constraint trigger (a database check that runs at commit time) or the reconciliation query catches any violation.
 
 **In plain words:** The tables: accounts, transactions and entries. Entries are never changed or deleted, only added.
 
@@ -316,11 +328,11 @@ INSERT INTO entries (tx_id, account_id, amount) VALUES ($1, $2, -$4), ($1, $3, $
 COMMIT;
 ```
 
-The conditional `UPDATE` takes a row lock on the `from` account, so two concurrent debits on the same account serialise: the second waits, then re-checks `balance >= $amount` against the committed value under READ COMMITTED.
+The conditional `UPDATE` takes a row lock on the `from` account, so two concurrent debits on the same account serialise: the second waits, then re-checks `balance >= $amount` against the committed value under READ COMMITTED (PostgreSQL's default isolation level).
 
 That is why the check and the debit must be in one statement, not a `SELECT` followed by an `UPDATE`.
 
-When a transfer touches two user accounts, lock them in a fixed order (for example by ID) to avoid deadlocks between A to B and B to A.
+When a transfer touches two user accounts, lock them in a fixed order (for example by ID) to avoid deadlocks (each transaction waiting forever for the other's lock) between A to B and B to A.
 
 The trade-offs of row locks versus version checks are in [[Locking - Optimistic vs Pessimistic]].
 
@@ -360,7 +372,7 @@ type IdempotencyRepo interface {
 |---|---|---|
 | [[Facade (vs Mediator)]] | `Wallet` | Handlers call Transfer and Reverse; the lease, ledger and receipts are hidden |
 | [[Repository and Unit of Work]] | `LedgerRepo`; one DB transaction per posting | All entries and balance updates commit together or not at all |
-| [[Command, Undo and Memento]] | Reversal as a compensating command | "Undo" is a new command, never a delete, so history is kept |
+| [[Command, Undo and Memento]] | Reversal as a compensating command (a new step that cancels an earlier one) | "Undo" is a new command, never a delete, so history is kept |
 | [[Decorator and Middleware]] | The idempotency envelope `run` | The same lease-post-complete wrapper serves Transfer and Reverse; in HTTP it is middleware |
 | [[Observer and Event Bus]] | `wallet.transfer.posted` events (follow-up) | Notifications and analytics must not sit inside the money transaction; publish through [[Transactional Outbox and CDC]] |
 
@@ -1114,6 +1126,8 @@ What the tests prove:
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working wallet and its tests. Next is interview depth: retries, duplicates at the same moment, workers that crash after posting, stale workers, reversals and the trade-offs you must defend.
+
 | Edge case | What happens | How the design handles it |
 |---|---|---|
 | Client times out and retries | Could debit twice | Same key: replay the saved receipt |
@@ -1132,7 +1146,7 @@ What the tests prove:
 ### Common mistakes
 
 - `SELECT balance` then `UPDATE balance = balance - x` in two statements without a lock (lost update and overdraft).
-- Storing only a balance column with no entries, so there is no audit trail and no way to reconcile.
+- Storing only a balance column with no entries, so there is no audit trail (a history of who changed what, and when) and no way to reconcile.
 - Deleting or editing an entry to fix a mistake.
 - Checking the idempotency key and writing the record in two non-atomic steps.
 - Saving the receipt before the ledger write commits.
@@ -1145,11 +1159,11 @@ What the tests prove:
 | Holds (authorise then capture) | A hold account per user: authorise moves money user -> hold; capture moves hold -> merchant; void moves it back. Each step is a balanced transaction with its own key |
 | Partial refund | A new transfer merchant -> user with `ReversalOf` pointing at the original, plus a check that total refunds do not exceed the original amount |
 | Fees | A third leg to a `fees` system account: user -400, merchant +390, fees +10 |
-| Multi-currency | One account per (user, currency); a conversion is four legs through an FX system account |
+| Multi-currency | One account per (user, currency); a conversion is four legs through an FX (foreign exchange) system account |
 | Higher throughput | Per-account locks in sorted order, or shard accounts; hot system accounts get several sub-accounts summed on read |
-| Statement API | Keyset pagination on `(account_id, seq)` |
+| Statement API | Keyset pagination ("give me the next page after seq 500" instead of skipping N rows) on `(account_id, seq)` |
 | Notifications and analytics | Write an outbox row in the same DB transaction ([[Transactional Outbox and CDC]]) |
-| Cross-service money movement | A saga with compensations ([[Saga Pattern]]); at system scale see [[Case Study - Payment System]] |
+| Cross-service money movement | A saga (a chain of steps, each with an undo step) with compensations ([[Saga Pattern]]); at system scale see [[Case Study - Payment System]] |
 
 Tradeoffs chosen:
 
@@ -1240,6 +1254,26 @@ I model money as a double-entry ledger: a transaction is two or more immutable e
 - Business rejection: release the key (or save the error; pick one and say it).
 - Reversal = new negated transaction, unique `reversal_of`, same no-negative rule.
 - Lock two accounts in ID order; `int64` paise; injected clock.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 Alice pays Bob 500. What entries are written?
+> Alice -500 and Bob +500; together they sum to zero.
+
+> [!question]- 🟢 How do you fix a wrong payment?
+> Post a reversal: a new transaction with every amount flipped. Never edit or delete entries.
+
+> [!question]- 🟢 Why can a system account go negative but a user wallet cannot?
+> Money must enter the system from somewhere: bank settlement goes negative when users top up. A user must never spend money they do not have.
+
+> [!question]- 🟡 Two requests each send 600 from a balance of 1000 at once. How do you stop -200?
+> Check and debit in one atomic step: under the mutex in memory, or `UPDATE ... WHERE balance >= 600` in SQL (0 rows means insufficient funds).
+
+> [!question]- 🟡 A worker posts the transfer and crashes before saving the receipt. What does the retry see?
+> The lease expires, the retry's post fails with a duplicate transaction ID, and it adopts the existing transaction; money moved once.
+
+> [!question]- 🟡 Why is the lease not enough on its own?
+> A stale worker can wake up after its lease ran out and still post; using the key as the unique transaction ID is the fencing that blocks it.
 
 ## Links 🟢
 

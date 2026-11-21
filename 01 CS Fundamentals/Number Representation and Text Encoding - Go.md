@@ -22,12 +22,17 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
 > - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Number Representation and Text Encoding]]: the theory twin. Know that `int8` wraps at 127, floats like `0.1` are rounded, money should be whole cents, and `len()` on a Go string counts bytes.
+> - [[How a Computer Runs a Program]]: values live in memory as bits.
+
 **From zero** 🟢: this file is the hands-on side of [[Number Representation and Text Encoding]]. It is small Go programs that poke at how numbers and text really live in bytes — integer overflow, float surprises like 0.1 + 0.2, and walking a string's UTF-8 bytes. Read each code step with its notes; run the tests to see the surprises happen on your own machine.
 
 ## Before the code 🟢
 
 - **Fixed-width integer types** (`int8`, `int64`, `uint32`): each has a set size and range; arithmetic wraps when it leaves the range.
-- **`float64`**: Go's IEEE 754 double; `==` compares exact bits.
+- **`float64`**: Go's IEEE 754 double (a 64-bit float, stored as sign + exponent + fraction); `==` compares exact bits.
+- **Rune**: Go's type for one Unicode character code (an `int32`); `'é'` is one rune but two bytes.
 - **`encoding/binary`**: standard package whose `ByteOrder` interface values (`LittleEndian`, `BigEndian`) write numbers as bytes in a fixed order.
 - **Arrays vs slices**: `[4]byte` is a fixed array comparable with `==`; `buf[:]` makes a slice view over it.
 - **`for range` on a string**: decodes UTF-8 and steps one rune (code point) at a time.
@@ -62,7 +67,11 @@ Each function is a minimal, pure, standalone demonstration of exactly one repres
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** which five surprises this module demonstrates. **Next we read the code:** four short steps, each a tiny function plus a "How it works" list.
+
 ### Step 1: silent integer overflow and exact money math
+
+**What this code does, in plain words:** one function adds two `int8` numbers with Go's normal `+` so we can watch 127 + 1 wrap to -128; another adds two money amounts stored as whole cents.
 
 **Concept.** `AddInt8Wrapping` implements [[Number Representation and Text Encoding#Two's complement and silent overflow]] directly: it is Go's own `+` operator on `int8`, wrapped in a named function purely so a test can call it and assert on the wraparound.
 
@@ -98,6 +107,8 @@ func MoneyCents(centsA, centsB int64) int64 {
 
 ### Step 2: float approximation
 
+**What this code does, in plain words:** it adds two floats and checks with `==` whether the sum equals a third float, so we can see `0.1 + 0.2` fail and `1 + 2` pass.
+
 **Concept.** `FloatsAreApproximate` implements [[Number Representation and Text Encoding#IEEE 754 floating point]]: it takes three `float64` arguments and reports whether `a + b == c` holds *exactly*, at the bit level.
 
 The function is generic over its three arguments rather than hardcoded to `0.1, 0.2, 0.3` so the same function can also prove the positive case (integral floats compare equal exactly), which is important: the point isn't "floats are always wrong," it's "floats are exact only for specific values."
@@ -130,6 +141,8 @@ flowchart LR
 
 ### Step 3: endianness
 
+**What this code does, in plain words:** it writes the same 4-byte number twice, once smallest byte first and once biggest byte first, so we can compare the two byte orders.
+
 **Concept.** `BytesLE` and `BytesBE` implement [[Number Representation and Text Encoding#Endianness]] using the standard library's `encoding/binary` package rather than manual bit-shifting, which is both less error-prone and the idiomatic Go approach for any code that needs a specific wire format.
 
 The alternative — relying on the host's native byte order via `unsafe` pointer casts — was rejected because it would make the function's output depend on which machine it runs on, defeating the entire purpose of fixing a byte order explicitly.
@@ -159,6 +172,8 @@ func BytesBE(v uint32) [4]byte {
 3. Both functions return a fixed-size `[4]byte` array (not a slice), which is comparable with `==` — this is what lets the test compare the result directly against a literal expected array.
 
 ### Step 4: bytes vs. runes
+
+**What this code does, in plain words:** it returns two counts for a string: how many bytes it has, and how many characters (runes) it has.
 
 **Concept.** `StringLens` implements [[Number Representation and Text Encoding#Go's string, []byte, and rune]]: it returns both the byte length (`len(s)`) and the rune count (via `for range`) so a caller — or a test — can see directly how far apart they are for a given string.
 
@@ -365,18 +380,44 @@ ok  	roll4scratch/numrep	1.516s
 
 `AddInt8Wrapping(127, 1) = -128`, `FloatsAreApproximate(0.1, 0.2, 0.3) = false`, and `StringLens("café") = (5, 4)` are the three headline results the theory note cites as measured, not merely claimed, behavior.
 
+> 🟡 → 🔴 **You now know** the code and what each test proves. **Next comes the advanced part:** where these little functions can mislead you, such as reading only the `false` float case or counting runes when users see one emoji.
+
 ## Pitfalls in the code 🔴
 
 - **`AddInt8Wrapping` has no guard rail.** It is Go's own `+` with no bounds check, by design — calling it with values near the `int8` boundary in real code (not just the test) will wrap exactly the same way.
 - **`FloatsAreApproximate` can mislead if misread.** It returns `true` for some inputs (e.g. integral values) and `false` for others — a reader skimming only the `false` case could wrongly conclude "floats are always imprecise," when the precision is exact for values that happen to be sums of powers of two.
 - **`BytesLE`/`BytesBE` do not validate `v`.** Any `uint32` value is accepted; there is no "this value doesn't fit" case to worry about, unlike signed-integer wraparound.
-- **`StringLens` counts runes, not grapheme clusters.** A visible "character" built from multiple combining code points (e.g. some emoji with skin-tone modifiers) will count as more than one rune even though a user sees one glyph — `for range` decodes Unicode code points, not what a font renders as a single glyph.
+- **`StringLens` counts runes, not grapheme clusters** (what a person sees as one character, which may be several code points). A visible "character" built from multiple combining code points (e.g. some emoji with skin-tone modifiers) will count as more than one rune even though a user sees one glyph — `for range` decodes Unicode code points, not what a font renders as a single glyph.
 
 ## Exercises 🔴
 
 1. Change `AddInt8Wrapping`'s parameter types from `int8` to `int16` and update the test's expected values for the new range's boundary (`32767 + 1`). Predict the new wrapped value before running it.
 2. Add a new case to `TestFloatsAreApproximate` that checks `FloatsAreApproximate(0.5, 0.25, 0.75)`. Predict whether it returns `true` or `false` before running it, using the "sums of powers of two are exact" rule from the theory note.
 3. Add a `StringLens` test case for a string containing a 4-byte UTF-8 character (an emoji such as `"😀"`). Predict the byte length and rune count before running it.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does `AddInt8Wrapping(127, 1)` return?
+> -128.
+
+> [!question]- Why does `MoneyCents` take `int64` and not `float64`?
+> Whole-number cents add exactly with no rounding; floats would drift.
+
+> [!question]- What does `StringLens("café")` return?
+> `(5, 4)`: 5 bytes, 4 runes.
+
+🟡 Medium
+
+> [!question]- Why does the float test also check `(1, 2, 3)`?
+> To prove floats are exact for some values (sums of powers of two), so the `false` result is about rounding, not `==` being broken.
+
+> [!question]- Why is `0x01020304` a good test value for endianness?
+> All four bytes differ, so a reversed order can never pass by accident.
+
+> [!question]- Why do `BytesLE`/`BytesBE` return `[4]byte` and not `[]byte`?
+> Arrays can be compared with `==` directly in tests, with no extra allocation.
 
 ## Links
 

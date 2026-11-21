@@ -32,6 +32,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code) and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[State Machines in Go]]: a thing is in one named mode at a time (Idle, MovingUp, DoorOpen), and events move it between modes.
+> - [[Strategy and Template Method]]: a rule behind an interface you can swap, here "which car answers this call".
+> - [[Concurrency for LLD]]: goroutines run at the same time; a mutex makes them take turns on shared data.
+
 **From zero, in 60 seconds** 🟢
 
 A building has a few lifts and many floors. Someone presses "up" on floor 5. A small brain, the **controller**, must pick which lift goes there. Inside a lift, people press the floor they want, and that lift adds the stop. Each lift keeps going in one direction, serving stops on the way, then turns around. This sweeping rule is called **LOOK**. The design is mostly about picking a good lift and keeping each lift's stop list in order.
@@ -66,6 +71,10 @@ This note designs the software that answers both questions.
 | LOOK | Keep going in one direction while stops remain ahead, then turn | Up to 8, then back down to 3 |
 | Tick | One step of simulated time | Each tick a car moves one floor |
 | Strategy pattern | Swap an algorithm behind an interface | Different dispatchers |
+| Mutex | A lock so only one goroutine changes shared data at a time | Button presses and the tick loop take turns |
+| Event loop | One goroutine owns the data; others send it requests on a channel | "Press 9" sent as a message to the owner |
+| Typed error | A named error value the caller can check, instead of a crash | `ErrInvalidFloor` for floor 99 |
+| Enum | A small fixed list of named values | `Idle`, `MovingUp`, `DoorOpen` |
 
 **Picture it**
 
@@ -79,7 +88,7 @@ flowchart LR
 ```
 
 **Analogy.** A bus on a line: it drives one way picking up everyone along the route, then turns at the end.
-Where it breaks: a bus has a fixed last stop; an elevator turns as soon as no calls remain ahead (LOOK, not SCAN).
+Where it breaks: a bus has a fixed last stop; an elevator turns as soon as no calls remain ahead (LOOK, not SCAN: SCAN always rides to the last floor before turning).
 
 **How the rest of this note builds up**
 
@@ -103,7 +112,7 @@ concurrently with the controller loop.
 
 ### Solving path
 
-1. Clarify floors, number of cars, capacity, out-of-service and fire recall.
+1. Clarify floors, number of cars, capacity, out-of-service and fire recall (a fire alarm sends every car to one safe floor).
 2. Model `car` with position, direction, state and two stop sets.
 3. Write LOOK: `nextDir`, `shouldStop`, `serve` and `settle`.
 4. Write the `Dispatcher` interface with a nearest-suitable-car rule.
@@ -132,13 +141,15 @@ The **tick loop** (one goroutine) advances every car and reports door openings. 
 | Entity | Fields | Why |
 |---|---|---|
 | `Controller` | mu, cfg, cars | The single entry point and the lock owner |
-| `car` (unexported) | floor, dir, state, doorLeft, up, down, loadKg, outOfService | One elevator; all its fields change only under `Controller.mu` |
+| `car` (unexported: lower-case name, so code outside the package cannot touch it) | floor, dir, state, doorLeft, up, down, loadKg, outOfService | One elevator; all its fields change only under `Controller.mu` |
 | `up`, `down` sets | `map[int]bool` | Direction-aware stops; a set makes duplicate presses free |
 | `State` | Idle, MovingUp, MovingDown, DoorOpen, Maintenance | The lifecycle (diagram in Step 8) |
 | `Dispatcher` | `Pick(cars []Status, floor, dir)` | The swappable "which car?" rule; it reads `Status` copies, so a strategy cannot corrupt a car |
 | `Status`, `Stop` | read-only copies | Dispatchers and displays never touch live cars |
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know hall calls, cabin calls, the dispatcher and the LOOK idea. Next we open the box: how the controller and cars link, the method set, the patterns, and the Go code for one tick.
 
 ```mermaid
 classDiagram
@@ -193,8 +204,8 @@ None: car state changes every tick and lives in memory. A trip log for tuning di
 
 | Pattern | Where |
 |---|---|
-| [[State Machines in Go]] | An enum plus one `switch` in `car.step`. Not the GoF State pattern with a type per state: five states with simple transitions read better in one place |
-| [[Strategy and Template Method]] | `Dispatcher`: `NearestSuitable` here; least loaded, ETA and zoning in Step 10 |
+| [[State Machines in Go]] | An enum plus one `switch` in `car.step`. Not the GoF State pattern (the classic "Gang of Four" design-patterns book version) with a type per state: five states with simple transitions read better in one place |
+| [[Strategy and Template Method]] | `Dispatcher`: `NearestSuitable` here; least loaded, ETA (estimated time of arrival) and zoning in Step 10 |
 | [[Facade (vs Mediator)]] | `Controller` is the one entry point for buttons, panels and the tick loop |
 | [[Observer and Event Bus]] | Extension: publish `Stop` events to floor displays |
 | [[Command, Undo and Memento]] | Extension: in the event-loop design, each press becomes a request object sent on a channel to the goroutine that owns the cars |
@@ -585,7 +596,7 @@ Two hall calls pressed at the same moment are dispatched one after the other: `H
 
 The alternative is an event loop: one goroutine owns all cars and receives presses on a channel with a reply channel. It needs no mutex, but every `Status` read becomes a round trip.
 
-With short critical sections the mutex is simpler ([[Concurrency for LLD]]).
+With short critical sections (the code run while holding the lock) the mutex is simpler ([[Concurrency for LLD]]).
 
 ## Test cases 🟡
 
@@ -606,7 +617,7 @@ xychart-beta
 | `TestNearestSuitable` | Cost picks the on-the-way car, penalises a car that passed the floor or goes the wrong way, skips out-of-service cars |
 | `TestOutOfServiceDrainsThenParks` | A draining car refuses new calls, finishes its call, parks in Maintenance; with no car in service `HallCall` returns `ErrNoCar` |
 | `TestOverweightHoldsDoor` | The door stays open while overweight and closes on the tick after the load drops |
-| `TestConcurrentPressesWithTickLoop` | 8 goroutines press 400 buttons while `Run` ticks; under `-race` every call is still served |
+| `TestConcurrentPressesWithTickLoop` | 8 goroutines press 400 buttons while `Run` ticks; under `-race` (Go's race detector, which flags unsafe shared access) every call is still served |
 
 Measured: `go test -race -cover` on Go 1.24.4 passes all 9 tests with about 98% statement coverage (97.6–99.2% across runs; the concurrency tests reach some branches only on some schedules).
 
@@ -858,6 +869,8 @@ func TestConcurrentPressesWithTickLoop(t *testing.T) {
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working controller and its tick tests. Next is interview depth: bad input that must not crash, overweight cars, fire recall, and the trade-offs between dispatch rules and between a mutex and an event loop.
+
 | Case | Handling |
 |---|---|
 | Unknown car ID | `withCar` checks bounds and returns `ErrUnknownCar`; indexing `c.cars[id]` directly would panic |
@@ -866,7 +879,7 @@ func TestConcurrentPressesWithTickLoop(t *testing.T) {
 | Down call while the car goes up | Kept in `down`; served after the turn, or at the turn-around floor |
 | Overweight | Door held open, car does not move until `SetLoad` reports the capacity or less |
 | Out of service | No new calls (`ErrOutOfService`, dispatcher skips it); finishes calls, then Maintenance |
-| Fire recall (designed, not coded) | `SetFireRecall(on)` clears both sets of every working car, adds the recall floor as the only stop, refuses calls with `ErrFireRecall`, and holds the door open at the recall floor (a `recalled` flag in the door branch). Real Phase I emergency recall (ASME A17.1) also reverses a car travelling away from the recall floor at its next landing without opening its doors |
+| Fire recall (designed, not coded) | `SetFireRecall(on)` clears both sets of every working car, adds the recall floor as the only stop, refuses calls with `ErrFireRecall`, and holds the door open at the recall floor (a `recalled` flag in the door branch). Real Phase I emergency recall (ASME A17.1, the North American elevator safety code) also reverses a car travelling away from the recall floor at its next landing without opening its doors |
 | All cars unavailable | `ErrNoCar` |
 
 ## Step 10: Tradeoffs and extensions 🔴
@@ -942,6 +955,26 @@ A Controller owns N cars and exposes HallCall, CabinCall, Status and a tick-base
 - On door close, `settle` picks MovingUp, MovingDown, Maintenance or Idle from the remaining calls.
 - Dispatcher Strategy reads `Status` copies: nearest suitable, least loaded, ETA, zoning.
 - Typed errors, never panics; deterministic `Step()` tests plus a `-race` test.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What is the difference between a hall call and a cabin call?
+> A hall call is pressed on a floor and has a direction (Up/Down); a cabin call is pressed inside one car and just names a floor.
+
+> [!question]- 🟢 A car at floor 0 has calls 5, 2, 8. In what order does LOOK serve them?
+> 2, 5, 8: it keeps going up and stops on the way (8 floors in total, against 14 for first-come order).
+
+> [!question]- 🟢 Why does a test call `Step()` instead of sleeping?
+> One `Step()` is one tick, so a test can say "door opens at floor 5 on tick 8" and run instantly with no flaky timing.
+
+> [!question]- 🟡 Why keep separate `up` and `down` stop sets?
+> So a car going up does not stop for someone who pressed Down; that call waits in `down` until the car turns.
+
+> [!question]- 🟡 What bug does `settle` prevent when the door closes?
+> Going Idle while calls remain; `settle` picks the next state from the calls left.
+
+> [!question]- 🟡 Why does the dispatcher get `Status` copies instead of live cars?
+> A swapped-in strategy can only read; it can never change a car's stops or state by mistake.
 
 ## Links 🟢
 

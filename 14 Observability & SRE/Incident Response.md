@@ -41,6 +41,10 @@ Everything in this note is about making each arrow fast and each box well-define
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Observability Fundamentals]]: metrics, logs and traces are the clues you read to see what is broken.
+> - [[Alerting and On-Call]]: an alert pages the on-call engineer when users are hurting, and links to a runbook. Incident response is what happens after that page.
+
 **From zero, in 60 seconds** 🟢
 
 An **incident** is when your system is broken for users right now.
@@ -86,6 +90,12 @@ Incident response is the agreed routine that makes this a calm, 15-minute fix in
 | Incident Commander (IC) | The one person who coordinates and decides | Says "we roll back now" |
 | Root cause | The underlying reason it broke | A config typo in the deploy |
 | Postmortem | A written review after the incident | Timeline plus action items |
+| Triage | A fast "how bad, who is needed" call, not a diagnosis | "SEV2, page payments team" |
+| Rollback | Going back to the last version that worked | undo the 14:02 deploy |
+| Kill switch | An on/off setting that turns a feature off without a deploy | pause webhook processing |
+| Status page | A public page that tells customers what is wrong | "Payments degraded, investigating" |
+| MTTD / MTTA / MTTR | Average time to detect, to acknowledge, and to mitigate | detect 2 min, ack 1 min, fix 5 min |
+| Webhook | An HTTP call another company's system makes to yours to tell you something happened | payment provider says "invoice 42 paid" |
 
 **Picture it**
 
@@ -112,9 +122,18 @@ Where it breaks: a fire is obvious, but a software incident can look "quiet" whi
 
 ## 1. Why it exists 🟢
 
+🟢 **Plain version:** A payment message got sent twice, so some customers were charged twice. The fix was simple: flip one switch to pause that feature. Without a clear process, people argued for 20 minutes about who should flip it, and about 800 bad events piled up. With a clear process, the first person to see the alert was in charge, flipped the switch at once, and the damage stopped within a minute.
+
+```mermaid
+flowchart LR
+    A["Alert fires"] --> N["No process:<br/>20 min of debate"] --> B["~800 duplicates"]
+    A --> Y["With process:<br/>on-call is IC, flips switch"] --> G["Stops in ~1 min"]
+```
+
+
 InvoiceOps's payment webhook handler commits the database update for an invoice, then returns `200 OK`.
 
-One day a load balancer timeout fires between the commit and the response: the handler's write succeeds, but the client never sees the `200`, so the payment provider's retry logic resends the same webhook.
+One day a load balancer timeout (the front-door server gives up waiting for an answer) fires between the commit and the response: the handler's write succeeds, but the client never sees the `200`, so the payment provider's retry logic resends the same webhook.
 
 Within four minutes, the `webhook_duplicate_total` counter — normally near zero — is climbing by about 40 a minute, and support tickets about double-charged invoices start arriving.
 
@@ -125,6 +144,14 @@ By the time someone finally flips the kill switch, the duplicate count has reach
 With a defined process, the shape is different: the on-call engineer who takes the alert becomes IC by default, states "SEV2, webhook duplicates, kill switch going on now," flips it, and the duplicate count stops climbing within roughly a minute of the alert firing.
 
 The difference between the two timelines is not technical skill — it is that **mitigation did not wait for a decision about who was allowed to act.**
+
+### Real-life example: a train-booking outage 🟢
+
+Think of IRCTC at 10 a.m., when Tatkal (last-minute) ticket booking opens.
+Payments start failing for many users right after a new release.
+The on-call engineer declares SEV1 and becomes incident commander, one engineer rolls back the release, and another posts "payments delayed, we are fixing it" on social media.
+Payments recover within minutes, and only after that does the team dig into which line of code was wrong.
+That order, stop the pain first, explain it later, is the whole idea of incident response.
 
 ## 2. Mental model 🟢
 
@@ -137,32 +164,64 @@ An incident runs like an emergency room, not like a debugging session at a desk.
 
 The mistake this model rules out: treating an incident like solo debugging, where one person reads code quietly until they understand the bug. An incident needs **coordination and a stop-the-bleeding action** before it needs understanding.
 
+## Common beginner mistakes 🟢
+
+- **Everyone debugging, nobody in charge** → no decision gets made, so a simple fix waits → name one Incident Commander in the first minute.
+- **Hunting for the root cause before stopping the damage** → users keep failing while you read code → do the cheap, reversible fix first (rollback, kill switch), then investigate.
+- **Saying "resolved" the moment the graph looks fine** → the problem comes back at the next traffic peak → wait one full stable cycle before closing.
+- **Going silent while fixing** → people keep asking "any update?" and distract the fixer → post short updates on a fixed schedule, even "still investigating".
+- **Writing the timeline from memory afterwards** → times and steps are wrong → have a scribe note each action with a timestamp as it happens.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the drill: detect, judge how bad, one leader, stop the damage, then explain. **Next we open the box**: the severity table, where incidents are detected, the four roles, the stages an incident moves through, and how updates flow.
 
 ### Severity
 
 **In plain words:** a small scale from SEV1 (big outage, wake people up) to SEV4 (minor). The table says what counts as each.
 
+**Step by step:**
+1. The alert says "confirmation emails not sent for any order".
+2. The on-call opens the severity table and finds the matching row: major feature broken for most users, no data loss. That is SEV2.
+3. SEV2 means: page the on-call rotation now, no need to wake executives.
+4. If it later turns out data was lost, the IC raises it to SEV1.
+
 | Severity | Criteria (any one qualifies) | Paging | Example |
 | -------- | ----------------------------- | ------ | ------- |
-| SEV1 | Full outage, data loss in progress, or a security breach | Page immediately, all hands, exec notified | Database primary down, no writes succeed anywhere |
+| SEV1 | Full outage, data loss in progress, or a security breach | Page immediately, all hands, exec notified | Database primary (the main copy that accepts writes) down, no writes succeed anywhere |
 | SEV2 | A major feature broken or degraded for most users; no data loss but user-visible | Page the on-call rotation | Checkout succeeds but confirmation emails never send for ~100% of orders |
 | SEV3 | A feature broken for a minority of users, or fully broken but with a workaround | Ticket now, page only if it does not improve | One region's dashboard is slow; other regions fine |
-| SEV4 | Cosmetic, internal-only, or a near-miss worth recording | Ticket, no page | A staging alert fired that should have been silenced |
+| SEV4 | Cosmetic, internal-only, or a near-miss worth recording | Ticket, no page | A staging (test environment) alert fired that should have been silenced |
 
 Severity criteria must be concrete numbers agreed on ahead of time (what fraction of users, what dollar amount, which kind of data) — "it feels big" is not a severity level, because two different engineers will disagree about what feels big under stress, and that disagreement itself wastes the first five minutes of the incident.
 
 ### Detection
 
+**In plain words:** an incident can start from an alert, a customer complaint, or an outside check failing.
+
+**Step by step:**
+1. Most often an alert fires, for example "checkout errors above 5%".
+2. Sometimes support says "five customers in Pune can't pay", and no alert matched it.
+3. Sometimes an outside probe (a fake user that checks the site every minute) fails, for example because a certificate expired.
+4. In all three cases, the incident clock starts at that moment, not when someone opens a laptop.
+
+
 An incident starts the moment any of these fires, not the moment someone opens a laptop to look at it:
 
 - An **alert** from the monitoring stack (see [[Alerting and On-Call]]) — the majority of SEV1/SEV2s.
 - A **customer report**, through support, that matches no existing alert — often how slow-burn or partial-region issues are first seen.
-- A **synthetic probe** or scheduled health check failing from outside the network, catching problems internal metrics miss (a DNS misconfiguration, a certificate expiry, a CDN edge issue).
+- A **synthetic probe** or scheduled health check failing from outside the network, catching problems internal metrics miss (a DNS misconfiguration, a certificate expiry, a CDN edge issue, meaning a problem at the nearby caching servers that deliver content to users).
 
 ### Roles
 
 **In plain words:** borrowed from fire and rescue teams: one commander makes calls, others do the hands-on work, talking and note-taking.
+
+**Step by step:**
+1. The on-call takes the page and says "I am IC".
+2. The IC asks one engineer to be tech lead: look at dashboards and say what changed.
+3. The IC asks another to be comms lead: post on the status page every 15 minutes.
+4. A fourth person is scribe: writes "14:08 IC orders rollback" as it happens.
+5. On a small SEV3, one person can do all four jobs.
 
 Borrowed from the Incident Command System (ICS) that emergency services use, and the model both PagerDuty and incident.io document for software incidents:
 
@@ -176,6 +235,13 @@ For a SEV3/SEV4, one person often holds all four roles — the model does not re
 ### Lifecycle
 
 **In plain words:** every incident moves through the same stages, from "something's wrong" to "we wrote down what we learned".
+
+**Step by step:**
+1. Detected: the alert fires at 14:06.
+2. Triaged: SEV2 declared, IC named, at 14:07.
+3. Mitigated: rollback done at 14:10 (other options: kill switch, failover to a standby, adding more servers).
+4. Resolved: still fine after one more full cycle, at 14:16.
+5. Postmortem: written in the next few days.
 
 ```mermaid
 stateDiagram-v2
@@ -193,6 +259,13 @@ The transition most teams skip is **Mitigated → Resolved**: "the error rate ju
 ### Communication during the incident
 
 **In plain words:** regular short updates on a fixed schedule, to a known channel, even if the update is "still working on it".
+
+**Step by step:**
+1. The IC hears from the tech lead: "SEV2, the 14:02 deploy looks suspect".
+2. The IC tells the comms lead to post "investigating" right away.
+3. The IC orders the rollback; the tech lead does it.
+4. The comms lead posts "mitigated, monitoring", then "resolved" once it holds.
+5. The tech lead never has to stop and answer "any update?".
 
 ```mermaid
 sequenceDiagram
@@ -223,6 +296,8 @@ Every arrow into Comms is the IC's job, not the tech lead's — this is the conc
 
 The cheapest possible mitigation primitive: a boolean the code checks before doing the risky thing, flippable without a deploy.
 
+**What this code does, in plain words:** a true/false flag says whether webhooks may be processed. The handler checks it first; if it is off, it answers "503, paused" and does nothing else. `atomic.Bool` makes it safe for many requests to read the flag at the same time.
+
 ```go
 var webhookProcessingEnabled atomic.Bool // defaults false until Enable() is called
 
@@ -244,7 +319,7 @@ This is the entire mechanism behind "flip the kill switch" in the timeline above
 
 **In plain words:** Go code for a simple timestamped log of who did what, which later becomes the postmortem timeline.
 
-The scribe's timestamped log is the raw material the postmortem's timeline section is built from (see [[Postmortems and Root Cause Analysis]]). It has one real requirement: appends from multiple goroutines (the IC's handler, a Slack-bot integration, a status-page webhook) must never race or lose an entry.
+The scribe's timestamped log is the raw material the postmortem's timeline section is built from (see [[Postmortems and Root Cause Analysis]]). It has one real requirement: appends from multiple goroutines (Go's lightweight threads; here the IC's handler, a Slack-bot integration, a status-page webhook) must never race or lose an entry.
 
 ```go
 package incident
@@ -358,7 +433,7 @@ Both tests pass under `go vet` and `go test -race` on Go 1.24.
 | 14:08:00 | IC | Checks "what changed": the 14:02 deploy is the only change in the last hour |
 | 14:08:45 | IC | Orders rollback of the 14:02 deploy (cheaper and faster than a root-cause fix) |
 | 14:10:30 | tech-lead | Rollback complete |
-| 14:11:30 | IC | Duplicate rate back to baseline, confirms over one more polling cycle |
+| 14:11:30 | IC | Duplicate rate back to baseline (its normal level), confirms over one more polling cycle |
 | 14:16:30 | IC | Declares Resolved after five stable minutes |
 
 Total time to mitigation: 4 minutes 20 seconds from alert to rollback complete.
@@ -377,6 +452,14 @@ Root cause (a changed timeout value that made the load balancer time out before 
 > [!warning] Interview trap
 > "Who fixes the bug during an incident?" is the wrong question to lead with. The IC's job is to decide **whether and when** to mitigate, not to write the fix — conflating the two is the single most common mistake candidates make describing incident response.
 
+### Incident response vs debugging vs postmortem 🟡
+
+| | Incident response | Debugging | Postmortem |
+| --- | --- | --- | --- |
+| Goal | Stop user pain now | Find and fix the bug | Learn and prevent repeats |
+| When | While it is broken | During or after | After it is stable |
+| Typical action | Roll back, flip kill switch | Read logs, traces, code | Timeline, root cause, action items |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - Formal roles add coordination overhead that is wasted on a SEV4 — a typo in an internal admin page does not need a four-person process.
@@ -386,7 +469,10 @@ Root cause (a changed timeout value that made the load balancer time out before 
 
 ## 7. In production 🔴
 
-- **Real systems:** Google's SRE practice (the book's "Managing Incidents" chapter) formalized IC/Ops/Comms roles for software incidents from the ICS model; PagerDuty, Opsgenie and incident.io all ship IC-rotation tooling and status-page integrations built around the same roles; most companies run their live coordination in a dedicated chat channel (ChatOps) per incident, created automatically when a SEV1/SEV2 is declared.
+> 🟡 → 🔴 **You now know** the severity table, the four roles, the incident stages and how updates flow, plus a real worked timeline. **Next is the advanced part**: how large companies run this with tools, what goes wrong (no IC, early "resolved", tired ICs), what to measure, and the deeper reasons behind "mitigate first" and "the IC never debugs".
+
+
+- **Real systems:** Google's SRE practice (the book's "Managing Incidents" chapter) formalized IC/Ops/Comms roles for software incidents from the ICS model; PagerDuty, Opsgenie and incident.io all ship IC-rotation tooling and status-page integrations built around the same roles; most companies run their live coordination in a dedicated chat channel (ChatOps: running operations from a chat room) per incident, created automatically when a SEV1/SEV2 is declared.
 - **Failure modes → fixes:**
   - No one declares IC → the paging tool auto-assigns the on-call engineer as IC by default, with an explicit hand-off command if someone else should take over.
   - The tech lead also tries to do comms → a bot posts "update in 15 minutes" automatically so the tech lead is not expected to answer ad hoc questions.
@@ -402,7 +488,7 @@ Root cause (a changed timeout value that made the load balancer time out before 
 
 **Why "mitigate before root cause" survives scrutiny.** The objection is "what if the rollback doesn't actually fix it, and we wasted time?" The answer is asymmetric cost: a rollback is a known, reversible, pre-tested state (the previous deploy was running minutes ago, under load, without this symptom), while a root-cause fix is unverified code written under pressure.
 
-Reverting to a known-good state is close to risk-free by comparison, even when it later turns out the deploy was not the actual cause — you lose a few minutes retrying, instead of risking a worse outage from an untested hotfix.
+Reverting to a known-good state is close to risk-free by comparison, even when it later turns out the deploy was not the actual cause — you lose a few minutes retrying, instead of risking a worse outage from an untested hotfix (a quick code fix pushed straight to production).
 
 **Why the IC must not debug.** The instant the IC opens a terminal, two things degrade simultaneously: nobody is deciding whether to escalate severity, extend the incident, or bring in more people, and nobody is tracking whether "five more minutes" has turned into forty.
 
@@ -447,6 +533,30 @@ Separating the roles is a scheduling discipline, not a skill hierarchy — the I
 - Track MTTD, MTTA, MTTR and repeat-incident rate — separately, because each points at a different fix.
 - Comms lead posts "investigating" immediately, even with zero new information.
 - Handoff explicitly past about 2 hours; fatigue degrades judgment faster than people notice in themselves.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does the Incident Commander do?
+> Coordinates and makes the decisions. They do not debug.
+
+> [!question]- What comes first: mitigation or root cause?
+> Mitigation. Stop the user pain first, find the cause later.
+
+> [!question]- What is a kill switch?
+> An on/off setting that turns a feature off instantly, without a deploy.
+
+🟡 Medium
+
+> [!question]- Why wait one full cycle before declaring Resolved?
+> A quiet graph can be luck; the problem may return at the next deploy wave or traffic peak.
+
+> [!question]- Why report median and p90 MTTR, not just the mean?
+> One very long incident drags the mean far up and hides what a normal incident looks like.
+
+> [!question]- A rollback would undo an unrelated urgent fix. What usually happens?
+> Usually still roll back, since users are hurting now; re-apply the other fix once stable. The IC makes that call.
 
 ## Links
 

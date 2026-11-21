@@ -44,6 +44,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (the decision steps), 4 (worked example) and 5 (comparison and drills).
 > - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Stream Processing Basics]]: a stream job runs forever and handles each event within seconds as it arrives.
+> - [[Kafka and Event Streaming]]: Kafka keeps events in an ordered log for days, so readers can go back and read them again.
+> - [[Delivery Semantics and Exactly-Once]]: a message can arrive at most once, at least once, or (with care) effectively exactly once.
+
 **From zero, in 60 seconds** 🟢
 
 Data keeps arriving: orders, clicks, payments.
@@ -94,6 +99,12 @@ This guide is about picking one, or both, and fixing results when the code had a
 | Reprocessing / backfill | Re-running logic over old data after a fix | Recompute last month's totals |
 | Window | A time bucket a stream groups events into | Orders per 5 minutes |
 | Event time | When the event really happened, not when it arrived | Phone was offline, sent late |
+| Offset | An event's position number in a Kafka log; replay starts from one | "start again from offset 1,200,000" |
+| Watermark | The stream's guess that "no older events are still coming" | watermark at 10:05 closes the 10:00-10:05 window |
+| Micro-batch | A stream run as many tiny batches, every few seconds | Spark Structured Streaming |
+| Checkpoint | A saved snapshot of a stream job's state and position, used after a crash | every 30 s |
+| Sink | Where a job writes its results | a Postgres table, Redis, ClickHouse |
+| Data lake | Cheap files on object storage that keep all history | S3 holding every order event for years |
 
 **Picture it**
 
@@ -158,7 +169,24 @@ flowchart LR
 > [!tip] Remember
 > Batch has an end and can be re-run. A stream has no end, so correctness has to be built in as state, time and replay.
 
+### Real-life example: Uber surge and Spotify Wrapped 🟢
+
+When you open Uber or Ola and see surge pricing, that price comes from a stream: ride requests and free drivers are counted per area every few seconds.
+The weekly earnings statement a driver gets is a batch job: the week is closed, then every trip, toll and refund is added up once, exactly.
+Spotify Wrapped is batch too: a whole year of listening is crunched in big jobs, and nobody needs it in real time.
+Same company, same data, two different speeds, because the freshness needed is different.
+
+## Common beginner mistakes 🟢
+
+- **Picking the tool before the freshness** → you build a streaming cluster for a once-a-day report → first write down how old the answer may be.
+- **Trusting a stream alone for money** → late or duplicate events make totals drift → compute money in a closed-day batch (or a ledger), and compare the stream against it.
+- **Keeping Kafka data for only a day with no lake copy** → a bug found next week cannot be replayed → keep raw events in a data lake for long history.
+- **Calling "a stream job plus some nightly job" Lambda** → Lambda means both compute the same result and are merged → say exactly what each path is for.
+- **Fixing a bug by overwriting the live table during a replay** → readers see half-fixed numbers → write to a new table, check it, then switch readers.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** batch works on a closed pile of data and a stream works on events as they come. **Next we open the box** in seven steps: how fresh the answer must be, how to recompute history, the Lambda and Kappa designs, today's middle path, time and late data, and the tools. Several steps start with a plain walk-through; the full detail follows.
 
 ### Step 1: how fresh must the answer be?
 
@@ -192,6 +220,13 @@ flowchart TD
 
 **In plain words:** logic changes and bugs happen. **Reprocessing** means recomputing results for past data with the fixed code. Batch does it by rerunning on stored input. A stream needs the input kept in a replayable log.
 
+**Step by step:**
+1. Last Tuesday the discount rule was wrong for 6 hours. You fix the code.
+2. Batch: re-run Tuesday's job on Tuesday's stored files, writing to a new table.
+3. Stream: start the fixed job from the Kafka offset before the bug, also writing to a new table.
+4. Compare the new totals with a trusted reference (for example settled payments).
+5. Switch readers to the new table. Nobody ever saw half-fixed numbers.
+
 ```mermaid
 sequenceDiagram
     participant Eng as Engineer
@@ -219,6 +254,13 @@ Notice the two rules: write to a new table, then switch readers. Never overwrite
 
 **In plain words:** keep two paths over the same input. A **speed layer** (stream) gives fast, approximate numbers. A **batch layer** recomputes exact numbers later. A **serving layer** merges them at read time.
 
+**Step by step:**
+1. Every ad click goes into one log.
+2. The speed layer (a stream job) keeps a running spend total per campaign, updated every few seconds.
+3. Overnight the batch layer recomputes yesterday's spend exactly from the stored clicks, including late ones.
+4. When you ask "spend so far", the serving layer adds the exact batch total for old days to the stream total for today.
+5. The cost: the same business rule is written twice, once per layer, and the two must agree.
+
 ```mermaid
 flowchart LR
     SRC[("Events")] --> LOG[("Kafka")]
@@ -242,6 +284,13 @@ flowchart LR
 ### Step 4: Kappa architecture
 
 **In plain words:** drop the batch path. Keep one stream job over a long-retention log. To reprocess, start a new copy of the job from an older offset, let it catch up, then switch.
+
+**Step by step:**
+1. Keep all events in a log for a long time (weeks or months).
+2. One stream job (v1) reads it and writes results to table A.
+3. The logic changes. Start a second copy (v2) from the start of the log, writing to table B.
+4. v2 reads old events fast until it catches up to "now".
+5. Check B, switch readers from A to B, then stop v1. One codebase, history fixed by replay.
 
 ```mermaid
 flowchart LR
@@ -288,6 +337,13 @@ flowchart TD
 ### Step 6: time, windows and late data (stream only)
 
 **In plain words:** in batch, "yesterday's orders" is a closed set. In a stream, you must decide when a window is done. **Event time** is when it happened, **processing time** is when you saw it, and a **watermark** is your guess of "no older events are still coming". See [[Stream Processing Basics]] for the mechanism.
+
+**Step by step:**
+1. You count orders in 1-minute windows by event time (when the order really happened).
+2. An order placed at 10:00:50 arrives at 10:01:05 because the phone was in a tunnel.
+3. The watermark trails 10 seconds behind the newest event, so the 10:00 window is still open; the order counts.
+4. Another order from 10:00:30 arrives at 10:03. Its window is closed, so it goes to a side output (a separate "late" list).
+5. The nightly batch job later adds the late ones to the exact totals.
 
 ```mermaid
 flowchart LR
@@ -357,7 +413,7 @@ flowchart LR
     WH --> FIN["Finance reports and payouts"]
 ```
 
-1. **Source of truth:** the orders database. Events leave through the **outbox** so none are lost ([[Transactional Outbox and CDC]]).
+1. **Source of truth:** the orders database. Events leave through the **outbox** (a table written in the same transaction as the order, then published) so none are lost ([[Transactional Outbox and CDC]]).
 2. **Log:** Kafka holds 7 days, so a streaming bug can be replayed.
 3. **Fast path:** Flink counts orders per zone in 5-minute event-time windows with 30 s lateness. Dashboard freshness is about 10 seconds (estimate).
 4. **Exact path:** every event also lands in the lake. At 02:00 a Spark job recomputes the previous day with discounts, refunds and late events applied. Payouts read only this table.
@@ -461,7 +517,9 @@ flowchart TD
 
 ## 7. In production 🔴
 
-- **Monitor lag, not just errors:** consumer lag per partition (`kafka-consumer-groups.sh --bootstrap-server <broker:9092> --describe --group <group>`; the script has no `.sh` suffix in some packaged installs), end-to-end event-time latency, checkpoint duration and size, and watermark lag.
+> 🟡 → 🔴 **You now know** how to pick by freshness, how Lambda and Kappa work, and how to handle late data. **Next comes the senior view**: what to watch in production (lag, idle partitions, skew, schema changes, reconciliation), and why exactly-once is a combination of parts, not a switch.
+
+- **Monitor lag, not just errors:** consumer lag (how far a reader is behind the newest event) per partition (`kafka-consumer-groups.sh --bootstrap-server <broker:9092> --describe --group <group>`; the script has no `.sh` suffix in some packaged installs), end-to-end event-time latency, checkpoint duration and size, and watermark lag.
 - **Idle partition trap:** one quiet partition stalls the watermark for the whole job. Configure idleness handling.
 - **Skew:** one hot key (a huge restaurant, a viral ad) overloads one worker. Salt the key or pre-aggregate. See [[Hot Keys and Hot Partitions]].
 - **Schema changes:** use a registry and compatible changes, or replays break ([[Event Schemas and Schema Registry]]).
@@ -514,7 +572,7 @@ flowchart LR
 
 **In plain words:** A stream job keeps running totals in memory. If those totals get too big to fit, a stream may be the wrong tool.
 
-State in a stream lives in memory or an embedded store (RocksDB in Flink) and is checkpointed. If state per key times keys exceeds what the cluster can hold, either window it, expire it with TTL, or reduce what is stored (counts, sketches; see [[Bloom Filters and Probabilistic Data Structures]]).
+State in a stream lives in memory or an embedded store (RocksDB in Flink, a fast on-disk key-value store inside the job) and is checkpointed. If state per key times keys exceeds what the cluster can hold, either window it, expire it with TTL, or reduce what is stored (counts, sketches; see [[Bloom Filters and Probabilistic Data Structures]]).
 
 ## 9. Interview questions 🔴
 
@@ -561,6 +619,26 @@ State in a stream lives in memory or an embedded store (RocksDB in Flink) and is
 
 - **Say it like this:** "I pick by freshness and correctness. The stream gives seconds-fresh approximate numbers; the nightly batch from the lake gives the exact ones, and I reconcile them."
 - **Always mention:** retention for replay, late data, idempotent sink, reconciliation.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is the first question to ask before choosing batch or stream?
+> How old may the answer be: days, minutes or seconds?
+
+> [!question]- (easy) Which suits restaurant payouts, and which suits a live "stuck orders" dashboard?
+> Payouts: nightly batch. Live dashboard: stream.
+
+> [!question]- (easy) What is reprocessing?
+> Recomputing past results with fixed code, after a bug or a logic change.
+
+> [!question]- (medium) What is the main cost of Lambda?
+> Two codebases computing the same result, which can drift apart.
+
+> [!question]- (medium) How does Kappa reprocess history?
+> Start a new copy of the stream job from an older log offset, let it catch up into a new table, then switch readers.
+
+> [!question]- (medium) What makes stream output exactly-once?
+> A replayable source, checkpoints that save state with offsets, and a transactional or idempotent sink.
 
 ## Links 🟢
 

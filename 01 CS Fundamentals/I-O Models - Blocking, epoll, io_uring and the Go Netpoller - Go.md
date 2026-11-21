@@ -22,6 +22,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add "Code", "Design decisions" and "Running it".
 > - 🔴 **Interview / SDE-3 prep?** Add "Tests", "Pitfalls" and the exercises. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]]: the theory twin. Know that Go secretly waits on many sockets with epoll so your code can look simple.
+> - [[Concurrency Primitives - Mutex, Semaphore, Atomics]]: several goroutines run at once, and sharing memory between them without care causes bugs.
+> - [[System Calls and User vs Kernel Mode]]: reading from the network is a request to the kernel.
+
 **From zero** 🟢
 
 This file is the hands-on twin of the theory note. It builds a tiny echo server in Go — a server that just sends back whatever you send it — and then proves two things with tests: 200 clients at once all work correctly and cheaply, and the server handles about 56,000 round trips per second on a laptop. Read it top to bottom; every code block is followed by a plain "How it works" list. You never see `epoll` in the code — that absence is the whole lesson.
@@ -29,7 +34,10 @@ This file is the hands-on twin of the theory note. It builds a tiny echo server 
 ## Before the code 🟢
 
 - **Goroutines (`go func(){...}()`)**: a cheap concurrent task; the server starts one per connection.
-- **`net.Listener` / `net.Conn` (interfaces)**: the standard library's network types; `Accept`, `Read`, `Write` look blocking but park only the goroutine.
+- **`net.Listener` / `net.Conn` (interfaces)**: the standard library's network types; `Accept`, `Read`, `Write` look blocking but park only the goroutine (put just that goroutine to sleep, leaving the OS thread free).
+- **Netpoller**: the part of the Go runtime that watches all sockets with epoll (or kqueue on Mac) and wakes the right goroutine when data arrives.
+- **EOF**: "end of file", the signal that the other side has nothing more to send.
+- **Data race**: two goroutines touching the same memory at once with at least one writing; results become random.
 - **`io.Copy`**: copies from a reader to a writer until EOF; here it echoes a connection back to itself.
 - **`sync.WaitGroup`**: waits until a group of goroutines has finished.
 - **`defer`**: runs cleanup (like `Close`) when the function returns, on every path.
@@ -62,11 +70,13 @@ flowchart LR
 - Go 1.24. No external dependencies: everything is the standard library (`net`, `io`, `sync`, `runtime`, `time`).
 - Layout: a single-package module `iomodels` with `echo.go`, `echo_test.go` and `echo_bench_test.go`.
 - Run it with `go vet ./... && go test -race -v ./...`.
-- No external service is needed; the tests dial the server over the loopback interface (`127.0.0.1:0`, an OS-assigned port), so the module has nothing to configure and nothing external to start first.
+- No external service is needed; the tests dial the server over the loopback interface (the machine talking to itself, never leaving the computer; `127.0.0.1:0` asks the OS to pick a free port), so the module has nothing to configure and nothing external to start first.
 - The race detector (`-race`) is deliberately part of the standard run here, not an optional extra.
 - A shared buffer bug in this kind of concurrent networking code is exactly the class of bug `-race` exists to catch, and the Pitfalls section below shows one on purpose.
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** what the module proves: many connections are cheap in Go, and `epoll` never shows up in your code. **Next we read the code** itself: a server that is just a loop plus one goroutine per connection.
 
 ### Step 1: the echo server
 
@@ -142,11 +152,13 @@ The module is deliberately small and dependency-free so that every line a reader
 
 ## Tests 🔴
 
+> 🟡 → 🔴 **You now know** how the server works. **Next comes the advanced part:** tests that prove it is correct with 200 clients at once, that no goroutine leaks, and a measured round-trips-per-second number, plus the concurrency traps hidden in such tests.
+
 ### Test 1: many concurrent connections, proven cheap
 
 **In plain words:** fire 200 clients at the server at once, check each one gets its own message back, and check no goroutine is left hanging afterwards.
 
-**Property.** 200 concurrent clients must all round-trip their own distinct message correctly, and the goroutine count must return to (near) baseline afterward — proving no goroutine was left parked forever.
+**Property.** 200 concurrent clients must all round-trip their own distinct message correctly, and the goroutine count must return to (near) baseline (the count before the test started) afterward — proving no goroutine was left parked forever.
 
 | Input | Expected |
 | --- | --- |
@@ -407,6 +419,30 @@ Each one maps to a real line in the code above, not a generic warning, and each 
 1. Change `TestEchoServerThroughput`'s `roundTripsPerConn` from 20 to 200 and predict whether round-trips-per-second rises, falls, or stays about the same. Run it and explain the result using "How it works."
 2. Deliberately hoist `buf` back above the `go func()` loop (making it shared) and run `go test -race`. Read the race report and map each stack frame back to the line that caused it, then explain in your own words why the shared slice is unsafe even though every goroutine only writes to the first few bytes of it.
 3. Add a variant of `EchoServer` that uses `conn.SetReadDeadline` with a short timeout instead of relying on `CloseWrite`, and write a test that proves a client that never writes gets disconnected instead of parking forever. Compare the goroutine-count check in that new test against the one in `TestEchoServerHandlesManyConcurrentConnections`.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does the echo server do with each connection?
+> It starts one goroutine that copies every byte it receives straight back to the sender with `io.Copy(c, c)`.
+
+> [!question]- Where is `epoll` in this code?
+> Nowhere. The Go runtime's netpoller uses it underneath; that hidden-ness is the lesson.
+
+> [!question]- Why does the test use `127.0.0.1:0`?
+> It talks over loopback and lets the OS pick a free port, so nothing external is needed and ports never clash.
+
+🟡 Medium
+
+> [!question]- Why must `buf` be created inside each client goroutine?
+> A shared buffer would be written by many goroutines at once, corrupting data and failing `-race`.
+
+> [!question]- Why does the client call `CloseWrite` instead of `Close`?
+> It sends EOF so the server's `io.Copy` finishes, while still letting the client read the echoed reply.
+
+> [!question]- Why does the leak check allow `before+5` and not an exact count?
+> Background runtime goroutines (garbage collector, timers) come and go, so an exact match would fail randomly.
 
 ## Links 🟢
 

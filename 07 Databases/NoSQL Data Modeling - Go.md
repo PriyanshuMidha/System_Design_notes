@@ -25,6 +25,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code steps 1-8 in order, then the Design decisions and Tests.
 > - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[NoSQL Data Modeling]]: the theory half. List the questions first, then build keys so each question is one read.
+> - [[SQL vs NoSQL]]: DynamoDB and MongoDB give up joins and free-form queries in exchange for scale.
+> - [[Relational Schema Design]]: the invoice, client and payment tables this note re-shapes into keys and documents.
+> - [[Partitioning and Sharding]]: the partition key decides which machine holds an item.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on half of [[NoSQL Data Modeling]]. It builds a tiny fake DynamoDB table in plain Go, so you can watch the ideas from the theory note actually run: building keys like `WS#acme`, reading one page of results at a time with a cursor, querying a second index, and spreading a hot key over many shards. It also shows the MongoDB invoice document and the one-step payment update written out in full. Read it top to bottom: each step gives the idea first, then the code, then a line-by-line "How it works".
@@ -33,7 +39,7 @@ This file is the hands-on half of [[NoSQL Data Modeling]]. It builds a tiny fake
 
 - **String keys**: plain functions build DynamoDB keys such as `WS#acme` and `INV#2026-11#0042`.
 - **`sort` and `strings`**: the in-memory table keeps items in sort-key order and matches prefixes, like a real `Query`.
-- **Cursor pagination**: `Query` returns at most `limit` items and a cursor to continue from.
+- **Cursor pagination** (a bookmark that says where the last page ended): `Query` returns at most `limit` items and a cursor to continue from.
 - **`hash/fnv`**: spreads one hot key over several partition keys in a stable way.
 - **`package main`**: a small program prints the whiteboard example.
 - **Run**: `go vet ./... && go test -race ./...`, and `go run ./cmd` for the whiteboard.
@@ -45,7 +51,7 @@ This file is the hands-on half of [[NoSQL Data Modeling]]. It builds a tiny fake
 | `main` printout (whiteboard program) | access pattern to key: every read is one `Query` on one partition key |
 | `WorkspacePK`, `InvoiceSK`, `InvoicePK`, `PaymentSK` | composite sort keys that serve several prefixes |
 | `Table.Query` with `startAfter` and a returned cursor | `LastEvaluatedKey` and `ExclusiveStartKey` pagination |
-| `Table.QueryGSI1` | an overloaded GSI answering "this client and its invoices" |
+| `Table.QueryGSI1` | an overloaded GSI (global secondary index: a second copy of the items, keyed differently) answering "this client and its invoices" |
 | `ShardedPK` | write sharding to escape the 1,000 WCU per-partition limit |
 | MongoDB invoice document and `$push`/`$inc` update | embedding, extended reference, computed fields and the idempotent single-document write |
 
@@ -72,6 +78,8 @@ flowchart LR
 - The MongoDB documents are JSON and run in `mongosh`; they are not part of the Go module.
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** what the code demonstrates. **Next we open the box**: first the design on paper (keys and the MongoDB document), then a small Go table that behaves like DynamoDB for `Put`, `Query`, cursors and a GSI.
 
 The code has two halves. The first half (steps 1 to 3) is the design on paper: the keys each access pattern uses, the MongoDB document, and the atomic payment write. The second half (steps 4 to 8) is a small Go model of the DynamoDB read path, so you can watch prefix queries, cursors and shard keys behave.
 
@@ -434,6 +442,8 @@ In real code, `Query` is `dynamodb.Query` from the AWS SDK for Go v2, with `KeyC
 
 The tests share one fixture, `seed`, that builds one workspace with four invoices (in months 2026-09, 2026-10 and two in 2026-11), one client row and one payment. Seed first, then each test asserts one property.
 
+**What this code does, in plain words:** it fills a fresh toy table with one workspace (`acme`), four invoices across three months, one client row and one payment, so every test starts from the same known data.
+
 ```go
 package dynkeys
 
@@ -488,6 +498,8 @@ func TestQueryByMonthPrefix(t *testing.T) {
 | Input | Expected |
 | --- | --- |
 | prefix `INV#`, limit 3, loop until cursor is empty | page 1 has 3 items, page 2 has 1, total 4 |
+
+**What this code does, in plain words:** it reads all invoices 3 at a time, passing the bookmark back each round, and checks it gets 3 then 1, with all 4 invoices seen exactly once.
 
 ```go
 func TestPaginationWithCursor(t *testing.T) {
@@ -606,6 +618,8 @@ Each line is one access pattern turned into a key, in the same order as the code
 
 ## Pitfalls in the code 🔴
 
+> 🟡 → 🔴 **You now know** how the toy table and its tests work. **Next are the gaps** between the toy and real DynamoDB that bite in production: map-shaped cursors, the 1 MB page limit, shard counts and byte-order sorting.
+
 - **The cursor is a plain string.** `Query` returns the last sort key as the cursor, which works because the tests query one partition key. DynamoDB's `LastEvaluatedKey` is a map of the table's key attributes (and the index's, for a GSI), so a real pager must pass the whole map back.
 - **No 1 MB page limit and no filter.** The stand-in cuts pages only by `limit`. Real `Query` also stops at 1 MB and applies `Limit` before any `FilterExpression`, so a real page can come back empty with a cursor.
 - **`ShardedPK` needs all `n` shards on read.** The function returns one shard for one write key; a reader has to query all `n` keys and merge. Changing `n` later re-maps existing keys.
@@ -618,6 +632,30 @@ Each line is one access pattern turned into a key, in the same order as the code
 1. Change `limit` in `TestPaginationWithCursor` from 3 to 1. Predict how many pages the loop reads and whether `all` still has 4 entries.
 2. In `seed`, change `"2026-11"` (the third invoice) to `"2026-12"`. Predict the result of `TestQueryByMonthPrefix` and which prefix query would now return that invoice.
 3. Change the shard count in `TestShardedPKIsStableAndSpread` from 10 to 1,000 with the same 1,000 write keys. Predict whether all 1,000 shards are used, and what that means for a reader.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does `InvoiceSK("2026-11", "inv_812")` return?
+> `INV#2026-11#inv_812`.
+
+> [!question]- When is the pagination loop finished?
+> When `Query` returns an empty cursor.
+
+> [!question]- Why do the MongoDB payment update and total change need no transaction?
+> Both live in one document, and a single-document write is always atomic.
+
+🟡 Medium
+
+> [!question]- Why does `ShardedPK` hash the event ID instead of picking a random shard?
+> The same event always lands on the same shard, so it can be found again.
+
+> [!question]- Why does `ITEM#10` sort before `ITEM#2`, and what is the fix?
+> String keys compare byte by byte, and `1` is less than `2`; zero-pad numbers like `ITEM#002`.
+
+> [!question]- In `TestGSIOverloadingServesClientView`, why does the oldest invoice come before the client row?
+> `INV#...` sorts before `META` because `I` comes before `M` in byte order.
 
 ## Links 🟢
 

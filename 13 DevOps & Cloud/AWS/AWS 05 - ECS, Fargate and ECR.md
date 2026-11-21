@@ -29,6 +29,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[AWS 04 - Compute Choices - EC2, ECS-Fargate, EKS, Lambda]]: ECS on Fargate runs your containers without you managing servers, and suits steady, always-on APIs.
+> - [[Docker 02 - Images, Layers and Containers]]: an image is a stack of layers named by a tag or an exact digest, and many containers can run from one image.
+
 **From zero, in 60 seconds** 🟢
 
 You have a container image. Now you need a place to keep it and a place to run it.
@@ -73,6 +77,12 @@ ECR stores your images safely, and ECS keeps the right number of copies running 
 | Health check | A URL the system calls to see if a copy is OK | `GET /readyz` returns 200 |
 | Rolling deployment | Replacing old copies with new ones a few at a time | Swap v41 to v42 without downtime |
 | Fargate | AWS runs the host machine; you only define tasks | No EC2 instances to patch |
+| Cluster | A named group that services and tasks belong to | `prod-cluster` |
+| awsvpc mode | Each task gets its own network card, IP address and security group | Task IP `10.0.3.17` |
+| Target group | The list of servers or tasks a load balancer sends traffic to | `orders-tg`, health check `/readyz` |
+| Deregistration delay | How long the load balancer lets a leaving task finish open requests | 30 seconds |
+| Circuit breaker | ECS's automatic stop-and-roll-back when new tasks keep failing | Rolls back to revision 6 |
+| Task role / execution role | The app's own AWS permissions / ECS's permissions to pull the image and ship logs | S3 read / ECR pull |
 
 **Picture it**
 
@@ -108,7 +118,15 @@ You also need something that keeps a target number of copies of it running, repl
 
 Doing this by hand — SSH to a box, `docker run`, watch it, restart it when it dies — does not survive a host failure, does not scale past one person's attention, and has no audit trail for who deployed what.
 
-ECS solves the "keep N copies running" problem with a **service**, which continuously reconciles the actual running task count against the desired count — the same control-loop idea Kubernetes uses, applied through AWS's own, simpler API.
+ECS solves the "keep N copies running" problem with a **service**, which continuously reconciles (compares and fixes) the actual running task count against the desired count — the same control-loop idea Kubernetes uses, applied through AWS's own, simpler API.
+
+### Real-life example: a sale-day deploy at a shopping app 🟢
+
+Imagine a fashion app like Myntra that must ship a fix to its cart service in the middle of a big sale.
+The new image is pushed to ECR and a new task definition revision is registered.
+The ECS service starts new tasks, waits until the load balancer sees them as healthy, and only then drains and stops old ones, so shoppers never hit a gap.
+If the new tasks keep failing their health check, the circuit breaker rolls back to the old revision on its own.
+Nobody had to SSH into a server, and capacity never dropped during the sale.
 
 ## 2. Mental model 🟢
 
@@ -116,12 +134,28 @@ Four nested ideas, in the order AWS introduces them:
 
 - **ECR** is a Docker registry — `docker push`/`pull`, just hosted by AWS with IAM-based access control instead of a username/password.
 - A **task definition** is a JSON blueprint: which image, how much CPU/memory, which ports, which environment variables and secrets, which IAM roles. It does not run anything by itself.
-- A **task** is one running copy of a task definition — and, importantly, a task can hold **several containers** (an app container plus sidecars for logging or a service-mesh proxy), all scheduled together on the same host or Fargate slot.
+- A **task** is one running copy of a task definition — and, importantly, a task can hold **several containers** (an app container plus sidecars (helper containers in the same task) for logging or a service-mesh proxy), all scheduled together on the same host or Fargate slot.
 - A **service** wraps a task definition with a desired count and keeps that many tasks running, replacing any that stop, and (if attached to a load balancer) only registering tasks that pass their health check.
+
+## Common beginner mistakes 🟢
+
+- **Running only `aws ecr get-login-password`** → it prints a token but does not log Docker in → pipe it into `docker login --password-stdin`.
+- **Deploying the `latest` tag** → you cannot tell which code a task runs, and rollbacks get confusing → tag by commit SHA and make tags immutable.
+- **Putting tasks in a private subnet with no way to reach ECR** → tasks fail with "CannotPullContainerError" → add ECR VPC endpoints or a NAT gateway.
+- **Having only one `/health` URL** → during shutdown the app is alive but should get no new traffic → use `/healthz` for alive and `/readyz` for ready.
+- **Giving the app's permissions to the execution role (or the reverse)** → one side gets powers it should not → keep the task role and execution role separate.
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that ECR stores images and an ECS service keeps N copies of a task definition running. **Next we open the box**: how tasks sit in your network behind a load balancer, how an image gets pulled from ECR, and how a rolling deploy swaps old tasks for new ones without dropping requests.
+
 **In plain words:** four boxes inside each other: cluster holds services, services keep tasks running, tasks are built from task definitions.
+
+**Step by step:**
+1. Users hit the Application Load Balancer in the public subnets.
+2. The load balancer's target group lists the IP address of each healthy task and checks `/readyz` on each.
+3. Each task sits in a private subnet with its own network card and its own security group (awsvpc mode).
+4. Tasks reach the database in an isolated subnet, and pull their image from ECR through a private VPC endpoint, with no NAT needed.
 
 ```mermaid
 flowchart TB
@@ -148,13 +182,25 @@ flowchart TB
     EP -. "PrivateLink, no NAT needed" .-> ECR
 ```
 
-Each task runs in **awsvpc** networking mode: it gets its own elastic network interface and its own security group, as if it were a small EC2 instance, instead of sharing the host's network namespace.
+Each task runs in **awsvpc** networking mode: it gets its own elastic network interface (ENI, a virtual network card) and its own security group, as if it were a small EC2 instance, instead of sharing the host's network namespace.
 
 That is what lets the ALB target group use **ip** target type (routing straight to the task's ENI IP) and what lets you scope a security group per task rather than per host.
 
 ### Pulling the image
 
 **In plain words:** log in to ECR first, then pull. People often forget that the login token only lasts 12 hours.
+
+**Step by step:**
+1. `aws ecr get-login-password` asks AWS for a temporary password (valid 12 hours) and prints it.
+2. That output is piped into `docker login --username AWS --password-stdin <registry>`, which actually logs Docker in.
+3. `docker push` or `docker pull` now works. Inside ECS, the task execution role does this for you automatically.
+
+```mermaid
+flowchart LR
+    G["get-login-password<br/>(prints token)"] -->|"pipe"| L["docker login<br/>--password-stdin"]
+    L --> P["docker push / pull works"]
+    G -.->|"no pipe"| E["'no basic auth credentials'"]
+```
 
 Logging in to ECR is a two-step process; the common mistake is running only the first step:
 
@@ -176,6 +222,13 @@ Running `get-login-password` alone prints a token to your terminal; it does not 
 ### Rolling deployment
 
 **In plain words:** ECS swaps tasks a few at a time and only removes old ones when new ones pass health checks.
+
+**Step by step (3 tasks, v41 → v42):**
+1. CI calls `update-service` with task definition revision 42.
+2. ECS starts new v42 tasks next to the 3 old ones (the default lets it go up to double, 200%).
+3. Each new task must answer `/readyz` with 200 a few times in a row before the load balancer adds it.
+4. ECS then deregisters an old v41 task: no new requests go to it, and it gets the deregistration delay (say 30 seconds) to finish open ones, then SIGTERM.
+5. If the v42 tasks keep failing health checks, the circuit breaker stops the rollout and goes back to revision 41.
 
 ```mermaid
 sequenceDiagram
@@ -224,7 +277,7 @@ func (a *App) Shutdown(ctx context.Context) error {
 
 A minimal ECS-ready Go HTTP service with a liveness probe (`/healthz`, always 200 while the process is alive), a readiness probe (`/readyz`, the one the ALB target-group health check polls), and a graceful `Shutdown` that flips readiness off before draining.
 
-This is what task definitions wire up as the ALB health-check path plus a `stopTimeout` long enough to let `Shutdown` finish.
+This is what task definitions wire up as the ALB health-check path plus a `stopTimeout` (how long ECS waits after SIGTERM before force-killing the container) long enough to let `Shutdown` finish.
 
 ```go
 // Package ecsapp shows the shutdown sequence an ECS/Fargate task must
@@ -289,6 +342,8 @@ func (a *App) Ready() bool { return a.ready.Load() }
 
 The test proves the property that actually matters in production: a request already in flight when `Shutdown` is called completes successfully, because `Shutdown` stops accepting new connections before it closes anything.
 
+**What this code does, in plain words:** the tests check that `/healthz` always says OK, that `/readyz` switches from OK to "503, not ready" once shutdown starts, and that a slow request already running when shutdown begins still finishes with a normal response.
+
 ```go
 func TestShutdownDrainsInFlightRequest(t *testing.T) {
     started := make(chan struct{})
@@ -321,7 +376,7 @@ func TestShutdownDrainsInFlightRequest(t *testing.T) {
 }
 ```
 
-**Result (this test run, Go 1.24.4, `go test -race`, 2026-11-07):** `TestHealthzAlwaysOK`, `TestReadyzFlipsOnShutdown`, and `TestShutdownDrainsInFlightRequest` all pass — including under the race detector, which matters here because readiness is read from the HTTP handler goroutine while `Shutdown` writes it from the signal-handling goroutine; `atomic.Bool` is what makes that safe.
+**Result (this test run, Go 1.24.4, `go test -race`, 2026-11-07):** `TestHealthzAlwaysOK`, `TestReadyzFlipsOnShutdown`, and `TestShutdownDrainsInFlightRequest` all pass — including under the race detector (Go's `-race` tool that catches two goroutines touching the same data unsafely), which matters here because readiness is read from the HTTP handler goroutine while `Shutdown` writes it from the signal-handling goroutine; `atomic.Bool` is what makes that safe.
 
 ### ECS concepts (corrected)
 
@@ -344,8 +399,8 @@ The old table's "Task | running container instance" line was wrong: a task is a 
 - Container image URI (by digest or an immutable tag, never floating `latest`)
 - CPU and memory, at the task level and optionally per container
 - Container port mappings
-- Environment variables (plain config) and secrets (references into Secrets Manager or SSM Parameter Store — see [[Secrets Management]])
-- Log configuration (`awslogs` driver to CloudWatch Logs, or FireLens for custom routing)
+- Environment variables (plain config) and secrets (references into Secrets Manager or SSM Parameter Store, AWS's two stores for settings and secrets — see [[Secrets Management]])
+- Log configuration (`awslogs` driver to CloudWatch Logs, or FireLens, a log-router sidecar, for custom routing)
 - Health check command (container-level) and, separately, the ALB target-group health check path
 
 ## 5. Variants and comparison 🟡
@@ -364,11 +419,14 @@ The old table's "Task | running container instance" line was wrong: a task is a 
 ## 6. Trade-offs and when not to use 🟡
 
 - Fargate removes host patching but costs more per unit of CPU/memory than the EC2 launch type at scale — re-evaluate once a service is large and stable.
-- `awsvpc` networking gives each task its own ENI, which is safer (per-task security groups) but consumes one VPC IP address per task; very large clusters can exhaust a subnet's IP space faster than expected — size subnets generously or use ENI trunking.
+- `awsvpc` networking gives each task its own ENI, which is safer (per-task security groups) but consumes one VPC IP address per task; very large clusters can exhaust a subnet's IP space faster than expected — size subnets generously or use ENI trunking (letting one host network card carry many tasks' traffic).
 - The deployment circuit breaker protects against a broken new revision looping forever, but it only catches failures visible to the ECS health check; a revision that deploys healthy but silently returns wrong data needs its own smoke tests in the pipeline (see [[CI-CD Pipelines (GitHub Actions for Go)]]).
 - For a single, small, rarely-changing service with no need for per-task networking or fine-grained IAM, a single EC2 instance running `docker compose` is simpler and cheaper — ECS earns its complexity once you need zero-downtime deploys, multiple replicas, or auto scaling.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how tasks sit behind a load balancer, how ECR login works, how rolling deploys and the circuit breaker protect a service, and how a Go app should flip readiness before shutting down. **Next is the advanced part**: the start-up and deploy failures teams actually hit, what to watch, and deeper features like capacity providers, service auto scaling and immutable tags.
+
 
 - **Real systems:** ECS/Fargate behind an ALB is one of the most common ways to run a containerized Go API on AWS without adopting Kubernetes; EKS (see [[Kubernetes Fundamentals]]) is the alternative once a team already runs Kubernetes elsewhere.
 - **Failure modes → fixes:**
@@ -416,6 +474,30 @@ The old table's "Task | running container instance" line was wrong: a task is a 
 - Task execution role = pull image/ship logs/fetch secrets; task role = the app's own AWS permissions.
 - Readiness flips off before the listener closes, so the ALB's deregistration delay has time to drain in-flight requests.
 - The deployment circuit breaker auto-rolls-back a revision whose new tasks keep failing health checks.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is the difference between ECR and ECS?
+> ECR stores container images; ECS runs them.
+
+> [!question]- What does an ECS service do?
+> It keeps a set number of tasks running and replaces any that stop.
+
+> [!question]- Is a task the same as one container?
+> No. A task is one running copy of a task definition and can hold several containers.
+
+🟡 Medium
+
+> [!question]- Tasks in a private subnet fail with "CannotPullContainerError". What is the usual fix?
+> Give them a path to ECR: ECR VPC endpoints (`ecr.dkr`, `ecr.api`, plus S3) or a NAT gateway.
+
+> [!question]- Why should `/readyz` return 503 as soon as shutdown starts?
+> So the load balancer stops sending new requests while the deregistration delay lets open ones finish.
+
+> [!question]- With `minimumHealthyPercent` 100 and `maximumPercent` 200, does capacity drop during a deploy?
+> No. All old tasks keep running while up to a full set of new ones start.
 
 ## Links
 

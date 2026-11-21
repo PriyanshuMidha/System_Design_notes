@@ -32,6 +32,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Functions, Closures, Defer, Panic and Recover]]: functions are values you can pass to other functions, and a closure remembers variables from where it was made. Iterators are built from exactly this.
+> - [[Interfaces]]: an interface is a list of methods a type must have. A generic constraint is written as an interface.
+
 **From zero, in 60 seconds** 🟢
 
 You write a `Max` function for ints. Then you need one for floats. Then strings. Same code three times.
@@ -75,6 +79,12 @@ Iterators solve a second problem: walking through a big or endless sequence one 
 | Instantiation | The compiler making a concrete version for one type | `Max[int]` |
 | Callback | A function you hand over to be called later | `yield(v)` |
 | Lazy | Producing values only when asked | Read lines one by one, not all at once |
+| Underlying type | The built-in type a named type is made from | `type UserID int` has underlying type `int` |
+| Type assertion | Pulling a concrete type back out of an `any` at runtime; panics if wrong | `v.(int)` |
+| Type inference | The compiler working out `T` from the arguments, so you do not write it | `Sum(xs)` instead of `Sum[int](xs)` |
+| GC shape | Go's grouping of types that look the same in memory, so they can share one compiled copy | all pointer types share one shape |
+| Free function | A plain function, not a method on a type | `func Transform(...)` |
+| LRU cache | A cache that throws out the Least Recently Used item when full | keep the 100 most recent requests |
 
 **Picture it**
 
@@ -103,15 +113,19 @@ Where it breaks: a cutter only works on dough the constraint allows; Go will not
 
 ## 1. Why it exists 🟢
 
-Before Go 1.18, a container that worked for any type either gave up type safety (`[]interface{}`, with a type assertion and a possible panic on every read) or was copy-pasted per type (`IntSet`, `StringSet`, `UserSet`, …). A cache keyed by `string` could not be reused for a cache keyed by `int64` without copying the whole file.
+Before Go 1.18, a container that worked for any type either gave up type safety, meaning the compiler catching wrong types for you (`[]interface{}`, with a type assertion and a possible panic on every read) or was copy-pasted per type (`IntSet`, `StringSet`, `UserSet`, …). A cache keyed by `string` could not be reused for a cache keyed by `int64` without copying the whole file.
 
 Generics close that gap: one `LRU[K comparable, V any]` type serves every key and value type, and the compiler rejects `cache.Put(42, "x")` on an `LRU[string, int]` at compile time, not with a runtime panic.
 
 Iterators close a different gap.
 
-Before Go 1.23, "give me a lazy, early-exitable sequence of my own type" meant either materializing a `[]T` (memory for every element, even if the caller only wants the first three) or hand-writing a `Next() (T, bool)` cursor type and asking every caller to drive it in a `for cursor.Next() { ... }` loop instead of plain `range`.
+Before Go 1.23, "give me a lazy, early-exitable sequence of my own type" meant either materializing (building the whole thing in memory up front) a `[]T` (memory for every element, even if the caller only wants the first three) or hand-writing a `Next() (T, bool)` cursor type (an object that remembers where you are and hands out the next item each call) and asking every caller to drive it in a `for cursor.Next() { ... }` loop instead of plain `range`.
 
 Range-over-func lets your own types plug into the same `for range` syntax as a slice or a channel.
+
+### Real-life example 🟢
+
+A ticketing app like BookMyShow keeps small in-memory caches: movies by movie ID (`string`), cinemas by cinema number (`int64`), seat maps by show ID. Before generics, each needed its own copy-pasted cache code. With generics, one `LRU[K comparable, V any]` serves all three, and the compiler stops anyone putting a cinema into the movie cache. Iterators help on the "download all my bookings" page: the server can walk bookings from the database one at a time and stop after the first 50, instead of loading all 5,000 into a slice first.
 
 ## 2. Mental model 🟢
 
@@ -119,15 +133,31 @@ A generic function is a **template that the compiler fills in and type-checks pe
 
 A constraint is a **list of what you're allowed to do with T**, expressed as an interface. `any` means "nothing but assignment and passing around." `comparable` means "`==` and `!=` work, so T can be a map key." `cmp.Ordered` means "`<`, `<=`, `>`, `>=` work."
 
-An iterator is a **function that calls your loop body for you**. `for v := range seq` where `seq` has type `func(func(V) bool)` desugars, roughly, to `seq(func(v V) bool { <loop body>; return true })`, with `break` turning the generated callback's return into `false`.
+An iterator is a **function that calls your loop body for you**. `for v := range seq` where `seq` has type `func(func(V) bool)` desugars (the compiler rewrites the nice syntax into plainer code), roughly, to `seq(func(v V) bool { <loop body>; return true })`, with `break` turning the generated callback's return into `false`.
 
 `iter.Seq[V]` is the standard library's name for exactly that function type — it exists so iterator-returning functions have one documented signature to agree on, not a new language mechanism.
 
+## Common beginner mistakes 🟢
+
+- **Writing `[T any]` and then using `<` or `+` on `T`** → `any` allows no operators, so it does not compile → use a constraint that allows them, like `cmp.Ordered` or your own `Number`.
+- **Using `int` instead of `~int` in a union** → a named type like `type UserID int` is then rejected → write `~int` to accept every type built on `int`.
+- **Returning `nil` from a generic function for "nothing"** → `T` might be an `int`, which cannot be `nil` → declare `var zero T` and return `zero`.
+- **An iterator that ignores `yield`'s return value** → a `break` in the caller does not stop the work → `if !yield(v) { return }` every time.
+- **Making everything generic** → code gets harder to read for no gain → use generics only when the types really share one shape, like a container or a sort.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that generics let you write one function for many types, and that an iterator hands a `for range` loop one item at a time. **Next we open the box**: how constraints are written, what the compiler does at each call, and exactly how `range` drives an iterator function.
 
 ### Whiteboard version
 
 **In plain words:** one `Sum` for every number type — the constraint is the guest list saying which types may come in.
+
+**Step by step:**
+1. `Number` lists the allowed types: `int`, `int64`, `float64`, and anything built on them (the `~`).
+2. `Sum[T Number]` says "`T` must be one of those".
+3. You call `Sum([]int{1, 2, 3})`. The compiler sets `T = int` and checks that `+` works on `int`. It does.
+4. It returns `6`. Calling `Sum([]string{"a"})` is refused before the program ever runs.
 
 ```go
 // A constraint is an interface restricting what T can be.
@@ -170,6 +200,13 @@ func Join[T Stringer](xs []T, sep string) string {
 
 **In plain words:** the compiler guesses the type from your arguments, checks the body against the rules, then builds (or shares) a concrete version — all before the program runs.
 
+**Step by step:**
+1. The compiler sees `Sum([]int{1, 2, 3})`.
+2. It infers `T = int` from the argument, so you do not write `Sum[int]`.
+3. It checks every line of `Sum` against `Number`: `+` is allowed, so the body is fine.
+4. It produces machine code for `int`, either as its own copy or shared with other look-alike types plus a small lookup table (a dictionary).
+5. At runtime the program just runs that code; no type checks happen while it runs.
+
 ```mermaid
 flowchart TB
     subgraph compile["Compile time"]
@@ -191,6 +228,13 @@ flowchart TB
 ### Range-over-func, step by step
 
 **In plain words:** the loop body becomes a callback the iterator calls once per item; `break` tells the iterator 'stop serving'.
+
+**Step by step:**
+1. You write `for v := range s.All() { ... }`.
+2. Go turns your loop body into a small function, `yield`, that returns `true` to mean "keep going".
+3. It calls `s.All()`'s function once, handing it `yield`.
+4. The iterator calls `yield(1)`, `yield(2)`, ... and your body runs for each.
+5. If your body hits `break`, that `yield` returns `false`, and the iterator must `return` right away.
 
 ```mermaid
 sequenceDiagram
@@ -218,6 +262,8 @@ The full code lives in a scratch module (`scratch/generics`), compiles, passes `
 ### A generic type, with `comparable` and `any`
 
 **In plain words:** a container type can take type parameters too — this `Set` works for any key type that supports `==`.
+
+**What this code does, in plain words:** `Set[K]` wraps a map whose values take no space, so only the keys matter. `NewSet(1, 2, 3)` builds one, `Add` puts a key in, `Has` checks for a key, and `Len` counts keys. The same code works for a set of strings, ints or any other `==`-able type.
 
 ```go
 // Set is a generic type: K is restricted to comparable because it is a map
@@ -265,6 +311,12 @@ type Pair[A, B any] = struct {
 
 **In plain words:** to make your own type loopable, return a function that calls `yield` per element and stops the moment `yield` says false.
 
+**Step by step:**
+1. `s.All()` returns a function; nothing runs yet.
+2. `for v := range s.All()` calls that function with Go's generated `yield`.
+3. The function loops over the map and calls `yield(v)` for each key.
+4. In the test, the loop body breaks after 2 items, so `yield` returns `false` and `All` stops. `seen` is exactly 2.
+
 ```go
 // All returns an iter.Seq[K]: a range-over-func iterator. iter.Seq[K] is
 // just a documented name for func(func(K) bool).
@@ -302,6 +354,13 @@ func TestRangeOverFuncEarlyBreak(t *testing.T) {
 **In plain words:** `range` pushes values at you; `iter.Pull` flips it so you ask for the next value yourself — rare, costs a goroutine, and you must call `stop()`.
 
 Most code should use `range`. `iter.Pull` exists for the rare case where you cannot write a `for range` loop — for example, stepping two iterators forward in lockstep to merge them:
+
+```mermaid
+flowchart LR
+    C["your code calls next()"] --> G["background goroutine<br/>runs the iterator"]
+    G -- "one value back" --> C
+    C -- "stop()" --> E["goroutine exits"]
+```
 
 ```go
 // FirstTwo uses iter.Pull (Go 1.23) to turn a push-style iter.Seq[K] into a
@@ -380,7 +439,7 @@ The full `LRU` (`Get`/`Put`/eviction) and its test `TestLRU` are in the scratch 
 | --- | --- | --- | --- |
 | `any` + type assertion | One function/type, runtime `.(T)` checks | A true grab-bag (e.g. `encoding/json` internals, `fmt.Println`) | Runtime panic risk; no compile-time safety |
 | Copy-paste per type | A separate `IntSet`, `StringSet`, … | One-off, never reused, or the types genuinely behave differently | Code duplication; drift between copies |
-| Interface with methods | `type Adder interface { Add(int) }` | The types share *behaviour*, not just a container shape | Dynamic dispatch (one indirect call), no zero-cost specialization |
+| Interface with methods | `type Adder interface { Add(int) }` | The types share *behaviour*, not just a container shape | Dynamic dispatch (the right method is looked up at runtime: one indirect call), no zero-cost specialization |
 | Generics | `Set[K comparable]`, `Sum[T Number]` | The types share a *shape* (container, algorithm) with no behavioural difference | Compile-time only; some binary-size/compile-time cost; constraints can get verbose |
 | Materialized `[]T` | Build the whole slice up front | The caller needs random access or will consume all of it anyway | O(n) memory even if only the first few elements are used |
 | `iter.Seq[T]` iterator | `func(yield func(T) bool)`, lazy | The caller may stop early, or the source is unbounded/expensive per element | None of the up-front memory; slightly more code than a plain slice |
@@ -389,15 +448,18 @@ The full `LRU` (`Get`/`Put`/eviction) and its test `TestLRU` are in the scratch 
 
 - Do not reach for generics just to avoid writing two functions; if the two versions would have unrelated bodies, a generic signature forcing a shared shape onto them is the wrong abstraction — copy-paste or an interface is clearer. This guidance carries over unchanged from the old generics note.
 - Deep constraint hierarchies (`~T1 | ~T2`, nested interfaces) read worse than the duplication they replace; stop generalizing once the constraint is harder to read than two concrete functions.
-- Generic code can be slower to compile and, with the dictionary-passing instantiation strategy, carries a small runtime indirection that a hand-written monomorphic function does not pay — profile before assuming generics are free.
+- Generic code can be slower to compile and, with the dictionary-passing instantiation strategy, carries a small runtime indirection that a hand-written monomorphic (written for one fixed type) function does not pay — profile before assuming generics are free.
 - A range-over-func iterator is not a drop-in replacement everywhere: you cannot index into it, take its length without consuming it, or use it with two-value range-over-channel-style select statements. Reach for a slice or a channel when the caller genuinely needs those.
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how constraints, type inference, generic types, type aliases and range-over-func iterators work, with tested code. **Next is the advanced part**: where the standard library uses them, the bugs they cause in real services, and how the compiler actually builds generic code (stencils and dictionaries).
+
+
 - **Real systems:** `golang.org/x/exp/slices` shipped generic slice helpers before they moved into the standard `slices` package (Go 1.21); the standard `maps`, `slices` and `cmp` packages are generic throughout; `iter.Seq` powers `maps.Keys/Values`, `slices.All/Values/Collect/Sorted`, and database/sql's planned iterator-based scanning.
 - **Failure modes → fixes:**
-  - An iterator that keeps calling `yield` after it returned `false` silently does extra work in the background (or, worse, mutates shared state after the caller thinks it stopped) → always check `yield`'s return value and return immediately.
-  - `iter.Pull` without `defer stop()` → goroutine leak; catch it with the `goleak` package in tests.
+  - An iterator that keeps calling `yield` after it returned `false` makes the program panic at runtime (since Go 1.23: "range function continued iteration after function for loop body returned false") → always check `yield`'s return value and return immediately.
+  - `iter.Pull` without `defer stop()` → goroutine leak (a goroutine that never ends and holds memory forever); catch it with the `goleak` package (a test helper that fails if goroutines are left running) in tests.
   - Choosing dictionary-based instantiation for a hot-path generic function → an extra indirect call per operation shows up in a CPU profile as time in the dictionary-passing wrapper; the fix is usually to drop generics on that one hot path, not to fight the compiler's heuristic.
 - **What to monitor:** binary size growth after adding generic code to a widely-instantiated function (many concrete types × stenciling); CPU profile share spent in dictionary-passing paths for generic hot paths.
 
@@ -407,7 +469,7 @@ The full `LRU` (`Get`/`Put`/eviction) and its test `TestLRU` are in the scratch 
 
 **Stenciling vs dictionaries.** The Go compiler specializes (stencils) a generic function per set of type arguments that share a "GC shape" — roughly, the same size and the same pointer/non-pointer layout.
 
-`Sum[int]` and `Sum[int64]` share one stencil (both are 8-byte, non-pointer words); `Sum[MyBoxedFloat]`, if it had a different layout, would not.
+`Sum[int]` and `Sum[MyInt]` (where `type MyInt int`) share one stencil, because shapes are grouped by underlying type; `Sum[int]` and `Sum[int64]` have different underlying types, so they get separate stencils; `Sum[MyBoxedFloat]`, if it had a different layout, would not.
 
 Within one GC shape, the compiler passes a runtime **dictionary** — a small table of the type's size, alignment and method/operator implementations — instead of generating a full copy per concrete type, trading a little runtime indirection for a smaller binary.
 
@@ -460,6 +522,30 @@ flowchart TD
 - `iter.Pull` converts push (`range`) to pull (`next()`/`stop()`) for the rare case you cannot use a loop; always `defer stop()`.
 - `slices.Collect`, `slices.Sorted`, `maps.Keys`/`Values`, and `strings.SplitSeq` (1.24) are the standard library's own iterator producers and consumers.
 - Do not use generics just to avoid writing two functions; use them when the types genuinely share a shape.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does the `T` in `func Max[T cmp.Ordered](a, b T) T` stand for?
+> A type parameter: a placeholder type the compiler fills in at each call, like `int` or `string`.
+
+> [!question]- Which constraint lets a type be used as a map key?
+> `comparable`.
+
+> [!question]- What type is `iter.Seq[int]` underneath?
+> `func(yield func(int) bool)`: a function that calls `yield` once per item.
+
+🟡 Medium
+
+> [!question]- `type UserID int`. Does `Sum([]UserID{1, 2})` compile with `Number` = `~int | ~int64 | ~float64`?
+> Yes. `~int` accepts any type whose underlying type is `int`.
+
+> [!question]- Your iterator loops over 1,000 rows and calls `yield` without checking the result. The caller breaks after 2. What goes wrong?
+> The iterator keeps calling `yield` after the loop has ended, which is a bug: the extra calls are wasted work, and Go stops the program with a runtime panic when `yield` is called again after it returned `false`.
+
+> [!question]- Why must you `defer stop()` after `iter.Pull`?
+> `iter.Pull` runs the iterator on a background goroutine. Without `stop()`, that goroutine can be left waiting forever: a leak.
 
 ## Links
 

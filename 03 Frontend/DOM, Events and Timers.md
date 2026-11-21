@@ -31,6 +31,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[JavaScript Core - Types, Scope, Hoisting, Closures, this]]: functions are values you can pass around, and a function remembers the variables around it (a closure).
+> - [[How Browsers Load and Render a Page]]: the browser turns HTML text into a tree in memory, then draws the page from it.
+
 **From zero, in 60 seconds** 🟢
 
 A web page starts as a text file of HTML. The browser reads it once and builds a live model of the page in memory — one object per tag, arranged as a tree. That tree is the **DOM**. From then on, JavaScript changes the page by changing the tree, never the original text.
@@ -74,6 +78,12 @@ Timers let the same code act later, like hiding a toast after 3 seconds.
 | Callback | A function you pass in to be called later | `setTimeout(fn, 500)` |
 | Bubbling | An event travelling up from the clicked element to its parents | Click on `<li>` also reaches `<ul>` |
 | Event loop | The browser's loop that runs queued callbacks one at a time | Runs your timer callback when the stack is free |
+| Call stack | The list of functions running right now; JS runs one thing at a time | `main()` calls `render()` |
+| Task queue | The waiting line of callbacks ready to run next | a timer callback waits here after its delay |
+| Event delegation | One listener on a parent handles clicks on all its children | one listener on `<ul>` for every `<li>` |
+| XSS (cross-site scripting) | An attacker's script sneaks into your page and runs as if it were yours | a comment that contains `<script>` |
+| Layout | The browser working out the size and position of every box | runs again after you change a width |
+| Viewport | The visible part of the browser window | what you see without scrolling |
 
 **Picture it**
 
@@ -111,6 +121,30 @@ There is no HTML for "delete the 4th item" — the delete has to find that speci
 
 That round trip — structure in memory, events telling you what changed, timers letting you defer work — is what this note covers.
 
+### Real-life example: WhatsApp Web 🟢
+
+On WhatsApp Web, each chat in the left list is a node in the DOM tree.
+When a new message arrives, JavaScript adds a new node at the top of the list instead of reloading the page.
+Clicking any chat is caught by one listener on the whole list (event delegation), so new chats work without extra code.
+The "typing…" label disappears a few seconds after the other person stops, which is a `setTimeout` that keeps getting reset.
+
+## Common beginner mistakes 🟢
+
+- **Using `setInterval` when you meant "run once later"** → it keeps running forever → use `setTimeout`, or call `clearInterval(id)` when done.
+- **Putting user text into `innerHTML`** → a name like `<img src=x onerror=steal()>` runs as code (XSS) → use `textContent`.
+- **Adding a listener to every list item** → new items get no listener, and memory grows → put one listener on the parent and check `event.target`.
+- **Removing a listener with a new arrow function** → `removeEventListener("click", () => …)` removes nothing, because it is a different function → keep the function in a variable, or use an `AbortController`.
+- **Trusting `setTimeout(fn, 0)` to run "now"** → it runs only after the current code finishes → never rely on exact timer timing.
+
+## Often confused 🟡
+
+| These two | First one | Second one |
+| --- | --- | --- |
+| `setTimeout` vs `setInterval` | Runs once after the delay | Runs again and again until `clearInterval` |
+| `stopPropagation()` vs `preventDefault()` | Stops the event travelling to other elements | Stops the browser's own action (follow link, submit form) |
+| `textContent` vs `innerHTML` | Sets plain text, always safe | Parses HTML, unsafe with user input |
+| HTML vs DOM | The text file, read once | The live tree in memory that JS changes |
+
 ## 2. Mental model 🟢
 
 The **DOM tree is not the HTML file** — HTML is the opening instructions, and the DOM is the building the browser constructs from them and then keeps live and mutable for the rest of the page's life.
@@ -123,9 +157,18 @@ A timer is a sticky note with a minimum wait time on it, handed to the browser: 
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that the DOM is a live tree, that events travel down and back up it, and that timers run code later. **Next we open the box**: how to find and change nodes safely, the exact path an event takes, how to clean up listeners, and what really happens between "the delay is over" and "your code runs".
+
 ### The DOM tree, selecting, and updating nodes
 
 **In plain words:** the tree below is the page as the browser holds it in memory. Finding a node is "walk the tree"; changing the page is "edit the tree" — the browser repaints to match.
+
+**Step by step:**
+1. The page has `<div id="images">` with two `<img>` tags inside. The browser holds them as a `div` node with two `img` child nodes.
+2. `document.querySelector("#images")` walks the tree and hands you the `div` node.
+3. `document.createElement("img")` makes a new, unattached node. `div.append(newImg)` hangs it on the tree.
+4. The browser notices the tree changed and **repaints** (redraws the screen), so the third image appears.
+5. `el.textContent = "Hi"` changes text safely. `el.remove()` takes a node off the tree.
 
 ```mermaid
 flowchart TD
@@ -145,7 +188,7 @@ const allImgs = document.querySelectorAll("#images img"); // static NodeList: do
 const liveList = document.getElementsByClassName("item"); // live HTMLCollection: DOES update as the DOM changes
 ```
 
-Updating content: `textContent` sets plain text and is always safe; `innerHTML` parses a string as HTML, which means any value from user input inserted via `innerHTML` can inject a `<script>` or event handler — a cross-site scripting (XSS) hole. Default to `textContent`, and if you must set markup from untrusted data, sanitize it first.
+Updating content: `textContent` sets plain text and is always safe; `innerHTML` parses a string as HTML, which means any value from user input inserted via `innerHTML` can inject a `<script>` or event handler — a cross-site scripting (XSS) hole. Default to `textContent`, and if you must set markup from untrusted data, **sanitize** it first (run it through a cleaner that strips scripts and event attributes).
 
 ```js
 el.textContent = userInput;             // safe: renders literally, never parsed as markup
@@ -160,13 +203,26 @@ li.textContent = userInput;   // still safe: set as text, not markup
 document.querySelector("ul").append(li); // appendChild(li) also works; append() also takes plain strings
 ```
 
+```mermaid
+flowchart LR
+    W1["write width"] --> R1["read height:<br/>forced layout"] --> W2["write width"] --> R2["read height:<br/>forced layout"]
+    Fix["Fix: read all, then write all"] --> One["one layout"]
+```
+
 Writing to the DOM triggers layout recalculation; reading a layout property (`offsetHeight`, `getBoundingClientRect()`) right after a write forces the browser to compute layout immediately instead of batching it, and alternating writes and reads in a loop (**layout thrashing**) can make a loop of 100 elements cost 100 forced layouts instead of one.
 
-Fix: read all the values you need first, then do all the writes, or batch writes with `requestAnimationFrame`.
+Fix: read all the values you need first, then do all the writes, or batch writes with `requestAnimationFrame` (asks the browser to run your function just before it next draws the screen).
 
 ### Event flow: capture, target, bubble, and delegation
 
 **In plain words:** a click does not land only on the thing you clicked. The event rides down the tree to it, then back up through every parent — so a parent can listen once for all of its children.
+
+**Step by step:**
+1. You click `dog.jpg`, which sits inside `div#images`, inside `body`.
+2. **Capture:** the event starts at `window` and travels down through `body` and `div#images` to the image. Only listeners that asked for `{ capture: true }` run here.
+3. **Target:** listeners on the image itself run.
+4. **Bubble:** the event travels back up: image, then `div#images`, then `body`, then `window`. Normal listeners run here.
+5. So one listener on `div#images` sees the click on any image inside it, and checks `e.target` to know which one.
 
 ```mermaid
 sequenceDiagram
@@ -196,16 +252,22 @@ document.querySelector("#images").addEventListener("click", (e) => {
 
 This single listener keeps working even if images are added to `#images` later — a per-image listener would need re-attaching every time.
 
-For a listener that only reads the event and never calls `preventDefault`, mark it `{ passive: true }` so the browser doesn't have to wait for your handler before scrolling — this matters most for `touchstart`/`wheel` listeners that can otherwise visibly delay scroll.
+For a listener that only reads the event and never calls `preventDefault`, mark it `{ passive: true }` (a promise to the browser: "I will not block the default action") so the browser doesn't have to wait for your handler before scrolling — this matters most for `touchstart` (finger touches the screen) / `wheel` (mouse wheel turns) listeners that can otherwise visibly delay scroll.
 
 > [!warning] Common mistake
 > Attaching a listener and forgetting to remove it. `removeEventListener` needs the exact same function reference you passed to `addEventListener` — an inline arrow function can never be removed, because a new function value is created every time you write it.
 >
-> A listener left on an element you then remove from the DOM keeps that element (and anything it closes over) pinned in memory until the page unloads.
+> A listener left on an element you then remove from the DOM keeps that element (and anything it closes over, meaning variables the function remembers) pinned in memory until the page unloads.
 
 ### Cleaning up listeners in bulk with AbortController
 
 **In plain words:** calling `removeEventListener` once per listener works, but it means keeping a reference to every single handler you ever attached. An **`AbortController`** is a single off-switch you hand to as many listeners as you like; calling it once removes all of them, with no list of function references to track.
+
+**Step by step:**
+1. A search popup opens. You make one switch: `const ac = new AbortController();`.
+2. You add three listeners (keydown, click, scroll), each with `{ signal: ac.signal }`.
+3. The user closes the popup. You call `ac.abort()` once.
+4. All three listeners are gone. You never had to keep the three functions in variables.
 
 **Picture it:**
 
@@ -229,7 +291,7 @@ window.addEventListener("resize", onResize, { signal: ac.signal });
 ac.abort(); // both listeners above are gone — no stored function references needed
 ```
 
-**Why it matters:** this is now the standard cleanup pattern for any component that attaches more than one or two listeners — one `ac.abort()` replaces a whole list of paired `addEventListener`/`removeEventListener` calls and can't be forgotten for just one of them, because there's only one call to make.
+**Why it matters:** this is now the standard cleanup pattern for any **component** (a reusable piece of UI, like a popup or a menu) that attaches more than one or two listeners — one `ac.abort()` replaces a whole list of paired `addEventListener`/`removeEventListener` calls and can't be forgotten for just one of them, because there's only one call to make.
 
 > [!tip] Remember
 > One listener you no longer need → `removeEventListener` with the same function reference. Several listeners that should all go away together → one shared `AbortController`, aborted once.
@@ -275,9 +337,9 @@ sequenceDiagram
 **Why it matters:** code that assumes `setTimeout(fn, 0)` runs "right now" will be surprised the first time a busy page delays it by hundreds of milliseconds — the fix is to never depend on exact timer timing for correctness, only for approximate scheduling.
 
 > [!warning] Common mistake
-> Two more details that are easy to get wrong: nested timers (`setTimeout` calling itself, or a `setInterval` beyond 5 levels deep in some engines) are clamped to a minimum delay around 4ms even if you ask for less; and a timer callback that throws does not stop a `setInterval`'s future firings — each tick is independent, so one bad tick never cancels the rest.
+> Two more details that are easy to get wrong: nested timers (`setTimeout` calling itself, or a `setInterval` beyond 5 levels deep in some engines) are **clamped** (forced up) to a minimum delay around 4ms even if you ask for less; and a timer callback that throws does not stop a `setInterval`'s future firings — each tick is independent, so one bad tick never cancels the rest.
 
-`requestAnimationFrame(fn)` is a different primitive for animation: it runs `fn` once, right before the browser's next repaint, synced to the display's refresh rate, rather than on a fixed millisecond delay.
+`requestAnimationFrame(fn)` is a different primitive for animation: it runs `fn` once, right before the browser's next repaint, synced to the display's **refresh rate** (how many times a second the screen redraws, often 60), rather than on a fixed millisecond delay.
 
 > [!tip] Remember
 > A timer's delay is always a minimum, never a guarantee — the callback still waits in line for the call stack to clear and for its turn on the task queue.
@@ -341,8 +403,8 @@ flowchart TD
 | `setTimeout` | Fires once, no sooner than the given delay | Deferred one-off work (debouncing, a delayed toast) | Must `clearTimeout` if you might want to cancel it |
 | `setInterval` | Fires repeatedly every delay, until stopped | Polling, a clock, a repeating UI tick | Drifts under load; must `clearInterval` or it runs forever |
 | `requestAnimationFrame` | Fires once per repaint, synced to refresh rate | Animation, anything that changes visual state every frame | Pauses automatically in a background tab |
-| `MutationObserver` | Callback fires when watched DOM nodes/attributes change | Reacting to DOM changes made by other code (widgets, extensions) | Batched, asynchronous — not instant |
-| `IntersectionObserver` | Callback fires when an element crosses a viewport threshold | Lazy-loading images, infinite scroll, "seen" tracking | Cheaper than scroll-event polling; still asynchronous |
+| `MutationObserver` | Callback fires when watched DOM nodes/attributes change (a built-in watcher for DOM changes) | Reacting to DOM changes made by other code (widgets, extensions) | Batched, asynchronous — not instant |
+| `IntersectionObserver` | Callback fires when an element crosses a viewport threshold (a built-in watcher for "is this on screen?") | **Lazy-loading** images (load them only when they scroll near the screen), infinite scroll, "seen" tracking | Cheaper than scroll-event polling; still asynchronous |
 | `AbortController` + `{ signal }` | One `abort()` call removes every listener registered with that signal | Removing several listeners together, e.g. on component teardown | Needs a listener-registration API that accepts `signal` (most DOM APIs do) |
 
 ## 6. Trade-offs and when not to use 🟡
@@ -354,16 +416,18 @@ flowchart TD
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to change the DOM, how events travel, and what timers really promise. **Next is the advanced part**: the patterns real apps build on top (debounce, throttle, observers), the slow-page and memory bugs they cause, and the event-loop details interviewers ask about.
+
 - **Real systems:** `setTimeout`/`clearTimeout` are the backbone of debounce (wait for input to pause before acting — search-as-you-type) and throttle (run at most once per interval — scroll handlers) utilities used in nearly every production frontend. `IntersectionObserver` powers lazy-loaded images and infinite-scroll feeds; `MutationObserver` underlies many browser extensions and some virtual-DOM diffing debug tools.
 - **Failure modes → fixes:**
   - A page that gets slower the longer it's open → listeners attached to removed elements (or in a loop without delegation) were never removed; audit with the browser DevTools' "Event Listeners" panel.
   - A UI glitch where a value "flickers" between an old and new state → a read (`offsetHeight`) interleaved with writes in a loop causing layout thrashing; batch reads, then writes.
   - A `setInterval`-based poll that silently stops updating → an uncaught exception inside the callback doesn't stop future ticks, but a forgotten `clearInterval` leak does accumulate timers; always store and clear the id when the component/page using it goes away.
-- **What to monitor:** long task warnings in DevTools' Performance panel (tasks over 50ms block input); listener counts per page over time; `IntersectionObserver`/`MutationObserver` callback frequency if a feature feels sluggish.
+- **What to monitor:** long task warnings in **DevTools** (the browser's built-in developer panel, opened with F12) Performance panel (tasks over 50ms block input); listener counts per page over time; `IntersectionObserver`/`MutationObserver` callback frequency if a feature feels sluggish.
 
 ## 8. Deep dive 🔴
 
-- **Macrotasks vs microtasks, and where timers sit.** `setTimeout`/`setInterval` callbacks are macrotasks, always run after any pending Promise callbacks — see [[JavaScript Async - Event Loop, Promises, async-await]] for the full event-loop mechanics.
+- **Macrotasks vs microtasks, and where timers sit.** `setTimeout`/`setInterval` callbacks are **macrotasks** (normal queued jobs, one per loop turn), always run after any pending Promise callbacks, which are **microtasks** (urgent jobs that all run before the next macrotask) — see [[JavaScript Async - Event Loop, Promises, async-await]] for the full event-loop mechanics.
 - **Minimum delay in practice.** Browsers clamp nested timers: after about 5 levels of a timer re-scheduling itself with `delay < 4ms`, engines force a 4ms floor, specifically to stop runaway timer loops from starving the rest of the page. A background (inactive) tab is throttled further, often to once per second or slower, to save power.
 - **Event delegation and `stopPropagation`.** Calling `stopPropagation` inside a delegated listener for one widget can silently break a different, unrelated listener higher up the tree that was relying on the event reaching it (for example, a modal's "click outside to close" handler on `document`). Treat `stopPropagation` as a last resort, not a default habit.
 - **`requestAnimationFrame` vs timers for animation.** A `setInterval(fn, 16)` tries to approximate 60fps but drifts and keeps running in a background tab (wasting battery) unless you manage it yourself; `requestAnimationFrame` is synced to the actual display refresh and is automatically paused when the tab isn't visible.
@@ -404,6 +468,26 @@ flowchart TD
 - `textContent` is always safe; `innerHTML` is an XSS risk with untrusted input.
 - Prefer `IntersectionObserver`/`MutationObserver` over polling the DOM in a loop.
 - Share one `AbortController` across several listeners that should all be removed together; one `abort()` replaces a list of paired `removeEventListener` calls.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: is the DOM the same thing as the HTML file?
+> No. The HTML file is text read once; the DOM is the live tree in memory that JavaScript changes.
+
+> [!question]- Easy: how many times does `setTimeout(fn, 1000)` run `fn`?
+> Once, after at least 1 second.
+
+> [!question]- Easy: which is safe for showing a user's name: `textContent` or `innerHTML`?
+> `textContent`. It never treats the text as HTML.
+
+> [!question]- Medium: you click an `<li>` inside a `<ul>`. A normal listener on the `<ul>` runs. In which phase?
+> The bubble phase, on the way back up from the `<li>`.
+
+> [!question]- Medium: a page runs a 2-second loop right after `setTimeout(fn, 500)`. When does `fn` run?
+> After about 2 seconds, once the loop ends and the call stack is empty. The delay is only a minimum.
+
+> [!question]- Medium: what is layout thrashing and how do you avoid it?
+> Mixing DOM writes with layout reads in a loop, forcing a layout on every read. Do all reads first, then all writes.
 
 ## Links 🟢
 

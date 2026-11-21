@@ -22,6 +22,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
 > - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Process Memory Layout - Stack vs Heap]]: the theory twin. Know that values that die with their function stay on the stack, values that outlive it "escape" to the heap, and goroutine stacks start at about 2 KB and double.
+> - [[Virtual Memory, Paging and the TLB]] and [[Processes, Threads and Context Switching]]: background only; not needed to follow the code.
+
 **From zero** 🟢: this file is the hands-on side of [[Process Memory Layout - Stack vs Heap]]. It is Go code that shows which variables stay on the stack and which escape to the heap, using Go's own escape-analysis output and benchmarks. Read each step's notes before the code; run the commands to see it live.
 
 ## Before the code 🟢
@@ -31,6 +35,8 @@ updated: 2026-11-13
 - **Methods on a pointer receiver**: `func (s *CallStack) Push(...)` lets the method change the stack it is called on.
 - **Goroutines and channels**: `go func(){...}()` starts a goroutine; closing `done` and receiving `<-done` waits for it to finish.
 - **`runtime.ReadMemStats`**: reads the runtime's memory counters, including `StackInuse` (bytes used by all goroutine stacks).
+- **Escape analysis**: the compiler's build-time check of whether a value's address can outlive its function; if yes, the value goes on the heap.
+- **LIFO**: last in, first out; the most recently added item is the first removed, like a pile of plates.
 - **What to run**: `go vet ./... && go test -race ./...`, then `go build -gcflags=-m ./escape/` and `go run ./cmd/stackdemo`.
 
 ## What this code shows 🟢
@@ -61,7 +67,11 @@ flowchart LR
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** the three things this module shows. **Next we read the code:** the escape-analysis pair, the compiler output that proves it, a hand-built call stack, and the stack-growth measurement.
+
 ### Step 1: two functions the compiler treats differently
+
+**What this code does, in plain words:** one function adds two numbers and returns the result; the other builds a `Counter` and returns its address. The first stays on the stack, the second must go to the heap.
 
 **Concept.** The theory note's whole claim is that a value's *provable lifetime*, not its type or syntax, decides stack vs heap ([[Process Memory Layout - Stack vs Heap#3. How it works 🟡]]).
 
@@ -127,6 +137,8 @@ escape/demo.go:23:7: &Counter{...} escapes to heap
 
 ### Step 3: a call stack you can push and pop
 
+**What this code does, in plain words:** it builds a toy call stack from a fixed-size slice and one index `sp`: push writes a frame and moves `sp` up, pop moves `sp` down and hands the frame back.
+
 **Concept.** The LIFO mechanism itself, modelled directly and tested — not a demonstration of escape analysis, but of what "the stack" actually *is* underneath it ([[Process Memory Layout - Stack vs Heap#Stack frames and the call stack]]).
 
 The alternative to a fixed backing array would be a `[]Frame` that grows with `append`, which is how Go's own growable goroutine stacks behave conceptually — but a fixed-capacity array is the better teaching tool here because it makes "stack overflow" an explicit, testable error instead of something `append` silently absorbs.
@@ -156,7 +168,7 @@ var ErrStackOverflow = fmt.Errorf("stack overflow: exceeded capacity")
 **How it works.**
 
 1. `Frame` is a fixed-size struct, the same way a real stack frame's layout is fixed once the compiler knows the function's locals.
-2. `ErrStackOverflow` is a sentinel error, mirroring the fact that a real thread hitting the end of its reserved stack region gets a fault (SIGSEGV on a guard page), not a graceful "please wait."
+2. `ErrStackOverflow` is a sentinel error, mirroring the fact that a real thread hitting the end of its reserved stack region gets a fault (SIGSEGV, the OS's "bad memory access" signal, triggered by a guard page: a deliberately unusable page placed just past the stack's end), not a graceful "please wait."
 
 The `CallStack` type itself, plus its constructor:
 
@@ -242,6 +254,8 @@ sequenceDiagram
 
 ### Step 4: measuring a goroutine's stack actually grow
 
+**What this code does, in plain words:** it starts a fresh goroutine, makes it call itself many times with a 4 KB array in each call so its stack must grow, then reads how much stack memory the program is using.
+
 **Concept.** The theory note claims goroutine stacks grow by doubling as recursion goes deeper ([[Process Memory Layout - Stack vs Heap#Worked numeric example: a goroutine's stack growing by doubling]]).
 
 `recurseAndMeasure` and `GoroutineStackGrowth` turn that claim into a number you can read off a real run: each call recurses to a chosen depth, forcing the runtime's `morestack` mechanism to fire repeatedly, then reports the process-wide stack memory in use.
@@ -309,7 +323,7 @@ func GoroutineStackGrowth(depths []int) []uint64 {
 
 1. Each depth runs on a **fresh goroutine**, so every measurement starts from the runtime's default small initial stack rather than reusing one that has already grown from a previous depth.
 2. The `done` channel blocks the loop until that goroutine finishes recursing and has recorded its measurement, so the loop body behaves like a synchronous call despite launching a goroutine.
-3. `out[i] = inUse` is written inside the spawned goroutine but only read after `<-done`, so there is no data race despite the closure capturing `out` and `i` — the channel receive happens-before the read.
+3. `out[i] = inUse` is written inside the spawned goroutine but only read after `<-done`, so there is no data race despite the closure capturing `out` and `i` — the channel receive happens-before the read (Go's memory rules guarantee the goroutine's write is visible once the receive completes).
 4. The function returns one `StackInuse` reading per requested depth, in order, ready to print or assert against.
 
 ## Design decisions 🟡
@@ -452,6 +466,8 @@ depth=3000  runtime StackInuse=33849344 bytes
 3. From depth 50 onward each step shows a clear jump, not a smooth climb — each jump is one or more `morestack` doubling events for that one measured goroutine.
 4. By depth 3000 the total has grown over 100x from the depth-1 baseline, entirely attributable to one goroutine's stack having doubled repeatedly to hold that much recursion.
 
+> 🟡 → 🔴 **You now know** how each piece works and what the tests check. **Next comes the advanced part:** why the measurement is only approximate, why a fresh goroutine per depth matters, and the stale data a pop leaves behind.
+
 ## Pitfalls in the code 🔴
 
 - **`StackInuse` is process-wide, not per-goroutine.** Reading it right after a measurement is "best effort": background goroutines (GC workers, the runtime's own housekeeping) add a baseline that makes depth 1 look larger than 2 KB.
@@ -464,6 +480,30 @@ depth=3000  runtime StackInuse=33849344 bytes
 1. Change `stackHog` from `[512]int64` (4 KB) to `[64]int64` (512 B). Predict whether the doubling jumps in the printed table happen at the same depths, earlier, or later, then run `go run ./cmd/stackdemo` and check.
 2. In `TestOverflowIsReportedNotPanicked`, change `NewCallStack(2)` to `NewCallStack(0)`. Predict what the very first `Push` call returns, then run the test.
 3. Add a fourth sample depth of `6000` to `cmd/stackdemo/main.go`'s `depths` slice. Predict whether `StackInuse` roughly doubles again from the depth-3000 reading, then run it and compare.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Which of the two demo functions allocates on the heap?
+> `NewCounterOnHeap`, because it returns the address `&Counter{...}`.
+
+> [!question]- What command shows escape decisions?
+> `go build -gcflags=-m ./escape/`.
+
+> [!question]- What does `Pop` return on an empty `CallStack`?
+> `ok == false`, never a panic.
+
+🟡 Medium
+
+> [!question]- Why does the stack-growth harness use a fresh goroutine for each depth?
+> So every measurement starts from the small default stack, not one already grown by the previous run.
+
+> [!question]- Why does depth 1 show about 288 KiB, not 2 KB?
+> `StackInuse` counts every goroutine in the process, including runtime background goroutines.
+
+> [!question]- Why does `CallStack` use a fixed capacity instead of `append`?
+> So overflow becomes an explicit, testable error, like a real thread's hard stack limit.
 
 ## Links
 

@@ -27,6 +27,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Data Structures Overview and Big-O Cheat Sheet]]: `O(1)` means the same small cost however big the data is.
+> - [[Arrays and Dynamic Arrays (Go Slices)]]: a Go slice is a view onto an array; `append` grows it, and `s[a:b]` makes a new view of the same array.
+
 **From zero, in 60 seconds** 🟢
 
 A **stack** and a **queue** are just lists with house rules about which end you may touch.
@@ -75,6 +79,11 @@ The first needs a stack (last in, first out); the second needs a queue (first in
 | Slice | Go's growable list backed by an array | `s := []int{1, 2, 3}` |
 | Ring buffer | A fixed array used in a circle, wrapping around | A 10-slot log that overwrites the oldest |
 | Deque | Double-ended queue: add/remove at both ends | A sliding window of recent prices |
+| Amortised `O(1)` | Usually instant; now and then one slow step, but cheap on average | a slice `append` that sometimes doubles |
+| Backing array | The real array in memory that a slice points into | `s[1:]` still uses the same array |
+| Monotonic stack | A stack kept in sorted order by popping items that can no longer matter | "next warmer day" |
+| Buffered channel | A Go channel with room for N items; a safe queue between goroutines | `make(chan Job, 100)` |
+| Backpressure | A full queue making the producer wait, so the slow side sets the pace | a send blocks on a full channel |
 
 **Picture it**
 
@@ -118,6 +127,13 @@ Both are the same underlying idea — a linear sequence with disciplined access 
 > [!tip] Remember
 > Stack and queue are the same structure (a sequence) with opposite removal rules. Memorize the rule, not the structure: LIFO removes what you added most recently, FIFO removes what you added first.
 
+### Real-life example 🟢
+
+Your browser's Back and Forward buttons are two stacks: each new page is pushed on "back"; pressing Back pops it and pushes it on "forward".
+When WhatsApp is offline, the messages you type wait in a queue and are sent in the same order once you reconnect, because the oldest message must go first.
+A restaurant on Swiggy receives orders into a queue so the kitchen cooks them in arrival order.
+And "highest price in the last 10 minutes" on a trading app is a sliding-window maximum, solved with a deque.
+
 ## 2. Mental model 🟢
 
 A stack is a **pile of plates**: you can only take the top one off, and you can only put a new one on top. The plate on the bottom was the first one placed and the last one you'll ever reach.
@@ -128,9 +144,25 @@ A deque is a line where people can also join or leave from the *front* — usefu
 
 This analogy breaks down for the monotonic patterns below: a real queue never lets someone cut in based on how "useful" they are, but a monotonic stack/deque actively *removes* earlier entries that can never matter again.
 
+## Common beginner mistakes 🟢
+
+- **Using `q = q[1:]` as a long-running queue** → the old front items' memory is never freed, so memory keeps growing → use a ring buffer or a buffered channel.
+- **Popping from an empty stack** → `s[len(s)-1]` panics when `len(s) == 0` → check the length first, or return an `ok` flag.
+- **Using a stack where order of arrival matters** → you serve the newest job first and old jobs starve → use a queue (FIFO) for "first come, first served".
+- **Treating an in-memory queue as safe storage** → a crash loses every waiting job → use Kafka or Redis Streams when jobs must survive.
+- **Never closing a channel** → a receiver waits forever and its goroutine leaks → let the single producer close it when done.
+
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the two rules: stack = newest first, queue = oldest first. **Next we open the box:** how a Go slice becomes a stack, why a slice is a poor queue and how a ring buffer fixes it, deques, monotonic stacks, BFS levels, and buffered channels. Each subsection starts with a short step-by-step walk.
+
 ### In plain words: a stack is a slice used LIFO
+
+**Step by step:**
+1. Start with an empty slice `s`.
+2. The user types "A", then "B": `s = append(s, "A")`, `s = append(s, "B")`. Now `s = [A, B]`.
+3. The user presses Ctrl+Z: read the last item `s[len(s)-1]` = "B".
+4. Shrink the slice: `s = s[:len(s)-1]`. Now `s = [A]`. "B" is undone.
 
 **Stack:** a sequence where `push` adds to one end and `pop` removes from that same end — the last thing pushed is the first thing popped.
 
@@ -145,12 +177,19 @@ flowchart TD
     G --> H["[1, 2]"]
 ```
 
-`push` is `append`; `pop` reads `s[len(s)-1]` then reslices to `s[:len(s)-1]`. Both are `O(1)` amortised, same as any slice append — see [[Arrays and Dynamic Arrays (Go Slices)]].
+`push` is `append`; `pop` reads `s[len(s)-1]` then reslices to `s[:len(s)-1]`. Both are `O(1)` amortised (cheap on average, even though an occasional `append` has to copy to a bigger array), same as any slice append — see [[Arrays and Dynamic Arrays (Go Slices)]].
 
 > [!tip] Remember
 > Everything a stack needs is already in a Go slice: `append` to push, reslice off the end to pop. No special type is required for the simple case.
 
 ### In plain words: why a plain slice is a bad queue, and what fixes it
+
+**Step by step (ring buffer with 4 slots):**
+1. Empty: `head = 0`, `size = 0`.
+2. Push jobs A, B, C: they go into slots 0, 1, 2. `size = 3`.
+3. Pop: read slot `head` (A), move `head` to 1, `size = 2`. Slot 0 is now free to reuse.
+4. Push D, E: D goes to slot 3; E wraps around (`% 4`) to slot 0. No item ever moves.
+5. Only when all 4 slots are full does the buffer grow, once, to 8 slots.
 
 **Example with numbers:** start with a slice of capacity 8 holding 8 elements. Dequeue once with `s = s[1:]`: `len` drops to 7, but `cap` is still effectively tied to the same 8-element backing array — the dropped element's memory isn't freed, it's just no longer reachable through `s[0]`. Do this a million times on a million-element queue and the backing array (all of it) stays alive the whole time, even though the logical queue might only ever hold a handful of items at once.
 
@@ -178,6 +217,13 @@ flowchart LR
 
 ### Picture it: a deque — push and pop from both ends
 
+**Step by step:**
+1. Start empty. `PushBack(3)` → `[3]`.
+2. `PushFront(4)` → `[4, 3]`.
+3. `PushBack(7)` → `[4, 3, 7]`.
+4. `PopFront()` gives 4 → `[3, 7]`. `PopBack()` gives 7 → `[3]`.
+5. Use only the back end and it is a stack; push at the back and pop at the front and it is a queue.
+
 ```mermaid
 flowchart LR
     Front(["front"]) -.-> D0["4"]
@@ -192,6 +238,12 @@ A deque supports four operations instead of a stack's two or a queue's two: `Pus
 ### In plain words: the monotonic stack — "next greater element"
 
 **Monotonic stack:** a stack that's kept sorted (increasing or decreasing) as a side effect of its push rule — before pushing a new value, pop off everything that the new value makes irrelevant.
+
+**Step by step (next warmer day):**
+1. Walk the temperatures left to right, keeping a stack of days still waiting for a warmer day.
+2. A new day arrives. While the day on top of the stack is colder, pop it: today is its answer.
+3. Push today onto the stack; it now waits for its own warmer day.
+4. Days left on the stack at the end never got a warmer day: answer 0.
 
 ```mermaid
 flowchart TD
@@ -210,6 +262,12 @@ Because each index is pushed once and popped at most once across the whole pass,
 ### Picture it: BFS level order as multi-source expansion
 
 A queue's FIFO order is exactly what makes **BFS level order** work: push every starting point first, then process the queue one full pass ("level") at a time, so everything processed in the same pass is the same distance from a start.
+
+**Step by step (rotting oranges):**
+1. Put every rotten orange in the queue. That is minute 0.
+2. Take out everything currently in the queue (one "level"). For each, add its fresh neighbours to the queue and mark them rotten.
+3. That whole pass was one minute.
+4. Repeat until the queue is empty. The number of passes is the number of minutes.
 
 ```mermaid
 flowchart TD
@@ -230,6 +288,13 @@ flowchart TD
 **Example with numbers:** the "rotting oranges" problem is exactly this — multiple rotten oranges rot their neighbours simultaneously, one grid step per minute. That's multi-source BFS where every rotten orange at minute 0 is pushed first, and each queue "level" (one pass over everything currently queued) is exactly one minute, because BFS visits nodes in order of distance from a source.
 
 ### Picture it: a buffered channel as a queue with backpressure
+
+**Step by step:**
+1. `jobs := make(chan Job, 3)` makes a queue with room for 3.
+2. The producer sends jobs 1, 2, 3. Each send returns at once; the buffer is now full.
+3. The producer tries to send job 4. It blocks: it must wait.
+4. A worker receives job 1. A slot frees up, and job 4's send goes through.
+5. So a slow worker automatically slows the producer, and memory never grows past 3 waiting jobs.
 
 ```mermaid
 sequenceDiagram
@@ -300,10 +365,12 @@ Runnable Go version: [[Stacks, Queues and Deques - Go]]
 - **A stack only answers "what's most recent."** If you need "what's oldest" or "what's largest so far," that's a queue or a heap respectively, not a stack — don't force LIFO access onto a FIFO problem.
 - **A monotonic stack/deque only helps when the question is about the *nearest* dominating element.** For "the k largest elements overall" (not nearest), a heap is the right tool — see [[Heaps and Priority Queues]].
 
+> 🟡 → 🔴 **You now know** how to build stacks, queues, deques, ring buffers and monotonic stacks, and when a channel is the right queue. **Next comes the advanced part:** where these sit in real systems, how unbounded queues and leaked goroutines fail in production, and why monotonic structures are `O(n)`.
+
 ## 7. In production 🔴
 
-- **Real systems:** the JavaScript/Go/most-languages call stack is a stack (literally — stack overflow is this structure overflowing); goroutine scheduling and most thread pools use a work queue; a web server's accept queue for incoming connections is FIFO; browser back/forward history is two stacks; a sliding-window rate limiter can be implemented with a monotonic deque of request timestamps.
-- **Failure modes → fixes:** an unbounded in-memory queue causing OOM under a traffic spike → bound it (ring buffer with backpressure, or a buffered channel) and shed load once full, rather than growing without limit; a goroutine leak from a channel that's never closed, leaving a receiver blocked forever → always have a clear owner that closes the channel when production is done; a stack-based recursive algorithm hitting Go's growable-but-still-finite goroutine stack on pathological input → convert to an explicit stack-based iterative version (see Deep dive) for unbounded depth.
+- **Real systems:** the JavaScript/Go/most-languages call stack is a stack (literally — stack overflow is this structure overflowing); goroutine scheduling and most thread pools use a work queue; a web server's accept queue (the kernel's line of new connections waiting for the program to pick them up) for incoming connections is FIFO; browser back/forward history is two stacks; a sliding-window rate limiter can be implemented with a monotonic deque of request timestamps.
+- **Failure modes → fixes:** an unbounded in-memory queue causing OOM under a traffic spike → bound it (ring buffer with backpressure, or a buffered channel) and shed load (politely reject extra requests) once full, rather than growing without limit; a goroutine leak from a channel that's never closed, leaving a receiver blocked forever → always have a clear owner that closes the channel when production is done; a stack-based recursive algorithm hitting Go's growable-but-still-finite goroutine stack on pathological input → convert to an explicit stack-based iterative version (see Deep dive) for unbounded depth.
 - **What to monitor:** queue depth (how full the buffer is) as the leading indicator of a consumer falling behind; for a channel-based pipeline, how often sends block (a proxy for backpressure actually kicking in).
 
 ## 8. Deep dive 🔴
@@ -346,6 +413,30 @@ Runnable Go version: [[Stacks, Queues and Deques - Go]]
 - Goroutine stacks start at 2 KB and grow; OS thread stacks are a fixed ~8 MB — part of why goroutines are cheap.
 - In-memory queue ≠ durable queue: a crash loses everything in a ring buffer or channel; use Kafka or Redis Streams when that matters.
 - Classic problems: valid parentheses (stack), daily temperatures (monotonic stack), sliding window maximum (monotonic deque), queue from two stacks (amortised O(1)), rotting oranges (multi-source BFS level order with a queue).
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Stack or queue for an "undo" button?
+> Stack: undo the most recent change first (LIFO).
+
+> [!question]- How do you push and pop with a Go slice used as a stack?
+> Push: `s = append(s, x)`. Pop: read `s[len(s)-1]`, then `s = s[:len(s)-1]`.
+
+> [!question]- What happens when you send to a full buffered channel?
+> The send blocks until a receiver takes an item.
+
+🟡 Medium
+
+> [!question]- Why does `q = q[1:]` leak memory in a long-running queue?
+> The backing array never shrinks, so removed items' space stays allocated while `append` keeps growing it.
+
+> [!question]- Why is the monotonic stack `O(n)` despite its inner loop?
+> Each item is pushed once and popped at most once over the whole run.
+
+> [!question]- How do you build a queue from two stacks?
+> Push to "in"; to pop, if "out" is empty move everything from "in" to "out", then pop "out". Amortised `O(1)`.
 
 ## Links
 

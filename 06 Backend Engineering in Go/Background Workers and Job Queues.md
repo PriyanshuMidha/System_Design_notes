@@ -35,6 +35,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[select and Concurrency Patterns]]: goroutines can pass work to each other through a channel, and `select` lets one goroutine wait on several channels or a timeout.
+> - [[Background Jobs and Worker Pools]]: the idea of a job moving through states (queued, running, done, failed), shown without real libraries.
+
 **From zero, in 60 seconds** 🟢
 
 Some work is too slow to do while a user waits — sending an email, building a PDF. So the server writes a little to-do item (a **job**) into a list (a **queue**) and answers the user right away.
@@ -74,6 +78,12 @@ Background jobs are those tickets: slow work leaves the request and is done late
 | Idempotent | Running twice has the same effect as once | Skip sending if the email is already marked sent |
 | Dead letter | Where jobs go after too many failures | `status = 'dead'`, a human looks at it |
 
+| Backoff | Waiting longer after each failure before retrying | 1 s, then 2 s, then 4 s |
+| Jitter | A random part added to the wait so retries spread out | wait a random time between 0 and 4 s |
+| At-least-once | A job may run more than once, never zero times | email job runs twice after a crash |
+| `SKIP LOCKED` | A Postgres option: skip rows another worker already locked | two workers grab two different jobs |
+| Outbox | A table row written with the business data, sent on later by a relay | `outbox` row "send email for inv_42" |
+
 **Picture it**
 
 ```mermaid
@@ -101,17 +111,23 @@ Where it breaks: a cook rarely cooks the same dish twice by accident, but a work
 
 ## 1. Why it exists 🟢
 
-InvoiceOps's `POST /invoices` handler needs to send a confirmation email. Doing it inline adds the email provider's latency (and its outages) to every invoice creation request — for a typical transactional email API, assume **p50 around 150 ms and p99 over 1 second** (illustrative, not measured; provider latency varies, so measure your own).
+🟢 **Plain version:** Sending an email can take a second or more, and the email company is sometimes down. So we do not want the user to wait for it. But if we just start a goroutine and the server restarts, the email is lost and nobody knows. We also need retries when the email company is down, and we must not send the same email twice. This note shows how to do all three.
+
+InvoiceOps's `POST /invoices` handler needs to send a confirmation email. Doing it inline adds the email provider's latency (and its outages) to every invoice creation request — for a typical transactional email API, assume **p50 around 150 ms and p99 over 1 second** (p50: half of calls are faster than this; p99: 99 out of 100 are faster) (illustrative, not measured; provider latency varies, so measure your own).
 
 Moving it off the request path is the easy part: `go sendEmail(invoice)`. The question this note exists to answer is what happens next, three ways:
 
-1. **The process restarts mid-send** (a deploy, a crash, an OOM-kill). A bare goroutine's state lives only in that goroutine's stack and the channel it came from — both gone. The email is never sent, and nothing knows that.
+1. **The process restarts mid-send** (a deploy, a crash, an OOM-kill: the operating system stops the program because it used too much memory). A bare goroutine's state lives only in that goroutine's stack and the channel it came from — both gone. The email is never sent, and nothing knows that.
 2. **The email provider is down for ten minutes.** Something has to retry, with a backoff that doesn't hammer a provider that is already struggling, and eventually give up and tell a human instead of retrying forever.
 3. **Two workers claim the same job** because a reminder-email job was enqueued twice (a retried webhook, a flaky network call that looked like it failed but didn't). The customer should get one email, not two.
 
 [[Background Jobs and Worker Pools]] already lays out the job lifecycle and the general shape of this problem in the abstract (there, with an in-memory model built for teaching, not for running).
 
 This note wires the same ideas to the libraries a Go service actually ships with: pgx against a Postgres jobs table, and `asynq` against Redis — plus the graceful-shutdown shape that makes "the process restarts mid-send" a non-event instead of a lost job.
+
+### A real-life example 🟢
+
+When you book a movie on BookMyShow, the ticket screen shows up at once, but the confirmation email and SMS arrive a few seconds later. The booking request only saved the booking and a "send ticket email" job, then answered you. A worker picked up that job and talked to the email service. If the email service was down, the worker tried again a little later, so you still got your ticket email, and only one copy of it.
 
 ## 2. Mental model 🟢
 
@@ -136,17 +152,31 @@ A worker never truly "owns" a job — it holds a **lease**, timestamped when it 
 
 ## 3. How it works 🟡
 
+🟢 → 🟡 You now know the idea: save the job somewhere safe, let a worker pick it up, retry on failure, and park it after too many failures. Next we open the box and see each piece: how a job is saved, how a worker claims it, how retries are timed, and how a worker stops cleanly.
+
 ### In-process pool: fast, and not durable
 
 **In plain words:** goroutines inside your server are fast but forget everything when the process dies — that is the whole problem.
+
+**Step by step:**
+1. The server makes a channel that holds up to 100 jobs and starts 4 goroutines that read from it.
+2. A request puts "email inv_42" into the channel and returns.
+3. One of the 4 goroutines takes it and sends the email.
+4. If the process dies while 30 jobs wait in the channel, those 30 jobs are gone, because the channel lived only in memory.
 
 [[select and Concurrency Patterns]] has the general-purpose version — `Submit`, backpressure, `Stop` that drains the queue. The version here is the same shape, specialized to a job type, to make one point concrete: it is a perfectly good tool for work that only needs to survive within the process's own lifetime (fan-out over a batch already held in memory, for example), and the wrong tool the moment "this must still happen after a crash" is a requirement — which most background jobs are.
 
 ### Enqueue in the same transaction
 
+**Step by step:**
+1. `POST /invoices` opens a database transaction.
+2. It inserts the invoice row `inv_42`.
+3. In the same transaction, it inserts a job row "send email for inv_42".
+4. `COMMIT` saves both together. If anything fails before that, neither is saved, so you never get an invoice without its email job, or an email job for an invoice that does not exist.
+
 The producer side matters as much as the worker. `Enqueue` (in the store code below) takes the caller's `pgx.Tx`, so the invoice row and its job row commit or roll back together.
 
-When the queue lives in another system (Redis, SQS, Kafka), write an outbox row in the same transaction and let a relay publish it; see [[Transactional Outbox and CDC]].
+When the queue lives in another system (Redis, SQS, Kafka: separate queue services), write an outbox row in the same transaction and let a relay publish it; see [[Transactional Outbox and CDC]].
 
 ```mermaid
 sequenceDiagram
@@ -172,6 +202,13 @@ sequenceDiagram
 
 **In plain words:** the worker asks the database "give me one unclaimed job and mark it mine" in a single step, so two workers can never grab the same job.
 
+**Step by step:**
+1. Worker 1 runs: "find one `queued` job, lock it, skip any row already locked". It gets job 90412.
+2. At the same moment Worker 2 runs the same query. Job 90412 is locked, so it skips it and gets job 90413.
+3. Each worker sets its job to `running`, adds 1 to `attempts`, sets a lease end time 30 seconds away, and commits.
+4. The worker sends the email with no database lock held.
+5. It marks the job `succeeded`, but only if `attempts` still equals the value it read. If someone else re-took the job meanwhile, this update changes nothing.
+
 A Postgres table is a complete job queue for most services, and `FOR UPDATE SKIP LOCKED` is the one clause that makes it safe under concurrent workers: instead of blocking on a row another transaction already locked, a worker simply skips it and takes the next one.
 
 ```mermaid
@@ -196,7 +233,14 @@ The claim, complete, and retry statements all guard on `attempts`, the value the
 
 **In plain words:** when a job fails, wait a bit and try again; wait longer each time; after enough failures, park it where a human can look at it.
 
-A failed job is retried with **exponential backoff and full jitter**: the delay before attempt *n* is a random draw between 0 and `min(2ⁿ seconds, cap)`, not a fixed `2ⁿ` — fixed backoff means every job that failed in the same incident retries in lockstep, turning one outage into a synchronized thundering herd the moment the dependency recovers.
+**Step by step:**
+1. Attempt 1 fails. Pick a random wait between 0 and 2 seconds.
+2. Attempt 2 fails. Pick a random wait between 0 and 4 seconds; then 0-8, and so on, up to a cap.
+3. After the last allowed attempt (say 10), set `status = 'dead'` and save the error text in `last_error`.
+4. If the error can never succeed (for example the email address is invalid), skip the retries and go to `dead` at once.
+5. A human fixes the cause and sets the job back to `queued`.
+
+A failed job is retried with **exponential backoff and full jitter**: the delay before attempt *n* is a random draw between 0 and `min(2ⁿ seconds, cap)`, not a fixed `2ⁿ` — fixed backoff means every job that failed in the same incident retries in lockstep, turning one outage into a synchronized thundering herd (thousands of retries hitting at the same second) the moment the dependency recovers.
 
 After `max_attempts`, the job moves to a `dead` state instead of retrying forever: that is the entire dead-letter mechanism in a single-table design — one more status value and a guarded `UPDATE`, not a separate queue.
 
@@ -204,26 +248,38 @@ An operator (or a small CLI) replays a dead job by setting it back to `queued`; 
 
 A **permanent error** — a malformed payload, a 4xx from a downstream API that will never succeed no matter how many times you ask — should skip straight to `dead` without spending the remaining attempts.
 
-The worked example below marks this with a sentinel error (`ErrPermanent`) a handler wraps its own error in, the same shape `asynq.SkipRetry` uses on the Redis side.
+The worked example below marks this with a sentinel error (a fixed, named error value you can check for, here `ErrPermanent`) a handler wraps its own error in, the same shape `asynq.SkipRetry` uses on the Redis side.
 
 ### Poison jobs, timeouts, fairness and trace context
+
+**Step by step:**
+1. A job whose data is broken fails every time. After the last attempt it goes to `dead`, and an alert fires on the dead count.
+2. Each attempt gets its own time limit, shorter than the lease, for example 20 seconds inside a 30-second lease, so one stuck call cannot hold a worker forever.
+3. One tenant (one customer company) that adds 10,000 jobs should not block everyone else, so cap how many of its jobs run at once.
+4. The job carries the request's trace ID, so the logs of the request and the later job show up as one story.
 
 - **Poison messages.** A job that fails every time is retried `max_attempts` times and then dead-lettered; a job that crashes the process every time is caught by the `attempts < max_attempts` clause plus `Reap`. Either way it ends in `dead` with `last_error` set instead of looping forever. Alert on the dead count; replay after the fix ships.
 - **Per-job timeout.** Every attempt runs under a deadline (`SetJobTimeout`) shorter than the lease. A hung downstream call then fails the attempt instead of pinning a worker slot, and a job still running when its lease lapses is the only way two workers run the same job at once.
 - **Concurrency limits per tenant or provider.** One noisy tenant can fill all N slots. Add a `tenant_id` column and cap it in the claim query, or use a separate queue (asynq queues, a `kind`-filtered worker pool) with its own concurrency per provider, so a slow email provider cannot starve payment jobs.
-- **Trace context.** Put the W3C `traceparent` in the job payload at enqueue time and start the handler's span from it, so one trace spans the HTTP request and the background work.
+- **Trace context.** Put the W3C `traceparent` (a standard header holding the trace ID that links logs and timings across services) in the job payload at enqueue time and start the handler's span from it, so one trace spans the HTTP request and the background work.
 
 ### Brokers, in one paragraph each
 
-- **SQS.** A received message is hidden for the visibility timeout (default 30 seconds). If the worker has not deleted it by then, it reappears. For a long job, call `ChangeMessageVisibility` periodically as a heartbeat. After `maxReceiveCount` receives, the redrive policy moves the message to a DLQ.
+- **SQS.** (Amazon's managed queue service.) A received message is hidden for the visibility timeout (default 30 seconds). If the worker has not deleted it by then, it reappears. For a long job, call `ChangeMessageVisibility` periodically as a heartbeat. After `maxReceiveCount` receives, the redrive policy moves the message to a DLQ (dead-letter queue).
 - **RabbitMQ.** A consumer `ack`s on success and `nack`s (with requeue or to a dead-letter exchange) on failure; an unacked message returns to the queue when the channel closes. Set `prefetch` (QoS) to cap unacked messages per consumer, or one worker hoards the queue.
-- **Kafka.** Consumers in a group share partitions; ordering holds only within a partition. Commit the offset after processing (at-least-once); committing before processing risks losing a message on a crash. There is no per-message retry: use a retry topic and a dead-letter topic.
+- **Kafka.** Consumers in a group share partitions (slices of a topic, each read by one consumer at a time); ordering holds only within a partition. Commit the offset (the position "I have read up to here") after processing (at-least-once); committing before processing risks losing a message on a crash. There is no per-message retry: use a retry topic and a dead-letter topic.
 - **River.** The Go library for the Postgres design above: `river.Client.InsertTx(ctx, tx, args, nil)` enqueues in your transaction, workers implement `Work(ctx, job)`, and it brings migrations, retries with backoff, uniqueness and `LISTEN/NOTIFY` wake-ups.
 - **Temporal (or similar durable workflow engines).** For multi-step sagas with waits and compensation, a workflow engine persists each step's progress so you do not hand-build a state machine on top of a job table.
 
 ### Graceful stop: release the lease, don't just stop the goroutine
 
 **In plain words:** when shutting down, the worker finishes or hands back the job it holds, like a shift worker clocking out properly.
+
+**Step by step:**
+1. A deploy sends SIGTERM (the "please stop" signal) to the worker.
+2. The claim loop stops taking new jobs.
+3. Jobs already running get, say, 20 seconds to finish and mark themselves done.
+4. A job still running after 20 seconds is left alone, not killed halfway. Its lease runs out, and a new worker picks it up again later.
 
 A worker's shutdown is a different shape from the HTTP server's. [[Graceful Shutdown and Health Checks]] covers the signal → `Shutdown(ctx)` → drain sequence a worker plugs into; what is specific to a *durable* queue is what "drain" means for a job whose state lives in Postgres rather than in a Go channel:
 
@@ -234,7 +290,13 @@ A worker's shutdown is a different shape from the HTTP server's. [[Graceful Shut
 
 ### Redis-backed: `asynq`
 
-`asynq` is a Redis-backed queue with retries, scheduled tasks, unique tasks, named weighted queues and an archive (its dead-letter set) built in. It stores tasks in Redis lists and sorted sets and moves them with Lua scripts; a worker holds a lease on an active task, and if the worker dies the lease lapses and a recoverer re-queues the task.
+**Step by step:**
+1. The API calls `client.Enqueue(task)`; `asynq` stores the task in Redis.
+2. An `asynq` server process pulls the task, takes a lease, and calls your handler.
+3. On error it schedules a retry with backoff; after the last retry it moves the task to the archive (its dead-letter area).
+4. If the worker dies, the lease runs out and `asynq` puts the task back in the queue.
+
+`asynq` is a Redis-backed queue with retries, scheduled tasks, unique tasks, named weighted queues and an archive (its dead-letter set) built in. It stores tasks in Redis lists and sorted sets (lists kept in order by a score, such as a run time) and moves them with Lua scripts (small programs Redis runs in one step); a worker holds a lease on an active task, and if the worker dies the lease lapses and a recoverer re-queues the task.
 
 Delivery is at-least-once, so handlers must be idempotent exactly as with Postgres. Choose it when the service already runs Redis (see [[Redis as a Queue - Lists, Streams and Pub-Sub]] for the underlying primitives) or needs higher throughput than polling a table.
 
@@ -280,7 +342,9 @@ The full version below adds what production needs: a real `pgx`-backed store wit
 
 It passes `go vet` and `go test -race` on Go 1.24.4. Postgres is replaced by an in-memory fake implementing the same `Store` interface in every test — `pgx`/`pgxpool` compile against the real driver but are never exercised against a live database, same for `asynq` against a live Redis.
 
-**The in-process pool** (fast, not durable — see "How it works"):
+**The in-process pool** (fast, not durable — see "How it works").
+
+**What this code does, in plain words:** it starts N goroutines that read jobs from one channel (`Submit` waits when the channel is full), and on `Stop` closes the channel and waits for the jobs already in it to finish.
 
 ```go
 package workers
@@ -347,7 +411,9 @@ func (p *Pool) Stop() {
 }
 ```
 
-**The durable store** (pgx against Postgres; `Store` is also implemented by an in-memory fake in the tests):
+**The durable store** (pgx against Postgres; `Store` is also implemented by an in-memory fake in the tests).
+
+**What this code does, in plain words:** it holds the SQL for each job step: add a job inside your transaction, claim one job with `SKIP LOCKED`, mark it done, schedule a retry, move it to `dead`, and reclaim jobs whose lease ran out. Every update checks `attempts` so a late worker cannot overwrite a newer result.
 
 ```go
 package workers
@@ -514,7 +580,9 @@ func (s *PostgresStore) Kill(ctx context.Context, id int64, attempts int, reason
 }
 ```
 
-**The worker**: claim loop, bounded concurrency, backoff, and graceful stop:
+**The worker**: claim loop, bounded concurrency, backoff, and graceful stop.
+
+**What this code does, in plain words:** a loop claims a job whenever a slot is free, runs the handler with a time limit, and then marks the job done, retried with a random delay, or dead. On shutdown it stops claiming and waits a fixed time for running jobs.
 
 ```go
 package workers
@@ -669,7 +737,9 @@ func (w *Worker) drain(timeout time.Duration) {
 }
 ```
 
-**Tests** (Postgres replaced throughout by an in-memory `fakeStore` implementing the same `Store` interface):
+**Tests** (Postgres replaced throughout by an in-memory `fakeStore` implementing the same `Store` interface).
+
+**What this code does, in plain words:** each test drives the worker against a fake store and checks one promise: a job succeeds and is marked complete, a failing job is retried and then dead-lettered, a permanent error skips retries, a hung job is cut off by its timeout, the concurrency limit holds, and shutdown drains or abandons jobs correctly.
 
 ```go
 package workers
@@ -1016,6 +1086,8 @@ func TestPool_OnErrorSeesAFailedJobInsteadOfSwallowingIt(t *testing.T) {
 
 ### Redis-backed, for comparison: `asynq`
 
+**What this code does, in plain words:** it builds the same email job with `asynq`: a client that enqueues a task with retry and uniqueness options, and a server with weighted queues whose handler returns `SkipRetry` for errors that can never succeed.
+
 ```go
 package workers
 
@@ -1127,7 +1199,26 @@ func NewAsynqServer(redisAddr string, sendEmail func(ctx context.Context, invoic
 - At-least-once delivery is not optional with any of these — if a handler genuinely cannot be made idempotent (a non-idempotent third-party charge API with no idempotency key of its own), the fix belongs in front of the queue (a dedupe table keyed by a request id), not inside the worker.
 - `asynq`'s retry and scheduling conveniences assume Redis is already a trusted dependency in this service; if it isn't, the Postgres-only design avoids introducing one just for queueing.
 
+### Job queue vs scheduled job 🟡
+
+| | Background job queue (this note) | Scheduled job ([[Scheduled Jobs]]) |
+| --- | --- | --- |
+| Started by | an event, like "invoice created" | the clock, like "every day at 9:00" |
+| How many | one job per event, can be millions | one run per tick |
+| Main risk | losing or doubling a job | two servers running the same tick |
+| Example | send email for `inv_42` | send all overdue reminders at 9:00 |
+
+### Common beginner mistakes 🟢
+
+- Using `go sendEmail()` for work that must happen → a restart loses it silently → save a job row in a durable queue.
+- Committing the invoice and then enqueueing in a separate step → a crash between them loses the job → enqueue inside the same transaction, or use an outbox.
+- Retrying with the same fixed delay for every job → all retries hit the recovering service at once → use exponential backoff with full jitter.
+- Retrying forever → one broken job loops for days → cap attempts and move it to `dead`.
+- Assuming each job runs exactly once → a crash after the email but before "done" sends it twice → make handlers idempotent.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now build a safe queue: save the job with the data, claim it with a lease, retry with jitter, and stop cleanly. The advanced part covers how these designs fail at scale: double side effects, lost jobs, retry storms, stuck leases, and how fast a Postgres table queue can really go.
 
 - **Real systems:** River and `asynq` are widely used Go job queues (Postgres and Redis respectively); Sidekiq (Ruby/Redis), Celery (Python, RabbitMQ/Redis) and BullMQ (Node/Redis) are the same durable-queue-with-retries idea in other ecosystems (Redis- or broker-backed rather than `SKIP LOCKED`).
 - **Failure modes → fixes:**
@@ -1180,6 +1271,26 @@ func NewAsynqServer(redisAddr string, sendEmail func(ctx context.Context, invoic
 - Enqueue inside the same transaction as the business write (or via an outbox); never "commit, then enqueue" in two steps.
 - Graceful stop: stop claiming, let in-flight jobs finish within a deadline, abandon (don't kill) anything past it — the lease, not the goroutine, is what makes that safe.
 - At-least-once delivery is the deal: handlers must be idempotent, full stop.
+
+## Self-check 🟢🟡
+
+> [!question]- Why is a channel with goroutines not a safe queue for important jobs?
+> It lives in memory, so a crash or deploy loses every job still waiting in it.
+
+> [!question]- What is a lease?
+> A time-limited claim on a job; if the worker dies, the lease runs out and another worker can take the job.
+
+> [!question]- Where does a job go after too many failures?
+> To the dead-letter state (`status = 'dead'`), where a human can look at it and replay it.
+
+> [!question]- What does `SKIP LOCKED` change compared with plain `FOR UPDATE`?
+> Workers skip rows already locked by others instead of waiting, so many workers claim different jobs at once.
+
+> [!question]- Why guard `Complete` with `WHERE attempts = $2`?
+> If the job was reclaimed by another worker, the slow worker's late update matches zero rows and cannot overwrite the newer result.
+
+> [!question]- Why must job handlers be idempotent?
+> Delivery is at-least-once: a worker can finish the work and crash before marking it done, so the job runs again.
 
 ## Links 🟢
 

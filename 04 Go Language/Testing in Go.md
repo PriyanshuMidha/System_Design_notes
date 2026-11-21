@@ -38,6 +38,11 @@ Fakes vs mocks as a design topic is [[Test Doubles and Mocking in Go]]; testing 
 > - 🟡 **Know the basics?** Add section 3 (the mechanics, piece by piece) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Syntax, Types and Control Flow]]: you can write functions, slices of structs and `for` loops. A table test is exactly that.
+> - [[Error Handling]]: functions return an `error`, and a test checks it with `if err != nil`.
+> - [[Packages, Modules and Dependency Management]]: a package is a folder of `.go` files; test files sit in the same folder as the code they test.
+
 **From zero, in 60 seconds** 🟢
 
 A **test** is a tiny program that calls your real code with a known input and complains if the answer is wrong. You write it once; Go reruns it every time you type `go test`.
@@ -83,6 +88,12 @@ Once written, it catches the regression for you, forever.
 | Coverage | Which lines your tests actually ran | `go test -cover` prints `82.0%` |
 | Race | Two goroutines touching the same memory unsafely | `go test -race` reports it |
 | Benchmark | A test that measures speed | `func BenchmarkAdd(b *testing.B)` |
+| Table test | One test function that loops over a list of cases | `tests := []struct{ name string; in, want int }{...}` |
+| Regression | A bug that comes back after it was fixed | a fixed discount bug breaks again |
+| Fuzzing | Go inventing many random inputs to find one that breaks a rule | `go test -fuzz=FuzzParsePaise` |
+| Golden file | A saved "known good" output that the test compares against | `testdata/receipt.golden` |
+| Fake / mock | A small stand-in for a real dependency, used only in tests | a fake clock instead of real time |
+| Flaky test | A test that sometimes passes and sometimes fails with no code change | depends on timing or test order |
 
 **Picture it**
 
@@ -113,8 +124,8 @@ Where it breaks: a checklist only covers what someone thought to write; tests pr
 A billing service has a `Total(items []Item) int64` function and a handler that calls it. Without tests, three real bugs slip through:
 
 1. An empty `items` slice crashes a careless implementation that assumes at least one item (nil slice range is actually safe in Go, but a naive rewrite that indexes `items[0]` for a "default item" would panic — exactly the kind of edge case a table test with an empty case catches for free).
-2. A fuzz test on this note's own `ParsePaise("123.45" → 12345)` parser found that `ParsePaise("100000000000000000")` silently returned a **negative** number: `strconv.ParseInt` accepts any value up to about 9.22×10¹⁸, but multiplying that by 100 overflows `int64` at about 9.22×10¹⁶ and wraps around. No hand-written test case would likely have picked `100000000000000000` as an input; with that string removed from the seed corpus, Go's coverage-guided fuzzer still landed on an equivalent overflowing value in well under a second of real searching (reproduced in this note's scratch module), which is the kind of input a human reviewing test cases by eye tends to skip.
-3. A worker pool with no `-race` test in CI reports correct totals in every manual run, then corrupts a shared counter once a week under real concurrent load — the race detector catches this class of bug deterministically in CI, long before "once a week" becomes a production incident.
+2. A fuzz test (a test where Go generates random inputs, explained in section 3) on this note's own `ParsePaise("123.45" → 12345)` parser found that `ParsePaise("100000000000000000")` silently returned a **negative** number: `strconv.ParseInt` accepts any value up to about 9.22×10¹⁸, but multiplying that by 100 overflows `int64` at about 9.22×10¹⁶ and wraps around. No hand-written test case would likely have picked `100000000000000000` as an input; with that string removed from the seed corpus (the starting list of example inputs), Go's coverage-guided fuzzer (it prefers inputs that reach new lines of code) still landed on an equivalent overflowing value in well under a second of real searching (reproduced in this note's scratch module), which is the kind of input a human reviewing test cases by eye tends to skip.
+3. A worker pool with no `-race` test in CI reports correct totals in every manual run, then corrupts a shared counter once a week under real concurrent load — the race detector (`-race`, which reports two goroutines touching the same memory unsafely) catches this class of bug deterministically in CI (the automatic test pipeline that runs on every change), long before "once a week" becomes a production incident.
 
 ## 2. Mental model 🟢
 
@@ -131,6 +142,8 @@ flowchart LR
 ```
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a test is a function `go test` runs to check your code, and that Go's usual style is one table of cases. **Next we open the box**: test files and packages, table tests with subtests, the `t.*` helpers, comparing values, fakes and fake time, golden files, examples, `httptest`, keeping slow tests out, and the race detector, coverage and fuzzing.
 
 ### Files, packages, and the `_test.go` suffix
 
@@ -196,7 +209,7 @@ sequenceDiagram
 - **`t.Fatal`/`t.Fatalf`** mark it failed and stop that goroutine immediately — use once a precondition means the rest of the function can't run meaningfully (a setup error, a nil you're about to dereference). `t.Fatal` inside a goroutine other than the test's own does **not** stop the test; call it only from the test's main goroutine.
 - **`t.Parallel()`**, called inside a subtest, marks that subtest to run concurrently with every other parallel sibling under the same parent, once all non-parallel siblings have finished. It is for making **independent** test cases share wall-clock time; it does not add concurrency to the code under test, and two parallel subtests that share mutable state (a package-level variable, a shared temp directory) will race each other.
 - **`t.Helper()`**, called in a function other than the test itself (like a shared assertion or setup helper), makes failure line numbers point at the *caller* of the helper, not at the line inside the helper — essential once you have more than one or two helpers, or every failure reports the same unhelpful line.
-- **`t.Cleanup(fn)`** registers `fn` to run when the test (or subtest) completes, in LIFO order, whether it passed, failed, or panicked. `t.TempDir()` already uses this internally to delete its directory for you; `t.Cleanup` is what you reach for when *you* open a resource (a temp file via `os.MkdirTemp`, a listener, a goroutine) and need it to be guaranteed to close even on failure.
+- **`t.Cleanup(fn)`** registers `fn` to run when the test (or subtest) completes, in LIFO order (last registered runs first), whether it passed, failed, or panicked. `t.TempDir()` already uses this internally to delete its directory for you; `t.Cleanup` is what you reach for when *you* open a resource (a temp file via `os.MkdirTemp`, a listener, a goroutine) and need it to be guaranteed to close even on failure.
 - **`t.Setenv(key, val)`** sets an environment variable for the duration of the test and restores it afterward — safer than `os.Setenv`/manual restore, and it fails the test immediately if called from a parallel subtest (environment variables are process-global, so two parallel subtests setting the same one would race).
 - **`t.TempDir()`** returns a fresh, test-scoped directory, automatically removed after the test — the default way to get a disposable filesystem location instead of hand-rolling `os.MkdirTemp` + manual cleanup for the common case.
 - **`t.Context()`** (Go 1.24) returns a `context.Context` that is canceled when the test completes — useful for passing to code under test that expects a context and should be torn down with the test, without building one by hand.
@@ -206,7 +219,7 @@ sequenceDiagram
 The standard library gives you `reflect.DeepEqual` and manual field checks; two popular additions fill the gap:
 
 - **`github.com/google/go-cmp`**'s `cmp.Diff(want, got)` produces a readable structural diff and lets you ignore fields (`cmpopts.IgnoreFields`) or define custom equality (for floats, times) — the Go team's own preference for comparing complex structs in tests.
-- **`github.com/stretchr/testify`**'s `assert`/`require` give one-line assertions (`assert.Equal(t, want, got)`, `require.NoError(t, err)`); `assert` records a failure and continues, `require` stops like `t.Fatal`. Very common in application code, though some reviewers consider large assertion DSLs unnecessary over plain `if`/`t.Errorf`.
+- **`github.com/stretchr/testify`**'s `assert`/`require` give one-line assertions (`assert.Equal(t, want, got)`, `require.NoError(t, err)`); `assert` records a failure and continues, `require` stops like `t.Fatal`. Very common in application code, though some reviewers consider large assertion DSLs (mini-languages of helper functions) unnecessary over plain `if`/`t.Errorf`.
 
 Neither replaces the other; many Go codebases use plain `if` + `t.Errorf` for simple scalar checks and `cmp.Diff` only for structs/slices where a diff actually helps readability.
 
@@ -226,7 +239,7 @@ Use an injected `Clock` interface when the design should be testable without any
 
 **In plain words:** a golden file is a saved "known good" printout; the test re-renders the output and diffs it against the saved copy, like comparing today's receipt to a photocopy of yesterday's.
 
-A directory named `testdata` anywhere in a package is ignored by the Go toolchain's build (never compiled, never mistaken for a package) and is the conventional place for test fixtures: `.golden` expected-output files, sample JSON, fuzz corpora.
+A directory named `testdata` anywhere in a package is ignored by the Go toolchain's build (never compiled, never mistaken for a package) and is the conventional place for test fixtures (fixed sample data the tests read): `.golden` expected-output files, sample JSON, fuzz corpora.
 
 The golden-file pattern renders real output and diffs it against a checked-in file, with a flag to refresh the file when the expected output intentionally changes:
 
@@ -264,7 +277,7 @@ No `// Output:` comment means the example compiles (so it stays valid as the API
 
 ### httptest
 
-`net/http/httptest.NewRequest` and `NewRecorder` let you call an `http.Handler` directly as a function — no real socket, no real port — and inspect the `*httptest.ResponseRecorder` for status code and body:
+`net/http/httptest.NewRequest` and `NewRecorder` let you call an `http.Handler` directly as a function — no real socket (network connection), no real port — and inspect the `*httptest.ResponseRecorder` for status code and body:
 
 ```go
 req := httptest.NewRequest(http.MethodPost, "/total", bytes.NewBufferString(body))
@@ -291,14 +304,14 @@ func TestMain(m *testing.M) {
 
 Two independent ways to keep slow tests out of the default run:
 
-- **`//go:build integration`** at the top of a file excludes it from a normal `go test ./...` entirely; only `go test -tags=integration ./...` compiles and runs it. Use this for tests that need a real external dependency (a database via testcontainers-go, a real queue).
+- **`//go:build integration`** at the top of a file excludes it from a normal `go test ./...` entirely; only `go test -tags=integration ./...` compiles and runs it. Use this for tests that need a real external dependency (a database via testcontainers-go, a library that starts real databases in throwaway Docker containers; a real queue).
 - **`if testing.Short() { t.Skip(...) }`** inside a test that *does* compile normally, so `go test -short ./...` (a fast pre-commit gate) skips it while a full `go test ./...` still runs it — use this for a test that's merely slow (a large table, many iterations), not one that needs infrastructure the build tag would exclude.
 
 A typical CI pipeline runs `go test -short -race ./...` on every push and `go test -tags=integration ./...` before merge; see [[Testing in CI-CD, Flaky Tests and Testing in Production]] for the full staging.
 
 ### The race detector
 
-`go test -race` instruments every memory access and synchronization event and reports a **data race** — two goroutines accessing the same memory where at least one is a write, with no happens-before relationship between them — as a build-breaking failure with both goroutines' stacks, even if the test's assertions all passed.
+`go test -race` instruments every memory access and synchronization event and reports a **data race** — two goroutines accessing the same memory where at least one is a write, with no happens-before relationship (no lock, channel or other sync step putting them in order) between them — as a build-breaking failure with both goroutines' stacks, even if the test's assertions all passed.
 
 It roughly doubles memory use and slows execution several-fold, which is why it is normal to run it in CI but not necessarily on every local `go test` during rapid iteration. A race is probabilistic: `go test -race -count=5` (or more) reruns the whole suite that many times, because one race-free run proves nothing about the next one.
 
@@ -456,6 +469,8 @@ func ParsePaise(s string) (int64, error) {
 
 The tests, including the table tests, `t.Cleanup`, the golden file, `httptest`, `-short`, the example, and the benchmark:
 
+**What this code does, in plain words:** `TestTotal` is the table test for `Total`. `newTempInvoiceDir` is a helper that makes a temp folder and registers its cleanup. `TestReceiptWritesIntoTempDir` and `TestReceiptGolden` check the receipt file, the second against a saved golden copy. `TestTotalHandler` calls the HTTP handler through `httptest` with no real server, and `TestTotalHandlerManyItems` is skipped under `-short`. `ExampleTotal` doubles as documentation, and `BenchmarkTotal` times `Total` with `b.Loop()`.
+
 ```go
 var update = flag.Bool("update", false, "update golden files")
 
@@ -588,6 +603,8 @@ func BenchmarkTotal(b *testing.B) {
 
 The fuzz target that found the overflow, with the crashing input kept as a permanent regression seed:
 
+**What this code does, in plain words:** it seeds the fuzzer with a few sample strings (including the one that used to overflow), then for every input Go generates it calls `ParsePaise`. An error is fine; a negative result from an input that does not start with `-` fails the test.
+
 ```go
 func FuzzParsePaise(f *testing.F) {
 	for _, seed := range []string{
@@ -685,6 +702,9 @@ func TestTotalHandler_AgainstRealPaymentSandbox(t *testing.T) {
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to write table tests with subtests, use the `t.*` helpers, golden files, `httptest`, examples, build tags, `-short`, `-race`, coverage, fuzzing and goleak, all on one real package. **Next is the advanced part**: how teams run these in CI, the failure patterns they catch, and how `-race`, `t.Parallel` scheduling, coverage-guided fuzzing and `synctest` really work.
+
+
 - **Real systems:** nearly every Go service in production runs `go vet` and `go test -race -cover ./...` as a required CI gate before merge; the Go standard library itself is tested almost entirely with table-driven tests and a very large shared `FuzzXxx` corpus (Go's own `encoding/json`, `net/http`, and `image` packages have all had bugs found this way).
 - **Failure modes → fixes:**
   - A flaky `-race` failure that reproduces once in twenty runs → `go test -race -count=20 -run TestName` to force many reruns locally before assuming it's a false alarm (true races detected by `-race` are real; the detector itself does not produce false positives, only false negatives when a race doesn't trigger on a given run).
@@ -738,6 +758,30 @@ func TestTotalHandler_AgainstRealPaymentSandbox(t *testing.T) {
 - `b.Loop()` (Go 1.24) over manual `b.N` loops — it resets the timer and stops the compiler from discarding the call.
 - `FuzzXxx` + `f.Add` seeds + `f.Fuzz` property; a crasher becomes a permanent `testdata/fuzz/` regression test.
 - `go.uber.org/goleak` in `TestMain` catches goroutine leaks; `-shuffle=on` catches order-dependent tests.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Which files and function names does `go test` pick up?
+> Files ending in `_test.go`, and functions named `TestXxx(t *testing.T)` (plus `BenchmarkXxx`, `ExampleXxx`, `FuzzXxx`).
+
+> [!question]- What is the difference between `t.Error` and `t.Fatal`?
+> `t.Error` marks the test failed and keeps going; `t.Fatal` marks it failed and stops that test.
+
+> [!question]- What does `t.Run("one_item", ...)` give you?
+> A named subtest you can run alone (`-run TestTotal/one_item`) and that fails by name.
+
+🟡 Medium
+
+> [!question]- Does `t.Parallel()` make your code under test run on more goroutines?
+> No. It only lets independent subtests run at the same time to save wall-clock time.
+
+> [!question]- A test needs a real database. Build tag or `testing.Short()`?
+> A build tag (`//go:build integration`), so it is not even compiled in a normal `go test ./...`.
+
+> [!question]- Your fuzz target only checks "does not panic". What would it miss in `ParsePaise`?
+> Wrong but non-crashing results, like the silent overflow that returned a negative number. Also check a property of the result.
 
 ## Links 🟢
 

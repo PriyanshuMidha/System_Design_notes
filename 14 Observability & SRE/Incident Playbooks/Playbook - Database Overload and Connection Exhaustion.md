@@ -49,6 +49,11 @@ Interview one-liner: "First I decide whether it is saturation (slow queries) or 
 > - 🟡 **Know the basics?** Add section 3 (first 5 minutes and steps A to H), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Production Debugging Playbook]]: check "what changed" first, and stop the damage before hunting the cause.
+> - [[Connection Pooling]]: an app keeps a fixed set of open database connections and lends them to requests; when all are lent out, new requests wait.
+> - [[Debugging Database Performance]]: `pg_stat_activity`, `pg_stat_statements` and `EXPLAIN` show what the database is running and why it is slow.
+
 **From zero, in 60 seconds** 🟢
 
 Your app talks to the database through open lines called **connections**.
@@ -96,6 +101,12 @@ Users see errors even though the database is still running.
 | Saturation | A resource is fully busy and work starts queuing | CPU at 100 percent, queries wait |
 | Slow query | A query that takes much longer than normal | Missing index, full table scan |
 | Query plan | The steps the database chooses to run a query | `EXPLAIN` shows Seq Scan vs Index Scan |
+| Idle in transaction | A session that ran `BEGIN` and then stopped, still holding its locks and slot | forgot to commit after an error |
+| Little's Law | Connections in use = queries per second × seconds each holds one | 500/s × 0.01 s = 5 |
+| Replica | A read-only copy of the database that follows the primary | send reports there, not to the primary |
+| Failover | Switching to a standby copy when the main one fails | promote the replica |
+| `statement_timeout` | A setting that cancels any query running longer than a limit | 30 s for the API role |
+| HPA | Kubernetes's autoscaler that adds pods under load (each with its own pool) | 12 → 40 pods |
 
 **Picture it**
 
@@ -130,8 +141,8 @@ Where it breaks: a restaurant can add chairs cheaply; each database connection c
 
 **Symptoms.**
 
-- App errors: `FATAL: sorry, too many clients already`, or `FATAL: remaining connection slots are reserved for non-replication superuser connections`.
-- Go pool symptoms: requests hang in `db.Conn` or `QueryContext` for seconds, then `context deadline exceeded`.
+- App errors: `FATAL: sorry, too many clients already`, or `FATAL: remaining connection slots are reserved for non-replication superuser connections` (the last few slots are kept for admins).
+- Go pool symptoms: requests hang in `db.Conn` or `QueryContext` for seconds, then `context deadline exceeded` (Go's "time limit reached" error).
 - Dashboards: database CPU near 100%, connection count flat at `max_connections`, p99 latency climbing, 504s from the proxy, queue depth growing.
 - Replicas fall behind, backups or migrations stall.
 
@@ -141,6 +152,13 @@ Where it breaks: a restaurant can add chairs cheaply; each database connection c
 
 > [!tip] Remember
 > Pool size is per pod. The database sees pods times pool size, plus jobs, plus humans with psql.
+
+### Real-life example: a midnight report job 🟢
+
+Imagine a billing app like Zoho Invoice running its nightly export of all invoices.
+After a release, the export query has no index to use, so each run takes 11 seconds instead of 50 ms, and 40 export workers run at once.
+They hold 40 connections for minutes, the database CPU hits 98%, and the normal API starts timing out for customers in other time zones.
+Pausing the export and ending its sessions brings everything back in two minutes; adding the missing index fixes it for good.
 
 ## 2. Mental model 🟢
 
@@ -170,7 +188,17 @@ flowchart TD
 > [!tip] Remember
 > Exhaustion is usually a latency problem wearing a connection-count costume.
 
+## Common beginner mistakes 🟢
+
+- **Raising `max_connections` or the pool size first** → more queries fight for the same CPU, each gets slower, and it gets worse → reduce demand first.
+- **Forgetting that pool size is per pod** → 40 pods × 25 connections = 1,000, far above the database's 200 → divide the database's limit by the maximum number of pods.
+- **Calling a slow outside API inside a transaction** → the row lock and slot are held while you wait → keep transactions short, with no network calls inside.
+- **Running `EXPLAIN ANALYZE` on a write in production** → it really runs the statement → use plain `EXPLAIN`, or wrap it in a transaction you roll back.
+- **Failing over to the standby to fix overload** → the same queries hit a host with a cold cache → stop the bad workload instead.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the two problems (a busy database and a database out of connection slots) and that slowness alone can use up every slot. **Next we open the box**: the first five minutes, a flowchart, and eight checks (A to H) from "how full is it" to the database machine itself.
 
 ### The first 5 minutes
 
@@ -178,7 +206,7 @@ flowchart TD
    - Is it the database or the app? Check DB CPU, connection count, and the app's pool wait.
    - Which services share this database? Which are failing?
    - Is it one cluster or all shards?
-2. **Check what changed.** A deploy with a new query or missing index, a pool size or replica-count change (HPA scaled pods up), a cron job or backfill, a migration holding a lock, a traffic spike, a failover, a vacuum or stats problem.
+2. **Check what changed.** A deploy with a new query or missing index, a pool size or replica-count change (HPA scaled pods up), a cron job or backfill (a job that rewrites lots of old data), a migration holding a lock, a traffic spike, a failover, a vacuum (Postgres's background clean-up of old rows) or stats problem.
 3. **Mitigate first.** In this order of safety:
    - Stop the noisy source: pause the batch job, scale down the runaway deployment, disable the feature flag.
    - Terminate idle-in-transaction sessions and the worst long-running queries.
@@ -193,6 +221,14 @@ flowchart TD
 > Raising `max_connections` or the app pool size first. More concurrent queries compete for the same CPU, each runs slower, holds its slot longer, and the database gets worse faster. Reduce demand first.
 
 ### The diagnosis flowchart
+
+**In plain words:** first decide "busy" or "full", then find who holds the slots and what they wait on.
+
+**Step by step:**
+1. Is database CPU high with many `active` sessions? It is busy: find the expensive queries (steps C and E).
+2. Are slots full but CPU low? Look at session states: `idle` means oversized pools; `idle in transaction` means stuck transactions.
+3. Are many sessions waiting on `Lock`? Find the root blocker (step D).
+4. Is the app's pool wait high but the database calm? The app's own pool is the limit (step F).
 
 ```mermaid
 flowchart TD
@@ -212,6 +248,11 @@ flowchart TD
 ### Step A: How full is the database?
 
 **In plain words:** count how many connections are open compared to the max allowed.
+
+**Step by step:**
+1. Count all sessions and compare with `max_connections`: 198 of 200 means full.
+2. Count by `state`: `active`, `idle`, `idle in transaction`.
+3. Many `active` → too much work. Many `idle` → too many or too big pools. Many `idle in transaction` → transactions left open.
 
 ```sql
 -- Connections by state
@@ -237,6 +278,11 @@ SELECT count(*) AS used FROM pg_stat_activity WHERE backend_type = 'client backe
 
 **In plain words:** group the connections by app and user, to see which service is taking them.
 
+**Step by step:**
+1. Group `pg_stat_activity` by `application_name`, `usename` and `client_addr`.
+2. Sort by count.
+3. If one service or job owns most slots (say `invoiceops-export` with 41), that is your suspect.
+
 ```sql
 -- By application and user (set application_name in your DSN so this is useful)
 SELECT application_name, usename, client_addr, state, count(*)
@@ -252,6 +298,11 @@ If one `client_addr` or `application_name` owns most slots, that deployment or j
 ### Step C: Which queries are long or stuck?
 
 **In plain words:** list the queries that have been running the longest. One bad query often stands out.
+
+**Step by step:**
+1. List non-idle sessions ordered by how long their query has run.
+2. Read `wait_event_type`: empty with `active` means it is using CPU; `Lock` means it waits for another session; `IO` means it waits on disk.
+3. Copy the top query's text for steps D and E.
 
 ```sql
 SELECT pid, now() - query_start AS runtime, state, wait_event_type, wait_event,
@@ -272,13 +323,19 @@ ORDER BY idle_for DESC;
 | --- | --- |
 | `Lock` | Waiting for a lock held by another session: find the blocker |
 | `IO` | Waiting on disk: cold cache, big scans, saturated storage |
-| `LWLock` | Internal contention, often a symptom of too many active backends |
+| `LWLock` | Internal contention (lightweight locks inside Postgres), often a symptom of too many active backends |
 | `Client` | Waiting for the app to send or read data |
 | empty (and `active`) | Using CPU |
 
 ### Step D: Who is blocking whom?
 
 **In plain words:** some queries wait for a lock held by another. Find the one at the front holding everyone up.
+
+**Step by step:**
+1. Run the `pg_blocking_pids` query to list who blocks whom.
+2. Find the root blocker: a session that blocks others but is not blocked itself.
+3. Read its query and state. `idle in transaction` is the classic culprit.
+4. If safe, end it with `pg_terminate_backend(pid)`, then fix the code that left it open.
 
 ```mermaid
 flowchart LR
@@ -296,11 +353,17 @@ WHERE cardinality(pg_blocking_pids(a.pid)) > 0;
 
 Find the root blocker (a pid that blocks others but is not itself blocked) and look at its query and `state`. An `idle in transaction` blocker is a classic: a forgotten transaction pins a row lock and everyone queues behind it.
 
-A schema migration doing `ALTER TABLE` waits for a lock, and all new queries queue behind it; see [[Zero-Downtime Schema Migrations]].
+A schema migration doing `ALTER TABLE` waits for a lock (an `ACCESS EXCLUSIVE` lock, which no other query may share), and all new queries queue behind it; see [[Zero-Downtime Schema Migrations]].
 
 ### Step E: Which statements cost the most?
 
 **In plain words:** over the last hours, which queries used the most total time. Those are the best ones to fix.
+
+**Step by step:**
+1. Sort `pg_stat_statements` by total execution time.
+2. Huge `calls` with tiny average time → N+1 or a hot loop.
+3. Few calls with a big average time → one expensive query; run `EXPLAIN` on it.
+4. A query that was not there yesterday → the last deploy added it.
 
 Requires the `pg_stat_statements` extension (PostgreSQL 13 and later use `total_exec_time`).
 
@@ -331,6 +394,11 @@ Look for `Seq Scan` on a big table, a large gap between estimated and actual row
 
 **In plain words:** check the app's own connection pool: how many are in use, and how long requests wait for one.
 
+**Step by step:**
+1. Graph the app's pool metrics: `InUse`, `Idle`, `WaitCount`, `WaitDuration`.
+2. `InUse` stuck at the maximum and `WaitCount` rising → requests are waiting for a connection.
+3. Compare with database CPU: high CPU means slow queries hold connections; low CPU means the pool is simply too small or leaking.
+
 ```promql
 # If you register the Prometheus Go collector for database/sql (collectors.NewDBStatsCollector)
 go_sql_in_use_connections{job="invoiceops"}
@@ -339,7 +407,7 @@ rate(go_sql_wait_duration_seconds_total{job="invoiceops"}[5m])
   / rate(go_sql_wait_count_total{job="invoiceops"}[5m])   # average wait per blocked acquire
 ```
 
-Database-side, with `postgres_exporter`:
+Database-side, with `postgres_exporter` (the standard Prometheus exporter for Postgres):
 
 ```promql
 sum by (state) (pg_stat_activity_count{datname="invoiceops"})
@@ -351,6 +419,11 @@ In Go, `db.Stats()` returns `sql.DBStats`: `InUse`, `Idle`, `OpenConnections`, `
 ### Step G: If you use PgBouncer
 
 **In plain words:** PgBouncer is a middleman that shares a few database connections among many app connections. Check its own queue.
+
+**Step by step:**
+1. Connect to PgBouncer's admin console and run `SHOW POOLS`.
+2. Sustained `cl_waiting` above zero → clients are queued for a server connection.
+3. Growing `maxwait` → the wait is getting longer: the pool, or the database behind it, is the bottleneck.
 
 ```bash
 psql -h pgbouncer -p 6432 -U pgbouncer pgbouncer -c 'SHOW POOLS;'
@@ -368,6 +441,11 @@ See [[Connection Pooling]] for transaction versus session pooling and what break
 ### Step H: Host-level checks
 
 **In plain words:** look at the database machine itself: CPU, memory, and disk. A full disk or slow disk shows up here.
+
+**Step by step:**
+1. Check CPU and load on the database host.
+2. Check disk: free space and I/O wait (`iostat`).
+3. On a managed database (AWS RDS, Google Cloud SQL), read the provider's graphs instead: CPU, connections, IOPS (disk operations per second), and burst balance (spare disk speed credits).
 
 ```bash
 # On the database host (or via your cloud's metrics): CPU, I/O wait
@@ -501,6 +579,9 @@ In plain words: reads that could go to replicas are hitting the primary. Check r
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to tell a busy database from a full one, find who holds the slots, and pick a safe mitigation. **Next is the advanced part**: early alerts, safe default timeouts, pool sizing and bulkheads, and the deeper reasons (per-connection cost, vacuum, plan flips, thundering herds) behind them.
+
+
 ### Alerts that catch this early
 
 **In plain words:** alert when connections reach about 80% full or when queries start waiting, before users see errors.
@@ -542,7 +623,7 @@ Always pass a `context` with a deadline to `QueryContext`, `ExecContext` and `Be
 
 **In plain words:** more connections is not better. A small pool with a short wait line usually beats a big one.
 
-A common starting rule of thumb, from the PostgreSQL and pooler community, is a pool size in the low tens per database server rather than hundreds, often quoted as about twice the CPU core count plus the number of effective disk spindles (the PostgreSQL wiki and HikariCP pool-sizing guidance).
+A common starting rule of thumb, from the PostgreSQL and pooler community, is a pool size in the low tens per database server rather than hundreds, often quoted as about twice the CPU core count plus the number of effective disk spindles (independent disks that can work in parallel) (the PostgreSQL wiki and HikariCP pool-sizing guidance).
 
 This is a heuristic, not a law: start small, measure throughput and latency under load, and raise only if the database has CPU headroom.
 
@@ -579,7 +660,7 @@ ORDER BY xact_start LIMIT 5;
 
 **In plain words:** the database suddenly chooses a worse way to run a query that used to be fast.
 
-A query that ran fast for months suddenly uses a different plan after stats change or a data skew event (for example a tenant uploads 10 million rows). Symptoms: sudden CPU jump with no deploy. Fix: `ANALYZE`, a better index, extended statistics, or a rewrite. Do not "fix" by killing it repeatedly.
+A query that ran fast for months suddenly uses a different plan after stats change or a data skew event (for example a tenant uploads 10 million rows). Symptoms: sudden CPU jump with no deploy. Fix: `ANALYZE`, a better index, extended statistics (extra stats on how columns relate), or a rewrite. Do not "fix" by killing it repeatedly.
 
 ### Thundering herd after recovery
 
@@ -621,7 +702,7 @@ Short-TTL caching of hot read endpoints can cut load by large factors quickly, a
 > Work backwards from the database: total allowed connections minus reserved for admin, replication and jobs, divided by the maximum number of pods the autoscaler can create. Keep per-pod pools small (single digits to low tens), cap HPA max replicas, or put a pooler in front. Measure with `DBStats.WaitCount` and database CPU.
 
 > [!question]- The migration you ran caused an outage even though it was "only adding a column". How?
-> `ALTER TABLE` needs a strong lock. If a long transaction held a conflicting lock, the ALTER waited, and every new query queued behind the waiting ALTER, filling all slots. Use `lock_timeout`, run migrations when no long transactions are open, and follow expand-and-contract patterns.
+> `ALTER TABLE` needs a strong lock. If a long transaction held a conflicting lock, the ALTER waited, and every new query queued behind the waiting ALTER, filling all slots. Use `lock_timeout`, run migrations when no long transactions are open, and follow expand-and-contract patterns (add the new shape first, move over, then remove the old).
 
 ## 10. Cheat sheet 🟢
 
@@ -645,15 +726,37 @@ Short-TTL caching of hot read endpoints can cut load by large factors quickly, a
 - [ ] Batch and interactive workloads separated (roles, pools, replicas).
 - [ ] Blameless review done, see [[Postmortems and Root Cause Analysis]].
 
-## 12. Links
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What are the two ways a database can "run out"?
+> It is busy (too much work, CPU or disk full) or full (no connection slots left).
+
+> [!question]- What does "idle in transaction" mean?
+> A session started a transaction and stopped, still holding its locks and its slot.
+
+> [!question]- Should you raise `max_connections` first?
+> No. Reduce demand first: pause jobs, end the worst sessions, shed load.
+
+🟡 Medium
+
+> [!question]- 400 queries/s, each holds a connection for 0.5 s. How many connections are in use?
+> 400 × 0.5 = 200, enough to fill a database with `max_connections = 200`.
+
+> [!question]- 20 pods × pool of 15. Database allows 200. Problem?
+> Yes: up to 300 connections could be requested. Shrink pools, cap pods, or add PgBouncer.
+
+> [!question]- Many sessions wait on `Lock`. What do you look for?
+> The root blocker: a session that blocks others but is not blocked itself, often idle in transaction.
+
+## Links
 
 - Method: [[Production Debugging Playbook]], [[Incident Response]], [[Postmortems and Root Cause Analysis]]
 - Database debugging: [[Debugging Database Performance]], [[Query Plans and EXPLAIN]], [[N+1 Query Problem]], [[Connection Pooling]], [[Locking - Optimistic vs Pessimistic]], [[Replication]], [[Zero-Downtime Schema Migrations]]
 - Sibling playbooks: [[Playbook - Error Rate Spike (5xx)]], [[Playbook - High Latency]], [[Playbook - Bad Deploy and Rollback]]
 - Resilience: [[Bulkheads and Concurrency Limits]], [[Circuit Breaker]], [[Load Shedding and Graceful Degradation]], [[Timeouts, Retries and Backoff]]
 - Go side: [[Database Access (database-sql, pgx, sqlc)]], [[Observability in Go Services]]
-
-## Links
 
 ### Watch on YouTube
 

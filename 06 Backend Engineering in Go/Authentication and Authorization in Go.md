@@ -30,7 +30,7 @@ This note is the Go implementation that sits behind those concepts: the middlewa
 
 ### Whiteboard version
 
-**In plain words:** this is the whole idea in 12 lines of code — a gatekeeper function that checks the caller before letting the real handler run.
+**In plain words:** this is the whole idea in 12 lines of code — a gatekeeper function that checks the caller before letting the real handler run. A **handler** is the function that does the real work for one URL; a **context key** is the label we use to store and find the caller on the request.
 
 The shape of every request that needs auth, before any of the hardening below:
 
@@ -56,6 +56,11 @@ Everything below is what `verify` and the context key actually need to be safe i
 > - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+> [!note] Before this note
+> - [[Building REST Endpoints]]: a handler is a Go function that gets one HTTP request and writes one response.
+> - [[Middleware]]: you can wrap a handler in another function that runs first and may stop the request early.
+> - [[Context Package]]: each request carries a `ctx` value that can hold small facts, like "who is calling", down to every function.
 
 **From zero, in 60 seconds** 🟢
 
@@ -100,6 +105,13 @@ A web service does the same for every request: first "who is this?", then "may t
 | `context.Context` | Go value that carries request data and deadlines through calls | The verified user ID rides on `ctx` |
 | RBAC | Role-based access control: permissions come from a role | `role=viewer` cannot edit invoices |
 
+| Principal | The checked caller: user ID, workspace ID and role | `Principal{UserID:"u_42", Role:"viewer"}` |
+| Bearer token | A token sent in the `Authorization` header; whoever holds it gets in | `Authorization: Bearer eyJhbGci...` |
+| Refresh token | A long-lived token used only to get a new short-lived access token | lives 30 days, swapped on every use |
+| TTL (time to live) | How long something stays valid | access token TTL = 10 minutes |
+| Claims | The facts written inside a JWT | `sub` (user), `exp` (expiry time) |
+| IDOR | A bug where changing an ID in the URL shows someone else's data | `/invoices/502` instead of `/invoices/501` |
+
 **Picture it**
 
 ```mermaid
@@ -127,24 +139,50 @@ Where it breaks: a JWT is more like a signed letter you carry around; the desk c
 
 ## 1. Why it exists 🟢
 
+🟢 **Plain version:** InvoiceOps keeps invoices for many companies in one app. Without a login check, the server cannot tell who is asking. With a login check but no permission check, a logged-in user from company A could type company B's invoice number and read it. Two other dangers shape the design: a stolen token that keeps working for hours, and a fake token that the server wrongly trusts. Short token lives and a strict signature check fix those.
+
 InvoiceOps has workspaces, each with its own invoices, and three roles: `owner`, `admin`, `viewer`. Without authentication, `GET /v1/invoices/{id}` cannot know who is asking. Without authorization, a correctly authenticated viewer in workspace A could pass workspace B's invoice ID and read it — an IDOR (insecure direct object reference) that authentication alone never catches, because the caller really is who they say they are.
 
 Two failure modes drive most of this note's design:
 
-- **A stolen access token.** If access tokens live for 24 hours and carry no revocation check, a token copied from a compromised laptop keeps working for up to 24 hours after the user logs out. Short-lived tokens (5–15 minutes) plus a refresh token shrink that window to the access-token TTL.
-- **A forged token.** `jwt-go`'s historical API let a caller pass `alg: none` or substitute an RSA public key as an HMAC secret (the RS256→HS256 confusion attack) if the verifier didn't pin the expected algorithm. golang-jwt v5's `WithValidMethods` closes this, but only if every call site uses it — a single unguarded `Parse` call anywhere in the service reopens the hole.
+- **A stolen access token.** If access tokens live for 24 hours and carry no revocation check (no way to cancel a token early), a token copied from a compromised laptop keeps working for up to 24 hours after the user logs out. Short-lived tokens (5–15 minutes) plus a refresh token shrink that window to the access-token TTL (its lifetime).
+- **A forged token.** `jwt-go`'s historical API let a caller pass `alg: none` or substitute an RSA public key as an HMAC secret (the RS256→HS256 confusion attack: the attacker tricks the server into checking a signature with the wrong kind of key; RS256 and HS256 are two ways to sign a token, and HMAC is a signature made with one shared secret) if the verifier didn't pin the expected algorithm. golang-jwt v5's `WithValidMethods` closes this, but only if every call site uses it — a single unguarded `Parse` call anywhere in the service reopens the hole.
+
+### A real-life example 🟢
+
+When you open Swiggy, the app sends your saved login token with every request. The server first checks the token is real and not expired: that is authentication. Then, when you open "My orders", it only returns orders where the user ID is yours, so you never see a stranger's address: that is authorization. If you change an order ID in the request by hand, the server still answers "not found", because the database query also filters by your user ID. This note builds exactly that pattern for InvoiceOps workspaces.
+
+### Authentication vs authorization 🟡
+
+| | Authentication | Authorization |
+| --- | --- | --- |
+| Question it answers | Who is calling? | What may they do? |
+| Runs | First, once per request | After authentication, per action and per row |
+| Fails with | 401 Unauthorized | 403 Forbidden (or 404 for another workspace's row) |
+| In this note | token or session check in `RequireAuth` | `RequireRole` plus `WHERE workspace_id = ...` |
 
 ## 2. Mental model 🟢
 
 Think of three layers, each answering a different question, run strictly in order:
 
-1. **Authentication ("who"):** read a credential (bearer token or session cookie), verify it, and produce a `Principal` — user ID, workspace ID, role — that nothing downstream can forge, because it only exists after a cryptographic or storage check passed.
+1. **Authentication ("who"):** read a credential (bearer token or session cookie), verify it, and produce a `Principal` (a small struct describing the checked caller) — user ID, workspace ID, role — that nothing downstream can forge, because it only exists after a cryptographic check (a signature check with math) or a storage lookup passed.
 2. **Authorization, coarse-grained ("what kind of action"):** does this `Principal`'s role allow this operation at all? A `viewer` never reaches `DELETE /v1/invoices/{id}`, regardless of whose invoice it is.
 3. **Authorization, object-level ("this specific row"):** even an `admin` only sees rows in their own workspace. This check cannot live in Go code reading a row and then deciding to reject it — by the time Go has the row, the database already did the work and may have leaked timing or row-count information. It belongs in the query itself: `WHERE workspace_id = $1 AND id = $2`.
 
 A `Principal` extracted once in middleware and threaded through `context.Context` means every layer below it operates on data it can trust, not on a header it re-parses.
 
 ## 3. How it works 🟡
+
+🟢 → 🟡 You now know the two checks: "who are you?" (401 if not proven) and "may you do this?" (403 if not). Next we open the box: how login hands out tokens, how each request is checked, and how an expired token is swapped for a new one.
+
+**Step by step:**
+1. Asha logs in with email and password. The server compares the password with the saved bcrypt hash.
+2. If it matches, the server gives her two tokens: an access token that lives 10 minutes and a refresh token that lives 30 days.
+3. Every API call sends the access token. Middleware checks its signature, issuer, audience and expiry, then puts `Principal{UserID, WorkspaceID, Role}` on the context.
+4. After 10 minutes the access token expires and the API answers 401. The app sends the refresh token to `/refresh`.
+5. The server finds the refresh token's hash in the database, deletes it, and gives back a brand-new pair. If an old, already-used refresh token shows up, the server cancels the whole chain of tokens (the "token family") and asks for a fresh login.
+
+The full detail, as a sequence diagram:
 
 ```mermaid
 sequenceDiagram
@@ -181,6 +219,13 @@ sequenceDiagram
 
 **In plain words:** picture airport security — one queue, several checkpoints in a fixed order, and you only board if you pass them all.
 
+**Step by step:**
+1. A request for `GET /v1/invoices` arrives. Is there an `Authorization: Bearer ...` header? No → 401.
+2. Parse the JWT, allowing only the one signing method we expect, and check `iss` (who issued it), `aud` (who it is for) and `exp` (expiry). Bad or expired → 401.
+3. Put the `Principal` on the context.
+4. Check the role: a `viewer` calling a delete route → 403.
+5. The handler runs, and its SQL query includes `WHERE workspace_id = <caller's workspace>`.
+
 ```mermaid
 flowchart LR
     R[Request] --> A{Authorization header<br/>present and well-formed?}
@@ -195,12 +240,14 @@ flowchart LR
 
 Two things only show up once this is code, not a diagram:
 
-- **The context key must be an unexported type**, never a bare string, so another package's `context.WithValue(ctx, "userID", ...)` cannot collide with or spoof this one.
+- **The context key must be an unexported type** (a type whose name starts with a lowercase letter, so other packages cannot use it), never a bare string, so another package's `context.WithValue(ctx, "userID", ...)` cannot collide with or spoof this one.
 - **401 vs 403 vs 404** encode different information to an attacker. No token or a bad token is 401. A valid caller whose role is wrong for the route is 403. A valid caller asking for another workspace's resource by ID should be 404, not 403 — 403 confirms the resource exists; 404 does not.
 
 ## 4. Worked example 🟡
 
-The full tested code (hashing, token issue/verify, and the middleware chain) is in the whiteboard section's companion module. Here is the piece most notes skip: the algorithm-confusion defence and its test.
+The full tested code (hashing, token issue/verify, and the middleware chain) is in the whiteboard section's companion module.
+
+**What this code does, in plain words:** `Verify` takes the raw token string, checks its signature using only HS256 (our one allowed method), checks who made it, who it is for and that it has not expired, and returns the user facts inside it. Any token that fails one check is rejected with an error. Here is the piece most notes skip: the algorithm-confusion defence and its test.
 
 ```go
 // Verify parses and validates raw, pinning the algorithm and checking
@@ -282,7 +329,9 @@ func TestRequireAuthAndRequireRole(t *testing.T) {
 
 **Measured:** built in a scratch module (`authdemo`, Go 1.24.4, golang-jwt/jwt/v5 v5.3.1, golang.org/x/crypto v0.42.0) and run with `go test -race`. All 8 test functions passed, including the alg-none forgery test, an expired-token test, a wrong-issuer test, and the full missing-token / wrong-role / valid-admin middleware chain above.
 
-bcrypt cost tuning is itself a measurement, not a guess:
+bcrypt cost tuning is itself a measurement, not a guess.
+
+**What this code does, in plain words:** it hashes one test password at three "cost" settings (10, 12, 14) and prints how long each took. A higher cost means a slower hash, which also slows down an attacker guessing passwords.
 
 ```go
 for _, cost := range []int{10, 12, 14} {
@@ -316,7 +365,17 @@ Full treatment of sessions, JWT internals, refresh-token theory and OAuth's flow
 - RBAC with two roles is adequate for InvoiceOps; a system with many fine-grained permissions (per-resource, per-action) usually needs a policy engine (e.g. OPA) instead of a role string, because an `if role == "admin"` ladder stops scaling past a handful of roles.
 - `http.CrossOriginProtection` (Go 1.25) and `SameSite` cookies solve CSRF for cookie-based auth; a bearer-token API that never sets cookies has no CSRF surface to defend in the first place — don't add CSRF tokens to a pure API client.
 
+### Common beginner mistakes 🟢
+
+- Saving passwords as plain text or with a fast hash like SHA-256 → one database leak exposes every password → use bcrypt or Argon2id, which are slow on purpose.
+- Calling `jwt.Parse` without `WithValidMethods` → a forged token with `alg: none` may pass → always pin the expected algorithm.
+- Checking only the role, not the workspace → a valid viewer can read another company's invoice by ID → put `workspace_id` in every query's `WHERE`.
+- Using a plain string like `"userID"` as the context key → another package can overwrite or fake it → use an unexported key type.
+- Giving access tokens a 24-hour life → a stolen token works all day → keep them at 5-15 minutes and use a refresh token.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now build the login, the middleware chain and the role check. The advanced part is about what attackers and real traffic do to that design: stolen refresh tokens, clock differences between servers, password guessing, and leaked signing keys.
 
 - **Real systems:** Auth0, AWS Cognito and Okta all implement this exact short-lived-access / rotated-refresh pattern behind a managed API; Stripe's dashboard uses session cookies for humans and API keys for server integrations — two different auth mechanisms for two different callers, not one mechanism stretched to fit both.
 - **Failure modes → fixes:**
@@ -372,6 +431,26 @@ Full treatment of sessions, JWT internals, refresh-token theory and OAuth's flow
 - 401 = no/bad credential, 403 = valid credential wrong role, 404 = valid credential but not your resource (don't leak existence).
 - Object-level authorization is enforced in the query (`WHERE workspace_id = $1`), not by trusting an ID from the URL.
 - Rate limit login per IP *and* per account; return identical errors and timing for "wrong password" and "unknown account".
+
+## Self-check 🟢🟡
+
+> [!question]- What is the difference between authentication and authorization?
+> Authentication proves who is calling; authorization decides what that caller may do.
+
+> [!question]- Why does the server store a bcrypt hash instead of the password?
+> A hash cannot be turned back into the password, so a leaked database does not leak passwords.
+
+> [!question]- Which status code means "no token or a bad token"?
+> 401 Unauthorized.
+
+> [!question]- Why must the JWT algorithm be pinned with `WithValidMethods`?
+> Otherwise a forged token can claim `alg: none` or a mixed-up algorithm and still pass the check.
+
+> [!question]- A viewer from workspace A asks for workspace B's invoice. What should the API return, and where is that enforced?
+> 404, enforced by `WHERE workspace_id = $1 AND id = $2` in the SQL query, so the row is never found.
+
+> [!question]- Why rotate the refresh token on every use?
+> Each token works once; if an old one is used again, someone copied it, so the whole token family is cancelled.
 
 ## Links 🟢
 - **Before this:** [[Building REST Endpoints]], [[Middleware]], [[Context Package]]

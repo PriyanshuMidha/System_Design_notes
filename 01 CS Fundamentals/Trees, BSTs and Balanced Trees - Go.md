@@ -22,12 +22,18 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
 > - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Trees, BSTs and Balanced Trees]]: the theory twin. Know the BST rule (smaller left, bigger right), the three delete cases, the four traversals, and what a rotation does.
+> - [[Arrays and Dynamic Arrays (Go Slices)]] and [[Stacks, Queues and Deques]]: `LevelOrder` uses a slice as a queue.
+
 **From zero** 🟢: this file is the hands-on side of [[Trees, BSTs and Balanced Trees]]. It builds a plain binary search tree in Go — insert, search, delete, traversals — plus the rotations that balanced trees are made of, with tests proving the BST rule survives every operation. Read each step's notes before the code.
 
 ## Before the code 🟢
 
 - **Pointer-linked structs** (`type Node struct { Left, Right *Node }`): each node points to its children; `nil` means "no child".
-- **Recursion** (`Insert`, `Delete`, `Height`, `InOrder`): each function handles one node and calls itself on a subtree.
+- **Recursion** (`Insert`, `Delete`, `Height`, `InOrder`): each function handles one node and calls itself on a subtree (a node plus everything below it).
+- **In-order successor**: the smallest key in a node's right subtree; used to replace a deleted node that has two children.
+- **Rotation**: lifting a child into its parent's place while keeping the BST order; the building block of balanced trees.
 - **Returning the new root** (`root = Insert(root, k)`): insert, delete and rotations may change which node is on top, so callers reassign.
 - **Function arguments** (`visit func(int)`): traversals call back into your code for each key instead of building a list.
 - **A slice as a queue** (`LevelOrder`): breadth-first traversal appends children to the back and reads from the front.
@@ -62,7 +68,11 @@ updated: 2026-11-13
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** what the BST code covers. **Next we read it:** six steps, from the node type to rotations.
+
 ### Step 1: the node and the BST invariant
+
+**What this code does, in plain words:** it defines a tree node (a key and two child pointers) and an `Insert` that walks left or right until it finds an empty spot for the new key.
 
 **Concept.** `Node` is the whole data structure: a key plus two child pointers. `Insert` is the simplest possible expression of the BST property from the theory note — recurse left if the new key is smaller, right if larger, and attach a new leaf the first time you hit a nil child. There is no balancing here at all; that is deliberate, since this step is meant to match the theory note's whiteboard version exactly before any complexity is added.
 
@@ -95,6 +105,8 @@ func Insert(n *Node, key int) *Node {
 
 ### Step 2: searching without recursion
 
+**What this code does, in plain words:** it walks down from the root, going left or right by comparing keys, and reports whether the key was found.
+
 **Concept.** `Search` implements the same left/right decision as `Insert`, but as an iterative loop rather than recursion, since a search never needs to build anything on the way back up — a direct illustration that recursion and iteration are interchangeable here, and iteration avoids any call-stack growth for a search-only traversal.
 
 ```go
@@ -120,6 +132,8 @@ func Search(n *Node, key int) bool {
 3. Falling off the loop (`n` became `nil`) means the key was never found, so the function returns `false` only in that one place, after the loop.
 
 ### Step 3: the three delete cases
+
+**What this code does, in plain words:** it finds the key, then removes a leaf, splices up a single child, or (with two children) copies in the successor's key and deletes the successor instead.
 
 **Concept.** `Delete` is the direct implementation of the theory note's three-case walkthrough: leaf (just remove), one child (splice it up), two children (replace with the in-order successor, then delete that successor). The helper `min` finds that successor by walking left from the right subtree until there's no more left — exactly the "smallest key in the right subtree" the theory note describes.
 
@@ -163,6 +177,8 @@ func Delete(n *Node, key int) *Node {
 
 ### Step 4: height, and why it proves the degenerate case
 
+**What this code does, in plain words:** it returns the number of levels below a node, so we can compare a balanced tree (height 2) with a chain (height 4).
+
 **Concept.** `Height` is a small, pure recursive function, but it is the measuring instrument the theory note's degenerate-case claim depends on: running it on a balanced 7-node tree versus a 5-node sorted-insert chain is what turns "an unbalanced BST can be as bad as a linked list" from an assertion into a number you can check.
 
 ```go
@@ -185,6 +201,8 @@ func Height(n *Node) int {
 3. This function makes no attempt to be efficient for repeated calls (it's `O(n)` per call, re-walking the whole subtree every time) — fine for a one-off measurement, but a production balanced tree instead caches height in each node and updates it incrementally on every rotation.
 
 ### Step 5: four traversals
+
+**What this code does, in plain words:** four ways to visit every node: in-order, pre-order, post-order (recursive) and level-order (row by row with a queue).
 
 **Concept.** These four functions are the direct Go translation of the theory note's traversal table: the same `visit` callback pattern, varied only in *when* it's called relative to the recursive descent into children.
 
@@ -247,6 +265,8 @@ func LevelOrder(root *Node, visit func(int)) {
 2. Each dequeued node's children are *enqueued*, not recursed into — this is what makes the traversal breadth-first (level by level) instead of depth-first: the queue always holds "everything at or past the current level," never diving ahead into one branch.
 
 ### Step 6: rotations — the primitive balanced trees are built from
+
+**What this code does, in plain words:** it lifts a child up into its parent's place and moves the parent down, without breaking the smaller-left / bigger-right order.
 
 **Concept.** `rotateLeft` and `rotateRight` are the single mechanical operation every self-balancing tree in the theory note (AVL, red-black) repeats to fix an imbalance. Neither function knows anything about balance factors or colors — rotation is purely a local pointer rearrangement that is guaranteed to preserve the BST property, which is exactly why it's safe for a balancing algorithm to call it without re-checking the whole tree afterward.
 
@@ -551,6 +571,8 @@ ok  	bst	1.461s
 
 Reading this output line by line: all four tests pass silently, meaning (in order) the three delete cases produce the correct sorted contents, `Height` reports `2` for the balanced tree and `4` for the degenerate chain exactly as the theory note's worked example claims, `Search` correctly distinguishes present from absent keys, and both rotation directions leave the tree's sorted order unchanged. `-race` reports no data races, as expected for single-goroutine, non-concurrent code — included here for consistency with this vault's other Go notes.
 
+> 🟡 → 🔴 **You now know** how each function works and what the tests prove. **Next comes the advanced part:** the extra walk in two-child delete, rotations that panic on a missing child, and the `queue[1:]` memory leak.
+
 ## Pitfalls in the code 🔴
 
 - `Delete`'s two-children case calls `min(n.Right)` and then recursively calls `Delete(n.Right, succ.Key)` — a second full traversal down to the successor. This is simple and correct but not maximally efficient; a version that returned the successor's node directly from the same walk that found it would save one traversal, at the cost of more complex code.
@@ -562,6 +584,30 @@ Reading this output line by line: all four tests pass silently, meaning (in orde
 1. **Change this, predict the result:** call `Delete` on a key that doesn't exist in the tree. Predict what `Delete` returns and whether it panics, then verify against the code — does the "not found" case need special handling, or does the existing logic already cover it correctly?
 2. **Change this, predict the result:** in `TestHeightDegenerateVsBalanced`, change the degenerate chain to insert `{5, 4, 3, 2, 1}` (descending instead of ascending) instead of `{1, 2, 3, 4, 5}`. Predict the resulting height before running it, and explain which child pointer (`Left` or `Right`) chains this time.
 3. **Extend it:** write a `IsValidBST(n *Node) bool` function using the inherited `(min, max)` range technique from the theory note's Deep dive, and a test that constructs a binary tree (not built via `Insert`) that looks locally sorted at every parent-child pair but is *not* a valid BST globally — proving why the naive "check immediate children only" approach is wrong.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why does `Insert` return a `*Node`?
+> The root may change (for example, inserting into an empty tree), so the caller reassigns it.
+
+> [!question]- What does `Height(nil)` return, and why?
+> -1, so a single leaf comes out as height 0.
+
+> [!question]- What happens when you insert a duplicate key?
+> Nothing; the tree is returned unchanged.
+
+🟡 Medium
+
+> [!question]- After deleting 20, 30 and 50 from the 7-node tree, what does in-order give?
+> `[40, 60, 70, 80]`.
+
+> [!question]- Why can't `LevelOrder` be written with the same recursion as the others?
+> Row-by-row order needs a queue; recursion naturally follows one branch deep, like a stack.
+
+> [!question]- How does the rotation test prove rotations are safe?
+> In-order output stays `[10, 20, 30, 40, 50]` after rotating left and back right.
 
 ## Links
 

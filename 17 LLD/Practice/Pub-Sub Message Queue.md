@@ -32,6 +32,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs) and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[LLD Interview Method]]: the step order these notes follow: clarify, entities, APIs, storage, code, edge cases.
+> - [[Observer and Event Bus]]: a sender announces an event and any number of listeners react, without knowing each other.
+> - [[Concurrency for LLD]]: goroutines, mutexes and channels; how to wait for something without burning CPU.
+
 **From zero, in 60 seconds** 🟢
 
 A publisher sends messages to a named channel called a **topic**. Many subscribers read from it, each at its own pace. The broker keeps each topic as a list that only grows, and every message gets a number, its **offset**. Each subscriber remembers which number it has finished. A subscriber must say "got it" (ack) for each message; if it does not, the message is sent again later. If the slowest reader falls too far behind, publishers are made to wait.
@@ -62,6 +67,10 @@ Everything else in this note is just these 3 questions:
 | At-least-once | Every message arrives, maybe more than once | Redelivered after a timeout |
 | Backpressure | Slowing the producer when buffers are full | `Publish` blocks |
 | Dead-letter list | Where a message goes after too many failures | #42 failed 5 times |
+| Committed offset | Everything below this number is done for this subscription | committed = 3: messages 0, 1, 2 acked |
+| Idempotent consumer | Handling the same message twice has the same effect as once | Charge only if order #42 is not already paid |
+| Lag | How far a subscription is behind the newest message | Topic end 100, committed 90: lag 10 |
+| Partition | One of several separate logs a topic is split into | `hash(key) % 4` picks partition 2 |
 
 **Picture it**
 
@@ -96,22 +105,22 @@ and acknowledge them. Unacknowledged messages must be redelivered. Messages with
 topic are delivered in publish order. Memory must stay bounded when a consumer is slow.
 ```
 
-- It tests separating storage (the log) from consumption state (offsets), delivery semantics, flow control and correct concurrency with blocking waits. Time box: 10 minutes for Steps 1-4, 10 for Steps 5-7, 30-35 for the code, 10 for edge cases and the partitioned version.
+- It tests separating storage (the log) from consumption state (offsets), delivery semantics (the promise: at most once, at least once, or exactly once), flow control (not letting a fast side drown a slow side) and correct concurrency with blocking waits. Time box: 10 minutes for Steps 1-4, 10 for Steps 5-7, 30-35 for the code, 10 for edge cases and the partitioned version.
 
 ### Solving path
 
 1. Clarify: push or pull, delivery guarantee, ordering scope, what happens to a message nobody subscribes to, how slow consumers are handled.
 2. Name the entities: `Message` (with offset), `topic` (log + base offset), `subscription` (committed, next, acked, in-flight, attempts), `Broker`.
 3. Write `Publish` (append under the lock) and `Poll` (hand out from `next` in order).
-4. Add `Ack` with out-of-order acks and the committed offset that advances only over a contiguous prefix.
+4. Add `Ack` with out-of-order acks and the committed offset that advances only over a contiguous prefix (an unbroken run from the start: 0, 1, 2 but not 0, 2).
 5. Add redelivery on ack timeout (rewind to committed), the dead-letter list, `MaxInFlight`, and the bounded buffer with a blocking `Publish`.
-6. Test fan-out, redelivery order, poison messages, both bounds, and 4 publishers with 2 consumers under `-race`.
+6. Test fan-out (one message to many subscriptions), redelivery order, poison messages (a message that crashes the consumer every time), both bounds, and 4 publishers with 2 consumers under `-race` (Go's race detector, which flags unsafe shared access).
 
 ## Step 1: Clarify requirements 🟢
 
 ### Questions to ask (with assumed answers)
 
-- Push or pull? *Assume: pull (`Poll`), plus a `Changed` channel so a consumer can wait without busy-looping. Pull makes flow control the consumer's choice.*
+- Push or pull? *Assume: pull (`Poll`), plus a `Changed` channel so a consumer can wait without busy-looping (asking "anything new?" in a tight loop and wasting CPU). Pull makes flow control the consumer's choice.*
 - Delivery guarantee? *Assume: at-least-once. A message is redelivered until acked; exactly-once is out of scope and needs idempotent consumers ([[Delivery Semantics and Exactly-Once]]).*
 - Ordering? *Assume: in publish order per topic, per subscription. No ordering across topics.*
 - Does a new subscription see old messages? *Assume: by default it starts at the end; `fromOldest` starts at the oldest message still retained.*
@@ -157,7 +166,7 @@ The hardest use case is **ack with redelivery while keeping order**: acks arrive
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
-| `Message` | Topic, Offset, Key, Payload, PublishedAt | Immutable once published; the offset is its identity within the topic |
+| `Message` | Topic, Offset, Key, Payload, PublishedAt | Immutable (never changed) once published; the offset is its identity within the topic |
 | `Delivery` | Message, Attempt | One hand-out to one subscription; the attempt number lets consumers spot redeliveries |
 | `topic` | base, log, subs, changed | The retained log (offsets `base` to `end-1`) and its subscriptions |
 | `subscription` | committed, next, acked, inflight, attempts, dead | One consumer group's cursor and bookkeeping |
@@ -167,6 +176,8 @@ The hardest use case is **ack with redelivery while keeping order**: acks arrive
 Modelling insight: **the message is stored once; consumption is just numbers**. A subscription is `committed` (everything below is done), `next` (the next offset to hand out), and the sets for the offsets in between. Fan-out to 10 subscriptions costs 10 cursors, not 10 copies. The topic can drop a message only when **every** subscription has committed past it.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know topics, subscriptions, offsets and acks, and that the message is stored once while each subscription is just numbers. Next we open the box: the message lifecycle, the API, a table layout, and the Go code for publish, poll and ack.
 
 ```mermaid
 classDiagram
@@ -243,7 +254,7 @@ POST /topics/{t}/subscriptions/{s}/acks     body: {offsets: [3, 4, 7]}      -> 2
 GET  /topics/{t}/subscriptions/{s}          -> 200 {committed, lag, inFlight, deadLetters}
 ```
 
-`waitMs` is long polling: the handler polls, and if nothing came back it waits on `Changed(topic)` or the timeout. The Go surface:
+`waitMs` is long polling (the server holds the request open until data arrives or time runs out): the handler polls, and if nothing came back it waits on `Changed(topic)` or the timeout. The Go surface:
 
 ```go
 type MessageQueue interface {
@@ -319,7 +330,7 @@ type CursorRepo interface {
 }
 ```
 
-Publish runs the `UPDATE topic_heads` and the `INSERT INTO messages` in one transaction. The per-topic row lock serialises publishers to one topic, which is the same trade the in-memory lock makes; partitions in Step 10 are how real systems lift it. The row-lock trade-offs are in [[Locking - Optimistic vs Pessimistic]].
+Publish runs the `UPDATE topic_heads` and the `INSERT INTO messages` in one transaction. The per-topic row lock (the database makes others wait on that row) serialises (lines up one by one) publishers to one topic, which is the same trade the in-memory lock makes; partitions in Step 10 are how real systems lift it. The row-lock trade-offs are in [[Locking - Optimistic vs Pessimistic]].
 
 ## Step 7: Patterns 🟡
 
@@ -1012,9 +1023,11 @@ func TestConcurrentPublishersAndConsumers(t *testing.T) {
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working broker and its tests. Next is interview depth: crashes before ack, out-of-order acks, poison messages, slow consumers, lost wake-ups, and how partitions scale it.
+
 | Edge case | What happens | How the design handles it |
 |---|---|---|
-| Consumer crashes after processing, before acking | The message comes back | At-least-once by design; the consumer dedupes by `(topic, offset)` or a business key |
+| Consumer crashes after processing, before acking | The message comes back | At-least-once by design; the consumer dedupes (drops repeats) by `(topic, offset)` or a business key |
 | Acks arrive out of order (3 before 1) | `committed` must not jump past 1 | `acked` set above `committed`; `advance` moves only over a contiguous prefix |
 | One delivery times out while later ones are healthy | Later ones are redelivered too | Go-back-N keeps order; the cost is duplicates and extra attempts (see Step 10) |
 | Poison message | Redelivered forever, blocks everything behind it | `MaxAttempts`, then the dead-letter list ([[Dead Letter Queues and Poison Messages]]) |
@@ -1044,7 +1057,7 @@ func TestConcurrentPublishersAndConsumers(t *testing.T) {
 | Several consumers sharing one subscription | Consumer group: assign partitions to members, one member per partition, rebalance on join or leave |
 | Selective redelivery | Redeliver only the expired offsets (as Google Pub/Sub does without ordering keys); faster, but order is lost |
 | Replay | Time-based retention independent of acks; a subscription can seek to an offset or a time |
-| Durability | Append to a segment file with fsync policy, or the tables in Step 6; replicate for availability |
+| Durability | Append to a segment file with fsync policy (`fsync` forces data from memory onto the disk), or the tables in Step 6; replicate for availability |
 | Push delivery | A goroutine per subscription that polls and calls a handler with a bounded worker pool, still acking |
 | Exactly-once processing | Not in the broker: idempotent consumers, or commit the offset in the same transaction as the side effect ([[Transactional Outbox and CDC]]) |
 
@@ -1099,7 +1112,7 @@ Redraw it from memory:
 > [!question]- How do acks that arrive out of order move the committed offset?
 > Acked offsets above `committed` go into a set. `committed` advances only while `acked[committed]` is true, so it moves over a contiguous prefix and never skips a message that is still in flight. In the test, acks for 0 and 2 move `committed` to 1, and after 1 is redelivered and acked it jumps to 3.
 
-> [!question]- Trap: the consumer acks a message, the broker records it, and the consumer crashes before its database write commits. Is that at-least-once?
+> [!question]- Trap: the consumer acks a message, the broker records it, and the consumer crashes before its database write commits (the side effect: the real-world change the message asked for). Is that at-least-once?
 > No, that message is lost: acking before the side effect is at-most-once. For at-least-once the consumer must ack after the side effect commits. Then a crash between the two causes a redelivery, so the consumer must be idempotent, for example a unique constraint on the message ID.
 
 > [!question]- How does redelivery keep per-topic order, and what does it cost?
@@ -1112,7 +1125,7 @@ Redraw it from memory:
 > A blocked publisher must honour `ctx.Done()`, and `Cond.Wait` cannot sit in a `select`. Closing a channel wakes every waiter at once (a broadcast), and replacing it under the lock arms the next round. Waiters take the channel before they release the lock or before `Poll`, so no wake-up is lost.
 
 > [!question]- How would you scale this to many consumers in one group and higher throughput?
-> Split each topic into partitions by `hash(key) % N`, each with its own log and lock. A consumer group assigns each partition to exactly one member and rebalances when members join or leave. Order then holds per key, throughput grows with partitions, and committed offsets become per (group, partition), as in Kafka.
+> Split each topic into partitions by `hash(key) % N`, each with its own log and lock. A consumer group assigns each partition to exactly one member and rebalances when members join or leave. Order then holds per key, throughput grows with partitions, and committed offsets become per (group, partition), as in Kafka (the widely used distributed log broker).
 
 ## Cheat sheet 🟢
 
@@ -1124,6 +1137,26 @@ Redraw it from memory:
 - Bounds: `BufferSize` per topic (slowest subscription), `MaxInFlight` per subscription; blocking `Publish` with `ctx`.
 - Wait with a closed-and-replaced `changed` channel, taken before `Poll`.
 - Scale with partitions by key and consumer groups; order becomes per key.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What is a topic and what is a subscription in this design?
+> A topic is a log of messages; a subscription is one reader's position (cursor) in that log.
+
+> [!question]- 🟢 Billing and email both subscribe to `orders`. How many copies of each message are stored?
+> One. Each subscription just keeps its own offsets.
+
+> [!question]- 🟢 What happens to a message that is never acked?
+> After `AckTimeout` it is handed out again; after `MaxAttempts` it moves to the dead-letter list.
+
+> [!question]- 🟡 Acks arrive for 0 and 2 but not 1. Where is `committed`?
+> At 1. It only moves over an unbroken run of acked offsets, so it waits for 1.
+
+> [!question]- 🟡 Why must a consumer ack after its database write, not before?
+> Acking first and then crashing loses the message (at-most-once); acking after means a crash only causes a redelivery.
+
+> [!question]- 🟡 Why a closed-and-replaced channel instead of `sync.Cond` to wait?
+> A blocked `Publish` must also stop on `ctx.Done()`, and `Cond.Wait` cannot be used inside a `select`; a channel can.
 
 ## Links 🟢
 

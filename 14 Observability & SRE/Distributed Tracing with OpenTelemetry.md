@@ -44,6 +44,10 @@ Three spans (`db.query`, `queue.publish`, and the worker's consume span) all car
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Observability Fundamentals]]: an app leaves three kinds of clues (logs, metrics, traces), and sampling keeps only some traces to save money.
+> - [[Structured Logging]]: every log line can carry a `trace_id` field, so you can jump from a trace to its log lines.
+
 **From zero, in 60 seconds** 🟢
 
 One click in an app can pass through 10 services. When it is slow, which one is to blame?
@@ -90,6 +94,12 @@ Tracing stamps the request with one ID and records every step, so you can see wh
 | Collector | A middle service that receives, filters and forwards spans | Drops 90% of healthy traces |
 | Sampling | Keeping only some traces to save cost | Keep 1 in 100 |
 | Cardinality | How many distinct values a label has | User IDs = millions |
+| Root span | The first, top span of a trace; it has no parent | `POST /pay`, 420 ms |
+| Waterfall | The trace drawn as stacked time bars, one per span | long bar = slow step |
+| Critical path | The chain of steps that actually decided the total time | API → `db.update_invoice` |
+| `traceparent` | The standard HTTP header that carries the trace ID and parent span ID | `00-4bf9...-00f0...-01` |
+| Span link | A "related to" pointer between spans that do not run inside each other | Kafka worker points back to the publisher |
+| Baggage | Small extra key-values that travel with the request to every service | `tenant.id=acme` |
 
 **Picture it**
 
@@ -118,11 +128,19 @@ Where it breaks: a parcel is scanned at every depot, but traces are usually samp
 
 ## 1. Why it exists 🟢
 
-A checkout request in a 12-service system times out. Logs show "timeout" in three different services, at three different timestamps, with no shared ID. Without a trace you grep five log streams trying to reconstruct the order of events by eyeballing timestamps that may themselves be skewed by clock drift.
+A checkout request in a 12-service system times out. Logs show "timeout" in three different services, at three different timestamps, with no shared ID. Without a trace you grep five log streams trying to reconstruct the order of events by eyeballing timestamps that may themselves be skewed by clock drift (each server's clock slowly running a little fast or slow).
 
-With tracing, one `trace_id` ties every span together, and the waterfall shows the request spent 180 ms in the API, 20 ms in a Redis lookup, then 3.4 s blocked on a single `db.query` span to Postgres — the actual bottleneck, found by sorting one view instead of correlating five.
+With tracing, one `trace_id` ties every span together, and the waterfall shows the request spent 180 ms in the API, 20 ms in a Redis lookup (Redis is a fast in-memory store), then 3.4 s blocked on a single `db.query` span to Postgres (the main database) — the actual bottleneck, found by sorting one view instead of correlating five.
 
 **Measured (synthetic, this note):** the `InvoiceOps` webhook example below produces one root span and four child spans for a single request; `go test` confirms the count.
+
+### Real-life example: a slow Zomato checkout 🟢
+
+Think of placing an order on Zomato.
+One tap on "Place order" may touch a cart service, a price service, a coupon service, a payment service and a restaurant service.
+If checkout suddenly takes 5 seconds, each team's own logs say "we look fine".
+A trace of one slow checkout shows all five steps as bars on one timeline, and the coupon check alone takes 4 seconds.
+Now one team knows the problem is theirs, in minutes instead of hours of meetings.
 
 ## 2. Mental model 🟢
 
@@ -137,11 +155,27 @@ Walking the tree from the root down and reading each span's `[start, start+durat
 
 **Analogy:** a trace is a call stack that survived a network hop. A normal stack trace shows which function called which, in one process. A distributed trace shows which service called which, with wall-clock durations, across as many processes as the request touched.
 
+## Common beginner mistakes 🟢
+
+- **Starting a goroutine with `context.Background()`** → the new span has no parent, so the trace breaks in two → pass the request's `ctx` into the goroutine.
+- **Putting a raw ID in the span name** (`GET /users/48213`) → millions of unique names swamp the tracing backend → name it by route (`GET /users/{id}`) and put the ID in an attribute only if needed.
+- **Keeping only 1% of traces, chosen at the start** → the rare slow request you need was probably thrown away → tail-sample in the Collector and always keep errors and slow traces.
+- **Forgetting to flush on shutdown** → the last batch of spans is lost when the service exits → call `TracerProvider.Shutdown` (or `ForceFlush`) before exit.
+- **Thinking traces replace logs** → many requests have no trace at all because of sampling → keep structured logs with the `trace_id` field too.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a trace is a tree of timed spans that share one trace ID. **Next we open the box**: what fields a span holds, how the trace ID hops between services in a header, how spans travel to the backend, and how to read the waterfall to find the slow part.
 
 ### Span anatomy and span kind
 
 **In plain words:** a span is one timed step: a name, start and end time, a parent, and some labels. "Kind" says if it is a server, a client, or a queue step.
+
+**Step by step:**
+1. The API receives `POST /pay`. It starts the root span: new trace ID `abc`, span ID `s1`, no parent, kind `SERVER`.
+2. The API calls the database. It starts span `s2` with parent `s1` and kind `CLIENT`, and adds an attribute `db.system=postgresql`.
+3. The database call fails. The code records the error and sets the span status to `Error`.
+4. Each span ends with a duration, say `s2` took 40 ms and `s1` took 300 ms.
 
 | Field | Meaning |
 | --- | --- |
@@ -157,6 +191,20 @@ Walking the tree from the root down and reading each span's `[start, start+durat
 
 **In plain words:** one HTTP header carries the trace ID and the parent span ID to the next service. That is the whole trick.
 
+**Step by step:**
+1. Service A is inside span `00f0...` of trace `4bf9...`. It calls service B.
+2. Before sending, A writes the header `traceparent: 00-4bf9...-00f0...-01`.
+3. B reads the header. Its new span gets the same trace ID, and its parent is `00f0...`.
+4. The same string can ride in gRPC metadata (gRPC is a fast service-to-service call system) or a Kafka message header.
+5. For queue work that runs later, the worker makes a **link** back to the publisher's span instead of a parent.
+
+```mermaid
+flowchart LR
+    P["API: publish span"] -- "message + traceparent" --> K["Kafka queue"]
+    K --> W["Worker: consume span"]
+    W -. "span link (runs later)" .-> P
+```
+
 OTel's default propagator is the **W3C Trace Context** format:
 
 ```text
@@ -170,11 +218,18 @@ Every outbound call (HTTP header, gRPC metadata, or a Kafka message header) carr
 
 **Baggage** (the `baggage` header) carries arbitrary key/value context the same way — for example a `tenant.id` to tag every downstream span — but baggage is not telemetry; it must be kept small since it travels on every request.
 
-For asynchronous work (a Kafka consumer, a cron-triggered job), the consumer does not share a timeline with the producer, so OTel uses a **span link** instead of a parent/child edge: the consumer's span links back to the producer's span ID, and tracing UIs draw it as a cross-reference rather than claiming the consumer "contains" the producer's wait time.
+For asynchronous work (a Kafka consumer, a cron-triggered job, meaning one started by a timer), the consumer does not share a timeline with the producer, so OTel uses a **span link** instead of a parent/child edge: the consumer's span links back to the producer's span ID, and tracing UIs draw it as a cross-reference rather than claiming the consumer "contains" the producer's wait time.
 
 ### The pipeline: SDK, Collector, backend
 
 **In plain words:** your code makes spans with the SDK, a collector gathers and filters them, and a backend stores and shows them.
+
+**Step by step:**
+1. Your code calls the OTel API: `tracer.Start(ctx, "db.update_invoice")`.
+2. The SDK (the engine you set up once at startup, called the **TracerProvider**) decides whether to record it, using its **Sampler**.
+3. Finished spans are grouped into batches and sent by an **exporter** over **OTLP** (OpenTelemetry's wire format) to the Collector.
+4. The Collector batches, hides personal data, and keeps all error and slow traces plus a small share of the rest.
+5. It sends them to Tempo or Jaeger, and Grafana draws the waterfall.
 
 ```mermaid
 flowchart LR
@@ -201,6 +256,12 @@ flowchart LR
 
 **In plain words:** bars stacked by time. Long bars are slow steps; gaps between bars are time spent waiting somewhere you didn't measure.
 
+**Step by step:**
+1. Look at the top bar, the root span: `POST /webhooks/razorpay` took 420 ms.
+2. Find which child bars fill most of it: `db.update_invoice` took 320 ms. That is the critical path.
+3. Look for gaps where no child bar runs. That time was spent on something with no span.
+4. Look for the same short bar repeated many times, like `db.query` ×40. That is a loop calling the database once per item.
+
 ```mermaid
 gantt
     title POST /payments/webhooks/razorpay (critical path in bold via color)
@@ -215,9 +276,9 @@ gantt
     queue.publish_invoice_status :a5, 390, 30
 ```
 
-The root span (420 ms) is explained almost entirely by `db.update_invoice` (320 ms): that is the critical path. A gap between the end of one span and the start of the next (not shown here) that isn't covered by any child span means time the parent spent on something unsampled — often a GC pause, a lock wait, or a connection-pool queue.
+The root span (420 ms) is explained almost entirely by `db.update_invoice` (320 ms): that is the critical path. A gap between the end of one span and the start of the next (not shown here) that isn't covered by any child span means time the parent spent on something unsampled — often a GC pause (Go's garbage collector briefly slowing the program), a lock wait, or a connection-pool queue (waiting for a free database connection).
 
-Repeated, near-identical child spans (`db.query` ×40) is the N+1 pattern: look for a loop calling the database once per item instead of batching.
+Repeated, near-identical child spans (`db.query` ×40) is the N+1 pattern (1 query for a list, then 1 more query per item in it): look for a loop calling the database once per item instead of batching.
 
 ## 4. Worked example 🟡
 
@@ -226,6 +287,8 @@ Repeated, near-identical child spans (`db.query` ×40) is the N+1 pattern: look 
 The full version below builds InvoiceOps's real webhook span tree (`verify_signature → db.check_webhook_event → db.update_invoice → queue.publish_invoice_status`, kept from the old Go OpenTelemetry Metrics Tracing note) with a real `TracerProvider`, context threading, error recording, and a span exported in-memory for the test to assert on.
 
 It compiles and passes `go vet` and `go test -race` on Go 1.24.4 with `go.opentelemetry.io/otel` v1.31.0.
+
+**What this code does, in plain words:** `NewProvider` sets up the tracing engine and says "keep every trace". `HandleWebhook` starts one root span for the whole webhook, then calls four helper steps. Each helper starts its own child span from the same `ctx`, so all four hang under the root. When a step fails, the root span records the error and is marked `Error`.
 
 ```go
 // Package tracing shows the shape of an OpenTelemetry-instrumented request
@@ -398,30 +461,41 @@ Full logging and metrics instrumentation for a Go service — `log/slog` setup, 
 | Tail sampling (Collector) | Buffer the whole trace briefly, decide after it finishes | You must keep every error and p99 trace | More Collector memory; added latency before export |
 | Logs with correlation IDs only (no tracing) | `trace_id` in log lines, reconstructed by grep across services | Very small systems, 1–2 services | No automatic waterfall; manual correlation |
 
+### Tracing vs logs vs profiling 🟡
+
+| | Tracing | Logs | Profiling |
+| --- | --- | --- | --- |
+| Answers | Which service or step was slow for this request? | What exactly happened in this event? | Which line of code uses the CPU or memory? |
+| Scope | One request, across many services | One event, in one service | One process, across all requests |
+| Kept | A sample of requests | Usually most lines | Short samples, often always-on |
+
 ## 6. Trade-offs and when not to use 🟡
 
-- Tracing adds a header to propagate and a span to create on every call; in a single-process monolith, a request-scoped structured logger with a request ID gives most of the same debugging value for much less machinery.
-- 100% sampling at high QPS is expensive to store; most of what you keep is traces that look exactly like every other trace. Tail sampling earns its complexity once traffic is high enough that 100% sampling isn't affordable.
+- Tracing adds a header to propagate and a span to create on every call; in a single-process monolith (one app that does everything in one program), a request-scoped structured logger with a request ID gives most of the same debugging value for much less machinery.
+- 100% sampling at high QPS (queries per second) is expensive to store; most of what you keep is traces that look exactly like every other trace. Tail sampling earns its complexity once traffic is high enough that 100% sampling isn't affordable.
 - A trace shows one request's path, not aggregate behavior. "Is p99 latency trending up this week?" is a metrics question (see [[Metrics and Prometheus]]), not a tracing one — traces are for "why was *this* request slow," metrics are for "is the service healthy."
 - Spans with unbounded attributes (a raw user ID, a full URL with query string) blow up the tracing backend's storage and indexing the same way an unbounded metric label blows up a time-series database.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** span fields, how `traceparent` carries the trace across services and queues, the SDK → Collector → backend path, and how to read a waterfall. **Next is the advanced part**: what breaks in real fleets (broken traces, lost spans, clock skew), what to monitor on the Collector, and the deeper details interviewers probe.
+
 
 - **Real systems:** Jaeger (CNCF, originally Uber) and Grafana Tempo are the two common open-source trace backends behind an OTel Collector; Honeycomb and Datadog APM accept OTLP directly. Google's Dapper paper (2010) and Twitter's Zipkin predate OTel and established the trace/span/propagation model OTel standardized.
 - **Failure modes → fixes:**
   - Broken trace (a span with no parent appears as its own root) → a hop didn't propagate `traceparent` — check for a goroutine started with `context.Background()` instead of the request's `ctx`, or a queue client that didn't forward headers.
   - Missing spans for the slow path → head sampling dropped the trace before anyone knew it would be slow; switch to tail sampling on error/latency.
   - PII in attributes (an email in `user.email`) → add a Collector attribute-processor redaction rule and fix the call site.
-  - Clock skew between hosts makes a child span appear to start before its parent → fix NTP; most backends also clamp this visually but it signals a real infrastructure problem.
+  - Clock skew between hosts makes a child span appear to start before its parent → fix NTP (the network time protocol that keeps server clocks in sync); most backends also clamp this visually but it signals a real infrastructure problem.
 - **What to monitor:** Collector queue length and dropped-span count (`otelcol_processor_dropped_spans`), export error rate, sampling rate actually achieved vs configured, and span count per trace (a sudden jump often means a new N+1).
 
 ## 8. Deep dive 🔴
 
-- **Span metrics without tail sampling.** The Collector's `spanmetrics` connector derives RED metrics (rate, errors, duration histogram) from every span before sampling drops it, so you keep accurate latency percentiles even at 1% trace sampling — metrics and traces are sampled independently.
+- **Span metrics without tail sampling.** The Collector's `spanmetrics` connector (a Collector part that turns spans into metrics) derives RED metrics (rate, errors, duration histogram) from every span before sampling drops it, so you keep accurate latency percentiles even at 1% trace sampling — metrics and traces are sampled independently.
 - **Context propagation pitfalls in Go.** A goroutine spawned with `go worker(ctx)` carries the span correctly only if `ctx` (not a fresh `context.Background()`) is passed in; a very common bug is firing a background goroutine from inside an HTTP handler after the handler's span already ended, orphaning the child span's parent.
 - **Exemplars.** A Prometheus histogram bucket can carry an **exemplar**: one sampled trace ID for a request that landed in that bucket. Grafana renders this as a small dot on the latency graph you can click straight into the matching trace — the mechanical link between [[Metrics and Prometheus]] and this note.
 - **Baggage vs attributes.** Baggage travels with the request on the wire (so every downstream service can read it) and must be explicitly copied onto spans as attributes if you want it indexed; it is not free telemetry and a large baggage value inflates every hop's request size.
-- **Why 128-bit trace IDs.** At 128 bits, the birthday-bound collision probability across even an extremely high-traffic system over years is negligible, which matters because a collision would silently merge two unrelated requests into one trace.
+- **Why 128-bit trace IDs.** At 128 bits, the birthday-bound collision probability (the chance that any two of many random IDs happen to match) across even an extremely high-traffic system over years is negligible, which matters because a collision would silently merge two unrelated requests into one trace.
 
 ## 9. Interview questions 🔴
 
@@ -453,6 +527,30 @@ Full logging and metrics instrumentation for a Go service — `log/slog` setup, 
 - Exemplars connect a metric's histogram bucket to one representative trace.
 - Never put a raw ID, email, or full URL in a span name or attribute — same cardinality rule as metric labels.
 - `TracerProvider.Shutdown`/`ForceFlush` on exit is what actually exports the last batch; skipping it silently drops spans.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is a span?
+> One timed step inside a trace, with a name, a start, a duration and a parent.
+
+> [!question]- What do all spans of one request share?
+> The same trace ID.
+
+> [!question]- Which header carries the trace from one service to the next?
+> `traceparent`, the W3C Trace Context header.
+
+🟡 Medium
+
+> [!question]- Why does a Kafka worker use a span link instead of a parent?
+> It runs later, on its own timeline, so it is "related to" the publisher, not "inside" it.
+
+> [!question]- Head or tail sampling to keep every error trace?
+> Tail sampling in the Collector, because it decides after it has seen the whole trace.
+
+> [!question]- A trace splits into two separate traces after a goroutine. Likely cause?
+> The goroutine was started with `context.Background()` instead of the request's `ctx`.
 
 ## Links
 

@@ -27,6 +27,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Walk through Code steps 1-4; each has an "In plain words" line and a step-by-step explanation.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Tests, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[SQL Essentials]]: a query like `WHERE workspace_id = 42 AND status = 'overdue'` filters rows by column values.
+> - The theory twin [[Indexing Fundamentals]] explains B-trees, fan-out and the leftmost-prefix rule in plain words; read its sections 1-3 first.
+
 **From zero, in 60 seconds** 🟢
 
 This file teaches one idea with runnable Go code: a database index is just a sorted list, and sorted order is why some lookups are fast and others are not. It builds a fake index of 10,000 entries as a sorted Go slice, then runs two searches. The one that matches the sort order (workspace then status) touches 26 entries; the one that does not (status alone) must touch all 10,000. It also has a tiny function that computes how tall a real B-tree is. Read the theory note first, then follow the code top to bottom; every block is explained right after it.
@@ -35,10 +39,10 @@ This file teaches one idea with runnable Go code: a database index is just a sor
 
 - **Structs with several fields** (`Entry`): one index entry holding `workspace_id`, `status`, `due_date` and the row id.
 - **A three-way compare function** (`compare(a, b) int`): returns negative, zero or positive, the same contract `slices.SortFunc` uses.
-- **Sorted slices plus binary search** (`sort.Search`): the slice plays the leaf level of a B+tree.
+- **Sorted slices plus binary search** (`sort.Search`, which finds a spot in a sorted list by halving it each step): the slice plays the leaf level (the bottom row of pages, where every key lives) of a B+tree.
 - **Multiple return values** (`ids, examined`): each search also reports how many entries it looked at, to make the cost visible.
 - **Integer loops** (`Height`): repeated division by the fan-out gives the tree height.
-- **What to run:** `go vet ./... && go test -race -v ./...` inside the module.
+- **What to run:** `go vet ./... && go test -race -v ./...` inside the module (`-race` turns on Go's race detector, which flags unsafe use of shared data).
 
 ## What this code shows 🟢
 
@@ -76,6 +80,8 @@ idx/
 - Run: `go vet ./... && go test -race -v ./...`
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** the lesson: sorted order makes some searches tiny and others full scans. **Next we open the code**: the entry and its sort rule, the two-binary-search seek, the full scan, and the tree-height loop, each with a line-by-line walk.
 
 ### Step 1: the index entry and the sorted slice
 
@@ -185,7 +191,7 @@ func (c *Composite) SeekPrefix(ws int64, st string) (ids []int64, examined int) 
 2. `key` compares an entry to the target on the first two columns only. It returns negative, zero or positive: the entry sorts before, within, or after the prefix.
 3. `lo` is the first index where `key >= 0`, the start of the run.
 4. `hi` is the first index where `key > 0`, one past the end of the run.
-5. `sort.Search` does a binary search and needs a monotonic predicate (false, false, ..., true, true). Here it is monotonic because the slice is sorted by those same leading columns.
+5. `sort.Search` does a binary search and needs a monotonic predicate (a yes/no test whose answers never flip back: false, false, ..., true, true). Here it is monotonic because the slice is sorted by those same leading columns.
 6. `c.entries[lo:hi]` is the run, taken as a slice with no copying; the loop collects the row ids.
 
 ```mermaid
@@ -269,6 +275,8 @@ flowchart LR
 ```
 
 ## Design decisions 🔴
+
+> 🟡 → 🔴 **You now know** how each function works and why the seek touches 26 entries while the scan touches 10,000. **Next comes the review view**: the design choices, the exact-count tests, and the places where this model differs from a real B-tree.
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -573,6 +581,30 @@ The leftmost-prefix lookup examined **26 of 10,000** entries; the status-only qu
 1. Change `SeekPrefix` so it also takes a due-date lower bound and seeks on all three columns. Predict how many entries it examines compared with the two-column version, then run it.
 2. Change `compare` to sort by `(status, workspace_id, due_date, row_id)` but leave `SeekPrefix` unchanged. Predict whether `SeekPrefix(42, "overdue")` still returns 25 rows, and why `sort.Search` needs its predicate to be monotonic.
 3. Call `Height(100_000_000, 100)` and `Height(100_000_000, 50)`. Predict both before running, then explain why a wide key (low fan-out) costs extra levels.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does the sorted slice stand for?
+> The leaf level of a composite B-tree index on `(workspace_id, status, due_date)`.
+
+> [!question]- How many entries does `SeekPrefix(42, "overdue")` examine, and how many does `ScanStatus("overdue")` examine?
+> About 26 versus all 10,000.
+
+> [!question]- What does `Height(100_000_000, 300)` return?
+> 4, because 300^3 = 27 million is too small and 300^4 covers it.
+
+🟡 Medium
+
+> [!question]- Why does `SeekPrefix` need two binary searches?
+> One finds the first entry of the `(42, overdue)` run and the other finds the first entry after it.
+
+> [!question]- If `compare` sorted by status first but `SeekPrefix` stayed the same, why could results be wrong?
+> `sort.Search` needs the slice sorted by the same columns as its test; otherwise the yes/no answers are not monotonic and it lands in the wrong place.
+
+> [!question]- Why does `Height` use an integer loop instead of `math.Log`?
+> Floating-point logs can be off by one exactly at powers of the fan-out, such as 90,000 at fan-out 300.
 
 ## Links
 

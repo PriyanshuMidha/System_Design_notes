@@ -29,11 +29,14 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - Nothing. This note starts from zero. It helps if you know that a website runs on a computer somewhere that answers requests, but even that is explained below.
+
 **From zero, in 60 seconds** 🟢
 
 Running a website needs computers that are always on. Buying them is slow and costly.
 **Cloud computing** means renting those computers (and storage, and databases) from a company like AWS, over the internet.
-You click or call an API, and a server is ready in a minute. You pay for what you use, like an electricity bill.
+You click a button or call an API (send a request from your code to the provider's web interface), and a server is ready in a minute. You pay for what you use, like an electricity bill.
 
 ```mermaid
 flowchart LR
@@ -71,6 +74,11 @@ Cloud computing lets the shop rent extra computers for that day and hand them ba
 | Region | A geographic area where a provider runs data centers | `ap-south-1` (Mumbai) |
 | Availability Zone (AZ) | A separate data center (or group) inside a region | `ap-south-1a` |
 | Managed service | Something the provider runs and patches for you | RDS instead of Postgres you install yourself |
+| IaaS / PaaS / FaaS / SaaS | How much you rent: a bare machine, a ready platform, a single function, or a finished app | EC2 / App Runner / Lambda / Gmail |
+| Shared responsibility | The split of security work: the provider guards the building and hardware, you guard what you put inside | AWS patches the host, you patch your VM's OS |
+| Elasticity | Capacity grows and shrinks on its own as traffic changes | 2 servers at night, 20 during a sale |
+| Egress | Data leaving the provider's network to the internet, billed per GB | Users downloading 1 TB of videos from your app |
+| On-demand / Reserved / Spot | Three ways to pay: by the hour, cheaper for a 1-3 year promise, or very cheap but can be taken back | Spot for a nightly batch job |
 
 **Picture it**
 
@@ -97,7 +105,7 @@ Where it breaks: with a rented car you never share the engine with strangers; in
 
 ## 1. Why it exists 🟢
 
-Before cloud computing, running a web service meant buying physical servers, racking them in a data center you leased, wiring networking and power, and provisioning for your busiest day of the year year-round.
+Before cloud computing, running a web service meant buying physical servers, racking them (bolting them into metal shelves) in a data center you leased, wiring networking and power, and provisioning for your busiest day of the year year-round.
 
 A retailer sizing for a Black Friday spike at 10× normal traffic had to buy that capacity permanently and let it idle the other 364 days, or under-provision and fall over.
 
@@ -105,11 +113,26 @@ Cloud computing turns that capital purchase into a rental. [NIST SP 800-145] def
 
 - **On-demand self-service:** you provision a server or a database from an API or console, without calling a salesperson.
 - **Broad network access:** everything is reachable over standard network protocols, from laptops to phones.
-- **Resource pooling:** the provider's physical hardware is shared across many customers using virtualization, assigned and reassigned by demand.
+- **Resource pooling:** the provider's physical hardware is shared across many customers using virtualization (software that splits one physical computer into many pretend ones), assigned and reassigned by demand.
 - **Rapid elasticity:** capacity can scale out in minutes and back down just as fast, so it feels unlimited to the consumer.
 - **Measured service:** usage is metered (CPU-hours, GB stored, requests served), so both sides can see exactly what was consumed.
 
 Concretely: that retailer runs 10 servers year-round on AWS and asks for 90 more an hour before the Black Friday spike, then releases them the next morning. They pay for 90 extra servers for about 18 hours, not 365 days.
+
+```mermaid
+flowchart LR
+    N["Normal days:<br/>10 servers"] --> S["Sale day: rent 90 more<br/>for about 18 hours"]
+    S --> B["Next morning: hand 90 back"]
+    B --> P["Bill: 100 servers for 18 h,<br/>10 servers the rest of the year"]
+```
+
+### Real-life example: a big ticket sale 🟢
+
+Think of the minute tickets open for a huge concert on BookMyShow.
+For about an hour, many times more people hit the app than on a normal evening.
+If the company owned only enough servers for normal evenings, the app would freeze right when people want it most.
+With the cloud, the team adds extra servers before the sale opens and gives them back once the rush ends.
+They pay for that extra capacity for a few hours, not for the whole year.
 
 ## 2. Mental model 🟢
 
@@ -122,9 +145,26 @@ Think of it as renting serviced apartments instead of buying a house:
 
 Across all four, the building (power, physical security, networking backbone) is the provider's job. How much of the inside is your job shrinks as you move from IaaS toward SaaS — and so does how much you can customize.
 
+## Common beginner mistakes 🟢
+
+- **Thinking the cloud is always cheaper** → a server left running all month costs the same whether anyone uses it or not → turn off what you do not use, and set a budget alarm on day one.
+- **Thinking the provider secures everything** → AWS guards the building, but an open storage bucket or an unpatched VM is your fault → learn the shared-responsibility line for each service you use.
+- **Putting everything in one AZ** → one data center losing power takes your whole app down → run at least 2 copies in 2 different AZs.
+- **Confusing a region with an AZ** → a region is a whole city area, an AZ is one site inside it → spread across AZs for everyday safety, and across regions only for rare disaster cases.
+- **Forgetting data transfer costs** → moving data out to the internet or between AZs is billed per GB → keep chatty services in the same AZ and watch the "data transfer" line on the bill.
+
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** what cloud computing is, why renting beats buying for spiky traffic, and the apartment-to-hotel ladder of IaaS, PaaS, FaaS and SaaS. **Next we open the box**: who exactly is in charge of which layer, and how the provider's buildings are laid out on the map so one fire does not take you down.
+
 **In plain words:** the cloud is layers. The provider owns the bottom (buildings, hardware); the higher the service you rent, the more of the stack they run for you.
+
+**Step by step (who looks after what):**
+1. You rent one EC2 virtual machine in Mumbai to run your Go API.
+2. AWS looks after the building, power, the physical server and the hypervisor (the software layer that splits that server into many VMs).
+3. You look after everything inside your VM: the guest OS (the operating system running inside your VM, such as Ubuntu), its security patches, your app and your data.
+4. Now swap the VM for RDS, a managed database. AWS also patches the database's OS and engine, so your list shrinks to tables, queries and who may log in.
+5. Rule of thumb: the more "finished" the thing you rent, the shorter your to-do list, and the fewer knobs you can turn.
 
 ```mermaid
 flowchart TB
@@ -155,6 +195,13 @@ The line moving is the whole point of the shared-responsibility model: AWS is ex
 
 **Regions and Availability Zones**, concretely:
 
+**Step by step (where the servers live):**
+1. AWS picks a city area, say Mumbai, and calls it a region: `ap-south-1`.
+2. Inside it, it builds 3 separate sites, each with its own power and cooling: the AZs `ap-south-1a`, `1b` and `1c`.
+3. Fast private cables link the 3 AZs, so copying data between them takes about a millisecond.
+4. You run 2 copies of your app, one in `1a` and one in `1b`. A fire in `1a` leaves `1b` serving users.
+5. Another region, such as Singapore, is fully separate. Your data goes there only if you copy it on purpose.
+
 ```mermaid
 flowchart LR
     subgraph regionA["Region: ap-south-1 (Mumbai)"]
@@ -178,19 +225,19 @@ flowchart LR
 
 - A **region** is an independent geographic area (e.g., `ap-south-1` for Mumbai). Nothing about a region's infrastructure or data is shared with another region unless you explicitly replicate.
 - An **Availability Zone (AZ)** is one or more discrete data centers with their own power and cooling, connected to the other AZs in the region by low-latency private links. AWS `ap-south-1` has 3 AZs as of 2026.
-- Designing for "an AZ can disappear" means running at least 2 (ideally 3) AZs for anything stateful: an RDS Multi-AZ deployment keeps a synchronously replicated standby in a second AZ and fails over automatically, typically within one to two minutes (AWS pricing/documentation figure, varies by engine and transaction load), if the primary's AZ goes down.
-- **Edge locations** are a separate, much larger network of points of presence used by CDNs (CloudFront) to cache content close to end users; they are not where your compute runs.
+- Designing for "an AZ can disappear" means running at least 2 (ideally 3) AZs for anything stateful: an RDS Multi-AZ deployment keeps a synchronously replicated standby (a spare copy of the database that receives every write before the write is confirmed) in a second AZ and fails over (switches traffic to that spare) automatically, typically within one to two minutes (AWS pricing/documentation figure, varies by engine and transaction load), if the primary's AZ goes down.
+- **Edge locations** are a separate, much larger network of points of presence used by CDNs (content delivery networks: servers spread across many cities that keep copies of images and videos near users; AWS's is CloudFront) to cache content close to end users; they are not where your compute runs.
 
 ## 4. Worked example 🟡
 
 ### Whiteboard version
 
-A team choosing between renting 3 fixed EC2 instances versus using on-demand Fargate tasks that scale with traffic:
+A team choosing between renting 3 fixed EC2 instances versus using on-demand Fargate tasks (AWS runs your container for you and bills by the second; a "task" is one running copy) that scale with traffic:
 
 | Approach | Cost model | What happens at 3am when traffic is near zero |
 | --- | --- | --- |
 | 3 fixed EC2 instances, always on | Pay for 3 instances × 730 hours/month, regardless of load | All 3 instances idle, same cost as peak |
-| Fargate service, autoscaled 1–10 tasks | Pay per vCPU-second and GB-second actually used | Scales down to 1 task; cost drops to near the floor |
+| Fargate service, autoscaled 1–10 tasks | Pay per vCPU-second (one virtual CPU used for one second) and GB-second (1 GB of memory held for one second) actually used | Scales down to 1 task; cost drops to near the floor |
 
 ### Deep dive: picking a pricing model
 
@@ -210,10 +257,18 @@ This mirrors **CapEx vs OpEx**: buying your own data center is capital expenditu
 
 **In plain words:** the bills that surprise people are usually small hourly items left running, or data moving out of the cloud.
 
-- **NAT Gateway hourly + per-GB charges**: a NAT Gateway in each AZ, left running for a service that barely uses outbound internet, bills 24/7 regardless of traffic — a common surprise line on a monthly AWS bill.
-- **Cross-AZ and egress data transfer**: traffic that crosses an AZ boundary, or leaves AWS to the internet, is billed per GB; traffic stored and served from inside one AZ generally is not.
+- **NAT Gateway hourly + per-GB charges**: a NAT Gateway (an AWS box that lets private servers reach the internet without being reachable from it) in each AZ, left running for a service that barely uses outbound internet, bills 24/7 regardless of traffic — a common surprise line on a monthly AWS bill.
+- **Cross-AZ and egress data transfer** (egress = data leaving AWS for the internet): traffic that crosses an AZ boundary, or leaves AWS to the internet, is billed per GB; traffic stored and served from inside one AZ generally is not.
 - **Idle reserved capacity**: committing to Reserved Instances sized for a traffic forecast that doesn't materialize locks in a cost without the matching usage.
-- **Unmonitored managed-service tiers**: provisioned-capacity services (e.g., a sized RDS instance) keep billing at the provisioned size even when actual load barely uses it, unlike serverless variants that scale to zero.
+- **Unmonitored managed-service tiers**: provisioned-capacity services (you pick a fixed size up front, e.g., a sized RDS instance) keep billing at the provisioned size even when actual load barely uses it, unlike serverless variants (versions where AWS adds and removes capacity for you) that scale to zero.
+
+```mermaid
+flowchart TD
+    Q{"Can the job be stopped<br/>and restarted safely?"} -- "yes" --> SP["Spot: up to ~90% off"]
+    Q -- "no" --> Q2{"Will it run all day,<br/>every day, for a year?"}
+    Q2 -- "yes" --> RI["Reserved / Savings Plan"]
+    Q2 -- "no or unsure" --> OD["On-demand"]
+```
 
 ## 5. Variants and comparison 🟡
 
@@ -231,25 +286,38 @@ This mirrors **CapEx vs OpEx**: buying your own data center is capital expenditu
 | Hybrid cloud | Some workloads on-prem, some in public cloud, connected | Gradual migration, or keeping latency-sensitive/legacy systems on-prem |
 | Multi-cloud | Workloads spread across more than one public cloud provider | Avoiding vendor lock-in, or using a best-of-breed service elsewhere; costs more in operational complexity |
 
+### Cloud vs your own data center (on-prem): the comparison people get wrong 🟡
+
+| Question | Cloud | Own data center (on-prem: servers you buy and run yourself) |
+| --- | --- | --- |
+| How fast can I get a new server? | Minutes | Weeks (order, ship, rack, wire) |
+| How do I pay? | Monthly bill for what you use | Large payment up front, then it is yours |
+| Who fixes a broken disk? | The provider | Your team |
+| Cheaper for spiky or growing traffic? | Usually yes | Usually no: you buy for the peak |
+| Cheaper for huge, flat, well-known traffic? | Often no | Sometimes yes (the Dropbox story below) |
+
 ## 6. Trade-offs and when not to use 🟡
 
-- **Elasticity is not free.** On-demand pricing means unbounded traffic can mean an unbounded bill; without budget alarms and autoscaling ceilings, a traffic spike (legitimate or a DDoS) directly becomes a cost spike.
-- **Virtualization overhead and noisy neighbors.** Multiple tenants share physical hardware; a provider's scheduler isolates you, but very latency-sensitive workloads sometimes still prefer bare-metal instances.
-- **Vendor lock-in.** Deep use of one provider's managed services (proprietary APIs, managed databases, IAM model) raises the cost of ever moving to a different provider. Using open standards (containers, Terraform, standard SQL) softens this.
+- **Elasticity is not free.** On-demand pricing means unbounded traffic can mean an unbounded bill; without budget alarms and autoscaling ceilings, a traffic spike (legitimate or a DDoS, a flood of fake traffic meant to knock you over) directly becomes a cost spike.
+- **Virtualization overhead and noisy neighbors.** Multiple tenants share physical hardware; a provider's scheduler isolates you, but very latency-sensitive workloads sometimes still prefer bare-metal instances (a whole physical server rented to you alone, no VM layer).
+- **Vendor lock-in** (it becomes hard and costly to leave one provider). Deep use of one provider's managed services (proprietary APIs, managed databases, IAM model) raises the cost of ever moving to a different provider. Using open standards (containers, Terraform, standard SQL) softens this.
 - **Predictable, steady-state workloads at large scale can be cheaper self-hosted.** A company with years of flat, well-understood traffic and the staff to run data centers (famously, Dropbox moved storage off AWS S3 to its own infrastructure in 2016 for a workload it understood precisely) can beat cloud pricing at sufficient scale — this is the exception, not the default assumption.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how the responsibility line moves, how regions and AZs are laid out, and how to pick a pricing model. **Next is the advanced part**: what actually breaks in real companies, what to watch on a dashboard, and the deeper ideas (virtualization, managed vs self-hosted, scalability vs elasticity) that interviewers like to probe.
+
 
 - **Real systems:** Netflix runs almost entirely on AWS and relies on Multi-AZ and multi-region design to survive AZ failures; Capital One is a well-known case of a regulated bank moving core workloads to AWS under the shared-responsibility model with its own compliance controls layered on top.
 - **Failure modes → fixes:**
   - An AZ loses power → services pinned to one AZ go down → run compute and data stores across at least 2 AZs, with a load balancer that health-checks and routes around the bad AZ.
   - A region-wide event → anything single-region is down → for critical systems, replicate to a second region and have a tested failover runbook (pure insurance; most teams accept single-region risk for non-critical systems because of the added cost and complexity).
   - Runaway autoscaling from a cost-ignorant policy → a bug causes a scaling loop → set hard maximum instance/task counts and billing alarms, not just scale-out triggers.
-- **What to monitor:** AZ-level health checks and error rates, monthly cost by service (cost allocation tags), Reserved/Savings-Plan coverage vs actual on-demand spend, and NAT Gateway / cross-AZ transfer cost specifically, since both are easy to forget.
+- **What to monitor:** AZ-level health checks and error rates, monthly cost by service (cost allocation tags: labels like `team=payments` you attach to resources so the bill can be split by them), Reserved/Savings-Plan coverage vs actual on-demand spend, and NAT Gateway / cross-AZ transfer cost specifically, since both are easy to forget.
 
 ## 8. Deep dive 🔴
 
-**Virtualization underneath IaaS.** A hypervisor (e.g., AWS's Nitro hypervisor, a thin KVM-based layer) partitions one physical host into multiple virtual machines, each with its own kernel, isolated from its neighbors.
+**Virtualization underneath IaaS.** A hypervisor (e.g., AWS's Nitro hypervisor, a thin layer based on KVM, the virtualization feature built into Linux) partitions one physical host into multiple virtual machines, each with its own kernel, isolated from its neighbors.
 
 Containers (see [[Docker 01 - Why Containers]]) are a lighter-weight alternative that share one kernel instead of running a full guest OS per workload; a newer middle ground is a microVM (e.g., Firecracker, which backs AWS Lambda and Fargate) — a stripped-down VM that boots in milliseconds, giving container-like density with VM-like isolation boundaries.
 
@@ -306,6 +374,30 @@ A system can be scalable (stateless, horizontally replicable) without being elas
 - CapEx (buy hardware, size for peak) vs OpEx (rent, pay for actual usage) is the financial version of the same trade-off.
 - Classic cost traps: NAT Gateway hourly + per-GB charges, cross-AZ transfer, idle reserved capacity.
 - Scalability (can it handle more load) is not the same property as elasticity (does it adjust automatically).
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- In one line, what is cloud computing?
+> Renting computers, storage and services from a provider over the internet and paying for what you use.
+
+> [!question]- What is the difference between a region and an AZ?
+> A region is a city-sized area (Mumbai); an AZ is one separate data center site inside it (`ap-south-1a`).
+
+> [!question]- Your EC2 VM gets hacked because its OS was never patched. Whose fault is it, yours or AWS's?
+> Yours. On IaaS, patching the guest OS is your side of the shared-responsibility line.
+
+🟡 Medium
+
+> [!question]- Traffic is near zero at 3am. Which costs less then: 3 always-on EC2 instances or an autoscaled Fargate service, and why?
+> The Fargate service, because it shrinks to 1 task and you pay per second used, while the 3 instances bill the same as at peak.
+
+> [!question]- Which pricing model fits a nightly batch job that can be restarted if stopped?
+> Spot, because it can be up to about 90% cheaper and an interruption only means re-running the job.
+
+> [!question]- What is the difference between scalability and elasticity?
+> Scalability means the design can handle more load if given more machines; elasticity means machines are added and removed automatically as load changes.
 
 ## Links
 

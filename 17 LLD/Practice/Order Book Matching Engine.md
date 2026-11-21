@@ -31,6 +31,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[LLD Interview Method]]: the step order these notes follow: clarify, entities, APIs, storage, code, edge cases.
+> - [[Concurrency for LLD]]: goroutines and channels; one goroutine can own data while others send it requests.
+> - [[Heaps and Priority Queues]]: how to always get the best item fast; here we compare a heap with sorted price levels.
+
 **From zero, in 60 seconds** 🟢
 
 A stock exchange matches people who want to buy with people who want to sell. Waiting buy orders are called **bids**, and waiting sell orders are called **asks**. They are kept sorted: best price first, and at the same price, whoever came first. When a new order arrives, it trades with the best waiting orders on the other side while the prices meet. Anything left over waits in the book, or is cancelled for a market order.
@@ -62,6 +67,11 @@ Everything else in this note is just these 3 questions:
 | FIFO | First in, first out | Older order at 99 fills first |
 | Maker / taker | Maker was resting in the book; taker just arrived | Trade price = maker's price |
 | Tick | Smallest price step, stored as an integer | ₹100.05 = 10005 ticks |
+| Resting order | A limit order that did not fully match and now waits in the book | Sell 5 @ 101 waiting |
+| Partial fill | Only part of an order trades; the rest stays open | Buy 13, only 10 available: 3 left |
+| Deterministic | Same commands in the same order always give the same trades | Replaying the log rebuilds the book |
+| Single writer | Only one goroutine ever changes the book; others send it commands | Engine loop reads a channel |
+| Snapshot | A saved copy of the whole book at one moment | Book as of command #5,000 |
 
 **Picture it**
 
@@ -105,7 +115,7 @@ Many clients submit orders at the same time.
 3. Choose the structures: levels sorted best-first, a FIFO list per level, and an `id -> element` map for cancel.
 4. Write `Submit`: match against `levels[0]` of the opposite side while prices cross, then rest the limit remainder.
 5. Write `Cancel` and `Depth`, then wrap the book in a single-writer `Engine` goroutine.
-6. Test price-time priority, partial fills, multi-level sweeps, market leftovers and cancel, then a concurrent test that checks conservation of quantity and an uncrossed book.
+6. Test price-time priority, partial fills, multi-level sweeps, market leftovers and cancel, then a concurrent test that checks conservation of quantity (no units appear or vanish) and an uncrossed book (best bid stays below best ask).
 
 ## Step 1: Clarify requirements 🟢
 
@@ -133,13 +143,13 @@ Many clients submit orders at the same time.
 
 - Deterministic: the same command sequence always produces the same trades (needed for replay and audits).
 - Concurrency-safe for many submitting clients, with a single, total order of commands.
-- Submit and cancel run in O(log L) for the level search plus O(fills); cancel by ID does not scan the book.
+- Submit and cancel run in O(log L) (L = number of price levels; grows very slowly) for the level search plus O(fills); cancel by ID does not scan the book.
 - Prices and quantities are `int64`; the clock is injected so trade timestamps are testable.
 
 ### Out of scope
 
-- Networking, FIX protocol, market data broadcast and risk checks (margin, position limits).
-- Clearing and settlement of the trades (see [[Digital Wallet and Ledger]] for the money side).
+- Networking, FIX protocol (the standard message format between brokers and exchanges), market data broadcast and risk checks (margin, position limits).
+- Clearing and settlement (actually moving the money and shares after a trade) of the trades (see [[Digital Wallet and Ledger]] for the money side).
 - Multi-symbol routing and auctions (opening and closing auctions).
 
 ## Step 2: Actors and use cases 🟢
@@ -157,7 +167,7 @@ The hardest use case is **Submit** for a large order: it may sweep several price
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
-| `Order` | ID, Side, Kind, Price (ticks), Qty | The client input; immutable once submitted |
+| `Order` | ID, Side, Kind, Price (ticks), Qty | The client input; immutable (never changed) once submitted |
 | `resting` | id, side, price, remaining, lvl | The live part of a limit order on the book; `remaining` falls with each fill |
 | `level` | price, FIFO list of `*resting`, total | All resting orders at one price, oldest first; `total` serves depth in O(1) |
 | `sideBook` | levels sorted best-first, desc flag | Bids sorted high to low, asks low to high, so `levels[0]` is always the best |
@@ -166,9 +176,11 @@ The hardest use case is **Submit** for a large order: it may sweep several price
 | `Book` | bids, asks, index id -> element, seen ids, clock, trade seq | The matching logic; single-threaded |
 | `Engine` | command channel, quit channel | The single writer that owns the Book |
 
-Vocabulary: the **taker** is the incoming order that removes liquidity; the **maker** is the resting order it trades against. The **spread** is best ask minus best bid; the book is **crossed** if best bid >= best ask, which must never be true after a command finishes.
+Vocabulary: the **taker** is the incoming order that removes liquidity (orders waiting to be traded against); the **maker** is the resting order it trades against. The **spread** is best ask minus best bid; the book is **crossed** if best bid >= best ask, which must never be true after a command finishes.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know bids, asks, makers, takers and the rule "best price first, oldest first, trade at the maker's price". Next we open the box: how levels and orders link, the API, the command log for recovery, and the Go matching loop.
 
 ```mermaid
 classDiagram
@@ -235,7 +247,7 @@ Stream /symbols/{sym}/trades           -> {seq, price, qty, takerSide, makerId, 
 Errors: 400 bad side/type/qty/price, 409 duplicate clientOrderId, 503 engine closed
 ```
 
-The client order ID doubles as the idempotency key: a retried submit with the same ID is rejected as a duplicate instead of creating a second order (the general pattern is in [[Idempotency and Idempotency Keys]]). The Go surface the handlers call:
+The client order ID doubles as the idempotency key (an ID that makes a retry safe: the second copy is recognised and refused): a retried submit with the same ID is rejected as a duplicate instead of creating a second order (the general pattern is in [[Idempotency and Idempotency Keys]]). The Go surface the handlers call:
 
 ```go
 type MatchingService interface {
@@ -302,7 +314,7 @@ One catch: `Trade.At` comes from the injected clock, so during replay the clock 
 | [[Command, Undo and Memento]] | Each request is a `func(*Book)` command on a channel; the command log | Commands serialise all writes and can be logged and replayed |
 | [[Facade (vs Mediator)]] | `Engine` | Clients see Submit, Cancel and Depth; the loop, channel and book are hidden |
 | [[Observer and Event Bus]] | Trade events to clearing and market data (follow-up) | The engine must not know who listens or wait for them |
-| [[Strategy and Template Method]] | Matching rule (price-time FIFO versus pro-rata, a follow-up) | Some futures markets allocate fills pro-rata; the loop stays the same |
+| [[Strategy and Template Method]] | Matching rule (price-time FIFO versus pro-rata, a follow-up) | Some futures markets allocate fills pro-rata (split by order size instead of by arrival time); the loop stays the same |
 | [[Repository and Unit of Work]] | `CommandLog`, `TradeSink` | Storage stays outside the deterministic core |
 
 Patterns not used, and why:
@@ -955,6 +967,8 @@ What the tests prove:
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working engine and its tests. Next is interview depth: big orders that sweep many levels, cancel racing a fill, duplicate IDs, IOC/FOK and stop orders, and the data-structure trade-offs.
+
 | Edge case | What happens | How the design handles it |
 |---|---|---|
 | Incoming order larger than one level | Must continue to the next price | Outer loop over `levels[0]` until filled or not crossing |
@@ -999,8 +1013,8 @@ Tradeoffs chosen:
 - **Sorted slice of levels with binary search.** Finding a level is O(log L), but inserting or removing a level in the middle shifts the slice, O(L). Most activity is near the best price and L is usually small, so this is fast in practice and simple to code.
 
   A balanced tree (for example a red-black tree or a B-tree) gives O(log L) for every operation. Many production engines instead use an array indexed by price tick within a band, which is O(1) per level access.
-- **Heap instead of a sorted slice.** A heap gives the best price in O(1) and push in O(log L), but depth needs a sort and removing a middle level needs lazy deletion. Good if you only ever need the top.
-- **`container/list` per level.** O(1) push back, pop front and remove from the middle (cancel). The cost is a pointer per node and poor cache locality; an intrusive linked list or a ring buffer with tombstones is faster but longer to code.
+- **Heap instead of a sorted slice.** A heap gives the best price in O(1) and push in O(log L), but depth needs a sort and removing a middle level needs lazy deletion (mark it dead now, throw it away when it reaches the top). Good if you only ever need the top.
+- **`container/list` per level.** O(1) push back, pop front and remove from the middle (cancel). The cost is a pointer per node and poor cache locality (nodes scattered in memory, so the CPU cache helps less); an intrusive linked list (the next/prev pointers live inside the order itself) or a ring buffer (a fixed array used in a circle) with tombstones ("deleted" markers) is faster but longer to code.
 - **Single writer goroutine versus a mutex.** The channel hop costs some microseconds per command (an estimate; measure on your hardware), but gives a total order, no lock contention inside matching, and a natural place to append to a command log. A mutex is fine for a single process with low load; it does not give you a replayable order by itself.
 
 ## Drawing 🟢
@@ -1054,7 +1068,7 @@ stateDiagram-v2
 > One heap of all orders works for matching, but cancel needs the order's heap index and depth needs a scan of every order. Levels group equal prices, so depth is one row per level with a running total, and a FIFO per level gives time priority with O(1) pop front and O(1) remove by element. The ID index makes cancel O(1) for the queue part.
 
 > [!question]- Trap: a buy limit at 105 meets a resting ask at 100. What is the trade price?
-> 100, the maker's price. The resting order set the price first; the taker gets price improvement. Using the taker's price would overcharge the buyer and break every test that sweeps levels.
+> 100, the maker's price. The resting order set the price first; the taker gets price improvement (a better price than it asked for). Using the taker's price would overcharge the buyer and break every test that sweeps levels.
 
 > [!question]- Why a single-writer goroutine rather than a mutex or per-level locks?
 > Matching touches both sides and many levels in one command, so fine-grained locks would need ordering rules and could still interleave two takers on one level. One owner goroutine runs commands in a total order, which makes results deterministic and replayable from a command log. The inner loop then needs no locks at all.
@@ -1063,7 +1077,7 @@ stateDiagram-v2
 > Append every command to a durable log before the engine runs it, with a sequence number. On restart, load the last snapshot and replay commands from its sequence. Because matching is deterministic (no wall clock in decisions, no map iteration order), the replay produces the same book and the same trades; the `(symbol, seq)` key on trades deduplicates republishing.
 
 > [!question]- A market order arrives for 1,000 units but the book only has 20. What happens, and what would a real venue add?
-> It fills 20 at progressively worse prices and cancels 980; it never rests. Venues add price protection bands or convert market orders to limit orders at a collar price, so a thin book cannot fill someone at an absurd price.
+> It fills 20 at progressively worse prices and cancels 980; it never rests. Venues add price protection bands or convert market orders to limit orders at a collar price (a limit set a few percent away from the best price), so a thin book cannot fill someone at an absurd price.
 
 > [!question]- How do you implement fill-or-kill without undoing trades?
 > Check first, then match. Walk the opposite levels from the best price and sum quantity while prices cross; if the sum is below the order quantity, reject it with no trades. Because the engine is single-threaded, nothing can change the book between the check and the match.
@@ -1090,6 +1104,26 @@ A limit remainder rests at the back of its level; a market remainder is cancelle
 - Index `orderID -> list element` for O(1) cancel; drop empty levels.
 - Invariants: Filled + Resting + Cancelled = Qty; book never crossed; trade seq gap-free.
 - Single writer goroutine, integer ticks, injected clock, command log for replay.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 Two asks at 99: S1 arrived first, then S2. A buy for 5 at 99 arrives. Who trades?
+> S1, because within one price the oldest order fills first (FIFO).
+
+> [!question]- 🟢 A buy limit at 105 meets a resting ask at 100. What is the trade price?
+> 100, the maker's (resting order's) price.
+
+> [!question]- 🟢 Why are prices stored as integer ticks?
+> Floats like 100.1 round, which breaks price equality and the sorting of levels.
+
+> [!question]- 🟡 Asks: 100x5, 100x5, 101x10. A buy limit at 101 for 13. What trades happen?
+> 5 @ 100, 5 @ 100, then 3 @ 101; the 101 ask has 7 left.
+
+> [!question]- 🟡 A market order for 25 finds only 20 units. What happens to the other 5?
+> They are cancelled; a market order never rests on the book.
+
+> [!question]- 🟡 Why one goroutine owning the book instead of a mutex?
+> It gives one total order of commands, so results are deterministic and can be replayed from a command log; the matching loop needs no locks.
 
 ## Links 🟢
 

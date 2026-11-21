@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[JWT - Structure, Validation and Pitfalls]]: a JWT is a signed pass that works until its expiry time and cannot easily be cancelled early.
+> - [[Sessions and Cookies]]: a server can keep a record and delete it to log someone out, and an `HttpOnly` cookie hides a value from page JavaScript.
+
 **From zero, in 60 seconds** 🟢
 
 After login, an app gives you a pass to show on every request.
@@ -75,6 +79,12 @@ The fix: one short-lived pass for everyday calls and one long-lived pass used on
 | Revoke | The server marking a token as dead before it expires | Logging out kills the refresh token |
 | Cookie (`HttpOnly`) | Browser-stored value that page JavaScript cannot read | Refresh token stored safely from XSS |
 | XSS | Attacker script running inside your page | Script reading `localStorage` |
+| Rotation | Every refresh swaps the old refresh token for a new one | T1 used → T2 issued, T1 dead |
+| Token family | All refresh tokens that came from one login, chained together | T1 → T2 → T3 from Monday's login |
+| Reuse detection | Noticing that an already-used refresh token came back | T1 shows up after T2 was issued |
+| Opaque token | A random string with no readable meaning; the server looks it up | `r_8f3a9c...` |
+| SPA | Single-page app: a web app that runs mostly as JavaScript in the browser | A React dashboard |
+| Grace window | A few seconds where a just-replaced token is still accepted once, to allow honest retries | 5-second window after rotation |
 
 **Picture it**
 
@@ -106,9 +116,22 @@ A single long-lived token is a single point of failure: make it short enough to 
 
 Two tokens resolve the conflict: the access token (what every request actually carries) stays short, and the refresh token (presented rarely, only to a single trusted endpoint) carries the convenience.
 
-A concrete scenario: a mobile app with a 10-minute access token and a 30-day refresh token lets a user stay logged in for a month without re-entering a password, while a leaked access token — say, captured in a proxy log — is worthless 10 minutes later.
+A concrete scenario: a mobile app with a 10-minute access token and a 30-day refresh token lets a user stay logged in for a month without re-entering a password, while a leaked access token — say, captured in a proxy log (the request log of a middle server the traffic passes through) — is worthless 10 minutes later.
 
 The refresh token is the one credential that must survive theft detection, which is what rotation is for.
+
+### Real-life example: Netflix on a friend's TV 🟢
+
+You sign in to Netflix on a friend's TV and forget to sign out. Weeks later you press "Sign out of all devices". Netflix cancels the long-lived login on that TV, so the next time the TV asks for a fresh short-lived pass, it is refused and the TV shows the sign-in screen. Meanwhile your own phone, which also stays logged in for months, never asks for your password because it quietly swaps its long-lived token for fresh short ones in the background. That is the two-token pattern in daily life.
+
+### Access token vs refresh token 🟡
+
+| | Access token | Refresh token |
+| --- | --- | --- |
+| Lifetime | Minutes (5-15) | Days to weeks |
+| Sent to | Every API call | Only `/auth/refresh` |
+| Usually looks like | A JWT, checked by signature | A random string, looked up in a table |
+| If stolen | Works until it expires, minutes | Caught by reuse detection, family revoked |
 
 ## 2. Mental model 🟢
 
@@ -116,11 +139,29 @@ Think of a **hotel key card system with a front-desk reissue**. The access token
 
 The refresh token is your reservation confirmation at the front desk: present it, and the desk clerk deactivates your old card and hands you a freshly coded one. If someone steals your reservation confirmation and tries to use it *after* you already picked up your new card, the front desk notices a confirmation being used twice and locks the whole reservation — forcing everyone holding a card under it to come back to the desk and prove who they are again.
 
+## Common beginner mistakes 🟢
+
+- **Making the access token last a day or more** → a stolen one works all day → keep it to 5-15 minutes.
+- **Storing tokens in `localStorage`** → any injected script can read them → refresh token in an `HttpOnly` cookie, access token in memory.
+- **Reusing the same refresh token forever** → a thief can use it quietly for weeks → rotate it on every refresh.
+- **Storing raw refresh tokens in the database** → a database leak hands out live logins → store only their SHA-256 hash.
+- **Retrying refresh in a loop on 401** → a revoked session spins forever → refresh once, retry once, then send the user to login.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** why one login is split into a short access token and a long refresh token. **Next we open the box**: the exact refresh flow, how rotation catches a stolen refresh token, and where each kind of app should keep each token.
 
 ### Issuing and refreshing
 
 **In plain words:** login gives both tokens. Calls use the short one. When it expires, the app quietly trades the long one for a new pair.
+
+**Step by step:**
+1. 9:00 Riya logs in to a shopping app. She gets an access token (valid till 9:10) and a refresh token (valid for 30 days, in an `HttpOnly` cookie).
+2. 9:00-9:10 every call (`GET /orders`) carries the access token.
+3. 9:11 a call gets 401: the access token expired.
+4. The app quietly calls `POST /auth/refresh`; the browser attaches the refresh cookie.
+5. The server checks the refresh token, retires it, and returns a new access token (till 9:21) and a new refresh token.
+6. The app repeats the failed `GET /orders` once. Riya never saw a thing.
 
 ```mermaid
 sequenceDiagram
@@ -149,6 +190,13 @@ sequenceDiagram
 ### Rotation with reuse detection
 
 **In plain words:** every refresh token can be used only once. A second use of the same token means two people have it, so you shut the whole chain down.
+
+**Step by step:**
+1. Monday's login starts family F1 with refresh token T1.
+2. Riya's app refreshes: T1 is marked "used", T2 is issued in F1.
+3. A thief who copied T1 from an old log tries to refresh with it.
+4. The server sees T1 is already used. Two holders exist, so it revokes all of F1 (T1 and T2).
+5. The thief gets 401. Riya's next refresh with T2 also gets 401, so she logs in again and starts a fresh family.
 
 Every refresh token belongs to a **family** started at login. Each rotation marks the presented token "used" and chains a new one into the same family. Presenting an already-used token is reuse — a strong signal of theft — and revokes the entire family at once, forcing re-login on every device sharing that family.
 
@@ -184,6 +232,12 @@ The legitimate user is forced to re-login too — an intentional trade-off. Ther
 ### Storage per client
 
 **In plain words:** where to keep the tokens depends on the app. Browsers should use HttpOnly cookies; mobile apps use the phone's secure storage.
+
+**Step by step:**
+1. Ask: can page JavaScript read this spot? If yes (`localStorage`), no token goes there.
+2. Browser app: keep the access token in a JS variable (lost on reload, fine), and the refresh token in an `HttpOnly` cookie sent only to `/auth/refresh`.
+3. Mobile app: put the refresh token in the phone's locked vault (Android Keystore, iOS Keychain).
+4. Server-to-server calls: no refresh token at all; use the service auth methods instead.
 
 | Client | Access token | Refresh token |
 | --- | --- | --- |
@@ -389,16 +443,26 @@ func TestReuseDetectionRevokesFamily(t *testing.T) {
 
 - **Sliding sessions trade security for convenience.** A refresh token whose expiry keeps resetting on use can keep a compromised session alive indefinitely if the attacker also keeps using it; pair sliding expiry with an absolute maximum (for example, forced re-login after 90 days regardless of activity).
 - **Rotation adds a race to handle.** Two near-simultaneous refresh calls from the same legitimate client (a flaky network causing a silent retry) can look exactly like reuse. A short grace window — accept the immediately-prior token once, within a few seconds, without treating it as theft — avoids false positives; anything presented after that grace window is treated as reuse.
+
+```mermaid
+flowchart LR
+    T1["T1 rotated to T2 at 12:00:00"] --> Q{"T1 seen again when?"}
+    Q -- "within 5 s, once" --> OK["honest retry: return T2 again"]
+    Q -- "later, or twice" --> R["reuse: revoke family"]
+```
 - **When one access token alone is fine:** short-lived, service-to-service calls with no interactive user (use [[Service-to-Service Auth - API Keys, HMAC, mTLS]] instead), or internal tools behind a VPN where a single session cookie with server-side revocation is simpler and the added rotation machinery buys little.
 
 ## 7. In production 🔴
 
-- **Real systems:** Auth0 and Okta implement refresh token rotation with reuse detection by default for SPA clients; Google and Microsoft OAuth both rotate refresh tokens for public clients; AWS Cognito offers configurable refresh-token revocation. RFC 9700 (OAuth 2.0 Security BCP) requires rotation with reuse detection for public clients that cannot keep a secret.
+> 🟡 → 🔴 **You now know** the refresh flow, rotation with reuse detection and safe storage. **Next we look at real systems**: what Auth0, Google and others do, how refresh breaks in production (races, logs, sliding sessions), and stronger token binding for high-value APIs.
+
+
+- **Real systems:** Auth0 and Okta implement refresh token rotation with reuse detection by default for SPA clients; Google and Microsoft OAuth both rotate refresh tokens for public clients; AWS Cognito offers configurable refresh-token revocation. RFC 9700 (OAuth 2.0 Security BCP, the official best-practice guide) requires rotation with reuse detection for public clients (apps such as SPAs and mobile apps that run on the user's device and so cannot keep a secret).
 - **Failure modes → fixes:**
-  - Concurrent refresh calls from one client both treated as reuse → add a short single-flight grace window so a near-simultaneous retry doesn't nuke a legitimate session.
+  - Concurrent refresh calls from one client both treated as reuse → add a short single-flight (only one refresh in flight at a time) grace window so a near-simultaneous retry doesn't nuke a legitimate session.
   - Refresh token stored in `localStorage` → move it to an `HttpOnly` cookie or platform secure storage; this closes the XSS exfiltration path.
   - No absolute cap on sliding sessions → add a hard expiry alongside the sliding one.
-  - Family revoked but access tokens already issued keep working → keep access-token `exp` short enough that the blast radius after revocation is minutes, not hours.
+  - Family revoked but access tokens already issued keep working → keep access-token `exp` short enough that the blast radius (how much harm is possible) after revocation is minutes, not hours.
 - **What to monitor:** refresh-reuse events (each one is a likely theft or a client bug — alert on any volume), refresh failure rate, average and p99 time between refreshes, and the distribution of family sizes (an unusually long family can mean a client that never truly logs out).
 
 ## 8. Deep dive 🔴
@@ -406,7 +470,7 @@ func TestReuseDetectionRevokesFamily(t *testing.T) {
 - **Why hash, not store, the raw refresh token.** The token store is a prime target if the database leaks; storing only `SHA-256(raw)` means a database leak alone does not hand out usable tokens, mirroring why passwords are hashed rather than stored plain (see [[Password Storage and Login Security]]). Unlike passwords, refresh tokens are high-entropy random strings, so a fast hash (no salt, no slow KDF) is sufficient — there is no dictionary attack to defend against.
 - **Concurrent refresh races in SPAs.** A page with several tabs, or a mobile app resuming from background, can fire two refresh calls near-simultaneously with the same (not-yet-rotated) token. The common fix is a short-lived grace record: when a token is rotated, keep it valid for a few more seconds for exactly one more "it's probably the same client" refresh, while still treating any reuse after that window — or any reuse of a token older than one generation — as theft.
 - **Absolute vs sliding expiry, together.** Sliding expiry (reset the clock on activity) optimizes for "don't log out an active user"; an absolute cap (force re-login after N days regardless) bounds how long a quietly-compromised session can persist. Production systems use both: slide the expiry on each refresh, but refuse to issue a refresh token past the absolute cap from the original login.
-- **DPoP and mTLS as the next step up.** Rotation detects theft of the refresh token itself; it does nothing if the attacker steals and uses the token before the legitimate client's next refresh. Sender-constrained tokens bind the token to a private key (DPoP, RFC 9449) or a TLS client certificate (mTLS), so a copied token is useless without the key it was issued to — the attacker would need both.
+- **DPoP and mTLS as the next step up.** Rotation detects theft of the refresh token itself; it does nothing if the attacker steals and uses the token before the legitimate client's next refresh. Sender-constrained tokens bind the token to a private key (DPoP, RFC 9449: the client signs each request with its own key, so a copied token alone fails) or a TLS client certificate (mTLS), so a copied token is useless without the key it was issued to — the attacker would need both.
 - **401 → refresh → retry once.** Clients should treat exactly one 401 as "try a refresh, then retry the original request once"; a second 401 after a successful-looking refresh should not loop — it should surface as a real auth failure (expired family, revoked session) rather than retry forever.
 
 ## 9. Interview questions 🔴
@@ -441,6 +505,26 @@ func TestReuseDetectionRevokesFamily(t *testing.T) {
 - Add a short grace window for near-simultaneous refreshes to avoid false reuse alarms.
 - Sliding expiry needs an absolute cap alongside it, or a compromised session never dies.
 - Rotation detects theft after the fact; it does not stop the first fraudulent use — that's what the access token's short `exp` bounds.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) Which token is sent on every API call?
+> The access token.
+
+> [!question]- (easy) Roughly how long should an access token live?
+> About 5-15 minutes.
+
+> [!question]- (easy) Where should a browser app keep its refresh token?
+> In an `HttpOnly`, `Secure`, `SameSite` cookie scoped to the refresh path, never `localStorage`.
+
+> [!question]- (medium) An already-used refresh token is presented again. What does the server do and why?
+> It revokes the whole token family, because two parties hold the same token and the server cannot tell which one is the thief.
+
+> [!question]- (medium) Why can the server store refresh tokens with a fast SHA-256 hash, when passwords need a slow hash?
+> Refresh tokens are long random strings, so there is no word list to guess from; a fast hash is enough to make a leaked table useless.
+
+> [!question]- (medium) Does rotation stop the first use of a stolen refresh token?
+> No. It only detects the theft when the old token is used a second time; the short access-token life limits the damage meanwhile.
 
 ## Links
 

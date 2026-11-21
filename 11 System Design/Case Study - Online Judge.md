@@ -38,6 +38,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example) and 8 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 5 (deep dives), 6, 7, 9 and 10. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+> - [[Background Jobs and Worker Pools]]: slow work is put on a queue and done by worker processes, not inside the web request.
+> - [[Docker 09 - Container Security and Hardening]]: a container shares the host's kernel, so it must be locked down before running untrusted code.
+> - [[Back-of-the-Envelope Estimation]]: turning submissions per second into CPU cores and machines.
+
 **From zero, in 60 seconds** 🟢
 
 An online judge, like LeetCode, runs your code against hidden tests and says "accepted" or "wrong answer".
@@ -77,6 +83,10 @@ An online judge runs strangers' code safely, fairly and fast, even at contest pe
 | Queue | A waiting line of jobs that workers take from | Pending submissions |
 | Worker | A machine process that does the slow job | Compiles and runs one submission |
 | cgroup / namespace | Linux tools to limit and hide resources | Max 256 MB RAM, own process list |
+
+| seccomp | A Linux filter that kills a program if it makes a forbidden system call | blocks opening a network socket |
+| Visibility timeout | How long a taken queue message stays hidden before it is offered again | 60 s, then another worker retries |
+| CPU time | Time the program actually spent on the processor, not time spent waiting | 0.93 s CPU even if 1.4 s passed |
 
 **Picture it**
 
@@ -133,6 +143,13 @@ The examiner (judge) does not trust anyone, compares the result with the answer 
 
 **Out of scope (say it in the interview):** plagiarism detection, a full web IDE, problem authoring tools.
 
+### Real-life example: a weekend LeetCode contest 🟢
+
+On a Sunday morning, thousands of people join a LeetCode weekly contest. In the last 10 minutes, everyone submits at once.
+You press "Submit" and instantly see "Pending", then a few seconds later "Accepted, 48 ms".
+Somewhere, someone has submitted code that tries to open a network connection to grab the answers; it is killed and marked as a runtime error, and nobody else notices.
+The ranking table updates every few seconds, and your rank depends on problems solved and time taken.
+
 **Glossary.** A **submission** is one code upload. A **verdict** is the outcome: **AC** accepted, **WA** wrong answer, **TLE** time limit exceeded, **MLE** memory limit exceeded, **RE** runtime error, **CE** compile error, **OLE** output limit exceeded. A **sandbox** is an isolated environment for one run.
 
 A **checker** is a program that decides whether the output is right (needed when many answers are valid). A **special judge** is a custom checker.
@@ -170,7 +187,17 @@ flowchart LR
     C --> B["Result on the board"]
 ```
 
+## Common beginner mistakes 🟢
+
+- **Running the code inside the web request** → requests hang for seconds and a contest rush takes the site down → reply with a ticket and judge from a queue.
+- **Thinking "it runs in Docker, so it is safe"** → a plain container shares the host kernel → stack namespaces, cgroups, seccomp, no network and a host with no secrets.
+- **Measuring wall-clock time** → a busy machine makes the same code look slower → measure CPU time on pinned cores, and re-run results close to the limit.
+- **A visibility timeout shorter than the longest judge run** → the job reappears while still running and is judged twice → size it above the worst case and fence the verdict write.
+- **Reading the leaderboard straight from the database on every refresh** → thousands of heavy queries a second → keep a Redis sorted set built from verdicts and cache the page for 1-2 s.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the plan: accept fast, queue, judge slowly in a locked box. **Next we open the box** and follow one submission through the API, the queue, the sandbox and back to your screen.
 
 ### Step by step: one submission
 
@@ -182,10 +209,10 @@ flowchart LR
 4. **Reply.** The API returns `202 Accepted` with the id. This takes tens of milliseconds, independent of judge load.
 5. **Claim.** A judge worker with a free sandbox slot pulls the message. The queue hides the message for a **visibility timeout** (for example 60 s) so no other worker takes it.
 6. **Prepare.** The worker loads the source, fetches the problem's test cases (cached on local disk by version) and creates a fresh sandbox.
-7. **Compile.** For compiled languages, the compiler runs in a sandbox with its own tighter limits (compile bombs are a real attack, for example C++ template recursion or `#include "/dev/random"`).
-8. **Run.** For each test case, run the binary in a sandbox with time, memory, process and output limits, feeding the input on stdin and capturing stdout.
+7. **Compile.** For compiled languages, the compiler runs in a sandbox with its own tighter limits (compile bombs, tiny programs that make the compiler use huge time or memory, are a real attack, for example C++ template recursion or `#include "/dev/random"`).
+8. **Run.** For each test case, run the binary in a sandbox with time, memory, process and output limits, feeding the input on stdin and capturing stdout (the program's standard input and output streams).
 9. **Check.** Compare the output with the expected answer, or run the checker program.
-10. **Verdict.** Stop at the first failure (ICPC style) or run all tests (partial scoring style). Write the final verdict, time and memory with a conditional update, then ack the queue message.
+10. **Verdict.** Stop at the first failure (ICPC style, the rule used by the big university programming contest) or run all tests (partial scoring style). Write the final verdict, time and memory with a conditional update, then ack the queue message.
 11. **Notify.** Publish "submission X done" so the user's page updates.
 
 ```mermaid
@@ -346,6 +373,8 @@ stateDiagram-v2
 
 ## 5. Deep dives 🔴
 
+> 🟡 → 🔴 **You now know** one submission's full path, the sizing, the API, the tables and the verdict states. **Next is the advanced part**: the layers of the sandbox, which isolation tool to pick, fair timing, the queue under a contest rush, contest scoring, then scaling and failures.
+
 ### 5.1 The sandbox: how to run hostile code safely
 
 #### In plain words
@@ -376,11 +405,11 @@ flowchart TB
 #### The layers, one by one
 
 1. **Namespaces** give the program its own view. A new PID namespace means it cannot see or signal other processes. A mount namespace gives it a private filesystem. An empty network namespace means no sockets reach anywhere. A user namespace maps "root" inside to nobody outside.
-2. **cgroups** (control groups) cap resources. `memory.max` kills the group on overrun, so you get MLE instead of a swap storm. `pids.max` stops a fork bomb. `cpu.max` stops it from hogging cores. Check `memory.events` to tell "killed by OOM" from a normal crash.
+2. **cgroups** (control groups) cap resources. `memory.max` kills the group on overrun, so you get MLE instead of a swap storm (the machine slowing to a crawl as it moves memory to disk). `pids.max` stops a fork bomb. `cpu.max` stops it from hogging cores. Check `memory.events` to tell "killed by OOM" from a normal crash.
 3. **seccomp** filters system calls. Allow list only the calls a normal program needs (`read`, `write`, `mmap`, `exit_group`), and kill on `socket`, `ptrace`, `mount`, `clone` with namespace flags, `kexec_load` and friends.
 4. **rlimits** (`setrlimit`) add belt and braces: `RLIMIT_CPU` for CPU seconds, `RLIMIT_FSIZE` to cap output file size, `RLIMIT_NOFILE`, `RLIMIT_STACK`.
 5. **Filesystem:** read-only root with only the compiler or runtime and libraries; a tiny writable tmpfs for the run. The test input is piped in, never mounted from a shared path. Source and answer files of other users are simply not present.
-6. **Drop privileges:** run as an unprivileged uid, drop all capabilities, set `no_new_privs`.
+6. **Drop privileges:** run as an unprivileged uid (user ID), drop all capabilities (Linux's fine-grained admin powers), set `no_new_privs` (the program can never gain more rights).
 7. **Output cap:** read at most N MB of stdout. A program printing forever would otherwise fill the disk or memory of the worker (verdict OLE).
 8. **Wall-clock timer outside the box.** The sandbox's CPU timer does not catch a program that sleeps or blocks forever. The supervisor kills it when wall time exceeds about 2-3 times the CPU limit.
 
@@ -459,9 +488,9 @@ flowchart LR
 ```
 
 #### Steps to get stable numbers
-1. **Pin each sandbox to its own physical core** (`cpuset`), and leave one core for the supervisor and OS. Do not run more sandboxes than cores.
+1. **Pin each sandbox to its own physical core** (`cpuset`, the cgroup setting that picks which cores a group may use), and leave one core for the supervisor and OS. Do not run more sandboxes than cores.
 2. **Measure CPU time** (user + sys) from the cgroup or `wait4` rusage, not wall time. A program blocked waiting does not burn its limit.
-3. **Disable noise sources:** fixed CPU frequency, hyper-threading siblings left idle for contest hosts, no background jobs on the host.
+3. **Disable noise sources:** fixed CPU frequency, hyper-threading siblings (two logical cores sharing one physical core) left idle for contest hosts, no background jobs on the host.
 4. **Language multipliers:** give Java and Python extra time (for example x2 to x3), because of VM startup and slower runtime. State it on the problem page.
 5. **Re-run borderline results.** If a run is within about 10 percent of the limit and fails with TLE, re-run once on another worker before committing the verdict.
 6. **Warm-up:** exclude compile time and runtime start from the measured time where possible.
@@ -586,6 +615,14 @@ flowchart TD
 > [!warning] Common mistake
 > Giving the judge worker broad cloud credentials "to fetch tests". If code ever escapes, the attacker owns the account. Use a narrow, read-only token for one test-data bucket, or a pre-signed URL per problem.
 
+### Things people confuse this with 🟡
+
+| System | What it runs | How it differs from an online judge |
+| --- | --- | --- |
+| CI pipeline (GitHub Actions) | Your own team's trusted code and tests | Code is trusted and runs for minutes; no hidden tests or fairness rules |
+| Online IDE / playground | Any code, interactively | Needs long sessions and more system access, so heavier isolation (gVisor, microVMs) |
+| [[Case Study - Distributed Job Scheduler]] | Jobs at a chosen time | About when to run; the judge is about running hostile code safely right now |
+
 ## 8. Trade-offs 🟡
 
 | Decision | Option A | Option B | Our pick and why |
@@ -610,8 +647,8 @@ flowchart LR
 - **Real examples:** Codeforces, LeetCode and HackerRank run contests with spiky load. Judge0 and the IOI's `isolate` are open source and show the layered-sandbox approach. AWS Lambda and Fargate use Firecracker microVMs for hostile multi-tenant code (Firecracker paper, NSDI 2020). Exact internals of the commercial sites are not public, so treat their numbers as unknown.
 - **Metrics to watch:** queue depth and oldest-message age, verdict latency p50/p95 per language, sandbox failures, `system_error` rate, worker utilisation, compile cache hit rate, test-data cache hit rate.
 - **Alerts:** oldest queued age over 60 s in a contest, `system_error` rate over 0.5 percent, any worker failing its self-test.
-- **Operations:** immutable worker images per language, rolled out with canaries and a rejudge plan if a compiler update changes behaviour. Keep compiler and runtime versions pinned and show them on the site.
-- **Security posture:** egress denied on worker subnets, no instance profile permissions beyond one bucket read, logs of unexpected seccomp kills as security events.
+- **Operations:** immutable worker images per language, rolled out with canaries (a few workers get the new version first while you watch for problems) and a rejudge plan if a compiler update changes behaviour. Keep compiler and runtime versions pinned and show them on the site.
+- **Security posture:** egress (outgoing network traffic) denied on worker subnets, no instance profile (the cloud credentials a machine gets automatically) permissions beyond one bucket read, logs of unexpected seccomp kills as security events.
 
 ## 10. Interview questions 🔴
 
@@ -654,14 +691,32 @@ flowchart LR
 - Leaderboard: Redis ZSET derived from the DB, cached 1-2 s.
 - Scale on queue age. Pre-warm before contests.
 
-## 12. Links
+## Self-check 🟢🟡
+
+> [!question]- Easy: why does the site reply with a ticket instead of the verdict?
+> Judging takes seconds and contests are bursty, so the work goes on a queue and the user waits on a ticket.
+
+> [!question]- Easy: what is a sandbox?
+> A locked box where the code runs with no network, little memory, few processes and a time limit.
+
+> [!question]- Easy: what stops a fork bomb?
+> The cgroup's `pids.max` limit, so fork fails after a few dozen processes.
+
+> [!question]- Medium: a run takes 1.04 s against a 1 s limit. What does a fair judge do?
+> It is within 10% of the limit, so re-run once on a fresh sandbox before deciding TLE.
+
+> [!question]- Medium: worker A dies mid-judge. How does the job finish without being judged twice?
+> The visibility timeout ends, worker B takes it with attempt 2, and the verdict write only succeeds for `attempt = 2`.
+
+> [!question]- Medium: 100 submissions a second at about 6 CPU-seconds each. How many cores?
+> About 600 cores, not counting headroom.
+
+## Links
 
 - Decision guides: [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]], [[Choosing Compute, Scaling and Deployment - Decision Guide]], [[Choosing a Database - Decision Guide]], [[Choosing an API and Communication Style - Decision Guide]], [[Choosing Storage for Files, Search and Analytics - Decision Guide]], [[Choosing a Caching Strategy - Decision Guide]]
 - Concepts: [[Background Jobs and Worker Pools]], [[Docker 09 - Container Security and Hardening]], [[Dead Letter Queues and Poison Messages]], [[Backpressure and Flow Control]], [[Autoscaling]], [[Idempotency and Idempotency Keys]]
 - Related case studies: [[Case Study - Distributed Job Scheduler]], [[Case Study - Leaderboard and Top-K]]
 - Framework: [[System Design Interview Framework]], [[HLD Round - Complete Step-by-Step Guide]]
-
-## Links
 
 ### Watch on YouTube
 

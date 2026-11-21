@@ -37,6 +37,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 9, 10 and 11. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+> - [[Back-of-the-Envelope Estimation]]: turning users and pings into requests per second and gigabytes.
+> - [[Geospatial Indexing]]: splitting the earth into cells (geohash, H3) so "what is near me?" is a quick lookup.
+> - [[Graphs and Graph Algorithms]]: points joined by weighted lines, and how Dijkstra finds the cheapest path.
+
 **From zero, in 60 seconds** 🟢
 
 A maps app does three separate jobs: draw the map, find a route, and guess the travel time.
@@ -75,6 +81,10 @@ When a road jams, the time changes and you may get a new route.
 | GPS probe | A location ping from a phone or car | `(28.61, 77.20) at 09:01:05` |
 | ETA | Estimated time of arrival | "Arrive 9:42" |
 | CDN | Servers near users that hand out cached files | Tiles served from a city nearby |
+
+| Map matching | Snapping noisy GPS points onto the road the car is really on | a point 20 m off lands on MG Road |
+| Contraction hierarchy | A road graph pre-processed with shortcut roads so long routes search very few points | city street → highway → city street |
+| Geocoding | Turning an address into coordinates (reverse: coordinates into an address) | "MG Road" → (12.97, 77.60) |
 
 **Picture it**
 
@@ -126,6 +136,13 @@ Underneath is a pile of data and algorithms that must be both enormous (the whol
 - **Battery and bandwidth** on the phone: send little, cache a lot.
 - Out of scope: street-level imagery, satellite imagery pipelines, ads, transit schedule ingestion detail, business listings management.
 
+### Real-life example: Google Maps on a Bengaluru commute 🟢
+
+You open Google Maps at 8:45 am and ask for a route to the office. The map appears instantly because the squares for your area are already cached nearby.
+It offers three routes, the fastest one in blue, and says "34 min".
+Thousands of phones on Outer Ring Road are reporting crawling speeds, so that stretch turns red.
+Halfway there, a jam forms ahead, and the app offers a new route that saves 6 minutes.
+
 **Glossary.**
 - **Tile**: a square piece of the map at one zoom level. **Zoom level z**: 0 is the whole world in one tile; each level doubles resolution in x and y.
 - **Vector tile**: a tile that holds geometry (lines, polygons, labels) the phone draws itself. **Raster tile**: a pre-drawn image (PNG or JPEG).
@@ -156,7 +173,17 @@ flowchart LR
     RT -->|"route + ETA"| U
 ```
 
+## Common beginner mistakes 🟢
+
+- **Drawing the map per user on the server** → nothing can be cached and the servers melt → pre-cut identical tiles and serve them from a CDN.
+- **Putting the user's blue dot or route inside the tile** → every tile becomes personal and uncacheable → draw personal things as an overlay on the phone.
+- **Running plain Dijkstra on the whole country** → tens of millions of points explored per route → pre-process with contraction hierarchies.
+- **Storing the road graph in a graph database and querying it live** → far too slow for 10,000 routes a second → load a compact graph into memory.
+- **Using raw GPS points as road speeds** → points are 10-30 m off and land on the wrong road → map-match first, then take the median speed per road.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the three jobs: draw tiles, find routes, and turn phone pings into traffic. **Next we open the box**: the services behind each job, and step by step how the map is shown, a route is planned and a trip is navigated.
 
 ```mermaid
 flowchart TB
@@ -186,9 +213,9 @@ flowchart TB
 ```
 
 **Showing the map, step by step**
-1. The app knows its viewport (centre and zoom). It computes which `z/x/y` tiles cover the screen.
+1. The app knows its viewport (the part of the map on screen: centre and zoom). It computes which `z/x/y` tiles cover the screen.
 2. It requests each tile from the CDN. A hit returns in tens of milliseconds.
-3. A miss goes to the tile service, which reads a pre-built tile from object storage (or renders it for deep zoom levels) and returns it with a long `Cache-Control`.
+3. A miss goes to the tile service, which reads a pre-built tile from object storage (or renders it for deep zoom levels) and returns it with a long `Cache-Control` (a header telling the CDN and phone how long they may keep it).
 4. The app draws the tiles, and overlays live traffic colours and its own blue dot.
 
 **Planning a route, step by step**
@@ -225,7 +252,7 @@ Numbers:  ~350k tile req/s peak, ~1.2M probes/s peak, ~1 ms route query (estimat
 
 **In plain words:** each zoom level cuts the world into 4 times more squares than the last. A tile's name is just its zoom, column and row.
 
-The world map is projected with **Web Mercator** onto a square, then cut into `2^z x 2^z` tiles at zoom `z`.
+The world map is projected with **Web Mercator** (the standard way web maps flatten the round earth) onto a square, then cut into `2^z x 2^z` tiles at zoom `z`.
 
 | Zoom | Tiles at this level (4^z) | Approx metres per pixel at the equator (256 px tiles) | Typical view |
 | --- | --- | --- | --- |
@@ -335,7 +362,7 @@ erDiagram
 - **Road graph** is stored in a compact binary format built offline, loaded into memory by the routing shards. It is **not** served from a live database: queries are far too frequent and need pointer-chasing speed.
 - **Live traffic** is a separate overlay: a map `edge_id -> current_speed` in a cache (for example Redis or an in-process snapshot refreshed each minute). The routing engine reads it when computing edge costs.
 - **Historical speeds** (168 buckets per edge: 24 hours x 7 days) give a baseline and let the system predict the future ("leave at 8 am Monday"). See [[Time-Series and Columnar Storage]].
-- **Places** (shops, landmarks) are documents in a search index, each tagged with a geohash or H3 cell for the "near me" filter. See [[Geospatial Indexing]].
+- **Places** (shops, landmarks) are documents in a search index, each tagged with a geohash or H3 cell (a short code for a small patch of the earth) for the "near me" filter. See [[Geospatial Indexing]].
 
 > [!tip] Remember
 > Static base map, in-memory routing graph, live traffic overlay: three layers of data, each with its own freshness.
@@ -344,7 +371,7 @@ erDiagram
 
 | Decision | Options | Choice | Why |
 | --- | --- | --- | --- |
-| Tile format | raster PNG/JPEG; vector (protobuf) | vector | much smaller, crisp at any zoom, rotatable, client styles (dark mode) without new tiles; cost: client GPU work |
+| Tile format | raster PNG/JPEG; vector (protobuf, a compact binary format) | vector | much smaller, crisp at any zoom, rotatable, client styles (dark mode) without new tiles; cost: client GPU work |
 | Tile generation | pre-render everything; render on demand; hybrid | hybrid: pre-build z0-z14, on-demand for deeper | counts explode at high zoom (4^18 is 68 B); most deep tiles are never requested |
 | Tile addressing | `z/x/y`; quadkey; S2 cell id | `z/x/y` | simple, universal client libraries, cacheable URLs |
 | Routing algorithm | Dijkstra; A*; contraction hierarchies; hub labels | contraction hierarchies | milliseconds on continental graphs after preprocessing; Dijkstra takes seconds |
@@ -365,6 +392,14 @@ flowchart TD
     CCH --> M
 ```
 
+### Things people confuse this with 🟡
+
+| System | What it does | How it differs from maps and navigation |
+| --- | --- | --- |
+| [[Case Study - Ride Sharing and Proximity]] | Finds nearby drivers and matches them to riders | Uses maps and ETAs, but its core is tracking moving cars and matching, not drawing or routing |
+| [[Geospatial Indexing]] alone | Answers "what is within 2 km?" | Only nearness; no roads, turns or travel times |
+| GPS | The phone working out its own position from satellites | Just gives a location; the maps system turns it into a map, a route and an ETA |
+
 ## 6. Trade-offs 🟡
 
 - **Pre-build vs on-demand tiles.** Pre-building z0 to z14 (about 358 M tiles) costs storage and build time but makes the common zoom levels instant and cacheable. On-demand rendering at deeper zoom saves storage but adds origin load and cold-start latency, absorbed by the CDN after the first request.
@@ -373,7 +408,7 @@ flowchart TD
 - **Fastest vs most predictable route.** The fastest route now may become slow by the time you reach the jam. Using predicted speeds (historical blend) at the time you will be on each segment, called **time-dependent routing**, costs more compute but gives better ETAs.
 - **Freshness vs stability of traffic.** Updating speeds every few seconds reacts quickly but causes flicker and route oscillation. Smoothing windows of 1 to 2 minutes trade reaction speed for stability.
 - **Privacy vs coverage.** Probes are essential for traffic but sensitive. Anonymise with rotating ids, drop the first and last minutes of a trip, aggregate per road and require a minimum number of devices before publishing a speed.
-- **When simpler wins.** A delivery company with 500 vehicles in one city can run an open-source engine (OSRM or Valhalla) on one machine with OpenStreetMap data, use a hosted tile provider, and skip live probes.
+- **When simpler wins.** A delivery company with 500 vehicles in one city can run an open-source engine (OSRM or Valhalla, free routing servers) on one machine with OpenStreetMap data, use a hosted tile provider, and skip live probes.
 
 ```mermaid
 flowchart LR
@@ -384,12 +419,14 @@ flowchart LR
 
 ## 7. In production 🔴
 
-- **Real examples.** OpenStreetMap publishes the planet's road data.
+> 🟡 → 🔴 **You now know** the three paths, the tile maths, the sizing, the API and the three data layers. **Next is the advanced part**: production failures, how tiles are served through the CDN, fast routing on a planet-sized graph, live traffic and ETA, search, offline maps and scaling.
+
+- **Real examples.** OpenStreetMap (a free, volunteer-built world map) publishes the planet's road data.
   - OSRM and Valhalla are open-source routing engines whose documentation describes contraction hierarchies and tiled graphs.
   - Mapbox's public vector tile specification defines the tile format used by many providers.
   - DeepMind published that graph neural networks improved ETA accuracy in Google Maps (see the DeepMind blog source above).
   - Uber open-sourced the H3 cell index, widely used for grouping locations (see [[Case Study - Ride Sharing and Proximity]]).
-- **Failure: a CDN region loses cache.** The origin sees a stampede. Fix: request coalescing at the CDN (one origin fetch per tile), origin shield tier, and serving stale tiles while revalidating. See [[CDN and Edge]].
+- **Failure: a CDN region loses cache.** The origin sees a stampede. Fix: request coalescing at the CDN (one origin fetch per tile), origin shield tier (one extra CDN layer that all edge servers ask before the origin), and serving stale tiles while revalidating. See [[CDN and Edge]].
 - **Failure: bad map data.** A wrongly one-way street or a missing bridge sends cars the wrong way. Fix: map builds are **versioned**, validated by automated checks (graph connectivity, reroute sanity on sample trips), canaried to a small share of traffic, and **rolled back** by repointing to the previous version.
 - **Failure: traffic pipeline lag or outage.** Routing keeps working with historical speeds (graceful degradation). The route response includes a flag that live traffic was unavailable.
 - **Failure: ETA drift.** Predicted vs actual arrival diverge in a city during rain or an event. Monitor error per city and hour; fall back to historical-only if the live model goes bad.
@@ -486,7 +523,7 @@ Real systems keep a baseline hierarchy for historical speeds and apply live corr
 
 A cross-region route is stitched: route to border nodes on each side and combine with a small high-level graph of border-to-border times, precomputed. See [[Partitioning and Sharding]].
 
-**Snapping and turn costs.** The start and end points are first snapped to the nearest road edge using a spatial index (geohash or R-tree). Turn restrictions and turn costs (left across traffic is slower than right) are modelled by splitting nodes or using edge-based graphs, which increases graph size but gives realistic ETAs.
+**Snapping and turn costs.** The start and end points are first snapped to the nearest road edge using a spatial index (geohash or R-tree, a tree of nested rectangles for fast "what is near this point"). Turn restrictions and turn costs (left across traffic is slower than right) are modelled by splitting nodes or using edge-based graphs, which increases graph size but gives realistic ETAs.
 
 **Alternatives.** Offer two or three routes by finding paths that are different enough (a penalty or "via node" method), not just the second shortest, which would be the same road with a tiny detour.
 
@@ -515,7 +552,17 @@ flowchart LR
     ML --> R
 ```
 
-**Map matching.** A GPS point can be 10 to 30 m off, and in an urban canyon far more. A point near a parallel service road could belong to either road. **Hidden Markov map matching** (Newson and Krumm) treats the true road as hidden state.
+**Map matching.**
+
+```mermaid
+flowchart LR
+    G["noisy GPS points"] --> C["candidate roads near each point"]
+    C --> S["score: distance + is the path drivable?"]
+    S --> P["most likely road path"]
+    P --> T["time spent on each road = speed sample"]
+```
+
+A GPS point can be 10 to 30 m off, and in an urban canyon (streets between tall buildings that bounce signals) far more. A point near a parallel service road could belong to either road. **Hidden Markov map matching** (Newson and Krumm) treats the true road as hidden state.
 
 For each point it scores candidate edges by distance (emission probability) and scores transitions between consecutive points by how plausible the driving path is compared with the straight-line move. Finding the best sequence is the Viterbi algorithm.
 
@@ -556,7 +603,7 @@ flowchart LR
 
 **Address geocoding** uses a hierarchy: country, region, city, street, house number. A parser splits the text into components, matches each against the hierarchy, and interpolates house numbers along the street segment when exact points are missing. **Reverse geocoding** finds the nearest edge or polygon containing the point.
 
-**Autocomplete** serves prefixes quickly from a trie or an edge-n-gram index, biased by the user's location (see [[Case Study - Search Autocomplete]]). Details of indexing are in [[Search Engines and Inverted Indexes]].
+**Autocomplete** serves prefixes quickly from a trie (a tree where each step adds one letter) or an edge-n-gram index (an index of every word's starting pieces), biased by the user's location (see [[Case Study - Search Autocomplete]]). Details of indexing are in [[Search Engines and Inverted Indexes]].
 
 **Why it matters.** Local ranking, not global popularity, is what makes results feel right.
 
@@ -639,6 +686,26 @@ Watch cost: probe processing and CDN egress dominate the bill, so shrink tile by
   - "Multiple stops in best order" (travelling salesman heuristics over a distance matrix from the routing engine).
   - "Real-time ETA sharing" (a pub-sub channel per share link; see [[Scaling WebSockets]]).
 - **Decision guides to cite.** [[Choosing Storage for Files, Search and Analytics - Decision Guide]], [[Choosing a Caching Strategy - Decision Guide]], [[Choosing a Database - Decision Guide]], [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]], [[Choosing Compute, Scaling and Deployment - Decision Guide]].
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is a map tile?
+> A small square piece of the map at one zoom level, named `z/x/y`.
+
+> [!question]- Easy: why can tiles be served by a CDN?
+> They look the same for everyone, so one cached copy serves millions.
+
+> [!question]- Easy: where does live traffic come from?
+> Anonymous location pings (probes) from phones on the road.
+
+> [!question]- Medium: how many tiles are there at zoom 10?
+> 4^10, about 1 million.
+
+> [!question]- Medium: why are contraction hierarchies so much faster than plain Dijkstra?
+> Pre-computed shortcut edges let the search climb onto the highway network and explore a few hundred points instead of millions.
+
+> [!question]- Medium: an 800 m road drops from 50 km/h to 20 km/h. How does its travel time change?
+> From about 58 seconds to 144 seconds.
 
 ## 12. Cheat sheet 🟢
 

@@ -31,6 +31,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3, the on-call steps (4, 5, 6), fixes (7), the worked example (8), and 9-10.
 > - 🔴 **Interview / SDE-3 prep?** Add 11, 12 and 13. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Incident Response]]: in an outage, one person leads, you stop the damage first, and you post regular updates.
+> - [[Production Debugging Playbook]]: check "what changed" and scope the problem (which path, which region, which client) before digging in.
+
 **From zero, in 60 seconds** 🟢
 
 Your site is built to handle a normal amount of visitors.
@@ -79,6 +83,12 @@ Each needs a different fix, so you must tell them apart fast.
 | Rate limiting | Capping requests per client | 100 req/min per IP |
 | Load shedding | Rejecting low-value work on purpose to save the core | Turn off recommendations |
 | Bottleneck | The one part that runs out first | The database connection limit |
+| Origin | Your own servers behind the CDN | the API pods and database |
+| L3/L4 vs L7 | Network-level floods (raw packets, connections) vs application-level floods (real-looking HTTP requests) | UDP flood vs 10,000 `/search` calls |
+| SYN flood | Sending many "start a connection" packets and never finishing, to fill the server's waiting list | thousands of half-open connections |
+| Botnet | Many hacked machines controlled by one attacker | 50,000 home routers |
+| Challenge | A check that real browsers pass easily and simple bots fail | CAPTCHA or a JavaScript test |
+| HPA | Kubernetes's Horizontal Pod Autoscaler: adds pods when load rises | 12 → 40 pods |
 
 **Picture it**
 
@@ -108,7 +118,7 @@ Where it breaks: in a store you can see who is who; online, bots look like users
 Symptoms the on-call sees:
 
 - Request rate jumps to 5-50 times normal within minutes (the exact multiple varies; the alert fires on a ratio to the same hour last week).
-- p99 latency climbs, then 502/503/504 appear. CPU, connection counts or database load saturate.
+- p99 latency climbs, then 502/503/504 (bad gateway, service unavailable, gateway timeout) appear. CPU, connection counts or database load saturate.
 - Health checks start failing, pods restart, and capacity shrinks exactly when it is needed.
 
 User impact: pages time out, checkout fails, logged-in users get kicked out, and legitimate customers are indistinguishable from the flood at the application layer.
@@ -117,6 +127,13 @@ Example for this note: ShopRight runs a flash sale at 12:00. Normal load is 800 
 
 > [!tip] Remember
 > A spike has three possible faces: wanted, unwanted, or self-inflicted. The fix differs for each.
+
+### Real-life example: a ticket sale opening 🟢
+
+Think of tickets for a big concert going on sale on BookMyShow at noon.
+At 12:00 the request rate jumps 20 times: most are real fans, but some are bots trying to grab tickets to resell.
+The team serves the event page from the CDN cache, puts fans in a virtual queue, and adds a challenge for clients that refresh hundreds of times a minute.
+Real fans get through slowly but surely, while the bots mostly get stopped at the edge before they ever reach the booking servers.
 
 ## 2. Mental model 🟢
 
@@ -141,23 +158,44 @@ flowchart LR
     APP -. "degrade features" .-> X3[Optional work skipped]
 ```
 
+## Common beginner mistakes 🟢
+
+- **Scaling out first** → more web pods open more database connections and the database falls over → find the bottleneck, protect it, then scale only that tier.
+- **Blocking by country or User-Agent alone** → bots use home IPs everywhere and fake their User-Agent, while real users get blocked → block by behaviour: rate per client, path mix, missing cookies.
+- **Fighting a flood inside the app** → bad requests still eat your bandwidth and CPU → block at the edge (CDN, WAF) first.
+- **Treating a retry storm as an attack** → blocking your own clients hides the real failure → fix the failing service and add backoff with jitter.
+- **Leaving emergency rules in place forever** → real users stay blocked weeks later → review every temporary rule after the incident.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a spike can be real users, an attack, or your own retries, and that each needs a different fix. **Next we open the box**: the three kinds of attack, how to tell a crowd from an attack, the first five minutes, and checks at each layer from the network to the database.
 
 ### The three attack families
 
 **In plain words:** attackers can exhaust bandwidth, exhaust connection tables, or exhaust application work. Each needs a different defense.
 
+**Step by step:**
+1. Is your network link full of tiny packets? That is a volumetric (L3/L4) flood; only your provider can scrub (filter) it upstream.
+2. Are there thousands of half-open connections (`SYN-RECV`)? That is a SYN flood; SYN cookies and the load balancer handle it.
+3. Is the network fine but CPU or the database maxed by normal-looking HTTP calls to one path? That is an L7 flood; use WAF rules, caching and challenges.
+
 | Layer | Name | Example | Tell-tale sign | Defended by |
 | --- | --- | --- | --- | --- |
-| L3/L4 volumetric | UDP/ICMP/DNS-amplification flood | Fills the network pipe | Link saturated, tiny packets, source IPs spoofed or reflector IPs | Upstream scrubbing (ISP, Cloudflare, AWS Shield) |
-| L4 protocol | SYN flood | Fills the half-open connection queue | Many `SYN-RECV` sockets in `ss -s`, `conntrack` table full | SYN cookies, LB with SYN protection |
-| L7 application | HTTP flood, slow requests (Slowloris), expensive endpoints | Real HTTP requests to `/search` | Normal-looking requests, high CPU or DB load, one path dominates | WAF rate rules, caching, challenges, auth |
+| L3/L4 volumetric | UDP/ICMP/DNS-amplification flood | Fills the network pipe | Link saturated, tiny packets, source IPs spoofed (faked) or reflector IPs (innocent servers tricked into sending at you) | Upstream scrubbing (ISP, Cloudflare, AWS Shield) |
+| L4 protocol | SYN flood | Fills the half-open connection queue | Many `SYN-RECV` sockets in `ss -s`, `conntrack` table (Linux's list of tracked connections) full | SYN cookies, LB with SYN protection |
+| L7 application | HTTP flood, slow requests (Slowloris: holding connections open by sending data very slowly), expensive endpoints | Real HTTP requests to `/search` | Normal-looking requests, high CPU or DB load, one path dominates | WAF rate rules, caching, challenges, auth |
 
 **Why it matters:** an L7 flood will not show up as a saturated network link, so teams that only watch bandwidth miss it.
 
 ### Spike or attack: telling them apart
 
 **In plain words:** real customers browse normally and buy things. Attackers hit the same page over and over from odd places.
+
+**Step by step:**
+1. Compare the path mix with the same hour last week. Real users spread across home, product, cart and pay.
+2. Check concentration: do a few IPs or one odd User-Agent send a big share?
+3. Check cookies and conversions: bots often have no cookies and never buy.
+4. Check the calendar: a sale or push notification makes a real crowd likely, but both can happen together.
 
 ```mermaid
 flowchart TD
@@ -173,7 +211,7 @@ flowchart TD
 ```
 
 > [!warning] Common mistake
-> Blocking by geography or User-Agent alone. Botnets use residential IPs across many countries and spoof User-Agent strings. Use behaviour (request rate per client, path mix, missing cookies) as the primary signal.
+> Blocking by geography or User-Agent alone. Botnets use residential IPs (home internet addresses) across many countries and spoof User-Agent strings. Use behaviour (request rate per client, path mix, missing cookies) as the primary signal.
 
 > [!tip] Remember
 > Compare the request mix to a normal day. Real users browse then buy; bots hammer one URL.
@@ -190,6 +228,14 @@ flowchart TD
 4. **Communicate.** Declare the severity per [[Incident Response]], open the incident channel, name the Incident Commander, post a status-page update ("degraded performance, investigating") within about 10 minutes, and repeat every 15-30 minutes.
 
 ## 5. Diagnosis flowchart 🟡
+
+**In plain words:** follow the clues from "traffic is up" to the right kind of fix.
+
+**Step by step:**
+1. Is the network link itself full? Call the provider for upstream scrubbing.
+2. If not, does one path or a few clients dominate? Treat it as an L7 attack: edge rate limits and challenges.
+3. Do requests per client rise right after errors? It is a retry storm: fix the failing part.
+4. Otherwise it is real users: cache, degrade extras, and scale the tier that is actually full.
 
 ```mermaid
 flowchart TD
@@ -212,6 +258,11 @@ flowchart TD
 ### 6.1 Is it real traffic? Dashboards and PromQL
 
 **In plain words:** compare today with the same hour last week, and see which pages get the extra traffic.
+
+**Step by step:**
+1. Divide today's request rate by the same hour last week (`offset 1w`): 10 means a 10x spike.
+2. List the top paths with `topk`: one path at 80% suggests abuse; an even spread suggests real users.
+3. Check the error ratio and p99 per path to see what is actually hurting.
 
 Assume the standard HTTP metrics `http_requests_total{service,path,status}` and `http_request_duration_seconds_bucket` (names depend on your instrumentation; see [[Metrics and Prometheus]]).
 
@@ -238,6 +289,11 @@ What it means: a spike multiple of 10 with one path taking 80% of requests point
 
 **In plain words:** sort the request log by IP address, country and browser type. Attacks usually stand out.
 
+**Step by step:**
+1. Count requests per IP in the last few minutes of access logs.
+2. If 20 IPs send 60% of traffic, block those IPs at the edge.
+3. If thousands of IPs each send a little with the same path pattern and odd User-Agent, write a WAF rule on that fingerprint instead.
+
 ```bash
 # Top client IPs in the last 10000 nginx log lines (combined log format, IP is field 1)
 tail -n 10000 /var/log/nginx/access.log | awk '{print $1}' | sort | uniq -c | sort -rn | head -20
@@ -255,6 +311,11 @@ What it means: if 20 IPs account for 60% of requests, block them. If thousands o
 
 **In plain words:** check whether the machines are running out of open connections, not just CPU.
 
+**Step by step:**
+1. Run `ss -s`: many `syn-recv` and falling `estab` (established) means a SYN flood.
+2. Run `conntrack -C` and compare with `nf_conntrack_max`: near the max means packets get dropped at random.
+3. Check `dmesg` for "table full, dropping packet" to confirm.
+
 ```bash
 ss -s                                   # socket summary: estab, synrecv, timewait
 ss -tn state syn-recv | wc -l           # half-open connections
@@ -269,6 +330,11 @@ What it means: thousands of `syn-recv` sockets with a falling `estab` count indi
 ### 6.4 Kubernetes and the app tier
 
 **In plain words:** check whether your app copies are full, restarting, or waiting to scale up.
+
+**Step by step:**
+1. `kubectl top pod`: are CPU and memory near limits?
+2. Check the HPA: is it already at its maximum replicas, with pods stuck `Pending` (no machine room)?
+3. Take a goroutine and CPU profile from one pod to see whether requests wait on the database or burn CPU.
 
 ```bash
 kubectl top pods -n shop --sort-by=cpu | head
@@ -291,6 +357,11 @@ What it means: a goroutine count that grows with request rate and sits in `net/h
 
 **In plain words:** more app copies mean more database connections. Make sure the database isn't the part that breaks.
 
+**Step by step:**
+1. Count database connections by state; near `max_connections` means the database is the choke point.
+2. Look at the heaviest running queries in `pg_stat_activity`.
+3. Check the Redis hit ratio: if it drops during the spike, attackers may be using random query strings that skip the cache.
+
 ```sql
 -- PostgreSQL: how many connections and what are they doing?
 SELECT state, count(*) FROM pg_stat_activity GROUP BY state ORDER BY 2 DESC;
@@ -311,6 +382,11 @@ What it means: many `active` or `idle in transaction` connections near `max_conn
 
 **In plain words:** time each step of the request to see where the extra traffic causes waiting.
 
+**Step by step:**
+1. Run the `curl -w` command from outside.
+2. Large `connect` means the network or the load balancer's queue.
+3. Large `ttfb` (time to first byte) with a normal connect means the app or the database.
+
 ```bash
 curl -s -o /dev/null -w "dns:%{time_namelookup} connect:%{time_connect} tls:%{time_appconnect} ttfb:%{time_starttransfer} total:%{time_total}\n" https://shop.example.com/
 ```
@@ -329,7 +405,7 @@ What it means: a large `connect` time points at the network or LB queue, a large
 | L7 flood on an endpoint | WAF rate-based rule per IP on that path (AWS WAF rate-based rules, Cloudflare rate limiting). Challenge (CAPTCHA/JS) instead of hard block if unsure. |
 | Expensive endpoint | Cache for 10-30 s at the CDN, disable the feature behind a flag, or require auth. |
 | Real surge, DB bound | Shed non-critical traffic with a priority queue, raise pool limits carefully, add read replicas. |
-| Real surge, stateless tier bound | Raise HPA max replicas; check node capacity so pods actually schedule. |
+| Real surge, stateless tier (servers that keep no data of their own) bound | Raise HPA max replicas; check node capacity so pods actually schedule. |
 | Retry storm | Stop the failing upstream, add exponential backoff with jitter, open circuit breakers. |
 
 Example AWS WAF rate rule (rate-based statement; the limit is evaluated per source IP over a sliding window that defaults to 5 minutes and can be set to 1, 2, 5 or 10 minutes with `EvaluationWindowSec`):
@@ -389,7 +465,7 @@ Times are illustrative.
 | 12:00:00 | Flash sale starts. Marketing sent a push notification at 11:59. |
 | 12:00:40 | Alert: error ratio above 5% for 1 minute. On-call opens the dashboard: req/s 9,000 vs 800 normal. |
 | 12:02 | Top paths: `/api/search` is 55% of traffic. Cart and checkout traffic is only 6%, lower than a normal ratio. Top 40 IPs account for 35% of requests. |
-| 12:04 | Database CPU is 95%. `pg_stat_activity` shows 180 active queries, mostly `SELECT ... FROM products WHERE name ILIKE ...`. |
+| 12:04 | Database CPU is 95%. `pg_stat_activity` shows 180 active queries, mostly `SELECT ... FROM products WHERE name ILIKE ...` (a case-insensitive text match that cannot use a normal index). |
 | 12:05 | IC declared (SEV2). Status page updated. Decision: protect checkout. |
 | 12:06 | Search suggestions feature flag turned off. DB CPU drops to 70%. |
 | 12:08 | WAF rate rule on `/api/search`, 300 requests per 5 minutes per IP, plus a JS challenge for clients with no cookie. Bot traffic falls by about 60%. |
@@ -400,7 +476,7 @@ Times are illustrative.
 
 Lessons: scaling web pods did nothing until the DB was protected; the `ILIKE '%term%'` query had no index; search had no rate limit.
 
-Actions: trigram index or a search engine (see [[Search Engines and Inverted Indexes]]), per-IP rate limit, CDN caching rules, a load test of search at 10 times peak.
+Actions: trigram index (an index on 3-letter pieces of text, so `ILIKE '%term%'` can be fast) or a search engine (see [[Search Engines and Inverted Indexes]]), per-IP rate limit, CDN caching rules, a load test of search at 10 times peak.
 
 ```mermaid
 sequenceDiagram
@@ -430,7 +506,7 @@ sequenceDiagram
 | Volumetric DDoS | Link saturated | Provider scrubbing | Anything at the app layer |
 | Scraper | Steady, crawls all products | Bot management, auth for bulk data | Ignoring it (it costs money) |
 | Retry storm | Requests per client rise after errors | Fix upstream, backoff and jitter | More capacity (it amplifies) |
-| Credential stuffing | Spike on `/login`, high 401 rate | Per-account and per-IP limits, MFA | Caching |
+| Credential stuffing (trying leaked username-password pairs) | Spike on `/login`, high 401 rate | Per-account and per-IP limits, MFA (a second login factor, like an OTP) | Caching |
 
 ## 10. Trade-offs 🟡
 
@@ -441,6 +517,9 @@ sequenceDiagram
 - **Always-on DDoS protection** costs more than on-demand but reacts in seconds.
 
 ## 11. In production 🔴
+
+> 🟡 → 🔴 **You now know** how to classify a spike, where to look at each layer, and which fix fits which cause. **Next is the advanced part**: alerts and dashboards for real fleets, and the deeper mechanics (connection fan-out, SYN cookies, amplification, slow attacks, retry amplification) interviewers probe.
+
 
 - Alert on the ratio to last week's same hour, not just an absolute number.
 - Dashboards: req/s by path, 5xx ratio, p99, DB connections, cache hit ratio, HPA replicas against max, LB active connections.
@@ -536,13 +615,13 @@ If each of 3 layers retries 3 times, one user failure produces up to 27 calls on
 > Confirm the metric and blast radius, check recent changes and campaigns, then classify the traffic (real, attack, or retry storm) using path mix and client distribution. Mitigate before diagnosing: edge rate limiting or caching, shed non-critical work, scale only the saturated tier. Announce the incident and keep the checkout path alive.
 
 > [!question]- How do you distinguish a DDoS from a legitimate flash crowd?
-> Compare the request mix with a normal day: real users follow journeys (browse, cart, pay), bots hit one or few paths. Check concentration by IP, ASN and User-Agent, cookie presence, and conversion rate. A matching business event (a sale, a notification) makes a flash crowd likely, but the two can overlap.
+> Compare the request mix with a normal day: real users follow journeys (browse, cart, pay), bots hit one or few paths. Check concentration by IP, ASN (the network, such as one ISP or cloud, an IP belongs to) and User-Agent, cookie presence, and conversion rate. A matching business event (a sale, a notification) makes a flash crowd likely, but the two can overlap.
 
 > [!question]- Why might adding more servers make the incident worse?
 > A non-scalable shared dependency (database connections, a lock, a third-party rate limit) becomes the limit. More pods multiply demand on it. Fix the bottleneck with pooling, caching and load shedding, and then scale.
 
 > [!question]- What defenses work at each OSI layer?
-> L3/L4 volumetric floods need upstream scrubbing and anycast CDNs. SYN floods need SYN cookies and a protected LB. L7 floods need WAF rate rules, caching, challenges, auth and cheap endpoints. You layer them.
+> L3/L4 volumetric floods need upstream scrubbing and anycast CDNs (one IP served from many locations, so a flood is spread out). SYN floods need SYN cookies and a protected LB. L7 floods need WAF rate rules, caching, challenges, auth and cheap endpoints. You layer them.
 
 > [!question]- What is a retry storm and how do you stop one?
 > When a dependency fails and many clients retry at once, retries multiply the load and keep the dependency down. Stop by fixing or isolating the failing service, using exponential backoff with jitter, retry budgets, circuit breakers and load shedding.
@@ -567,6 +646,30 @@ If each of 3 layers retries 3 times, one user failure produces up to 27 calls on
 - Key PromQL: spike multiple with `offset 1w`, `topk` by path, error ratio, `histogram_quantile`.
 - Set server timeouts (`ReadHeaderTimeout`) against slow attacks.
 - Communicate early; postmortem after.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What are the three possible causes of a sudden traffic spike?
+> Real users, an attack (DDoS, scraping), or your own clients retrying.
+
+> [!question]- Where should you block bad traffic?
+> At the outermost layer you control: the CDN or WAF, before it reaches your servers.
+
+> [!question]- Name one thing a real crowd does that bots usually don't.
+> Follow a normal journey (browse, cart, pay) and carry cookies.
+
+🟡 Medium
+
+> [!question]- 8 pods with 20 DB connections each scale to 40 pods. The DB allows 200. What happens?
+> They want 800 connections; pods wait, health checks fail and pods restart. Use a pooler and cap concurrency.
+
+> [!question]- Thousands of `SYN-RECV` sockets and falling established connections. What is it?
+> A SYN flood; make sure SYN cookies are on and the load balancer's protection is enabled.
+
+> [!question]- Why does adding web pods not stop a volumetric flood?
+> The network link is full before traffic reaches the pods; only upstream scrubbing helps.
 
 ## Links
 

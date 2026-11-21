@@ -33,6 +33,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs) and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[LLD Interview Method]]: the step order these notes follow: clarify, entities, APIs, storage, code, edge cases.
+> - [[OOP in Go - Structs, Interfaces, Embedding]]: Go has no classes or inheritance; you share code with small interfaces and fields.
+> - [[Strategy and Template Method]]: a rule behind an interface you can swap, here the dice.
+
 **From zero, in 60 seconds** 🟢
 
 These are two simple board games, used as a warm-up coding round. In tic-tac-toe, two players take turns marking a grid, and three in a row wins. In snake and ladder, players roll a die and move; snakes send you down and ladders send you up. Both share the same shape: players take turns, each move is checked, and after each move you check for a winner. That shared shape becomes one **Game** interface.
@@ -65,6 +70,10 @@ The trick is to share the common parts and keep each game's rule small and fast.
 | Jump map | A map from a start cell to an end cell | `{16: 6, 4: 14}` |
 | Injected dice | Dice passed in as an interface, so tests can fix rolls | Scripted dice returns 6, then 2 |
 | Machine coding | A timed round where you write working code | 60 minutes, runnable program |
+| Mutex | A lock so only one goroutine changes the game at a time | Two "Alice moves" requests take turns |
+| Atomic | Done as one step nobody can cut into | Check turn, place mark, pass turn |
+| Dependency injection | Hand a part in from outside instead of building it inside | `NewSnakeLadder(..., dice)` |
+| Deterministic | Gives the same result every run | Scripted dice 3, 5, 5, 6 |
 
 **Picture it**
 
@@ -123,7 +132,7 @@ Both games must be testable without randomness and safe if moves arrive concurre
 - What if a roll goes past the last cell? *Assume: the player does not move (exact finish required). Some house rules bounce back instead; that is a strategy swap.*
 - Can a snake end on a ladder's foot (a chain)? *Assume: no; the constructor rejects chains so every move does at most one jump.*
 - Do players start on cell 1 or off the board? *Assume: off the board at position 0; the first roll of 3 puts them on cell 3.*
-- Is this one process with a CLI, or a server? *Assume: an in-memory library; a CLI or an HTTP handler drives it.*
+- Is this one process with a CLI (command-line program), or a server? *Assume: an in-memory library; a CLI or an HTTP handler drives it.*
 
 ### Functional
 
@@ -141,7 +150,7 @@ Both games must be testable without randomness and safe if moves arrive concurre
 ### Out of scope
 
 - A graphical UI, network play and matchmaking.
-- An AI opponent (minimax) for tic-tac-toe.
+- An AI opponent (minimax: try every future move and pick the best worst case) for tic-tac-toe.
 - Persisting games across restarts (discussed in Step 6).
 
 ## Step 2: Actors and use cases 🟢
@@ -172,6 +181,8 @@ The hardest use case is the move itself: validate, apply, check for a win, and o
 Modelling insight: **a snake and a ladder are the same entity**, a jump. Separate `Snake` and `Ladder` types add nothing but duplicate code. The **snake and ladder board is not a grid**; it is a size and a map. The **tic-tac-toe board needs the grid** only to reject a taken cell; the win check never reads it.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know what the two games share (players, turns, status) and what differs (the move rule). Next we open the box: how the types link, the API, how a game is saved, and the Go code with the O(1) counters.
 
 ```mermaid
 classDiagram
@@ -226,7 +237,7 @@ classDiagram
     SnakeLadder ..> Jump : built from
 ```
 
-- Both games **compose** `turns`; neither inherits from a base game. In Go, a small shared helper plus a shared interface replaces the Java-style abstract `Game` class.
+- Both games **compose** `turns` (hold it as a field); neither inherits (gets code from a parent class) from a base game. In Go, a small shared helper plus a shared interface replaces the Java-style abstract `Game` class.
 - `SnakeLadder` **depends on** the `Dice` interface, not on `math/rand`.
 - `Jump` is only constructor input; at runtime the game holds the jumps as a map.
 
@@ -255,7 +266,7 @@ type Game interface {
 // SnakeLadder: Play(playerID string) (TurnResult, error)
 ```
 
-Why `Move` and `Play` are not on the interface: their inputs differ (a cell versus nothing), and forcing one `Move(any)` signature would push type assertions into every caller. Keep the interface to what is truly shared.
+Why `Move` and `Play` are not on the interface: their inputs differ (a cell versus nothing), and forcing one `Move(any)` signature would push type assertions (runtime checks like `v.(Cell)` to get the real type back) into every caller. Keep the interface to what is truly shared.
 
 ## Step 6: Storage and repositories 🟡
 
@@ -283,8 +294,8 @@ CREATE TABLE moves (
 );
 ```
 
-- **The move log is the source of truth.** Replaying the moves rebuilds the counters and positions, which is why the snake and ladder log stores the roll that was used, not just the new position.
-- **Two requests for the same turn:** the primary key `(game_id, seq)` lets only one insert of move number `seq` succeed; the loser gets a unique violation and maps it to 409. The `version` column gives the same guarantee on the `games` row (see [[Locking - Optimistic vs Pessimistic]]).
+- **The move log is the source of truth** (the one record everything else is rebuilt from). Replaying the moves rebuilds the counters and positions, which is why the snake and ladder log stores the roll that was used, not just the new position.
+- **Two requests for the same turn:** the primary key `(game_id, seq)` lets only one insert of move number `seq` succeed; the loser gets a unique violation (the database refuses a duplicate key) and maps it to 409 (HTTP "Conflict"). The `version` column gives the same guarantee on the `games` row (see [[Locking - Optimistic vs Pessimistic]]).
 - Repository interface, if you are asked for one: `GameRepo.Load(id)`, `GameRepo.AppendMove(id, seq, move)` ([[Repository and Unit of Work]]).
 
 ## Step 7: Patterns 🟡
@@ -301,7 +312,7 @@ CREATE TABLE moves (
 Patterns not used, and why:
 
 - No abstract `BaseGame` with template methods: the two move rules share almost nothing, so a base class would be empty glue. A shared interface plus a helper is enough.
-- No `Cell` or `Board` class for snake and ladder: a cell has no behaviour; a size and a map cover it (YAGNI).
+- No `Cell` or `Board` class for snake and ladder: a cell has no behaviour; a size and a map cover it (YAGNI: "you aren't gonna need it").
 - No State pattern objects: a game has three statuses with no per-state behaviour beyond "reject moves when over".
 
 ## Folder structure 🟡
@@ -648,7 +659,7 @@ var (
 
 ## Test cases 🟡
 
-The tests cover every win direction, the draw, every rejection, a 5 x 5 board, scripted snakes and ladders, the overshoot rule, bad configurations, and two concurrency cases. Run with `go test -race ./...` (Go 1.24.4, all pass).
+The tests cover every win direction, the draw, every rejection, a 5 x 5 board, scripted snakes and ladders, the overshoot rule, bad configurations, and two concurrency cases. Run with `go test -race ./...` (`-race` turns on Go's race detector, which flags unsafe shared access) (Go 1.24.4, all pass).
 
 **In plain words:** Tests for every way to win, bad moves, a bigger board and scripted dice rolls.
 
@@ -853,6 +864,8 @@ func TestSnakeLadderConcurrentPlayers(t *testing.T) {
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know both working games and their tests. Next is interview depth: tricky moves (centre cell, win on the last cell), bad snake layouts, two requests for one turn, and extensions like k-in-a-row.
+
 | Edge case | What happens | How the design handles it |
 |---|---|---|
 | Wrong player moves | Out-of-turn move | `ErrNotYourTurn`; checked before any state change |
@@ -887,7 +900,7 @@ func TestSnakeLadderConcurrentPlayers(t *testing.T) {
 | Several dice | `Dice` returns a sum; or inject `[]Dice` |
 | More than two tic-tac-toe players | ±1 sums break; keep a counter per player per line: O(p · n) memory |
 | Spectators and a networked game | Observer on each move; server holds the game and a move log with a unique sequence number |
-| AI opponent | Minimax with alpha-beta over the counters (out of scope here) |
+| AI opponent | Minimax with alpha-beta (a trick that skips moves that cannot change the answer) over the counters (out of scope here) |
 
 Tradeoffs chosen:
 
@@ -955,7 +968,7 @@ Redraw it from memory:
 > Rejecting chains guarantees at most one jump per move and rules out loops such as a ladder from 10 to 20 and a snake from 20 to 10.
 
 > [!question]- Two HTTP requests for the same player's move arrive together. What happens?
-> In memory, the game mutex makes the move one atomic step; the second request sees that the turn has passed and gets `ErrNotYourTurn` (409). In a database, insert the move with the next sequence number under a primary key `(game_id, seq)`, or bump a version column with a compare-and-set; only one insert or update succeeds.
+> In memory, the game mutex makes the move one atomic step; the second request sees that the turn has passed and gets `ErrNotYourTurn` (409). In a database, insert the move with the next sequence number under a primary key `(game_id, seq)`, or bump a version column with a compare-and-set (update only if the version is still the one you read); only one insert or update succeeds.
 
 > [!question]- How would you support "k in a row wins" on a large board?
 > The counters assume a full line. Instead, after each move walk outwards from the new mark in the four directions (horizontal, vertical, two diagonals), counting matching marks on both sides until k or a gap. That is O(k) per move and still avoids scanning the board.
@@ -969,6 +982,26 @@ Redraw it from memory:
 - Exact finish: overshoot means no move; bounce-back is a strategy swap.
 - Inject the dice; script it in tests.
 - One mutex per game makes a turn atomic; `(game_id, seq)` unique key in a database.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 Why is a snake and a ladder the same thing in code?
+> Both mean "land on cell a, move to cell b"; one `map[int]int` covers both, and the numbers show which way it goes.
+
+> [!question]- 🟢 What happens if a roll goes past the last cell?
+> The player stays where they are (exact finish rule).
+
+> [!question]- 🟢 Why is the dice an interface?
+> So tests can pass `ScriptedDice` with fixed rolls and check exact positions.
+
+> [!question]- 🟡 X adds +1, O adds -1. On 3 x 3, which counter value means O won a row?
+> -3; only a line made fully of O's sums to -n.
+
+> [!question]- 🟡 The last free cell is filled and makes a line. Draw or win?
+> Win, because the win check runs before the draw check.
+
+> [!question]- 🟡 Why reject a snake that ends on a ladder's foot?
+> It makes chains and possible loops; with no chains, each move does at most one jump.
 
 ## Links 🟢
 

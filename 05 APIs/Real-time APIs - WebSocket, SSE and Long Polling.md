@@ -37,6 +37,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: normally the client sends a request and the server answers once.
+> - [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]: HTTP/2 can carry many requests at once over one connection; HTTP/1.1 cannot.
+> - [[TCP - Handshake, Reliability, Flow and Congestion Control]]: TCP is the reliable, in-order byte pipe that HTTP and WebSocket run on.
+
 **From zero, in 60 seconds** 🟢
 
 Normal web requests work like asking a question: the app asks, the server answers once, done. But a chat message should appear the moment your friend sends it — without the app asking over and over.
@@ -82,6 +87,12 @@ Real-time APIs keep a connection open so the server can push the message to you 
 | Heartbeat (ping/pong) | A tiny message that proves the link is still alive | Ping every 30 s |
 | Event ID / offset | A number on each event so a client can resume | "Send me everything after 41" |
 | Fan-out | Sending one event to many listeners | One price update to 100,000 screens |
+| SSE | Server-Sent Events: one long HTTP response the server keeps adding events to | live cricket score feed |
+| WebSocket | A two-way message channel that starts as an HTTP request | WhatsApp Web chat |
+| Frame | One small WebSocket message unit with a header | a text frame `"hi"` |
+| Backpressure | Slowing or dropping when a receiver cannot keep up | a slow phone gets only the latest price |
+| Broker | A middleman that passes events between servers | Redis, Kafka |
+| Idle timeout | A proxy closing a connection that has been quiet too long | AWS ALB: 60 s |
 
 **Picture it**
 
@@ -115,6 +126,12 @@ A trading screen shows prices that change several times a second. With plain req
 
 The same problem appears in chat, notifications, live dashboards, collaborative editing, multiplayer games and streaming LLM output.
 
+### Real-life example: Cricbuzz and WhatsApp Web 🟢
+
+A live cricket score page only needs the server to push "4 runs!" to you; you never send anything back. That fits SSE.
+WhatsApp Web needs both directions: you type messages, and others' messages arrive instantly. That fits WebSocket.
+If your Wi-Fi blips, both reconnect and ask for "everything after the last message I saw", so nothing is lost.
+
 ## 2. Mental model 🟢
 
 - **Short polling:** you call the shop every five minutes to ask "is my order ready?".
@@ -122,7 +139,17 @@ The same problem appears in chat, notifications, live dashboards, collaborative 
 - **SSE:** the shop keeps a one-way radio channel open to you and announces updates. If the signal drops, your radio retunes automatically and asks for "everything after announcement 41".
 - **WebSocket:** an open phone line. Both sides talk whenever they want.
 
+## Common beginner mistakes 🟢
+
+- **Short polling every second** → thousands of requests that mostly say "nothing new" → use long polling, SSE or WebSocket.
+- **Choosing WebSocket when data only flows to the client** → extra complexity → use SSE.
+- **No heartbeats** → a proxy closes the quiet connection after 60 s → send a ping more often than the idle timeout.
+- **No event IDs** → after a reconnect, events in the gap are lost → number events and resume from the last ID.
+- **Unbounded send buffers** → one slow client eats server memory → cap the buffer and drop or disconnect slow clients.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the four ways to get live updates and which fits which job. **Next we open the box**: exactly what travels on the wire for long polling, SSE and WebSocket, and how each recovers from a dropped connection.
 
 | | Short polling | Long polling | SSE | WebSocket |
 | --- | --- | --- | --- | --- |
@@ -147,6 +174,13 @@ The cursor makes it lossless: events that arrive between two requests are picked
 ### Server-Sent Events
 
 **In plain words:** the server answers once and never finishes the answer: events keep flowing down as little text blocks. The browser even reconnects by itself and says "I had read up to event 42".
+
+**Step by step:**
+1. The page runs `new EventSource("/prices")`, which sends a normal `GET`.
+2. The server answers `200` with `Content-Type: text/event-stream` and keeps the response open.
+3. Each price change is written as `id: 42` + `data: {...}` + a blank line; the page's listener fires.
+4. Wi-Fi drops. The browser waits the `retry` time, reconnects, and sends `Last-Event-ID: 42`.
+5. The server replays events 43 and 44, then continues live.
 
 The browser's `EventSource` sends a `GET`. The server answers `200` with `Content-Type: text/event-stream` and never finishes the response. Each event is a block of `field: value` lines ended by a blank line:
 
@@ -186,6 +220,13 @@ sequenceDiagram
 
 **In plain words:** it starts as a normal web request that asks "can we switch to a raw two-way channel?" After the 101 answer, both sides exchange small framed messages on the same connection.
 
+**Step by step:**
+1. The browser sends `GET /chat` with `Upgrade: websocket`.
+2. The server checks the `Origin` and the session cookie, then answers `101 Switching Protocols`.
+3. Now both sides send frames on the same TCP connection: you send "hi", the server sends new messages.
+4. Every 25 s the server sends a ping and the browser answers pong, so proxies see activity.
+5. On a deploy the server sends close code `1001`; the client reconnects after a short random delay and resumes from its last sequence number.
+
 **The handshake** is an ordinary HTTP/1.1 request that asks to switch protocols:
 
 ```http
@@ -211,7 +252,7 @@ Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
 
 - Each frame has a FIN bit, a 4-bit **opcode**, a mask bit, a payload length (7 bits, or 16 or 64 bits for larger payloads) and, from clients, a 4-byte masking key.
 - Opcodes: `0x1` text (must be UTF-8), `0x2` binary, `0x0` continuation, and the control frames `0x8` close, `0x9` ping and `0xA` pong.
-- **Client-to-server frames must be masked**, and server-to-client frames must not be. Masking XORs the payload with a random key so that a malicious page cannot make the bytes look like a valid HTTP request to a confused intermediary (a cache-poisoning attack). It is not encryption; use `wss://` (TLS) for that.
+- **Client-to-server frames must be masked**, and server-to-client frames must not be. Masking XORs (mixes, bit by bit) the payload with a random key so that a malicious page cannot make the bytes look like a valid HTTP request to a confused intermediary (a cache-poisoning attack). It is not encryption; use `wss://` (TLS) for that.
 - **Fragmentation:** a large message can be split into a first frame (FIN=0), continuation frames, and a final frame (FIN=1). Control frames carry at most 125 bytes, are never fragmented, and may be sent between fragments, so a ping is not stuck behind a 50 MB message.
 - **Close codes:** `1000` normal closure, `1001` going away (server shutdown or page navigation), `1008` policy violation (for example a failed auth check), `1009` message too big, `1011` server internal error.
 	- `1006` is never sent on the wire: it is what the API reports when the connection died **without** a close frame, such as a network drop or an idle timeout.
@@ -627,6 +668,8 @@ Side by side, topic by topic:
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how long polling, SSE and WebSocket work and recover. **Next is the advanced part**: authentication on connect, heartbeats and idle timeouts, resume, backpressure, scaling across many servers, and protocol edge cases.
+
 - **Real systems:** Slack delivers real-time events to apps over WebSockets (Socket Mode). Exchanges publish market-data tickers over public WebSocket feeds. Collaborative editors such as Figma sync document changes over WebSockets. LLM APIs from OpenAI and Anthropic stream generated tokens as SSE.
 
 ### Authentication on connect
@@ -782,6 +825,26 @@ Full handlers are in [[WebSockets and SSE in Go]].
 - Heartbeat under every idle timeout (ALB 60 s); reconnect with jittered backoff; resume from the last seq.
 - Bounded send buffers: drop, conflate or disconnect slow consumers; never block fan-out.
 - No built-in delivery guarantee: seq numbers, acks, replay buffer, dedupe.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: which technique only sends data from server to client?
+> SSE.
+
+> [!question]- Easy: what status code ends a successful WebSocket handshake?
+> `101 Switching Protocols`.
+
+> [!question]- Easy: why send heartbeats?
+> So proxies do not close a quiet connection, and so dead connections are noticed.
+
+> [!question]- Medium: 100,000 screens poll every 5 s. How many requests per second?
+> 20,000, most of them returning nothing new.
+
+> [!question]- Medium: how does an SSE client avoid losing events after a reconnect?
+> The browser sends `Last-Event-ID`, and the server replays everything after it.
+
+> [!question]- Medium: what does close code `1006` mean?
+> The connection died without a close frame, for example a network drop or idle timeout.
 
 ## Links 🟢
 

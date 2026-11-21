@@ -46,6 +46,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (the five questions and family map), 4 (worked example), 5, 6 and 9 (drills).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 10 and 11. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[SQL vs NoSQL]]: relational databases keep strict tables with joins; NoSQL stores give up some of that for easy scaling or flexible shapes.
+> - [[Transactions and ACID]]: a transaction is a group of changes that all happen or none happen, even if the server crashes halfway.
+
 **From zero, in 60 seconds** 🟢
 
 There is no single best database. Each kind is built for one shape of work.
@@ -92,6 +96,12 @@ One kind of database is great at the first job, another at the second. Choosing 
 | Index | An extra structure that makes a lookup fast | Index on `email` |
 | Sharding | Splitting data across machines by a key | Users A-M on node 1, N-Z on node 2 |
 | Replica | A copy of the data on another machine | Read replica for reports |
+| Key-value store | Give a key, get a value; nothing else | `session:abc` → user 42 |
+| Document store | Each record is a whole JSON document | one menu with all its sections |
+| Wide-column store | Rows grouped by a partition key, sorted inside it; built for huge write volume | messages by `channel_id`, newest first |
+| Columnar (OLAP) | Stores each column together so big sums are fast | revenue by city over 2 years |
+| NewSQL | SQL and transactions spread across many machines and regions | Spanner, CockroachDB |
+| Source of truth | The one store whose data wins if copies disagree | Postgres, with search and cache rebuilt from it |
 
 **Picture it**
 
@@ -143,6 +153,22 @@ Think of databases as **different kinds of storage rooms**.
 
 The analogy breaks at consistency: a real filing room has no concept of two copies disagreeing, while distributed databases must decide what happens when they do.
 
+### Real-life example: what big apps actually picked 🟢
+
+Instagram started on PostgreSQL and grew it by splitting data across many Postgres databases.
+Discord stores its chat messages in ScyllaDB (a Cassandra-style wide-column store), because it gets a huge stream of writes read back by channel.
+Banks and UPI apps keep balances in relational databases with transactions, because a transfer must never half-happen.
+Almost every app also runs Redis for sessions and caches, and a search engine for its search box, fed from the main database.
+
+## Common beginner mistakes 🟢
+
+- **Starting from a product name** ("let's use MongoDB") → the store may not fit your queries → write down the access patterns first, then pick the family.
+- **Choosing NoSQL "for scale" at 1,000 users** → you lose joins and transactions for scale you do not need → one PostgreSQL with replicas goes very far.
+- **Making Elasticsearch or Redis the only copy** → a lost node or a reindex loses data → keep the truth in a durable database and rebuild the others from it.
+- **Designing DynamoDB tables like SQL tables** → queries you did not plan for become full scans → design the keys from the exact queries up front.
+- **Running dashboards on the orders database** → huge scans slow down checkout → copy data to a columnar warehouse for analytics.
+
+
 ```mermaid
 flowchart LR
     Q["Your access pattern"] --> A["Point lookup by key"]
@@ -159,6 +185,8 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** each database family is a different kind of storage room. **Next we open the box**: five questions that pick the family, a flowchart that turns answers into a choice, and a map from family to engine.
+
 ### The five questions
 
 **In plain words:** Do not start from product names. Answer five questions about your data, and the shortlist writes itself.
@@ -174,6 +202,12 @@ flowchart LR
 ### The decision flowchart
 
 **In plain words:** Answer one yes/no question at a time and follow the arrows. You end up at the family that fits.
+
+**Step by step (orders for a food app):**
+1. Do I need transactions and joins? Yes: an order, its payment and its status must change together.
+2. That puts me in relational territory. Will one machine hold it? 2 million orders a day is about 2 GB a day, so yes for years.
+3. So: PostgreSQL. No sharding yet, read replicas for reports.
+4. Now repeat for driver locations: no joins, 25,000 overwrites a second, only "latest position" matters. That is key-value: Redis.
 
 ```mermaid
 flowchart TD
@@ -210,7 +244,7 @@ flowchart TD
 | Relational | Tables, foreign keys, SQL | PostgreSQL, MySQL | Transactions, joins, ad hoc queries |
 | Document | JSON documents | MongoDB, Couchbase | Nested aggregates read as a unit |
 | Key-value | Key to opaque value | Redis, DynamoDB, Riak | Lookup by key at low latency |
-| Wide-column | Partition key plus sorted clustering columns |
+| Wide-column | Partition key plus sorted clustering columns (the columns that order rows inside one partition) |
 
 Cassandra, ScyllaDB, HBase | Huge write volume, time-ordered reads per partition |
 | Graph | Nodes and edges | Neo4j, Neptune | Multi-hop relationship queries |
@@ -276,9 +310,9 @@ Numbers below are rough orders of magnitude for orientation. They come from publ
 
 **In plain words:** Both are safe, proven choices. Postgres has more features; MySQL is simple and very common at big web companies.
 
-Both are mature relational engines. Pick PostgreSQL for richer SQL (window functions, JSONB, partial indexes, extensions such as PostGIS) and strict correctness. Pick MySQL when the team knows it, or when you rely on its replication and tooling ecosystem (Vitess, ProxySQL).
+Both are mature relational engines. Pick PostgreSQL for richer SQL (window functions, JSONB (stored, indexable JSON), partial indexes, extensions such as PostGIS) and strict correctness. Pick MySQL when the team knows it, or when you rely on its replication and tooling ecosystem (Vitess, ProxySQL).
 
-Uber publicly described moving from Postgres to MySQL in 2016 because of write amplification in Postgres indexes and replication design at their scale. That is a case where a specific scale pattern drove the choice, not a general verdict.
+Uber publicly described moving from Postgres to MySQL in 2016 because of write amplification (one logical change causing many physical writes) in Postgres indexes and replication design at their scale. That is a case where a specific scale pattern drove the choice, not a general verdict.
 
 Deep notes: [[Relational Schema Design]], [[SQL Essentials]], [[Indexing Fundamentals]], [[Isolation Levels and MVCC]].
 
@@ -370,6 +404,8 @@ flowchart LR
 ```
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how to pick a family and an engine for each kind of data. **Next comes the senior view**: what real companies chose and why, how each family fails in production, why the storage engine decides the database type, consistency choices, scale thresholds and safe migrations.
 
 ### Real company examples
 
@@ -561,7 +597,27 @@ Avoid:
 - Polyglot is normal; one source of truth, many derived views.
 - Interview formula: access pattern, choice, reason, accepted cost.
 
-## 13. Links 🟢
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is the first question to ask when picking a database?
+> What shape is the data and how will it be read (the access patterns)?
+
+> [!question]- (easy) Which family fits money and inventory?
+> Relational (or NewSQL), because they need transactions and strong consistency.
+
+> [!question]- (easy) Why is a search engine not your source of truth?
+> It is a derived copy that can lag and be rebuilt; the truth lives in a durable database.
+
+> [!question]- (medium) 100k drivers ping every 4 s, and only the latest position matters. Which store?
+> A key-value store in memory, such as Redis (about 25,000 overwrites a second).
+
+> [!question]- (medium) When would you pick NewSQL over PostgreSQL?
+> When you need SQL transactions and also horizontal scale or multi-region writes beyond one primary.
+
+> [!question]- (medium) Why does DynamoDB need access patterns up front?
+> You can only query efficiently by the keys you designed; anything else becomes a scan.
+
+## Links 🟢
 
 - Before this: [[SQL vs NoSQL]], [[Transactions and ACID]], [[System Design Interview Framework]]
 - Relational depth: [[Relational Schema Design]], [[SQL Essentials]], [[Indexing Fundamentals]], [[Index Types and Index Design]], [[Query Plans and EXPLAIN]], [[Isolation Levels and MVCC]], [[Locking - Optimistic vs Pessimistic]]
@@ -572,7 +628,7 @@ Avoid:
 - Case studies: [[Case Study - Key-Value Store]], [[Case Study - Chat System]], [[Case Study - Payment System]], [[Case Study - Leaderboard and Top-K]]
 - Next: [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]]
 
-## Links 🟢
+ 🟢
 
 ### Watch on YouTube
 

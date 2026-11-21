@@ -35,6 +35,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[LLD Round Playbook]]: how to run the clock in an LLD round: say the plan, agree scope fast, code the one hard method, test it. This note applies that to product-style questions.
+> - [[LLD Interview Method]]: the step order for solving one LLD problem (requirements, entities, APIs, storage, code). Here the API and storage steps simply move earlier.
+
 **From zero, in 60 seconds** 🟢
 
 This note covers one kind of interview round: design a small part of a quick-delivery grocery app, like placing an order.
@@ -84,6 +88,13 @@ This round tests whether your design stops that, and whether a retry creates a s
 | Transaction | A group of DB writes that all happen or none do | Reserve stock + insert order |
 | Idempotency key | An ID that makes a retry do nothing new | Same key → same order returned |
 | Compensation | Undoing an earlier step after a later one fails | Release stock if saving the order fails |
+| Conditional update | An `UPDATE` with a check in its `WHERE`, so it changes 0 rows if the check fails | `... WHERE available_qty >= 1` |
+| Row lock | The database makes other writers of the same row wait their turn | Buyer 2 waits for buyer 1's update |
+| Deadlock | Two transactions each wait for a row the other holds, forever | Order A locks milk then bread; B locks bread then milk |
+| 409 Conflict | The HTTP code for "your request clashes with the current state" | "Out of stock" |
+| Sweeper | A background job that cleans up stuck work | Frees reservations older than 15 minutes |
+| p99 | The time 99 of every 100 requests finish within | p99 of `PlaceOrder` = 250 ms |
+| Winner test | A test where many goroutines race for one item and exactly one must win | 50 buyers, 1 carton, 1 order |
 
 **Picture it**
 
@@ -129,11 +140,27 @@ Think of the round as **a design review of one pull request** for a real service
 
 Analogy: a building inspector does not care how pretty the floor plan is; they check the load-bearing walls. In this round the load-bearing walls are the invariants (stock never negative, one rider per order, one order per retry).
 
+## Common beginner mistakes 🟢
+
+- **Checking stock in Go, then subtracting in a second step** → three buyers can all pass the check → do "subtract only if enough is left" in one SQL `UPDATE`.
+- **Using a Go mutex as the final answer** → it only works inside one server, and there are many → say the real guarantee is the database row.
+- **Returning on a save error without releasing the stock** → every database hiccup leaks inventory → release the reservation before returning.
+- **Ignoring retries** → a timed-out client taps again and gets two orders → require an idempotency key with a unique constraint.
+- **Drawing Parking Lot-style class trees** → the interviewer never hears how the last unit is protected → name the invariant first and show where it is enforced.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the danger (overselling) and the fix idea (let the database check and subtract in one step). **Next we open the box**: the round formats, the order of a hybrid round, why API and schema come first, and which practice problems match.
 
 ### Round formats
 
 **In plain words:** The same question can be asked as talk-only, code-only, or a mix. Know which one you're in.
+
+**Step by step:**
+1. Talk-only: you draw APIs, tables and the order flow; maybe write one method as pseudocode.
+2. Code-only: you build a small program that runs, in 60-120 minutes.
+3. Hybrid (most common here): API and tables on the board, then one real Go method in an editor.
+4. Ask the recruiter which one, so you know where to spend your time.
 
 | Format | What you produce | How it is scored | Prep note |
 | --- | --- | --- | --- |
@@ -144,6 +171,14 @@ Analogy: a building inspector does not care how pretty the floor plan is; they c
 ### Flow of a hybrid round
 
 **In plain words:** Scope, then API, then table design, then Go code for one hard method, then a test, then follow-up questions.
+
+**Step by step (60 minutes):**
+1. Minutes 0-5: scope. "One city, many dark stores, pay later is out of scope."
+2. Minutes 5-12: API, `POST /orders` with an `Idempotency-Key` header.
+3. Minutes 12-20: tables `inventory` and `orders`, with `CHECK (available_qty >= 0)`.
+4. Minutes 20-45: code `PlaceOrder` in Go.
+5. Minutes 45-52: winner test, 50 buyers and 1 carton.
+6. Minutes 52-60: follow-ups like partial stock and hot items.
 
 ```mermaid
 flowchart TD
@@ -159,10 +194,16 @@ flowchart TD
 
 **In plain words:** The data lives in a shared database, not in one program's memory. So the database rules are where safety really lives.
 
+**Step by step:**
+1. The app runs on 10 servers. Each has its own memory, so a lock in one server means nothing to the others.
+2. All 10 share one database row: store 7, milk, `available_qty = 1`.
+3. So the "never below zero" rule must live on that row, in the table design.
+4. That is why the API and the table come before the Go classes.
+
 In a puzzle LLD the state lives in memory, so classes come first. In a product LLD the state lives in a database shared by many service instances, so:
 
 1. The API fixes the contract: what a retry looks like (`Idempotency-Key` header), what errors the client sees (409 when out of stock).
-2. The schema decides where the invariant is enforced: a `CHECK (available_qty >= 0)` and a conditional `UPDATE` hold across all instances; a Go mutex holds only inside one process.
+2. The schema decides where the invariant is enforced: a `CHECK (available_qty >= 0)` (a rule the database checks on every write) and a conditional `UPDATE` hold across all instances; a Go mutex (an in-memory lock) holds only inside one process.
 3. Only then do the Go types follow, as thin wrappers around those guarantees.
 
 The general 10-step order is in [[LLD Interview Method]]; this round just pulls steps 5–6 (APIs, storage) earlier.
@@ -177,6 +218,11 @@ flowchart LR
 ### Typical problems and where to practise them
 
 **In plain words:** A short list of common questions, what each one really tests, and where to practise.
+
+**Step by step:**
+1. Read the question and find its "last unit" rule: last carton, last rider, last coupon use, last seat.
+2. Find that problem in the table below.
+3. Practise it in the linked note until you can code the core method in about 25 minutes.
 
 | Problem as asked | What it probes | Practise with |
 | --- | --- | --- |
@@ -272,9 +318,9 @@ WHERE  store_id = $1 AND product_id = $2 AND available_qty >= $3;
 
 Run one such statement per item inside one transaction, and roll back if any returns 0 rows.
 
-Two concurrent transactions on the same row serialise on the row lock: the second one re-evaluates `available_qty >= $3` after the first commits (PostgreSQL 17, READ COMMITTED), so it sees the new value and affects 0 rows.
+Two concurrent transactions on the same row serialise on the row lock (take turns): the second one re-evaluates `available_qty >= $3` after the first commits (PostgreSQL 17, READ COMMITTED, the default mode where each statement sees data saved before it started), so it sees the new value and affects 0 rows.
 
-To avoid deadlocks between two multi-item orders, update items in a fixed order (sort by `product_id`). The full lock discussion is in [[Locking - Optimistic vs Pessimistic]].
+To avoid **deadlocks** (two transactions each waiting for a row the other holds) between two multi-item orders, update items in a fixed order (sort by `product_id`). The full lock discussion is in [[Locking - Optimistic vs Pessimistic]].
 
 ### The race you must name
 
@@ -305,6 +351,8 @@ sequenceDiagram
 The old version of this code reserved stock, then saved the order, and returned on a save error without releasing the stock, so every DB hiccup leaked inventory. It also used a raw `"reserved"` string.
 
 The version below fixes both, adds an idempotency key and falls back to the next store when the nearest one loses the race. The in-memory `MemInventory` stands in for the SQL above: its single mutex plays the role of the row lock.
+
+**What this code does, in plain words:** `PlaceOrder` first checks the idempotency key and returns the old order on a retry. Then it tries stores from nearest to farthest: reserve every item, and if one item is short, release what it took and try the next store. Once reserved, it saves the order; if saving fails, it releases the stock before returning the error.
 
 ```go
 package order
@@ -586,7 +634,7 @@ func TestRejectsBadItems(t *testing.T) {
 
 Measured: `go vet ./...` is clean and `go test -race -count=1 ./...` passes on Go 1.24 (the test uses `for i := range 50`, which needs Go 1.22 or later; 5 tests, 50 concurrent orders in the winner test).
 
-One honest gap to say out loud: `ByIdemKey` followed by `Save` is check-then-act, so two concurrent requests with the same key could both pass the check. In PostgreSQL the `UNIQUE (user_id, idempotency_key)` constraint closes that gap: the second insert fails, and the handler then reads and returns the first order. See [[Idempotency and Idempotency Keys]].
+One honest gap to say out loud: `ByIdemKey` followed by `Save` is **check-then-act** (look first, act second, with a gap in between), so two concurrent requests with the same key could both pass the check. In PostgreSQL the `UNIQUE (user_id, idempotency_key)` constraint closes that gap: the second insert fails, and the handler then reads and returns the first order. See [[Idempotency and Idempotency Keys]].
 
 ## 5. Variants and comparison 🟡
 
@@ -598,7 +646,7 @@ One honest gap to say out loud: `ByIdemKey` followed by `Save` is check-then-act
 | Conditional `UPDATE ... WHERE available_qty >= n` | Row lock + re-check in the DB | Default answer for product rounds | Hot rows serialise; one row per (store, product) |
 | `SELECT ... FOR UPDATE` then update | Explicit pessimistic lock | Multi-step logic needs the read value | Longer lock hold, deadlock risk without ordering |
 | Optimistic `version` column | Update only if version unchanged, retry | Low contention | Retries storm on hot items |
-| Redis `DECRBY` + Lua check | Atomic in Redis, DB updated async | Flash sales, extreme QPS | Two sources of truth; needs reconciliation |
+| Redis `DECRBY` + Lua check (a tiny script Redis runs as one step) | Atomic in Redis, DB updated async | Flash sales, extreme QPS (queries per second) | Two sources of truth; needs reconciliation |
 | Reservation rows with TTL | Insert a hold that expires if unpaid | Payment happens later | Sweeper job; must be idempotent |
 
 ## 6. Trade-offs and when not to use 🟡
@@ -611,6 +659,9 @@ One honest gap to say out loud: `ByIdemKey` followed by `Save` is check-then-act
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the API, the schema, the race and a tested Go method. **Next is the senior view**: what an SDE-3 adds after the core works (failure paths, hot rows, monitoring, rollout), plus the tricky follow-ups.
+
+
 What an SDE-3 adds after the core method works. Bring one or two of these up yourself; that is the level signal.
 
 - **Multi-instance correctness:** invariants in the DB (CHECK, conditional UPDATE, unique keys), not in process memory.
@@ -619,7 +670,7 @@ What an SDE-3 adds after the core method works. Bring one or two of these up you
 - **Double assignment:** one rider, two orders; fix with a conditional `UPDATE riders SET status='busy' WHERE id=$1 AND status='idle'`. Practised in [[Delivery Partner Assignment]].
 - **Hot items:** one row per (store, milk) at peak becomes a lock hotspot; options are batching, per-store queues, or splitting stock into buckets. See [[Hot Keys and Hot Partitions]].
 - **Observability:** count `reserve_conflicts_total` by store, `reservation_leaks` found by the sweeper, p99 of `PlaceOrder`; trace one order across order, inventory and payment ([[Observability Fundamentals]]).
-- **Rollout:** new selection strategy behind a flag, compared in shadow mode first ([[Feature Flags]]).
+- **Rollout:** new selection strategy behind a flag, compared in shadow mode (the new rule runs alongside, but its answer is only logged) first ([[Feature Flags]]).
 
 ## 8. Deep dive 🔴
 
@@ -705,12 +756,28 @@ Write this down within an hour of the round:
 - Prove it: N goroutines, one winner, `go test -race`.
 - SDE-3 extras: multi-instance, failure paths, observability, rollout.
 
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is "overselling"?
+> Selling more units than you have, like three people all getting the last carton of milk.
+
+> [!question]- (easy) Why do API and schema come before Go classes in this round?
+> The stock lives in a shared database used by many servers, so the safety rule must live there.
+
+> [!question]- (easy) What does a 0-row result from the conditional `UPDATE` mean?
+> Not enough stock; answer 409 or try the next store.
+
+> [!question]- (medium) Why sort items by `product_id` before reserving them?
+> So two multi-item orders lock rows in the same order and can't deadlock.
+
+> [!question]- (medium) `Save` fails after `Reserve` worked. What must the code do?
+> Release the reservation (with `context.WithoutCancel`), and rely on a sweeper if the release fails too.
+
+> [!question]- (medium) How do you stop a retry creating a second order?
+> An `Idempotency-Key` with a unique constraint on `(user_id, idempotency_key)`; the retry gets the first order back.
+
 ## Links 🟢
 
 - **Before this:** [[LLD Round Playbook]], [[LLD Interview Method]], [[Concurrency for LLD]]
 - **Next:** [[Inventory Order Assignment (Dark Store)]], [[Delivery Partner Assignment]], [[Cart Checkout with Coupons]]
 - **Compare with:** [[Movie Ticket Booking]] (same reserve-then-pay shape with seats), [[System Design Interview Framework]] (the HLD round)
-
-### Watch on YouTube
-
-- [Zepto Hiring GenAI, Analyst, Product Engineer + more  / Job Description + Interview Rounds Explained](https://www.youtube.com/watch?v=zC9KndQNBFM) · Upasana Chaudhuri · 3 min · 636 views

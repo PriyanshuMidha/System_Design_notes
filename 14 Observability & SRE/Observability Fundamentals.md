@@ -45,6 +45,9 @@ A log line names one event with full detail. A counter does not know this invoic
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - Nothing. This note starts from zero. It helps if you have seen a web app answer a request, but that is all.
+
 **From zero, in 60 seconds** 🟢
 
 Your app is running on servers you can't see inside. When something breaks, you need clues.
@@ -90,6 +93,12 @@ Observability means writing down the right things so you can answer questions yo
 | Label / field | A key-value tag attached to data | `route="/invoices"` |
 | Cardinality | How many distinct values a label can take | `status` has ~5; `user_id` has millions |
 | Correlation | Linking signals with a shared ID | Same `trace_id` in the trace and the log line |
+| Time series | One line on a graph: a metric name plus one exact set of labels, with a value at each moment | `http_requests_total{route="/invoices", status="2xx"}` |
+| p99 latency | The time that 99 out of 100 requests finish within; the slowest 1% take longer | p99 = 800 ms |
+| Dashboard | A screen of graphs about one service | Grafana board with request rate and errors |
+| Collector | A middle program that receives telemetry, filters it and forwards it to storage | the OpenTelemetry Collector |
+| Sampling | Keeping only some traces to save money | keep 1 in 100 normal requests |
+| Exemplar | One real example trace ID pinned to a point on a metric graph | click a spike, open trace `T` |
 
 **Picture it**
 
@@ -119,11 +128,29 @@ Where it breaks: a flight recorder records everything for a short time; software
 
 ## 1. Why it exists 🟢
 
-InvoiceOps runs fine for months on four dashboards: request rate, error rate, p99 latency, and CPU. Then a customer reports "my invoice says pending for 20 minutes" — a question none of those four dashboards was built to answer, because nobody predicted "a single invoice gets stuck in the gap between the webhook handler and the worker that updates it."
+🟢 **Plain version:** Dashboards only show the questions someone thought of in advance. One day a customer asks something new, like "why is my one invoice stuck?". If the app already wrote detailed, searchable notes about every request, you can answer that today without changing any code. That ability is what "observability" means.
 
-A monitoring-only setup has no way to answer that: the dashboards show aggregates, not this one invoice. An observable system can answer it without a new deploy, because the telemetry was already detailed enough: filter the structured logs by `invoice_id=482`, follow its `trace_id` across the webhook handler, the database write and the worker's queue consumer, and see exactly which span took 20 minutes (queue consumer never fired — a dead consumer group, not a slow database).
+
+InvoiceOps runs fine for months on four dashboards: request rate, error rate, p99 latency, and CPU. Then a customer reports "my invoice says pending for 20 minutes" — a question none of those four dashboards was built to answer, because nobody predicted "a single invoice gets stuck in the gap between the webhook handler (the code that receives the payment provider's "payment done" call) and the worker (a background program) that updates it."
+
+A monitoring-only setup has no way to answer that: the dashboards show aggregates, not this one invoice. An observable system can answer it without a new deploy, because the telemetry was already detailed enough: filter the structured logs (log lines written as key-value fields, so you can search by any field) by `invoice_id=482`, follow its `trace_id` across the webhook handler, the database write and the worker's queue consumer, and see exactly which span took 20 minutes (queue consumer never fired — a dead consumer group, meaning the group of workers that read jobs from the queue had stopped, not a slow database).
 
 The practical difference: **monitoring requires the question to be known in advance** (so a dashboard or alert can be built for it); **observability requires only that enough structured detail was recorded** that an unpredicted question can still be answered from it.
+
+```mermaid
+flowchart LR
+    Q["New question:<br/>why is invoice 482 stuck?"] --> L["Search logs:<br/>invoice_id=482"]
+    L --> T["Follow its trace_id"]
+    T --> A["Answer: the queue worker never ran"]
+```
+
+### Real-life example: a late Swiggy order 🟢
+
+Think of a food app like Swiggy on a Friday night.
+A few customers say "my order shows 'placed' but the restaurant never got it".
+The overall graphs look fine: errors are low and pages are fast.
+Engineers search the logs for one of those order IDs, follow its trace, and see the "send to restaurant" step never ran for orders from one city.
+No dashboard was built for that question, but the recorded detail still answered it. That is observability.
 
 ## 2. Mental model 🟢
 
@@ -135,9 +162,26 @@ Think of the system as a black box you cannot open, but it leaves three kinds of
 
 None of the three alone reconstructs the incident. The diary has no sense of trend ("is this normal?"); the tally board has no sense of one specific case; the baton has no sense of why — only where the time went. Observability is the discipline of keeping all three, and keeping them joinable.
 
+## Common beginner mistakes 🟢
+
+- **Putting a user ID or raw URL in a metric label** → every new value makes a new time series, and memory grows until the metrics server falls over → use a small fixed set, like the route pattern `/invoices/{id}`, and put IDs in logs.
+- **Writing logs as free text** ("payment failed for 482") → you cannot filter or count by a field → write key-value logs: `invoice_id=482 status=failed`.
+- **Forgetting the `trace_id` in log lines** → you find a slow trace but cannot find its logs, so you start guessing → add the `trace_id` to every log line once, in middleware.
+- **Thinking more dashboards means more observability** → dashboards only answer questions you planned → keep detailed, linked data so new questions can be answered too.
+- **Keeping every trace forever** → the storage bill explodes → keep all errors and slow traces, and only a small share of normal ones.
+
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the three kinds of clues (metrics, logs, traces) and why a shared `trace_id` matters. **Next we open the box**: how the data travels from your app to a screen, how you click from a graph to one request, and why traces are only partly kept.
+
 **In plain words:** data flows from your app, through a collector, into stores for each signal, and then to dashboards. Shared IDs link the three signals together.
+
+**Step by step:**
+1. Your Go service records a log line, bumps a counter and times a span while handling `POST /invoices`.
+2. The tracing library sends the span to a collector; the log line goes to standard output, where a log agent picks it up.
+3. Prometheus visits the service every few seconds and reads the current counter values.
+4. Each store keeps its own kind of data: Prometheus for metrics, Tempo or Jaeger for traces, Loki or Elasticsearch for logs.
+5. Grafana shows all three on one screen, and the shared `trace_id` lets you click from one to the next.
 
 The telemetry pipeline that gets data from a running service to a human looking at a graph, with the correlation links that make cross-signal debugging possible:
 
@@ -159,11 +203,20 @@ flowchart TB
     GRAF -.->|"click a spike → jump to<br/>the matching traces and logs"| GRAF
 ```
 
-The solid arrows move data. The dashed arrows are **correlation**: an exemplar attaches one sampled trace ID to a histogram bucket, so clicking a latency spike in Grafana jumps straight to a real trace from that spike, and every log line carries the same `trace_id` the trace uses, so a trace's slow span names the exact log lines to read next.
+Names in the diagram, in plain words: the **OTel SDK** is the OpenTelemetry library inside your app that creates spans and metrics; **OTLP** is the format it uses to send them; the **OTel Collector** is a middle program that receives, filters and forwards them; **Prometheus** stores metrics, **Tempo/Jaeger** store traces, **Loki/Elasticsearch** store logs, and **Grafana** is the screen that shows them all; **Vector/Fluent Bit** are small log agents that read your app's output and ship it.
+
+The solid arrows move data. The dashed arrows are **correlation**: an exemplar attaches one sampled trace ID to a histogram bucket (a histogram counts requests into time ranges, like "under 100 ms" or "under 1 s"; each range is a bucket), so clicking a latency spike in Grafana jumps straight to a real trace from that spike, and every log line carries the same `trace_id` the trace uses, so a trace's slow span names the exact log lines to read next.
 
 ### Following a spike from metric to trace to log
 
 **In plain words:** you start broad (a graph) and zoom in: pick a slow example request, then read exactly what it logged.
+
+**Step by step:**
+1. The on-call engineer sees the p99 time for `/invoices` jump on a Grafana graph.
+2. That graph point carries an exemplar: one real slow request, trace `T`.
+3. Clicking it opens trace `T`. The waterfall shows the `db.update_invoice` step took 1.8 seconds.
+4. Searching logs for `trace_id=T` finds the line "lock wait on invoices row 482".
+5. So the cause is another transaction holding a row lock (a "wait your turn" marker on one database row), not a slow query plan (the steps the database chose to run the query).
 
 The debugging path the dashed correlation arrows above make possible, traced as a sequence:
 
@@ -193,6 +246,12 @@ Three clicks, three signals, no guessing: the metric said *when* and *how bad*, 
 
 **In plain words:** metrics are cheap but rough; logs and traces are detailed but cost more. Use each for what it is good at.
 
+**Step by step:**
+1. Need a trend, like "errors per second this week"? Use a metric. It is cheap even for years.
+2. Need the full story of one event, like "what happened to invoice 482"? Use logs.
+3. Need to know which service or step was slow for one request? Use a trace.
+4. Need to know which line of code burns the CPU? Use a profile (a sampled record of where the program spends its time).
+
 | Signal | Answers | Cardinality | Typical cost |
 | --- | --- | --- | --- |
 | Logs | What happened on this one event, in full detail | Unbounded fields are fine (the event itself is the key) | Highest per-event cost; expensive to store at full fidelity for long |
@@ -205,9 +264,24 @@ Three clicks, three signals, no guessing: the metric said *when* and *how bad*, 
 
 **In plain words:** metrics are usually collected by a scraper visiting your app. Traces are often only kept for a share of requests to save money.
 
+**Step by step:**
+1. Every 15 seconds or so, Prometheus calls `GET /metrics` on your service and copies the numbers. That is **pull**.
+2. When a request ends, the tracing library sends its finished spans to the collector right away. That is **push**.
+3. The collector waits until a whole trace is complete, say 2 seconds.
+4. It checks the trace: error or slower than 1 second? Keep it. Normal and fast? Keep only about 1 in 20.
+5. Only the kept traces are stored, so the bill stays small but the useful traces are never lost.
+
+```mermaid
+flowchart LR
+    S["Spans arrive"] --> W["Collector waits<br/>for whole trace"]
+    W --> D{"Error or slow?"}
+    D -- "yes" --> K["Keep"]
+    D -- "no" --> R["Keep a small share,<br/>drop the rest"]
+```
+
 Metrics are usually **pulled**: Prometheus scrapes each service's `/metrics` endpoint on a schedule (see [[Metrics and Prometheus]]). Traces and logs are usually **pushed**: the SDK sends completed spans and log lines to a collector as they happen, because waiting to be scraped would mean holding a request's full trace in memory indefinitely.
 
-A trace is either **sampled** or dropped before it is ever sent, because keeping every trace of a 10,000 RPS service is too expensive to store:
+A trace is either **sampled** or dropped before it is ever sent, because keeping every trace of a 10,000 RPS (requests per second) service is too expensive to store:
 
 - **Head sampling** decides at the start of a trace, cheaply, often "keep 1% of traces" — simple, but a sampled-out trace might have been exactly the slow or failing one you needed.
 - **Tail sampling** buffers a trace until it completes, then decides: this is why an OTel Collector exists in the middle of the pipeline — it can hold spans long enough to apply a rule like "always keep this trace if it errored or if it took over 1 second," which a head-sampling SDK cannot do, since it has not seen the outcome yet.
@@ -225,9 +299,9 @@ http_requests_total{path="/invoices/483", method="GET", status="200"} 1
 ...
 ```
 
-**Estimate:** at 500 req/s with mostly unique invoice IDs, this metric grows by roughly 500 new time series per second. Prometheus holds each active series in memory (tens of KB of overhead per series, including its label set and chunk buffers); at that growth rate the service's own metrics exhaust Prometheus's memory within hours — a cardinality explosion caused by the instrumentation, not by traffic.
+**Estimate:** at 500 req/s with mostly unique invoice IDs, this metric grows by roughly 500 new time series per second. Prometheus holds each active series in memory (tens of KB of overhead per series, including its label set and chunk buffers, the small in-memory blocks of recent samples); at that growth rate the service's own metrics exhaust Prometheus's memory within hours — a cardinality explosion caused by the instrumentation, not by traffic.
 
-The fix is the same idea in `## 3`: label by the **route template**, never the raw path:
+The fix is the same idea in `## 3`: label by the **route template** (the URL pattern with placeholders, like `/invoices/{id}`), never the raw path:
 
 ```text
 http_requests_total{route="/invoices/{id}", method="GET", status="2xx"} 48213
@@ -236,6 +310,21 @@ http_requests_total{route="/invoices/{id}", method="GET", status="2xx"} 48213
 Now the label set has exactly one entry per route × method × status class — bounded by the number of endpoints the service has, not by how many invoices exist. See [[Observability in Go Services]] for the Go middleware that records this correctly, and [[Metrics and Prometheus]] for how Prometheus stores and queries it.
 
 ## 5. Variants and comparison 🟡
+
+### Monitoring vs observability 🟡
+
+People mix these two up all the time.
+
+| | Monitoring | Observability |
+| --- | --- | --- |
+| Question | Known in advance ("is the error rate high?") | New, never planned ("why is this one invoice stuck?") |
+| Tool | Fixed dashboards and alerts | Detailed, linked logs, traces and metrics you can search |
+| Needs a code change for a new question? | Often yes | No, if the detail was already recorded |
+| Example | Alert when errors pass 2% | Find every request from one tenant that hit one slow step |
+
+### Golden signals, RED and USE
+
+In plain words: **saturation** means "how full" a resource is (a queue with 900 of 1,000 slots used), and **utilization** means "how busy" it is (CPU at 70%).
 
 | Model | What it groups metrics by | Use when |
 | --- | --- | --- |
@@ -256,20 +345,23 @@ RED and USE are the same four golden signals split by what they're measuring: RE
 
 ## 7. In production 🔴
 
-- **Real systems:** Google's four golden signals (SRE Book, ch. 6); the OpenTelemetry Collector as the standard vendor-neutral pipeline hop between every major APM vendor (Datadog, Honeycomb, Grafana Cloud) and open-source backends (Prometheus, Tempo, Loki); Netflix and Uber's widely cited adoption of wide structured events for request-level debugging.
+> 🟡 → 🔴 **You now know** how telemetry flows, how to click from a graph to one request, and how to keep labels small. **Next is the advanced part**: what breaks in real systems at large scale, what to watch on the telemetry pipeline itself, and the design choices interviewers ask about (pull vs push, where to sample, profiles).
+
+
+- **Real systems:** Google's four golden signals (SRE Book, ch. 6); the OpenTelemetry Collector as the standard vendor-neutral pipeline hop between every major APM vendor (APM means application performance monitoring, a paid tool that shows app health; Datadog, Honeycomb, Grafana Cloud) and open-source backends (Prometheus, Tempo, Loki); Netflix and Uber's widely cited adoption of wide structured events for request-level debugging.
 - **Failure modes → fixes:**
   - Cardinality explosion from an unbounded label → label by a closed set (route template, status class), never an ID; alert on Prometheus's own `prometheus_tsdb_symbol_table_size_bytes` or head series count.
   - No correlation ID → logs and traces are stuck as two separate investigations; inject `trace_id` into every log line at the framework/middleware level, not per call site.
   - Sampling too aggressively at the head → the one slow or failing trace you need was never kept; tail-sample at the collector and always keep errors and slow traces.
-  - Telemetry cost grows unbounded → set retention tiers (7 days full-fidelity, 90 days downsampled) and drop rules for noisy, low-value spans/labels at the collector, not in application code.
+  - Telemetry cost grows unbounded → set retention tiers (7 days full-fidelity, 90 days downsampled, meaning many points merged into fewer averaged points) and drop rules for noisy, low-value spans/labels at the collector, not in application code.
 - **What to monitor:** active time-series count per metric (catches cardinality growth early), trace sampling rate actually applied vs. configured, collector queue depth and dropped-span count, log/metric/trace ingestion cost per service.
 
 ## 8. Deep dive 🔴
 
 - **Instrumenting a new Go service, in order:** (1) structured logs with `log/slog` and a request-scoped logger carrying `trace_id` — see [[Structured Logging]]; (2) RED metrics via `client_golang` middleware with bounded labels — see [[Metrics and Prometheus]]; (3) traces via the OpenTelemetry Go SDK with context propagated through every goroutine and queue boundary — see [[Distributed Tracing with OpenTelemetry]] and [[Observability in Go Services]]; (4) wire exemplars so a histogram bucket links to a sampled trace; (5) add the service to one dashboard with a RED row and a USE row for its dependencies.
 - **Why pull for metrics, push for traces.** A pull model (Prometheus scraping `/metrics`) makes the monitoring system control its own load and makes "is this target up" trivially answerable (a failed scrape). It doesn't work for traces because a trace is a one-time event with an unpredictable duration, not a value you can re-read at the next scrape — it has to be pushed once it completes (or in a streaming fashion for very long traces).
-- **Agent vs. gateway collector topology.** A collector can run as a sidecar/daemonset agent next to every service (handles local batching, local redaction, lower network hop) and/or as a central gateway cluster (does tail sampling, which needs to see every span of a trace in one place — sampling decisions can't be made correctly if spans are scattered across per-node agents making decisions in isolation).
-- **Profiles as a fourth signal.** Continuous profiling (always-on, low-overhead CPU/memory sampling, e.g. pprof-based) answers "where in the code is the time going" at a level traces don't reach — a slow span says "this function call took 400ms," a profile says why, line by line. See [[Benchmarks, Profiling and Tracing]] for the Go tooling.
+- **Agent vs. gateway collector topology.** A collector can run as a sidecar/daemonset agent (a small helper copy running on the same machine or pod as each service) next to every service (handles local batching, local redaction, lower network hop) and/or as a central gateway cluster (does tail sampling, which needs to see every span of a trace in one place — sampling decisions can't be made correctly if spans are scattered across per-node agents making decisions in isolation).
+- **Profiles as a fourth signal.** Continuous profiling (always-on, low-overhead CPU/memory sampling, e.g. pprof-based; pprof is Go's built-in profiler) answers "where in the code is the time going" at a level traces don't reach — a slow span says "this function call took 400ms," a profile says why, line by line. See [[Benchmarks, Profiling and Tracing]] for the Go tooling.
 
 ## 9. Interview questions 🔴
 
@@ -301,6 +393,30 @@ RED and USE are the same four golden signals split by what they're measuring: RE
 - Metrics are pulled (scraped); traces and logs are pushed to a collector.
 - Tail-sample at the collector; always keep errors and slow traces.
 - Telemetry has a real cost: set retention tiers and drop rules deliberately.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Which signal tells you "how many errors per second this week"?
+> A metric. It is a cheap number tracked over time.
+
+> [!question]- What shared value lets you jump from a trace to its log lines?
+> The `trace_id`, written into every log line for that request.
+
+> [!question]- Why is `user_id` a bad metric label?
+> Each new user makes a new time series, so memory grows without limit. Put it in logs instead.
+
+🟡 Medium
+
+> [!question]- Why does tail sampling need a collector in the middle?
+> The keep-or-drop choice is made after the trace ends, so something must hold all its spans until then; the app's SDK decides too early.
+
+> [!question]- Why are metrics pulled but traces pushed?
+> A metric is a current value Prometheus can read again next time; a trace is a one-time event that must be sent once it finishes.
+
+> [!question]- What is an exemplar for?
+> It pins one real trace ID to a point on a metric graph, so a click on a spike opens an actual slow request.
 
 ## Links
 

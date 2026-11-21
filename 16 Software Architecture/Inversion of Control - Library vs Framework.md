@@ -29,6 +29,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Interfaces]]: a Go interface is a list of methods; `http.Handler` is just "anything with a `ServeHTTP` method". That is how a framework knows how to call your code.
+> - [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]: the "composition root" (`main`) builds the real objects and hands them in. Dependency injection in section 3 is exactly that.
+
 **From zero, in 60 seconds** 🟢
 
 A **library** is code you call when you want, like a calculator you pick up.
@@ -67,6 +71,12 @@ That flip, from "I call it" to "it calls me", is inversion of control.
 | Interface | A set of methods a type promises to have | `http.Handler` needs `ServeHTTP` |
 | Dependency | Something a piece of code needs to do its job | A service needs a database |
 | Dependency injection | Handing a type its dependencies from outside | `NewService(repo)` |
+| Hollywood principle | "Don't call us, we'll call you": the framework calls your code | `net/http` calls your handler |
+| Middleware | A wrapper that runs before or after a handler and decides whether to call it | Auth check, logging |
+| Hook | A named slot where you register code to run at a set moment | "on save", "before commit" |
+| Goroutine | A lightweight Go thread; the server starts one per request | Two requests, two goroutines |
+| Composition root | The one place (`main`) that builds objects and hands them in | `main.go` calling `NewService(store)` |
+| Lock-in | It gets costly to leave a tool once your code is shaped around it | Rewriting hooks to switch frameworks |
 
 **Picture it**
 
@@ -95,13 +105,15 @@ Where it breaks: a line cook can refuse or be slow, but your handler cannot chan
 
 ## 1. Why it exists 🟢
 
-A new engineer on InvoiceOps is asked to add structured logging and gets two different answers depending on which part of the codebase they touch.
+🟢 **Plain version:** Some code you call yourself, on the exact line you choose. Other code you hand to a bigger system, and that system calls it whenever it decides, maybe many times at once. If you mix the two up, you get surprises, like a web handler that you assumed runs once but actually runs for 50 visitors at the same time. Knowing which is which tells you how careful your code must be.
+
+A new engineer on InvoiceOps is asked to add **structured logging** (logs written as named fields like `invoice_id=42`, not free text) and gets two different answers depending on which part of the codebase they touch.
 
 In the validation code, they write `if err := validate.Required(email); err != nil { ... }` — a direct function call, at the exact line where the check is needed, returning control back to the caller immediately. This is a **library** call: ordinary, predictable, and entirely on the caller's schedule.
 
-In the HTTP layer, they register a handler with `mux.HandleFunc("POST /invoices", createInvoice)` and never call `createInvoice` themselves anywhere in the codebase. `net/http`'s server calls it, once per matching request, whenever one arrives — in a goroutine the server itself created. This is a **framework** relationship: the engineer wrote code, but gave up deciding when and how often it runs.
+In the HTTP layer, they register a handler with `mux.HandleFunc("POST /invoices", createInvoice)` and never call `createInvoice` themselves anywhere in the codebase. `net/http`'s server calls it, once per matching request, whenever one arrives — in a **goroutine** (a lightweight Go thread) the server itself created. This is a **framework** relationship: the engineer wrote code, but gave up deciding when and how often it runs.
 
-Mixing up the two is a common, costly mistake: expecting a registered handler to run exactly once like a function call (it can run concurrently, many times, for many requests) or trying to "just call" a piece of framework-owned lifecycle code out of its normal sequence (a React component's render function, a test framework's `setUp`) and getting surprising results, because that code was written assuming the framework's rules about *when* it runs.
+Mixing up the two is a common, costly mistake: expecting a registered handler to run exactly once like a function call (it can run concurrently, many times, for many requests) or trying to "just call" a piece of framework-owned lifecycle code out of its normal sequence (a React component's render function, React being a popular web UI tool; a test framework's `setUp`, the step it runs before each test) and getting surprising results, because that code was written assuming the framework's rules about *when* it runs.
 
 ```mermaid
 flowchart LR
@@ -116,9 +128,32 @@ In the second, you are a line cook working a shift: an expediter calls out order
 
 **Simple test:** stare at the call site. If *your* code's line number is where the function starts running, it is a library. If your code is sitting inside a slot (a registered handler, a callback, an interface method) and you cannot point to the line in your codebase that calls it, it is a framework calling you.
 
+### Real-life example 🟢
+
+Think of building a chat app like WhatsApp for Android.
+When you shrink a photo before sending it, you call an image library yourself: `compress(photo)`. That is a library.
+But you never call your own "screen opened" code. Android calls it when the user taps the app icon, and calls "screen hidden" when they switch away. That is a framework calling you.
+The same app uses both, and the rule is the same: you call a library; a framework calls you.
+
+## Common beginner mistakes 🟢
+
+- **Assuming a handler runs once, like a normal function** → `net/http` may run it for many requests at the same time → write handlers that are safe to run in parallel (no shared map without a lock).
+- **Calling a framework's lifecycle method yourself** → it may now run twice or in the wrong order → use the extension points it gives you, like middleware or hooks.
+- **Thinking "I used an interface, so I'm doing dependency injection"** → an interface only allows swapping; DI is about who builds the object → pass the built dependency in through the constructor.
+- **Picking a heavy framework for one tiny endpoint** → more setup code than real code → start with the standard library; add a framework when you need what it gives.
+- **Reaching for a DI container on day one** → the wiring becomes hard to read → wire by hand in `main` until it gets truly unwieldy.
+
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the one-line test: you call a library, a framework calls you. **Next we open the box**: the two call orders side by side, the difference between library, framework and platform, how the same flip happens inside one request (middleware), and how it applies to building objects (dependency injection).
+
 ### The inversion, drawn as two sequences
+
+**Step by step:**
+1. Library: your `main` calls `json.Marshal(invoice)`. It runs, returns bytes, and your `main` carries on.
+2. Framework: your `main` calls `mux.HandleFunc("POST /invoices", createInvoice)` and then `server.ListenAndServe()`.
+3. A customer sends a request. The server, not you, calls `createInvoice`.
+4. Ten customers at once? The server calls it ten times, in parallel.
 
 ```mermaid
 sequenceDiagram
@@ -145,17 +180,29 @@ The two diagrams show the same shape with the arrows reversed. In the library di
 
 **In plain words: three words that sound alike but differ in who is in charge.**
 
+**Step by step:**
+1. Library: you call `sha256.Sum256(data)`. It controls only that one call.
+2. Framework: `net/http` controls when your handler runs.
+3. Platform: AWS Lambda (Amazon's "run my function when an event arrives" service) controls when your function runs **and** how many copies of it exist and when they start.
+
 | Term | What it controls | Go example |
 | --- | --- | --- |
 | Library | Nothing beyond the one call; you call it when you need it | `encoding/json`, `strings`, `crypto/sha256` |
 | Framework | The overall control flow and lifecycle; it calls your code | `net/http`'s `*http.Server`, a test runner's `TestMain` |
-| Platform / SDK | A whole runtime environment plus its own conventions (deployment, scaling, config) that your code runs inside | AWS Lambda (your handler function is called by the Lambda runtime, which also owns scaling and retries), Kubernetes operators (your reconcile function is called by the controller-runtime framework) |
+| Platform / SDK | A whole runtime environment plus its own conventions (deployment, scaling, config) that your code runs inside | AWS Lambda (your handler function is called by the Lambda runtime, which also owns scaling and retries), Kubernetes operators (Kubernetes runs containers across many machines; an operator is your code that it calls to fix things up; your reconcile function is called by the controller-runtime framework) |
 
 A platform is usually a framework with an operational environment wrapped around it: Lambda is a framework for the call ("here is an event, handle it") plus a platform decision about how many instances exist and when they start.
 
 ### IoC inside a single process: middleware chains and plugin hooks
 
 Inversion of control is not only "the whole app is a framework". It shows up at a much smaller scale, every time code registers a callback and hands control to something that decides when to invoke it:
+
+**Step by step:**
+1. You register two middlewares: `logging`, then `auth`, around your handler.
+2. A request arrives. The app calls `logging`, which notes the start time and calls `next`.
+3. `next` is `auth`. It checks the token. Bad token? It answers 401 and never calls `next`.
+4. Good token? It calls `next`, which is your handler.
+5. None of these pieces called itself; the app decided the order.
 
 ```mermaid
 flowchart LR
@@ -175,6 +222,12 @@ This is the same Hollywood principle at the scale of a single request, and it is
 
 **In plain words: instead of a function building its own database client, someone hands one in.**
 
+**Step by step:**
+1. Without DI: inside `NewService`, the code opens its own Postgres connection. Tests now need Postgres.
+2. With DI: `NewService(store Store)` takes a store that is already built.
+3. `main` builds a Postgres store and passes it in.
+4. A test builds a tiny in-memory store and passes that in instead. `Service` never knows the difference.
+
 Dependency injection is the specific case where what gets "called for you" is the *construction* of a dependency, not a lifecycle event. Instead of:
 
 ```text
@@ -190,7 +243,7 @@ service := domain.NewService(store, notifier)   // handed in, not constructed in
 
 `Service` no longer decides how its `Store` is built, or even what kind it is — control over that decision moved to whatever calls `NewService`.
 
-In Go this is usually done by hand in a `main` composition root (see [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]); `google/wire` generates that wiring code at compile time, and `uber-go/fx` builds and calls it at runtime from a dependency graph, but both are automating the same manual pattern, not doing something different in kind.
+In Go this is usually done by hand in a `main` composition root (see [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]); `google/wire` generates that wiring code at compile time (before the program runs), and `uber-go/fx` builds and calls it at runtime (while the program runs, using **reflection**, Go's way of inspecting types while running) from a dependency graph, but both are automating the same manual pattern, not doing something different in kind.
 
 ```mermaid
 flowchart LR
@@ -231,6 +284,8 @@ func (s *Scheduler) Tick() {
 The full version below contrasts a library (`validate`, called directly) with a small framework (`miniframework`, which owns dispatch and middleware), both compiling together with a composition root in `main`.
 
 A Go package pair (`validate`, `miniframework`) that compiles and passes `go vet` and `go test -race` on Go 1.24.
+
+**What this code does, in plain words:** `validate` is a library: plain functions you call to check an email or an amount. `miniframework` is a tiny framework: you `Register` a handler and some middleware, and its `Dispatch` decides when to call them and in what order. `main` uses both.
 
 ```go
 // validate/validate.go - a library: your code calls it, on your schedule.
@@ -444,9 +499,19 @@ ok  	note2/validate	1.436s
 | --- | --- | --- | --- |
 | Library | Your code | `encoding/json`, `crypto/sha256`, `strings` | Full control, but you must write the orchestration yourself |
 | Framework | The framework, into a slot you filled | `net/http`'s server calling your `http.Handler` | Less code to write per feature; you accept its lifecycle and conventions |
-| Plugin / middleware hook | The owning component, at a point it defines | HTTP middleware, `database/sql` driver registration, Cobra command hooks | Fine-grained IoC without adopting a whole framework |
+| Plugin / middleware hook | The owning component, at a point it defines | HTTP middleware, `database/sql` driver registration, Cobra command hooks (Cobra is a Go library for command-line tools) | Fine-grained IoC without adopting a whole framework |
 | Platform / SDK | The platform's runtime, including scaling decisions | AWS Lambda handler, Kubernetes controller-runtime `Reconcile` | Framework trade-off plus operational lock-in (how it scales, deploys, retries) |
 | Dependency injection container | Whatever resolves the graph (your `main`, or `wire`/`fx`) | hand-wired `main.go`, `google/wire`, `uber-go/fx` | Removes manual wiring boilerplate; a generated or reflection-based graph is harder to read top-down |
+
+### IoC vs dependency injection vs interfaces 🟡
+
+These three are often treated as one thing. They are not.
+
+| Idea | The question it answers | Go example |
+| --- | --- | --- |
+| Inversion of control | Who decides **when** code runs? | `net/http` calls your handler |
+| Dependency injection | Who **builds** the object my code needs? | `main` builds the store and passes it to `NewService` |
+| Interface | Can I **swap** one implementation for another? | `Store` fits both a Postgres store and a test fake |
 
 ## 6. Trade-offs and when not to use 🟡
 
@@ -457,9 +522,12 @@ ok  	note2/validate	1.436s
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how the flip works for whole apps, single requests and object building. **Next is the senior view**: real libraries vs frameworks (React vs Next.js, Gin vs the standard library), how framework-called code fails in production, and when a DI container earns its cost.
+
+
 - **Real systems:** React is a library (you call `createRoot(...).render(...)`, and your code decides when state changes trigger it); Next.js, layered on top of React, is a framework (it owns routing, data-fetching lifecycle and build output, and calls your page components). `net/http` is simultaneously a small framework (`*http.Server` calling your `http.Handler`) and ships libraries beside it (`net/http.Get`, which you call). Gin and Echo are slightly heavier frameworks than the stdlib mux, trading `http.Handler` compatibility for their own context type and conventions.
 - **Failure modes → fixes:**
-  - Expecting a framework-owned callback to run exactly once, synchronously, like a function call — it may run concurrently, be retried, or run zero times if a route never matches. Fix by writing handlers that are safe to call concurrently and idempotent where retries are possible.
+  - Expecting a framework-owned callback to run exactly once, synchronously, like a function call — it may run concurrently, be retried, or run zero times if a route never matches. Fix by writing handlers that are safe to call concurrently and **idempotent** (running twice has the same effect as once) where retries are possible.
   - Fighting the framework's lifecycle (manually calling a hook method the framework also calls) and getting double-invocation or ordering bugs. Fix by using the extension points the framework actually offers (middleware, hooks) instead of calling its internals directly.
   - Adopting a framework for a service with one route and no middleware needs, then spending more code satisfying its conventions than the route itself required. Fix by starting with the standard library and only adopting a router or framework when route grouping or middleware composition earns its keep.
 - **What to monitor:** nothing is IoC-specific to alert on directly; the practical signal is how much of a PR's diff is "satisfying the framework" (config, lifecycle boilerplate) versus actual business logic, which is a cheap proxy for whether the framework is pulling its weight.
@@ -514,6 +582,26 @@ Larger frameworks (Rails, Django, Spring, NestJS) additionally invert control ov
 - `net/http`: `http.Get` is a library call; `(*http.Server).Serve` calling your handler is a small framework.
 - React (library, you call `render`) vs Next.js (framework, it owns routing and calls your pages) is the canonical frontend example of the same split.
 - Pick a framework for the convention it saves you from inventing; expect the lock-in that comes with its lifecycle.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) Library or framework: you call `json.Marshal` yourself.
+> Library. You decide when it runs.
+
+> [!question]- (easy) What is the Hollywood principle?
+> "Don't call us, we'll call you": a framework calls the code you registered.
+
+> [!question]- (easy) What is dependency injection, in one line?
+> Handing a type the objects it needs from outside, instead of it building them itself.
+
+> [!question]- (medium) Is `net/http` a library or a framework?
+> Both: `http.Get` is a library call; `http.Server` calling your handler is a small framework.
+
+> [!question]- (medium) Why must a registered HTTP handler be safe to run in parallel?
+> The server may call it for many requests at the same time, each on its own goroutine.
+
+> [!question]- (medium) Does using an interface mean you are doing DI?
+> No. An interface allows swapping; DI is about who builds the object and passes it in.
 
 ## Links 🟢
 

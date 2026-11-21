@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (happens-before rules), 4 (worked examples) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Goroutines and Channels]]: `go f()` runs `f` alongside your code, and a channel passes a value from one goroutine to another.
+> - [[sync Primitives and Atomics]]: a `sync.Mutex` lets only one goroutine into a block of code at a time, and `atomic.Int64` updates a number in one step nobody can interrupt.
+
 **From zero, in 60 seconds** 🟢
 
 A **goroutine** is a small task Go runs alongside your other code.
@@ -74,6 +78,12 @@ In Go, two goroutines touching the same variable without coordination do exactly
 | Happens-before | A guaranteed "A is visible to B" ordering | A send happens-before its receive completes |
 | Data race | Unsynchronized access to the same memory, at least one a write | Two goroutines doing `counter++` |
 | Atomic | A single operation no other goroutine can see half-done | `atomic.Int64.Add(1)` |
+| Undefined behavior | The language makes no promise at all about what happens; any result, or a crash, is allowed | reading a racy slice |
+| Mutex | A lock that only one goroutine can hold at a time | `mu.Lock(); n++; mu.Unlock()` |
+| Read-modify-write | Read a value, change it, write it back: three steps, not one | `counter++` |
+| Race detector | Go's built-in tool (`-race`) that reports data races while the program runs | `go test -race ./...` |
+| Torn read | Seeing half of an old value and half of a new one | new slice pointer with old length |
+| Sequentially consistent | Every goroutine agrees on one single order of the operations | Go atomics since 1.19 |
 
 **Picture it**
 
@@ -99,7 +109,7 @@ Where it breaks: real notepads never show half-written numbers, but a racy Go sl
 
 ## 1. Why it exists 🟢
 
-A single CPU core already reorders its own instructions and keeps values in registers and store buffers rather than main memory; compilers reorder and cache loads across statements too, as long as the reordering is invisible to that one goroutine running alone.
+A single CPU core already reorders its own instructions and keeps values in registers and store buffers (a small queue of pending writes inside each CPU core) rather than main memory; compilers reorder and cache loads across statements too, as long as the reordering is invisible to that one goroutine running alone.
 
 None of that is wrong on a single thread — the compiler and CPU only promise that *a single goroutine* sees its own operations in program order.
 
@@ -107,9 +117,13 @@ The problem appears the moment two goroutines touch the same variable.
 
 Goroutine A might set `ready = true` and expect goroutine B to see it. But without a synchronization point the compiler is free to keep `ready` in a CPU register inside A's loop and never write it back to memory at all.
 
-And even if it does write it back, the CPU's cache coherence protocol gives no ordering guarantee relative to any *other* write A made first.
+And even if it does write it back, the CPU's cache coherence protocol (the hardware rules that keep each core's cache roughly in sync) gives no ordering guarantee relative to any *other* write A made first.
 
 Go's memory model exists to draw a line: these specific operations create a cross-goroutine ordering guarantee, and nothing else does.
+
+### Real-life example 🟢
+
+Think of the "seats left" number on a BookMyShow show page. Many buyers' requests run as separate goroutines on the same server, and each one that books a seat does `seatsLeft--`. With no lock, two goroutines can both read `5`, both write `4`, and the page now shows one more seat than really exists, so a seat can be sold twice. Nothing crashes and no error is logged; the number is just wrong. A `sync.Mutex` around the update, or an `atomic.Int64`, makes each update a clean handover so no booking is lost.
 
 ## 2. Mental model 🟢
 
@@ -121,11 +135,28 @@ If there is no bridge between a write and a read of the same variable from diffe
 
 The race detector's job is to notice when code reads or writes a location with no such bridge connecting it to a concurrent access.
 
+## Common beginner mistakes 🟢
+
+- **Using a plain `bool` as a "done" flag between goroutines** → the reader may never see it change and loop forever → use a channel, `sync.WaitGroup` or `atomic.Bool`.
+- **Thinking `counter++` is one step** → it is read, add, write, and two goroutines can interleave → use `atomic.Int64.Add(1)` or a mutex.
+- **"`go test -race` passed, so there are no races"** → it only checks the code your tests actually ran → add tests that run the concurrent paths.
+- **"It's only a counter, a wrong value is fine"** → a race is undefined behavior; the compiler may even remove the read → fix every race.
+- **Assuming a goroutine's writes are visible once it has finished** → finishing gives no guarantee → wait with `WaitGroup.Wait()` or a channel receive.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that two goroutines sharing a variable need a channel, mutex or atomic between them, and that this link is called happens-before. **Next we open the box**: the exact list of operations that create happens-before, why Go 1.19 changed the rules for atomics, and tested examples, including the real race detector output.
 
 ### Whiteboard version
 
 **In plain words:** this is the classic broken pattern — one goroutine raises a plain flag, another watches it. It looks fine, compiles fine, and is undefined behaviour.
+
+**Step by step:**
+1. Goroutine A computes `result`, then sets `ready = true`.
+2. The main goroutine loops `for !ready {}`, waiting.
+3. Nothing links A's writes to main's reads, so the compiler may read `ready` once and keep it in a register: the loop can spin forever.
+4. Even if `ready` is seen as `true`, `result` may still look old, because the CPU may have made the two writes visible in a different order.
+5. Fix: send `result` on a channel, or protect both with a mutex.
 
 ```go
 // Unsafe: no happens-before edge between the writer and the reader.
@@ -147,6 +178,13 @@ Nothing here is a syntax error, and on many machines it "usually" appears to wor
 ### The happens-before relation
 
 **In plain words:** a short official list of operations that act as handshakes between goroutines. Everything the sender did before the handshake, the receiver is guaranteed to see after it.
+
+**Step by step:**
+1. Goroutine A sets `order.Total = 500`.
+2. A sends on a channel: `ch <- order`.
+3. Goroutine B receives: `o := <-ch`.
+4. The send happens-before the receive finishes, so B is guaranteed to see `Total = 500`, and everything else A wrote before the send.
+5. The same works with `mu.Unlock()` in A followed by `mu.Lock()` in B.
 
 ```mermaid
 flowchart LR
@@ -177,6 +215,12 @@ One easy-to-miss omission: **a goroutine's exit guarantees nothing.** Nothing in
 
 ### Why atomics changed in Go 1.19
 
+**Step by step:**
+1. Before 2022, Go's written rules said very little about atomics, even though they worked well in practice.
+2. Go 1.19 wrote down a strong promise: all atomic operations on a variable happen in one order that every goroutine agrees on.
+3. So if goroutine A does `flag.Store(true)` after setting data, and B sees `flag.Load() == true`, B also sees that data.
+4. You can reason about atomics the same way as about a mutex-protected value, just for one word at a time.
+
 Before the 2022 memory-model revision, Go's model said less than the implementation actually provided, leaving atomics in an awkward, under-specified state.
 
 Go 1.19 adopted the same sequential-consistency guarantee that C++'s `memory_order_seq_cst` and Java's `volatile` give: every goroutine observes atomic operations on a given location in one single, agreed-upon order, so you can reason about atomic counters and flags the same way you reason about a mutex-protected value, without a separate mental model for "the atomics version."
@@ -186,6 +230,8 @@ Go 1.19 adopted the same sequential-consistency guarantee that C++'s `memory_ord
 Code from a scratch module (`scratch/memmodel`); it compiles, passes `go vet`, and its tests pass under `go test -race` on Go 1.24.4.
 
 ### Channel handoff: safe because of the send/receive edge
+
+**What this code does, in plain words:** a helper goroutine builds a value and sends it on a channel; the caller receives it and returns it. The send-then-receive is the handshake, so the caller is guaranteed to see the fully built value.
 
 ```go
 // PublishWithChannel safely publishes a value built in one goroutine to a
@@ -246,6 +292,12 @@ func TestCounterMutexIsRaceFree(t *testing.T) {
 **Measured:** `go test -race -v ./...` in `scratch/memmodel` (Go 1.24.4, 2026-11-07) — `TestCounterMutexIsRaceFree`, `TestAtomicCounterIsRaceFree`, `TestOnceInitRunsExactlyOnce`, `TestWaitGroupHandoff`, `TestPublishWithChannel`: 5/5 PASS, 0 race warnings.
 
 ### The data race itself: a lost update with no happens-before edge
+
+**Step by step:**
+1. `n` is `10`. Goroutine A reads `10`.
+2. Before A writes back, goroutine B also reads `10`.
+3. A writes `11`. B writes `11`.
+4. Two `Add(1)` calls ran, but `n` went up by one: an update was lost.
 
 ```mermaid
 sequenceDiagram
@@ -322,7 +374,7 @@ Re-running the same binary a few more times produces a different wrong count eac
 
 That variability *is* the benign-race myth in miniature: **the race detector flags the unsynchronized access itself, not a specific wrong answer**, because there is no specific wrong answer — the access is undefined behavior, and the exact number of lost updates depends on the scheduler's mood on a given run.
 
-A race that happens to land on the right number some run is not a counterexample; it is the same undefined behavior producing a different, equally unprincipled result. This test is kept behind a `race_demo` build tag specifically so it never runs as part of the normal `go test -race ./...` suite, which must stay green.
+A race that happens to land on the right number some run is not a counterexample; it is the same undefined behavior producing a different, equally unprincipled result. This test is kept behind a `race_demo` build tag (a label that includes a file only when you pass `-tags race_demo`) specifically so it never runs as part of the normal `go test -race ./...` suite, which must stay green.
 
 ### `sync.Once` and `WaitGroup` edges
 
@@ -367,7 +419,7 @@ Each goroutine writes a distinct slice index, so there is no race on `results` i
 | Primitive | What it synchronizes | Use when | Cost |
 | --- | --- | --- | --- |
 | Channel send/receive | A value handoff plus everything before it | Passing ownership of data between goroutines, pipelines, fan-out/fan-in | One scheduling handoff; unbuffered blocks until both sides are ready |
-| `Mutex`/`RWMutex` | A critical section around shared state | Multiple fields must be updated together, or the invariant spans more than one word | Lock/unlock overhead; contention serializes goroutines |
+| `Mutex`/`RWMutex` | A critical section (code only one goroutine may run at a time) around shared state | Multiple fields must be updated together, or the invariant spans more than one word | Lock/unlock overhead; contention (many goroutines waiting for the same lock) serializes goroutines |
 | `atomic.*` | A single word (int, pointer, bool) | A counter, flag, or single-word pointer swap, nothing more | Cheaper than a mutex under contention; cannot protect multi-field invariants |
 | `sync.Once` | A one-time initialization | Lazy singleton setup, config loaded on first use | One atomic check after the first call; negligible |
 | `sync.WaitGroup` | "All of these finished" | Fan-out work where the caller waits for everyone, not for a value | Cheap; carries no data, only completion |
@@ -376,11 +428,14 @@ Each goroutine writes a distinct slice index, so there is no race on `results` i
 ## 6. Trade-offs and when not to use 🟡
 
 - A mutex protects an **invariant spanning multiple fields or steps** (check-then-act); an atomic protects **one word**. Reaching for several independent atomics to approximate a multi-field invariant reintroduces races between the individual atomic operations themselves.
-- Busy-waiting on a plain flag (`for !done {}`) is not just wasteful, it may be an outright data race with no happens-before edge, so the loop is not even guaranteed to terminate — the compiler is allowed to hoist the read out of the loop entirely since, from its single-goroutine view, nothing in the loop body changes `done`.
-- The race detector roughly doubles memory use and multiplies CPU time by 2-20x (measured by the Go team's own documentation for ThreadSanitizer-based tooling), so it is normally run in CI and on a canary fraction of traffic, not on every production instance all the time.
+- Busy-waiting on a plain flag (`for !done {}`) is not just wasteful, it may be an outright data race with no happens-before edge, so the loop is not even guaranteed to terminate — the compiler is allowed to hoist (move) the read out of the loop entirely since, from its single-goroutine view, nothing in the loop body changes `done`.
+- The race detector typically multiplies memory use by 5-10x and CPU time by 2-20x (measured by the Go team's own documentation for ThreadSanitizer-based tooling), so it is normally run in CI (the automatic test pipeline) and on a canary fraction of traffic (a few servers that get new builds first), not on every production instance all the time.
 - Over-synchronizing (a mutex around a value only ever touched by one goroutine) adds pure overhead and signals confusion about ownership; prefer the "owner goroutine" pattern (see [[Goroutines and Channels]]) when a value genuinely belongs to one goroutine at a time.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** which operations create happens-before, how mutexes, atomics, `Once` and `WaitGroup` keep goroutines in step, and what the race detector reports. **Next is the advanced part**: how real teams catch races, the race patterns that keep showing up in production, and why "benign" races are a myth.
+
 
 - **Real systems:** Go's own standard library races were a major motivation for shipping a built-in detector (`go test -race`, `go build -race`) rather than leaving it to third-party tools.
 
@@ -409,13 +464,20 @@ Each goroutine writes a distinct slice index, so there is no race on `results` i
 
 A race on one of these is not "you might read a slightly stale int" — it is a window where a reader can observe, for example, the *new* pointer paired with the *old* length, producing a slice header that points past the end of its own backing array.
 
+```mermaid
+flowchart LR
+    W["writer: (ptr A, len 3)<br/>→ (ptr B, len 100)"] -- "updates ptr first" --> M["shared slice header"]
+    M -- "reader looks in between" --> R["reads (ptr A, len 100)"]
+    R --> X["reads 97 slots past<br/>the end of A: crash or garbage"]
+```
+
 That can corrupt memory or crash the process, not just return a wrong-but-harmless value. This is why "benign races" on anything bigger than a single aligned machine word are categorically more dangerous than a torn single-word read.
 
 **"No out-of-thin-air values."** Even though a racing read is allowed to see a stale or inconsistent value, the Go memory model explicitly rules out a read observing a value that was never written by any goroutine, by any ordering.
 
 In practice this guarantee matters far less than "do not write racy code in the first place" — it is a backstop for how wild an implementation's behavior is allowed to be, not a safety net you should ever rely on.
 
-**What ThreadSanitizer actually does.** `go test -race` instruments every memory access and goroutine-creation/synchronization event, then uses vector clocks to detect when two accesses to the same location, from different goroutines, have no happens-before edge between them, with at least one being a write.
+**What ThreadSanitizer actually does.** `go test -race` instruments every memory access and goroutine-creation/synchronization event, then uses vector clocks (per-goroutine counters that record which events each goroutine has already "seen") to detect when two accesses to the same location, from different goroutines, have no happens-before edge between them, with at least one being a write.
 
 It only sees paths your tests actually execute, under the specific scheduling the runtime happens to choose that run — a race can exist in code for years before `-race` happens to catch it, and a test suite with poor coverage of concurrent code paths gives false confidence.
 
@@ -468,6 +530,30 @@ The `TestRaceDetectorCatchesRacyCounter` run above is a concrete demonstration: 
 - Concurrent writes to a Go map crash the process immediately, by design, even without `-race`.
 - Torn multi-word values (string, slice, interface) under a race can corrupt memory, not just read stale.
 - Mutex for a multi-field invariant; atomic for one word; never a busy-wait on a plain flag.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is a data race, in one line?
+> Two goroutines touch the same variable at the same time, at least one writes, and nothing links them.
+
+> [!question]- Name three tools that make sharing safe.
+> A channel, a `sync.Mutex`, an atomic (also `sync.Once` and `sync.WaitGroup`).
+
+> [!question]- Which command finds races while your tests run?
+> `go test -race ./...`.
+
+🟡 Medium
+
+> [!question]- Why can `for !ready {}` loop forever even after another goroutine sets `ready = true`?
+> With no happens-before edge, the compiler may read `ready` once and keep it in a register, so the loop never sees the change.
+
+> [!question]- 100 goroutines each call `n++` on a shared `int` with no lock. The result is 93. Is it still a bug on a run that prints 100?
+> Yes. The race is undefined behavior on every run; 100 is just luck.
+
+> [!question]- When is a mutex the right choice over an atomic?
+> When the rule covers more than one value or step, e.g. "update balance and history together". An atomic only protects one word.
 
 ## Links
 

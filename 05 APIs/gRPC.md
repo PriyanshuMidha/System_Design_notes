@@ -35,6 +35,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]: HTTP/2 carries many requests at the same time over one connection, as separate streams.
+> - [[Choosing an API Style]]: gRPC is the usual pick for calls between your own services.
+> - [[REST and HTTP API Design]]: the familiar alternative: URLs, verbs and JSON.
+
 **From zero, in 60 seconds** 🟢
 
 Inside a backend, services call each other constantly. **gRPC** makes such a call feel like calling an ordinary function: `GetUser(42)` — except the function runs on another machine.
@@ -83,6 +88,11 @@ A shared contract file guarantees both sides agree, and the data travels as smal
 | Stream | One call's lane inside an HTTP/2 connection; can carry many messages | Server sending live price updates |
 | Deadline | The latest time by which a call must finish | "Give up after 300 ms" |
 | Status code | gRPC's error category on every response | `NOT_FOUND`, `UNAVAILABLE` |
+| Stub | Generated client code that looks like a local function but calls the server | `client.GetUser(ctx, req)` |
+| Trailers | Headers sent at the very end of a response; gRPC puts its status there | `grpc-status: 0` |
+| Varint | A number stored in as few bytes as it needs | 42 takes 1 byte |
+| Metadata | Extra key-value info sent with a call, like HTTP headers | `authorization`, `x-request-id` |
+| Interceptor | Code that wraps every call, like middleware | logging, auth, retries |
 
 **Picture it.**
 
@@ -121,6 +131,13 @@ Deadlines, cancellation, status codes, metadata and retries are part of the fram
 
 Google built it from its internal RPC system, Stubby, and open-sourced it in 2015.
 
+### Real-life example: inside a food delivery app 🟢
+
+When you place an order on an app like Swiggy or Uber Eats, your phone makes one normal web call.
+Behind it, the order service quickly asks other internal services: "is this restaurant open?", "what is the price with this coupon?", "which rider is nearby?".
+These internal calls happen thousands of times a second, so teams often use gRPC: small binary messages, one shared contract, and a deadline on every call so one slow service cannot freeze the order.
+The rider's live location can flow as a gRPC stream between internal services.
+
 ## 2. Mental model 🟢
 
 **A remote procedure call (RPC) is a function call that happens to cross the network.** The generated client stub looks like a local method, `client.GetUser(ctx, req)`. Underneath, it encodes the request, sends it on an HTTP/2 stream, waits for the response or the deadline, and decodes the result or a status code.
@@ -131,11 +148,37 @@ gRPC ships one maintained client library per language (Go, Java, C++, Python, C#
 
 Browsers are a separate problem. JavaScript in a browser cannot control HTTP/2 framing or read trailers, so a browser cannot speak native gRPC. It needs gRPC-Web or Connect, usually through a proxy (section 5).
 
+## Common beginner mistakes 🟢
+
+- **No deadline on a call** → one slow service makes every caller hang → pass a `context` with a timeout on every call.
+- **Calling gRPC directly from a browser** → browsers cannot read trailers → use gRPC-Web or Connect, or REST at the edge.
+- **Reusing or renumbering a field** → old and new code silently misread each other → add new numbers, `reserved` deleted ones.
+- **Treating HTTP 200 as success** → the real result is `grpc-status` in the trailers → check the gRPC status code.
+- **Putting gRPC behind an L4 load balancer** → one long connection pins all calls to one server → balance per call (L7 proxy or client-side).
+
+## Often confused 🟡
+
+| These two | gRPC | REST |
+| --- | --- | --- |
+| Contract | `.proto` file, code generated | Often OpenAPI, sometimes only docs |
+| Payload | Binary protobuf | Text JSON |
+| Transport | HTTP/2 required | HTTP/1.1, 2 or 3 |
+| Best for | Internal service-to-service calls, streaming | Public APIs, browsers, caching |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** gRPC is a typed function call over the network, defined in a `.proto` file. **Next we open the box**: how the contract becomes code, how a message becomes bytes, how calls ride HTTP/2, and the four call shapes.
 
 ### Define the service, then generate code
 
 **In plain words:** you write the menu of functions and message shapes once; a generator writes the boring networking code for every language your teams use.
+
+**Step by step:**
+1. You write `service UserService { rpc GetUser(GetUserRequest) returns (User); }` in `user.proto`.
+2. You run `buf generate` (or `protoc`). It writes Go structs, a client stub and a server interface.
+3. The Users team implements `GetUser` on the server interface.
+4. The Orders team calls `client.GetUser(ctx, &GetUserRequest{Id: 42})` as if it were a local function.
+5. If someone changes the contract badly, code fails to compile instead of failing in production.
 
 ```protobuf
 syntax = "proto3";
@@ -198,6 +241,13 @@ This file was compiled with `protocompile` v0.14.1 (a pure-Go protobuf compiler)
 
 **In plain words:** protobuf never sends field names, only field numbers packed into a byte or two. That is the whole reason `{"id":42}` shrinks from 9 bytes to 2.
 
+**Step by step:**
+1. `GetUserRequest{id: 42}`: field 1 is an integer.
+2. The tag is `1 << 3 | 0` = 8, one byte `0x08`.
+3. 42 is below 128, so it fits in one byte `0x2A`.
+4. gRPC adds a 5-byte prefix: a "not compressed" flag and the length 2.
+5. 7 bytes go into the HTTP/2 DATA frame, compared with 9 bytes of JSON before any headers.
+
 Protobuf writes each field as a **tag** followed by a value. The tag packs the field number and a 3-bit **wire type**: `tag = field_number << 3 | wire_type`. Integers use **varints**: 7 bits per byte, with the high bit meaning "more bytes follow", so small numbers take one byte.
 
 Field names never travel; numbers do. That is why protobuf is smaller than JSON.
@@ -215,16 +265,29 @@ flowchart LR
 
 ### On HTTP/2
 
+**Step by step:**
+1. Orders opens one TCP connection to Users and keeps it.
+2. Each call gets its own numbered stream: call A on stream 1, call B on stream 3, at the same time.
+3. Each call sends HEADERS (method path, `grpc-timeout`) then DATA (the message).
+4. The server answers HEADERS `200`, DATA, then trailers with `grpc-status` (0 = OK).
+5. A slow call on stream 1 does not hold up stream 3.
+
 **In plain words:** each call rides its own lane (stream) inside one shared connection. The odd part: the real success/failure code arrives at the very end, in "trailers", and the HTTP status is 200 even for failures.
 
 - Each RPC is one **HTTP/2 stream**. Many streams share one TCP connection, interleaved as frames, so a slow call does not block a fast one at the HTTP layer. The basics of streams and multiplexing live in [[HTTP-1.1 vs HTTP-2 vs HTTP-3]].
-- Headers are compressed with **HPACK**. After the first call, repeated headers such as `:path` and `content-type` shrink to an index into a shared table.
+- Headers are compressed with **HPACK** (HTTP/2's header compression). After the first call, repeated headers such as `:path` and `content-type` shrink to an index into a shared table.
 - **Request:** a HEADERS frame (`:method POST`, `:path`, `content-type: application/grpc`, `te: trailers`, optional `grpc-timeout` and custom metadata), then DATA frames holding length-prefixed messages.
 - **Response:** HEADERS (`:status 200`), DATA frames, then **trailers**: a final HEADERS frame carrying `grpc-status` and `grpc-message`. The HTTP status is 200 even when the call failed. The real outcome is `grpc-status`, which can only be known after the last message is sent.
 
 ### Four call types
 
 **In plain words:** one question one answer; one question many answers; many questions one answer; or an open two-way conversation. Pick the shape that matches the data flow.
+
+**Step by step:**
+1. **Unary:** "get user 42" → one user back.
+2. **Server streaming:** "send me AAPL prices" → a tick every time the price changes.
+3. **Client streaming:** a phone uploads 1,000 telemetry readings → one "accepted 998, rejected 2" reply.
+4. **Bidirectional:** chat: both sides send messages whenever they like on one open call.
 
 | Call type | Shape | Real examples | Not a good fit |
 | --- | --- | --- | --- |
@@ -561,6 +624,8 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the contract, the bytes, HTTP/2 streams and the four call types. **Next is the advanced part**: deadlines, status codes and retries, interceptors, load balancing, keepalive, and the deeper protocol details.
+
 - **Real systems:** the Kubernetes container runtime interface (kubelet to containerd) is gRPC. The etcd v3 API is gRPC, and its `Watch` method is a bidirectional stream. Envoy usually receives its dynamic configuration over gRPC xDS streams (files and REST polling are the alternatives).
 
 ### Deadlines, propagation and cancellation
@@ -703,6 +768,26 @@ grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check
 - Always set deadlines; pass the incoming `ctx` downstream; retry only `UNAVAILABLE` (plus idempotent calls) with backoff and a budget.
 - L4 balancers pin connections: use client-side `round_robin`/xDS or an L7 proxy, plus `MaxConnectionAge`.
 - Browsers need gRPC-Web, Connect or grpc-gateway; use reflection and `grpcurl` in development, health service for probes.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: where is a gRPC service's contract written?
+> In a `.proto` file.
+
+> [!question]- Easy: which HTTP version does gRPC need?
+> HTTP/2.
+
+> [!question]- Easy: what should every gRPC call carry to avoid hanging?
+> A deadline (a timeout on its `context`).
+
+> [!question]- Medium: why can't a browser call native gRPC?
+> It cannot read HTTP/2 trailers, where gRPC puts its status; use gRPC-Web or Connect.
+
+> [!question]- Medium: a call returns HTTP 200. Did it succeed?
+> Not necessarily; check `grpc-status` in the trailers.
+
+> [!question]- Medium: which call type fits a live price feed?
+> Server streaming: one request, many responses.
 
 ## Links 🟢
 

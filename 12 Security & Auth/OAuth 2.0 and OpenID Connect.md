@@ -34,6 +34,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Authentication vs Authorization]]: "who are you?" (authentication) and "what may you do?" (authorization) are different questions; OAuth answers the second, OIDC adds the first.
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: a server can send the browser to another site with a redirect (a 302 response with a `Location` header), and URLs can carry values like `?code=abc`.
+
 **From zero, in 60 seconds** 🟢
 
 Say a trip app wants to read your Google Calendar.
@@ -79,6 +83,12 @@ OAuth is that pass system; OpenID Connect adds "and here is who the user is".
 | Redirect URI | Where the browser is sent back after login | `https://app.example/callback` |
 | ID token | A signed note saying who logged in (OIDC) | A JWT with `sub` and `email` |
 | PKCE | A one-time secret proving the same app finishes the flow | `code_verifier` + `code_challenge` |
+| Consent screen | The "Allow this app to…?" page the login server shows you | "StayPlanner wants to view your calendar" |
+| Front / back channel | Front = values carried through your browser's redirects; back = a direct server-to-server call | Code comes via front, tokens via back |
+| `state` | A random value the app sends out and checks when you come back, to stop forged logins | `state=x7Kq...` |
+| `nonce` | A random value placed inside the ID token, so an old ID token cannot be replayed | `nonce=9fA2...` |
+| CSRF | Another site tricking your browser into sending a request you did not mean | A forged OAuth redirect |
+| BFF | Backend-for-Frontend: a small server that holds the tokens so the browser app does not | SPA → its own BFF → Google API |
 
 **Picture it**
 
@@ -117,6 +127,18 @@ That design has three concrete problems:
 
 OAuth 2.0 replaces "hand over the password" with "redirect the user to Google, let them approve a specific, named scope (`calendar.readonly`), and give StayPlanner a token that only does that, only for a while, and that Google can revoke on its own without touching the user's password."
 
+### Real-life example: "Continue with Google" on BookMyShow 🟢
+
+On BookMyShow you can tap "Continue with Google" instead of making a new password. Your phone jumps to a Google page, you pick your account, and you land back in BookMyShow already signed in. BookMyShow never saw your Google password; it got a signed ID token saying "this is Google user 1234, email you@gmail.com" (that is OIDC). If an app also asks "read your Google Contacts", the extra access token it gets for that is plain OAuth, and you can cancel it later in your Google account settings without changing your password.
+
+## Common beginner mistakes 🟢
+
+- **Using an OAuth access token as proof of login** → it says what the app may do, not who the user is → use the OIDC ID token for login.
+- **Skipping the `state` check on the callback** → an attacker can log the victim into the attacker's account → generate `state` before the redirect and compare it on return.
+- **Allowing loose redirect URIs (prefix or wildcard)** → codes get sent to look-alike attacker URLs → register and match the exact URI.
+- **Linking accounts by email** → emails change and get reused, so someone can take over an account → key on `(issuer, sub)`.
+- **Asking for broad scopes "just in case"** → scarier consent screen and bigger damage if a token leaks → ask for the narrowest scope, like `calendar.readonly`.
+
 ## 2. Mental model 🟢
 
 Think of a **valet key**: a car key that starts the engine and goes 20 mph but cannot open the trunk or glovebox. The valet never gets the owner's real key, the car dealer (not the valet) decided exactly what the valet key can do, and the owner can deactivate it without re-cutting their own key.
@@ -128,6 +150,8 @@ Think of a **valet key**: a car key that starts the engine and goes 20 mph but c
 - The **valet key itself** is the access token: limited, time-boxed, revocable, and never the owner's real credential.
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that OAuth hands an app a limited key instead of your password, and OIDC adds "who you are". **Next we open the box**: the four players, the main code + PKCE flow step by step, the small checks (`state`, `nonce`, PKCE) that stop real attacks, and the other flows for TVs and servers.
 
 ### Roles and channels
 
@@ -142,12 +166,20 @@ Think of a **valet key**: a car key that starts the engine and goes 20 mph but c
 
 Two channels matter throughout OAuth:
 
-- **Front channel**: anything that travels through the user's browser via redirects (the authorization request, the authorization code). An attacker who controls the user's network or a malicious browser extension can observe this.
+- **Front channel**: anything that travels through the user's browser via redirects (the authorization request, the authorization code). An attacker who controls the user's network or a malicious browser extension can observe this, so nothing long-lived should travel here.
 - **Back channel**: a direct HTTPS call from the client's server straight to the authorization server, never touching the browser. The code-for-token exchange happens here.
 
 ### Authorization Code + PKCE, step by step
 
 **In plain words:** the browser carries a short one-time code back to the app. The app swaps that code for tokens, and proves it is the same app that started the flow.
+
+**Step by step:**
+1. Ana clicks "Import from Google Calendar" in StayPlanner. StayPlanner makes a random secret (the `code_verifier`) and keeps it; it sends Google only a hash of it (the `code_challenge`).
+2. Ana's browser is redirected to Google, where she logs in and clicks "Allow: read calendar".
+3. Google redirects her browser back to StayPlanner with a one-time `code=abc123`.
+4. StayPlanner's server calls Google directly: "here is `abc123`, and here is my original secret".
+5. Google hashes the secret, sees it matches the challenge from step 1, and returns an access token (plus an ID token if `openid` was asked for).
+6. StayPlanner calls the Calendar API with that access token.
 
 This is the flow OAuth 2.1 and RFC 9700 require for **every** client, confidential or public:
 
@@ -177,7 +209,13 @@ Step 2 and step 4–5 are front channel: the authorization request and the code 
 
 **In plain words:** if someone steals the one-time code on the way back, it is useless to them. Only the app holding the matching secret can cash it in.
 
-Without PKCE, step 7 would only need the `code`. Anything that can observe the front channel — a logging proxy, a malicious app registered with the same custom URL scheme on mobile, a referrer leak — can steal the code and redeem it itself:
+**Step by step:**
+1. A bad app on Ana's phone has registered the same custom link prefix (`stayplanner://`) and grabs the redirect with `code=abc123`.
+2. It rushes to Google: "swap `abc123` for tokens".
+3. Google asks for the `code_verifier` whose hash matches the challenge. The bad app never had it.
+4. Google answers `400 invalid_grant`. The real StayPlanner, which kept the verifier in memory, swaps the code normally.
+
+Without PKCE, step 7 would only need the `code`. Anything that can observe the front channel — a logging proxy, a malicious app registered with the same custom URL scheme (an app link prefix like `myapp://`) on mobile, a referrer leak (the browser telling the next site which URL you came from) — can steal the code and redeem it itself:
 
 ```mermaid
 sequenceDiagram
@@ -207,11 +245,17 @@ flowchart LR
 ```
 
 - **Confidential client**: a server-side app (StayPlanner's backend) that can hold a `client_secret` safely. It authenticates itself at the token endpoint with that secret.
-- **Public client**: a mobile app or single-page app (SPA) that ships its binary or JS to the user's device. Anything embedded in it can be extracted, so it has **no** usable secret. PKCE was built for this case and, since RFC 9700, is required for confidential clients too, as defense in depth.
+- **Public client**: a mobile app or single-page app (SPA, a web app that runs as JavaScript in the browser) that ships its binary or JS to the user's device. Anything embedded in it can be extracted, so it has **no** usable secret. PKCE was built for this case and, since RFC 9700, is required for confidential clients too, as defense in depth (extra layers, so one failure is not fatal).
 
 ### Scopes vs. claims
 
 **In plain words:** scopes are what the app asks to do ("read calendar"). Claims are facts inside a token ("user is ana@x.com").
+
+**Step by step:**
+1. StayPlanner asks for scopes `openid email calendar.readonly`.
+2. Google shows Ana a consent screen built from those scopes: "see your email address, view your calendars".
+3. Ana approves. The access token can now only read calendars.
+4. Because `openid email` was asked, the ID token carries the claims `sub: 1234` and `email: ana@x.com`.
 
 These are two different lists and the most common point of confusion:
 
@@ -234,6 +278,21 @@ A client should **never** send the ID token to an API as a bearer credential, an
 
 ### `state` and `nonce`
 
+**Step by step (`state`):**
+1. Before redirecting Ana to Google, StayPlanner makes `state = x7Kq` and saves it in Ana's session.
+2. Google sends Ana back with `code=...&state=x7Kq`.
+3. StayPlanner compares: the returned `x7Kq` matches the saved one, so this redirect really belongs to Ana's own login.
+4. If an attacker forces Ana's browser to a callback carrying the attacker's own code, the `state` will not match Ana's session, and StayPlanner refuses.
+
+```mermaid
+flowchart LR
+    S["Save state=x7Kq<br/>in Ana's session"] --> G["Google login"]
+    G --> B["Back with state=?"]
+    B --> Q{"matches x7Kq?"}
+    Q -- "yes" --> OK["continue"]
+    Q -- "no" --> X["reject: forged"]
+```
+
 - **`state`**: an opaque, per-request random value the client generates, stores server-side (or in a signed cookie) before the redirect, and checks against what comes back. It defeats CSRF: without it, an attacker can start their own OAuth flow, capture the resulting code, and trick the victim's browser into completing the redirect — binding the *victim's* session to the *attacker's* account at the client.
 - **`nonce`**: a value OIDC carries inside the ID token itself. The client generates it, sends it in the authorization request, and checks it against the `nonce` claim in the returned ID token. It stops replay of an old, previously-issued ID token being submitted as if it were fresh.
 
@@ -255,9 +314,9 @@ flowchart TD
 ```
 
 - **Client credentials**: the client authenticates with its own `client_id` + secret (or a signed JWT assertion) and gets a token representing *itself*, not a user. This is the OAuth grant used for service-to-service calls; see [[Service-to-Service Auth - API Keys, HMAC, mTLS]] for how that is actually operated (key rotation, mTLS-bound tokens, JWT client assertions).
-- **Device authorization grant** (RFC 8628): the device shows a short code and a URL, the user approves on a second device (phone, laptop) by typing the code in a browser, and the device polls the token endpoint until the authorization server reports success.
+- **Device authorization grant** (RFC 8628; for smart TVs, command-line tools and IoT, i.e. small internet-connected gadgets): the device shows a short code and a URL, the user approves on a second device (phone, laptop) by typing the code in a browser, and the device polls the token endpoint until the authorization server reports success.
 - **Refresh token**: redeems a long-lived refresh token for a new access token without the user re-authenticating. Covered in depth, including rotation and reuse detection, in [[Access and Refresh Tokens]].
-- **Deprecated: Implicit grant** returned the access token directly in the redirect URL fragment, with no code and no back channel, so the token itself traveled the front channel and leaked into browser history, referrer headers, and server logs. **Deprecated: ROPC** (Resource Owner Password Credentials) had the client collect the user's password and POST it directly, defeating the entire point of OAuth. OAuth 2.1 and RFC 9700 remove the implicit grant and disallow ROPC for new clients: use Authorization Code + PKCE for anything with a browser, and the device grant for anything without one.
+- **Deprecated: Implicit grant** returned the access token directly in the redirect URL fragment (the part after `#`), with no code and no back channel, so the token itself traveled the front channel and leaked into browser history, referrer headers, and server logs. **Deprecated: ROPC** (Resource Owner Password Credentials) had the client collect the user's password and POST it directly, defeating the entire point of OAuth. OAuth 2.1 and RFC 9700 remove the implicit grant and disallow ROPC for new clients: use Authorization Code + PKCE for anything with a browser, and the device grant for anything without one.
 
 ## 4. Worked example 🟡
 
@@ -435,13 +494,16 @@ Store `(issuer, sub) → local_user_id` and look up by that pair on every login.
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the code + PKCE flow, scopes vs claims, ID vs access tokens and the `state`/`nonce` checks. **Next we look at real systems**: how big providers and SPAs run OAuth, the attacks seen in production (loose redirect URIs, mix-ups), what to monitor, and the deeper choices (introspection, key discovery, client authentication).
+
+
 - **Real systems:**
   - "Login with Google / GitHub / Microsoft" buttons are OIDC, using Authorization Code + PKCE.
   - Identity providers such as Auth0, Okta, and Keycloak implement the authorization server role so product teams do not run their own.
   - Kubernetes `kubectl` uses the Device Authorization Grant for `kubectl oidc-login` style CLI auth against a cluster's identity provider.
   - The Backend-for-Frontend (BFF) pattern: since the implicit grant is gone, an SPA no longer holds tokens in JS at all. A thin backend owns the Authorization Code + PKCE flow, keeps tokens server-side, and gives the browser only an HttpOnly session cookie.
 - **Failure modes → fixes:**
-  - Redirect URI left as a loose prefix match → an attacker registers `https://app.example.com.evil.com/callback` or abuses an open redirect on the real host to steal the code. Fix: exact string match on the registered redirect URI, no wildcards.
+  - Redirect URI left as a loose prefix match → an attacker registers `https://app.example.com.evil.com/callback` or abuses an open redirect (a page on the real site that forwards to any URL given to it) on the real host to steal the code. Fix: exact string match on the registered redirect URI, no wildcards.
   - "Mix-up attack": a client talks to the wrong authorization server (possible when one client is registered with several providers) and sends a code meant for one provider to another. Fix: the client stores *which* issuer it started the flow with and validates the ID token's `iss` against exactly that issuer.
   - Authorization server outage mid-flow → the client has a code but the token endpoint is down. Fix: treat the exchange as retryable with backoff, and fail the login with a clear retry message rather than silently creating a half-authenticated session.
   - Consent screen shows an overly broad scope list → treat scopes as a cost; request the narrowest scope the feature needs (`calendar.readonly`, not `calendar`).
@@ -453,7 +515,7 @@ Store `(issuer, sub) → local_user_id` and look up by that pair on every login.
 
 ## 8. Deep dive 🔴
 
-- **Discovery and JWKS.** OIDC providers publish a discovery document at `/.well-known/openid-configuration` listing their endpoints and signing key set (JWKS) location. Clients fetch and cache the JWKS, keyed by `kid`, and refresh it (with a cache-miss retry) when they see an unknown `kid` — this is how key rotation happens without a deploy on the client side. See [[JWT - Structure, Validation and Pitfalls]] for the signature-verification mechanics this feeds.
+- **Discovery and JWKS.** OIDC providers publish a discovery document (a JSON file listing all their URLs) at `/.well-known/openid-configuration` listing their endpoints and signing key set (JWKS) location. Clients fetch and cache the JWKS, keyed by `kid`, and refresh it (with a cache-miss retry) when they see an unknown `kid` — this is how key rotation happens without a deploy on the client side. See [[JWT - Structure, Validation and Pitfalls]] for the signature-verification mechanics this feeds.
 - **Refresh token rotation and reuse detection.** Each refresh exchange returns a *new* refresh token and invalidates the old one. If the old (already-rotated) refresh token is ever presented again, that is a signal it was stolen and used by someone else before the legitimate client's next refresh — the authorization server should revoke the entire token family, not just the one token.
 
 ```mermaid
@@ -466,7 +528,7 @@ stateDiagram-v2
     Revoked --> [*]
 ```
 
-- **JWT access tokens vs. introspection.** A resource server can validate a JWT access token locally (fast, no network call, but a stolen-and-still-valid token lives until `exp`) or call the authorization server's introspection endpoint (RFC 7662) for every request (slower, but revocation is instant). Many production systems use short-lived JWTs (1–15 minutes) as a middle ground: local validation most of the time, with a short enough blast radius that instant revocation matters less.
+- **JWT access tokens vs. introspection.** A resource server can validate a JWT access token locally (fast, no network call, but a stolen-and-still-valid token lives until `exp`) or call the authorization server's introspection endpoint (RFC 7662; an API that answers "is this token still valid, and what can it do?") for every request (slower, but revocation is instant). Many production systems use short-lived JWTs (1–15 minutes) as a middle ground: local validation most of the time, with a short enough blast radius that instant revocation matters less.
 - **Confidential client authentication at the token endpoint.** A plain `client_secret` is a long-lived shared secret that can leak from config or logs. RFC 9700 recommends `private_key_jwt`: the client signs a short-lived JWT assertion with its own private key instead of sending a secret at all — the same client-assertion mechanism covered in [[Service-to-Service Auth - API Keys, HMAC, mTLS]].
 - **Go libraries for this in practice.** `golang.org/x/oauth2` implements the client side of the standard grants (code exchange, token refresh); `coreos/go-oidc` adds OIDC discovery, JWKS caching, and ID token verification on top of it. The hand-written checks in this note's worked example are what those libraries do internally — useful to know, rarely worth reimplementing in a production client.
 
@@ -506,6 +568,26 @@ stateDiagram-v2
 - Map logins by `(issuer, sub)`, never by email.
 - Client credentials grant = service-to-service, no user; device grant = no browser available; both deprecate implicit and ROPC.
 - Rotate refresh tokens on every use and revoke the whole family on reuse detection.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) Does the app ever see the user's Google password in OAuth?
+> No. The user types it only on Google's page; the app gets a limited token.
+
+> [!question]- (easy) What does OIDC add on top of OAuth?
+> A signed ID token that says who the user is.
+
+> [!question]- (easy) What is a scope?
+> The named permission the app asks for, like `calendar.readonly`.
+
+> [!question]- (medium) A thief grabs the authorization code from the redirect. Why can't they use it?
+> With PKCE, swapping the code needs the `code_verifier`, which never left the real app.
+
+> [!question]- (medium) What do `state` and `nonce` each protect?
+> `state` protects the redirect back to the app from CSRF; `nonce` stops an old ID token being replayed as new.
+
+> [!question]- (medium) Which flow does a smart TV use, and which does a backend job with no user use?
+> The device authorization grant for the TV; client credentials for the backend job.
 
 ## Links
 - **Before this:** [[Access and Refresh Tokens]], [[JWT - Structure, Validation and Pitfalls]], [[Secrets Management]]

@@ -21,12 +21,18 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
 > - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Union-Find and Skip Lists]]: the theory twin. Know path compression and union by rank, Kruskal's "skip edges that would make a loop", and the skip list's coin-flip express lanes.
+> - [[Trees, BSTs and Balanced Trees]] and [[Graphs and Graph Algorithms]]: trees, graphs, and BFS for the naive comparison.
+
 **From zero** 🟢: this file is the hands-on side of [[Union-Find and Skip Lists]]. It builds both structures for real in Go: union-find with path compression and union by rank, and a skip list with randomized levels — plus the tests that prove them correct. Read one structure at a time; they are independent.
 
 ## Before the code 🟢
 
 - **Slices as arrays of state** (`parent []int`, `rank []int`): each element is an index, so the forest is two slices, not a tree of pointers.
 - **Recursion** (`Find`): calls itself to reach the root, then repoints nodes on the way back (path compression).
+- **DSU (disjoint-set union)**: another name for union-find; `parent[i]` is element `i`'s boss, and a root is its own boss.
+- **Sentinel head node**: a fake first node in the skip list so inserting at the front needs no special case.
 - **Methods on pointer receivers** (`func (d *DSU) Union`): functions attached to a type that can change its fields.
 - **`sort` / `slices` and `math/rand`**: sort edges by weight for Kruskal; flip coins for skip-list levels.
 - **Testing and benchmarks** (`testing.T`, `testing.B`): tests assert behavior; a benchmark measures speed and has no pass/fail.
@@ -62,11 +68,15 @@ flowchart LR
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** the two structures and what the tests and benchmark prove. **Next we read the code:** union-find and Kruskal first (steps 1-4), then the skip list (steps 5-7).
+
 The code below walks through four pieces in order: the disjoint-set union itself (steps 1-2), the minimum-spanning-tree algorithm it exists to serve (step 3), a measured benchmark proving the "near-constant" claim with real numbers rather than only an asymptotic argument (step 4, covered in the Tests section below), and the unrelated-but-same-chapter skip list (steps 5-7).
 
 Union-find and the skip list share a package here purely because the theory note covers both in one chapter — in a real codebase, these would almost certainly live in two separate packages, since nothing about either structure depends on the other.
 
 ### Step 1: the disjoint-set union
+
+**What this code does, in plain words:** it creates `n` elements, each its own group of one: `parent[i] = i`, rank 0, and a counter of how many groups exist.
 
 **Concept.** The theory note's whiteboard sketch is parent pointers with no optimization at all ([[Union-Find and Skip Lists#4. Worked example 🟡]]).
 
@@ -103,6 +113,8 @@ func New(n int) *DSU {
 
 ### Step 2: Find, with path compression
 
+**What this code does, in plain words:** it follows parent links up to the root, and on the way back makes every node it passed point straight at that root.
+
 **Concept.** `Find` does two jobs at once: it answers "what is x's root?" and, by re-pointing every visited node straight at that root, it shortens every future walk through those same nodes — this is path compression, covered in [[Union-Find and Skip Lists#3.1 Union-find: path compression and union by rank]].
 
 ```go
@@ -123,6 +135,8 @@ func (d *DSU) Find(x int) int {
 3. This recursive form is clear to read but costs one stack frame per node on the path; an iterative two-pass version (walk to the root, then walk again re-pointing) avoids that at the cost of a few more lines — a reasonable alternative for extremely deep, adversarial trees.
 
 ### Step 3: Union, by rank
+
+**What this code does, in plain words:** it finds both roots; if they are the same it returns `false`, otherwise it hangs the lower-rank root under the higher one and returns `true`.
 
 **Concept.** `Union` always attaches the shorter tree under the taller one, which the theory note's deep dive proves keeps any tree's height at `O(log n)` even before path compression helps ([[Union-Find and Skip Lists#8. Deep dive 🔴]]).
 
@@ -168,6 +182,8 @@ func (d *DSU) Sets() int {
 
 ### Step 4: Kruskal's minimum spanning tree
 
+**What this code does, in plain words:** it sorts edges cheapest first and keeps each edge only if `Union` says it joins two separate groups, stopping once it has `n-1` edges.
+
 **Concept.** This is the textbook reason union-find exists ([[Union-Find and Skip Lists#1. Why it exists 🟢]]): sort edges by weight, then use `Union`'s own return value as the cycle check, with no separate graph-traversal code needed.
 
 ```go
@@ -210,6 +226,8 @@ func KruskalMST(n int, edges []Edge) []Edge {
 3. The early `break` once `len(mst) == n-1` stops as soon as a spanning tree (exactly `n-1` edges for `n` nodes) is complete, skipping any remaining, heavier edges.
 
 ### Step 5: the skip list's node shape and level choice
+
+**What this code does, in plain words:** it defines a skip-list node with one forward link per lane it belongs to, and flips coins to pick how many lanes a new node joins.
 
 **Concept.** The theory note's mental model is "a sorted list with random express lanes" ([[Union-Find and Skip Lists#3.2 Skip lists: randomized levels]]).
 
@@ -296,6 +314,8 @@ func (s *SkipList) randomLevel() int {
 2. `randomLevel` is a direct translation of "keep flipping while heads": each loop iteration is one coin flip, and the loop simply stops at the first tails (or at `maxLevel`, whichever comes first).
 
 ### Step 6: finding predecessors, inserting and deleting
+
+**What this code does, in plain words:** it walks from the top lane down, remembering the last node before the target on each lane; `Insert` and `Delete` then relink just those nodes.
 
 **Concept.** `findPredecessors` is the one walk every other operation builds on: starting from the top level, it records the last node at each level whose key is still smaller than the target — exactly the "express lane, then local" walk from the mental model.
 
@@ -409,6 +429,8 @@ func (s *SkipList) Delete(member string) {
 3. Deleting a member that was never inserted is a silent no-op (`existing == nil` returns early) rather than an error — matching Redis's own `ZREM` semantics of "fine, it's gone either way."
 
 ### Step 7: range queries
+
+**What this code does, in plain words:** it uses the express lanes to jump to the first score `>= min`, then walks the bottom lane collecting members until the score passes `max`.
 
 **Concept.** `RangeByScore` is the operation Redis's `ZRANGEBYSCORE` is built on, and the reason a skip list — not a hash table — backs a sorted set: an ordered range scan needs the list to actually be ordered, which a hash table never is.
 
@@ -727,6 +749,8 @@ PASS
 
    The exact multiplier varies run to run (BFS cost depends on how connected the random graph happens to be), but the order of magnitude is stable, which is the point: union-find's near-constant cost per query versus a linear-in-graph-size reachability check.
 
+> 🟡 → 🔴 **You now know** how every function works and what the tests and benchmark show. **Next comes the advanced part:** what is not safe (concurrency), what is slower than it looks (`Delete`'s scan), and the silent limits (`maxLevel`, recursion depth).
+
 ## Pitfalls in the code 🔴
 
 - **Neither `DSU` nor `SkipList` is safe for concurrent use.** Both mutate shared state (`parent`/`rank` slices; the linked `forward` pointers) with no `sync.Mutex` or other synchronization anywhere in this file.
@@ -842,6 +866,30 @@ A quick map of responsibility, useful when coming back to this module after a ga
 - `dsu_test.go` and `skiplist_test.go` — the correctness tests for each structure, kept separate from `bench_test.go` so an ordinary `go test -race ./...` run never has to pay for the benchmark's 100,000-query inner loop.
 
 Reading the five non-test files in that order — `dsu.go`, then `kruskal.go`, then `bench_test.go`, then `skiplist.go` — mirrors the order the theory note itself introduces the ideas in, which is also the order the "Code" section above walks through them.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does `Union` return when both elements are already in the same group?
+> `false`. Kruskal uses that to skip edges that would make a loop.
+
+> [!question]- How many edges does Kruskal's MST have for `n` nodes?
+> Exactly `n − 1`.
+
+> [!question]- In `RangeByScore`, why tie-break by member name?
+> So members with the same score come out in a fixed order: `bob` before `dave`.
+
+🟡 Medium
+
+> [!question]- Why does the skip list seed its own random source?
+> So tests get the same level sequence every run and failures are reproducible.
+
+> [!question]- Why is `SkipList.Delete` `O(n)` here, not `O(log n)`?
+> It first scans the bottom lane to find the member's score; real `ZSET`s keep score in a side hash map.
+
+> [!question]- Is `DSU` safe to share between goroutines?
+> No. It has no lock; callers must add one or keep it in one goroutine.
 
 ## Links
 

@@ -24,7 +24,7 @@ updated: 2026-11-13
 
 ### Whiteboard version
 
-A team ships a Go service. In 2024 it was built and tested against Go 1.21 and a specific version of a C library used by a CGO dependency. By 2026, a new engineer's laptop has Go 1.24 and a newer system library.
+A team ships a Go service. In 2024 it was built and tested against Go 1.21 and a specific version of a C library used by a CGO dependency (a Go library that calls C code, so it needs that C library on the machine). By 2026, a new engineer's laptop has Go 1.24 and a newer system library.
 
 The code that compiled and passed tests in 2024 now fails to build, or builds but behaves differently at runtime, because the **environment**, not the code, changed underneath it.
 
@@ -36,6 +36,9 @@ A container fixes this by shipping the Go 1.21 toolchain's *output* (a compiled 
 > - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and 10 (why, mental model and the cheat sheet). Stop there, that is a full first pass.
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+> [!note] Before this note
+> - [[Processes, Threads and Context Switching]]: a process is one running program; the operating system gives it an ID number (PID) and its own memory. A container turns out to be just a process with blinkers on.
 
 **From zero, in 60 seconds** 🟢
 
@@ -81,6 +84,12 @@ Containers ship the app *and* its surroundings together, so "works on my machine
 | Virtual machine (VM) | A full fake computer with its own OS | An EC2 instance |
 | Image | A frozen package of app + files | `myapi:1.4.0` |
 | Container | A running, isolated process started from an image | `docker run myapi:1.4.0` |
+| Namespace | A Linux feature that limits what a process can *see* (its own files, its own process list, its own network) | Inside, your app thinks it is PID 1 |
+| cgroup (control group) | A Linux feature that limits what a process can *use* (CPU, memory) | "This container gets at most 512 MiB" |
+| Hypervisor | Software that splits one physical machine into several VMs | AWS Nitro, VMware |
+| Registry | An online store for images that you push to and pull from | Docker Hub, AWS ECR |
+| Digest | A fingerprint (hash) of an image's exact bytes; same digest = same image | `sha256:3f2a9c…` |
+| Dockerfile | A text recipe of steps that builds an image | `FROM golang:1.24` … |
 
 **Picture it**
 
@@ -108,15 +117,32 @@ Where it breaks: real shipping boxes are fully sealed; software containers share
 
 ## 1. Why it exists 🟢
 
-Before containers, deploying meant replicating a server's exact state by hand or with a configuration-management tool: install this OS package at this version, this language runtime, this library, set these environment variables, open these ports. Four places had to agree: a developer's laptop, a teammate's laptop, the CI runner, and production. They rarely did.
+Before containers, deploying meant replicating a server's exact state by hand or with a configuration-management tool (a script runner like Ansible or Chef that installs the same things on many servers): install this OS package at this version, this language runtime, this library, set these environment variables, open these ports. Four places had to agree: a developer's laptop, a teammate's laptop, the CI runner (the machine that builds and tests code on every push), and production. They rarely did.
 
 Concretely: an API depends on `libssl` 1.1 and Node.js 18. A teammate's laptop has `libssl` 3.0 and Node.js 20 because they set it up a year later.
 
-The code runs locally for them with subtly different TLS defaults and V8 behavior, passes their tests, and then fails a cipher-negotiation test in CI, which still has the older versions. Nobody changed the code; the environment changed under it.
+The code runs locally for them with subtly different TLS defaults (the rules for encrypted connections) and V8 behavior (V8 is the JavaScript engine inside Node.js), passes their tests, and then fails a cipher-negotiation test (a check of which encryption method both sides agree on) in CI, which still has the older versions. Nobody changed the code; the environment changed under it.
 
 Multiply this by every dependency and every machine, and "works on my machine" becomes the default failure mode of the team, not an edge case.
 
 Containers close the gap by making the environment part of the shipped artifact instead of part of the target machine.
+
+```mermaid
+flowchart LR
+    Code["Same code"] --> A["Laptop A:<br/>libssl 1.1, Node 18"]
+    Code --> B["Laptop B:<br/>libssl 3.0, Node 20"]
+    A --> OK["tests pass"]
+    B --> Fail["CI fails"]
+    Img["Container image:<br/>code + its own libssl + Node"] --> Same["same result everywhere"]
+```
+
+### Real-life example: a new joiner's first day 🟢
+
+Imagine joining the backend team at a company like Swiggy.
+Without containers, day one is spent installing the right Postgres, Redis and Go versions, and something is always slightly off.
+With containers, you run one command and get the exact Postgres, Redis and API images the rest of the team uses.
+The image that the build system tested is the same one that later runs in production.
+So "it worked on my laptop" finally means something.
 
 ## 2. Mental model 🟢
 
@@ -124,9 +150,9 @@ A container is **a normal operating-system process that cannot see most of the m
 
 The host kernel is the only thing actually running the code — there is no second kernel, no virtual CPU. Four Linux kernel mechanisms do the hiding:
 
-- **PID namespace** — the process sees itself as PID 1 and cannot see the host's other processes.
+- **PID namespace** — the process sees itself as PID 1 (process number 1, normally the first program a machine starts) and cannot see the host's other processes.
 - **Mount namespace** — the process sees its own root filesystem (the image's files), not the host's.
-- **Network namespace** — the process gets its own loopback and network interfaces.
+- **Network namespace** — the process gets its own loopback (its own private `localhost`) and network interfaces.
 - **cgroups** — the kernel caps how much CPU, memory, and I/O the process (and its children) may use, and can kill it if it goes over a memory limit.
 
 Analogy: a container is like a hotel room, not a separate building.
@@ -135,9 +161,25 @@ Every room (container) shares the same building's foundation, plumbing, and elec
 
 A VM, by contrast, is a separate building with its own foundation, plumbing, and electrical grid — a full guest OS and kernel — which is why it costs far more to stand up and run.
 
+## Common beginner mistakes 🟢
+
+- **Calling a container a "small VM"** → it has no kernel of its own; it is one process on the host's kernel → think "fenced-off process", which also explains why it starts in under a second.
+- **Using a floating tag like `node:20`** → that tag can point to a different image next week, so builds drift again → pin the version, ideally by digest.
+- **Storing important data inside the container** → its files vanish when the container is removed → put data in a volume or an outside database.
+- **Assuming containers fix every environment difference** → settings and outside services can still differ between staging and prod → keep config in environment variables and check them per environment.
+- **Running as root inside the container "because it's isolated"** → the isolation is thinner than a VM's → run as a normal user (see Docker 09).
+
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that a container is a normal process that cannot see most of the machine, and that the image carries the app's whole environment. **Next we open the box**: how this stack differs from a VM's stack, and how one image travels unchanged from your laptop to production.
+
 **In plain words:** you write a recipe (Dockerfile), build it into an image, push it to a shared store (registry), and anyone can pull and run the exact same thing.
+
+**Step by step (VM vs container):**
+1. A VM host runs a hypervisor. Each VM on top boots its own full OS and kernel, which takes tens of seconds and gigabytes.
+2. A container host runs one OS with one kernel. There is no second OS to boot.
+3. Starting a container just asks that kernel for a new process, with namespaces (what it can see) and cgroups (what it can use) switched on.
+4. So App A and App B start almost instantly, sharing the one kernel but not each other's files.
 
 ```mermaid
 flowchart TB
@@ -156,9 +198,15 @@ flowchart TB
     end
 ```
 
-Each guest OS in the VM stack boots its own kernel, drivers, and init system before the app ever starts — that is where the extra minutes and gigabytes go. In the container stack, `App A` and `App B` start as soon as the single shared kernel hands them a process id; there is no second boot.
+Each guest OS in the VM stack boots its own kernel, drivers, and init system (the first program that starts all the others) before the app ever starts — that is where the extra minutes and gigabytes go. In the container stack, `App A` and `App B` start as soon as the single shared kernel hands them a process id; there is no second boot.
 
 The second mechanism is **build once, run anywhere the same way**:
+
+**Step by step:**
+1. `docker build` turns your source code and Dockerfile into an image, fingerprinted as `sha256:3f2a9c…`.
+2. `docker push` uploads it to a registry such as ECR.
+3. Your laptop, the CI runner and production all `pull` that same fingerprint.
+4. Same fingerprint means same bytes, so nothing can quietly change between test and production.
 
 ```mermaid
 flowchart LR
@@ -180,7 +228,7 @@ Two developers, Priya and Sam, both run the same image, `myapi:3f2a9c` (a digest
 | Host | What the kernel sees | What the container sees |
 | --- | --- | --- |
 | Priya's Linux laptop | A process in its own PID/mount/net namespaces, cgroup-limited to 512 MiB and 1 CPU | Its own root filesystem from the image, PID 1, `localhost` |
-| Sam's Mac (Docker Desktop) | Docker Desktop runs one lightweight Linux VM; inside that VM, the same namespaced process | Identical: same root filesystem, same PID 1, same `localhost` |
+| Sam's Mac (Docker Desktop, the Mac/Windows app that runs Docker) | Docker Desktop runs one lightweight Linux VM; inside that VM, the same namespaced process | Identical: same root filesystem, same PID 1, same `localhost` |
 | A production EC2 host | Same namespaced process, same cgroup limits, same image digest | Identical to both of the above |
 
 This is the concrete payoff: the thing both developers and production run is bit-for-bit the same artifact, so a bug that shows up in production can be reproduced locally by pulling that exact digest — not by trying to remember what versions production happened to have.
@@ -201,31 +249,34 @@ Label: **estimate** — these vary enormously by image size and VM image, but th
 | Containers | Shared host kernel, isolated via namespaces + cgroups | Packaging and deploying one service per isolated unit, dev/CI/prod parity | Weaker isolation boundary than a VM; shares the kernel |
 | Virtual machines | Hypervisor virtualizes hardware; each VM boots its own kernel | Running different OS kernels on one host, or where kernel-level isolation is a hard security requirement | Minutes to boot, gigabytes of overhead per instance |
 | Bare metal / direct install | App runs directly on the host OS, no isolation layer | Maximum performance, single-tenant hardware you fully control | No portability, no isolation between apps on the same host |
-| WebAssembly (Wasm) sandboxes | App compiled to Wasm, run in a Wasm runtime's sandbox | Very fast cold starts for simple, language-agnostic, CPU-bound functions | Smaller ecosystem, limited syscall/network access without extra runtimes |
+| WebAssembly (Wasm) sandboxes | App compiled to Wasm, run in a Wasm runtime's sandbox | Very fast cold starts for simple, language-agnostic, CPU-bound functions | Smaller ecosystem, limited syscall (requests a program makes to the kernel, like "open this file")/network access without extra runtimes |
 
 ## 6. Trade-offs and when not to use 🟡
 
-- Containers share the host kernel, so a kernel exploit can, in principle, cross container boundaries — a VM's hardware-enforced isolation is stronger. Multi-tenant, hostile-workload platforms often still put a VM (or a sandboxed runtime like gVisor/Kata) around groups of containers.
+- Containers share the host kernel, so a kernel exploit can, in principle, cross container boundaries — a VM's hardware-enforced isolation is stronger. Multi-tenant, hostile-workload platforms often still put a VM (or a sandboxed runtime like gVisor/Kata, which add an extra wall between the container and the real kernel) around groups of containers.
 - A container needs a Linux-kernel-compatible host. Running Linux containers on macOS or Windows works only because Docker Desktop first starts a small Linux VM for you — see the deep dive.
 - Containers do not fix configuration drift between environments: an environment variable or a feature flag that differs between staging and production still differs, container or not.
 - Containers do not remove the need to manage state. A container's own filesystem is ephemeral; databases and files that must survive a restart still need volumes or external storage (see [[Docker 06 - Volumes and Bind Mounts]]).
-- For a single, trusted, long-lived service with no need for portability or per-service isolation, a container adds an extra build and runtime layer for little benefit — a systemd-managed process can be simpler.
+- For a single, trusted, long-lived service with no need for portability or per-service isolation, a container adds an extra build and runtime layer for little benefit — a systemd-managed process (a program started and restarted by Linux's built-in service manager) can be simpler.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how containers differ from VMs, how one image moves unchanged through every environment, and when containers are the wrong tool. **Next is the advanced part**: how real platforms use containers, the failures teams actually hit, and what really happens on a Mac when you type `docker run`.
+
 
 - **Real systems:** every major cloud platform (AWS ECS/EKS/Fargate, Google Cloud Run/GKE, Azure Container Apps/AKS) runs workloads as containers; CI systems (GitHub Actions, GitLab CI) run each job inside a container for a clean, reproducible environment.
 - **Failure modes → fixes:**
   - "Works on my machine, fails in CI" despite using containers → the Dockerfile itself is not pinned (a floating base tag like `node:20` resolved to a different patch version on different days); pin by digest.
-  - Container runs locally but not on a teammate's Mac/Windows laptop → usually a resource limit in Docker Desktop's VM (memory, disk) or a platform mismatch (an `arm64`-only image on an `amd64` host or vice versa); see [[Docker 02 - Images, Layers and Containers]] on multi-arch images.
+  - Container runs locally but not on a teammate's Mac/Windows laptop → usually a resource limit in Docker Desktop's VM (memory, disk) or a platform mismatch (an `arm64`-only image, built for Apple-silicon-style chips, on an `amd64` Intel/AMD host or vice versa); see [[Docker 02 - Images, Layers and Containers]] on multi-arch images.
   - "It worked before I added volumes" → state leaking across container restarts in ways the image didn't account for; isolate what must persist.
-- **What to monitor:** image digest actually deployed (not just the tag), container restart count, OOM-kill count from cgroup limits, and build time as a proxy for how bloated the image has become.
+- **What to monitor:** image digest actually deployed (not just the tag), container restart count, OOM-kill count (OOM = out of memory: the kernel kills a container that goes over its memory limit) from cgroup limits, and build time as a proxy for how bloated the image has become.
 
 ## 8. Deep dive 🔴
 
 **Why Docker Desktop needs a VM on macOS and Windows.** Linux containers rely on Linux-specific kernel namespaces and cgroups; macOS's XNU kernel and Windows's NT kernel don't have them. Docker Desktop starts one small Linux VM (historically via HyperKit/Virtualization.framework on macOS, WSL2 on Windows) and runs the actual containers as Linux processes inside that single VM. From the outside this looks like "Docker just works" on a Mac, but there is in fact one VM boot happening — it's just shared across every container you start, not one VM per container, which is why it is still far cheaper than running separate VMs per service.
 
 **The ecosystem map.** "Docker" names several distinct pieces that container terminology often blurs together:
-- **Docker Engine** — the daemon (`dockerd`) and CLI that build images and run containers on one host.
+- **Docker Engine** — the daemon (`dockerd`, a background program that does the real work) and CLI that build images and run containers on one host.
 - **OCI (Open Container Initiative)** — the vendor-neutral specifications for what an image and a runtime must look like, so images built by Docker run under `containerd`, `podman`, or a Kubernetes node's runtime without changes.
 - **Registries** — where built images are stored and pulled from (Docker Hub, AWS ECR, GitHub Container Registry).
 - **Compose** — a tool to describe and run several related containers together on one host (see [[Docker 07 - Docker Compose for Local Development]]).
@@ -261,6 +312,30 @@ A single-host `docker run` and a Kubernetes-scheduled pod both end up starting t
 - Docker Desktop on macOS/Windows runs one shared Linux VM under the hood so Linux containers can exist at all.
 - Containers do not fix config drift, kernel-feature differences, or statefulness — those need their own solutions.
 - "Docker" = Engine (daemon/CLI) + OCI spec (portability) + registries (distribution) + Compose/Kubernetes (orchestration).
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does a container package together?
+> The app plus everything it needs to run: code, libraries, files and settings.
+
+> [!question]- Does a container have its own kernel?
+> No. It shares the host's one kernel; only a VM has its own.
+
+> [!question]- What is the difference between an image and a container?
+> The image is the frozen package; a container is a running process started from it.
+
+🟡 Medium
+
+> [!question]- Which Linux feature stops a container from seeing other processes, and which one stops it using all the memory?
+> Namespaces hide things (the PID namespace hides other processes); cgroups limit resources like memory.
+
+> [!question]- Why pull an image by digest instead of a tag like `myapi:latest`?
+> A tag can be moved to a different image; a digest always means the exact same bytes.
+
+> [!question]- How do Linux containers run on a Mac at all?
+> Docker Desktop starts one small Linux VM, and every container runs as a process inside it.
 
 ## Links
 

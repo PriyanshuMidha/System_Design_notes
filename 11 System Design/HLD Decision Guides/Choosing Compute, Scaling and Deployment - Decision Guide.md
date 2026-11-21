@@ -37,6 +37,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (each decision), 4 (worked example), 5, 6 and 9 (drills).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 10 and 11. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Scaling Basics]]: you grow by buying a bigger machine or adding more machines, and adding machines only works if they keep no user data in memory.
+> - [[Cloud Computing Basics]]: in the cloud you rent machines, storage and services by the hour or by use, instead of buying hardware.
+
 **From zero, in 60 seconds** 🟢
 
 Your code has to run somewhere. It can run on a rented machine, in a **container** (a sealed box with your code and everything it needs), or as a small function the cloud starts for you.
@@ -80,6 +84,12 @@ This guide helps you pick the simplest option that survives the load.
 | Stateless | A copy keeps no user data in memory between requests | Any pod can serve any user |
 | Scale up / scale out | Bigger machine / more machines | 8 to 32 cores / 4 to 12 pods |
 | Autoscaling | Adding or removing copies automatically by a signal | Add pods when CPU > 60% |
+| Pod | One running copy of your container in Kubernetes | `orders-api-7f9c` |
+| Cold start | Extra delay when a new copy starts from nothing | first Lambda call takes 500 ms |
+| ECS / Fargate | AWS's simpler service for running containers without managing servers | 8 API tasks on Fargate |
+| AZ (availability zone) | A separate data centre within one region | Mumbai has 3 AZs |
+| RTO | How long you may be down after a disaster | RTO 15 minutes |
+| Canary | Sending a small share of traffic to a new version first | 1% of users on v2 |
 
 **Picture it**
 
@@ -132,6 +142,21 @@ Think of **transport for a company**.
 
 The analogy breaks down on cost: renting cars is cheapest per hour when they are busy all day, and the ride-hailing app is cheapest only when trips are rare.
 
+### Real-life example: Swiggy at lunch, a photo app at night 🟢
+
+At 12:00 a food app like Swiggy or Zomato gets several times its morning traffic. Its API runs as many identical containers behind a load balancer, and more are added automatically just before the rush.
+Its orders database runs on one big machine with copies, because databases are much harder to spread out.
+A small step like "make a thumbnail when a restaurant uploads a photo" happens a few hundred times a day, so it runs as a serverless function that costs nothing while idle.
+New app versions go to a small slice of users first (canary), and roll back automatically if errors rise.
+
+## Common beginner mistakes 🟢
+
+- **Saying "Kubernetes and 40 microservices" for a small product** → the team spends its time running the platform → start with a modular monolith on a simple container service.
+- **Using serverless for a steady 50,000 requests a second** → paying per request costs more than always-on containers → use serverless for rare or spiky work.
+- **Keeping sessions or files on one server** → you cannot add or replace copies freely → keep sessions in Redis or tokens, files in object storage.
+- **Scaling only after users feel it** → new copies take minutes to start, so the peak hits first → pre-scale for known peaks and scale on a signal that rises early.
+- **"Active-active in 3 regions" without saying how writes work** → two regions can accept conflicting writes → state the write plan, or use one primary region with a standby.
+
 ```mermaid
 flowchart TD
     Q1{"Traffic: steady, spiky,<br/>or event-driven?"}
@@ -144,6 +169,8 @@ flowchart TD
 ```
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the four places code can run and the rule "simplest thing that survives the load". **Next we open the box**: one decision at a time, from VMs vs containers to Kubernetes, serverless, service size, scaling, state, autoscaling, regions and deployments. Several decisions start with a plain walk-through; the full detail follows.
 
 ### 3.1 The four compute options
 
@@ -177,6 +204,13 @@ flowchart LR
 
 **In plain words.** A VM carries a whole operating system. A container shares the host's kernel and carries only your app and its libraries, so it is smaller and starts faster. See [[Docker 01 - Why Containers]] and [[Docker 08 - How Docker Works Under the Hood]].
 
+**Step by step:**
+1. You build your Go API once into a container image: the binary plus its few files, tens of megabytes.
+2. The same image runs on your laptop, in testing and in production.
+3. A machine can run many containers side by side, all sharing that machine's kernel (the core of the operating system).
+4. A new copy starts in about a second, so rolling out a new version is quick.
+5. A VM, by contrast, boots a whole operating system and takes minutes.
+
 **Example.** A Go API image can be roughly tens of megabytes (estimate for a static binary on a minimal base), starts in about a second, and you can pack many on one host. A VM image is gigabytes and starts in minutes.
 
 **Why it matters.** Containers give you the same artifact from laptop to prod and make rolling deployments quick. Choose a VM only when you need kernel-level control, strong isolation between tenants, or software that does not containerise.
@@ -184,6 +218,13 @@ flowchart LR
 ### 3.3 When Kubernetes is worth it
 
 **In plain words.** **Kubernetes** is a scheduler that keeps the desired number of containers running, restarts failed ones, spreads them across machines and wires up service discovery. It is a platform for running a platform.
+
+**Step by step:**
+1. You tell Kubernetes: "run 6 copies of `orders-api`, each needs 1 CPU".
+2. It finds machines (nodes) with room and starts 6 pods there.
+3. One node dies, taking 2 pods. Kubernetes notices and starts 2 new pods elsewhere.
+4. You ship v2. It replaces pods a few at a time, only when the new ones pass health checks.
+5. The cost: someone must run and upgrade the cluster itself.
 
 ```mermaid
 flowchart TD
@@ -206,11 +247,18 @@ Choose Kubernetes when at least two or three of these hold:
 If none hold, ECS on Fargate is less work. See [[Kubernetes Fundamentals]] and [[AWS 04 - Compute Choices - EC2, ECS-Fargate, EKS, Lambda]].
 
 > [!warning] Common mistake
-> Saying "Kubernetes" because it is standard. It adds cluster upgrades, networking, RBAC and add-on version management. For a five-service product, say "ECS Fargate now, move to EKS if the service count and team justify a platform team".
+> Saying "Kubernetes" because it is standard. It adds cluster upgrades, networking, RBAC (role-based access control: who may do what in the cluster) and add-on version management. For a five-service product, say "ECS Fargate now, move to EKS if the service count and team justify a platform team".
 
 ### 3.4 Serverless: the real limits
 
 **In plain words.** You upload a function; the provider runs copies when events arrive and scales them for you.
+
+**Step by step:**
+1. A restaurant uploads a photo. The upload fires an event.
+2. The cloud starts a copy of your "resize" function. If none is warm, this first start is slower (a cold start).
+3. The function resizes the photo and saves it. You pay for those few hundred milliseconds only.
+4. 1,000 uploads at once start up to 1,000 copies, each opening its own database connection if you are careless.
+5. No uploads at night means no copies and no bill.
 
 **Limits to quote.** AWS Lambda has a maximum timeout of 15 minutes and a default account concurrency limit of 1,000 per Region (raisable).
 
@@ -295,6 +343,13 @@ flowchart LR
 
 **In plain words.** A **stateless** service keeps nothing between requests, so any copy can answer any request. A **stateful** one remembers things, so requests for the same data must reach the same place. The Twelve-Factor App says processes should be stateless and share-nothing ([[Cloud Native and the 12-Factor App]]).
 
+**Step by step:**
+1. Riya logs in. Pod 2 saves her session in Redis, not in its own memory.
+2. Her next request goes to pod 5. Pod 5 reads the session from Redis and serves her.
+3. She uploads a profile photo. It goes to object storage, not pod 5's disk.
+4. Pod 5 crashes. Nothing is lost; the load balancer sends her next request to pod 1.
+5. So scaling is just "add pods", and a crash is a non-event.
+
 ```mermaid
 flowchart LR
     C["Clients"] --> LB["Load balancer"]
@@ -322,13 +377,20 @@ Where each kind of state goes:
 
 **In plain words.** An **autoscaler** adds or removes copies based on a measured signal. Pick the signal that rises before users suffer.
 
+**Step by step:**
+1. 10 pods are running; the target is 60% CPU each.
+2. Lunch traffic pushes average CPU to 90%.
+3. The autoscaler computes 10 × 90 / 60 = 15 and asks for 5 more pods.
+4. The new pods take a minute or two to start and join the load balancer.
+5. After lunch it waits about 5 minutes of low load before removing pods, so it does not flap up and down.
+
 The Kubernetes Horizontal Pod Autoscaler computes `desired = ceil(current * currentMetric / targetMetric)`. Scale-down waits for a stabilisation window (300 seconds by default) to avoid flapping. See [[Autoscaling]].
 
 | Signal | Good for | Weak because |
 | --- | --- | --- |
 | CPU utilisation | CPU-bound API pods | Misses I/O-bound slowness |
 | Requests per pod (RPS) | Web APIs | Needs a metrics pipeline |
-| Queue depth or age | Workers | Needs a custom or KEDA metric |
+| Queue depth or age | Workers | Needs a custom or KEDA (an add-on that scales Kubernetes pods on queue length and similar events) metric |
 | Latency (p95) | Direct user pain | Noisy, can oscillate; adding pods may not fix a slow database |
 | Schedule | Known peaks (lunch rush) | Wrong if the pattern shifts |
 | Memory | Rarely | Often does not fall after load drops |
@@ -371,11 +433,18 @@ flowchart TD
 | Active-active | Seconds | Highest | Write conflicts, global consistency |
 
 > [!warning] Common mistake
-> Saying "active-active in 3 regions" without explaining how writes work. Active-active forces a choice between conflict resolution (CRDTs, last-writer-wins) and a single write region per entity. Name which one.
+> Saying "active-active in 3 regions" without explaining how writes work. Active-active forces a choice between conflict resolution (CRDTs, data types that merge concurrent edits automatically; last-writer-wins) and a single write region per entity. Name which one.
 
 ### 3.10 Deployment strategy
 
 **In plain words.** How a new version replaces the old. See [[Deployment Strategies - Rolling, Blue-Green, Canary]], [[Feature Flags]] and [[Rollback and Safe Migrations]].
+
+**Step by step (canary):**
+1. v2 is deployed next to v1. The load balancer sends 1% of traffic to v2.
+2. Dashboards compare v2's error rate and latency with v1's.
+3. Healthy after 15 minutes? Move to 10%, then 50%, then 100%.
+4. Errors jump at any step? Send all traffic back to v1 at once.
+5. Only 1% of users ever saw the bad version.
 
 | Strategy | Mechanism | Rollback | Extra cost |
 | --- | --- | --- | --- |
@@ -461,6 +530,8 @@ Numbers are rough, documented or estimated, as marked.
 > Say the trade-off in one sentence at the same time as the choice. It is the single most scored behaviour.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how to choose where code runs, how it scales and how it ships. **Next comes the senior view**: production habits and failure modes, then the deeper details of database scale-up, Kubernetes requests and limits, cold starts, headroom maths and stateful workloads.
 
 **Real-life examples.**
 
@@ -602,6 +673,26 @@ StatefulSets give stable identity and storage, but running a database on Kuberne
 - Size for the loss of one AZ.
 - Multi-region is a cost and write-consistency decision; justify it with RTO, RPO or latency.
 - Canary plus feature flags for risky changes.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is the difference between scaling up and scaling out?
+> Up: a bigger machine. Out: more machines sharing the work.
+
+> [!question]- (easy) When is serverless a good fit?
+> Rare or spiky work, like a photo resize a few hundred times a day.
+
+> [!question]- (easy) Why must app servers be stateless to scale out?
+> So any copy can serve any request and copies can be added or lost freely.
+
+> [!question]- (medium) 10 pods at 90% CPU, target 60%. How many pods does the autoscaler want?
+> 10 × 90 / 60 = 15 pods.
+
+> [!question]- (medium) Name two signs that Kubernetes is worth it.
+> 15+ services needing the same deploy tooling, and a platform team that can run the cluster.
+
+> [!question]- (medium) Why scale the database up before sharding it?
+> A bigger machine is an afternoon's work; sharding is months of work and hard to undo.
 
 ## Links 🟢
 

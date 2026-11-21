@@ -36,6 +36,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (row locks, version columns, deadlocks), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Transactions and ACID]]: a transaction groups statements between `BEGIN` and `COMMIT`; its locks last until it ends.
+> - [[Isolation Levels and MVCC]]: at PostgreSQL's default level (READ COMMITTED) each statement sees the latest saved data, and two read-then-write requests can still overwrite each other.
+
 **From zero, in 60 seconds** 🟢
 
 Two requests want to change the same database row at the same moment. Each reads the row, does a little maths, and writes the result back. The second write quietly wipes out the first. That bug is called a **lost update**.
@@ -81,6 +85,11 @@ Locking is how you stop the second writer from wiping out the first.
 | Contention | How often requests fight over the same row | A hot product's stock row |
 | Deadlock | Two transactions each wait for a lock the other holds | A locks 1 then 2, B locks 2 then 1 |
 | Retry | Run the whole read-compute-write again after a conflict | Re-read the invoice and try again |
+| Read-modify-write | Read a value, change it in your code, write it back | Read paid 10,000, add 2,000, write 12,000 |
+| Pessimistic locking | Lock the row first so others wait their turn | `SELECT ... FOR UPDATE` |
+| Optimistic locking | Write only if the row is unchanged since you read it; else retry | `WHERE version = 7` |
+| Lock timeout | The longest you agree to wait for a lock before giving up | `SET LOCAL lock_timeout = '2s'` |
+| SQLSTATE | The five-character error code PostgreSQL sends back | `40P01` = deadlock |
 
 **Picture it**
 
@@ -108,7 +117,7 @@ Where it breaks: rooms are visibly occupied, but a database writer only finds ou
 
 ## 1. Why it exists 🟢
 
-InvoiceOps records payments against invoices. Invoice 501 has `total_minor = 100000` (₹1,000.00 in paise, the minor unit) and nothing paid yet. Two payment webhooks arrive within the same 5 ms, one for 30,000 and one for 50,000. The handler does what most first versions do:
+InvoiceOps records payments against invoices. Invoice 501 has `total_minor = 100000` (₹1,000.00 in paise, the minor unit) and nothing paid yet. Two payment webhooks (HTTP calls the payment provider makes to our server to say "a payment happened") arrive within the same 5 ms, one for 30,000 and one for 50,000. The handler does what most first versions do:
 
 1. `SELECT paid_minor FROM invoices WHERE id = 501` → 0
 2. compute `0 + amount` in Go
@@ -177,11 +186,36 @@ flowchart LR
 | Needs a schema change | no | yes: a `version` column |
 | Can span several HTTP requests | no | yes |
 
+### Real-life example: holding a movie seat 🟢
+
+Think of picking seat F14 on a ticket app like BookMyShow while someone else taps the same seat.
+The app can run `UPDATE seats SET held_by = me WHERE id = 'F14' AND held_by IS NULL`, a write that only works if nobody holds the seat yet.
+One tap changes 1 row and wins; the other changes 0 rows and is told "seat taken, pick another".
+Editing your profile name in the same app is different: two edits at once are rare, so a version number is enough, and the loser simply reloads and tries again.
+Both are "locking", just with different bets on how often people collide.
+
+## Common beginner mistakes 🟢
+
+- **Reading a value in code and writing it back** → two requests both read 10,000 and one payment vanishes → let SQL do the maths: `SET paid_minor = paid_minor + 2000`.
+- **Running `SELECT ... FOR UPDATE` outside a transaction** → with autocommit the lock is released as soon as the `SELECT` ends → put the `SELECT` and the `UPDATE` inside one `BEGIN ... COMMIT` on one connection.
+- **Waiting for a lock forever** → a stuck request holds a pooled connection, and the pool runs dry → set `SET LOCAL lock_timeout = '2s'`.
+- **Ignoring "0 rows updated"** → the optimistic write lost, but the code reports success → always check rows affected and re-read or return a conflict.
+- **Locking several rows in random order** → two requests each hold one and wait for the other: a deadlock → lock rows in ascending id order.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the bug (lost update) and the two cures: lock first, or check a version when writing. **Next we open the box**: how PostgreSQL row locks work and their four strengths, how the version column catches a conflict, how deadlocks happen and how lock order prevents them, and two cousins, advisory locks and compare-and-set. Each subsection starts with a short step-by-step walk.
 
 ### 3.1 Pessimistic: row locks in PostgreSQL
 
 **In plain words:** `SELECT ... FOR UPDATE` is how you say "this row is mine until I commit"; anyone else who wants to change it stands in line behind you.
+
+**Step by step:**
+1. Webhook A runs `BEGIN` and `SELECT ... FROM invoices WHERE id = 501 FOR UPDATE`. It gets the row (paid 0) and the lock.
+2. Webhook B runs the same `SELECT ... FOR UPDATE` and has to wait.
+3. A checks its rules, sets paid to 30,000 and commits. The lock is released.
+4. B wakes up and reads the fresh row: paid 30,000, not the old 0.
+5. B adds its 50,000 and commits: paid 80,000. Nothing was lost.
 
 A **row lock** is a lock on one row version, taken by a locking read or by `UPDATE`/`DELETE`, and held until the transaction ends. There is no way to release a row lock early, so the lock lives exactly as long as the transaction ([[Transactions and ACID]] covers where transactions begin and end).
 
@@ -219,7 +253,7 @@ At READ COMMITTED, when B's wait ends, PostgreSQL re-reads the newest committed 
 
 **In plain words:** locks come in four strengths, like door signs from "do not enter" down to "please do not repaint this room"; a stronger sign blocks more kinds of visitors.
 
-PostgreSQL has four row-lock strengths. **FOR KEY SHARE** is what foreign-key checks take on the parent row; "key" here means the columns of a unique index that a foreign key could reference.
+PostgreSQL has four row-lock strengths. **FOR KEY SHARE** is what foreign-key checks (the database making sure a child row, like a payment, points to a real parent row, like an invoice) take on the parent row; "key" here means the columns of a unique index that a foreign key could reference.
 
 | Lock clause | Taken by | Blocks | Does not block |
 | --- | --- | --- | --- |
@@ -267,11 +301,18 @@ flowchart TD
     TM -- "no" --> E2["error 55P03 after 2 s"]
 ```
 
-`lock_timeout` is off (0) by default in PostgreSQL 17, which means a blocked request waits forever, holding a pooled connection. Set it per transaction with `SET LOCAL`, which resets at commit or rollback.
+`lock_timeout` is off (0) by default in PostgreSQL 17, which means a blocked request waits forever, holding a pooled connection (one of the few database connections your app shares; see [[Connection Pooling]]). Set it per transaction with `SET LOCAL`, which resets at commit or rollback.
 
 ### 3.2 Optimistic: the version column
 
 **In plain words:** give every row a counter. You note the counter when you read, and your write says "only if the counter is still 7". If someone bumped it meanwhile, your write touches zero rows and you redo the work on fresh data.
+
+**Step by step:**
+1. A and B both read invoice 501: paid 0, version 7.
+2. A writes `paid = 30000, version = 8 WHERE id = 501 AND version = 7`. It matches: `UPDATE 1`.
+3. B writes `paid = 50000, version = 8 WHERE id = 501 AND version = 7`. The row is now version 8, so it matches nothing: `UPDATE 0`.
+4. B sees 0 rows, waits a moment, and re-reads: paid 30,000, version 8.
+5. B writes `paid = 80000, version = 9 WHERE version = 8`: `UPDATE 1`. Both payments counted.
 
 Add a counter to every row that is edited by read-modify-write:
 
@@ -334,6 +375,13 @@ Runnable Go version: [[Locking - Optimistic vs Pessimistic - Go]]
 
 **In plain words:** a deadlock is two people each holding one door and waiting for the other's door. The fix is a house rule: everyone always takes the doors in the same order.
 
+**Step by step:**
+1. A wants to merge invoice 501 into 502, so it locks 501 first.
+2. At the same time B merges 502 into 501, so it locks 502 first.
+3. A now asks for 502 and waits for B. B asks for 501 and waits for A. Nobody can move.
+4. After about 1 second PostgreSQL notices the loop, cancels one of them with error `40P01`, and the other carries on.
+5. The cure: both always lock the lower id first (501, then 502). Then B just waits behind A, and no loop can form.
+
 A **deadlock** is a cycle of waits: transaction A holds row 1 and wants row 2, while B holds row 2 and wants row 1. Neither can proceed.
 
 ```mermaid
@@ -350,7 +398,7 @@ sequenceDiagram
     DB-->>B: lock 501 granted
 ```
 
-PostgreSQL does not check for deadlocks on every wait. A waiting backend checks only after `deadlock_timeout` (default 1 s), then aborts one transaction in the cycle with SQLSTATE `40P01`.
+PostgreSQL does not check for deadlocks on every wait. A waiting backend (the server process serving one connection) checks only after `deadlock_timeout` (default 1 s), then aborts one transaction in the cycle with SQLSTATE `40P01`.
 
 In practice the victim is usually the backend that ran the check, which is the one that started waiting first; do not rely on which side loses. So a deadlock costs about a second of latency and one failed transaction.
 
@@ -388,6 +436,13 @@ sequenceDiagram
 
 **In plain words:** sometimes there is no row to lock, so you lock an agreed-upon number instead, like hanging your coat on hook 42 to say "statement job for workspace 42 is taken".
 
+**Step by step:**
+1. Two copies of a job both want to rebuild workspace 42's monthly statement. There is no single row that stands for "this job".
+2. Both turn the text `'statement:42'` into the same number with a hash function.
+3. Job 1 calls `pg_advisory_xact_lock(that number)` and gets it.
+4. Job 2 calls the same and waits.
+5. Job 1 commits, the lock is released automatically, and Job 2 goes next.
+
 An **advisory lock** is a lock on a number that you choose rather than on a row. PostgreSQL enforces nothing about what it protects; your code agrees on what the number means. It is useful as an application mutex when there is no row to lock, for example "only one job may regenerate the monthly statement for workspace 42".
 
 ```sql
@@ -416,11 +471,18 @@ sequenceDiagram
     PG-->>J2: granted, J2 regenerates nothing twice
 ```
 
-Prefer the transaction-scoped form. A session-scoped lock taken through a transaction-pooling proxy such as PgBouncer can stay attached to a server connection that another client then reuses (see [[Connection Pooling]]). Advisory locks protect only work inside one PostgreSQL cluster; for coordination across services, see [[Distributed Locks and Fencing Tokens]].
+Prefer the transaction-scoped form. A session-scoped lock taken through a transaction-pooling proxy such as PgBouncer (a program that shares a few real database connections among many app connections, handing one out per transaction) can stay attached to a server connection that another client then reuses (see [[Connection Pooling]]). Advisory locks protect only work inside one PostgreSQL cluster; for coordination across services, see [[Distributed Locks and Fencing Tokens]].
 
 ### 3.5 Optimistic concurrency outside SQL: compare-and-set
 
-**In plain words:** the version-check trick is everywhere, not just SQL: HTTP, DynamoDB, Redis and ORMs all have a way to say "write only if it still looks like what I read".
+**In plain words:** the version-check trick is everywhere, not just SQL: HTTP, DynamoDB, Redis and ORMs (libraries that map code objects to database tables) all have a way to say "write only if it still looks like what I read".
+
+**Step by step:**
+1. User 1 opens invoice 501 in the browser. The API sends it with a tag, `ETag: "7"` (the version).
+2. User 2 opens the same invoice and also gets `"7"`.
+3. User 1 saves and sends `If-Match: "7"`. The version still is 7, so the save works and the tag becomes `"8"`.
+4. User 2 saves and sends `If-Match: "7"`. The version is now 8, so the API answers `412 Precondition Failed`.
+5. User 2's screen reloads the new data and asks them to apply their change again.
 
 Optimistic concurrency outside SQL uses the same idea, called **compare-and-set** (CAS: write only if the current value still equals what you expect):
 
@@ -566,12 +628,14 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how row locks, version checks, lock ordering and advisory locks work, and when to pick each. **Next comes the senior view**: how real systems use them, how lock pile-ups show up in production, the `SKIP LOCKED` job queue, and the internals interviewers probe.
+
 - **Real systems:** ORMs ship optimistic locking as a built-in (Hibernate `@Version`, Rails `lock_version`). Job-queue libraries on PostgreSQL such as River (Go), Oban (Elixir) and Solid Queue (Rails) fetch work with `FOR UPDATE SKIP LOCKED`. Kubernetes uses optimistic concurrency on every object through `resourceVersion` and rejects stale updates with HTTP 409.
 - **Failure modes → fixes:**
 	- Requests pile up behind one hot row → `lock_timeout`, shorter transactions, or split the row (stock buckets, counter shards).
 	- Bursts of `40P01` → find the two code paths in the deadlock log entry and make them lock in the same order.
 	- Optimistic retries never succeed under load → add jitter, cap attempts, or move that path to `FOR NO KEY UPDATE`.
-	- A migration's `ALTER TABLE` waits behind a long transaction and every query queues behind the migration → `lock_timeout` on DDL; see [[Zero-Downtime Schema Migrations]].
+	- A migration's `ALTER TABLE` waits behind a long transaction and every query queues behind the migration → `lock_timeout` on DDL (schema-changing statements like `ALTER TABLE`); see [[Zero-Downtime Schema Migrations]].
 	- `idle in transaction` sessions holding locks after an app crash mid-request → `idle_in_transaction_session_timeout`.
 - **What to monitor:**
 	- `log_lock_waits = on`: logs any lock wait longer than `deadlock_timeout`.
@@ -619,6 +683,8 @@ Worker 1 locks the first 10 due rows; worker 2, running the same query a millise
 Once the claim has committed, the rows stay `running`, so a reaper must reset rows whose `locked_at` is too old. Retries, visibility timeouts and dead-letter handling belong to [[Background Workers and Job Queues]].
 
 ## Whiteboard version 🟢
+
+🟢 **Plain version:** The bug is two requests that each read a value, change it in code and write it back, so one change is lost. If one SQL statement can do the change, use that and skip locks. If conflicts are rare or the edit takes a long time, check a version number when writing and retry on "0 rows". If the row is busy or the work is costly to redo, lock it first, with a time limit. When you lock several rows, always lock them in the same order.
 
 ```text
 lost update = read -> compute in app -> write, overlapping another writer
@@ -709,7 +775,7 @@ The version check works at READ COMMITTED because the `UPDATE` re-reads the late
 
 **In plain words:** one row is a single till: locked writes queue one by one, so a hot row tops out near a thousand writes a second no matter how big the server is.
 
-One row can absorb only so many locked writes per second, because they serialize on its lock and each one waits for the previous commit's WAL flush.
+One row can absorb only so many locked writes per second, because they serialize on its lock and each one waits for the previous commit's WAL flush (forcing the change log onto disk before "committed" is returned).
 
 If a commit takes about 1 ms, one row tops out around 1,000 writes per second, regardless of how many CPUs the server has (an estimate from commit latency, not a benchmark).
 
@@ -755,6 +821,8 @@ flowchart LR
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** Let one SQL statement do the maths whenever it can. Otherwise pick a bet: lock the row first and make others wait, or write only if the version is unchanged and retry if not. Never wait for a lock without a time limit. Lock several rows in id order, and retry the whole transaction on a deadlock, but never retry a business-rule failure like "would overpay".
+
 - Lost update = read, compute in the app, write back, overlapping with another writer. Atomic SQL beats any lock.
 - Pessimistic: `FOR NO KEY UPDATE` for updates, `FOR UPDATE` for deletes and key changes, `FOR SHARE` to freeze a row; lock lives until commit.
 - Never wait forever: `SET LOCAL lock_timeout = '2s'`; `NOWAIT` fails at once; both raise `55P03`.
@@ -763,6 +831,30 @@ flowchart LR
 - Deadlocks: lock in id order; retry on `40P01`; detected after `deadlock_timeout` (1 s).
 - `FOR UPDATE SKIP LOCKED` = job queue; `pg_advisory_xact_lock` = app mutex.
 - Retry whole transactions on `40001`, `40P01`, `55P03`; never retry business-rule failures.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is a lost update?
+> Two requests read the same value, each changes it in code, and the second write wipes out the first.
+
+> [!question]- Which needs a schema change, optimistic or pessimistic locking?
+> Optimistic: it needs a `version` column.
+
+> [!question]- What does "UPDATE 0" mean in the optimistic pattern?
+> Someone changed the row since you read it; re-read and try again, or report a conflict.
+
+🟡 Medium
+
+> [!question]- Why prefer `FOR NO KEY UPDATE` over `FOR UPDATE` when updating `paid_minor`?
+> It does not block foreign-key checks, so inserting a payment that points at the invoice does not have to wait.
+
+> [!question]- Two transactions lock invoices 501 and 502 in opposite orders. What happens, and what is the fix?
+> A deadlock: PostgreSQL cancels one with `40P01` after about 1 s; lock rows in ascending id order.
+
+> [!question]- Why must a user editing in a browser for five minutes use optimistic locking?
+> Holding a database lock and a connection for five minutes of thinking would block everyone else; a version or ETag check holds nothing.
 
 ## Links 🟢
 

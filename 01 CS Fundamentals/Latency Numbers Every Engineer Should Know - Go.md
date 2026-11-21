@@ -21,6 +21,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add "Code", "Design decisions" and "Running it".
 > - 🔴 **Interview / SDE-3 prep?** Add "Tests", "Pitfalls" and the exercises. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Latency Numbers Every Engineer Should Know]]: the theory twin. Know what p50/p99 mean, why fan-out hurts the tail, and Little's Law `L = λW`.
+> - [[Memory Hierarchy and CPU Caches]] and [[Storage Devices - HDD, SSD, NVMe]]: where the ladder's numbers come from. Not needed to read the code itself.
+
 **From zero** 🟢
 
 This file is the hands-on twin of the latency theory note. It holds three tiny Go functions: one that computes p50/p95/p99 the way real dashboards do, one that shows why calling 100 services in parallel makes slow requests almost certain, and one that is Little's Law as a single multiplication. Read it top to bottom; every code block is followed by a plain "How it works" list, and the tests prove each claim with real numbers.
@@ -58,15 +62,17 @@ flowchart LR
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** the three ideas this code proves. **Next we read the code:** three short functions, each followed by a plain "How it works" list.
+
 ### Step 1: percentiles from a batch of samples
 
 **In plain words:** sort the measured times, then pick the value that sits X% of the way up the sorted list — that is all a "p99" is.
 
 **Concept.** The theory note explains why p99 matters more than the average ([[Latency Numbers Every Engineer Should Know#p50, p95, p99: why the average lies]]): a handful of slow requests can hide inside a healthy-looking mean.
 
-`Percentile` is the computation behind that claim — the same nearest-rank-with-interpolation method Go's own benchmarking tools and most APM agents use.
+`Percentile` is the computation behind that claim — the same nearest-rank-with-interpolation method (find the position X% of the way up the sorted list; if it falls between two values, take a point between them) that Go's own benchmarking tools and most APM agents (application performance monitoring tools such as Datadog or New Relic) use.
 
-The alternative is a true histogram (fixed or exponential buckets), which scales to millions of samples without sorting them all, but is overkill for the batch sizes this note works with; sorting and interpolating is simpler and exact for a few thousand samples.
+The alternative is a true histogram (fixed or exponential buckets: counters for ranges like "0-1 ms", "1-2 ms", "2-4 ms"), which scales to millions of samples without sorting them all, but is overkill for the batch sizes this note works with; sorting and interpolating is simpler and exact for a few thousand samples.
 
 ```go
 package latency
@@ -179,6 +185,8 @@ There is no loop, no state, because the law holds for any stable queue regardles
 | Two named `float64` parameters for `LittlesLaw` | A single `Workload` struct | Self-documenting call sites for a two-argument formula; a struct would pay off only if more fields were likely to join it later |
 
 ## Tests 🔴
+
+> 🟡 → 🔴 **You now know** how each function works. **Next comes the advanced part:** tests that pin each claim to exact numbers, and the hidden assumptions (sorting in place, independent calls, a stable system) that can make the results wrong in real use.
 
 ### Test 1: percentile on known values
 
@@ -343,6 +351,30 @@ ok  	latency	1.440s
 1. `LittlesLaw` takes `lambdaPerSec` before `wSeconds`, but since it only multiplies them, swapping the call to `LittlesLaw(0.05, 1000)` gives the same answer. Add a doc comment or a named-parameter wrapper that would make a genuine unit mix-up (seconds passed where requests/sec was expected) visible at the call site instead of silently compiling.
 2. Add a `FanOutP999(n int, pFast float64)` that takes the per-call fast-probability as a parameter instead of hardcoding `0.99`. Predict `FanOutP999(100, 0.999)` before running it, and compare it to `FanOutP99(100)`.
 3. In `TestPercentileKnownValues`, change the sample count from 101 to 100 and predict the new p50. Run it and explain the difference using the rank formula in "How it works."
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does `Percentile` do first with the samples?
+> It sorts them from smallest to largest, then picks the value X% of the way up.
+
+> [!question]- What does `LittlesLaw(1000, 0.05)` return, and what does it mean?
+> 50: on average 50 requests are inside the system at once.
+
+> [!question]- Why does `Percentile` return 0 for an empty slice?
+> So a brand-new counter with no data gives a harmless zero instead of crashing.
+
+🟡 Medium
+
+> [!question]- Why do the tests copy the slice before calling `Percentile`?
+> `Percentile` sorts in place, so without a copy it would reorder the caller's data.
+
+> [!question]- Why is `FanOutP99`'s answer a floor, not an exact forecast, in real systems?
+> It assumes calls are independent; real calls often share a database or network, so slowness comes together and is more common.
+
+> [!question]- What does `FanOutP99(1)` return, and why is that a good sanity test?
+> 0.01: with one call, exactly 1% exceed their own p99 by definition.
 
 ## Links 🟢
 

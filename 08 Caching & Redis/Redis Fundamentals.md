@@ -37,6 +37,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add the rest of section 3 (speed, keys and expiry, atomic updates), section 4 (the seat counter in Go), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Caching Fundamentals]]: a cache is a fast copy of data kept in memory so the database is asked less often.
+> - [[Hash Tables and Go Maps]]: a map looks up a value by its key in about the same time, however many keys there are. Redis is basically one huge map on a server.
+
 **From zero, in 60 seconds** 🟢
 
 Redis is a program that keeps data in memory (RAM) instead of on disk, so reads and writes take well under a millisecond.
@@ -86,6 +90,10 @@ That shared fast place is Redis.
 | Thread | One line of execution inside a program | Redis runs all commands on one main thread |
 | Round trip (RTT) | Time for a request to go out and the reply to come back | ~0.1 ms on the same data centre network |
 | TTL | "Time to live": how long until a key is auto-deleted | `EXPIRE session:9 3600` = 1 hour |
+| Event loop | One thread that keeps asking "which connection has something for me?" and serves each in turn | Redis serving 10,000 clients on one thread |
+| Pipelining | Sending many commands at once without waiting for each reply | 100 `SET`s in one round trip |
+| Persistence (RDB / AOF) | Optional saving of memory to disk: a full snapshot (RDB) or a log of every write (AOF) | `appendonly yes` |
+| Eviction | Redis removing keys because memory is full | `maxmemory-policy allkeys-lru` |
 
 **Picture it**
 
@@ -121,7 +129,9 @@ A movie-booking site shows "seats left" on every show page. The number lives in 
 
 You could keep the counter in each app server's memory, but then 30 app servers hold 30 different numbers.
 
-You need one shared, very fast place that many servers can read and update atomically. That is what Redis gives you: a shared memory that speaks in data structures. The general idea of keeping a copy of data close to the reader is covered in [[Caching Fundamentals]]; this note is about Redis itself.
+You need one shared, very fast place that many servers can read and update atomically.
+
+Real apps do exactly this. A ticket app like BookMyShow has to show "seats left" to everyone at once, a food app like Swiggy keeps your login session and cart handy across many servers, and games keep live leaderboards. In each case, many servers need the same small, fast-changing value, and asking the main database every time would be too slow. That is what Redis gives you: a shared memory that speaks in data structures. The general idea of keeping a copy of data close to the reader is covered in [[Caching Fundamentals]]; this note is about Redis itself.
 
 ## 2. Mental model 🟢
 
@@ -134,13 +144,23 @@ Think of Redis as **one very fast clerk at a single counter**, sitting in a room
 
 The single clerk is both the strength (no locks, every command atomic) and the weakness (one slow request makes everyone wait).
 
+## Common beginner mistakes 🟢
+
+- **Running `KEYS *` to list keys** → it walks every key in one go and freezes Redis for everyone (about 54 ms on 1 million keys) → use `SCAN`, which walks a little at a time.
+- **Reading a value, then writing it back as two commands** → two servers can both read "1 seat left" and both sell it → use one command (`DECRBY`), a `WATCH` retry, or a Lua script.
+- **Expecting `MULTI`/`EXEC` to undo on error like SQL** → Redis has no rollback; the other commands still run → check inputs first, or use a Lua script.
+- **Updating a key with a plain `SET` and losing its timer** → the key now never expires → pass `EX` again or use `KEEPTTL`.
+- **Keeping data that must never be lost only in Redis** → by default a crash can lose recent writes → keep orders and payments in a real database, and use Redis in front of it.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that Redis is one fast, shared, in-memory map where every command runs alone, one after another. **Next we open the box**: how one thread serves thousands of clients, why that is so fast, how keys and timers work, and how to make a few steps happen safely together.
 
 ### 3.1 The server in one picture
 
 **In plain words:** your app sends short text commands over the network, Redis looks the key up in one big in-memory table, and sends the answer back.
 
-Redis is a TCP server (default port 6379). Clients send commands in a simple text protocol called **RESP** (REdis Serialization Protocol). The server keeps a big hash table, the **keyspace**, that maps each key to a value object.
+Redis is a **TCP server** (a program that listens for network connections on a port; Redis uses port 6379 by default). Clients send commands in a simple text protocol called **RESP** (REdis Serialization Protocol). The server keeps a big hash table, the **keyspace**, that maps each key to a value object.
 
 ```mermaid
 flowchart LR
@@ -161,7 +181,7 @@ flowchart LR
 
 Step by step:
 
-1. **Multiplexing.** The kernel tells Redis which of thousands of sockets have data ready, using `epoll` on Linux or `kqueue` on macOS (the measured server reported `multiplexing_api:kqueue`). One thread can serve tens of thousands of connections this way; see [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]].
+1. **Multiplexing.** The **kernel** (the core of the operating system) tells Redis which of thousands of **sockets** (open network connections) have data ready, using `epoll` on Linux or `kqueue` on macOS (the measured server reported `multiplexing_api:kqueue`). One thread can serve tens of thousands of connections this way; see [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]].
 2. **Parsing.** The command bytes are parsed. Since Redis 6.0, optional **I/O threads** (`io-threads`, default 1) can do socket reads and writes in parallel. Command *execution* stays on one thread.
 3. **Execution.** The main thread looks up the key in the keyspace and runs the command against the in-memory structure.
 4. **Reply.** The result goes into the client's output buffer and is written back.
@@ -171,10 +191,17 @@ Step by step:
 
 **In plain words:** everything is in memory, the work per command is tiny, and there is no locking because only one command runs at a time.
 
+**Step by step:**
+1. A `GET show:42:seats` arrives. Redis looks up one key in memory, which takes about a ten-thousandth of a millisecond.
+2. No other command is running, so there is nothing to lock and nobody to wait for.
+3. Redis writes the answer and moves straight to the next ready client.
+4. The command itself was tiny. Most of the 0.2 ms the client waited was the trip over the network.
+5. That is why sending 16 commands per trip (pipelining) gave about 10 times more work per second in the measurement below.
+
 | Reason | What it means |
 | --- | --- |
 | RAM, not disk | A memory access is around 100 ns; an SSD read is tens of microseconds or more. |
-| One executor thread | No locks, no context switches between commands, no lock contention. |
+| One executor thread | No locks, no **context switches** (the CPU pausing one thread to run another) between commands, no lock contention. |
 | Event loop | One thread waits on all sockets at once instead of one thread per client. |
 | Compact encodings | Small hashes, lists, sets and sorted sets are stored as one flat **listpack** (a packed byte array); small integer sets as an **intset**. Fewer pointers, better CPU cache use. |
 | Simple protocol | RESP is cheap to parse. |
@@ -185,7 +212,14 @@ The catch: on a real network the **round-trip time (RTT)** between app and Redis
 
 **In plain words:** a key is a name, the value has one type (number, list, set...), and an optional timer deletes it later.
 
-- A **key** is a binary-safe string, usually namespaced with colons: `user:42`, `show:42:seats`.
+**Step by step:**
+1. `SET session:9 "asha" EX 3600` creates key `session:9`, a string, with a 1-hour timer.
+2. `TTL session:9` shows how many seconds are left, for example 3,598.
+3. `HSET user:42 name Asha city Pune` creates a different key whose value is a hash with two fields.
+4. After an hour, `session:9` expires. The next `GET` finds nothing, or a background sweep removes it first.
+5. If memory fills up before then, eviction may remove keys early, but only if you set an eviction policy.
+
+- A **key** is a **binary-safe** string (any bytes are allowed, not just letters), usually namespaced with colons: `user:42`, `show:42:seats`.
 - A **value** has one type. The main types: string, hash, list, set, sorted set, stream, plus bitmaps and bitfields (operations on strings), HyperLogLog (a probabilistic counter stored as a string), geospatial indexes (stored as a sorted set) and, in Redis 8, JSON and vector sets.
 	- Pub/Sub is a messaging feature, not a data type. The full guide is [[Redis Data Structures and When to Use Each]].
 ```mermaid
@@ -239,6 +273,13 @@ flowchart TD
 ### 3.4 Atomicity: three tools
 
 **In plain words:** one command is always safe on its own. For a few steps that must happen together, use a transaction, a small Lua script, or a "watch and retry" check.
+
+**Step by step:**
+1. 50 seats left. 200 buyers each want to "check there is a seat, then take one".
+2. Done as two separate commands (`GET`, then `DECRBY`), several buyers read the same number before anyone takes a seat, so the show oversells.
+3. With `WATCH`: each buyer watches the key, reads it, then queues the `DECRBY`. If anyone changed the key in between, Redis cancels that buyer's step, and the buyer simply tries again.
+4. With a Lua script: the check and the take are sent as one small program, and Redis runs it as one command. Nobody can slip in between.
+5. Either way, exactly 50 seats are sold and the count never goes below zero.
 
 Every single command is atomic: `INCR`, `SET NX`, `ZINCRBY` and `LPUSH` can never interleave with another client's command. When you need *several* steps to be atomic, you have three tools:
 
@@ -511,13 +552,15 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how Redis serves many clients with one thread, how keys expire, how to make multi-step updates safe, and what Redis costs in RAM and durability. **Next is the advanced part**: managed offerings and their failure modes, how Redis stores small values compactly, what "single-threaded" really means, and the edge cases interviewers like.
+
 - **Real systems:** Redis is commonly used as the cache and fast-state layer in front of a relational database (sessions, rate limits, leaderboards, feature flags, job queues).
 	- Managed offerings include AWS ElastiCache (Redis OSS and Valkey engines), Google Cloud Memorystore, Azure Cache for Redis, Redis Cloud and Upstash.
 	- Setup and client config are in [[Redis Hands-on Setup with Go]]; Go client patterns are in [[Redis in Go]].
 - **Failure modes and fixes:**
 	- Memory full with the default policy `noeviction` (measured: `maxmemory-policy noeviction` on a fresh Redis 8.2): writes start failing with `OOM command not allowed`. Fix: set `maxmemory` and an eviction policy such as `allkeys-lru` for a pure cache.
-	- Latency spikes from a blocking command: find it with `SLOWLOG GET`, ban `KEYS` with ACLs or `rename-command`.
-	- Fork pauses and memory doubling during RDB snapshot or AOF rewrite (copy-on-write): leave headroom, see [[Redis in Production - Memory, Latency, Security]].
+	- Latency spikes from a blocking command: find it with `SLOWLOG GET`, ban `KEYS` with **ACLs** (access control lists: per-user rules for which commands are allowed) or `rename-command`.
+	- **Fork** pauses (Redis copying itself into a child process to save data) and memory doubling during RDB snapshot or AOF rewrite (**copy-on-write**: every memory page changed during the save is copied): leave headroom, see [[Redis in Production - Memory, Latency, Security]].
 	- Losing the only node: add replicas and failover, see [[Redis Replication, Sentinel and Cluster]].
 - **What to monitor:** `used_memory` vs `maxmemory`, `evicted_keys`, `expired_keys`, `keyspace_hits` / `keyspace_misses` (hit ratio), `connected_clients`, `instantaneous_ops_per_sec`, `SLOWLOG` entries, replication lag, and `mem_fragmentation_ratio`.
 
@@ -596,6 +639,30 @@ To use more CPU cores for commands you run more Redis processes: shards in Redis
 - Multi-step atomicity: `WATCH` + `MULTI/EXEC` (optimistic) or Lua/Functions (server-side, blocks everyone).
 - Never: `KEYS`, huge values, `DEL` of huge keys (use `UNLINK`), long scripts.
 - Licence: Redis 8 is RSALv2/SSPLv1/AGPLv3; Valkey is the BSD fork of 7.2.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Where does Redis keep its data while running?
+> In RAM, which is why commands take microseconds; saving to disk is optional.
+
+> [!question]- Why is a single Redis command always atomic?
+> One thread runs commands one at a time, so no other command can run halfway through it.
+
+> [!question]- What does `TTL key` return for a key that does not exist?
+> -2. A key with no timer returns -1.
+
+🟡 Medium
+
+> [!question]- Why does pipelining speed things up even though Redis has one thread?
+> Most of the wait is the network round trip; pipelining shares one trip among many commands.
+
+> [!question]- If one command inside `MULTI`/`EXEC` fails, what happens to the others?
+> They still run. Redis transactions have no rollback.
+
+> [!question]- What is the difference between expiry and eviction?
+> Expiry removes a key whose timer ran out; eviction removes keys that have not expired because memory is full.
 
 ## Links 🟢
 

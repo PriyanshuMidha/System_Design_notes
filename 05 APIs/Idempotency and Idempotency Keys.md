@@ -34,6 +34,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: requests have a method (`GET`, `POST`, `PUT`, `DELETE`) and headers, and responses have status codes.
+> - [[Timeouts, Retries and Backoff]]: when a call takes too long, the client gives up and tries again.
+> - [[Transactions and ACID]]: a group of database writes can be made all-or-nothing, and a unique constraint stops duplicate rows.
+
 **From zero, in 60 seconds** 🟢
 
 You tap "Pay". The money leaves your account, but the reply gets lost on bad network. The app cannot tell "it failed" from "it worked but I never heard back", so it tries again.
@@ -80,6 +85,12 @@ An idempotency key lets the server recognise "this is the same payment again" an
 | Unique constraint | A database rule that rejects duplicate values | Only one row per `order_id` |
 | Race condition | Two things running at once give a wrong result | Two retries both see "not paid yet" |
 | Header | Extra key-value info sent with a request | `Idempotency-Key: 8e1f...` |
+| Atomic | Happens as one indivisible step; nobody can sneak in between | "insert if absent" as one SQL statement |
+| UUID | A long random ID that is practically never repeated | `8e03978e-40d5-43e8-bc93-6894a57f9324` |
+| PSP | Payment service provider: the company that actually charges the card | Razorpay, Stripe |
+| Fingerprint | A short hash of the request, to spot "same key, different request" | SHA-256 of method + path + body |
+| Replay | Sending back the saved answer instead of doing the work again | the retry gets the first `201` |
+| TTL | Time to live: how long a record is kept | keys deleted after 24 hours |
 
 **Picture it**
 
@@ -117,6 +128,14 @@ This is not rare at scale. If 0.1% of payment requests time out at the client af
 
 Retries are the only cure for lost responses, and retries are only safe when the operation is idempotent. The idempotency key turns a non-idempotent `POST` into one whose retries are harmless.
 
+### Real-life example: a UPI payment that "hangs" 🟢
+
+You pay ₹499 on a food app with UPI and the screen spins, then says "payment pending".
+Behind the scenes the money may already have moved, but the confirmation was lost on the way back.
+If you tap Pay again, the app sends the same payment ID as before, not a new one.
+The server sees that ID, recognises the payment, and shows its result instead of charging you a second time.
+That repeated payment ID is an idempotency key.
+
 ## 2. Mental model 🟢
 
 - **Safe** means "no effect on the server": `GET` just reads.
@@ -126,11 +145,36 @@ An elevator call button is idempotent: press it five times, one elevator comes. 
 
 The idempotency key is a **cloakroom ticket**. The client invents a ticket number for *one logical operation* and shows it on every attempt. The first attempt does the work and pins the result to the ticket; every later attempt with the same ticket gets that same result back.
 
+## Common beginner mistakes 🟢
+
+- **Making a new key for every retry** → every retry looks new, so you charge twice anyway → make one key per payment and reuse it on every try, even after an app restart.
+- **"Look up the key, then insert it" as two steps** → two retries arriving together both see nothing and both charge → claim the key with one atomic insert on a unique key.
+- **Accepting the same key with a different amount** → you silently ignore the new amount or charge twice → compare a fingerprint and return `422`.
+- **Expiring keys sooner than clients retry** → a late retry becomes a fresh charge → keep keys longer than the longest retry window (24 hours is common).
+- **Forgetting the call to the payment provider** → your API is safe but your worker double-charges → send the provider its own stable key too.
+
+## Often confused 🟡
+
+| These two | First one | Second one |
+| --- | --- | --- |
+| Safe vs idempotent | Changes nothing (`GET`) | May change things, but repeating changes nothing more (`PUT`, `DELETE`) |
+| Idempotency key vs request ID | One per logical operation, same on every retry | One per attempt, for logs and tracing |
+| `409` vs `422` here | Same key is still being processed; try again soon | Same key was used for a different request; a client bug |
+| Set vs add | `balance = 100` is idempotent | `balance += 100` is not |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that retries are needed and only safe for idempotent operations, and that a key makes a `POST` safe to retry. **Next we open the box**: which HTTP methods are naturally safe, how to design operations to be repeat-safe, the key protocol step by step, the race that breaks the naive version, and a key's life cycle.
 
 ### HTTP methods (RFC 9110)
 
 **In plain words:** some verbs are repeat-safe by their very meaning (reading, replacing, deleting), and some are not (creating). This table is the official scorecard.
+
+**Step by step:**
+1. `GET /orders/7` twice: nothing changes either time. Safe and idempotent.
+2. `PUT /orders/7 {"status":"paid"}` twice: the order is "paid" after one call and still "paid" after two. Idempotent.
+3. `DELETE /orders/7` twice: gone after one call, still gone after two (the second may say `404`). Idempotent.
+4. `POST /orders` twice: two new orders. Not idempotent, so it needs a key.
 
 | Method | Safe | Idempotent | Notes |
 | --- | --- | --- | --- |
@@ -146,7 +190,7 @@ For a non-idempotent method such as `POST` it says the client should not, unless
 
 Go's `http.Transport` follows that rule. It silently retries a request that failed on a reused connection only when:
 
-1. the body is absent or re-creatable (`GetBody` is set), **and**
+1. the body is absent or re-creatable (`GetBody`, a function that can rebuild the body, is set), **and**
 2. either the method is `GET`, `HEAD`, `OPTIONS` or `TRACE` or the request carries an `Idempotency-Key` or `X-Idempotency-Key` header (checked in the Go 1.24 source, `Request.isReplayable`).
 
 Sending the header therefore also tells Go's own client that a `POST` may be resent.
@@ -154,6 +198,18 @@ Sending the header therefore also tells Go's own client that a `POST` may be res
 ### Make it naturally idempotent first
 
 **In plain words:** before building key machinery, try to phrase the operation so repeating it is harmless by design, like "set the value to X" instead of "add X".
+
+**Step by step:**
+1. The app makes its own order ID, say `7f9c…`, and sends `PUT /v1/orders/7f9c…`. A retry writes the same row again.
+2. Or the server updates only "if the version is still 3". The retry finds version 4 and changes nothing.
+3. Or the `payments` table has `UNIQUE (order_id)`. A second payment for the same order is rejected by the database.
+4. Only if none of these fit (like "charge this card") do you add an idempotency key.
+
+```mermaid
+flowchart LR
+    S["set balance = 100"] --> S2["twice: still 100 ✅"]
+    A["add 100 to balance"] --> A2["twice: +200 ❌"]
+```
 
 Before adding keys, check whether the operation can be idempotent by design:
 
@@ -167,8 +223,8 @@ When none of these fit ("charge this card", "send this SMS", "create a transfer"
 
 **In plain words:** one ticket per payment, not per attempt. The server keeps a small record per ticket: what was asked, whether it is still running, and the answer to replay.
 
-1. The client generates a random key per **logical operation**, not per attempt. The IETF draft recommends a UUID (RFC 9562); Stripe accepts keys up to 255 characters.
-2. It persists the key with the pending operation (so an app restart reuses it), then sends `Idempotency-Key: "8e03978e-40d5-43e8-bc93-6894a57f9324"`. The draft defines the value as a structured-field string, which is why it is quoted; Stripe takes it unquoted.
+1. The client generates a random key per **logical operation** (one user intent, like "pay for order 42"), not per attempt. The IETF draft recommends a UUID (RFC 9562); Stripe accepts keys up to 255 characters.
+2. It persists the key with the pending operation (so an app restart reuses it), then sends `Idempotency-Key: "8e03978e-40d5-43e8-bc93-6894a57f9324"`. The draft defines the value as a **structured-field string** (a standard HTTP header value format that puts text in quotes), which is why it is quoted; Stripe takes it unquoted.
 3. The server, scoped to the caller, keeps one record per key:
 
 | Field | Purpose |
@@ -218,6 +274,13 @@ sequenceDiagram
 
 **In plain words:** "look first, then write" fails when two requests look at the same moment: both see nothing and both do the work. The check and the claim must be one atomic step.
 
+**Step by step:**
+1. Retry 1 and retry 2 arrive within 1 ms, both with key `k1`.
+2. Both run `SELECT ... WHERE key = 'k1'`. Neither has written yet, so both get "not found".
+3. Both charge ₹499. The customer pays ₹998.
+4. The fix: each runs `INSERT k1 ... ON CONFLICT DO NOTHING`. The database's unique index lets exactly one insert succeed.
+5. Only the one whose insert succeeded charges; the other sees "already claimed" and returns `409` or the saved answer.
+
 The obvious version, "look the key up; if absent, do the work and save the key", is broken. Two retries arriving together both see "absent":
 
 ```mermaid
@@ -242,6 +305,13 @@ The fix is to make the **check and the claim one atomic statement** on a unique 
 ### Lifecycle of a key record
 
 **In plain words:** a key record is born when a request claims it, completes when the answer is saved, gets freed if the attempt crashed, and is deleted after a day.
+
+**Step by step:**
+1. 10:00: a payment request inserts key `k1` as `in_progress`.
+2. 10:00:01: the charge works; the record becomes `completed` with the `201` response saved.
+3. 10:05: a retry arrives and gets the saved `201` replayed.
+4. If instead the server had crashed mid-way, after the lock time-out a retry with the same fingerprint would take over the key.
+5. Next day at 10:00: the record is older than 24 hours and a cleanup job deletes it.
 
 ```mermaid
 stateDiagram-v2
@@ -721,18 +791,20 @@ If step 4 updates zero rows, another attempt took over the key; do not report su
 | Unique business key | `UNIQUE (order_id)` on the effect table | One effect per business entity ("pay this order once") | Only fits when such a key exists |
 | Conditional update | `WHERE version = $n` or `If-Match` | Updates to existing state | Retry sees a conflict and must re-read |
 | Idempotency key in the database | Claim row, store response, replay | Payments, transfers, any `POST` with external effects | One extra write per request; table to expire |
-| Idempotency key in Redis | `SET idem:{scope}:{key} <hash> NX EX 86400` claims; a second write stores the response | High request rates, effects outside your database | Redis must be durable enough; claim and effect are not atomic together |
+| Idempotency key in Redis | `SET idem:{scope}:{key} <hash> NX EX 86400` claims (`NX` = only if it does not exist, `EX 86400` = expire after 24 hours);  a second write stores the response | High request rates, effects outside your database | Redis must be durable enough; claim and effect are not atomic together |
 | Idempotent consumer | `processed_events(event_id PRIMARY KEY)` inserted in the effect's transaction | Webhooks and queue consumers with at-least-once delivery | A dedupe table per consumer; see [[Delivery Semantics and Exactly-Once]] |
 
 ## 6. Trade-offs and when not to use 🟡
 
 - **Every keyed `POST` costs at least two extra writes** (claim and complete) and a stored response body. For a high-volume, naturally idempotent endpoint, use `PUT` or a unique constraint instead.
-- **The key store is now on the critical path.** If it is down, fail closed for money movement (return 503) rather than process without protection.
+- **The key store is now on the critical path.** If it is down, **fail closed** (refuse the request rather than risk it) for money movement (return 503) rather than process without protection.
 - **Stored responses can hold personal data.** Store the minimum needed to replay, scope by tenant, and expire on time.
 - **It protects one hop only.** Your API being idempotent does not stop your worker from charging the PSP twice; each downstream call needs its own key (section 8).
 - **Read-only and naturally idempotent calls do not need it.** Stripe ignores keys on `GET` and `DELETE` because they are idempotent by definition.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** natural idempotency, the key protocol, the race and the record life cycle, with measured proof that the atomic claim charges once. **Next is the advanced part**: how Stripe and others run it, production failures, doing the claim inside the same transaction, keys for the payment provider, what to replay, and fingerprinting.
 
 - **Real systems:**
 	- Stripe accepts `Idempotency-Key` on every `POST`, keys up to 255 characters, prunes keys once they are at least 24 hours old, compares parameters with the original request, and replays the first result, including `500` errors.
@@ -767,7 +839,7 @@ UPDATE accounts SET balance_paise = balance_paise + $8 WHERE id = $7;
 COMMIT;
 ```
 
-At the default `READ COMMITTED` level, a concurrent duplicate's `INSERT` waits on the unique index until the first transaction commits, then sees the conflict and replays the committed response. If the first transaction rolls back, the duplicate's insert succeeds and it does the work. There is no `in_progress` state, no 409, and nothing can get stuck.
+At the default `READ COMMITTED` level (PostgreSQL's default isolation: each statement sees data committed before it started), a concurrent duplicate's `INSERT` waits on the unique index until the first transaction commits, then sees the conflict and replays the committed response. If the first transaction rolls back, the duplicate's insert succeeds and it does the work. There is no `in_progress` state, no 409, and nothing can get stuck.
 
 **External effects need atomic phases.** A PSP call cannot sit inside your database transaction.
 
@@ -796,13 +868,13 @@ Pick one per endpoint and document it.
 
 Hashing raw bytes treats `{"a":1,"b":2}` and `{"b":2,"a":1}` as different requests; a client library that re-serializes on retry would hit spurious 422s.
 
-Hash the parsed, validated request (or canonical JSON) instead, and leave out volatile fields such as client timestamps or trace IDs.
+Hash the parsed, validated request (or **canonical JSON**: JSON written in one fixed way, keys sorted, no extra spaces) instead, and leave out volatile fields such as client timestamps or trace IDs.
 
 **Idempotent APIs vs idempotent consumers.** An idempotent API protects the request path: the client holds the key.
 
 An idempotent **consumer** protects message handling: the producer's `event_id` is the key, and the consumer inserts it into `processed_events` in the same transaction as the effect.
 
-Brokers and webhook senders deliver at least once, so "exactly-once" processing is at-least-once delivery plus an idempotent consumer. See [[Delivery Semantics and Exactly-Once]], [[Receiving Webhooks Idempotently]] and [[Transactional Outbox and CDC]].
+Brokers and webhook senders deliver **at least once** (a message may arrive twice, never zero times), so "exactly-once" processing is at-least-once delivery plus an idempotent consumer. See [[Delivery Semantics and Exactly-Once]], [[Receiving Webhooks Idempotently]] and [[Transactional Outbox and CDC]].
 
 **Where to use it:** payments and refunds, order creation, money transfers, sending emails and SMS, inventory reservations, webhook handlers, and any `POST` a client or gateway may retry.
 
@@ -842,6 +914,26 @@ Brokers and webhook senders deliver at least once, so "exactly-once" processing 
 - Different body → 422; in progress → 409 + `Retry-After`; completed → replay, errors included; missing where required → 400.
 - Store request hash, status, response, `locked_at`, `created_at`; expire after a published window (24 h).
 - Propagate deterministic keys downstream; consumers dedupe on `event_id`.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what does idempotent mean?
+> Doing it twice has the same effect as doing it once.
+
+> [!question]- Easy: which is idempotent: `PUT` or `POST`?
+> `PUT`. `POST` is not, so it needs an idempotency key.
+
+> [!question]- Easy: should the client make a new idempotency key on each retry?
+> No. One key per logical operation, reused on every retry.
+
+> [!question]- Medium: why is "SELECT the key, then INSERT it" unsafe?
+> Two concurrent retries can both see "absent" and both do the work. Claim with one atomic `INSERT ... ON CONFLICT DO NOTHING`.
+
+> [!question]- Medium: a retry comes while the first attempt is still running. What does the server return?
+> `409 Conflict` with `Retry-After`; the client tries again and then gets the saved result.
+
+> [!question]- Medium: the server charged the card, then crashed. How does the retry avoid a second charge at the provider?
+> It sends the provider the same stable key (like the internal payment ID), so the provider returns the original charge.
 
 ## Links 🟢
 

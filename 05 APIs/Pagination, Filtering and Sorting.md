@@ -37,6 +37,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[REST and HTTP API Design]]: a list endpoint like `GET /orders` returns JSON, and options go in the URL as query parameters (`?limit=20`).
+> - [[Indexing Fundamentals]]: an index keeps rows sorted by some columns, so the database can jump to a value instead of reading every row.
+
 **From zero, in 60 seconds** 🟢
 
 A list can be huge: 200,000 orders. The screen shows 20. So the server sends one **page** of 20, plus a bookmark for where to continue.
@@ -81,6 +85,12 @@ This note is about building that bookmark so that every page is fast and no orde
 | Sort key / tie-breaker | Columns the list is ordered by; a unique last column breaks ties | `created_at DESC, id DESC` |
 | Query parameter | Options appended to a URL | `?status=paid&sort=-created_at` |
 | Allow-list | A fixed list of accepted values; everything else is rejected | Sort only by `created_at` or `total` |
+| Keyset pagination | Asking for rows after the last row's sort value, instead of skipping rows | `WHERE (created_at, id) < (x, y)` |
+| B-tree | The usual kind of database index: a sorted tree you can jump through in a few steps | an index on `(customer_id, created_at)` |
+| Composite index | One index over several columns, in a fixed order | `(customer_id, created_at DESC, id DESC)` |
+| `has_more` | A yes/no flag saying another page exists | `"has_more": true` |
+| Signed cursor | A cursor with a secret-key signature, so clients cannot edit it | HMAC over the cursor data |
+| Total count | How many rows match in all | "2,481 orders" (costly to compute) |
 
 **Picture it**
 
@@ -122,6 +132,13 @@ Pagination fixes the size problem. The naive fix, `LIMIT 20 OFFSET n`, creates t
 
 Keyset pagination fixes both: every page costs about the same, and inserts or deletes elsewhere in the list never shift it.
 
+### Real-life example: scrolling Amazon or Flipkart orders 🟢
+
+Open "Your orders" on Amazon or Flipkart and scroll down: new orders load in small batches as you reach the bottom.
+Each batch is a page, and the app remembers where the last batch ended.
+If you place a new order while scrolling, the list you are reading does not suddenly show an order twice; the new one appears when you refresh from the top.
+Filters like "Last 30 days" or "Cancelled" are part of the same request and the server only accepts the filter names it knows.
+
 ## 2. Mental model 🟢
 
 - **Offset** is "skip the first 100,000 lines of the phone book, then read 20". You still have to count past 100,000 lines.
@@ -129,11 +146,37 @@ Keyset pagination fixes both: every page costs about the same, and inserts or de
 
 The cursor is the bookmark: the sort key of the last row the client saw. As long as the sort key is **unique** and the list is read **in index order**, the bookmark always points to the same place, no matter what is inserted before it.
 
+## Common beginner mistakes 🟢
+
+- **Using `OFFSET` for deep pages** → page 5,000 reads 100,000 rows and throws them away → use keyset pagination with an index.
+- **Sorting by `created_at` alone** → two orders with the same time get skipped or repeated across pages → add the unique `id` as a tie-breaker.
+- **Setting `has_more` when the page is exactly full** → a phantom empty next page → fetch `limit + 1` rows and check if the extra one exists.
+- **Putting the user's sort field straight into SQL** → SQL injection → map allowed field names to fixed SQL through an allow-list.
+- **Letting clients send `limit=100000`** → one request drags the database → clamp the limit to a maximum like 100.
+
+## Often confused 🟡
+
+| These two | First one | Second one |
+| --- | --- | --- |
+| Offset vs keyset | "Skip N rows": slower with depth, shifts on inserts | "Rows after this key": same speed every page, no shifting |
+| Cursor vs page number | An opaque bookmark from the server | A position the client can type, like page 7 |
+| Filtering vs sorting | Choosing which rows (`status=paid`) | Choosing their order (`-created_at`) |
+| `has_more` vs total count | Cheap yes/no from one extra row | Expensive full count of every match |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** why offset is slow and shifty and that a cursor bookmark fixes both. **Next we open the box**: what the database actually reads in each case, the exact recipe for keyset pagination, and how a client walks the whole list while new rows arrive.
 
 ### Offset scan vs keyset seek
 
 **In plain words:** offset counts its way to the page; keyset jumps to it. The two boxes below show what the database actually reads for each.
+
+**Step by step:**
+1. The app asks for orders 100,001 to 100,020.
+2. **Offset:** the database starts at the newest order in the index and steps through 100,000 entries, throwing each away, then returns the next 20.
+3. **Keyset:** the cursor says "the last order you saw was 2 Nov 08:01, id 812366".
+4. The database walks down the B-tree to that key in about 3 or 4 steps, then reads the next 21 entries.
+5. It returns 20; the 21st only tells it that `has_more` is true.
 
 ```mermaid
 flowchart TB
@@ -181,9 +224,16 @@ LIMIT 21;
 ```
 
 5. **`limit + 1` trick.** Ask for 21 rows, return 20. If row 21 exists, `has_more = true` and the cursor is built from row 20. This avoids both a `count(*)` and the classic bug of `has_more = len(rows) == limit`, which reports a phantom next page whenever the last page is exactly full.
-6. **Encode and sign the cursor** so the client treats it as an opaque token and cannot edit it (section 4). Base64 is an encoding, not encryption: anyone can decode the payload, so encrypt it as well if the key values must stay hidden.
+6. **Encode and sign the cursor** so the client treats it as an opaque token and cannot edit it (section 4). Base64 (a way to write bytes as plain text) is an encoding, not encryption: anyone can decode the payload, so encrypt it as well if the key values must stay hidden.
 
-Representative output (PostgreSQL 17) for a customer with 200,000 orders. Offset to page 5,001:
+```mermaid
+flowchart LR
+    Q["ask for 21 rows"] --> G{"got 21?"}
+    G -- "yes" --> M["return 20,<br/>has_more = true,<br/>cursor from row 20"]
+    G -- "no, fewer" --> E["return them,<br/>has_more = false"]
+```
+
+Representative `EXPLAIN ANALYZE` output (the database's report of how it ran a query and how many rows it touched, PostgreSQL 17) for a customer with 200,000 orders. Offset to page 5,001:
 
 ```text
 Limit  (cost=4319.61..4320.47 rows=20 width=32) (actual time=38.904..38.913 rows=20 loops=1)
@@ -208,6 +258,12 @@ The inner node tells the story: offset read `rows=100020` to return 20; keyset r
 ### A client walking the list
 
 **In plain words:** the diagram below is one phone scrolling through its orders while a new order arrives mid-scroll — and nothing shifts.
+
+**Step by step:**
+1. The app asks for 20 orders. The server reads 21, returns 20 with `has_more: true` and cursor `c1`.
+2. A new order is placed. It goes to the top of the list, above where the reader is.
+3. The app sends `cursor=c1`. The server checks the signature, then reads rows after row 20's key. The new order is not in that range, so nothing shifts.
+4. The third page has only 7 rows left: `has_more: false` and no cursor. The app stops loading.
 
 ```mermaid
 sequenceDiagram
@@ -260,7 +316,7 @@ CREATE INDEX orders_customer_created_id ON orders (customer_id, created_at DESC,
 
 **In plain words:** the real handler adds the guard rails: allow-listed filters, a clamped limit, and a signed cursor that only works with the exact filter it was issued for.
 
-The list handler's core in Go: parse and allow-list the query, build the keyset SQL, apply the `limit + 1` trick, and issue an HMAC-signed cursor bound to the filter and sort. It compiles and passes `go vet` and `go test -race` on Go 1.24.
+The list handler's core in Go: parse and allow-list the query, build the keyset SQL, apply the `limit + 1` trick, and issue an **HMAC**-signed cursor (a signature made with a secret server key) bound to the filter and sort. It compiles and passes `go vet` and `go test -race` on Go 1.24.
 
 ```go
 // Package orders lists a customer's orders with keyset pagination.
@@ -597,11 +653,13 @@ What well-known APIs do:
 
 - **No random access.** Keyset cannot jump to page 50. If the product truly needs page numbers (a back-office table), use offset with a cap on depth, or jump by value ("orders before 1 March") instead of by position.
 - **One index per sort order.** Every sort the API allows needs its own composite index ending in the tie-breaker. Five sortable fields with two directions and two filters can mean many indexes and slower writes. Allow only the sorts the product actually uses.
-- **Cursors expire in meaning.** A cursor encodes a position under one filter and sort. Changing either must start from page 1, which is why the code binds the cursor to a fingerprint.
+- **Cursors expire in meaning.** A cursor encodes a position under one filter and sort. Changing either must start from page 1, which is why the code binds the cursor to a **fingerprint** (a short hash of the filter and sort).
 - **Small lists do not need it.** A settings list with at most 50 items can return everything; pagination plumbing there is pure cost.
 - **Totals are not free.** `count(*)` has to visit every matching row (see section 8). Offer `has_more` by default and a total only when the product needs it.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how to build keyset pagination with a signed cursor, and when offset is still fine. **Next is the advanced part**: what GitHub, Stripe, Google and Elasticsearch do, production failures, mixed sort directions, backward pages, user-chosen sorts, total counts and search engines.
 
 - **Real systems:**
 	- GitHub's REST API paginates with the RFC 8288 `Link` header, caps `per_page` at 100, and its search API returns at most 1,000 results per search, however large `total_count` is.
@@ -609,14 +667,14 @@ What well-known APIs do:
 	- Google's API design guide (AIP-158) uses opaque `page_token`s. The other request parameters must match the call that issued the token, and a mismatch should be rejected with `INVALID_ARGUMENT`. Its optional `total_size` may be an estimate if the API documents that.
 	- Elasticsearch refuses `from + size` beyond `index.max_result_window` (default 10,000) and recommends `search_after` with a point in time for deeper paging.
 - **Failure modes → fixes:**
-	- Deep offset pages time out or overload the database (often a crawler walking `?page=1..50000`) → switch to keyset, or cap `page` and return 400 beyond it.
+	- Deep offset pages time out or overload the database (often a **crawler**, a bot that walks every link, walking `?page=1..50000`) → switch to keyset, or cap `page` and return 400 beyond it.
 	- Clients see duplicates or gaps in infinite scroll → add the unique tie-breaker to the sort and the cursor; never paginate on a non-unique key alone.
-	- Rows vanish when the sort column is `NULL` → row comparisons with `NULL` are unknown, so make the column `NOT NULL` or sort on `COALESCE(col, sentinel)` in both the index and the query.
+	- Rows vanish when the sort column is `NULL` → row comparisons with `NULL` are unknown, so make the column `NOT NULL` or sort on `COALESCE(col, sentinel)` (replace NULL with a fixed stand-in value) in both the index and the query.
 	- Clients hand-craft cursors or old cursors break after a deploy → make cursors opaque, sign them, version their format, and return a clear 400 for an invalid cursor.
 	- `limit=100000` requests → clamp to a documented maximum (AIP-158 says to coerce down) or reject with 400; never pass the raw value to SQL.
 - **What to monitor:**
 	- p99 latency of list endpoints split by "first page" and "has cursor".
-	- Rows read per row returned (from `pg_stat_statements` or `EXPLAIN` sampling); a ratio far above 1 means an offset or a missing index.
+	- Rows read per row returned (from `pg_stat_statements`, PostgreSQL's per-query statistics, or `EXPLAIN` sampling); a ratio far above 1 means an offset or a missing index.
 	- 400 responses for invalid cursors after each deploy.
 	- Distribution of requested `limit` values and of page depth.
 
@@ -660,11 +718,11 @@ Pick one style per API and reject unknown fields with 400.
 
 1. No total; `has_more` only (Stripe).
 2. A capped count: `SELECT count(*) FROM (SELECT 1 FROM orders WHERE customer_id = $1 LIMIT 10001) t` and show "10,000+".
-3. A planner estimate. For a whole table, `SELECT reltuples::bigint FROM pg_class WHERE oid = 'orders'::regclass;` (updated by `VACUUM`, `ANALYZE` and a few DDL commands such as `CREATE INDEX`; since PostgreSQL 14, `-1` means the table has never been vacuumed or analyzed). For a filter, read the `rows=` estimate from `EXPLAIN (FORMAT JSON)`.
+3. A **planner** estimate (the database's own guess at row counts, used to plan queries). For a whole table, `SELECT reltuples::bigint FROM pg_class WHERE oid = 'orders'::regclass;` (updated by `VACUUM`, `ANALYZE` and a few DDL commands such as `CREATE INDEX`; since PostgreSQL 14, `-1` means the table has never been vacuumed or analyzed). For a filter, read the `rows=` estimate from `EXPLAIN (FORMAT JSON)`.
 4. A maintained counter (a `customer_stats` row updated in the same transaction, or a cache with a TTL).
 5. An exact `count(*)`, which in PostgreSQL must check visibility of every matching row (an index-only scan helps only when the visibility map is current).
 
-**Search engines.** In Elasticsearch, `from: 9980, size: 20` makes every shard return its top 10,000 hits to the coordinating node, which then sorts `shards × 10,000` entries to keep 20.
+**Search engines.** In Elasticsearch, `from: 9980, size: 20` makes every **shard** (one slice of the index, on its own node) return its top 10,000 hits to the **coordinating node** (the node that merges results), which then sorts `shards × 10,000` entries to keep 20.
 
 That is why `index.max_result_window` defaults to 10,000.
 
@@ -687,7 +745,7 @@ Both are keyset designs with different wrapping; see [[GraphQL]] and [[gRPC]].
 > Sort by `(created_at DESC, id DESC)`, index `(feed_id, created_at DESC, id DESC)`, and return an opaque cursor built from the last row's key. New posts land above the cursor, so later pages never shift. To show new posts, the client fetches from the top again (or uses a `before` cursor from its first item).
 
 > [!question]- Why put `id` in the cursor when you sort by `created_at`?
-> `created_at` is not unique. With `created_at < x` alone, every other row sharing the boundary timestamp is skipped; with `<=`, rows repeat. The unique tie-breaker makes the sort a total order, so every row has exactly one position.
+> `created_at` is not unique. With `created_at < x` alone, every other row sharing the boundary timestamp is skipped; with `<=`, rows repeat. The unique tie-breaker makes the sort a **total order** (no two rows tie), so every row has exactly one position.
 
 > [!question]- How do you compute `has_more` without a count?
 > Fetch `limit + 1` rows. If the extra row exists, there is another page; drop it and build the cursor from the last row kept. Checking `len(rows) == limit` is wrong: it promises a next page whenever the last page happens to be exactly full.
@@ -715,6 +773,26 @@ Both are keyset designs with different wrapping; see [[GraphQL]] and [[gRPC]].
 - Response: `data`, `next_cursor`, `has_more`, optionally an RFC 8288 `Link` header.
 - Totals: skip, cap, estimate, or maintain a counter; exact `count(*)` is a full visit.
 - Allow-list filter and sort fields; never splice them into SQL.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: why not return all 200,000 orders at once?
+> It is slow, uses lots of memory, and the screen only shows 20.
+
+> [!question]- Easy: what does a cursor hold?
+> The sort key of the last row the client saw (plus a signature and filter info).
+
+> [!question]- Easy: why add `id` to a sort by `created_at`?
+> Times can tie; `id` is unique, so every row has one fixed place.
+
+> [!question]- Medium: how many rows does `LIMIT 20 OFFSET 100000` read?
+> About 100,020; it walks past the first 100,000.
+
+> [!question]- Medium: how do you know there is a next page without counting?
+> Fetch 21 rows for a page of 20; if the 21st exists, `has_more` is true.
+
+> [!question]- Medium: a client reuses a cursor with a different `status` filter. What should happen?
+> Reject it with `400`, because the cursor's fingerprint does not match the new filter.
 
 ## Links 🟢
 

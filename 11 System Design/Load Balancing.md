@@ -38,6 +38,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (L4 vs L7, algorithms, health checks), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Scaling Basics]]: you grow by adding more identical servers, and that only works if no server keeps user data in its own memory.
+> - [[Forward and Reverse Proxies - L4 vs L7]]: a reverse proxy is a server that stands in front of your servers and passes requests on; it can look at just the address (L4) or the whole web request (L7).
+
 **From zero, in 60 seconds** 🟢
 
 Your app runs on 3 copies of the same server, so it can handle more users.
@@ -86,6 +90,12 @@ That front door is a load balancer.
 | HTTP | The text protocol web requests use, with path and headers | `POST /login` with a `Cookie` header |
 | Health check | A small "are you OK?" call to a server | `GET /healthz` returns `200` |
 | Horizontal scaling | Adding more identical servers instead of a bigger one | Going from 3 pods to 4 |
+| Pod | One running copy of your app in Kubernetes | `pod-1`, `pod-2`, `pod-3` |
+| L4 / L7 | L4 sees only address and port; L7 reads the whole web request | L7 can send `/api/billing` to billing pods |
+| TLS | The encryption behind `https://` | the LB decrypts, then reads the path |
+| gRPC / HTTP/2 | Ways to send many requests over one open connection | 1,000 calls on a single connection |
+| 5xx | Server error status codes | `502 Bad Gateway`, `503 Service Unavailable` |
+| Anycast | Many sites announce the same IP; the network picks the nearest | one IP served from Mumbai and Singapore |
 
 **Picture it**
 
@@ -130,11 +140,45 @@ A host at a busy restaurant. Guests do not pick a table; the host does. A good h
 - lets a waiter whose shift is ending finish the tables they already have, but gives them no new ones (**connection draining**);
 - seats regulars with the waiter who knows their order (**sticky sessions**), which works until that waiter is off sick.
 
+### Real-life example: Swiggy at dinner time 🟢
+
+At 8 pm thousands of people open Swiggy at once.
+All of them hit the same web address, and a load balancer behind it spreads them over many identical app servers.
+If one server crashes, health checks notice within seconds and stop sending it orders; your app just keeps working.
+When engineers ship new code, old servers are drained (they finish what they are doing) before they stop, so no order fails mid-payment.
+Inside, a request for menus and a request for payments are sent to different groups of servers based on the URL, which is L7 routing.
+
+## Common beginner mistakes 🟢
+
+- **Running a single load balancer box** → it becomes the one thing whose death takes everything down → use a pair, anycast, or a managed LB that spans zones.
+- **Health check that only says "process is up"** → a server with a broken database link still gets traffic → check the things a real request needs, and also watch real errors.
+- **Liveness check (Kubernetes's "is this process stuck? then restart it" probe) that calls the database** → a short database blip makes Kubernetes restart every pod at once → keep liveness shallow; put dependency checks in readiness.
+- **Putting gRPC behind a plain L4 balancer** → one long connection carries everything, so one pod gets all the work → balance per request at L7 or in the client.
+- **Stopping a server without draining** → its in-flight requests turn into 502 errors on every deploy → deregister, let requests finish, then stop.
+
+### Load balancer vs things people confuse it with 🟡
+
+| Thing | Main job | Example |
+| --- | --- | --- |
+| Load balancer | Spread requests over healthy copies of a service | ALB in front of 3 invoice pods |
+| Reverse proxy | Stand in front of servers; may cache, compress, terminate TLS | Nginx in front of one app |
+| API gateway | An L7 proxy plus API rules: login checks, rate limits, versioning | Kong checking a token, then routing |
+| Service discovery | Keep the list of which servers exist right now | Kubernetes endpoints for `invoice-svc` |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** a load balancer is one front door that sends each request to a healthy server. **Next we open the box**: where balancers sit in a big system, what L4 and L7 can each see, the rules for picking a server, and how servers join and leave safely. Each subsection starts with a plain step-by-step walk; the full detail follows.
 
 ### Where load balancers sit
 
 **In plain words:** a big app often has more than one load balancer: one at the front door for the internet, and more inside, between your own services.
+
+**Step by step:**
+1. A user in Pune opens the app. DNS (or a GSLB, a DNS-based global balancer) picks the nearest region, say Mumbai.
+2. In Mumbai, a fast L4 balancer takes the TCP connection and hands it to one of several L7 proxies.
+3. The L7 proxy reads the path. `/api/invoices` goes to invoice pods, `/api/billing` to billing pods.
+4. The invoice pod needs the payment service. It picks a payment pod itself from a list it keeps (client-side balancing).
+5. So one click may pass through 2-3 balancing steps, each doing a different job.
 
 ```mermaid
 flowchart LR
@@ -154,6 +198,13 @@ Large sites stack layers: DNS picks a region, a fast L4 tier spreads TCP connect
 ### L4 vs L7
 
 **In plain words:** an L4 balancer reads only the "envelope" (address and port) and is very fast. An L7 balancer opens the letter (the web request) and can route by URL or header, but does more work.
+
+**Step by step:**
+1. A request arrives: `GET /api/billing/7` to `10.0.0.9:443`.
+2. An L4 balancer sees only `10.0.0.9:443`. It picks a server for the whole connection and copies bytes back and forth.
+3. An L7 balancer decrypts the TLS, reads `/api/billing/7` and its headers, and picks a server for this one request.
+4. The next request on the same connection may go to a different server at L7, but always the same one at L4.
+5. So L4 is faster and works for any protocol; L7 is smarter but does more work per request.
 
 ```mermaid
 flowchart LR
@@ -176,10 +227,25 @@ The owning note for the proxy layers themselves is [[Forward and Reverse Proxies
 
 **In plain words:** these are the rules for "who gets the next request". Simple turns (round robin) work when all servers are equal. Smarter rules look at who is least busy.
 
+**Step by step (power of two choices, a popular smart rule):**
+1. You have 100 servers. A new request arrives.
+2. Pick 2 servers at random, say #17 (5 requests in flight) and #63 (2 in flight).
+3. Send the request to #63, the less busy one.
+4. Repeat for every request. No global list of "who is least busy" is needed.
+5. In the test in section 4, the busiest server drops from 1.33 times the average load to 1.02 times.
+
+```mermaid
+flowchart LR
+    R["New request"] --> P["Pick 2 at random"]
+    P --> A["#17: 5 busy"]
+    P --> B["#63: 2 busy"]
+    B --> W["Send to #63"]
+```
+
 | Algorithm | How it picks | Use when | Weakness |
 | --- | --- | --- | --- |
 | Round robin | Next backend in order | Equal backends, similar request cost | Ignores slow or busy backends |
-| Weighted round robin | Order biased by weight (Nginx's smooth variant interleaves) | Mixed instance sizes, canary at 5% | Static weights do not react to load |
+| Weighted round robin | Order biased by weight (Nginx's smooth variant interleaves) | Mixed instance sizes, canary at 5% (a small share of traffic sent to a new version as a test) | Static weights do not react to load |
 | Random | Uniform random pick | Simple, stateless balancers | Uneven by chance: busiest gets about 1.3× average in our test |
 | Least connections | Fewest open connections | Long or varied connections | Needs global state; connection count is a weak proxy for HTTP/2 |
 | Least outstanding requests | Fewest in-flight requests | Variable request cost (default to consider for L7) | Needs per-request accounting |
@@ -191,9 +257,16 @@ The owning note for the proxy layers themselves is [[Forward and Reverse Proxies
 
 **In plain words:** check servers often, stop sending work to sick ones, let a leaving server finish what it has, and ease a new server in slowly.
 
+**Step by step:**
+1. Every 5 seconds the LB calls `GET /healthz` on pod-1.
+2. Pod-1 answers `503` twice in a row. The LB takes it out of rotation.
+3. Requests pod-1 was already working on are allowed to finish (draining).
+4. Later pod-1 answers `200` a few times. The LB puts it back.
+5. It starts with a small share of traffic (slow start), then gets its full share once its caches are warm.
+
 - **Active checks:** the LB calls `GET /healthz` every few seconds; after N failures it marks the backend down, after M successes it marks it up.
 - **Passive checks (outlier detection):** the LB watches real traffic and ejects a backend that returns, for example, 5 consecutive 5xx responses (Envoy's documented default for `consecutive_5xx`), then retries it later.
-- **Readiness vs liveness** (Kubernetes): readiness says "send me traffic" and removes the pod from the endpoints when it fails; liveness says "I am not stuck" and restarts the container when it fails. A liveness probe that checks the database will restart every pod during a database blip; keep liveness shallow. See [[Graceful Shutdown and Health Checks]].
+- **Readiness vs liveness** (Kubernetes's two kinds of health probe): readiness says "send me traffic" and removes the pod from the endpoints when it fails; liveness says "I am not stuck" and restarts the container when it fails. A liveness probe that checks the database will restart every pod during a database blip; keep liveness shallow. See [[Graceful Shutdown and Health Checks]].
 - **Connection draining (deregistration delay):** a backend that is leaving gets no new requests but keeps its in-flight ones until they finish or a timeout passes (AWS ALB target groups default to a 300 s deregistration delay, per the ELB docs).
 - **Slow start:** a new backend gets a ramp of traffic instead of its full share at once, so a backend with cold caches and empty connection pools is not flattened by a full share of traffic in its first seconds.
 
@@ -219,6 +292,12 @@ sequenceDiagram
 ### Sticky sessions vs external state
 
 **In plain words:** "sticky" means the same user always goes to the same server. Easy, but if that server dies, the user loses their session. Better: keep session data in a shared store so any server can serve anyone.
+
+**Step by step:**
+1. Meera logs in; the LB sends her to Server 2 and sets a cookie that says "Server 2".
+2. Every later click carries the cookie, so she keeps landing on Server 2, which has her session in memory.
+3. Server 2 crashes. Her session is gone, and she is logged out.
+4. The fix: Server 2 writes the session to Redis. Now any server can read it, and no cookie pinning is needed.
 
 ```mermaid
 flowchart LR
@@ -435,7 +514,7 @@ flowchart LR
 
 1. The deploy tool marks `pod-1` for removal; Kubernetes sets it not-ready and the LB deregisters it.
 2. The LB stops sending new requests to `pod-1`; its 40 in-flight requests continue.
-3. `pod-1` receives `SIGTERM`, stops accepting new connections, and Go's `http.Server.Shutdown` waits for the 40 requests to finish.
+3. `pod-1` receives `SIGTERM` (the polite "please shut down" signal), stops accepting new connections, and Go's `http.Server.Shutdown` waits for the 40 requests to finish.
 4. The new `pod-1b` passes readiness and gets a slow-start ramp.
 
 Without step 2 (or with a shutdown that exits immediately), those 40 requests become 502 errors on every deploy.
@@ -445,10 +524,10 @@ Without step 2 (or with a shutdown that exits immediately), those 40 requests be
 | Where balancing happens | How | Use when | Cost |
 | --- | --- | --- | --- |
 | DNS (round-robin records, GSLB) | Different IPs per lookup; latency or geo policies (Route 53) | Region and data-centre selection | Client and resolver caching ignore TTLs; slow failover |
-| Anycast | Same IP announced from many sites; BGP picks the nearest | Global edge, DNS, CDNs, L4 front doors | Needs your own network/BGP; a route change can move flows |
+| Anycast | Same IP announced from many sites; BGP (the protocol internet routers use to share routes) picks the nearest | Global edge, DNS, CDNs, L4 front doors | Needs your own network/BGP; a route change can move flows |
 | L4 load balancer | Connection-level forwarding (NLB, IPVS, Maglev) | Raw throughput, non-HTTP protocols, static IPs | No request-level routing |
 | L7 proxy | Request-level routing (ALB, Envoy, Nginx, HAProxy) | HTTP APIs, path routing, canaries | More CPU per request; TLS termination point |
-| Client-side (look-aside) | Client gets the backend list from [[Service Discovery]] or xDS and picks | gRPC and service-to-service calls | Logic in every client; needs a discovery system |
+| Client-side (look-aside) | Client gets the backend list from [[Service Discovery]] or xDS (Envoy's API for pushing backend lists and routes) and picks | gRPC and service-to-service calls | Logic in every client; needs a discovery system |
 | Sidecar / service mesh | An Envoy next to each pod does the client-side work | Many services, many languages | Extra hop and operational weight |
 
 ## 6. Trade-offs and when not to use 🟡
@@ -461,10 +540,12 @@ Without step 2 (or with a shutdown that exits immediately), those 40 requests be
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** L4 vs L7, the picking rules and how servers join and leave safely. **Next comes the senior view**: the real products, how client IPs and encryption flow through, how the LB itself stays up, and the subtle reasons balancing goes wrong.
+
 - **Real systems:** AWS ALB (L7), NLB (L4, preserves client IP, static IPs) and GWLB (for inline security appliances, using GENEVE); Google Maglev (software L4 with consistent hashing); Envoy (L7 with `ROUND_ROBIN`, `LEAST_REQUEST`, `RING_HASH`, `MAGLEV`, `RANDOM` policies); Nginx (`round robin` by default, `least_conn`, `ip_hash`, `hash ... consistent`, `random two least_conn`); HAProxy; Kubernetes Services (kube-proxy with iptables or IPVS, which is L4).
 - **Client IP:** an L7 proxy adds `X-Forwarded-For` (and `X-Forwarded-Proto`); an L4 balancer that does not preserve the source IP can send the PROXY protocol header (v1 text, v2 binary) so the backend still learns it. Trust these headers only from your own proxies.
-- **TLS:** terminate at the L7 proxy to route by path and inspect headers; pass through at L4 when the backend must hold the key or for end-to-end mTLS; re-encrypt to the backend when the network is untrusted.
-- **LB high availability:** an active/passive pair sharing a virtual IP with VRRP (keepalived), an anycast fleet, or a managed LB that is already multi-zone. A single LB box is a single point of failure.
+- **TLS:** terminate at the L7 proxy to route by path and inspect headers; pass through at L4 when the backend must hold the key or for end-to-end mTLS (both sides prove who they are with certificates); re-encrypt to the backend when the network is untrusted.
+- **LB high availability:** an active/passive pair sharing a virtual IP with VRRP (a protocol that moves one shared IP to the standby box if the active one dies; keepalived runs it), an anycast fleet, or a managed LB that is already multi-zone. A single LB box is a single point of failure.
 - **Failure modes → fixes:**
 	- gRPC traffic all on one pod behind an L4 LB → use an L7 proxy that balances per request, or gRPC client-side `round_robin` with DNS or xDS; set `MaxConnectionAge` on the server so clients reconnect and rebalance.
 	- WebSocket connections never rebalance after scale-out → see [[Scaling WebSockets]].
@@ -517,6 +598,26 @@ Without step 2 (or with a shutdown that exits immediately), those 40 requests be
 - gRPC / HTTP/2 → L7 or client-side LB, never plain L4.
 - Client IP via `X-Forwarded-For` (L7) or PROXY protocol (L4).
 - LB HA: VRRP pair, anycast, or managed; DNS/GSLB for regions.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What two things does a load balancer give you?
+> One stable address for clients, and requests spread only over healthy servers.
+
+> [!question]- (easy) What is a health check?
+> A small "are you OK?" call, like `GET /healthz`, that decides whether a server gets traffic.
+
+> [!question]- (easy) What does draining mean?
+> A leaving server gets no new requests but finishes the ones it already has.
+
+> [!question]- (medium) Why can't a plain L4 balancer spread gRPC traffic well?
+> gRPC sends many requests over one long connection, and L4 balances connections, not requests.
+
+> [!question]- (medium) How does power of two choices pick a server?
+> It picks two at random and sends to the less busy one, which avoids hot spots without global state.
+
+> [!question]- (medium) Why keep the liveness probe shallow?
+> If it checks the database, one database blip makes Kubernetes restart every pod at once.
 
 ## Links
 

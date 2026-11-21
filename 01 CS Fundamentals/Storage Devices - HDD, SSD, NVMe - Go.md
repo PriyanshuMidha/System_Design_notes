@@ -23,6 +23,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
 > - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Storage Devices - HDD, SSD, NVMe]]: the theory twin. Know that flash cannot overwrite a page, erases whole blocks, and that garbage collection's extra copies are "write amplification".
+> - [[Memory Hierarchy and CPU Caches]]: background only.
+
 **From zero** 🟢: this file is the hands-on side of [[Storage Devices - HDD, SSD, NVMe]]. It builds a toy version of the firmware brain inside every SSD (a flash translation layer), then measures write amplification growing as the drive fills up — the theory note's pages, erase blocks and garbage collection made runnable. Read each step's notes before the code.
 
 ## Before the code 🟢
@@ -32,6 +36,8 @@ updated: 2026-11-13
 - **Maps and slices** (`map[...]`, `[]int`): the logical-to-physical page mapping and the per-block page lists.
 - **`math/rand` with a fixed seed**: pseudo-random but repeatable writes, so tests give the same write-amplification numbers every run.
 - **Helper functions in tests** (`writeRandom`): shared setup that several tests reuse.
+- **LBA (logical block address)**: the block number the OS uses; the FTL maps each one to a real flash page.
+- **FTL (flash translation layer)**: the SSD's firmware "address book" that hides erase-before-write from the OS.
 - **What to run:** `go vet ./... && go test -race ./...` inside the module; add `-v -run TestAmplification` to see the amplification numbers.
 
 ## What this code shows 🟢
@@ -63,7 +69,11 @@ updated: 2026-11-13
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** what the toy FTL is for: watching write amplification grow as the drive fills. **Next we read the code:** six small steps, from page states to the final ratio.
+
 ### Step 1: the geometry and page states
+
+**What this code does, in plain words:** it sets up a tiny fake SSD shape: blocks of 4 pages, where each page is free, valid (holds live data) or stale (old copy, waiting to be erased).
 
 **Concept.** This step encodes the physical shape the theory note describes: pages grouped into erase blocks, and the three states a page moves through (free → valid → stale → free). The theory note's state diagram is literally this `pageState` enum plus the transitions `FTL.Write` and `FTL.garbageCollect` implement below. A real SSD uses blocks of hundreds of pages; this toy uses four, because the mechanism — not the scale — is what the theory needs to show.
 
@@ -98,6 +108,8 @@ type page struct {
 3. `page.lba` only means something when `state == valid`; a free or stale page's `lba` is leftover data nobody reads, which is why `garbageCollect` below checks `state` before trusting `lba`.
 
 ### Step 2: the FTL's bookkeeping
+
+**What this code does, in plain words:** it defines the controller's notebook: the blocks, the "logical address → physical page" map, where to write next, and counters for host writes, GC copies and erases.
 
 **Concept.** The `FTL` struct is the controller's entire memory of the drive: which physical page holds which logical address (`mapTable`), where the next fresh page is (`writeCursor`, log-structured — always advancing, never searching from zero), and three counters that let `WriteAmplification` compute its ratio after the fact. Keeping counters instead of recomputing from state matches how a real SSD controller tracks wear: counting events as they happen is cheap; re-deriving them by scanning all flash is not.
 
@@ -134,6 +146,8 @@ func (f *FTL) at(abs int) *page { return &f.blocks[abs/pagesPerBlock][abs%pagesP
 
 ### Step 3: writing a logical address
 
+**What this code does, in plain words:** to write a logical address, it marks the old page (if any) stale, puts the data in a fresh page, updates the map and counts one host write.
+
 **Concept.** This is the theory note's central claim made literal: a host write *never* overwrites a physical page. `Write` always allocates a fresh page, and if an old physical copy existed, it is marked stale rather than erased in place — because flash cannot be erased at page granularity at all, only at block granularity.
 
 ```go
@@ -158,6 +172,8 @@ func (f *FTL) Write(lba int) {
 3. `hostWrites++` happens exactly once per call, counting only writes the *host* asked for — `allocPage` below may trigger garbage collection internally, but those copies are counted separately as `gcWrites`.
 
 ### Step 4: finding a free page, and triggering GC when space is tight
+
+**What this code does, in plain words:** it finds the next free page, but first runs garbage collection if only one block's worth of free pages is left.
 
 **Concept.** `allocPage` is where over-provisioning becomes concrete: the threshold `freePages() <= pagesPerBlock` is the toy's stand-in for a real SSD reserving spare capacity. A real controller's actual threshold is tuned by its firmware and the drive's advertised over-provisioning percentage; this toy collects as soon as free space drops below one block's worth, which is the smallest safe margin that guarantees GC always has somewhere to land its copies.
 
@@ -195,10 +211,12 @@ func (f *FTL) freePages() int {
 ```
 
 **How it works.**
-1. The scan starting at `writeCursor` and wrapping with `% f.total()` is the **log-structured** write pattern real FTLs use: always advance forward, never search from the beginning, so writes cluster rather than scatter.
+1. The scan starting at `writeCursor` and wrapping with `% f.total()` is the **log-structured** (always write to the next spot forward, like adding lines to a diary) write pattern real FTLs use: always advance forward, never search from the beginning, so writes cluster rather than scatter.
 2. The `panic` is a deliberate, loud failure, not a silently wrong result — it signals a configuration bug (too little over-provisioning for the working set), which is exactly the failure mode the theory note's over-provisioning section warns about; a production FTL would instead refuse new writes and report "drive full," but panicking is the right choice for a teaching toy where that state should never be reached by the tests.
 
 ### Step 5: garbage collection — the copy-before-erase that *is* write amplification
+
+**What this code does, in plain words:** it picks the block with the fewest live pages, saves those live pages' addresses, wipes the block, and rewrites the live data elsewhere, counting every rewrite as an extra (GC) write.
 
 **Concept.** `garbageCollect` has two distinct jobs, each small enough to read on its own: pick *which* block to reclaim, then actually reclaim it. Splitting them this way mirrors how the theory note separates "the GC policy" (which block is cheapest to reclaim) from "the GC mechanism" (copy-then-erase).
 
@@ -281,6 +299,8 @@ func (f *FTL) copyForward() int {
 2. The `panic` here is reachable only if `garbageCollect` somehow freed fewer pages than it needs to copy — which should never happen, since erasing a whole block always frees at least as many pages as it had live ones — so hitting it in practice would point to a bug in `garbageCollect`'s bookkeeping, not normal operation.
 
 ### Step 6: measuring the result
+
+**What this code does, in plain words:** it returns (host writes + GC writes) ÷ host writes; 1.0 means no extra writes.
 
 **Concept.** `WriteAmplification` is the single public number the entire mechanism exists to produce, and it is the thing the theory note's worked example and the test below both check against real measured behavior, not just an asserted formula.
 
@@ -588,6 +608,8 @@ The second test's `t.Logf` line is the headline number from the theory note's wo
 
 The third test's silent pass confirms no data was lost or corrupted across 5,000 writes and repeated garbage collection cycles. `-race` found no data races because this code is single-goroutine; it is run here for consistency with every other Go note in this vault.
 
+> 🟡 → 🔴 **You now know** how the FTL works and what the three tests prove. **Next comes the advanced part:** the silent integer-division bug, an unguarded edge case, and what the `panic` calls really mean.
+
 ## Pitfalls in the code 🔴
 
 - Forgetting `float64(...)` on either side of the division in `WriteAmplification` silently truncates the ratio to an integer — Go will not warn you, because integer division is valid Go, just wrong here.
@@ -599,6 +621,30 @@ The third test's silent pass confirms no data was lost or corrupted across 5,000
 1. **Change this, predict the result:** lower `pagesPerBlock` from 4 to 2 and rerun `TestAmplificationRisesAsOverProvisioningShrinks`. Predict whether the 80%-full amplification goes up or down before running it, and explain why using the "fewest live pages" GC policy.
 2. **Change this, predict the result:** change `allocPage`'s trigger from `f.freePages() <= pagesPerBlock` to `f.freePages() <= pagesPerBlock*2` (double the effective over-provisioning reserve) and predict what happens to both the 40%-full and 80%-full amplification numbers.
 3. **Extend it:** add a `TRIM(lba int)` method that marks an LBA's current physical page `stale` immediately (as if the OS told the FTL the data is deleted) without writing a replacement. Write a test showing that a workload with TRIM calls between writes ends up with lower write amplification than the same workload without TRIM.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What happens to the old page when the host rewrites an LBA?
+> It is marked stale; the new data goes to a fresh page.
+
+> [!question]- What does a write amplification of 1.0 mean?
+> No extra writes: every physical write was one the host asked for.
+
+> [!question]- Which block does garbage collection pick?
+> The one with the fewest valid pages, because it is cheapest to clean.
+
+🟡 Medium
+
+> [!question]- Why is amplification higher at 80% full than at 40% full?
+> With less spare space, blocks chosen for cleaning still hold more live pages, so more must be copied.
+
+> [!question]- Why does `reclaim` collect live LBAs before erasing?
+> Flash erases a whole block at once, so the live data must be saved first and rewritten after.
+
+> [!question]- What bug do the `float64(...)` conversions prevent?
+> Integer division would turn 3/2 into 1 instead of 1.5.
 
 ## Links
 

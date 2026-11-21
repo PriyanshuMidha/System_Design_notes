@@ -31,6 +31,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works, with the small whiteboard code), section 4 (the full worked example) and sections 5 and 6 (variants and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Interfaces]]: two different types can share one interface, so callers treat them the same way.
+> - [[Design Patterns Overview and Chooser]]: Composite is the structural pattern for "a tree of parts".
+> - [[Trees, BSTs and Balanced Trees]]: a tree has a root, each node has one parent, and nodes can have children.
+
 **From zero, in 60 seconds** 🟢
 
 Lots of data is shaped like a tree: folders hold files and other folders; categories hold products and other categories.
@@ -71,6 +76,10 @@ Composite lets you ask the same question of a single item or a whole group.
 | Interface | A list of methods a type promises to have | `CountProducts() int` |
 | Recursion | A function that calls itself on smaller parts | category asks each child to count |
 | Cycle | A loop where a node ends up inside itself | A contains B, B contains A |
+| Parent pointer | A field on each node pointing back to the node above it | `Dairy.parent` is `Grocery` |
+| Depth | How many levels down a node sits | Grocery 0, Dairy 1, Milk 2 |
+| Iterator | Code that hands you items one at a time, and you can stop early | `for n, depth := range root.All()` |
+| Stack overflow | A crash when a function calls itself too many times | Counting a tree that loops forever |
 
 **Picture it**
 
@@ -103,10 +112,14 @@ Without Composite, every caller writes the same nested loops: for each category,
 
 Trees also bring two failure modes:
 
-- **Cycles.** If "Grocery" is added under its own child "Dairy", a recursive count never ends. Go's stack grows until the 1 GB limit (on 64-bit systems) and the process dies with a fatal stack overflow that `recover` cannot catch.
+- **Cycles.** If "Grocery" is added under its own child "Dairy", a recursive count never ends. Go's stack grows until the 1 GB limit (on 64-bit systems) and the process dies with a fatal stack overflow that `recover` (Go's way to catch a panic) cannot catch.
 - **Unbounded depth.** A bad import creates a 10,000-level chain, and every page that renders breadcrumbs slows to a crawl.
 
 The code below refuses both when a child is added, so every later walk can trust the shape.
+
+### Real-life example 🟢
+
+Picture the category menu in a grocery app like Swiggy Instamart or BigBasket. "Dairy" holds "Milk" and "Cheese", "Milk" holds the actual packets, and the app can still show "Dairy (124)" at the top. To get that number, the app does not need special code for each level: it asks "Dairy" for its count, and "Dairy" asks each of its children in turn. A single product just says "1". A folder of folders on your phone works the same way. That "treat one item and a whole group the same way" idea is Composite.
 
 ## 2. Mental model 🟢
 
@@ -117,6 +130,8 @@ The pattern has three roles:
 - **Component**: the shared interface (`Node`).
 - **Leaf**: has no children and answers directly (`*Product`).
 - **Composite**: holds children of type `Node` and answers by combining their answers (`*Category`).
+
+> 🟢 → 🟡 **You now know** the idea: an item and a group answer the same question, and a group asks its children. **Next we open the box**: the three roles in Go types, how `Add` refuses loops and over-deep trees, and how one walk over the tree serves counting, searching and printing.
 
 ## 3. How it works 🟡
 
@@ -160,9 +175,9 @@ flowchart TD
 Step by step:
 
 1. **Recursive operations.** `Category.CountProducts()` loops over its children and adds up their counts; `Product.CountProducts()` returns 1. `TotalPricePaise` and `Validate` follow the same shape.
-2. **The mutation API lives on the composite only.** `Add` is a method of `*Category`, not of `Node`, so `product.Add(x)` does not compile. GoF calls this choosing *safety* over *transparency*.
+2. **The mutation API lives on the composite only.** `Add` is a method of `*Category`, not of `Node`, so `product.Add(x)` does not compile. GoF calls this choosing *safety* (the compiler stops misuse) over *transparency* (every node has the same methods).
 3. **Guards in `Add`.** Walk up the parent pointers from the new parent: if you meet the child, adding it would close a cycle. Refuse a category that already has a parent (this is a tree, not a graph). Refuse the child if `depth(parent) + height(child)` exceeds `MaxDepth`.
-4. **Iterative traversal.** `All` walks the tree with an explicit stack and yields each node with its depth as a Go 1.23 iterator, so callers can `break` early. Swap the stack for a queue to get level order (breadth first).
+4. **Iterative traversal.** `All` walks the tree with an explicit stack and yields each node with its depth as a Go 1.23 iterator, so callers can `break` early. Swap the stack for a queue to get level order (breadth first: all of level 1, then all of level 2).
 5. **Composites of errors.** `Validate` returns `errors.Join` of the children's errors, and `errors.Is` searches that error tree, so one call reports every bad product.
 
 ### Whiteboard version
@@ -209,6 +224,15 @@ func main() {
 **In plain words:** One program that builds a product catalog tree, adds safety checks, walks it and searches it. The core is the shared interface and the loop over children.
 
 One `package main` with the catalog tree, the guards, an iterator, search, validation and `io.MultiWriter`. It compiles with Go 1.24 and passes `go vet` and `go test -race`, using only the standard library.
+
+**Step by step:**
+
+1. `Node` is the shared interface: `Name`, `CountProducts`, `TotalPricePaise` and `Validate`.
+2. `Product` is a leaf. It answers for itself: a count of 1, its own price, and an error if the price is not positive.
+3. `Category` holds `children` and answers by looping over them and adding up their answers, however deep they go.
+4. `Category.Add` refuses a nil child, a cycle, a category that already has a parent, and a tree deeper than `MaxDepth`, using `canAdopt`, `depth` and `height`.
+5. `All` walks every node with its own stack (no recursion), and `Search` and `Print` are built on top of it.
+6. `main` builds a small catalog, prints it, searches it, shows that adding "Grocery" under "Dairy" is refused (a cycle), and lets `Validate` catch the bread with a zero price.
 
 ```go
 // Command catalog models a category tree with the Composite pattern:
@@ -611,9 +635,9 @@ The in-memory tree is usually loaded from a table. Three common schemas:
 
 | Schema | How a subtree is read | Moving a subtree | Cost |
 | --- | --- | --- | --- |
-| Adjacency list (`parent_id`) | `WITH RECURSIVE` query | Update one row | Recursive query for every subtree read |
-| Closure table (`ancestor_id, descendant_id, depth`) | One indexed lookup on `ancestor_id` | Delete and re-insert many rows | About `n × average depth` rows |
-| Materialized path (`ltree` or text `'1.2.9'`) | Prefix match: `path <@ '1.2'` with a GiST index | Rewrite the path of every node in the subtree | Path length limits depth; renumbering on moves |
+| Adjacency list (`parent_id`) | `WITH RECURSIVE` query (SQL that repeats a lookup level by level) | Update one row | Recursive query for every subtree read |
+| Closure table (one row for every ancestor-descendant pair: `ancestor_id, descendant_id, depth`) | One indexed lookup on `ancestor_id` | Delete and re-insert many rows | About `n × average depth` rows |
+| Materialized path (`ltree` or text `'1.2.9'`) | Prefix match: `path <@ '1.2'` with a GiST index (a PostgreSQL index type that supports such tree queries) | Rewrite the path of every node in the subtree | Path length limits depth; renumbering on moves |
 
 The adjacency list is the simplest. The `CYCLE` clause (PostgreSQL 14 and later) stops the recursion if bad data contains a loop, and the depth filter enforces the same limit as `MaxDepth`:
 
@@ -676,6 +700,14 @@ FROM category_closure
 WHERE ancestor_id = 1 AND depth > 0;
 ```
 
+## Common beginner mistakes 🟢
+
+- **Mistake:** writing nested loops in the caller ("for each category, for each subcategory, for each product"). → **Why it's wrong:** the code breaks the day someone adds a fourth level. → **Do this instead:** call `root.CountProducts()` or `root.TotalPricePaise()` and let each `Category` ask its own children.
+- **Mistake:** putting `Add` on the `Node` interface. → **Why it's wrong:** then a `Product` must have an `Add` that makes no sense, and someone will call it. → **Do this instead:** keep `Add` on `Category` only, so the compiler stops you from adding a child to a product.
+- **Mistake:** adding children without any checks. → **Why it's wrong:** a category placed under its own child makes every count loop forever and crash the program. → **Do this instead:** check in `Add`, as `canAdopt` does: refuse cycles (`ErrCycle`), a second parent (`ErrHasParent`) and too much depth (`ErrTooDeep`).
+- **Mistake:** storing prices as `float64` rupees. → **Why it's wrong:** sums of decimals drift (0.1 + 0.2 is not exactly 0.3), and totals over thousands of products show odd paise. → **Do this instead:** store whole paise in an `int64`, like `pricePaise`.
+- **Mistake:** stopping at the first bad product when checking the tree. → **Why it's wrong:** the admin fixes one, runs the check again, and finds the next, one at a time. → **Do this instead:** collect every problem, as `Category.Validate` does with `errors.Join`.
+
 ## 5. Variants and comparison 🟡
 
 | Variant | How it works | Use when | Cost |
@@ -683,7 +715,7 @@ WHERE ancestor_id = 1 AND depth > 0;
 | Interface + leaf and composite types (this note) | `Node` interface; `*Category` holds `[]Node` | Node kinds behave differently (product vs category, file vs folder) | A type switch whenever you need the children |
 | One struct type for every node | `type Node struct { Kind NodeKind; Children []*Node }`, or linked children as in `golang.org/x/net/html`, whose `Node` has a `Type` field and `FirstChild` and `NextSibling` pointers | Parsers and documents where all nodes share fields | Checks on `Kind` replace polymorphism |
 | Transparent composite | `Add` and `Children` on the interface; leaves return an error | Generic tree tools that must edit any node | A leaf exposes methods it cannot honour |
-| Composite of behaviour | One value fans a call out to many of the same interface: `io.MultiWriter`, `errors.Join`, a multi-handler for `log/slog` | Several sinks or results must look like one | Error policy: stop at the first failure or collect all |
+| Composite of behaviour | One value fans a call out (sends the same call to each) to many of the same interface: `io.MultiWriter`, `errors.Join`, a multi-handler for `log/slog` | Several sinks or results must look like one | Error policy: stop at the first failure or collect all |
 
 **Composite vs Decorator.** Both build a recursive structure of one interface. A decorator wraps **one** object and adds behaviour to its calls; a composite holds **many** children and combines their results. See [[Decorator and Middleware]].
 
@@ -700,14 +732,16 @@ WHERE ancestor_id = 1 AND depth > 0;
 
 - **No cycle check.** A cycle turns every recursive method into an infinite recursion and a fatal stack overflow. Check in `Add`, and use `CYCLE` or a visited set when the tree comes from outside.
 - **No depth limit.** Deep trees make every walk and breadcrumb expensive. Enforce a limit at write time.
-- **Quadratic aggregates.** Printing the count next to every category calls `CountProducts` on every subtree, which is `O(n × depth)`. For big trees, cache the aggregate on each category and mark ancestors dirty on change, using the parent pointers.
+- **Quadratic aggregates** (work that grows much faster than the tree). Printing the count next to every category calls `CountProducts` on every subtree, which is `O(n × depth)`. For big trees, cache the aggregate on each category and mark ancestors dirty (needing a recount) on change, using the parent pointers.
 - **Concurrent mutation.** The tree is not safe for concurrent `Add` and reads. Build it once and share it read-only, guard the whole tree with one `sync.RWMutex`, or swap in a new immutable tree through an `atomic.Pointer`.
 - **Typed nil children.** A nil `*Product` stored in a `Node` is a non-nil interface; calling a method on it panics if the method reads a field. `Add` rejects both a nil interface and a typed nil.
+
+> 🟡 → 🔴 **You now know** how to build a safe tree in Go, test it and store it in PostgreSQL. **Next comes the production view**: where Composite hides in Go's standard library, the slowdowns and double counts seen in real catalogs, and the design choices behind safe versus transparent trees.
 
 ## 7. In production 🔴
 
 - **Real systems:**
-	- `go/ast`: `ast.Node` is the component, and `ast.Inspect` walks the tree of declarations, statements and expressions. `text/template/parse` has a `ListNode` holding `[]Node`.
+	- `go/ast` (Go's own parsed-source tree): `ast.Node` is the component, and `ast.Inspect` walks the tree of declarations, statements and expressions. `text/template/parse` has a `ListNode` holding `[]Node`.
 	- `io/fs.WalkDir` walks directories (composites) and files (leaves) through `fs.DirEntry.IsDir()`. The vault's full worked problem on this is [[File Search (Unix find)]].
 	- `errors.Join` (Go 1.20+) builds a tree of errors; `errors.Is` and `errors.As` search it depth first.
 	- `io.MultiWriter` and `io.MultiReader` make many writers or readers look like one.
@@ -758,6 +792,26 @@ WHERE ancestor_id = 1 AND depth > 0;
 - Composites of behaviour: `io.MultiWriter`, `errors.Join` (searched by `errors.Is`), multi-handlers.
 - In PostgreSQL: adjacency list + `WITH RECURSIVE ... CYCLE`, closure table, or `ltree` path.
 - Cache aggregates for big trees; share built trees read-only.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What are the three roles in Composite?
+> Component (the shared interface), leaf (answers directly) and composite (holds children and combines their answers).
+
+> [!question]- 🟢 How does a category count its products?
+> It asks each child for its count and adds the answers; a product just returns 1.
+
+> [!question]- 🟢 Why does `Add` live only on `*Category` and not on `Node`?
+> So nobody can give a product children; the compiler stops it.
+
+> [!question]- 🟡 How does `Add` detect that a new child would create a loop?
+> It walks up the parent pointers from the new parent; if it meets the child, adding it would close a cycle.
+
+> [!question]- 🟡 A product sits in two categories. What goes wrong with the total count?
+> It is counted twice; count distinct product IDs or treat the data as a graph.
+
+> [!question]- 🟡 Composite or Decorator: one value wraps exactly one other value and adds logging?
+> Decorator. A composite holds many children and combines their results.
 
 ## Links 🟢
 

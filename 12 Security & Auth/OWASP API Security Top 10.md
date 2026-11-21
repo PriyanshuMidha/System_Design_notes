@@ -27,6 +27,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Authentication vs Authorization]]: being logged in (authentication) is not the same as being allowed to touch a given record (authorization).
+> - [[Access and Refresh Tokens]]: each request carries a token saying who the caller is; the server must still decide what that caller may do.
+
 **From zero, in 60 seconds** 🟢
 
 **OWASP** is a non-profit group that lists the most common ways websites and APIs get hacked.
@@ -71,6 +75,12 @@ The OWASP API Top 10 is a list of the ten most common mistakes like this.
 | BOLA | Broken Object Level Authorization: no ownership check per record | Reading order 1002 that isn't yours |
 | Rate limit | A cap on how many calls a caller can make | 100 requests per minute |
 | SSRF | Tricking the server into fetching a URL the attacker picks | Server fetching `http://169.254.169.254/` |
+| BFLA | Broken Function Level Authorization: a normal user can call an admin-only endpoint | `POST /admin/users/7/promote` works for anyone |
+| BOPLA / mass assignment | The server accepts or returns fields it should not | Body sneaks in `"role":"admin"` |
+| DTO | A small struct listing exactly the fields allowed in or out | `OrderUpdateRequest{Status}` |
+| Enumeration | Walking through IDs one by one to find other people's data | 48213, 48214, 48215… |
+| API gateway | The front-door server that checks tokens before requests reach services | Kong, AWS API Gateway |
+| Cloud metadata endpoint | A special internal address where a cloud server can fetch its own secret keys | `169.254.169.254` |
 
 **Picture it**
 
@@ -113,17 +123,47 @@ Nothing was "hacked" — the attacker used their own valid login and the documen
 
 This single pattern — **Broken Object Level Authorization (BOLA)** — has been OWASP's #1 API risk in both the 2019 and 2023 editions, because it is easy to introduce (one missing `WHERE owner_id = ?`) and devastating once found (every sequential ID is a free enumeration).
 
+### Real-life example: ticket bots and order pages 🟢
+
+On a ticket app like BookMyShow, two items from this list show up in real life. If the "view booking" API returned any booking for any logged-in user, someone could step through booking numbers and collect strangers' names and phone numbers (API1, BOLA). And when a big concert goes on sale, bots try to grab every seat in the first second through the public booking API; every request is "valid", but the business rule "fair chance for real fans" breaks (API6). The first is fixed with one ownership check in the query; the second needs rate limits, purchase caps and bot checks.
+
 ## 2. Mental model 🟢
 
 Think of each API endpoint as a door with two separate locks: an **authentication** lock (do you have a valid key at all?) and an **authorization** lock (does *this specific key* open *this specific door*?).
 
 Most of this list is incidents where only the first lock was installed. BOLA is "any valid key opens every room's door." BFLA is "any valid key opens the staff-only doors too." Unrestricted resource consumption is "the door has no limit on how many times per second you can walk through it." Treat every item below as: which lock is missing, and on what resource?
 
+## Common beginner mistakes 🟢
+
+- **Trusting the gateway to "handle auth"** → it checks the token, not who owns order 48214 → scope every query by the caller's ID in the service.
+- **Binding the whole JSON body onto the database model** → a client can set `role` or `amount` (BOPLA) → decode into a small request struct with only the editable fields.
+- **Returning the whole database row** → hidden fields like `passwordHash` leak → build a response struct per role.
+- **Hiding admin buttons in the UI and calling it security** → anyone can call the URL directly (BFLA) → check the role inside every admin handler.
+- **No limit on `?limit=`** → one request asks for 5 million rows and hurts everyone (API4) → cap page size, body size and time.
+
+### BOLA vs BFLA vs BOPLA 🟡
+
+| | What is missing | Example | Fix |
+| --- | --- | --- | --- |
+| BOLA (API1) | Check on *which record* | User A reads order of user B | `WHERE owner_id = caller` |
+| BFLA (API5) | Check on *which endpoint* | Normal user calls `/admin/promote` | Role check in the handler |
+| BOPLA (API3) | Check on *which fields* | Body sets `role: admin` | Allow-listed DTO in and out |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that most API breaches are a missing "may this caller touch this?" check. **Next we open the box**: all ten items one by one, and exactly where in your system each permission check has to run.
 
 ### The 2023 list, each with the one-line bug and the one-line fix
 
 **In plain words:** skim this as a checklist. Each row is "the server trusted X" followed by "check X yourself".
+
+**Step by step (follow one request down the flowchart):**
+1. `PATCH /orders/48214` arrives. Is the token valid? No → API2 (broken authentication).
+2. Does order 48214 belong to this caller? No → API1 (BOLA).
+3. Does the body only touch fields this caller may change? It also sets `amount` → API3 (BOPLA).
+4. Is the request within size, time and rate limits? A 5-million-row page → API4.
+5. Is this caller's role allowed to use this endpoint at all? A normal user on an admin route → API5 (BFLA).
+6. Only after all checks pass does the handler run; if it fetches a URL the client gave, that URL must be checked too → API7 (SSRF).
 
 ```mermaid
 flowchart TD
@@ -148,18 +188,25 @@ flowchart TD
 | --- | --- | --- | --- |
 | **API1** | Broken Object Level Authorization (BOLA) | `GET /orders/{id}` returns any order for any logged-in caller | Scope every query by `owner_id`/`tenant_id` derived from the token, never from the path |
 | **API2** | Broken Authentication | Weak JWT validation (`alg: none`), no token expiry, password reset leaks via timing, no MFA on sensitive accounts | Validate signature + `alg` allowlist + `exp`/`aud`/`iss` on every token (see [[JWT - Structure, Validation and Pitfalls]]); short-lived tokens; rate-limit auth endpoints |
-| **API3** | Broken Object Property Level Authorization (BOPLA, merges old "Excessive Data Exposure" + "Mass Assignment") | `PATCH /users/{id}` accepts a JSON body that happens to include `"role":"admin"` and the server binds it straight onto the model; or a `GET` response includes a `passwordHash` field the UI just doesn't render | Allow-list request fields per endpoint (a DTO struct with only the editable fields) and allow-list response fields per caller role — never serialize the whole DB row |
+| **API3** | Broken Object Property Level Authorization (BOPLA, merges old "Excessive Data Exposure" + "Mass Assignment") | `PATCH /users/{id}` accepts a JSON body that happens to include `"role":"admin"` and the server binds it straight onto the model; or a `GET` response includes a `passwordHash` field the UI just doesn't render | Allow-list request fields per endpoint (a DTO, data transfer object, struct with only the editable fields) and allow-list response fields per caller role — never serialize the whole DB row |
 | **API4** | Unrestricted Resource Consumption | No cap on page size (`?limit=5000000`), no request timeout, no per-caller rate limit, an endpoint that triggers an expensive join or a PDF render | Enforce max page size, request body size, timeouts, and per-account/IP/API-key rate limits (see [[Rate Limiting - Algorithms and Distributed Design]]) |
 | **API5** | Broken Function Level Authorization (BFLA) | A regular user calls `POST /admin/users/{id}/promote` directly — the endpoint exists and only the UI hides the button | Check role/permission inside the handler for every privileged function, never rely on "the frontend doesn't show the button" |
-| **API6** | Unrestricted Access to Sensitive Business Flows | A bot buys out all event tickets in a flash sale via the public purchase API, bypassing the intended "one human, one purchase" assumption | Rate-limit and add friction (CAPTCHA, device/behavioral checks, purchase caps) on flows where *volume itself* is the business risk, not just the data |
-| **API7** | Server-Side Request Forgery (SSRF) | An endpoint fetches a URL the client provides (an "import avatar from URL" feature) and the server requests `http://169.254.169.254/latest/meta-data/` — the cloud metadata endpoint — instead | Validate and allowlist destination schemes/hosts, block link-local/private ranges, fetch through an isolated proxy with no credentials attached |
-| **API8** | Security Misconfiguration | Verbose stack traces in production error responses, default credentials left on an admin panel, permissive CORS (`Access-Control-Allow-Origin: *` with credentials), unpatched dependencies | Harden defaults, a config baseline enforced in CI, generic error bodies with a request ID, automated dependency/CVE scanning |
+| **API6** | Unrestricted Access to Sensitive Business Flows | A bot buys out all event tickets in a flash sale via the public purchase API, bypassing the intended "one human, one purchase" assumption | Rate-limit and add friction (CAPTCHA, the "prove you are human" puzzle; device/behavioral checks; purchase caps) on flows where *volume itself* is the business risk, not just the data |
+| **API7** | Server-Side Request Forgery (SSRF) | An endpoint fetches a URL the client provides (an "import avatar from URL" feature) and the server requests `http://169.254.169.254/latest/meta-data/` — the cloud metadata endpoint — instead | Validate and allowlist destination schemes/hosts, block link-local/private ranges (internal-only addresses like `169.254.x.x` and `10.x.x.x`), fetch through an isolated proxy with no credentials attached |
+| **API8** | Security Misconfiguration | Verbose stack traces (the full list of code lines that led to an error) in production error responses, default credentials left on an admin panel, permissive CORS (`Access-Control-Allow-Origin: *` with credentials), unpatched dependencies | Harden defaults, a config baseline enforced in CI, generic error bodies with a request ID, automated dependency/CVE (publicly known vulnerability) scanning |
 | **API9** | Improper Inventory Management | A `v1` endpoint was supposed to be retired, still runs with no monitoring, and skipped the authz fix that `v2` got; a staging API is reachable from the internet with test data | Maintain a live API inventory (every version, every environment), decommission old versions, apply security fixes to all live versions equally |
 | **API10** | Unsafe Consumption of APIs | The backend calls a third-party API and trusts its response unvalidated — following its redirects, parsing its data without size/schema limits, logging its raw payload including secrets it echoed back | Treat third-party API responses like any other untrusted input: validate, size-limit, timeout, and don't propagate their errors verbatim to your own clients |
 
 ### Where authorization actually has to happen
 
 **In plain words:** the gateway can check "is this a real user". Only the service that owns the data can check "is this row theirs", so that check must live there.
+
+**Step by step:**
+1. User A sends `GET /orders/48214` with their token.
+2. The gateway checks the token is real and not expired. It cannot know who owns order 48214.
+3. It forwards the request to the order service along with "caller = user-A".
+4. The order service runs `SELECT * FROM orders WHERE id = 48214 AND owner_id = 'user-A'`.
+5. The order belongs to user B, so zero rows come back, and the service answers 404, without even admitting the order exists.
 
 ```mermaid
 sequenceDiagram
@@ -321,6 +368,8 @@ For the full Go middleware chain this check sits in — request-ID, auth, rate l
 
 ## 5. Variants and comparison 🟡
 
+A pentest (penetration test) is a hired, permitted attack on your own system to find holes; fuzzing means sending many odd or random inputs to see what breaks.
+
 | Risk | Layer it's checked at | Caught by a pentest? | Caught by code review? |
 | --- | --- | --- | --- |
 | API1 BOLA | Per-request, in the data layer | Only if the tester owns two accounts and tries cross-account IDs | Yes, if reviewers specifically check every query's `WHERE` clause |
@@ -339,12 +388,15 @@ For the full Go middleware chain this check sits in — request-ID, auth, rate l
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** all ten risks and why the object check must live in the service. **Next we look at real systems**: the breaches these bugs caused, how teams keep them from coming back, what to monitor, and the deeper reasons BOLA stays at number one and SSRF is so dangerous in the cloud.
+
+
 - **Real systems:** large BOLA breaches have hit ride-hailing, fintech and social apps via exactly the sequential-ID pattern above; SSRF via a "fetch this URL" feature reaching cloud metadata endpoints has been behind several well-known cloud account compromises; API6-style ticket/sneaker bot abuse is a standing arms race for e-commerce and events platforms.
 - **Failure modes → fixes:**
   - A new endpoint ships without an object-level authz check because the reviewer assumed the gateway "already handles auth" → make the per-object check a required line item in the API review checklist, not implicit.
   - An internal admin endpoint is reachable because a role check was only enforced in the frontend → every privileged handler re-checks the role server-side (API5).
   - A "retired" `v1` endpoint still runs with the old, unfixed authz bug (API9) → maintain an actual inventory with an owner and a kill date per version.
-  - An "import from URL" feature is repurposed to probe internal services (API7) → resolve and validate the destination before fetching, block RFC 1918/link-local ranges, and fetch via an egress proxy with no cloud credentials attached.
+  - An "import from URL" feature is repurposed to probe internal services (API7) → resolve and validate the destination before fetching, block RFC 1918/link-local ranges (private and internal-only IP addresses), and fetch via an egress proxy (a single exit server for outgoing calls) with no cloud credentials attached.
 - **What to monitor:** 403/404 rates per endpoint (a spike on one object ID pattern suggests enumeration), request volume per account/IP on sensitive flows, outbound request destinations from any "fetch a URL" feature, and the set of live API versions against what's actually monitored.
 
 ## 8. Deep dive 🔴
@@ -352,7 +404,7 @@ For the full Go middleware chain this check sits in — request-ID, auth, rate l
 - **Why BOLA keeps winning #1.** It's not a framework bug or a missing library — `authMiddleware.Required()` runs fine, the token is valid, the user genuinely is who they say they are. The missing step is a second, independent check — "does this caller own this specific row" — that has to be written per query, so it scales with the number of endpoints rather than being solved once centrally. Policy engines (OPA, Casbin — see [[Authentication vs Authorization]]) help by moving the *rule* out of each handler, but someone still has to call the check on every object access.
 - **BOPLA subsumes two 2019 categories** ("Excessive Data Exposure" and "Mass Assignment") because OWASP 2023 recognized they're the same bug from opposite directions: a response that serializes too many fields out, and a request that binds too many fields in. The single fix — an explicit, allow-listed DTO per direction, per role — covers both.
 - **API6 is the odd one out on this list**: it isn't a missing technical check so much as a missing *product* threat model — "what happens if this flow runs a million times per second by a bot, not a human." The defense (rate limits, device signals, purchase caps, deliberate friction) overlaps heavily with [[API Abuse and Bot Protection]], which this note defers to for the detection and mitigation mechanics.
-- **SSRF and cloud metadata.** The specific danger of API7 inside a cloud deployment is that `169.254.169.254` (AWS/GCP/Azure instance metadata) often serves short-lived credentials with no additional auth required from inside the VM/container network — so a single unvalidated outbound fetch can turn into full credential theft. IMDSv2-style hop-limited, token-gated metadata APIs and network policies that block the metadata address from application containers are the infrastructure-side mitigation, independent of fixing the application's URL validation.
+- **SSRF and cloud metadata.** The specific danger of API7 inside a cloud deployment is that `169.254.169.254` (AWS/GCP/Azure instance metadata) often serves short-lived credentials with no additional auth required from inside the VM/container network — so a single unvalidated outbound fetch can turn into full credential theft. IMDSv2-style (AWS's newer metadata service that needs a token first) hop-limited, token-gated metadata APIs and network policies that block the metadata address from application containers are the infrastructure-side mitigation, independent of fixing the application's URL validation.
 
 ## 9. Interview questions 🔴
 
@@ -388,6 +440,26 @@ For the full Go middleware chain this check sits in — request-ID, auth, rate l
 - API7 SSRF: validate and allowlist any server-made outbound request to a client-given URL; block link-local/private ranges.
 - API8/9/10: config hardening + a live inventory of every API version + treat third-party API responses as untrusted input.
 - The recurring theme: authenticate once at the edge, but authorize per object, per field, and per function — every time, in the service.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is the number 1 item on the OWASP API list?
+> API1, BOLA: reading or changing another user's record just by changing its ID.
+
+> [!question]- (easy) A normal user calls an admin-only URL and it works. Which item is that?
+> API5, BFLA.
+
+> [!question]- (easy) Why return 404 instead of 403 for someone else's order?
+> So the reply does not even confirm that the order exists.
+
+> [!question]- (medium) Why can't the API gateway fix BOLA for you?
+> It only sees the token; it does not have the database row that says who owns the object.
+
+> [!question]- (medium) How does a request DTO stop mass assignment?
+> It only has the fields the client may set, so extra keys like `role` have nowhere to go.
+
+> [!question]- (medium) Why is SSRF so dangerous on a cloud server?
+> The server can be tricked into calling the metadata address, which may hand out the server's cloud credentials.
 
 ## Links
 

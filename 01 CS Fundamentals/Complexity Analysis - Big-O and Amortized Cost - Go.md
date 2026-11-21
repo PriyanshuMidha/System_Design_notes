@@ -21,6 +21,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Work through the Code steps 1-3 and the Tests.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Number Representation and Text Encoding]]: numbers double in powers of 2 (1, 2, 4, 8, ... 1,024), which is why "grow by doubling" reaches a million in about 20 steps. Read [[Complexity Analysis - Big-O and Amortized Cost]] first too: "amortized `O(1)`" means cheap on average over many calls.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the runnable half of [[Complexity Analysis - Big-O and Amortized Cost]]. The theory note claims that Go's `append` and map inserts are cheap on average even though single calls can be expensive. This file does not just repeat the claim — it measures it: small Go programs count every real reallocation and time real map builds, and tests fail if the numbers ever stop matching the theory. Read each "Step" top to bottom: plain-words line, code, then a numbered walk-through.
@@ -51,6 +54,8 @@ This file is the runnable half of [[Complexity Analysis - Big-O and Amortized Co
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** what the two experiments measure. **Next we read the code:** a diary of every slice reallocation, a total of all copying work, and a stopwatch on map building. Each step starts with one plain-words line.
+
 ### Step 1: logging every slice reallocation
 
 **In plain words:** this code appends items one by one and writes down every moment Go had to build a bigger array — like keeping a diary of every time the valet moved your cars to a larger lot.
@@ -69,6 +74,8 @@ type ReallocPoint struct {
 ```
 
 **How it works.** `Len` and `Cap` are recorded together because the *gap* between the length that triggered growth and the new capacity is exactly the spare room the next several appends get to use for free.
+
+**What this code does, in plain words:** start with an empty slice, add `n` numbers one at a time, and every time `cap` jumps (a new, bigger array was made) write down the length and the new capacity.
 
 ```go
 // GrowthLog appends n elements to a nil slice one at a time and records
@@ -184,12 +191,14 @@ flowchart LR
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** how each function measures growth and how the tests check the numbers. **Next comes the advanced part:** why it was measured this way, where the measurements can mislead, and exercises.
+
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
 | `GrowthLog` detects reallocation by comparing `cap(s)` before/after | Instrument the runtime directly (not possible from user code) | Black-box but reliable: `cap()` is the only externally visible signal of a reallocation, and it's exactly right |
 | `TotalCopiesFor` derived from `GrowthLog`'s output | Count copies with a custom allocator or `runtime/trace` | Far simpler, and sufficient: the theory note only needs the *total*, not a trace of individual memory writes |
 | `BuildMapTimings` measures wall-clock time, not an operation count | Count rehash/bucket-evacuation events like `GrowthLog` does for slices | Go's `map` doesn't expose a `cap()`-equivalent signal for bucket growth, so timing is the only externally observable proxy available from user code |
-| Map benchmark uses a generous 50x band in its test | A tight, exact bound | Wall-clock timing is noisy (GC pauses, scheduler jitter); a tight bound would make the test flaky on a shared CI machine without making the underlying claim any more true |
+| Map benchmark uses a generous 50x band in its test | A tight, exact bound | Wall-clock timing is noisy (GC pauses, when the garbage collector briefly slows the program; scheduler jitter, small random delays in when code gets a CPU); a tight bound would make the test flaky (passing and failing at random) on a shared CI (automatic build-and-test server) machine without making the underlying claim any more true |
 
 ## Tests 🟡
 
@@ -246,7 +255,7 @@ A failure here (total copies exceeding `5n`) would directly contradict the theor
 
 ### TestGrowthIsMonotonic
 
-**Property.** `cap()` growth must be monotonically non-decreasing, and every reallocation's new capacity must be strictly greater than the length that triggered it — a basic sanity check that the measured log itself is internally consistent before trusting the two tests above.
+**Property.** `cap()` growth must be monotonically non-decreasing (it only stays the same or goes up, never down), and every reallocation's new capacity must be strictly greater than the length that triggered it — a basic sanity check that the measured log itself is internally consistent before trusting the two tests above.
 
 ```go
 func TestGrowthIsMonotonic(t *testing.T) {
@@ -323,7 +332,7 @@ ok  	rollscratch/complexity	2.245s
 
 **Reading the output.** Each `t.Logf` line prints one data point from the measured tables above; the trimmed excerpt here shows the first and last size for each test to keep the output short, while the full four-size run is what produced every row in the theory note's tables.
 
-`PASS` on all four tests under the race detector confirms both "reallocations are logarithmic" and "map insertion's per-op cost stays flat" are not just plausible arguments but checked facts about this exact Go version and platform.
+`PASS` on all four tests under the race detector (`-race`, a Go tool that catches unsafe shared-memory access between goroutines) confirms both "reallocations are logarithmic" and "map insertion's per-op cost stays flat" are not just plausible arguments but checked facts about this exact Go version and platform.
 
 ## Pitfalls in the code 🔴
 
@@ -336,6 +345,26 @@ ok  	rollscratch/complexity	2.245s
 1. Modify `GrowthLog` to also record the *ratio* `cap(s) / prevCap` at each reallocation point, and predict how that ratio changes as `n` crosses 256 (hint: compare to the growth table in [[Arrays and Dynamic Arrays (Go Slices)]]). Then run it.
 2. Add a third measured example to `BuildMapTimings`'s sibling: time deleting all `n` keys from a fully built map one at a time, and predict whether deletion shows the same flat-ns/op shape as insertion (map deletion doesn't shrink the bucket array in Go, so predict accordingly before running).
 3. Change `TestTotalCopiesIsLinearInN`'s bound from `5*n` to `3*n` and predict which `n` values (if any) in the test's list would then fail, using the measured "copies/n" column in the theory note's table. Then run it to confirm.
+
+## Self-check 🟢🟡
+
+> [!question]- How does `GrowthLog` know a reallocation happened?
+> `cap(s)` changed after an `append`.
+
+> [!question]- For `n = 1,000,000`, about how many reallocations were measured?
+> 38, which is roughly logarithmic, not a million.
+
+> [!question]- Why does `TotalCopiesFor` add `p.Len - 1`, not `p.Len`?
+> The element that triggered the growth is written fresh into the new array; only the older ones are copied.
+
+> [!question]- What would `NSPerOp` look like if map insert were really `O(n)` per call?
+> It would grow about 1,000x as `n` grows 1,000x, instead of staying around 50-100 ns.
+
+> [!question]- Why does the map test use a wide 50x band?
+> Timing is noisy (GC, scheduler), and a tight band would fail at random.
+
+> [!question]- If you pre-size with `make([]int, 0, n)`, what does `GrowthLog`-style counting show?
+> Zero reallocations, because there is already room for all `n` items.
 
 ## Links
 

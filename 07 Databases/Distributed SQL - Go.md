@@ -26,6 +26,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add the full "Code" walkthrough, "Design decisions" and "Tests".
 > - 🔴 **Interview / SDE-3 prep?** Add "Pitfalls in the code" and do the "Exercises". Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Transactions and ACID]]: a transaction runs from `BEGIN` to `COMMIT` and is all or nothing, so a retry must re-run the whole block.
+> - [[Isolation Levels and MVCC]]: every saved value carries a timestamp, and readers see the newest version at or below their own timestamp.
+> - [[Replication]], [[Partitioning and Sharding]] and [[Consensus - Raft and Paxos]]: data is cut into slices, each slice has copies on several machines, and the copies agree by majority vote.
+> - The theory twin [[Distributed SQL]] explains ranges, HLC clocks and `40001` retries in plain words; read its sections 1-3 first.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on twin of [[Distributed SQL]]. It builds three small Go pieces that make a distributed SQL database work from the client's side: a clock that keeps "cause before effect" across machines with bad watches (the HLC), a router that finds which data slice holds a key, and a retry loop for the "please run that transaction again" errors these databases return. Read the theory note first if any of those words are new. Here, go step by step; every code block has a plain "How it works" list after it, and the tests prove each promise without needing a real database.
@@ -38,7 +44,7 @@ This file is the hands-on twin of [[Distributed SQL]]. It builds three small Go 
 - **`errors.As` and `errors.Join`**: unwrap an error to find the SQL state, and combine the database error with a context error.
 - **`context.Context` and `time.After` with `select`**: the retry loop sleeps with backoff but stops early if the request is cancelled.
 - **Goroutines and `sync.WaitGroup`**: one test hammers the clock from many goroutines under `-race`.
-- **What to run:** `go vet ./... && go test -race ./...`; the pgx snippet in step 4 is shown only, not compiled.
+- **What to run:** `go vet ./... && go test -race ./...` (`-race` turns on Go's race detector, which flags unsafe use of shared data from several goroutines); the pgx snippet in step 4 is shown only, not compiled.
 
 ## What this code shows 🟢
 
@@ -77,6 +83,8 @@ go test -race ./...
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** the three jobs: tell time across machines, find which slice holds a key, and retry when the database says "try again". **Next we open the code** for each one, with a line-by-line walk after every block.
+
 ### Step 1: hybrid logical clock
 
 **In plain words: a clock that never runs backwards, and jumps forward whenever it hears from a machine whose watch is ahead — so an effect always gets a later timestamp than its cause.**
@@ -87,7 +95,7 @@ A hybrid logical clock (HLC, [[Distributed SQL#An HLC keeps cause before effect]
 
 The alternative is Spanner's TrueTime, which needs atomic clocks and commit wait ([[Distributed SQL#Commit wait in Spanner]]), or a central timestamp oracle that adds a network hop to every transaction ([[Distributed SQL#Timestamps: TrueTime vs HLC vs a timestamp oracle]]).
 
-HLC was chosen because it needs only the standard library and ordinary NTP-synced clocks.
+HLC was chosen because it needs only the standard library and ordinary NTP-synced clocks (NTP is the internet service that keeps server clocks roughly in step).
 
 First, the timestamp type and its ordering:
 
@@ -116,7 +124,7 @@ func (t Timestamp) Less(o Timestamp) bool {
 
 **How it works.**
 
-1. `Wall` is physical nanoseconds since the Unix epoch, so timestamps stay close to real time and humans can read them.
+1. `Wall` is physical nanoseconds since the Unix epoch (1 January 1970, the usual zero point for computer clocks), so timestamps stay close to real time and humans can read them.
 2. `Logical` is a counter that only matters when two events share the same `Wall` value, or when the wall clock lags behind a timestamp received from another node.
 3. `Less` compares `Wall` first, then `Logical`. This is a total order on timestamps.
 4. The struct is a plain comparable value, so tests can compare timestamps with `==` and use them as map keys.
@@ -279,7 +287,7 @@ func NewRouter(ranges []Range) (*Router, error) {
 1. A `Range` is half-open: `Start` is included and `End` is excluded. An empty `End` means "up to infinity".
 2. `Leaseholder` is the one replica that serves reads and proposes writes for that range; the router returns it so the caller can send the request there.
 3. `NewRouter` enforces the invariant that every later function depends on: the first range starts at `""`, each range ends exactly where the next one starts, and the last range is open-ended. That means every possible key has exactly one range.
-4. The sentinel `ErrBadLayout` lets callers test the failure with `errors.Is`.
+4. The sentinel `ErrBadLayout` (one fixed error value that callers can compare against) lets callers test the failure with `errors.Is`.
 
 Then the lookup and the split:
 
@@ -333,7 +341,7 @@ flowchart LR
 
 The database cannot retry for you because it does not know what your application code did between statements, so the client wraps the whole transaction in a retry loop.
 
-The loop must retry only errors that retrying can fix, wait with capped exponential backoff and full jitter so that many clients do not collide again at the same instant, and stop when the context is cancelled.
+The loop must retry only errors that retrying can fix, wait with capped exponential backoff (each wait doubles, up to a maximum) and full jitter (each wait is a random time up to that limit) so that many clients do not collide again at the same instant, and stop when the context is cancelled.
 
 An alternative is a driver-level retry of single statements, which is wrong for a multi-statement transaction because earlier statements would be lost.
 
@@ -473,7 +481,7 @@ sequenceDiagram
 | --- | --- | --- |
 | HLC (wall time plus counter) | TrueTime or a timestamp oracle | Works on ordinary clocks and needs no extra hop. It gives causal order but not external consistency without waiting out clock skew. |
 | Injected `physNow` function | Call `time.Now` directly | Tests control time exactly. One extra function call per timestamp. |
-| `sync.Mutex` in `Clock` | Atomic compare-and-swap on a packed 64-bit value | Simple and obviously correct. Packed atomics are faster but harder to read. |
+| `sync.Mutex` in `Clock` | Atomic compare-and-swap (a CPU instruction that updates a value only if it has not changed) on a packed 64-bit value | Simple and obviously correct. Packed atomics are faster but harder to read. |
 | Sorted slice plus `sort.Search` | A B-tree or interval tree | Tiny and fast for thousands of ranges. `Split` copies the slice, so it is `O(ranges)`. |
 | Validate layout in `NewRouter` | Trust the caller | `Lookup` can never index out of range for a validated router. Costs a pass at start-up. |
 | Split keeps the old ID on the left | Assign two new IDs | Existing references stay valid. |
@@ -788,6 +796,8 @@ ok  	example.com/distsql	1.255s
 
 ## Pitfalls in the code 🔴
 
+> 🟡 → 🔴 **You now know** how the clock, router and retry loop work and what each test proves. **Next come the sharp edges**: missing locks, unsafe splits, error wrapping that hides a retry, and side effects that run once per attempt.
+
 - `Clock.Update` must hold the same mutex as `Now`. Without it, two goroutines can hand out the same timestamp. `TestHLCConcurrent` checks 8,000 timestamps for duplicates.
 - `Router.Split` mutates the slice in place and is not safe for concurrent use. A real range cache needs a lock or copy-on-write.
 - `Router.Lookup` assumes the layout was validated by `NewRouter`. A first range that does not start at `""` would make `i-1` negative.
@@ -800,6 +810,30 @@ ok  	example.com/distsql	1.255s
 1. In `TestHLCCausality`, set node B's clock ahead of A's instead (`tb.ns = 9_000_000`). Predict `recv.Wall` and `later.Wall` before running it.
 2. Call `r.Split("/invoices/m", 9)` on the router from `TestRouter`. Predict whether the router changes and which range `Lookup("/invoices/m")` returns.
 3. Change the `maxAttempts` in the give-up test from 3 to 1. Predict `calls` and whether `Retryable(err)` is still true.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What two parts make up an HLC timestamp?
+> Wall-clock nanoseconds plus a small logical counter.
+
+> [!question]- Which errors does `Retryable` treat as worth retrying?
+> Only SQLSTATE `40001` (serialization failure) and `40P01` (deadlock).
+
+> [!question]- In the router, which range owns a key equal to a boundary like `/invoices/m`?
+> The range that starts at that key, because `Start` is included.
+
+🟡 Medium
+
+> [!question]- Node B's clock is 5 ms behind A. After `b.Update((5 ms, 0))`, what does `b.Now()` return?
+> (5 ms, 2): B keeps A's wall time and bumps the counter, so the payment is after the invoice.
+
+> [!question]- Why must the closure passed to `RunTx` begin and commit its own transaction?
+> A retry must start fresh from `BEGIN`; reusing an outer transaction would resume inside an aborted one and fail again.
+
+> [!question]- What goes wrong if you wrap a driver error with `%v` instead of `%w`?
+> The SQL state is lost from the error chain, so `Retryable` returns false and a fixable conflict becomes a failure.
 
 ## Links 🟢
 

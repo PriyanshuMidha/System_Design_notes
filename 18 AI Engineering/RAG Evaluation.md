@@ -32,6 +32,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[RAG Pipeline]]: a RAG bot first fetches the top chunks for a question, then the model writes an answer from those chunks with sources.
+
 **From zero, in 60 seconds** 🟢
 
 A RAG bot works in two steps. First it searches your documents. Then the model writes an answer from what it found.
@@ -80,6 +83,11 @@ RAG evaluation gives each stage its own score so you know what broke.
 | Faithfulness | Does the answer stick to the retrieved text? | No invented numbers |
 | LLM-as-judge | Using a model to grade another model's answer | Judge scores 1-5 |
 | CI gate | An automatic test that blocks a bad change | Build fails if recall drops |
+| CI | The automatic build-and-test run on every code change | Runs on each pull request |
+| Regression | Something that used to work and got worse after a change | Recall fell from 0.91 to 0.78 |
+| MRR | Average of 1 ÷ the rank of the first right result | Right chunk at rank 2 → 0.5 |
+| nDCG | A 0-to-1 score for how well all right results are ordered near the top | 1.0 = perfect order |
+| Reference answer | The correct answer written down ahead of time | "Refunds within 14 days" |
 
 **Picture it**
 
@@ -116,6 +124,21 @@ A support team ships a RAG assistant, and a manager asks: "is it good?" Without 
 
 Concretely: after switching from a 500-token to a 1,000-token chunk size, answer quality on a sample of eyeballed transcripts "seems about the same." A golden-set eval run instead reports recall@5 dropped from 0.91 to 0.78 while faithfulness held steady at 0.94 — a retrieval regression invisible to spot-checking, caught in minutes by a metric built for exactly that stage.
 
+### Real-life example 🟢
+
+Think of the help bot in a banking app like HDFC or ICICI that answers "what is the charge for a failed NACH mandate?".
+The team wants to switch to a cheaper embedding model. Before shipping, they run 80 saved questions with known right chunks.
+Recall@5 drops from 0.90 to 0.72 on fee questions, though answers "look fine" in a quick demo.
+The CI gate fails the build, so the switch never reaches customers who would have got wrong fee amounts.
+
+### Common beginner mistakes 🟢
+
+- **Judging by reading a few answers** → you miss most bad answers and cannot tell which stage broke → score retrieval and generation separately on a fixed golden set.
+- **Using only one "answer correct?" score** → when it drops, you do not know whether search or writing failed → also track recall@k (search) and faithfulness (writing).
+- **Trusting an LLM judge blindly** → judges can prefer long or confident answers → check the judge against 30-50 human-graded cases first.
+- **Building the golden set only from LLM-made questions** → they reuse the chunk's own words, so they are too easy → add hand-written and real user questions.
+- **Picking a round-number threshold** → scores wobble a little run to run, so the gate fails on noise and people start ignoring it → measure that wobble first and set the threshold above it.
+
 ## 2. Mental model 🟢
 
 Treat a RAG pipeline like a two-stage exam: **retrieval** is "did the student open the right page of the textbook," and **generation** is "given that page, did the student answer correctly from it."
@@ -123,6 +146,15 @@ Treat a RAG pipeline like a two-stage exam: **retrieval** is "did the student op
 A student who opens the wrong page and still happens to write a correct answer from memory passed the exam but failed the lesson you were testing — and a student who opened the right page but copied it wrong failed for the opposite reason.
 
 RAG evaluation tests each stage with a metric built for that stage, instead of only grading the final answer and shrugging about why it was wrong.
+
+### RAG evaluation vs the things people confuse it with 🟡
+
+| Thing | What it checks | Key difference |
+| --- | --- | --- |
+| RAG evaluation | Search quality and answer quality on a golden set | Splits the score by stage so you know what to fix |
+| Unit tests | Exact output of plain code | Code is exact; RAG answers vary, so you score them instead of matching strings |
+| [[LLM Evals in Production]] | Any LLM feature, offline and on live traffic | Broader; RAG evaluation adds retrieval-specific scores like recall@k |
+| [[LLM Observability]] | What happened on each real call (traces, cost, latency) | Records calls; evaluation grades them |
 
 ```mermaid
 flowchart LR
@@ -142,9 +174,20 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that a RAG bot has two steps, search and writing, and that you score each on a fixed golden set. **Next we open the box**: how to build the golden set, how each search score is counted, how answer scores work, and how to check an LLM judge before trusting it. Each subsection starts with a plain step-by-step walk.
+
 ### Whiteboard version
 
 **In plain words:** Take a few labelled questions, run them through the bot, score the results, and block the release if scores drop.
+
+**Step by step:**
+1. Save 50 questions, each with the chunk IDs that should be found and the right answer.
+2. On every change, run all 50 through the real pipeline.
+3. Score search (recall@k, MRR, nDCG) and the answers (faithfulness).
+4. Compare each score to its minimum, say recall@5 ≥ 0.85.
+5. Below the minimum: fail the build and name which score dropped.
+
+Full detail:
 
 The smallest useful eval loop: a handful of labeled queries, run through the live pipeline, scored against the labels, gated in CI.
 
@@ -161,13 +204,22 @@ flowchart LR
 
 **In plain words:** An answer key for your bot: questions, the pages that should be found, and the right answer.
 
+**Step by step:**
+1. An expert writes 30 real-sounding questions and marks the right chunks, such as "Refund window for digital goods?" → chunk 42.
+2. An LLM reads 40 other chunks and writes one question per chunk, cheaply.
+3. Add 10 real user questions from production where users said "this didn't help".
+4. Add a few questions with no answer in the docs, to check the bot says "I don't know".
+5. Keep adding new hard cases as production finds them.
+
+Full detail:
+
 Every metric below needs a **golden set**: a list of `(query, relevant chunk IDs, reference answer)` rows. Three ways to build one, usually combined:
 
 - **Hand-labeled.** A domain expert writes realistic questions and marks which chunks should answer them. Expensive per row, but the most trustworthy — this is what you calibrate an LLM judge against (see below).
 - **Synthetically generated.** An LLM reads a chunk and generates a question it answers, giving you a `(question, chunk_id)` pair almost for free.
 
   It is useful for bulk recall@k coverage, but systematically easier than real user questions (it was generated *from* the answer, so it tends to use the chunk's own vocabulary) — don't rely on it alone for a representative difficulty distribution.
-- **Production-sampled.** Real user queries, sampled and then labeled (by a human, or by promoting a query where a human gave explicit feedback). These are the hardest and most representative rows, and the ones most worth adding over time as the eval set's "adversarial" cases.
+- **Production-sampled.** Real user queries, sampled and then labeled (by a human, or by promoting a query where a human gave explicit feedback). These are the hardest and most representative rows, and the ones most worth adding over time as the eval set's "adversarial" (deliberately hard, tricky) cases.
 
 A golden set of 50–100 rows, covering the easy cases, the known-hard cases (ambiguous phrasing, multi-hop questions), and a few known-unanswerable questions (to check the pipeline says "I don't know" instead of guessing) is enough to start; grow it as production surfaces new failure patterns.
 
@@ -182,9 +234,18 @@ flowchart LR
 
 **In plain words:** These all ask one thing in different ways: did the right page show up, and how near the top?
 
+**Step by step:**
+1. Question 1: the right chunk is at rank 2 of 5. Recall@5 = hit (1). Reciprocal rank = 1/2.
+2. Question 2: the right chunk is at rank 1. Recall@5 = 1. Reciprocal rank = 1.
+3. Question 3: the right chunk is not in the top 5. Recall@5 = 0. Reciprocal rank = 0.
+4. Average over the 3 questions: recall@5 = 2/3 ≈ 0.67, MRR = (0.5 + 1 + 0) / 3 = 0.5.
+5. nDCG does the same idea but credits every right chunk in the list, with less credit the lower it sits.
+
+Full detail:
+
 - **Recall@k**: the fraction of queries where at least one relevant chunk appears somewhere in the top k retrieved results. It answers "did retrieval find the needle at all," independent of rank — check this first, since nothing downstream (reranking, prompting, generation) can fix a chunk that was never retrieved.
 - **MRR (Mean Reciprocal Rank)**: the average of `1/rank` of the first relevant result per query (0 if none was found). Unlike recall@k, it rewards ranking the relevant chunk *first* over fifth — which matters, because a reranker or a context-assembly token budget can drop a correct-but-low-ranked chunk before it ever reaches the prompt.
-- **nDCG@k (normalized Discounted Cumulative Gain)**: rewards relevant results near the top of the list via a logarithmic rank discount, normalized against the best possible ordering so scores are comparable across queries with different numbers of relevant chunks. It generalizes MRR to "multiple relevant chunks, ranked well" rather than only "the first one found."
+- **nDCG@k (normalized Discounted Cumulative Gain)**: rewards relevant results near the top of the list via a logarithmic rank discount (each step down the list counts for a bit less, shrinking slowly), normalized against the best possible ordering so scores are comparable across queries with different numbers of relevant chunks. It generalizes MRR to "multiple relevant chunks, ranked well" rather than only "the first one found."
 
 All three are computed from the same labeled rows — `(query, set of relevant chunk IDs, chunk IDs the pipeline actually retrieved, in order)` — so one eval run against the golden set produces all three with no extra instrumentation.
 
@@ -199,6 +260,15 @@ flowchart LR
 
 **In plain words:** These ask: did the answer stick to the pages it was given, and were those pages even useful?
 
+**Step by step:**
+1. The bot got 5 chunks and answered "Refunds within 14 days, plus a ₹50 fee."
+2. Faithfulness: the chunks say "14 days" but nothing about a fee, so one claim is unsupported. Not faithful.
+3. Context precision: 2 of the 5 chunks were actually about refunds, so 2/5 = 0.4.
+4. Context recall: the reference answer needs 2 facts and both appear in the chunks, so 1.0.
+5. Each score points at a different fix: the prompt, the search noise, or missing chunks.
+
+Full detail:
+
 These check the *answer* against the *context it was actually given*, which is why they're scored independently of whether retrieval picked the ideal context — a generation metric answers "given these chunks, was the answer good," not "were these the right chunks."
 
 - **Faithfulness (groundedness)**: does every claim in the answer trace back to something stated in the retrieved context? An unfaithful answer invents or extrapolates beyond what the context actually says — the core hallucination check for a grounded system.
@@ -209,6 +279,15 @@ These check the *answer* against the *context it was actually given*, which is w
 ### LLM-as-judge, and why it needs calibration
 
 **In plain words:** Using one AI to grade another is cheap and fast, but you must first check the grader agrees with humans.
+
+**Step by step:**
+1. Pick 50 real answers.
+2. Humans mark each as faithful or not.
+3. The LLM judge marks the same 50, returning JSON like `{"faithful": true}`.
+4. Count how often they agree, say 46 of 50 = 92%.
+5. If agreement is high, use the judge in CI; if not, fix the judge prompt and check again. Re-check whenever the judge model or prompt changes.
+
+Full detail:
 
 Faithfulness and context precision are both naturally posed as "read this context and this answer, and judge X" — exactly the kind of task an LLM grades well, at a fraction of the cost of a human reviewer reading every case.
 
@@ -628,7 +707,9 @@ ok  	rageval	1.96s
 
 ## 7. In production 🔴
 
-- **Real systems:** eval frameworks like RAGAS popularized the faithfulness / context-precision / context-recall / answer-correctness metric set specifically for RAG; most LLM observability platforms (see [[LLM Observability]]) now ship built-in support for running these against sampled production traffic, not only a static golden set.
+> 🟡 → 🔴 **You now know** how to build a golden set, compute the search and answer scores, and check an LLM judge. **Next comes the senior view**: which tools teams use, how eval suites go stale, how to set CI thresholds from real noise, and how to read the scores to find which stage broke.
+
+- **Real systems:** eval frameworks like RAGAS (an open-source Python library for scoring RAG systems) popularized the faithfulness / context-precision / context-recall / answer-correctness metric set specifically for RAG; most LLM observability platforms (see [[LLM Observability]]) now ship built-in support for running these against sampled production traffic, not only a static golden set.
 - **Failure modes → fixes:**
   - Golden set goes stale as the corpus changes (a labeled "relevant" chunk gets edited or deleted) → re-validate golden-set chunk IDs against the live index on a schedule, and flag labels pointing at chunks that no longer exist.
   - LLM judge drifts after a model or grading-prompt change → re-run the human-agreement calibration check whenever either changes, not only once at setup.
@@ -650,7 +731,7 @@ ok  	rageval	1.96s
   nDCG's discounted-gain sum credits every relevant result in the list, discounted by its rank, which matters once your golden set has queries with several correct chunks (a question answerable from any of three overlapping paragraphs) where MRR would treat "found 1 of 3" and "found all 3" identically as long as the first one ranked the same.
 - **Setting CI thresholds without picking numbers out of the air.**
 
-  Run the eval suite several times against an *unchanged* pipeline first and look at the natural run-to-run variance (sampling order, any non-determinism in the judge or the model's temperature setting) — that variance is your noise floor.
+  Run the eval suite several times against an *unchanged* pipeline first and look at the natural run-to-run variance (sampling order, any non-determinism in the judge or the model's temperature setting) — that variance is your noise floor (the normal wobble you see even when nothing changed).
 
   A gate threshold needs headroom above it, or the gate fails intermittently on noise rather than on a real regression, training the team to ignore it.
 - **Promoting production failures into the golden set.** A production query where a user clicked "this didn't help," or where a human support agent had to step in, is exactly the kind of hard, representative case a synthetic or hand-written golden set tends to miss.
@@ -698,6 +779,26 @@ ok  	rageval	1.96s
 - Set CI gate thresholds from measured run-to-run variance, not a round number picked by feel.
 - High recall@k with low faithfulness points at generation; low recall@k points at retrieval — diagnose with the right metric before changing code.
 - An eval suite is maintained, ongoing work: keep feeding it real production failures, not just the queries you wrote on day one.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: What is a golden set?
+> A fixed list of test questions with the right chunks and right answers written down.
+
+> [!question]- Easy: What does recall@5 ask?
+> Did at least one right chunk appear in the top 5 results?
+
+> [!question]- Easy: What does faithfulness ask?
+> Does every claim in the answer come from the retrieved chunks?
+
+> [!question]- Medium: Recall@5 is 0.95 but users report made-up answers. Which stage is broken?
+> Generation: search finds the right chunks, but the model is not sticking to them.
+
+> [!question]- Medium: The right chunk is at rank 4 for one query. What is its reciprocal rank?
+> 1/4 = 0.25.
+
+> [!question]- Medium: Why check an LLM judge against human labels?
+> A judge can be biased or wrong; its scores mean something only if it agrees with humans.
 
 ## Links 🟢
 

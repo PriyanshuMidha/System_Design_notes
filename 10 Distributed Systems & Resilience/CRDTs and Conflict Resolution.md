@@ -39,6 +39,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Replication]]: the same data is copied to several machines; sometimes more than one copy accepts writes.
+> - [[Clocks and Ordering]]: machine clocks disagree, and version vectors can tell "happened before" from "happened at the same time".
+> - [[Consistency Models]]: "eventual" means copies agree once writes stop arriving.
+> - [[Quorums and Leaderless Replication]]: leaderless stores pick a winner with last-writer-wins or keep both versions as siblings.
+
 **From zero, in 60 seconds** 🟢
 
 Two phones edit the same shopping list while both are offline.
@@ -80,6 +86,10 @@ The rest of this note is just these 3 questions:
 | Last writer wins (LWW) | Keep the change with the latest timestamp | The other edit is silently lost |
 | Commutative / idempotent | Order does not matter / applying twice is same as once | max(3,5) = max(5,3); max(5,5)=5 |
 | Tombstone | A marker that says "this was deleted" | `eggs: removed` |
+| Siblings | All conflicting versions kept side by side for the app to merge | `{[], ["milk"]}` |
+| G-Counter | A counter that only grows: one slot per replica, merged by taking the max per slot | `{mumbai: 120, frankfurt: 80}` = 200 |
+| OR-Set | A set where each add gets a unique tag, so a remove only cancels adds it has seen | Re-added "milk" survives a concurrent remove |
+| Version vector | One counter per replica, used to spot concurrent writes | `[phone:2, laptop:1]` |
 
 **Picture it**
 
@@ -123,9 +133,17 @@ The same problem appears at much larger scale: a like counter written in Mumbai 
 
 Wherever writes are accepted on more than one replica to stay available during a network partition (the "A" choice in [[CAP and PACELC]]), something has to merge them.
 
+### Real-life example 🟢
+
+Think of a shared family shopping list app that works offline. Mum adds "milk" on her phone in a basement with no signal; you remove "eggs" on yours on the metro.
+When both phones get signal, the app must merge the two lists without asking anyone.
+A good design ends with the same list on both phones, with both changes kept. CRDTs are the data types that make that merge automatic and safe.
+
 ## 2. Mental model 🟢
 
-Think of each replica's state as a point that can only move **up** in a partial order, and merge as "take the smallest point above both". For a grow-only counter, each replica keeps its own tally, and merge takes the maximum per replica:
+🟢 **Plain version:** Each copy only ever gains information; it never goes backwards. Merging two copies means "keep everything either copy knows". Because of that, it does not matter in what order copies merge, or if the same merge happens twice: everyone ends up in the same place. For a counter, each phone keeps its own tally, and merging keeps the bigger tally per phone.
+
+Think of each replica's state as a point that can only move **up** in a **partial order** (some states are "above" others, but two states can also be side by side, neither above the other), and merge as "take the smallest point above both". For a grow-only counter, each replica keeps its own tally, and merge takes the maximum per replica:
 
 - Mumbai's view `{mumbai: 120, frankfurt: 70}`, Frankfurt's view `{mumbai: 100, frankfurt: 80}`.
 - Merge → `{mumbai: 120, frankfurt: 80}`, total 200. Merging again changes nothing. Merging in the other order gives the same answer.
@@ -141,6 +159,14 @@ Terms used below:
 - **Join-semilattice:** the math behind state-based CRDTs: a set of states with a merge ("join") that is commutative (`a ⊔ b = b ⊔ a`), associative (`(a ⊔ b) ⊔ c = a ⊔ (b ⊔ c)`) and idempotent (`a ⊔ a = a`).
 - **Tombstone:** a marker that something was deleted, kept so the deletion can be merged.
 
+## Common beginner mistakes 🟢
+
+- **Using last-writer-wins for things that must not be lost** → one of two concurrent edits silently disappears → use a CRDT (like an OR-Set for a cart) or keep siblings.
+- **A shared counter that "adds what the other side sent"** → syncing twice double-counts → keep one slot per replica and merge with max.
+- **Expecting a CRDT to protect "stock never below zero"** → two regions can each sell the last unit → use a home leader, consensus, or split the stock (escrow).
+- **Reusing a replica's ID after rebuilding it** → its new, smaller counts lose to the old ones → give a rebuilt replica a fresh ID.
+- **Never cleaning up tombstones** → every delete is kept forever and data grows → garbage-collect once all replicas have seen the delete.
+
 ```mermaid
 flowchart LR
     A["Copy A: count 3"] --> M["Merge: take the bigger per phone"]
@@ -151,9 +177,17 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that conflicts come from two copies accepting writes at once, and that a CRDT merges copies so everyone ends up the same. **Next we open the box**: the strategies from "newest wins" to CRDTs, the two ways CRDTs sync, the common types, and the shopping-list example step by step.
+
 ### Strategies, from simplest to richest
 
 **In plain words:** from "newest wins" (simple, loses data) to "keep both and let a smart type merge" (more work, loses nothing).
+
+**Step by step:**
+1. First ask: can one replica own this key? If all writes for user 42 go to Mumbai, there are no conflicts at all.
+2. If not, ask: is losing one of two writes OK? For "last seen at", yes: keep the newest timestamp (LWW).
+3. If losing a write is not OK, ask: is there a data type whose merge fits? A like count fits a counter; a cart fits a set.
+4. If nothing fits, keep both versions as siblings and let the app (or the user) merge them.
 
 ```mermaid
 flowchart TD
@@ -175,13 +209,19 @@ flowchart TD
 
 **In plain words:** you either send your whole copy and the other side merges it, or you send each small change and the other side replays it.
 
+**Step by step:**
+1. State-based: Mumbai sends its whole counter `{mumbai: 120, frankfurt: 70}` to Frankfurt.
+2. Frankfurt merges with max per slot. If the message arrives twice or late, nothing breaks.
+3. Operation-based: Mumbai sends just "+3". It is small, but must arrive exactly once, or the count is wrong.
+4. Delta-state: Mumbai sends only the slots that changed since the last sync, merged like state-based: small and still safe.
+
 | Kind | Replicas exchange | Requirement on the network | Example |
 | --- | --- | --- | --- |
 | State-based (CvRDT, convergent) | Whole states, merged with join | None: messages may be lost, duplicated or reordered, as long as states eventually spread | G-Counter as a map of per-replica counts |
-| Operation-based (CmRDT, commutative) | Operations ("increment by 3") | Every operation delivered exactly once to every replica, in causal order where the type needs it | Counter sending `+3` |
+| Operation-based (CmRDT, commutative) | Operations ("increment by 3") | Every operation delivered exactly once to every replica, in causal order (causes before effects) where the type needs it | Counter sending `+3` |
 | Delta-state | Small "delta" states since last sync, merged with join | Like state-based, but much smaller messages | Akka Distributed Data's delta CRDTs |
 
-State-based is easiest to get right, because merge tolerates any delivery. Op-based sends less data but needs a reliable causal broadcast layer underneath.
+State-based is easiest to get right, because merge tolerates any delivery. Op-based sends less data but needs a reliable causal broadcast layer (a messaging layer that delivers every message to everyone, causes first) underneath.
 
 ```mermaid
 flowchart TB
@@ -193,16 +233,32 @@ flowchart TB
 
 **In plain words:** a few ready-made shapes, like a counter that only goes up, cover most real needs.
 
+**Step by step:**
+1. Likes: a G-Counter. Each region bumps its own slot; total = sum of slots.
+2. Stock that goes up and down: a PN-Counter, one G-Counter for adds and one for removes; value = adds − removes.
+3. Profile photo: an LWW-Register; the newest write wins.
+4. Shopping cart: an OR-Set, so a re-add is not wiped out by an old remove.
+5. Shared text: a sequence CRDT, where every character has its own ID so concurrent typing merges cleanly.
+
 - **G-Counter (grow-only):** a map `replica → count`. Increment your own entry; value = sum; merge = per-replica max.
 - **PN-Counter:** two G-Counters, one for increments (P) and one for decrements (N); value = P − N.
 - **LWW-Register:** a single value with a `(timestamp, replica)` tag; merge keeps the higher tag.
 - **MV-Register (multi-value):** keeps all concurrent values, tagged with version vectors; the reader sees a set.
 - **G-Set / 2P-Set:** grow-only set; two-phase set adds a tombstone set, but an element once removed can never be added back.
 - **OR-Set (observed-remove set):** every add gets a unique tag; remove deletes only the tags the remover has seen. An add concurrent with a remove therefore survives: **add wins**.
-- **Maps:** a map of CRDTs, merged key by key (Riak maps, Automerge objects).
+- **Maps:** a map of CRDTs, merged key by key (Riak maps, Automerge objects; Automerge and Yjs are CRDT libraries for apps).
 - **Sequences:** lists and text where each character has a unique, ordered id (RGA, YATA in Yjs, Automerge's list type), so concurrent inserts at the same position interleave deterministically.
 
 ### The shopping list, step by step
+
+**In plain words:** the phone's remove only cancels the "milk" it knew about, so a "milk" the laptop added later survives the merge.
+
+**Step by step:**
+1. The phone adds milk, labelled `(phone,1)`, and syncs. Both devices have milk `(phone,1)`.
+2. The network drops. On the phone, the user removes milk: the phone marks `(phone,1)` as deleted.
+3. On the laptop, someone adds milk again, labelled `(laptop,1)`.
+4. The network returns and each device merges: all labels together, all deletions together.
+5. `(phone,1)` is deleted, but `(laptop,1)` is not, so milk is on both lists. Add wins.
 
 ```mermaid
 sequenceDiagram
@@ -545,7 +601,7 @@ The like-counter numbers: Mumbai counted 120 and Frankfurt 80 while partitioned.
 | LWW | Keep highest `(timestamp, replica)` | Overwrites where any recent value is fine: profile photo, last-seen time, cache entries | Silent loss of concurrent writes; clock skew picks the wrong winner |
 | Siblings + app merge | Version vectors detect concurrency; client merges | Domain-specific merge that no CRDT captures | Every reader must handle sets of values |
 | CRDT | Type-specific join, automatic | Counters, sets, collaborative documents, offline-first apps | Metadata (per-replica entries, tags, tombstones); a fixed merge policy |
-| Operational transformation (OT) | Concurrent edits are transformed against each other, in practice ordered by a central server | Real-time text editing with a server (Google Docs) | Practical systems rely on a central server; peer-to-peer transform functions are notoriously hard to get right |
+| Operational transformation (OT) | Concurrent edits are transformed (adjusted, such as shifting a position by one) against each other, in practice ordered by a central server | Real-time text editing with a server (Google Docs) | Practical systems rely on a central server; peer-to-peer transform functions are notoriously hard to get right |
 
 ### CRDT types at a glance
 
@@ -570,16 +626,18 @@ The like-counter numbers: Mumbai counted 120 and Frankfurt 80 while partitioned.
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the strategies for settling conflicts, state-based vs operation-based CRDTs, the common types and how an OR-Set keeps a re-added item. **Next comes the advanced part**: Redis Enterprise, Riak, Cassandra and collaborative editors in production, the failure modes, and the internals behind tombstone clean-up, text CRDTs, LWW and escrow.
+
 - **Real systems:**
 	- **Redis Enterprise Active-Active** databases replicate across regions using CRDT-based types: counters, sets, strings, hashes and others each have documented conflict rules.
-	- **Riak KV** offers siblings with causal context (dotted version vectors) and built-in data types: counters, sets, maps and HyperLogLogs at the top level, with registers and flags usable only as fields inside a map.
+	- **Riak KV** offers siblings with causal context (dotted version vectors) and built-in data types: counters, sets, maps and HyperLogLogs (a compact structure for estimating how many distinct items there are) at the top level, with registers and flags usable only as fields inside a map.
 	- **Cassandra** resolves every cell by LWW on its write timestamp, and has a counter type with its own replication path (see [[Wide-Column Stores and Cassandra]]).
 	- **DynamoDB global tables** in their default multi-Region eventual consistency mode use last writer wins between regions. DynamoDB itself is leader-based within a region (Multi-Paxos per partition), not Dynamo-style leaderless.
 	- **Collaborative editors:** Yjs (YATA) and Automerge are CRDT libraries used for shared documents and offline-first apps; Google Docs uses operational transformation instead.
 - **Failure modes → fixes:**
 	- LWW drops a write due to clock skew → use hybrid logical clocks for timestamps, or move the field to a CRDT or a home leader.
 	- Siblings pile up because clients never merge → enforce merge on read, and cap siblings with an alert.
-	- Tombstones grow without bound → periodic garbage collection once all replicas acknowledge a causal point; in Cassandra, run repair within `gc_grace_seconds` (default 10 days) so deleted data does not come back.
+	- Tombstones grow without bound → periodic garbage collection once all replicas acknowledge a causal point; in Cassandra, run repair (Cassandra's job that syncs replicas) within `gc_grace_seconds` (default 10 days) so deleted data does not come back.
 	- A counter "loses" increments after a replica is removed and re-added with the same id → never reuse replica ids; give a rebuilt replica a fresh id.
 - **What to monitor:**
 	- Replication lag between replicas or regions.
@@ -593,13 +651,13 @@ The like-counter numbers: Mumbai counted 120 and Frankfurt 80 while partitioned.
 
 **In plain words:** messages arrive late, twice or out of order; the three laws mean none of that changes the final answer.
 
-Anti-entropy (background sync, often via gossip, see [[Failure Detection, Gossip and Membership]]) delivers states late, repeatedly and in any order. Commutativity handles reordering, associativity handles batching (merging A into B then into C equals merging in any grouping), and idempotence handles duplicates.
+Anti-entropy (background sync, often via gossip, where nodes tell a few random peers what they know; see [[Failure Detection, Gossip and Membership]]) delivers states late, repeatedly and in any order. Commutativity handles reordering, associativity handles batching (merging A into B then into C equals merging in any grouping), and idempotence handles duplicates.
 
 Together they mean the network layer can be as sloppy as it likes; this is why state-based CRDTs need no exactly-once delivery.
 
 ### OR-Set internals and garbage collection
 
-The tag set grows forever in the naive design shown here. Production implementations (the "optimized OR-Set" and dot-based designs) replace explicit tombstones with a **causal context**: a version vector summarizing which tags each replica has seen.
+The tag set grows forever in the naive design shown here. Production implementations (the "optimized OR-Set" and dot-based designs, where a "dot" is one `(replica, counter)` tag) replace explicit tombstones with a **causal context**: a version vector summarizing which tags each replica has seen.
 
 A tag that the context covers but the add-set does not contain must have been removed. That makes removes cost no extra space, at the price of more intricate merge code.
 
@@ -650,6 +708,30 @@ To sell 100 seats from two regions without coordination per sale, split the quot
 - CRDTs cannot enforce cross-replica invariants (stock ≥ 0, unique names): coordinate or use escrow.
 - Metadata and tombstones grow; GC needs agreement.
 - Real: Redis Enterprise Active-Active, Riak data types, Yjs, Automerge; Cassandra and DynamoDB global tables use LWW.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is a conflict?
+> Two copies of the same data changed differently while they could not talk to each other.
+
+> [!question]- What does last-writer-wins lose?
+> The other concurrent write, silently.
+
+> [!question]- Mumbai's G-Counter is `{mumbai: 120, frankfurt: 70}` and Frankfurt's is `{mumbai: 100, frankfurt: 80}`. What is the merged total?
+> 200: per-slot max gives `{mumbai: 120, frankfurt: 80}`.
+
+🟡 Medium
+
+> [!question]- Why must CRDT merge be idempotent?
+> Syncs can repeat; merging the same state twice must not change the result (no double counting).
+
+> [!question]- In an OR-Set, one phone removes "milk" while another adds it. What is the result?
+> Milk stays: the remove only cancels the add tags it had seen, and the new add has a new tag.
+
+> [!question]- Can a PN-Counter keep stock from going below zero across two regions?
+> No. Each region can sell the last unit; you need coordination or escrow (split the stock between regions).
 
 ## Links
 

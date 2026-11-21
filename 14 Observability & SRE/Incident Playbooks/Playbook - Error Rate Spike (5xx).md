@@ -47,6 +47,11 @@ Say it out loud in an interview: "I confirm, scope, check what changed, mitigate
 > - 🟡 **Know the basics?** Add section 3 (first 5 minutes and steps), 4 (worked example), 5 (the four error codes) and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Production Debugging Playbook]]: check "what changed" first, scope the problem, and stop the damage before hunting the cause.
+> - [[Incident Response]]: one person leads, and you post short updates on a fixed schedule.
+> - [[Metrics and Prometheus]]: request counters with a `code` label let you graph the share of 5xx replies by route and pod.
+
 **From zero, in 60 seconds** 🟢
 
 Every web reply comes with a number called a **status code**.
@@ -94,6 +99,12 @@ You must decide fast: roll back, or find another cause?
 | Load balancer | Spreads traffic over many servers and may return its own 5xx | 502 when no healthy backend |
 | Rollback | Returning to the previous working version | Redeploy last good image |
 | SLO / error budget | A target for reliability and how much failure is allowed | 99.9 percent success per 30 days |
+| Proxy (nginx) | A server in front of your app that forwards requests to it | nginx returns 502 if your pod dies |
+| Readiness probe | Kubernetes's check "may this pod get traffic now?" | `/ready` failing removes the pod from the list |
+| Endpoints | The list of ready pods a Kubernetes service sends traffic to | empty list → 503 for everyone |
+| Keep-alive | Reusing one open connection for many requests | nginx reuses a connection the app already closed |
+| Panic | A Go crash in the middle of handling something | nil pointer → panic → 500 |
+| Canary | Sending a new version to a small share of traffic first | 5% for 30 minutes |
 
 **Picture it**
 
@@ -126,7 +137,7 @@ Where it breaks: a restaurant serves one table at a time; a service fails thousa
 
 ## 1. Why it exists 🟢
 
-**Symptoms.** The 5xx ratio on a service crosses its alert threshold (for example above 2% for 5 minutes). Users see "Something went wrong", a blank page, a Bad Gateway page from the load balancer, or a mobile app spinner that ends in a retry toast. Support tickets and social posts follow within minutes.
+**Symptoms.** The 5xx ratio on a service crosses its alert threshold (for example above 2% for 5 minutes). Users see "Something went wrong", a blank page, a Bad Gateway page from the load balancer, or a mobile app spinner that ends in a retry toast (a small pop-up message). Support tickets and social posts follow within minutes.
 
 **User impact.** Every 5xx is a request that failed for a reason that is not the user's fault. A checkout 5xx loses revenue. A login 5xx locks people out. Retries by clients make it worse: a 3x retry policy turns a 10% error rate into extra load that can push a struggling service over the edge.
 
@@ -134,6 +145,13 @@ The running example in this note is **InvoiceOps**, a Go invoicing API behind ng
 
 > [!tip] Remember
 > A 5xx is the server admitting fault. The fastest path is scope, change, mitigate, then decode the status.
+
+### Real-life example: a food app's checkout errors 🟢
+
+Think of Zomato or Swiggy right after a new app server release at lunchtime.
+Suddenly, 1 in 10 people tapping "Place order" sees "Something went wrong".
+The dashboard shows 502 errors on every route, starting a minute after the deploy, and the new pods keep restarting.
+The on-call rolls back in two minutes and errors drop to normal; only afterwards does the team find that one new report feature used far too much memory.
 
 ## 2. Mental model 🟢
 
@@ -160,7 +178,17 @@ flowchart LR
 > [!tip] Remember
 > Ask "which hop produced this status?" before "which line of code is wrong?".
 
+## Common beginner mistakes 🟢
+
+- **Reading logs for 20 minutes while a rollback is one command away** → users keep failing → if a deploy lines up with the spike, roll back first.
+- **Treating all 5xx codes the same** → 500, 502, 503 and 504 point at different parts of the chain → read the code and follow its branch.
+- **Restarting every pod before saving evidence** → logs and profiles vanish → save `logs --previous` and a profile from one bad pod first.
+- **Putting a database check in the readiness probe** → one DB blip marks every pod not ready and everything returns 503 → keep readiness local and cheap.
+- **Watching only the error percentage** → if traffic drops, the % can lie → plot request rate next to it.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a 5xx means the server side failed and that the code number hints at which part broke. **Next we open the box**: the first five minutes, the queries that scope the spike, how to find what changed, and a flowchart from symptom to cause.
 
 ### The first 5 minutes
 
@@ -176,7 +204,7 @@ Do these in order. Each step is short on purpose.
    - A flag flipped: **flip it back**.
    - Pods saturated: **scale out**, or **shed load** (reject low-priority traffic early).
    - One pod bad: **delete that pod**.
-   - Dependency down: **open the circuit breaker** or serve a degraded fallback.
+   - Dependency down: **open the circuit breaker** (stop calling it for a while) or serve a degraded fallback.
 4. **Communicate.** Post in the incident channel: "5xx spike on InvoiceOps since 14:02 UTC, about 18% of requests, cause unknown, investigating, rolling back the 14:00 deploy." Declare an incident per [[Incident Response]] if customer-facing.
 5. **Verify the mitigation.** Watch the 5xx ratio for 5 minutes. If it does not drop, the mitigation was wrong, so keep diagnosing; do not assume.
 
@@ -186,6 +214,12 @@ Do these in order. Each step is short on purpose.
 ### Step A: Confirm with a query
 
 **In plain words:** before acting, check the numbers: what share of requests fail, and on which routes and codes.
+
+**Step by step:**
+1. Run the overall 5xx ratio: say 18%, up from 0.1%.
+2. Split by route: all routes, or just `/reports/export`?
+3. Split by pod: all pods, or one bad one?
+4. Split by exact code: mostly 502? Then follow the 502 branch.
 
 Overall 5xx ratio (assuming the common `http_requests_total` counter with a `code` label; adapt the names to your instrumentation):
 
@@ -229,6 +263,12 @@ sum by (code) (rate(http_requests_total{job="invoiceops",code=~"5.."}[5m]))
 
 **In plain words:** most error spikes follow a change: a deploy, a setting, a feature switch. List what changed in the last hour.
 
+**Step by step:**
+1. Run `kubectl rollout history` and check the CD (continuous delivery) dashboard for deploys.
+2. Check feature-flag and config change logs for the last hour.
+3. Run `kubectl get events` for restarts, OOM kills and failed probes.
+4. If a change happened within a minute or two of the error line rising, roll it back.
+
 ```bash
 # Recent rollouts of this deployment
 kubectl rollout history deployment/invoiceops -n prod
@@ -246,6 +286,11 @@ Compare the deploy time on your CD dashboard with the moment the 5xx line left t
 ### The diagnosis flowchart
 
 **In plain words:** follow the arrows from the symptom to the most likely cause, one question at a time.
+
+**Step by step:**
+1. Started at a deploy? Roll back.
+2. Only one pod? Save its evidence and delete it.
+3. Otherwise read the status code: 500 → app logs; 502 → pod crashes and connections; 503 → ready pods and load shedding; 504 → slowness.
 
 ```mermaid
 flowchart TD
@@ -300,6 +345,12 @@ Total user impact: about 9 minutes of elevated errors. Without the rollback-firs
 
 In plain words: the handler panicked, returned an error you mapped to 500, or a dependency returned something your code could not handle.
 
+**Step by step:**
+1. Pull recent error logs and group them by message (`jq` helps for JSON logs).
+2. One message with a stack trace dominates? That is a specific bug: fix or roll back.
+3. "connection refused" or "deadline exceeded" to a dependency? It is a dependency outage.
+4. Many different messages at once? Something systemic, like a full pool or a broken config.
+
 ```mermaid
 flowchart LR
     R["Request"] --> H["Handler"]
@@ -327,6 +378,12 @@ Go `net/http` recovers panics per request and logs them; a `recover` middleware 
 ### Variant 2: 502 Bad Gateway (proxy got a bad answer)
 
 In plain words: nginx or the load balancer connected to your pod and got a closed connection, a reset, or malformed data. This usually means the pod died, restarted, or closed a keep-alive connection the proxy still thought was open.
+
+**Step by step:**
+1. Run `kubectl get pods`: are restarts climbing?
+2. Run `kubectl describe pod`: does the last state say `OOMKilled` or show a crash?
+3. Read nginx's error log: "connection refused" means nothing is listening; "upstream prematurely closed connection" means the pod dropped it mid-request.
+4. Only during deploys? Check graceful shutdown and readiness timing.
 
 ```mermaid
 sequenceDiagram
@@ -357,11 +414,17 @@ kubectl logs <pod> -n prod --previous --tail=100
 | "Connection refused" | Nothing listening: pod down, wrong port, or still starting |
 | "upstream prematurely closed connection" | Pod crashed mid-request, or closed the socket |
 | 502 only during deploys | Missing graceful shutdown or readiness mismatch; see [[Graceful Shutdown and Health Checks]] |
-| Sporadic 502 at low rate with long keep-alives | Server idle timeout shorter than proxy keep-alive; set the app idle timeout longer than the proxy's |
+| Sporadic 502 at low rate with long keep-alives | Server idle timeout shorter than proxy keep-alive (the app closes a connection nginx still plans to reuse, and nginx gets an RST, a "connection reset" packet); set the app idle timeout longer than the proxy's |
 
 ### Variant 3: 503 Service Unavailable (refusing right now)
 
 In plain words: either there is no healthy backend to send to, or the app itself is deliberately rejecting work (rate limit, load shedding, circuit open).
+
+**Step by step:**
+1. Run `kubectl get endpoints`: is the list of ready pods empty?
+2. If empty, check why readiness probes fail (`kubectl describe pod`).
+3. If pods are ready, the app itself returns 503: check rate-limiter and circuit-breaker metrics.
+4. A `Retry-After` header means it is deliberate load shedding.
 
 ```bash
 # Endpoints behind the service; empty means zero Ready pods
@@ -384,6 +447,12 @@ kubectl describe pod <pod> -n prod | grep -A5 -i "readiness"
 
 In plain words: the app is alive but did not answer before the proxy's timeout (for nginx, `proxy_read_timeout`, default 60 s). The cause is almost always slowness downstream.
 
+**Step by step:**
+1. Run `curl -w` against the slow route and split the time.
+2. High `ttfb` (time to first byte) with a fast connect → the app is slow to think: database, downstream call or lock.
+3. High `connect` → network or a full listen queue.
+4. Check p99 per route; if only one route is slow, follow the high-latency playbook.
+
 ```bash
 # Time a real request, split by phase
 curl -o /dev/null -s -w 'dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total} code=%{http_code}\n' \
@@ -396,7 +465,7 @@ curl -o /dev/null -s -w 'dns=%{time_namelookup} connect=%{time_connect} tls=%{ti
 | Result | Meaning |
 | --- | --- |
 | High `ttfb`, low connect | App is slow thinking: DB, downstream, lock wait |
-| High `connect` | Network or SYN backlog, saturated listener |
+| High `connect` | Network or SYN backlog (queue of half-open connections), saturated listener |
 | p99 high on one route only | A single query or downstream call; see [[Playbook - High Latency]] |
 
 ### Comparison of the four codes
@@ -429,6 +498,9 @@ curl -o /dev/null -s -w 'dns=%{time_namelookup} connect=%{time_connect} tls=%{ti
 > Restarting everything before collecting evidence. Grab `kubectl logs --previous`, a goroutine dump or a heap profile from **one** bad pod, then restart. Otherwise the next incident starts from zero.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how to scope a spike, find what changed, and follow each status code to its cause. **Next is the advanced part**: the three layers of fix, the right alert and dashboards, and the traps (misleading ratios, retry storms, timeouts that don't nest, health checks that lie, goroutine panics).
+
 
 ### Three layers of fix
 
@@ -515,10 +587,10 @@ An unrecovered panic in a goroutine you started yourself (not the request gorout
 > Still roll back first; correlation at the minute level is strong evidence. Then look for non-code changes shipped with the deploy: config, environment variables, resource limits, dependency versions, schema migrations, or a new feature flag default. Reproduce on the old build, compare behaviour, and use a canary next time.
 
 > [!question]- Errors are only on one pod out of twelve. What do you do?
-> Delete or cordon that pod to restore service and keep a copy of its logs and a profile first. Then ask why only that pod: a bad node, noisy neighbour, stuck connection pool, stale cache, a leaked goroutine, or a poisoned local state. If it recurs on other pods, it is a systemic leak with a delay.
+> Delete or cordon (mark as "no new pods here") that pod to restore service and keep a copy of its logs and a profile first. Then ask why only that pod: a bad node, noisy neighbour, stuck connection pool, stale cache, a leaked goroutine, or a poisoned local state. If it recurs on other pods, it is a systemic leak with a delay.
 
 > [!question]- How can retries make a 5xx incident worse and what do you do about it?
-> Each client retry adds load to the component that is already failing, so a 10% error rate can produce a large traffic multiplier and a retry storm. Use exponential backoff with jitter, cap retries with a budget, retry only idempotent calls, and add a circuit breaker so callers stop hammering a failing dependency.
+> Each client retry adds load to the component that is already failing, so a 10% error rate can produce a large traffic multiplier and a retry storm. Use exponential backoff with jitter, cap retries with a budget, retry only idempotent calls (calls that are safe to repeat), and add a circuit breaker so callers stop hammering a failing dependency.
 
 > [!question]- Why is putting a database check in the readiness probe dangerous?
 > A short database blip makes every pod NotReady at the same time. The service then has zero endpoints and returns 503 to everyone, turning a degraded dependency into a full outage. Keep readiness local and cheap; handle dependency failure inside request handling with timeouts, breakers and fallbacks.
@@ -544,15 +616,37 @@ An unrecovered panic in a goroutine you started yourself (not the request gorout
 - [ ] Blameless postmortem held, see [[Postmortems and Root Cause Analysis]].
 - [ ] Runbook and this playbook updated with anything learned.
 
-## 12. Links
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does a 5xx status code mean?
+> The server side failed, not the user.
+
+> [!question]- A deploy finished one minute before the spike. What do you do first?
+> Roll it back, then investigate.
+
+> [!question]- Which code means "the proxy gave up waiting"?
+> 504 Gateway Timeout.
+
+🟡 Medium
+
+> [!question]- Mostly 502s, and new pods keep restarting. Where do you look?
+> `kubectl describe pod` for OOMKilled or crashes, and `logs --previous`.
+
+> [!question]- 503 for everyone, and `kubectl get endpoints` is empty. Why?
+> No pod is ready; readiness probes are failing (maybe a dependency check inside them).
+
+> [!question]- Clients retry 3 times and 10% of calls fail. What happens to load on the failing part?
+> It rises by roughly 30%, which can push it further over the edge.
+
+## Links
 
 - Method: [[Production Debugging Playbook]], [[Incident Response]], [[Postmortems and Root Cause Analysis]]
 - Sibling playbooks: [[Playbook - Bad Deploy and Rollback]], [[Playbook - Database Overload and Connection Exhaustion]], [[Playbook - High Latency]]
 - Signals and alerting: [[Metrics and Prometheus]], [[Alerting and On-Call]], [[SLIs, SLOs, SLAs and Error Budgets]], [[Latency, Percentiles and Bottleneck Analysis]]
 - Resilience: [[Circuit Breaker]], [[Timeouts, Retries and Backoff]], [[Load Shedding and Graceful Degradation]]
 - Tools: [[Network Debugging Toolkit - dig, curl, ss, tcpdump]], [[Graceful Shutdown and Health Checks]], [[Debugging Memory Leaks and OOMs in Go]]
-
-## Links
 
 ### Watch on YouTube
 

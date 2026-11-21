@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (diffing and keys) and 4 (lifecycle and batching).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[React Fundamentals - Components, JSX, Props, State]]: a component returns JSX, and calling a state setter makes React run the component again.
+> - [[React Hooks]]: `useEffect` runs code after the page updates, and its cleanup runs before the next run or when the component goes away.
+
 **From zero, in 60 seconds** 🟢
 
 When data changes, something must update the page. Rebuilding the whole page is slow and loses your scroll position and typed text. React's trick: keep a cheap in-memory sketch of the page — the **virtual DOM** — and when data changes, draw a new sketch and compare it with the old one.
@@ -74,6 +78,12 @@ It then changes only the one piece of text that differs.
 | Mount / unmount | A component first appearing / being removed | opening / closing a modal |
 | Key | A stable ID React uses to match list items | `<li key={user.id}>` |
 | Batching | Grouping several state updates into one re-render | two `setX` calls, one render |
+| Reconciliation | React comparing the new UI description with the old one to find changes | "only the count text changed" |
+| Fiber | React's saved record for each component: its hooks, its DOM node, its pending work | one fiber per `<Counter>` |
+| Render phase | React calling your components and working out changes; no page edits yet | building the new tree |
+| Commit phase | React applying the changes to the real page and running effects | the text node is updated |
+| Heuristic | A quick rule of thumb that is right almost always | "different tag type means rebuild" |
+| Concurrent rendering | React pausing a big slow update to handle an urgent one first | typing stays smooth during a big filter |
 
 **Picture it**
 
@@ -117,15 +127,39 @@ Nothing else on the page re-renders at the DOM level, even though in principle "
 
 ## 1. Why it exists 🟢
 
-Before this model, UI libraries either mutated the DOM directly from scattered event handlers (jQuery-style — correct but hard to keep consistent as an app grows) or re-rendered the entire page on every change (simple but slow: full-page DOM rebuilds are visibly janky past a few hundred nodes).
+Before this model, UI libraries either mutated the DOM directly from scattered event handlers (jQuery-style, after the popular older library that edited the page by hand — correct but hard to keep consistent as an app grows) or re-rendered the entire page on every change (simple but slow: full-page DOM rebuilds are visibly **janky**, meaning stuttering, past a few hundred nodes).
 
 React's answer: let you write the UI as a **pure function of state** (`UI = f(state)`) and let the library work out the cheapest way to get the real DOM from the old state's UI to the new state's UI. You never write "update the third list item's text" — you re-describe the whole subtree and trust the diff.
 
 Concretely: re-rendering a 5,000-row table from scratch (destroy and recreate every `<tr>`) forces the browser to redo **layout** (a "reflow" — recomputing every element's size and position) and **paint** for all 5,000 rows. If only one row's data changed, reconciliation produces a diff with one DOM write, and only that row's box triggers reflow and repaint.
 
-A component re-renders (its function runs again) for three reasons: its own state changed (`useState`/`useReducer` setter called), its parent re-rendered (children re-render by default, even with unchanged props, unless wrapped in `React.memo`), or it reads a context whose Provider got a new `value`.
+A component re-renders (its function runs again) for three reasons: its own state changed (`useState`/`useReducer` setter called), its parent re-rendered (children re-render by default, even with unchanged props, unless wrapped in `React.memo`), or it reads a **context** (a value shared down the tree without props) whose **Provider** (the component that supplies that shared value) got a new `value`.
 
 Only the first two necessarily touch the DOM; reconciliation is what decides whether a re-render actually produces a DOM write.
+
+### Real-life example: a new WhatsApp Web message 🟢
+
+On WhatsApp Web, a new message moves that chat to the top of the left-hand list.
+React builds a new list description, compares it with the old one, and sees that only the order changed plus one preview line.
+Because each chat row has its chat id as its `key`, React just moves the existing rows instead of rewriting every one.
+Your half-typed reply in the open chat is not lost, because that part of the tree did not change type, so React updated it in place.
+
+## Common beginner mistakes 🟢
+
+- **Thinking "re-render" means "the page was redrawn"** → a re-render is only your function running again; the page changes only where the diff finds a difference → measure DOM work and render count separately.
+- **Using the array index as `key`** → inserting at the top makes every row take its neighbour's data and state → use a stable id from the data.
+- **Wrapping a child in a new `<div>` without thinking** → a different element type at that spot remounts the child and wipes its state → keep the wrapper type stable.
+- **Forgetting effect cleanup** → timers and subscriptions keep running after the component is gone → return a cleanup function from `useEffect`.
+- **Panicking when effects run twice in development** → that is `StrictMode` testing your cleanup, not a bug → it does not happen in production.
+
+## Often confused 🟡
+
+| These two | First one | Second one |
+| --- | --- | --- |
+| Re-render vs DOM write | Your component function runs again (cheap JS) | The real page is changed (costly) |
+| Render phase vs commit phase | Works out changes; can be paused or thrown away | Applies changes; always finishes once started |
+| React element vs fiber | A throwaway object made each render | A saved record that lives across renders |
+| Virtual DOM vs real DOM | React's in-memory sketch | What the browser actually shows |
 
 ## 2. Mental model 🟢
 
@@ -172,6 +206,15 @@ Every render produces a fresh element tree. React diffs it against the fiber tre
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that React draws a new sketch of the UI, compares it with the old one, and edits only the differences. **Next we open the box**: the two phases of an update, the rules React uses to compare trees, and exactly how `key` keeps list items straight.
+
+**Step by step:**
+1. You click "Like". The handler calls `setLikes(11)`.
+2. **Render phase:** React calls `LikeButton()` and gets a new element: a button with text 11.
+3. React compares it with the button's fiber, which still says 10. Only the text differs.
+4. **Commit phase:** React changes that one text node on the real page and then runs effects.
+5. The browser paints and you see 11.
+
 ```mermaid
 flowchart LR
     S["setState() called"] --> R["Render phase:<br/>call component functions,<br/>build new element tree,<br/>diff vs current fiber tree"]
@@ -186,7 +229,14 @@ The **commit phase** is where DOM writes and effects happen, and it always runs 
 
 ### Diffing heuristics
 
-**In plain words:** Comparing two arbitrary trees node-for-node to find the smallest edit is a genuinely expensive problem to solve exactly (`O(n³)` for arbitrary trees). React doesn't try to be exact — it uses two cheap rules of thumb that are right almost all the time, which brings the cost down to `O(n)`.
+**In plain words:** Comparing two arbitrary trees node-for-node to find the smallest edit is a genuinely expensive problem to solve exactly (`O(n³)` for arbitrary trees: 1,000 nodes would mean about a billion steps). React doesn't try to be exact — it uses two cheap rules of thumb that are right almost all the time, which brings the cost down to `O(n)`.
+
+**Step by step:**
+1. React walks the old and new trees together, position by position.
+2. At the top: old `<div>`, new `<div>`. Same type, so keep the DOM node and update only its changed props.
+3. One level down: old `<div>`, new `<span>`. Different type, so throw away the old `div` and everything inside it, then build a fresh `span`.
+4. For a list of children, if they have `key`s, match old and new by key; if not, match them by position.
+5. This simple walk costs about one step per node, so even big trees diff quickly.
 
 **Picture it:**
 
@@ -213,6 +263,13 @@ flowchart TD
 
 **In plain words:** Think of a classroom seating chart.
 
+**Step by step:**
+1. The list is `[A, B, C]` with keys `a`, `b`, `c`. Each row has its own DOM node, and B's row has a half-typed comment.
+2. A new item NEW is added at the front, with key `new`.
+3. React looks up each new child by key: `a`, `b`, `c` already exist, so their DOM nodes are reused and moved down. Only `new` is created.
+4. B's half-typed comment stays with B.
+5. With index keys instead, position 0 would now be NEW using A's old node, and B's comment would end up on A's row.
+
 If the teacher only tracks "whoever is in seat 3," and a new student is seated in seat 1, everyone from seat 1 onward gets relabeled with the wrong name — the chart didn't track *people*, it tracked *seats*.
 
 Matching list children by index has the same bug: it tracks position, not identity.
@@ -221,7 +278,7 @@ Without keys, React matches old and new children **by index**.
 
 Insert a new first item into `[A, B, C]` and, index-by-index, React sees "position 0 changed from A to NEW, position 1 changed from B to A, position 2 changed from C to B, position 3 is new (C)".
 
-Every existing DOM node gets patched with another item's data, and any per-item state (an open `<details>`, an uncontrolled `<input>`'s cursor) ends up attached to the wrong row.
+Every existing DOM node gets patched with another item's data, and any per-item state (an open `<details>`, an **uncontrolled** `<input>`'s cursor, meaning an input whose value the browser keeps rather than React state) ends up attached to the wrong row.
 
 **Picture it:**
 
@@ -282,7 +339,7 @@ stateDiagram-v2
 | `shouldComponentUpdate` | `React.memo` (compares props) | skip a re-render when nothing relevant changed |
 | `getDerivedStateFromProps` | compute the value directly in the render body, or `useMemo` | derive state from incoming props without a separate step |
 | `getSnapshotBeforeUpdate` | `useLayoutEffect` reading the DOM before the browser paints | capture something (scroll position) before the DOM updates visually |
-| `componentDidCatch` + `static getDerivedStateFromError` | no hook equivalent — still needs a class-based **error boundary** | catch render-time errors in a subtree and show a fallback |
+| `componentDidCatch` + `static getDerivedStateFromError` | no hook equivalent — still needs a class-based **error boundary** (a wrapper that catches crashes in the components below it) | catch render-time errors in a subtree and show a fallback |
 
 ```jsx
 function Chat({ roomId }) {
@@ -342,6 +399,15 @@ function handleClick() {
 
 Concurrent rendering lets React mark some updates as low priority so a high-priority one (typing in a box) isn't blocked behind a large re-render:
 
+```mermaid
+flowchart LR
+    T["you type 'a'"] --> U["urgent: update the box now"]
+    T --> L["low priority (startTransition):<br/>re-filter 10,000 rows"]
+    U --> P["box shows 'a' at once"]
+    L -.-> P2["list updates a moment later;<br/>paused if you type again"]
+```
+
+
 ```jsx
 const [query, setQuery] = useState('');
 const [isPending, startTransition] = useTransition();
@@ -361,7 +427,7 @@ function onChange(e) {
 | Approach | How it works | Use when | Cost |
 |---|---|---|---|
 | Virtual DOM diffing (React) | Diff element trees in JS, patch the real DOM | General-purpose UI with deep component trees and frequent targeted updates | Re-running component functions on every update; mitigated by `memo`/compiler |
-| Fine-grained reactivity (Solid, Svelte) | Compile-time or signal-based tracking of exactly which DOM node depends on which value | You want to skip the "re-run the function, diff the tree" step entirely | More magic at build time; different mental model for state |
+| Fine-grained reactivity (Solid, Svelte) | Compile-time or **signal**-based (a signal is a value that knows exactly who reads it) tracking of exactly which DOM node depends on which value | You want to skip the "re-run the function, diff the tree" step entirely | More magic at build time; different mental model for state |
 | Full re-render, no diffing (naive templating) | Re-build the DOM subtree from scratch on every change | Tiny pages, or a non-reactive library with no diffing step | Simple, but doesn't scale past small trees |
 | `React.memo` / `useMemo` / React Compiler | Skip re-rendering a subtree, or re-computing a value, when inputs are referentially equal | A component or computation is provably unaffected by a parent re-render | Comparison cost; can backfire if props are new objects/functions every render |
 
@@ -374,18 +440,20 @@ function onChange(e) {
 
 ## 7. In production 🔴
 
-- **Real systems:** every React 18/19 app (Next.js, Remix, CRA-successors like Vite); the Fiber architecture shipped in React 16 specifically to enable interruptible rendering for concurrent features.
+> 🟡 → 🔴 **You now know** the render and commit phases, the diff rules, keys, the lifecycle, batching and transitions. **Next is the advanced part**: what goes wrong in real apps, how to profile it, and the Fiber internals (linked lists, lanes) behind concurrent rendering.
+
+- **Real systems:** every React 18/19 app (Next.js, Remix, CRA-successors like Vite; CRA, Create React App, was the old official starter kit); the Fiber architecture shipped in React 16 specifically to enable interruptible rendering for concurrent features.
 - **Failure modes → fixes:**
   - List reorders scrambling input focus or animation state → add a stable `key`, never the array index, when the list can reorder or filter.
   - A component re-renders constantly and the app stutters → profile with React DevTools Profiler, find the state that's too high up the tree, move it down or memoize.
   - A subscription or timer keeps firing after a component is gone ("state update on an unmounted component") → return a cleanup function from the `useEffect` that created it.
   - Double effect firing in development → that's `StrictMode` intentionally mounting, unmounting and remounting once to surface missing cleanup; it does not happen in production builds.
-- **What to monitor:** React DevTools Profiler flame graphs for render duration and re-render counts; Core Web Vitals (INP particularly, since it reflects render-blocking work from input to paint).
+- **What to monitor:** React DevTools Profiler flame graphs for render duration and re-render counts; Core Web Vitals (Google's page-speed scores; INP, Interaction to Next Paint, particularly, since it reflects render-blocking work from input to paint).
 
 ## 8. Deep dive 🔴
 
 - **Fibers as a linked list, not a tree walk with the call stack.** Each fiber points to its child, sibling and return (parent), so React can pause work after any fiber and resume later without blowing the JS call stack recursing through a huge tree.
-- **Lanes.** React 18 assigns each update a priority "lane" (discrete, continuous, default, transition, idle). A transition-lane update can be preempted by a discrete-lane one (a click), which is the mechanism behind `startTransition` staying responsive.
+- **Lanes.** React 18 assigns each update a priority "lane" (discrete, continuous, default, transition, idle). A transition-lane update can be **preempted** (paused so something more urgent goes first) by a discrete-lane one (a click), which is the mechanism behind `startTransition` staying responsive.
 - **Batching is about commits, not renders.** "Batched" means React waits to flush DOM mutations and effects until it has processed all the synchronously-triggered state updates, producing one commit instead of several — it does not mean your component functions are called fewer times than state changes would otherwise imply.
 - **`use()` and Suspense for data** (stable since React 19) let a component "read" a promise during render and suspend, handing the tree's nearest `<Suspense>` boundary a fallback to show — closing the gap between "fetch in an effect after mount" and declaratively suspending render itself. See [[React Routing and Rendering Strategies - CSR, SSR, SSG]] for how this interacts with Server Components.
 
@@ -421,6 +489,26 @@ function onChange(e) {
 - Lifecycle: mount → update → unmount; hooks (`useEffect` + its cleanup function) replace class lifecycle methods except for error boundaries.
 - React 18+: batching applies everywhere, and `startTransition`/`useDeferredValue` mark updates as low priority so urgent ones aren't blocked.
 - `StrictMode`'s double-invoke in development is a leak detector, not a bug.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is the virtual DOM?
+> React's in-memory description of the UI, made of plain JS objects, that it compares before touching the real page.
+
+> [!question]- Easy: name the three phases of a component's life.
+> Mount, update, unmount.
+
+> [!question]- Easy: what should you use as a list item's `key`?
+> A stable id from the data, like `order.id`, not the array index.
+
+> [!question]- Medium: `<div><Form/></div>` changes to `<section><Form/></section>`. What happens to the form's typed text?
+> It is lost. A different element type at the same spot makes React remount the whole subtree.
+
+> [!question]- Medium: which phase can React pause or throw away, and why is that safe?
+> The render phase. It only calls functions and works out changes; nothing has touched the page yet.
+
+> [!question]- Medium: what does `startTransition` change?
+> It marks an update as low priority, so urgent updates like typing are handled first and the slow one can be paused.
 
 ## Links
 

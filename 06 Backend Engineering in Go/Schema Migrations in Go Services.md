@@ -32,6 +32,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Database Access (database-sql, pgx, sqlc)]]: Go opens a pool of database connections (`*sql.DB`) and runs SQL through it.
+> - [[Zero-Downtime Schema Migrations]]: big schema changes are split into small safe steps (add new, copy data, remove old) so old and new code can run side by side.
+> - [[Transactions and the Repository Pattern]]: a transaction groups SQL steps so they all succeed or all roll back.
+
 **From zero, in 60 seconds** 🟢
 
 Your code changes; the database's table shapes (the **schema**) must change with it. A **migration** is a small numbered file that makes one such change: "003: add column due_date".
@@ -70,6 +75,11 @@ Migrations write each change down as a numbered file, and the database remembers
 | Advisory lock | A Postgres lock on a number, not a row, used to coordinate apps | `pg_advisory_lock(42)` |
 | Replica | One of several identical copies of the service | 3 pods starting at once |
 
+| DDL | SQL that changes structure, not data | `ALTER TABLE`, `CREATE INDEX` |
+| Backfill | Filling a new column from existing data | copy `status` into `status_new` |
+| `CREATE INDEX CONCURRENTLY` | Build an index without blocking writes; not allowed inside a transaction | index `status_new` on a live table |
+| `//go:embed` | Go directive that puts files inside the compiled binary | SQL files shipped inside the app |
+
 **Picture it**
 
 ```mermaid
@@ -101,12 +111,16 @@ InvoiceOps runs behind a rolling deploy with 3 replicas. A release adds a `statu
 
 1. **The race.** Kubernetes starts all 3 new pods close together.
 
-   If each pod's startup code runs "apply any pending migrations" with no coordination, migration `0009` can execute three times concurrently — fine for an idempotent `CREATE TABLE IF NOT EXISTS`, but `ALTER TABLE invoices ADD COLUMN status_new text` run twice concurrently either errors (`column already exists`, if both start before either commits its catalog change) or, worse, wastes a stale connection holding a lock the other pod is also waiting for.
+   If each pod's startup code runs "apply any pending migrations" with no coordination, migration `0009` can execute three times concurrently — fine for an idempotent `CREATE TABLE IF NOT EXISTS`, but `ALTER TABLE invoices ADD COLUMN status_new text` (DDL: SQL that changes table structure) run twice concurrently either errors (`column already exists`, if both start before either commits its catalog change) or, worse, wastes a stale connection holding a lock the other pod is also waiting for.
 2. **The DDL that can't be wrapped.** The backfill migration also wants to index the new column: `CREATE INDEX CONCURRENTLY idx_invoices_status_new ON invoices(status_new)`. Postgres 17 refuses this statement inside a transaction block with `ERROR: CREATE INDEX CONCURRENTLY cannot run inside a transaction block`.
 
    Both `golang-migrate` and `goose` wrap each file in a transaction by default, so this migration fails outright unless the tool is told not to wrap it.
 
 A Go service's job is to run the right files, in order, exactly once per environment, with the locking and transaction-wrapping handled correctly — not to invent the expand/contract plan itself.
+
+### A real-life example 🟢
+
+When Swiggy adds "delivery instructions" to orders, the orders table needs a new column. Swiggy runs many copies of its order service, and a new version rolls out pod by pod. The change is shipped as a numbered migration file inside the new build. When the first new pod starts, it takes a database lock, adds the column, and writes "version 42 applied" in the ledger. The other pods start a moment later, see version 42 is done, and skip it.
 
 ## 2. Mental model 🟢
 
@@ -118,9 +132,17 @@ The one thing version control doesn't need and migrations do: **mutual exclusion
 
 ## 3. How it works 🟡
 
+🟢 → 🟡 You now know the shape: numbered files, applied once, in order, recorded in a ledger, one replica at a time. Next we open the box: how the ledger and its dirty flag behave, how the lock serializes replicas, and the three places you can run migrations from.
+
 ### The ledger and the dirty flag
 
 **In plain words:** the ledger is the database's own diary of applied migrations; the dirty flag means one died halfway and a human must look before anything else runs.
+
+**Step by step:**
+1. The ledger says version 8, `dirty = false`.
+2. The tool marks `dirty = true` and runs `0009_add_status_new.up.sql`.
+3. It succeeds: the ledger now says version 9, `dirty = false`.
+4. If the pod had died in step 2, the ledger would stay at `dirty = true`, and every later run would stop until a person checks the table and runs `migrate force`.
 
 Both libraries create a tracking table on first run (`schema_migrations` for golang-migrate, `goose_db_version` for goose) holding the current version and a `dirty` boolean. Before each migration: mark dirty. Run the file. On success: record the new version, clear dirty.
 
@@ -129,6 +151,13 @@ If the process dies mid-file — OOM-killed, deploy rolled back, the pod evicted
 ### Locking across replicas
 
 **In plain words:** take one named database lock before migrating, so the second replica waits or skips instead of colliding.
+
+**Step by step:**
+1. Pods A, B and C start together and each asks Postgres for the same advisory lock.
+2. A gets it; B and C wait.
+3. A applies 0009 and 0010, then releases the lock.
+4. B gets the lock, sees the ledger already at 0010, does nothing, releases. Then C does the same.
+5. With `golang-migrate` this lock is automatic; with `goose` you must turn it on with `WithSessionLocker`.
 
 ```mermaid
 sequenceDiagram
@@ -160,6 +189,12 @@ This is the single most important difference between the two libraries for a mul
 ### Where to run them
 
 **In plain words:** three places to trigger migrations, from cozy (app startup) to disciplined (a separate deploy step), and when each is fine.
+
+**Step by step:**
+1. App startup: each pod runs `migrate up` before serving. Easy; needs the lock; a slow migration delays every pod.
+2. CI/CD step: the pipeline runs `migrate up` once before rolling out pods. No race; needs DB access from CI.
+3. Kubernetes Job or init container: runs once per release before the new pods start. Fails visibly if broken.
+4. Any of the three still keeps the lock on, in case two releases overlap.
 
 ```mermaid
 flowchart TD
@@ -206,6 +241,8 @@ func RunUp(dsn string) error {
 ```
 
 The full version below embeds the files in the binary instead of reading them off disk (so the compiled service and its schema can never drift apart), reuses an already-open `*sql.DB`, and comes with two small, independently tested pieces of Go logic: a migration-file linter and a batched-backfill helper.
+
+**What this code does, in plain words:** it embeds the `sqlfiles/*.sql` files into the binary, builds a `golang-migrate` instance on top of your existing `*sql.DB`, and runs all pending "up" migrations, treating "nothing to do" as success.
 
 **Embedded migrations, run from an already-open connection.** It compiles and passes `go vet` on Go 1.24.4.
 
@@ -261,7 +298,9 @@ func Run(db *sql.DB) error {
 
 `sqlfiles/0001_init.up.sql` and its paired `.down.sql` live next to this file and get compiled into the binary by `//go:embed` — there is no separate migrations directory to ship or to lose track of in a container image.
 
-**A migration-file lint check.** The real mistake from "Why it exists": `CREATE INDEX CONCURRENTLY` inside goose's default transaction wrapper. This function catches it in a unit test, before the file ever reaches a database:
+**A migration-file lint check.**
+
+**What this code does, in plain words:** it reads a migration file's text and returns an error if it uses `CREATE INDEX CONCURRENTLY` without the `-- +goose NO TRANSACTION` line at the top; the tests feed it good and bad files. The real mistake from "Why it exists": `CREATE INDEX CONCURRENTLY` inside goose's default transaction wrapper. This function catches it in a unit test, before the file ever reaches a database:
 
 ```go
 package migrations
@@ -327,7 +366,9 @@ func TestValidateMigrationFile(t *testing.T) {
 
 That last case is exactly the index the old notes were right to keep: `webhook_events(provider, event_id) unique` is the constraint that makes webhook idempotency work (see [[Receiving Webhooks Idempotently]]) — and it's large enough on a busy table that you'd want `CONCURRENTLY` for it in production, which is precisely where this check earns its keep.
 
-**A batched backfill helper.** The data-migration half of expand/migrate/contract: move data into the new column a few hundred rows at a time instead of one giant `UPDATE`, so the migration never holds a long transaction or a long table scan against a live table.
+**A batched backfill helper.**
+
+**What this code does, in plain words:** `BackfillInBatches` calls a function that updates at most 500 rows, again and again, until a call updates fewer than 500, checking for cancellation between batches. The data-migration half of expand/migrate/contract: move data into the new column a few hundred rows at a time instead of one giant `UPDATE`, so the migration never holds a long transaction or a long table scan against a live table.
 
 ```go
 package migrations
@@ -401,6 +442,8 @@ func TestBackfillInBatches_StopsWhenShortBatchSeen(t *testing.T) {
 
 (Three more tests ship with this function in the test file: it propagates an error from `run` with `errors.Is`, it respects an already-cancelled context without calling `run` at all, and it rejects a non-positive `batchLimit`. All four tests and the four `ValidateMigrationFile` subtests pass under `go test -race` on Go 1.24.4.)
 
+**What this code does, in plain words (goose block below):** it registers a migration written in Go that runs inside goose's transaction and uses the batch helper to fill the new column.
+
 **Go-code migrations in goose**, for the rare case where SQL alone can't express the logic (reading an old JSON blob, deriving new typed columns, calling the batcher above):
 
 ```go
@@ -465,7 +508,26 @@ CI testing these migrations is `go test -tags=integration` against a disposable 
 - Declarative tools (Atlas) remove hand-written `up`/`down` pairs but hide the exact DDL that will run until you generate and read the plan — don't skip reading it.
 - For a single-instance hobby service with no rolling deploys, a locking strategy is overhead you don't need; a single `migrate up` on deploy is enough.
 
+### Schema migration vs data backfill 🟡
+
+| | Schema migration | Data backfill |
+| --- | --- | --- |
+| Changes | structure (columns, indexes) | the rows themselves |
+| Size | usually one quick statement | can touch millions of rows |
+| Where to run | migration tool | a batched one-shot job |
+| Example | `ADD COLUMN status_new text` | copy `status` into `status_new`, 500 rows at a time |
+
+### Common beginner mistakes 🟢
+
+- Editing a migration file that already ran → other environments never see the change → add a new numbered file instead.
+- Using goose without `WithSessionLocker` → two pods apply the same migration → turn the lock on, or use golang-migrate.
+- Putting `CREATE INDEX CONCURRENTLY` in a normal goose file → Postgres rejects it inside a transaction → add `-- +goose NO TRANSACTION`.
+- Doing a huge backfill in one `UPDATE` → long locks and replication lag → update in batches of a few hundred rows.
+- Ignoring `dirty = true` and forcing the version blindly → the schema may be half changed → check the actual tables first.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now ship migrations safely from Go: embedded files, a lock, and batched backfills. The advanced part covers what goes wrong in real deploys: dirty ledgers, racing pods, rejected DDL, startup probes killed by long migrations, and when to roll forward instead of down.
 
 - **Real systems:** golang-migrate and goose are the two most common migration runners in Go services; Atlas is increasingly used specifically for its CI-time lint step that flags locking or destructive DDL before merge.
 - **Failure modes → fixes:**
@@ -517,6 +579,26 @@ CI testing these migrations is `go test -tags=integration` against a disposable 
 - Batch a data backfill (`LIMIT 500`, loop until a short batch) instead of one giant `UPDATE`; put a long-running one in its own job, not inside the migration transaction.
 - `//go:embed` the SQL files so the binary and the schema history ship together.
 - The zero-downtime technique itself — expand, migrate, contract — is [[Zero-Downtime Schema Migrations]], not this note.
+
+## Self-check 🟢🟡
+
+> [!question]- What is a migration?
+> A small numbered file that changes the database schema once.
+
+> [!question]- What does `dirty = true` in the ledger mean?
+> A migration started but did not finish; a person must check before anything else runs.
+
+> [!question]- Which library locks across replicas automatically: golang-migrate or goose?
+> golang-migrate; goose needs `WithSessionLocker`.
+
+> [!question]- Why can `CREATE INDEX CONCURRENTLY` fail in goose?
+> Goose wraps files in a transaction by default, and Postgres forbids that statement inside one.
+
+> [!question]- Why batch a backfill instead of one big `UPDATE`?
+> Small batches commit and release locks quickly, so live traffic is not blocked.
+
+> [!question]- What does `//go:embed` give migrations?
+> The SQL files ship inside the binary, so the code and its schema history never drift apart.
 
 ## Links 🟢
 

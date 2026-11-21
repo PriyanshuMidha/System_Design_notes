@@ -32,6 +32,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Materialized Views and Denormalization]]: you can store a pre-joined, pre-computed copy of data so a slow query becomes a fast lookup.
+> - [[Transactional Outbox and CDC]]: changes can be passed reliably from one database to another copy, either via an outbox table or by reading the database's own log.
+> - [[Consistency Models]]: a copy that lags can show old data; "read your own writes" is the promise users care about most.
+
 **From zero, in 60 seconds** 🟢
 
 Most apps use one set of tables to both save data and show data.
@@ -73,6 +78,10 @@ The rest of this note is just these 3 questions:
 | Read model / projection | A copy of data shaped for one screen or query | The finance dashboard table |
 | Eventual consistency | The copy catches up a little later | Dashboard shows the payment after 1 s |
 | Outbox / CDC | Ways to pass changes from writes to read models reliably | An `outbox` table read by a worker |
+| Projector | The worker that turns write-side changes into read-model updates | Applies "payment ₹500" to the dashboard row |
+| Projection lag | How far the read model is behind the write side | Dashboard is 1 s or 3 changes behind |
+| Version token | The position of your write, sent back so reads can wait until the copy has it | "Show me data at least as new as 1042" |
+| Invariant | A business rule that must always hold | Payments never exceed the invoice amount |
 
 **Picture it**
 
@@ -117,9 +126,16 @@ flowchart LR
     RT --> FAST["Fast page"]
 ```
 
+### Real-life example 🟢
+
+On an online shop such as Flipkart, a seller changes a product's price in the main product database.
+The search results you see usually come from a separate search index (a different, read-only copy shaped for fast text search).
+That copy is updated a moment after the seller saves, so for a second or two search may still show the old price, while the product page already shows the new one.
+Writes go to one model, searches read another: that split is CQRS.
+
 ## 2. Mental model 🟢
 
-Start from **CQS** (Command-Query Separation, Bertrand Meyer): a method either changes state (a command) or returns a value (a query), never both. CQRS applies that rule to the whole data model: separate **models**, not just separate methods.
+Start from **CQS** (Command-Query Separation, an idea from Bertrand Meyer, who designed the Eiffel language): a method either changes state (a command) or returns a value (a query), never both. CQRS applies that rule to the whole data model: separate **models**, not just separate methods.
 
 The analogy is a **restaurant kitchen and its menu board**. Orders (commands) go to the kitchen, which follows strict rules: stock, recipes, order of work. The board in the dining room (a read model) shows "today's specials, 3 left", copied from the kitchen and updated when someone has a moment.
 
@@ -132,11 +148,28 @@ Terms used below:
 - **Projector:** the code that turns write-side changes into read-model updates.
 - **Projection lag:** how far the read model is behind the write model.
 
+## Common beginner mistakes 🟢
+
+- **Thinking CQRS needs events, Kafka or event sourcing** → none are required; a second table updated in the same transaction is already CQRS → start simple.
+- **Checking business rules against the read model** → it may be stale, so two commands can both pass → validate on the write side with constraints or conditional updates.
+- **Ignoring lag in the UI** → users save, reload, and their change is "missing" → return a version token, show the change optimistically, or read from the write side briefly.
+- **Using CQRS for plain CRUD screens** → you get two models and lag for no gain → use one model with good indexes until a query really needs its own shape.
+- **A projector that is not safe to repeat** → a duplicate message double-counts money on the dashboard → store the last applied position and skip anything older.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that CQRS keeps one model for changes and another, screen-shaped model for reads, copied from the first. **Next we open the box**: the two paths a request can take, the three levels of separation, and how to deal with the moment a user saves but the read copy is not updated yet.
 
 ### The two paths
 
 **In plain words:** writes go one way, reads go another way, and a small worker copies changes from the first to the second.
+
+**Step by step:**
+1. A finance user records a ₹500 payment: `POST /payments`.
+2. The command handler loads invoice INV-1 and checks the payment is not more than what is due.
+3. In one PostgreSQL transaction it inserts the payment and an outbox row saying "payment ₹500 on INV-1".
+4. The projector reads new outbox rows in order and updates the `customer_dashboard` table.
+5. `GET /dashboard` reads only that ready-made table: no joins, so it is fast.
 
 ```mermaid
 flowchart LR
@@ -157,11 +190,17 @@ Nothing in this picture needs a broker or event sourcing. The arrow from the tra
 
 **In plain words:** you can split just the tables, or the whole database, or use a totally different store for reads. More split means more lag and more work.
 
+**Step by step:**
+1. Level 1: the payment command also updates a `customer_dashboard` row in the same transaction. Never stale.
+2. Level 2: the dashboard is a separate table in the same database, updated a moment later by a worker. Slightly stale.
+3. Level 3: the dashboard lives in a different store (say, Elasticsearch), fed by an outbox relay. Usually under a second behind, but frozen if the relay stops.
+4. Start at level 1. Move up only when one specific query forces you to.
+
 | Level | Read model lives in | Updated by | Lag |
 | --- | --- | --- | --- |
 | 1. Separate code paths | The same tables, or a read table in the same database | The same transaction as the write | None |
-| 2. Separate read tables | Same database, separate tables or a materialized view | Outbox poller, trigger, or `REFRESH MATERIALIZED VIEW` | Milliseconds to minutes |
-| 3. Separate read store | Elasticsearch, Redis, a column store, another database | Outbox relay, CDC (Debezium), or an event stream | Usually under a second, unbounded when the projector is down |
+| 2. Separate read tables | Same database, separate tables or a materialized view | Outbox poller, trigger (code the database runs automatically on a change), or `REFRESH MATERIALIZED VIEW` | Milliseconds to minutes |
+| 3. Separate read store | Elasticsearch (a search engine), Redis (an in-memory store), a column store, another database | Outbox relay, CDC (Debezium, a popular CDC tool), or an event stream | Usually under a second, unbounded when the projector is down |
 
 Most teams should start at level 1 and move up only when a specific query forces them to.
 
@@ -175,6 +214,13 @@ flowchart LR
 ### Write, then read: where lag bites
 
 **In plain words:** the user clicks save, the page reloads, and the old data shows up because the copy is not done yet.
+
+**Step by step:**
+1. The user records ₹500 on INV-1. The command saves it as outbox position 1042 and returns the token 1042.
+2. The page reloads and asks the dashboard: "answer only if you are at 1042 or later".
+3. The dashboard is at 1039, so it answers "not caught up yet".
+4. The projector applies 1040, 1041 and 1042.
+5. The page retries, and the dashboard now shows outstanding ₹0.
 
 With an asynchronous projector, a user can save something and not see it:
 
@@ -588,7 +634,7 @@ COMMIT;
 | Same transaction | Command writes the read table too | Read and write in one database, low write contention | Write latency and lock contention on hot read rows |
 | Materialized view | `REFRESH MATERIALIZED VIEW CONCURRENTLY` on a schedule | Minutes of staleness is fine, query is expressible in SQL | Full recompute on each refresh (see [[Materialized Views and Denormalization]]) |
 | Outbox poller | Projector polls an outbox table by position | You want explicit events and control over ordering | Polling load, outbox cleanup |
-| CDC (Debezium, logical decoding) | Stream row changes from the WAL | Many read stores, no changes to write code | Row changes, not business intent; schema coupling |
+| CDC (Debezium, logical decoding) | Stream row changes from the WAL (the database's write-ahead log of every change) | Many read stores, no changes to write code | Row changes, not business intent; schema coupling |
 | Event-sourced projection | Projector folds the event stream (see [[Event Sourcing]]) | The write side is already event-sourced | All of event sourcing's costs |
 
 ### CQRS vs neighbours
@@ -596,7 +642,7 @@ COMMIT;
 | Idea | Separates | Consistency of reads |
 | --- | --- | --- |
 | Read replicas ([[Replication]]) | Where reads run; same schema | Replica lag, same shape as the primary |
-| Cache-aside ([[Caching Patterns]]) | A copy of the same data | TTL-based, invalidation is hard |
+| Cache-aside ([[Caching Patterns]]) | A copy of the same data | TTL-based (each entry expires after a set time), invalidation is hard |
 | Materialized view | A precomputed query in the same database | Stale until refresh |
 | CQRS | The model itself: different schemas, maybe different stores | Synchronous or eventually consistent, by design |
 | Event sourcing | How state is stored (as events) | Not about reads at all; often paired with CQRS |
@@ -606,19 +652,21 @@ COMMIT;
 - **It is two models to maintain.** Every new field touches the command side, the event or outbox format, the projector and the read model.
 - **Eventual consistency leaks into the product.** Somebody must decide what a user sees during lag, and support must know why "the dashboard was wrong for two seconds".
 - **Projectors are new production software.** They need deployment, monitoring, replays and on-call.
-- **Overkill for CRUD.** If screens show roughly what the table holds, one model with a few indexes is simpler and strongly consistent.
+- **Overkill for CRUD** (plain create, read, update, delete screens). If screens show roughly what the table holds, one model with a few indexes is simpler and strongly consistent.
 - **Never validate commands against a read model.** It may be stale; "is this username free?" must be checked on the write side, typically with a unique constraint.
 - **Do use it** when read and write loads differ greatly, when there are many query shapes (search, analytics, dashboards), or when different teams own the reads and the writes.
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the command and query paths, the three levels of separation, the ways to feed a read model, and how version tokens hide lag. **Next comes the advanced part**: where CQRS shows up in real systems (search, feeds, event stores), how projectors fail and get rebuilt, and subtle traps like outbox numbers that commit out of order.
+
 - **Real systems:**
 	- Search: products are written to PostgreSQL and projected into Elasticsearch or OpenSearch for full-text queries (see [[Search Engines and Inverted Indexes]]).
 	- Feeds and timelines: writes go to a posts table; per-user timelines are precomputed read models (see [[Case Study - News Feed]]).
-	- Event-sourced systems (EventStoreDB, now KurrentDB; Axon) are almost always CQRS, because an event log cannot answer queries on its own.
+	- Event-sourced systems (EventStoreDB, now KurrentDB; Axon: databases and frameworks built around event logs) are almost always CQRS, because an event log cannot answer queries on its own.
 - **Failure modes → fixes:**
 	- Projector crashes and the dashboard freezes → alert on lag; the projector resumes from its stored position.
-	- Projector bug corrupts the read model → fix the code, build a new read model by replaying from position 0 into a new table, then switch reads to it (blue/green for read models).
+	- Projector bug corrupts the read model → fix the code, build a new read model by replaying from position 0 into a new table, then switch reads to it (blue/green for read models: build the new copy beside the old one, then flip traffic).
 	- Duplicate delivery double-counts money → idempotent projector keyed by event position or event id.
 	- Events applied out of order → apply strictly by position per stream, or make updates commutative.
 	- Read model drifts from the truth silently → a nightly reconciliation job compares totals with the write side.
@@ -634,9 +682,9 @@ COMMIT;
 
 **In plain words:** numbers handed out early do not finish in order, so a reader can skip a row that commits late.
 
-In PostgreSQL a `bigserial` value is taken when the row is inserted, not when the transaction commits. Transaction A can take id 101, transaction B take 102 and commit first. A poller that reads "after 101" sees 102, advances its position, and never sees 101 when A commits. Fixes:
+In PostgreSQL a `bigserial` (auto-increasing number column) value is taken when the row is inserted, not when the transaction commits. Transaction A can take id 101, transaction B take 102 and commit first. A poller that reads "after 101" sees 102, advances its position, and never sees 101 when A commits. Fixes:
 
-- Read the outbox through **logical decoding** (CDC), which delivers changes in commit order.
+- Read the outbox through **logical decoding** (Postgres's feature for streaming committed changes, the basis of CDC), which delivers changes in commit order.
 - Or poll only rows older than the longest transaction (`created_at < now() - interval '5 seconds'`), accepting that delay. This is a heuristic, not a guarantee.
 - Or serialize outbox inserts (one writer, or a lock), which caps write throughput.
 
@@ -689,6 +737,30 @@ Total order across all events makes a projector simple but single-threaded. Most
 - Rebuild = replay into a new model, then switch.
 - Never validate commands against a read model.
 - No events, broker or event sourcing required.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is the difference between a command and a query?
+> A command changes data (and returns little more than "ok"); a query only reads data and changes nothing.
+
+> [!question]- Does CQRS require Kafka or event sourcing?
+> No. A read table updated in the same transaction already counts as CQRS.
+
+> [!question]- What is projection lag?
+> How far the read model is behind the write model, in changes or in seconds.
+
+🟡 Medium
+
+> [!question]- A user saves and the dashboard still shows the old total. Name one fix.
+> Return a version token from the command and have the read wait until the read model reaches it (or show the change optimistically in the UI).
+
+> [!question]- Why must "is this username free?" be checked on the write side?
+> The read model may be stale, so two sign-ups could both see the name as free; a unique constraint on the write side settles it.
+
+> [!question]- A projector bug corrupted the read model. How do you recover?
+> Fix the code, replay the history into a new table from position 0, let it catch up, then switch reads to it.
 
 ## Links
 

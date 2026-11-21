@@ -35,6 +35,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Authentication vs Authorization]]: attackers usually win by getting someone's identity (a password, key or session) and then doing what that identity is allowed to do.
+> - [[Incident Response]]: outages are handled with a fixed playbook (declare, assign an incident commander, communicate, fix, review); a security incident uses the same habits plus evidence and legal steps.
+
 **From zero, in 60 seconds** 🟢
 
 Your site has been hacked. The natural reaction is to delete the bad stuff fast. Don't.
@@ -78,6 +82,13 @@ Incident response is the calm, ordered plan for exactly this moment.
 | Indicator of compromise (IOC) | A clue that shows an attack happened | Unknown admin account, odd outbound IP |
 | Forensics | Collecting and preserving evidence to learn what happened | Snapshotting a disk before rebuild |
 | Postmortem | A blameless write-up of cause and fixes | "Root cause: leaked key in CI log" |
+| Web shell | A small script the attacker uploads to your server so they can run commands through a web page | `/uploads/img_cache.php?cmd=ls` |
+| Persistence | Hidden ways the attacker set up to get back in later | Extra SSH key, cron job, admin user |
+| Exfiltration | Copying data out of your systems to the attacker | Dumping the customers table to their server |
+| Dwell time | How long the attacker was inside before you noticed | 14 days |
+| Security group | A cloud firewall rule list attached to a server | "allow only the forensic host" |
+| Chain of custody | A written log of who copied which evidence, when, so it holds up legally | "10:02 Asha snapshotted vol-123" |
+| IaC | Infrastructure as code: servers described in files, so you can rebuild them exactly | Terraform, container images |
 
 **Picture it**
 
@@ -108,7 +119,7 @@ Where it breaks: a fire does not fight back; an attacker may still be inside and
 
 Picture a shop owner who arrives to find the back window broken. If they sweep up the glass, repaint, and reopen, the police find no fingerprints, the thief still has a copy of the keys, and the owner never learns what was stolen.
 
-The same thing happens to websites every day: someone sees a defaced page, restores it from a backup, and carries on, while the attacker still has a web shell, a stolen database password and a hidden admin account.
+The same thing happens to websites every day: someone sees a defaced page, restores it from a backup, and carries on, while the attacker still has a web shell (an uploaded script that lets them run commands through a web page), a stolen database password and a hidden admin account.
 
 A concrete scenario. An online store with 200,000 customers notices three signs in one morning: a spike in outbound traffic at 03:10 UTC, a customer complaint about a strange redirect to a pharmacy site, and an unfamiliar admin user created two days ago.
 
@@ -118,6 +129,20 @@ This note is the playbook for those hours. It is a response guide; preventing th
 
 > [!tip] Remember
 > A hacked site is a crime scene first and a broken site second.
+
+### Real-life example: strange orders on a shopping app 🟢
+
+Imagine a shopping app like Flipkart or Myntra gets a flood of complaints one morning: "my saved address changed" and "I got an order confirmation I never placed". A careless team would reset the database and move on. A prepared team declares a security incident, keeps the affected servers running but cut off, copies the logs, and discovers a leaked admin password let someone change addresses. They lock that account, rotate every admin password and key, check which customers were touched, tell those customers and the regulator within the legal deadline, and add MFA for all admins so it cannot happen the same way again.
+
+### Security incident vs a normal outage 🟡
+
+| | Normal outage | Security incident |
+| --- | --- | --- |
+| Main goal | Get the service back fast | Stop the attacker, then get back safely |
+| Restart / wipe the server? | Often fine | Not before you snapshot it (evidence) |
+| Who is involved | On-call engineers | Engineers + security + legal + leadership |
+| Deadlines from law | Usually none | Often yes (GDPR 72 hours, CERT-In 6 hours) |
+| Done when | Service is healthy | The way in is closed and every credential is rotated |
 
 ## 2. Mental model 🟢
 
@@ -139,11 +164,28 @@ flowchart LR
 
 The dotted arrow is important: investigation often reveals more compromised hosts, which sends you back to containment.
 
+## Common beginner mistakes 🟢
+
+- **Wiping the server right away** → the clues about how they got in are gone and the hole stays open → snapshot and copy logs first, then rebuild.
+- **Rotating passwords before cutting the attacker off** → if they still control a server, they read the new password too → isolate first, then rotate.
+- **Powering off the hacked server** → running processes and keys in memory vanish → isolate it from the network but keep it running.
+- **Restoring the newest backup** → it may already contain the backdoor → restore from a backup older than the first sign of attack.
+- **Talking about it on the normal company chat or email** → that may be compromised too → use a separate channel, like a phone bridge.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the fixed order (detect, contain, preserve, investigate, eradicate, recover, notify, learn) and why rushing hurts. **Next we open the box**: what each phase looks like in practice, with the real commands and checks engineers run.
 
 ### 3.1 Detect and confirm
 
 In plain words: you need to decide whether this is a real compromise, a bug, or a false alarm, and how big it is. Do this in minutes, not hours, but do not declare "all clear" from one clean check.
+
+**Step by step:**
+1. 03:10 an alert fires: outbound traffic from one web server is 40 times normal.
+2. The on-call engineer looks for a second, independent sign: a process run by the web user is talking to an unknown IP.
+3. Two signs together → declare a security incident and name an incident commander.
+4. Open a private channel the attacker cannot see, like a phone bridge, in case chat or email is also hacked.
+5. Start containment now; keep confirming the scope in parallel.
 
 Common detection sources:
 
@@ -151,13 +193,13 @@ Common detection sources:
 | --- | --- |
 | Monitoring or alerts | Sudden CPU spike (crypto miner), outbound traffic spike, new process |
 | Users or customers | "Your site redirected me", spam from your domain, account takeovers |
-| Security tools | WAF block spike, IDS alert, dependency scanner, cloud threat detection |
+| Security tools | WAF block spike, IDS (intrusion detection system: a tool that watches for attack patterns) alert, dependency scanner, cloud threat detection |
 | External | Google Safe Browsing warning, hosting provider abuse notice, a researcher's email, ransom note |
 | Audit logs | Login from a new country, new IAM user, disabled logging |
 
 Confirm with two independent signals before declaring a breach, but start containment at the first strong signal. A false alarm costs minutes; a real breach left running costs data.
 
-Declare an incident, assign an incident commander, and open a private channel (not the possibly compromised chat or email). If email or SSO might be compromised, use an out-of-band channel such as a phone bridge.
+Declare an incident, assign an incident commander, and open a private channel (not the possibly compromised chat or email). If email or SSO (single sign-on: one company login for all tools) might be compromised, use an out-of-band channel (a separate route the attacker does not control) such as a phone bridge.
 
 ### 3.2 Contain
 
@@ -179,8 +221,8 @@ flowchart TD
 Containment actions, in typical order:
 
 1. **Isolate, do not power off.** Remove the host from the load balancer and apply a deny-all security group that keeps only your forensic access. Powering off loses memory contents (running processes, network connections, keys in RAM).
-   Note: security groups are stateful, so a connection that is already established (such as a reverse shell) can stay open after you change the group. Kill it by also using a network ACL, or by terminating the connection on the host (for example `ss -K` or `tcpkill`), or by detaching the network interface.
-2. **Snapshot before you change anything.** Take a disk snapshot (for example an EBS snapshot) and, if you can, a memory image. This is your forensic copy.
+   Note: security groups are stateful, so a connection that is already established (such as a reverse shell, where the hacked server calls out to the attacker and takes commands) can stay open after you change the group. Kill it by also using a network ACL, or by terminating the connection on the host (for example `ss -K` or `tcpkill`), or by detaching the network interface.
+2. **Snapshot before you change anything.** Take a disk snapshot (for example an EBS snapshot, a point-in-time copy of an AWS disk) and, if you can, a memory image. This is your forensic copy.
 3. **Revoke and rotate credentials.** Cloud access keys, database passwords, API keys, session signing secrets, CI tokens, SSH keys. Invalidate all user sessions if session theft is possible. See [[Secrets Management]].
 4. **Block at the edge.** Add attacker IPs, user agents or paths to the WAF. Treat this as a speed bump only, since attackers change IPs.
 5. **Decide on downtime.** If data is actively leaving or ransomware is spreading, take the site down or show a maintenance page. A few hours of downtime is cheaper than a larger breach.
@@ -202,6 +244,13 @@ aws iam create-access-key --user-name deploy-bot
 
 In plain words: copy the logs and disks somewhere the attacker cannot reach, before they are overwritten or deleted. Attackers often clear logs, and normal log rotation will eventually erase them.
 
+**Step by step:**
+1. Take a snapshot of `web-2`'s disk and, if possible, a copy of its memory.
+2. Copy web, login, database and cloud audit logs into write-once storage that nobody can edit or delete.
+3. Compute a SHA-256 fingerprint of each copied file and write it down.
+4. Note who copied what and when (the chain of custody).
+5. Do all later analysis on copies mounted read-only on a separate machine, never on the original.
+
 | Evidence | How to preserve | Why |
 | --- | --- | --- |
 | Disk | Snapshot the volume; mount a copy read-only on a separate analysis host | Files, web shells, timestamps |
@@ -221,6 +270,13 @@ Keep working on copies, never on the original evidence.
 ### 3.4 Investigate
 
 In plain words: reconstruct what the attacker did, in time order. You want the entry point, the actions taken, the data accessed, and the first moment of compromise (the start of the dwell time).
+
+**Step by step:**
+1. Web logs: find odd requests, e.g. `UNION SELECT` in `/search?q=` 14 days ago, then a `200` on a strange `.php` file in uploads.
+2. Server: look for new users, new SSH keys, new cron jobs (scheduled commands) and files changed recently.
+3. Network: look for long-lived connections from the web user to unknown IPs.
+4. Cloud audit log: look for the server's cloud keys being used from an outside IP to copy storage buckets.
+5. Put every finding on one timeline: entry → foothold → spread → data taken.
 
 ```mermaid
 sequenceDiagram
@@ -303,7 +359,7 @@ lsof -i -P -n | grep -v LISTEN | head -30             # open network sockets
 top -b -n1 | head -15                                 # unexplained CPU (miner)
 ```
 
-A long-lived outbound connection from `www-data` to an unknown IP is a reverse shell or a command-and-control channel.
+A long-lived outbound connection from `www-data` to an unknown IP is a reverse shell or a command-and-control channel (the line the attacker uses to send orders to the hacked machine).
 
 **Cloud audit trail (AWS).**
 
@@ -332,7 +388,7 @@ SELECT rolname, rolsuper, rolcreaterole, rolcreatedb FROM pg_roles;
 Look for odd roles, bulk `SELECT` on user tables, and large exports (`COPY ... TO`) in the database log if statement logging was enabled.
 
 > [!tip] Remember
-> Build a timeline: first malicious request, first foothold, first lateral move, first data access. Every later step needs a log line.
+> Build a timeline: first malicious request, first foothold, first lateral move (jumping from the first hacked machine to others), first data access. Every later step needs a log line.
 
 ### 3.5 Eradicate
 
@@ -384,13 +440,20 @@ Steps:
 
 In plain words: some laws and contracts set deadlines. Involve legal counsel and your security or privacy officer early. The clock usually starts when you become aware of the breach, not when it is fully understood.
 
+**Step by step:**
+1. Write down the exact time you became reasonably sure personal data was touched, e.g. 04:10. Deadlines count from here.
+2. Tell leadership and legal at once; agree who speaks outside the company.
+3. Legal checks which rules apply: GDPR (72 hours to the regulator), CERT-In in India (6 hours), card brands if card data was involved.
+4. File the first report on time, even if facts are incomplete, and update it later.
+5. Send affected users a plain message: what happened, what data, what you did, what they should do.
+
 | Who | When or rule | Notes |
 | --- | --- | --- |
 | Internal leadership, legal | Immediately | Decide who speaks externally |
 | EU/UK data regulator (GDPR Art. 33) | Within 72 hours of becoming aware, where feasible, if the breach risks people's rights | Can be filed in phases; document reasons for delay |
 | Affected individuals (GDPR Art. 34) | Without undue delay if high risk to them | Plain language: what happened, what data, what to do |
 | CERT-In (India) | Within 6 hours of noticing certain cyber incidents (2022 directions) | Applies to service providers, intermediaries, and body corporates in India; confirm applicability with counsel |
-| Payment card brands and acquiring bank | Per your merchant agreement and PCI DSS incident response plan, when card data may be involved | They may require a forensic investigator (PFI) |
+| Payment card brands and acquiring bank | Per your merchant agreement and PCI DSS incident response plan, when card data may be involved | They may require a forensic investigator (PFI, a PCI-approved breach investigator) |
 | Cloud or hosting provider | When their infrastructure or abuse reports are involved | May help with logs and takedown |
 | Law enforcement | On advice of counsel, especially for extortion | Keep evidence intact |
 | Business partners and customers | Per contract | Prepare a clear statement |
@@ -400,6 +463,14 @@ Different countries and US states have their own breach laws and deadlines. This
 A good user notification states: what happened, what information was involved, what you did, what users should do (change passwords, watch for phishing), and how to contact you.
 
 ### 3.8 Post-incident review and hardening
+
+In plain words: once things are calm, write down what happened without blaming people, and turn each lesson into a fix with an owner.
+
+**Step by step:**
+1. Within two weeks, gather everyone involved for a blameless review.
+2. Walk the timeline and name the root cause (e.g. string-built SQL plus an over-broad cloud role).
+3. Note what detected the attack and what was too slow.
+4. Write action items with owners and dates, and add them to the hardening checklist.
 
 Within one to two weeks, hold a blameless review. Produce a timeline, root cause, what detection worked and what was too slow, and action items with owners and dates. Follow the process in [[Postmortems and Root Cause Analysis]]. Fold the lessons into [[Website Security Hardening Checklist]].
 
@@ -413,7 +484,7 @@ An online store, "ShopCo", Friday 03:10 UTC. All times are illustrative.
 | --- | --- |
 | 03:10 | Alert: outbound traffic from `web-2` is 40 times its normal level |
 | 03:18 | On-call engineer sees a `www-data` process connected to an unknown IP; declares an incident, opens a phone bridge |
-| 03:25 | Isolates `web-2`: removes it from the load balancer, applies a deny-all security group except the forensic bastion, takes an EBS snapshot |
+| 03:25 | Isolates `web-2`: removes it from the load balancer, applies a deny-all security group except the forensic bastion (the one locked-down machine investigators log in through), takes an EBS snapshot |
 | 03:40 | Reviews nginx logs: 14 days ago, repeated `UNION SELECT` requests against `/search?q=`, then a `200` on `/uploads/img_cache.php` |
 | 03:55 | Finds the web shell `img_cache.php`, a cron job running a script from `/tmp`, and a new SSH key in `authorized_keys` |
 | 04:10 | CloudTrail shows the instance role's credentials used from an external IP to list and copy S3 buckets, including `customer-exports` |
@@ -497,10 +568,13 @@ When not to follow the standard sequence strictly: if data is leaving right now 
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** each phase of the response and how the ShopCo breach played out. **Next we look at real practice**: the preparation that decides how an incident goes, what to monitor so you catch attackers sooner, and the deeper topics (order of volatility, CI/CD and supply-chain compromise, the legal clock) that senior engineers are expected to know.
+
+
 Preparation decides how the incident goes. Before anything happens, have:
 
 - An incident response plan with roles (commander, communications, technical lead, legal contact) and phone numbers.
-- Logs centralised and write-protected: web, auth, DB, CloudTrail with log file validation, VPC Flow Logs, with at least 90 days of retention (a common guideline). CERT-In's 2022 directions require keeping ICT system logs for 180 days within India's jurisdiction, and PCI DSS v4.0 requires 12 months of audit log history (3 months immediately available).
+- Logs centralised and write-protected: web, auth, DB, CloudTrail (AWS's record of every API call in your account) with log file validation, VPC Flow Logs (records of network connections in your cloud network), with at least 90 days of retention (a common guideline). CERT-In's 2022 directions require keeping ICT system logs for 180 days within India's jurisdiction, and PCI DSS v4.0 requires 12 months of audit log history (3 months immediately available).
 - Backups that are immutable or offline and tested by restoring. Ransomware attackers often delete reachable backups. See [[Backup, PITR and Disaster Recovery]].
 - Infrastructure as code so you can rebuild.
 - A contact list for your hosting provider, payment processor and legal counsel.
@@ -607,13 +681,31 @@ Say it as: "I confirm and scope, isolate without powering off, snapshot, then wo
 - Notify by the clock: GDPR 72 hours, CERT-In 6 hours, card brands per contract.
 - End with a blameless review and hardening items with owners.
 
-## 11. Links
+## Self-check 🟢🟡
+
+> [!question]- (easy) Why not wipe a hacked server straight away?
+> It destroys the evidence of how the attacker got in, and the hole usually stays open.
+
+> [!question]- (easy) What is a web shell?
+> A script the attacker uploads so they can run commands on your server through a web page.
+
+> [!question]- (easy) Isolate or power off the hacked machine?
+> Isolate it from the network but keep it running, so memory evidence survives.
+
+> [!question]- (medium) Why isolate before rotating secrets?
+> If the attacker still controls a host, they can read the new secrets as soon as you set them.
+
+> [!question]- (medium) Which backup do you restore from?
+> One taken before the earliest sign of compromise, so it does not include the backdoor.
+
+> [!question]- (medium) Under GDPR, when does the 72-hour clock start?
+> When you become reasonably sure that personal data was affected, not when the investigation ends.
+
+## Links
 
 - Prevention: [[Website Security Hardening Checklist]], [[OWASP API Security Top 10]], [[CSRF, XSS and Security Headers]]
 - Related security notes: [[Secrets Management]], [[Password Storage and Login Security]], [[API Abuse and Bot Protection]], [[Sessions and Cookies]], [[Access and Refresh Tokens]], [[JWT - Structure, Validation and Pitfalls]], [[Service-to-Service Auth - API Keys, HMAC, mTLS]]
 - Operations: [[Incident Response]], [[Postmortems and Root Cause Analysis]], [[Production Debugging Playbook]], [[Alerting and On-Call]], [[Backup, PITR and Disaster Recovery]]
-
-## Links
 
 ### Watch on YouTube
 

@@ -24,15 +24,20 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code, Tests and Running it sections top to bottom; each big block has a plain-words opener first.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: a client asks for a URL and a server answers it; here the "server" is a fake fetch function.
+> - [[DNS - Resolution, Records and Caching]]: only the idea of a cache with an expiry time (used in exercise 3).
+> - [[CDN and Edge]] (theory twin): what an origin shield is and why many misses at once are a problem.
+
 **From zero** 🟢 — This file is the hands-on twin of [[CDN and Edge]]. It builds, in about 60 lines of Go, the one trick an origin shield does: when 100 people ask for the same missing item at the same moment, only ONE request goes to the far-away origin server, and the other 99 simply wait and share that one answer. The tests then prove it — 100 simultaneous askers, exactly 1 origin call. Read each "In plain words" line before its code block and you can follow without deep Go knowledge.
 
 ## Before the code 🟢
 
-- **Goroutines**: functions running concurrently (`go f()`); the tests start 100 at once to simulate a burst of cache misses.
+- **Goroutines**: functions running concurrently (`go f()`), like many small workers sharing one program; the tests start 100 at once to simulate a burst of cache misses.
 - **`sync.Mutex`**: a lock so only one goroutine touches the `inFlight` map at a time.
 - **Channels (`chan struct{}`)**: closing a channel wakes every goroutine waiting on it, which is how one result is broadcast to all waiters.
 - **Maps**: `map[string]*call` tracks which cache keys already have a fetch running.
-- **What to run**: `go vet ./...` and `go test -race ./...` (the race detector checks for unsafe shared memory).
+- **What to run**: `go vet ./...` and `go test -race ./...` (the race detector checks for unsafe shared memory, meaning two goroutines touching the same variable at once without a lock).
 
 ## What this code shows 🟢
 
@@ -57,6 +62,8 @@ go test -race ./...
 ```
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** the goal: 100 askers, 1 trip to the origin. **Next we read the code** that does it: a map of "trips already underway", a lock to guard that map, and a channel that wakes all waiters at once.
 
 ### The shared state: one in-flight call per key
 
@@ -94,9 +101,9 @@ func New(fetch Fetcher) *Shield {
 
 **Concept.** This implements the shield box in [[CDN and Edge#Request collapsing and the origin shield]]: a map from cache key to "a fetch is already happening for this key."
 
-The alternative design would be a mutex per key held for the whole fetch duration, but that forces every waiter to block on a lock rather than a channel, and gives no easy way to count how many callers actually shared one fetch — which is exactly what the test below needs to prove collapsing happened.
+The alternative design would be a mutex (a lock only one goroutine can hold at a time) per key held for the whole fetch duration, but that forces every waiter to block on a lock rather than a channel, and gives no easy way to count how many callers actually shared one fetch — which is exactly what the test below needs to prove collapsing happened.
 
-A `sync.Map` was also considered, but a plain map plus one `sync.Mutex` is simpler here because every access already needs the mutex for the waiter count, so a lock-free map buys nothing.
+A `sync.Map` (Go's built-in map that is safe to share without your own lock) was also considered, but a plain map plus one `sync.Mutex` is simpler here because every access already needs the mutex for the waiter count, so a lock-free map buys nothing.
 
 **How it works.**
 1. `Fetcher` is the shape of "go ask the origin" — kept as a type so the shield has no idea whether `fetch` means an HTTP call, a database read, or anything else.
@@ -138,11 +145,11 @@ func (s *Shield) Get(key string) (value []byte, shared int, err error) {
 
 **Concept.** This is the section [[CDN and Edge#Request collapsing and the origin shield]] describes as "the PoP recognizes a fetch is already in flight and makes every other caller wait."
 
-The alternative of using a `sync.WaitGroup` per key was rejected because a `WaitGroup` carries no result value back to the waiters — a closed channel plus fields read only after the channel closes is the idiomatic Go way to broadcast one result to many goroutines.
+The alternative of using a `sync.WaitGroup` per key was rejected because a `WaitGroup` carries no result value back to the waiters — a closed channel plus fields read only after the channel closes is the idiomatic (normal, expected) Go way to broadcast one result to many goroutines.
 
 **How it works.**
 1. The mutex is held only long enough to check the map and either register a waiter or create a new `call` — never across the actual fetch, so unrelated keys never block on each other.
-2. The existing-call branch increments `waiters`, releases the lock immediately, then blocks on `<-c.done`. Reading `c.value`/`c.err` after the channel closes is safe without further locking, because a closed channel establishes a happens-before relationship in Go's memory model: everything written before `close(c.done)` is visible to every goroutine that observes the close.
+2. The existing-call branch increments `waiters`, releases the lock immediately, then blocks on `<-c.done`. Reading `c.value`/`c.err` after the channel closes is safe without further locking, because a closed channel establishes a happens-before relationship (a guarantee that one step's writes are visible to another step) in Go's memory model: everything written before `close(c.done)` is visible to every goroutine that observes the close.
 3. The new-call branch registers itself in `inFlight` *before* releasing the lock and calling `fetch`, so any caller arriving in that window sees the in-flight entry rather than starting a second fetch — this ordering is the entire point of the mutex.
 4. `delete(s.inFlight, key)` happens before `close(c.done)`, so a caller that arrives after the fetch finishes but before the close either joins the just-finishing call (rare, harmless — it gets the same result) or, after `delete`, starts a genuinely fresh fetch, matching "the next call after it finishes starts a fresh fetch."
 
@@ -226,6 +233,8 @@ sequenceDiagram
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** how `Get` joins or starts a fetch and why the lock is short. **Next, the advanced part**: why each design choice beat its alternative, what breaks if you reorder lines, and exercises that test your understanding.
+
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
 | Channel-based broadcast (`close(c.done)`) | `sync.WaitGroup` per key | A closed channel can carry a result to unlimited waiters via the happens-before rule; a `WaitGroup` only signals completion, not a value |
@@ -307,6 +316,8 @@ Without this property, a key would permanently share its very first fetch's resu
 
 A failure here (`originCalls == 1` on the second call) would mean the shield is accidentally caching values forever instead of only collapsing *concurrent* misses — a correctness bug that would serve stale data indefinitely.
 
+**What this code does, in plain words:** it calls `Get` for the same key twice, one after the other (not at the same time). Since the first trip is finished before the second starts, there is nothing to join, so the fake origin must be called twice.
+
 ```go
 func TestNewFetchAfterInFlightCompletes(t *testing.T) {
 	var originCalls int64
@@ -343,7 +354,7 @@ ok  	cdn	1.555s
 
 Reading it line by line: `go vet` printed nothing, meaning no suspicious constructs (unreachable code, wrong `Printf` verbs, lock-copying) were found.
 
-Both tests ran under `-race`, Go's data-race detector, which instruments every memory access and would fail the build if two goroutines touched the same memory without synchronization — passing here is the actual proof that the mutex-and-channel design has no race, not just that the assertions happened to pass.
+Both tests ran under `-race`, Go's data-race detector (a data race is two goroutines touching the same memory at once, with at least one writing), which instruments every memory access and would fail the build if two goroutines touched the same memory without synchronization — passing here is the actual proof that the mutex-and-channel design has no race, not just that the assertions happened to pass.
 
 ## Pitfalls in the code 🔴
 
@@ -356,6 +367,26 @@ Both tests ran under `-race`, Go's data-race detector, which instruments every m
 1. Change `Get` so the lock is held during the call to `fetch` (move `s.mu.Unlock()` to after the `fetch` call instead of before it). Predict what `go test -race` reports, and what happens to the 100-goroutine test's wall-clock time if `fetch` is made to sleep for 50ms. Then run it and compare.
 2. Add a `shared` return value assertion to `TestGetCollapsesConcurrentMisses`: capture each goroutine's own `shared` count and assert that at least one of them equals 100 (the very first caller to register should eventually see the final waiter count). Predict whether this is possible given the current code, since `shared` is captured at registration time, not at completion time — then try it.
 3. Add a per-key TTL so that even if a value is fetched once, `Get` still refetches after `ttl` has elapsed, combining this shield with the `CachingResolver` pattern from [[DNS - Resolution, Records and Caching - Go]]. Predict which lock(s) need to be held when checking the TTL, and write a test proving a stale-but-present value still triggers a refetch after expiry.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What does the shield do when 100 callers ask for the same missing key at once?
+> It lets one caller fetch from the origin and makes the other 99 wait and share that result.
+
+> [!question]- 🟢 What does `inFlight` store?
+> A map from cache key to the fetch that is currently running for that key.
+
+> [!question]- 🟢 Which command proves there is no unsafe sharing between goroutines?
+> `go test -race ./...`, which runs the tests with the race detector on.
+
+> [!question]- 🟡 Why is the lock released before calling `fetch`?
+> Holding it would make fetches for different keys wait on each other, killing concurrency.
+
+> [!question]- 🟡 Why is it safe for waiters to read `c.value` without the lock?
+> They read it only after `<-c.done` returns, and closing a channel makes all earlier writes visible.
+
+> [!question]- 🟡 Why does the second test expect 2 origin calls?
+> The first fetch finished and was removed from the map, so the second `Get` is a new miss, not a join.
 
 ## Links
 

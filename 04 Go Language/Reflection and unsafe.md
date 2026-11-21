@@ -31,6 +31,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (the rules) and 4 (worked examples) and 5.
 > - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Interfaces]]: an interface value (including `any`) holds two things: which concrete type is inside, and the data itself.
+> - [[Structs, Methods and Embedding]]: a struct has fields, fields starting with a capital letter are exported (visible outside the package), and a field can carry a tag like `` `json:"name"` ``.
+
 **From zero, in 60 seconds** 🟢
 
 Normally your code knows every type at compile time. But a library like the JSON encoder must handle structs invented long after it was written.
@@ -76,6 +80,12 @@ Reflection lets code ask at run time: "what type is this, what fields does it ha
 | Settable | A reflected value you are allowed to change | Needs a pointer plus `.Elem()` |
 | `unsafe.Pointer` | A pointer with no type, which bypasses safety checks | Reading a struct's raw bytes |
 | Garbage collector (GC) | Runtime part that frees unused memory | Can move stacks, so raw addresses go stale |
+| Kind | The basic built-in shape of a type | `reflect.Struct`, `reflect.Int64` |
+| Exported | Visible outside its package because the name starts with a capital letter | `Status` yes, `status` no |
+| `uintptr` | A plain whole number big enough to hold a memory address; the GC does not treat it as a pointer | `uintptr(p) + 8` |
+| Codegen | A tool that writes type-specific Go code for you before you build | `easyjson`, `sqlc` |
+| Alignment / padding | Fields must start at addresses that are multiples of their size; the compiler adds empty bytes to make that true | an `int64` starts at a multiple of 8 |
+| cgo | Go's bridge for calling C code | `import "C"` |
 
 **Picture it**
 
@@ -102,7 +112,7 @@ flowchart LR
 
 ## 1. Why it exists 🟢
 
-`encoding/json` must encode `Invoice`, `User`, and any other exported struct a caller defines, in a library written before any of those types existed. There is no way to write `func encode(i Invoice) string` in advance for a type the library has never heard of — the only way to read "whatever fields this struct has, and what their JSON tags say to rename them to" is to ask the type itself, at run time.
+`encoding/json` must encode (turn into JSON text) `Invoice`, `User`, and any other exported struct a caller defines, in a library written before any of those types existed. There is no way to write `func encode(i Invoice) string` in advance for a type the library has never heard of — the only way to read "whatever fields this struct has, and what their JSON tags say to rename them to" is to ask the type itself, at run time.
 
 That is reflection: `reflect.ValueOf(v).Type().Field(i).Tag.Get("json")` reads a field's tag with no compile-time knowledge of what field it is.
 
@@ -112,7 +122,7 @@ That is reflection: `reflect.ValueOf(v).Type().Field(i).Tag.Get("json")` reads a
 
 ## 2. Mental model 🟢
 
-An interface value — which is what `reflect.ValueOf` always receives, since its parameter type is `any` — is two machine words, not one:
+An interface value — which is what `reflect.ValueOf` always receives, since its parameter type is `any` — is two machine words (a word is 8 bytes on a 64-bit machine), not one:
 
 ```mermaid
 flowchart LR
@@ -131,6 +141,8 @@ flowchart LR
 **Kind vs Type**, concretely: `type UserID int64` has `Kind() == reflect.Int64` (it is built from `int64` underneath) but `Type().Name() == "UserID"` (its own declared name). Code that only checks `Kind` treats `UserID` and a plain `int64` identically; code that needs the declared name reads `Type()`.
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that reflection asks a value about its type at run time, and `unsafe` skips Go's safety checks to touch raw memory. **Next we open the box**: what a small reflection function looks like, the one rule for when reflection may write a value, and the short list of legal `unsafe.Pointer` moves.
 
 ### Whiteboard version
 
@@ -183,7 +195,7 @@ flowchart LR
 
 The reason a stored `uintptr` is unsafe: it is just an integer to the garbage collector, carrying no information that it used to be a pointer. If a GC cycle or a goroutine's stack growth moves the object between the `uintptr` conversion and a later use, the integer now points at garbage or at someone else's data.
 
-Keeping the arithmetic and the conversion back to `unsafe.Pointer` in one expression means no GC safepoint can land in between.
+Keeping the arithmetic and the conversion back to `unsafe.Pointer` in one expression means no GC safepoint (a moment where the runtime may pause your goroutine to do GC or stack work) can land in between.
 
 ## 4. Worked example 🟡
 
@@ -220,6 +232,8 @@ func TagsOf(v any) map[string]string {
 `f.IsExported()` and the `ok` from `Tag.Lookup` both matter: an unexported field has no business being serialized, and a field with no `json` tag at all should not report an empty string as if it had one. `Structs, Methods and Embedding` covers the tag *syntax* (`` `json:"status" db:"status"` ``); this is the API that reads it back.
 
 ### Settability, the pointer-and-`Elem()` pattern, and its two failure modes
+
+**What this code does, in plain words:** `SetViaPointer(&req, "Status", "paid")` checks it got a real pointer, follows it with `Elem()`, finds the field by name, checks the field can be set (it must be exported) and that the new value has the right type, then sets it. Each check that fails returns an error instead of panicking. The test tries one good case and the two failure cases.
 
 ```go
 // SetViaPointer sets a struct field by name through a pointer. This is the
@@ -294,6 +308,8 @@ This is exactly the gotcha behind "my test asserts `DeepEqual(got, []Invoice{})`
 
 ### Why reflection is slower than codegen
 
+**What this code does, in plain words:** two functions turn the same `Event` into the same text. `EncodeReflect` discovers the fields at run time with `reflect`, like `encoding/json` does. `EncodeDirect` reads `e.ID`, `e.Name` and so on directly, the way generated code would. The benchmark below compares them.
+
 ```go
 // EncodeReflect discovers Event's fields with reflection at call time — the
 // way encoding/json's default path works for a type it has not seen before.
@@ -333,6 +349,8 @@ This is the whole reason `encoding/json` ships a `Marshaler` escape hatch and wh
 ### `unsafe`: struct layout and zero-copy conversions
 
 **In plain words:** two real uses of `unsafe` — measuring exactly how a struct sits in memory, and relabelling the same bytes as a string without copying them.
+
+**What this code does, in plain words:** `HeaderLayout` asks `unsafe` for the size of a `Header` struct, its alignment, and the byte position (offset) of each field. The test checks the answers on a 64-bit Mac: 16 bytes in total, with `Version` tucked into the gap after `Flag`. The second block, `BytesToStringNoCopy` and `StringToBytesNoCopy`, relabels the same bytes as the other type without copying, guarding against an empty input first.
 
 ```go
 type Header struct {
@@ -400,7 +418,7 @@ func StringToBytesNoCopy(s string) []byte {
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
-| Reflection (`reflect`) | Discover fields/methods/tags at run time via `Type`/`Value` | The type is unknown at compile time (generic serializers, ORMs, validators, DI containers) | 2–5× slower than direct code, extra allocations, panics on a wrong `Kind` assumption |
+| Reflection (`reflect`) | Discover fields/methods/tags at run time via `Type`/`Value` | The type is unknown at compile time (generic serializers, ORMs: libraries that map structs to database tables, validators, DI containers: tools that build and wire your objects for you) | 2–5× slower than direct code, extra allocations, panics on a wrong `Kind` assumption |
 | Codegen (easyjson, `protoc-gen-go`, sqlc) | A tool generates type-specific code ahead of time | The type set is known at build time and the hot path matters | Build-step complexity; generated code to keep in sync |
 | Generics (`[T any]`) | Compiler specializes per type at compile time | The operation is the same shape across types, known at compile time | None of reflection's runtime cost; see [[Generics and Iterators]] |
 | Type switch over a closed interface | `switch v := x.(type) { case A: ...; case B: ... }` | A small, known, closed set of concrete types | Fast, but every new type needs a new `case` |
@@ -408,6 +426,9 @@ func StringToBytesNoCopy(s string) []byte {
 | cgo call | Go calls into C code | You need a C library with no Go equivalent | Each call crosses into C-runtime calling convention; see Deep dive |
 
 ## 6. Trade-offs and when not to use 🔴
+
+> 🟡 → 🔴 **You now know** how `Type` and `Value` work, the settability rule, the legal `unsafe.Pointer` moves, and measured proof that reflection costs about 3×. **Next is the advanced part**: when not to use either tool, how real libraries use them in production, and the low-level reasons behind the costs and the `uintptr` danger.
+
 
 - Reflection trades compile-time type errors for run-time panics: `v.Int()` on a `Value` whose `Kind()` is `String` panics, something a type switch or generics would have caught (or made impossible) at compile time.
 - Reach for reflection only when the type truly is not known until run time. If you are writing `if v.Kind() == reflect.Struct && v.Type() == reflect.TypeOf(Invoice{})`, you already know the type — use a type assertion or a type switch instead.
@@ -417,7 +438,7 @@ func StringToBytesNoCopy(s string) []byte {
 
 ## 7. In production 🔴
 
-- **Real systems:** `encoding/json`'s default path, `database/sql`'s `Scan` into struct fields via driver-specific reflection helpers, `go-playground/validator` and most ORMs (gorm) read struct tags with reflection; `google.golang.org/protobuf`'s reflection-based `protoreflect` API powers generic proto tooling (dynamicpb) even though generated messages use direct field access on the hot path; `strings.Builder` and `bytes.Buffer`'s internal `String()`/`Bytes()` conversions use the `unsafe.String`/`unsafe.Slice` pattern to avoid a copy on every call.
+- **Real systems:** `encoding/json`'s default path, `database/sql`'s `Scan` into struct fields via driver-specific reflection helpers, `go-playground/validator` and most ORMs (gorm) read struct tags with reflection; `google.golang.org/protobuf`'s (Protocol Buffers: a compact binary data format) reflection-based `protoreflect` API powers generic proto tooling (dynamicpb) even though generated messages use direct field access on the hot path; `strings.Builder` and `bytes.Buffer`'s internal `String()`/`Bytes()` conversions use the `unsafe.String`/`unsafe.Slice` pattern to avoid a copy on every call.
 - **Failure modes → fixes:**
   - A reflection-based decoder panics on an unexpected `Kind` in production because an input type changed shape → wrap the reflection walk in a `defer recover()` at the boundary, and add a table-driven test per supported `Kind`.
   - `reflect.DeepEqual(got, []Invoice{})` fails in a test because `got` is `nil`, not an empty slice → either assert on `len` instead of `DeepEqual`, or initialize the slice with `make([]Invoice, 0)` at the one place it is built.
@@ -484,6 +505,30 @@ This has measurably more overhead than a plain Go function call — commonly cit
 - `unsafe.String`/`unsafe.Slice` (Go 1.20) do zero-copy `[]byte ↔ string` reinterpretation; the caller must never mutate the source afterward.
 - `go vet`'s `unsafeptr` analyzer exists specifically to catch the uintptr-stored-across-statements mistake.
 - cgo calls cost real per-call overhead and typically force dynamic linking against libc unless `CGO_ENABLED=0`.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does reflection let code do?
+> Look at a value's type, fields and tags while the program runs, even for types the code has never seen.
+
+> [!question]- Which standard library package uses reflection to read `json:"..."` tags?
+> `encoding/json`.
+
+> [!question]- Is `unsafe` checked by the compiler for memory safety?
+> No. Every safety rule becomes your responsibility.
+
+🟡 Medium
+
+> [!question]- Why does `reflect.ValueOf(x).Field(0).SetString("a")` panic, and how do you fix it?
+> The value is a copy, so it is not settable. Use `reflect.ValueOf(&x).Elem()`.
+
+> [!question]- `type UserID int64`. What are its `Kind()` and its type name?
+> `Kind()` is `reflect.Int64`; the type name is `UserID`.
+
+> [!question]- Why must `unsafe.Pointer(uintptr(p) + 8)` be written in one expression?
+> A `uintptr` stored in a variable is just a number to the GC; if memory moves between statements, it points at the wrong place.
 
 ## Links
 

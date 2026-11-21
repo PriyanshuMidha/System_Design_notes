@@ -36,6 +36,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 6 (variants) and 7 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 5 (deep dives), 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Locking - Optimistic vs Pessimistic]]: two ways to stop two buyers changing the same row at once: lock first, or check a version and retry.
+> - [[Idempotency and Idempotency Keys]]: a unique key on a request lets a retry return the first result instead of acting twice.
+> - [[Rate Limiting - Algorithms and Distributed Design]]: capping how many requests a user or IP can send per second.
+> - [[Case Study - Ticket Booking]]: holding a seat for a few minutes while the buyer pays, then releasing it if they do not.
+
 **From zero, in 60 seconds** 🟢
 
 A flash sale sells a small, fixed stock to a huge crowd at one exact time.
@@ -74,6 +80,10 @@ The website also must not crash for everyone else who is just browsing.
 | Queue | A line of work items processed in order | Orders waiting for payment workers |
 | Idempotency key | An ID that makes a retry do nothing new | Same reservation ID sent twice = one order |
 | CDN | Servers near users that hand out static files | Sale page served from a nearby city |
+
+| SKU | One sellable item type | "Phone X 128 GB black" |
+| Reservation (hold) | A short claim on one unit that expires if unpaid | yours for 10 minutes |
+| Lua script | A tiny program Redis runs as one uninterrupted step | "check stock, decrement, mark buyer" |
 
 **Picture it**
 
@@ -134,13 +144,20 @@ Two things go wrong in a naive design. First, the database melts under load, bec
 
 **Out of scope:** pricing engines, recommendation, warehouse routing, returns.
 
+### Real-life example: a festive phone sale 🟢
+
+During a big festive sale on an app like Flipkart or Amazon, a popular phone is listed at a deep discount at midnight.
+Many people are shown a "you are in the queue" screen first; that is the waiting room.
+A few seconds after tapping "Buy", most people see "sold out" while the lucky ones get a payment page with a timer.
+If a winner's UPI payment fails or the timer runs out, that phone goes back on sale for someone else.
+
 ### How it differs from ticket booking
 
 **In plain words:** tickets are many different seats; a flash sale is many copies of one item, so it is just a counter going down.
 
 | | [[Case Study - Ticket Booking]] | Flash sale |
 | --- | --- | --- |
-| Inventory | Many distinct seats, each row cold | One or a few SKUs, one row extremely hot |
+| Inventory | Many distinct seats, each row cold (rarely touched) | One or a few SKUs, one row extremely hot (touched by everyone) |
 | Contention | Spread across seats | Concentrated on one counter |
 | Buyer chooses | A specific seat | "Any unit of this SKU" |
 | Main fix | Conditional update plus waiting room | Atomic counter in front of the database plus queueing |
@@ -187,7 +204,17 @@ stateDiagram-v2
 > [!tip] Remember
 > Every purchase attempt is a small state machine with a timer, so stuck states heal themselves.
 
+## Common beginner mistakes 🟢
+
+- **Reading stock, then writing stock in two steps** → two buyers both see "1 left" and both buy → make check-and-decrement one atomic step (Lua script or conditional `UPDATE`).
+- **Trusting Redis as the only stock record** → a Redis failover can lose recent writes and oversell → keep the SQL row with a `CHECK` as the final judge.
+- **Letting the whole crowd hit the servers** → the store crashes for everyone → serve the page from a CDN and admit buyers through a waiting room.
+- **Rate limiting only by IP address** → offices and mobile networks share IPs, so real users are blocked → also limit per user and per admission token.
+- **Holding unpaid units forever** → stock sits unsold → give every hold an expiry and return the unit when it passes.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the one rule (never oversell) and the three tools: a waiting room, a fast atomic gate, and short holds. **Next we open the box** and follow one shopper through every layer, then see how each layer shrinks the crowd.
 
 ```mermaid
 flowchart LR
@@ -210,13 +237,13 @@ flowchart LR
 
 **In plain words:** follow one shopper from the sale page, through the waiting room and the stock check, to payment.
 
-1. **Static sale page.** The page, images and countdown are plain files on the CDN, so a million viewers never reach the origin. The page asks the server for the time once, then counts down in the browser.
+1. **Static sale page.** The page, images and countdown are plain files on the CDN, so a million viewers never reach the origin (our own servers behind the CDN). The page asks the server for the time once, then counts down in the browser.
 2. **Waiting room.** At sale start, users get a random or first-come position and an admission token as capacity allows.
 3. **Gateway.** Checks the token, applies per-user and per-IP limits, and rejects obvious bots.
 4. **Reservation service.** Runs one Redis Lua script: "if the user has not bought and stock is above 0, decrement and mark the user". Returns win or lose in under a millisecond.
 5. **Winner path.** Write a `RESERVED` row with an expiry and publish `ReservationCreated`. The user is told "you got one, pay in 10 minutes".
 6. **Loser path.** Immediate "sold out" response. Nothing else is touched, so most of the crowd costs almost nothing.
-7. **Checkout.** Payment runs with an idempotency key (the reservation ID). Success arrives via webhook.
+7. **Checkout.** Payment runs with an idempotency key (the reservation ID). Success arrives via webhook (a call the payment provider makes to our server).
 8. **Confirm.** A conditional SQL update decrements the real inventory. If it fails, the payment is refunded.
 9. **Expiry.** A timer (or delayed message) returns unpaid reservations to stock.
 
@@ -224,6 +251,13 @@ flowchart LR
 > Every layer exists to make the next layer's job smaller: CDN, then queue, then gate, then database.
 
 ### The load funnel
+
+**Step by step:**
+1. A million people open the sale page. The CDN serves it, so our servers barely notice.
+2. 200,000 tap "Buy" in the first 10 seconds. The waiting room lets them through at about 2,000 a second.
+3. Each admitted tap runs the Redis gate. The first 10,000 win; everyone after that hears "sold out" within milliseconds.
+4. Winners get a 10-minute hold and pay. Say 4,000 to 7,000 pay in time.
+5. Holds that expire put units back, and a second wave of buyers can win them.
 
 ```mermaid
 flowchart TD
@@ -320,7 +354,7 @@ Redis keys (all under one hash tag so a Lua script can touch them together):
 | --- | --- | --- |
 | `sale:{sku42}:stock` | integer | remaining units |
 | `sale:{sku42}:buyers` | set | users who already won |
-| `sale:{sku42}:res:{id}` | string with TTL | optional marker for expiry tracking |
+| `sale:{sku42}:res:{id}` | string with TTL (time to live: Redis deletes it after that time) | optional marker for expiry tracking |
 
 ```mermaid
 erDiagram
@@ -350,6 +384,8 @@ erDiagram
 > The database CHECK constraint is your seatbelt: even if every other layer has a bug, the row cannot go over capacity.
 
 ## 5. Deep dives 🔴
+
+> 🟡 → 🔴 **You now know** the full path of a purchase, the sizing, the API and the tables. **Next is the advanced part**: the exact atomic gate and why SQL still checks it, expiry races, crowd control and bots, and checkout as a saga with refunds.
 
 ### Deep dive 1: stopping overselling at high speed
 
@@ -481,7 +517,7 @@ sequenceDiagram
 
 | Option | Pros | Cons |
 | --- | --- | --- |
-| Redis key with TTL per reservation, keyspace notifications | Simple | Notifications are not guaranteed delivery; can miss expiry |
+| Redis key with TTL per reservation, keyspace notifications (Redis messages like "key X expired") | Simple | Notifications are not guaranteed delivery; can miss expiry |
 | Delayed queue message | Reliable, scalable | Extra component |
 | DB sweeper query (`WHERE expires_at < now()`) | Easy, durable | Polling cost, lag of a minute |
 | Lazy expiry in the claim condition (as in tickets) | No job needed | Works for per-seat rows, awkward for a single counter |
@@ -516,11 +552,11 @@ flowchart LR
 | --- | --- | --- |
 | CDN | Absorb page and image traffic | Direct origin (will fall over) |
 | Waiting room | Convert a spike into a steady stream | Plain rate limit (rejects, causes retry storms) |
-| Token bucket per user | Stop one user from flooding | Per IP only (shared NAT punishes real users) |
+| Token bucket per user (each user gets a few request tokens that refill slowly) | Stop one user from flooding | Per IP only (shared NAT, where many devices sit behind one public IP, punishes real users) |
 | Bot defence | Keep scripts from taking the stock | Login-only sales, purchase history rules |
 | Per-user purchase cap | Fairness (1 per account, verified phone) | None (resellers win) |
 
-Rate limiting design is in [[Rate Limiting - Algorithms and Distributed Design]]; bot handling is in [[API Abuse and Bot Protection]]. Why a waiting room beats a plain 429: rejected users retry immediately, making the spike worse; a queue gives them a place to wait. See [[Load Shedding and Graceful Degradation]].
+Rate limiting design is in [[Rate Limiting - Algorithms and Distributed Design]]; bot handling is in [[API Abuse and Bot Protection]]. Why a waiting room beats a plain 429 (the HTTP "too many requests" error): rejected users retry immediately, making the spike worse; a queue gives them a place to wait. See [[Load Shedding and Graceful Degradation]].
 
 **Fairness choice.** Random lottery among those who arrive in the first 30 seconds, then first come first served. That removes the advantage of a faster connection or a bot hammering at 11:59:59.
 
@@ -583,7 +619,7 @@ flowchart TD
 ## 7. Trade-offs and when not to use 🟡
 
 - **Oversell vs undersell.** Slight undersell is cheap (return stock, sell again); oversell means refunds and angry users. Bias toward undersell.
-- **Hold time.** 10 minutes frees stock slowly; 3 minutes causes failed payments. UPI approvals and OTPs argue for 5 to 10 minutes.
+- **Hold time.** 10 minutes frees stock slowly; 3 minutes causes failed payments. UPI approvals and OTPs (one-time passwords sent by SMS) argue for 5 to 10 minutes.
 - **Redis gate cost.** A second system and two sources of truth. For a small sale (under about 100 buys/s per SKU) a conditional SQL update is enough and simpler. Do not build the full stack for a modest launch.
 - **Queue friction.** Users dislike waiting, but dislike an outage more.
 - **Strong vs eventual stock display.** Showing "only 3 left" accurately costs reads on the hot counter. Cache it for 1 to 2 seconds and accept that it is approximate.
@@ -617,8 +653,8 @@ flowchart LR
 - Load-test the gate path to a measured number; set the admission rate to roughly 70% of it.
 - Pre-warm caches, connection pools and autoscaling (scale before the spike; autoscalers react too slowly).
 - Pre-create the Redis counter from the inventory table and verify the match.
-- Game-day a Redis failover and a payment provider outage.
-- Feature flags: turn off recommendations, reviews and non-critical widgets during the sale ([[Load Shedding and Graceful Degradation]]).
+- Game-day (rehearse on purpose before the real day) a Redis failover and a payment provider outage.
+- Feature flags (switches that turn features on or off without a deploy): turn off recommendations, reviews and non-critical widgets during the sale ([[Load Shedding and Graceful Degradation]]).
 
 ### What to monitor
 
@@ -673,6 +709,26 @@ sequenceDiagram
 
 > [!question]- Would you use a queue to serialise purchase requests?
 > Optionally. Putting reservation requests on a per-SKU queue with a single consumer gives strict fairness and trivial correctness, but throughput is bound by that consumer. A Redis atomic gate gives similar correctness at much higher speed; use a queue for the slow downstream work (orders, notifications).
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is overselling?
+> Confirming more orders than you have units in stock.
+
+> [!question]- Easy: why serve the sale page from a CDN?
+> So a million page views never reach our own servers.
+
+> [!question]- Easy: what happens to a unit if the winner does not pay in time?
+> The hold expires and the unit goes back to stock for someone else.
+
+> [!question]- Medium: why use a Lua script in Redis instead of `GET` then `DECR`?
+> The script checks and decrements in one uninterrupted step, so no other request can sneak in between.
+
+> [!question]- Medium: Redis fails over and lets 10,003 people win. What stops overselling?
+> The SQL conditional update with `CHECK (sold <= total)` refuses the last 3, and those buyers are refunded.
+
+> [!question]- Medium: a payment succeeds after the hold expired and the unit was resold. What happens?
+> Confirmation re-checks status and stock, finds the unit gone, and refunds the payment automatically.
 
 ## 10. Cheat sheet 🟢
 

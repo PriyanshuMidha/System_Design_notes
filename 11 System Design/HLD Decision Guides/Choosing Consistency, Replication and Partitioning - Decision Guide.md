@@ -45,6 +45,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (the six decisions), 4 (chat example), 5, 6 and 9 (drills).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 10 and 11. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Replication]]: the same data is copied to several machines, usually one leader taking writes and followers copying from it.
+> - [[Partitioning and Sharding]]: big data is split into slices (shards) by a key so each machine holds only part.
+> - [[Consistency Models]]: a promise about how fresh a read is, from "always the latest" to "catches up eventually".
+> - [[CAP and PACELC]]: when the network splits you must choose between answering (maybe stale) and staying correct; even without a split, fresher costs slower.
+
 **From zero, in 60 seconds** 🟢
 
 One database gets too busy. So you make copies of it on other machines. Making copies is called **replication**.
@@ -89,6 +95,12 @@ This guide is about three choices: how fresh reads must be, how copies are kept,
 | Partition / shard | One slice of the data on its own machine | Users A-M on shard 1 |
 | Shard key | The field that decides which shard a row goes to | `chat_id` |
 | Quorum | A majority of copies that must agree | 2 of 3 replicas |
+| Linearizable | Every read sees the latest finished write, as if there were one copy | balance always up to date |
+| Read-your-writes | You always see your own changes, even if others see them later | your comment shows after reload |
+| Failover | Promoting a follower to leader when the leader dies | follower 2 becomes the new primary |
+| Cardinality | How many different values a field has | `user_id` high, `country` low |
+| Hot shard | One shard getting far more traffic than the rest | all new writes land on the last shard |
+| Scatter-gather | A query that must ask every shard and combine the answers | "search all messages for a word" |
 
 **Picture it**
 
@@ -134,6 +146,22 @@ If every withdrawal must phone every branch first, balances are always right but
 
 The analogy breaks down in one place: real databases can choose different rules per operation. A balance check can be strict while a "last seen" timestamp is allowed to be stale.
 
+### Real-life example: WhatsApp "last seen" vs your UPI balance 🟢
+
+WhatsApp's "last seen" can be a few seconds out of date and nobody minds, so it can be read from any nearby copy.
+Your UPI or bank balance must never show money you already spent, so it is read from the one copy that takes the writes.
+WhatsApp keeps each chat's messages together on one slice of machines (sharded by chat), so loading a chat touches one place.
+The same app makes different choices for different data, and that is the core skill of this guide.
+
+## Common beginner mistakes 🟢
+
+- **Saying "eventual consistency" and stopping** → users see their own post vanish on reload → add read-your-writes for the writer.
+- **Making everything strongly consistent "to be safe"** → every read waits on a leader or a majority, and the app is slow → use strong reads only for money, stock and uniqueness.
+- **Async replication alone for payments** → a leader crash can lose the last few confirmed writes → replicate synchronously to at least one follower for that data.
+- **Sharding by an auto-increment ID with ranges** → every new row lands on the last shard → use a hashed key or a key like `user_id`.
+- **Sharding before you need to** → joins, transactions and unique checks get hard → first tune queries, scale up, add replicas and caches.
+
+
 ```mermaid
 flowchart LR
     A["Dial 1: Consistency<br/>how fresh is a read"] --> D["Your data layer"]
@@ -144,9 +172,18 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the three dials: how fresh reads must be, how data is copied, and how it is split. **Next we open the box**, one decision at a time. Most decisions start with a plain walk-through; the full detail follows.
+
 ### Decision 1: how consistent must reads be?
 
 **In plain words.** A **consistency model** is a promise about what a read may return after writes. Stronger promises are easier to program against and slower or less available.
+
+**Step by step:**
+1. Asha likes a post. The like is written to the leader; followers get it a moment later.
+2. Bob reads the count from a follower and sees 1,204 instead of 1,205. Fine: eventual consistency.
+3. Asha pays ₹500. Her balance must never show the old amount.
+4. So the balance read goes to the leader (strong consistency), and pays that extra round trip.
+5. Rule: choose per piece of data, not one setting for the whole app.
 
 - **Strong (linearizable):** every read returns the latest completed write, as if there was one copy.
 - **Causal:** if write B was caused by (read) write A, nobody sees B without A. Unrelated writes may appear in different orders.
@@ -173,6 +210,12 @@ flowchart TD
 
 **In plain words:** Most users do not need perfect freshness. They just need to see their own changes, and never see time go backwards. Those are cheap to give.
 
+**Step by step (read-your-writes):**
+1. Ravi posts a comment. It is written to the leader.
+2. The app remembers "Ravi wrote something 2 seconds ago".
+3. Ravi reloads. For the next few seconds his reads go to the leader, so he sees his comment.
+4. Everyone else keeps reading from followers and sees it a moment later. Nobody complains.
+
 Many complaints about "eventual consistency" are really about three small problems. Each has a cheap fix without full strong consistency.
 
 | Symptom | Guarantee | Typical fix |
@@ -194,6 +237,12 @@ flowchart LR
 ### Decision 2: single-leader, multi-leader or leaderless?
 
 **In plain words.** Replication means keeping copies. The question is who is allowed to accept a write. A **leader** is the one node that orders writes. A **follower** copies the leader. A **leaderless** system lets any replica accept writes and uses quorums to reconcile.
+
+**Step by step:**
+1. Single leader: every write goes to one node, which puts them in one order and sends them to followers.
+2. Multi-leader: a leader in Europe and one in Asia each accept writes and swap them later. Two edits to the same row can clash.
+3. Leaderless: the client writes to several copies at once and counts it done when enough say yes.
+4. More leaders means writes are closer to users, but you must decide how to settle conflicts.
 
 ```mermaid
 flowchart TD
@@ -235,6 +284,13 @@ sequenceDiagram
 
 **In plain words.** In **synchronous** replication the leader waits for a follower to confirm before telling the client "done". In **asynchronous** replication it answers at once and the follower catches up later.
 
+**Step by step:**
+1. A write arrives at the leader and is saved to its disk.
+2. Async: the leader says "done" now and sends the change to followers right after.
+3. Sync: the leader first waits for one follower to say "saved", then says "done".
+4. The leader crashes. Async may lose the last few "done" writes; sync loses none.
+5. The price of sync is one extra network round trip on every write.
+
 | Mode | Write latency | Lost writes if leader dies | Availability |
 | --- | --- | --- | --- |
 | Async | Lowest (one local fsync) | Possible: the unreplicated tail (the replication lag window) | Highest |
@@ -260,6 +316,12 @@ flowchart LR
 ### Decision 4: how to partition (range, hash, geo, directory)?
 
 **In plain words.** A **partition** (or shard) is a slice of the data that lives on its own node group. The **partitioning scheme** decides which slice a row goes to.
+
+**Step by step:**
+1. Range: names A-M on shard 1, N-Z on shard 2. Great for "all users from A to C", but new time-based keys all hit the last shard.
+2. Hash: compute `hash(user_id)` and pick the shard from it. Load spreads evenly, but range queries must ask every shard.
+3. Geo: EU users on EU shards, Indian users on Indian shards. Good for law and latency.
+4. Directory: a lookup table says where each key lives, so you can move one big customer alone.
 
 ```mermaid
 flowchart TD
@@ -287,7 +349,7 @@ flowchart LR
 Problems each one creates:
 
 - **Range:** time-ordered keys send all new writes to the last shard (a hot shard). Fix by prefixing with a hash bucket or user id.
-- **Hash:** `hash(key) mod N` moves almost every key when N changes. Use a fixed number of virtual partitions (Kafka, Elasticsearch, Instagram's logical shards) or consistent hashing, see [[Consistent Hashing]].
+- **Hash:** `hash(key) mod N` moves almost every key when N changes. Use a fixed number of virtual partitions (many small logical slices mapped onto fewer machines; Kafka, Elasticsearch, Instagram's logical shards) or consistent hashing, see [[Consistent Hashing]].
 - **Geo:** a user who travels, or a query that joins EU and US data, crosses regions.
 
 > [!tip] Remember
@@ -296,6 +358,12 @@ Problems each one creates:
 ### Decision 5: picking a shard key
 
 **In plain words.** The **shard key** is the column that decides the shard. It is the hardest-to-change decision in the design. A good key has high cardinality, spreads writes evenly, and keeps your hottest query on one shard.
+
+**Step by step:**
+1. Write down the most common query: "show the last 50 messages in chat 991".
+2. Pick a key that keeps that query on one shard: `chat_id`.
+3. Check the spread: are there many chats, and is no single chat huge? Add a time bucket for giant chats.
+4. Check the rare queries: "all messages by user 7" now asks every shard. Accept it, or keep a second index.
 
 ```mermaid
 flowchart TD
@@ -415,10 +483,12 @@ Numbers in latency rows are rough estimates, not benchmarks. See [[Replication]]
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** each decision and how to apply it to a chat app. **Next comes the senior view**: how real companies chose, what to monitor, why quorums are not the same as strong consistency, and how to reshard, cross shards and span continents.
+
 - **Instagram (2012 post):** sharded PostgreSQL using many logical shards mapped onto fewer physical servers, with the shard id embedded in the generated 64-bit id so any id tells you where the row lives. Logical shards let them move data without rehashing. See [[Unique ID Generation]].
 - **Discord:** Cassandra, then ScyllaDB, for messages keyed by channel and bucket, per their 2023 post.
 - **Amazon DynamoDB:** eventually consistent reads by default, strongly consistent reads optional per request, global tables for multi-region writes with last-writer-wins reconciliation by default (a newer multi-Region strong consistency mode for global tables also exists; check current AWS docs for its limits).
-- **Google Spanner:** Paxos groups per split, TrueTime for external consistency, per the OSDI 2012 paper.
+- **Google Spanner:** Paxos (a voting protocol) groups per split, TrueTime (Google's clock API with a known error bound) for external consistency, per the OSDI 2012 paper.
 - **CockroachDB:** `REGIONAL BY ROW` tables pin rows to a region for latency and residency, with survival goals for zone or region failure.
 - **Figma:** vertical partitioning first, then horizontal sharding of PostgreSQL, per their 2024 post.
 
@@ -529,6 +599,26 @@ A strongly consistent write across US-East and EU-West needs at least one transa
 - Shard last: queries, indexes, cache, replicas, scale up first.
 - Fixed logical partitions beat `mod N`.
 - Always state the trade-off: freshness versus latency and availability.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is replication lag?
+> How far behind a follower copy is from the leader, for example 200 ms.
+
+> [!question]- (easy) Give one piece of data that can be eventually consistent and one that cannot.
+> Like counts can lag; a bank balance cannot.
+
+> [!question]- (easy) What is a shard key?
+> The field that decides which shard a row lives on, such as `chat_id`.
+
+> [!question]- (medium) What can async replication lose on failover?
+> The last writes the leader confirmed but had not yet sent to followers.
+
+> [!question]- (medium) Why is an auto-increment ID with range partitioning a bad shard key?
+> Every new row goes to the last range, making one hot shard.
+
+> [!question]- (medium) How do you give read-your-writes without full strong consistency?
+> Send a user's reads to the leader for a short time after they write, or pin them to one replica.
 
 ## Links 🟢
 

@@ -29,6 +29,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - Nothing. This note starts from zero. It is the entry map for the whole vault.
+
 **From zero, in 60 seconds** 🟢
 
 Backend work covers many topics. Without a map, it is easy to learn them in a random order and miss whole areas.
@@ -78,6 +81,12 @@ This note is the map of those things and where this vault teaches each one.
 | Infrastructure | The machines and platforms code runs on | Docker, Kubernetes, AWS |
 | Observability | Seeing what a running system is doing | Logs, metrics, traces |
 | Layer | One area of skill in the stack | "Messaging" is one layer |
+| Idempotent | Doing it twice has the same effect as once | Charging order 42 only once, even if the event arrives twice |
+| Outbox | A table where events are saved with the data, then sent by a helper | `order.created` row written with the order |
+| DLQ (dead-letter queue) | A side queue for messages that keep failing | A broken event parked for a human to look at |
+| SLO | A target for how well a service must behave | "99.9% of requests under 300 ms" |
+| Trace span | One timed step of a request, linked to the other steps | "save order: 12 ms" |
+| Canary rollout | Release a new version to a small share of traffic first | 5% of users get v2 |
 
 **Picture it**
 
@@ -106,11 +115,11 @@ Where it breaks: a city map is fixed; the tech in each layer changes every few y
 
 ## 1. Why it exists 🟢
 
-A new backend engineer who only knows "Go + Postgres" can ship a CRUD service but will stall in an SDE-3 interview the moment the conversation turns to "how would this handle 10x traffic" or "what happens when the queue backs up."
+A new backend engineer who only knows "Go + Postgres" can ship a **CRUD** service (create, read, update, delete with little logic) but will stall in an SDE-3 interview the moment the conversation turns to "how would this handle 10x traffic" or "what happens when the queue backs up."
 
-The gap is not depth in Go — it is not knowing which *other* layers exist at all: caching, messaging, distributed consensus, observability, deployment strategy.
+The gap is not depth in Go — it is not knowing which *other* layers exist at all: caching, messaging, distributed **consensus** (several servers agreeing on one answer even if some fail), observability, deployment strategy.
 
-Conversely, a candidate who has only read about these layers in the abstract (without ever writing the Go code for a worker pool, or running an `EXPLAIN` on a slow query) also stalls, one level later: they can name the layer but not reason about it under a follow-up question.
+Conversely, a candidate who has only read about these layers in the abstract (without ever writing the Go code for a **worker pool**, a fixed set of goroutines sharing a queue of jobs, or running an `EXPLAIN`, the command that shows how the database will run a query, on a slow query) also stalls, one level later: they can name the layer but not reason about it under a follow-up question.
 
 This note exists to give both the map (what layers exist, in what order to learn them) and the honest depth bar (deeply known vs. only recognised), concretely in terms of this vault's folders.
 
@@ -123,9 +132,32 @@ Picture a backend system as a stack of layers a request passes through, plus sev
 
 An SDE-3 candidate is expected to reason about every layer in both directions: what it does when it works, and what breaks when it doesn't.
 
+### Real-life example 🟢
+
+Think about placing a food order on Swiggy. Your tap hits the **API layer**. The **business logic** checks the restaurant is open and the cart is valid.
+The order is saved in a **database**; the menu you saw came from a **cache** so it loaded fast.
+A **message queue** tells the restaurant and the delivery system "new order", so your screen doesn't wait for them.
+All of it runs on **infrastructure** (servers, containers), and **observability** lets engineers see if orders suddenly slow down. One tap, about six layers.
+
+## Common beginner mistakes 🟢
+
+- **Learning tools before layers** → you know "Kafka" as a word but not what problem a queue solves → learn what each layer does, then one tool for it.
+- **Treating the database as the whole system in interviews** → answers sound junior → name at least three layers: data, plus caching, messaging or observability.
+- **Learning caching before transactions** → cache bugs look like magic → learn the data layer first, then caching.
+- **Trying to know every layer deeply** → you burn out → go deep on your language and main data store; recognise the rest.
+- **Memorising this table** → it is a map, not the lesson → follow the links into each folder.
+
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that a backend is a request path plus layers around it. **Next we open the map**: all ten layers, what depth each needs, which tools stand for it, and which folder teaches it.
+
 **In plain words:** Each layer below links to the folder that teaches it.
+
+**Step by step (how to use the table):**
+1. Pick the layer you feel weakest in, say "Messaging".
+2. Read its "knows deeply" column: delivery guarantees, ordering, DLQs.
+3. Check you can explain each one in two sentences.
+4. If not, open the linked folder ([[09 Messaging & Async MOC]]) and start there.
 
 ```mermaid
 flowchart TD
@@ -203,6 +235,13 @@ flowchart LR
     N -- "have job experience" --> S["Start from the<br/>SDE-3 checklist gaps"]
 ```
 
+### Know deeply vs only recognise 🟡
+
+| Depth | What it means | Layers (for a Go backend SDE-3) | Interview test |
+| --- | --- | --- | --- |
+| Know deeply | You can design with it and answer two follow-ups | Go, APIs, service layer, data stores, caching, messaging, distributed systems, observability, testing | "What breaks when…?" |
+| Recognise | You know what it is and why a team uses it | CI/CD, Kubernetes internals, cloud IaC, frontend rendering | "Why did this deploy fail?" at a high level |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - Following the table strictly, top to bottom, is slow if you already have production experience in some layers — skip to the [[SDE-3 Readiness Checklist]] and only backfill the folders it flags as weak.
@@ -210,6 +249,9 @@ flowchart LR
 - Treating this note as a syllabus to memorize, rather than a map to navigate, defeats its purpose — the depth lives in the linked folders, never here.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the ten layers, a learning order and how deep each must go. **Next is the senior view**: what real teams find hardest per layer, the classic interview failure, and why the learning order follows dependencies, not difficulty.
+
 
 - **Real systems:** almost every production backend at scale touches most of these layers; a payments service, a feed service and a chat service differ mainly in which layer (data consistency, fan-out, ordering) is their hardest problem.
 - **Failure modes → fixes:** the most common SDE-3 interview failure is treating one layer (usually the data layer) as the whole system and never mentioning caching, messaging or observability at all — a senior answer always touches at least three layers.
@@ -278,6 +320,26 @@ flowchart TD
 - Folder order roughly follows dependency order, not difficulty: language → APIs → service layer → data → caching → messaging → distributed systems → everything that composes them (11), then the specialisms (12–18).
 - A senior answer to "design X" always names at least three of these layers, not just the data layer.
 - Use [[SDE-3 Readiness Checklist]] to turn this map into a tracked, per-folder checklist.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) Name the four layers on the request path.
+> API layer, business logic, data layer, response (from the client's call).
+
+> [!question]- (easy) Name four layers that sit around the request path.
+> Caching, messaging, infrastructure and observability (security guards all of them).
+
+> [!question]- (easy) Which two layers must an SDE-3 know most deeply?
+> Their programming language and their primary data store.
+
+> [!question]- (medium) Why learn databases before caching?
+> You can't judge what a cache may safely show until you understand transactions and consistency in the data layer.
+
+> [!question]- (medium) In the `POST /v1/orders` trace, why is the outbox row written in the same transaction as the order?
+> So the order and its "order created" event are saved together; the event can't be lost or sent for an order that never saved.
+
+> [!question]- (medium) What makes an interview answer sound senior here?
+> It names at least three layers and says what each specifically does for the feature.
 
 ## Links 🟢
 

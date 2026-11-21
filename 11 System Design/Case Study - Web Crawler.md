@@ -33,6 +33,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Back-of-the-Envelope Estimation]]: turning a billion pages a month into fetches per second and terabytes.
+> - [[Bloom Filters and Probabilistic Data Structures]]: a tiny bit array that says "definitely not seen" or "probably seen".
+> - [[Consistent Hashing]]: a way to split hosts across machines so adding a machine moves only a few.
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+
 **From zero, in 60 seconds** 🟢
 
 A web crawler is a program that visits web pages to read them, like Google's bot.
@@ -106,10 +112,17 @@ The naive crawler is a breadth-first search: a queue of URLs, a loop that pops o
 - **It loops forever.** A calendar page links to "next month" endlessly, and session ids in URLs make every link look new.
 - **It wastes bandwidth.** The same article is reachable by many URLs (`?utm_source=`, `#section`, `http` vs `https`, mirrors).
 
+### Real-life example: Google finding a new blog post 🟢
+
+You publish a recipe on your blog in the morning. A few hours or days later, it shows up in Google search.
+Googlebot found it by following a link from your home page or sitemap, downloaded it, and handed it to the indexer.
+It never hits your small blog with hundreds of requests at once; it waits between visits.
+Your home page changes often, so it is re-visited often; an old "About me" page is visited rarely.
+
 **Functional requirements**
 - Given seed URLs, discover and download HTML pages across the web; store raw content with fetch metadata (time, status, headers).
 - Extract links and enqueue new ones; skip URLs already seen.
-- Obey robots.txt, plus a politeness delay per host.
+- Obey robots.txt (a file each site publishes saying which pages bots may visit), plus a politeness delay per host.
 - Re-crawl pages on a schedule that depends on how often they change.
 - Feed downstream consumers (indexing, as in [[Search Engines and Inverted Indexes]]).
 
@@ -144,7 +157,24 @@ flowchart LR
     L1 -. "new titles found" .-> D
 ```
 
+## Common beginner mistakes 🟢
+
+- **One plain FIFO queue of URLs** → most links point to the same site, so you hammer it → keep one queue per host and wait between visits.
+- **Treating `?utm_source=` and `#section` variants as new pages** → the same article is fetched many times → normalize URLs before the seen check.
+- **No limits on depth or pages per host** → calendars and session IDs create endless pages → cap pages and depth per host.
+- **Parsing inside the fetcher** → a slow parser blocks downloads → save raw pages and parse in a separate stage via Kafka.
+- **Re-crawling everything equally** → budget wasted on pages that never change → re-visit by change rate and importance.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the crawler loop and the politeness rule. **Next we open the box**: the frontier, fetcher, storage, parser and how new links are routed to the right machine.
+
+**Step by step (plain):**
+1. The frontier picks `https://a.com/page2` because a.com's wait time is over.
+2. The fetcher checks a.com's robots.txt (cached), downloads the page with strict time and size limits.
+3. The raw page is saved to storage and a small "fetched" message goes to Kafka.
+4. The parser finds 40 links, cleans them up, and drops ones already seen.
+5. Each new link goes to the machine that owns its host, where it joins that host's queue.
 
 ```mermaid
 flowchart LR
@@ -168,8 +198,8 @@ flowchart LR
 Step by step:
 1. **Frontier** chooses the next URL whose host is allowed to be fetched now (the mechanism is in section 8 and in the Go code).
 2. **Fetcher** resolves DNS through a local cache, checks robots.txt from a per-host cache, and fetches with strict limits: connect and read timeouts, a maximum body size, and a cap on redirects ([[Timeouts, Retries and Backoff]]).
-3. The raw response is written to object storage in WARC (Web ARChive) files, and a small event goes to Kafka ([[Kafka and Event Streaming]]). Fetching and parsing are decoupled, so a slow parser creates lag, not lost pages ([[Backpressure and Flow Control]]).
-4. **Parser** extracts links and text. The content fingerprint decides whether the page is new content or a duplicate of a page already stored.
+3. The raw response is written to object storage (cheap storage for big files) in WARC (Web ARChive) files, and a small event goes to Kafka ([[Kafka and Event Streaming]]). Fetching and parsing are decoupled, so a slow parser creates lag, not lost pages ([[Backpressure and Flow Control]]).
+4. **Parser** extracts links and text. The content fingerprint (a short hash of the page text) decides whether the page is new content or a duplicate of a page already stored.
 5. Each extracted URL is **normalized** (lower-case host, drop the fragment and default port, strip known tracking parameters), filtered (allowed schemes, URL length, per-host caps), and checked against the **seen-URL** set.
 6. New URLs are routed to the crawler node that owns `hash(host)`, using [[Consistent Hashing]] so adding a node moves only about `1/N` of hosts.
 
@@ -522,6 +552,14 @@ This frontier starts the politeness gap when a URL is handed out. A production v
 | Bloom filter | ~9.6 bits per URL at 1% false positives | Memory is tight; missing 1% of URLs is acceptable | False positives mean pages are **never** crawled |
 | Headless browser rendering | Run JavaScript before extracting links | Single-page apps | 10× to 100× more CPU per page (estimate); run only for hosts that need it |
 
+### Things people confuse this with 🟡
+
+| Thing | What it does | How it differs from a crawler |
+| --- | --- | --- |
+| Scraper | Pulls specific data from a few known pages | Narrow and targeted; a crawler discovers pages across the web |
+| Search index ([[Search Engines and Inverted Indexes]]) | Answers queries over pages | Comes after crawling; the crawler only fetches |
+| RSS / sitemap reader | Reads lists the site publishes | The site tells you what changed; no link discovery needed |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - **Freshness vs coverage.** Every re-crawl of a known page is a new page you did not fetch. Spend the budget by estimated change rate and importance, not uniformly.
@@ -538,9 +576,11 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the pipeline, the sizing, the data and the Go frontier. **Next is the advanced part**: real systems and failures, the two-level frontier, URL and content dedupe, re-crawl scheduling and scaling out.
+
 - **Real systems.**
 	- Mercator (Heydon and Najork) introduced the front-queue and back-queue frontier still taught in Introduction to Information Retrieval.
-	- Google published near-duplicate detection with 64-bit SimHash fingerprints, treating pages within a Hamming distance of 3 as near-duplicates (Manku et al., 2007).
+	- Google published near-duplicate detection with 64-bit SimHash fingerprints, treating pages within a Hamming distance of 3 (fingerprints differing in at most 3 bits) as near-duplicates (Manku et al., 2007).
 	- Googlebot ignores the non-standard `Crawl-delay` directive, per Google's own documentation.
 - **robots.txt rules (RFC 9309).**
 	- Use the `User-agent` group that matches the crawler's product token (else the `*` group), and within it the longest matching `Allow` or `Disallow` rule; on a tie, `Allow` wins.
@@ -571,6 +611,14 @@ flowchart LR
 ## 8. Deep dive 🔴
 
 ### The two-level frontier
+
+```mermaid
+flowchart LR
+    F["front queues by priority"] --> B["back queue per host"]
+    B --> H["heap: host ordered by ready time"]
+    H --> W["fetcher takes a ready host"]
+    W --> R["host ready again after delay"]
+```
 
 **In plain words:** first pick by importance, then sort into one queue per website so politeness is easy.
 
@@ -670,6 +718,26 @@ Conditional requests (`If-Modified-Since`, `If-None-Match`) turn unchanged pages
 
 > [!question]- How do you decide which pages to re-crawl and how often?
 > Keep a per-URL change estimate. If the content hash changed since the last fetch, shorten the interval; if it did not, lengthen it, within bounds. Use conditional GETs to make unchanged pages cheap, and prefer sitemap `lastmod` hints. Weight the schedule by importance so a news homepage is checked every few minutes and an old forum thread every few weeks.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is the frontier?
+> The to-do list of URLs still to fetch.
+
+> [!question]- Easy: what does "polite" mean for a crawler?
+> At most one request at a time per site, with a wait between requests, and obeying robots.txt.
+
+> [!question]- Easy: why save raw pages and not just parsed text?
+> So you can re-parse with a better parser without fetching the web again.
+
+> [!question]- Medium: 1 billion pages a month. Roughly how many fetches a second?
+> About 386 a second on average.
+
+> [!question]- Medium: how do you remember 10 billion seen URLs cheaply?
+> A Bloom filter, accepting that a few new pages are skipped as false positives.
+
+> [!question]- Medium: how do you avoid an endless calendar of "next month" pages?
+> Cap pages and depth per host, and normalize URLs to drop session IDs.
 
 ## 10. Cheat sheet 🟢
 

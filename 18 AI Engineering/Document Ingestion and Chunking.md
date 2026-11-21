@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[LLM Fundamentals]]: a model can read only so many tokens at once (the context window), and every token you send costs money.
+> - [[Embeddings]]: a piece of text can be turned into a list of numbers, so that similar meanings can be found by closeness.
+
 **From zero, in 60 seconds** 🟢
 
 You have a 40-page manual and want a bot to answer questions from it. You cannot paste all 40 pages into every question. It costs too much, and the answer gets lost in the pile.
@@ -76,6 +80,11 @@ This note is about cutting well and labelling well.
 | Metadata | Labels stored with a chunk | `source=manual.pdf, page=3` |
 | Embedding | Numbers that capture a chunk's meaning | A 1,536-number vector |
 | Upsert | Insert, or update if it already exists | Re-index a changed page |
+| OCR | Software that reads text out of a picture or a scanned page | A photo of a bill → its text |
+| Boilerplate | Repeated page parts that are not real content | Menus, cookie banners, page footers |
+| Content hash | A short fingerprint of a text that changes if the text changes | `sha256("Hold for 10s")` |
+| Tenant | One customer company whose data must stay separate | "acme" must never see "globex" files |
+| Dead-letter queue (DLQ) | A side queue for jobs that keep failing, so they stop blocking others | A corrupt PDF parked for a human |
 
 **Picture it**
 
@@ -111,6 +120,21 @@ Ingestion solves this by doing the expensive work once, offline: turn the PDF in
 
 Get chunking wrong and the symptoms show up downstream, not in this pipeline: retrieval returns the wrong paragraph, answers cite the wrong page, or a table of pricing data gets flattened into unreadable text and the model invents numbers instead.
 
+### Real-life example 🟢
+
+Think of an airline app like IndiGo adding a "ask about baggage rules" bot. The rules live in a 60-page PDF with tables of weight limits per route.
+Ingestion parses the PDF once, keeps each table as a readable table, cuts the text into small chunks along headings like "Cabin baggage" and "Extra baggage fees", and labels each chunk with its page number.
+When a traveller asks "how many kg can I carry on a domestic flight?", the bot fetches the 3 chunks about cabin baggage and answers with "page 12".
+If the airline updates the fees page, only the chunks whose text changed get re-embedded.
+
+### Common beginner mistakes 🟢
+
+- **Cutting every 500 characters, blind** → sentences and tables get split in half, so neither half makes sense → cut on paragraphs and headings first, and only cut smaller when a piece is still too big.
+- **Throwing away the page and source** → the bot cannot cite where an answer came from, and you cannot delete a document's chunks later → store document id, source and page with every chunk.
+- **Treating a scanned PDF like a normal one** → it has no text layer, so you get empty chunks with no error → check how much text came out per page and send near-empty pages to OCR.
+- **Re-embedding everything on every update** → you pay again for text that did not change → hash each chunk and only embed new or changed ones.
+- **Adding permissions later, at query time** → chunks without a tenant label can leak into other customers' answers → attach tenant and permission fields at ingestion.
+
 ## 2. Mental model 🟢
 
 Think of a cookbook.
@@ -119,7 +143,18 @@ You would not photocopy the whole book and hand it to someone asking "how long d
 
 Document ingestion is that tearing-and-labelling process, done automatically: split along natural boundaries (paragraphs, sections) first, fall back to harder cuts only when a piece is still too big, and always attach a label (metadata) before filing it away.
 
+### Chunking vs the things people confuse it with 🟡
+
+| Thing | What it does | Key difference |
+| --- | --- | --- |
+| Chunking | Cuts a document into small, labelled pieces to search later | Keeps the exact words, so facts can be quoted and cited |
+| Summarising | Writes a short version of the whole document | Loses exact numbers and clauses a question may need |
+| Long context | Sends the whole document with every question | No cutting, but costly per call and works only for small documents |
+| Tokenising | Splits text into tokens for the model to read | Happens inside every model call; much smaller pieces than chunks |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that ingestion prepares documents once: cut them into small labelled pieces so a question fetches only the right ones. **Next we open the box**: every stage from upload to storage, the different ways to cut text, the "small piece, big parent" trick, and exactly which labels each chunk needs. Each subsection starts with a plain step-by-step walk.
 
 **In plain words:** A file goes through an assembly line: read it, clean it, cut it, label it, turn it into numbers, store it.
 
@@ -146,8 +181,8 @@ flowchart TD
 
 Each stage, in order:
 
-1. **Load.** A format-specific loader fetches the raw bytes: an S3 object, an uploaded file, or a crawled URL.
-2. **Parse.** Extract text by format. A digital PDF has a text layer; a scanned PDF or photographed page does not and needs OCR (Tesseract, a cloud document AI service, or a layout-aware vision-language model — verify current options, since this area moves fast). HTML needs boilerplate stripped (navigation, cookie banners); DOCX and Markdown already carry structure (headings, lists) that a parser should keep rather than flatten.
+1. **Load.** A format-specific loader fetches the raw bytes: an S3 object (a file stored in Amazon's cloud storage), an uploaded file, or a crawled URL.
+2. **Parse.** Extract text by format. A digital PDF has a text layer; a scanned PDF or photographed page does not and needs OCR (Tesseract, a cloud document AI service, or a layout-aware vision-language model, meaning an AI model that reads page images and understands columns and tables — verify current options, since this area moves fast). HTML needs boilerplate stripped (navigation, cookie banners); DOCX and Markdown already carry structure (headings, lists) that a parser should keep rather than flatten.
 3. **Clean.** Remove running headers/footers and page numbers, join words split by line-wrapped hyphens, de-duplicate repeated boilerplate, and keep tables in a readable form (Markdown table or row-per-line text) instead of mashing cells into one unreadable line.
 4. **Chunk.** Split into pieces sized for the embedding model and the LLM's context budget. See the strategies below.
 5. **Enrich.** Optionally prepend context a chunk would otherwise lose by being cut out of its document: the section heading it falls under, or a one-sentence LLM-generated summary of what the chunk is about and where it sits ("contextual retrieval"). This measurably improves retrieval because the chunk's embedding now reflects context it didn't literally contain.
@@ -157,6 +192,15 @@ Each stage, in order:
 ### Chunking strategies
 
 **In plain words:** Different ways to cut the text, from "every 500 characters" (simple) to "wherever the topic changes" (smart).
+
+**Step by step:**
+1. Set a budget, say 500 tokens per chunk with 50 tokens of overlap.
+2. **Recursive:** split the section on blank lines into paragraphs. A 300-token paragraph fits, so it becomes one chunk.
+3. A 900-token paragraph is too big, so split it on sentence ends and pack sentences into chunks of up to 500 tokens.
+4. A single sentence over 500 tokens (rare, like a long list) gets split on words.
+5. Copy the last 50 tokens of each chunk to the start of the next, so a fact on the edge is not cut in half.
+
+Full detail:
 
 | Strategy | How it works | Use when |
 | --- | --- | --- |
@@ -178,6 +222,15 @@ flowchart LR
 
 **In plain words:** Search with small precise pieces, but hand the model the bigger section they came from.
 
+**Step by step:**
+1. The "Resetting the device" section is the **parent**. Cut it into 3 small **child** chunks of one sentence each.
+2. Embed and index only the children; each child stores its parent's id.
+3. Query "how long do I hold the button?" best matches child 1: "Hold the power button for 10s".
+4. Look up child 1's parent and send the whole section to the model.
+5. The answer can now also say "release when the LED turns blue", which was in child 3.
+
+Full detail:
+
 ```mermaid
 flowchart LR
     Doc["Section: Resetting the device"] --> C1["child: \"Hold the power button for 10s\""]
@@ -193,6 +246,15 @@ The vector search matches on the small, specific child chunk (precise embeddings
 ### What to store per chunk
 
 **In plain words:** Each chunk needs a label card: what it says, where it came from, and who may see it.
+
+**Step by step:**
+1. Give the chunk an id, like `manual-v3#p12#c4`, and keep its text.
+2. Write where it came from: `manual.pdf`, page 12, section "Reset".
+3. Store the document id and a hash of the chunk text.
+4. Add who may see it: `tenant_id = acme`, plus any role or group list (an **ACL**, access control list).
+5. Optionally note which embedding model made its vector, for safe migrations later.
+
+Full detail:
 
 - Chunk id and chunk text
 - Source document name and page or section
@@ -414,6 +476,15 @@ func TestDedup_DropsRepeatedFooter(t *testing.T) {
 
 **In plain words:** When a document changes, redo only the changed chunks, not the whole library.
 
+**Step by step:**
+1. The 40-page manual is edited: only page 7 changed.
+2. Re-parse and re-chunk the whole document (cheap).
+3. Hash each new chunk and compare with the hashes already stored.
+4. 295 of 300 hashes match, so skip them. Embed and upsert only the 5 changed chunks (the paid step).
+5. If parsing or embedding fails, retry a few times, then park the job in the dead-letter queue.
+
+Full detail:
+
 ```mermaid
 stateDiagram-v2
     [*] --> Queued: document uploaded or updated
@@ -460,18 +531,20 @@ flowchart LR
 
 ## 7. In production 🔴
 
-- **Real systems:** document loaders and chunkers in LangChain and LlamaIndex; Unstructured.io for layout-aware parsing (tables, multi-column PDFs); cloud document-AI services (verify current offerings, since this market moves fast) for OCR and form extraction.
+> 🟡 → 🔴 **You now know** the full pipeline, how to choose a chunking strategy and size, and how to re-index only what changed. **Next comes the senior view**: which tools teams use, how ingestion fails quietly, how to run it as a safe background job, and where PII, language and cost come in.
+
+- **Real systems:** document loaders and chunkers in LangChain and LlamaIndex; Unstructured.io for layout-aware parsing (parsing that understands page layout: tables, multi-column PDFs); cloud document-AI services (verify current offerings, since this market moves fast) for OCR and form extraction.
 - **Failure modes → fixes:**
   - A scanned PDF with no text layer silently returns empty chunks → detect this (near-zero extracted characters per page) and route to OCR.
   - A table flattened into one run-on line → parse tables separately and keep them as a Markdown table or row-per-line text block.
   - Re-ingesting a document re-embeds everything, burning API budget → content-hash each chunk and skip unchanged ones.
-  - A worker crashes mid-batch and half a document's chunks are indexed → make ingestion idempotent (upsert by chunk id) and make workers retry safely; route documents that fail repeatedly to a dead-letter queue instead of retrying forever (see [[Dead Letter Queues and Poison Messages]]).
+  - A worker crashes mid-batch and half a document's chunks are indexed → make ingestion idempotent (safe to run twice with the same result: upsert by chunk id) and make workers retry safely; route documents that fail repeatedly to a dead-letter queue instead of retrying forever (see [[Dead Letter Queues and Poison Messages]]).
 - **What to monitor:** ingestion latency per document (and per stage), parse failure rate by format, OCR fallback rate, chunks produced per document, embedding API cost per document, and the age of the oldest un-indexed document in the queue.
 
 ## 8. Deep dive 🔴
 
 - **Async pipeline design.** Ingestion is naturally a job queue problem: uploading a document enqueues a job, a pool of workers parses/chunks/embeds, and the document's status (queued → parsing → chunking → embedding → indexed, or failed) is polled or pushed to the uploader. Workers must be idempotent (safe to re-run a job that half-completed) and retries must be bounded, with a dead-letter queue for documents that keep failing — see [[Background Jobs and Worker Pools]] and [[Dead Letter Queues and Poison Messages]] for the general pattern; this note only covers what is specific to document pipelines.
-- **PII and dedup before embedding.** Running a PII detector (regex plus a lightweight model) before the embed step, and redacting or dropping chunks that fail it, is cheaper than catching the leak after it is sitting in a vector store that every retrieval query can reach.
+- **PII and dedup before embedding.** Running a PII (personal data such as phone numbers, emails, ID numbers) detector (regex plus a lightweight model) before the embed step, and redacting or dropping chunks that fail it, is cheaper than catching the leak after it is sitting in a vector store that every retrieval query can reach.
 - **Language detection.** A multilingual corpus needs per-chunk language tags, both so you can route to a multilingual embedding model and so retrieval can be filtered or boosted by the query's language.
 - **Cost.** OCR and embedding are the two line items that scale with corpus size: OCR is usually priced per page, embeddings per token. A 500-page scanned manual can cost noticeably more to ingest than an equivalent-length born-digital PDF purely from the OCR step — budget for it separately when estimating ingestion cost.
 
@@ -508,6 +581,26 @@ flowchart LR
 - Handle scanned PDFs (OCR), tables, and HTML boilerplate as separate parser paths, not one generic text extractor.
 - Attach permissions at ingestion time; enforce the filter at every retrieval query.
 - Make ingestion workers idempotent with bounded retries and a dead-letter queue.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: What is a chunk?
+> One small piece of a document, stored with labels so it can be searched and cited.
+
+> [!question]- Easy: Why not send the whole 40-page manual with every question?
+> It costs too many tokens and the useful paragraph gets lost in the middle.
+
+> [!question]- Easy: What is overlap for?
+> It repeats a little text at chunk edges so a fact on the boundary is not split in half.
+
+> [!question]- Medium: Your bot returns empty answers for one PDF. What do you check first?
+> Whether it is a scanned PDF with no text layer; if so, route it to OCR.
+
+> [!question]- Medium: One page of a manual changed. How do you avoid re-embedding all 300 chunks?
+> Compare content hashes and embed only the chunks whose hash changed.
+
+> [!question]- Medium: What does parent-child chunking give you?
+> Precise search on small children, plus full context by sending the parent section to the model.
 
 ## Links 🟢
 

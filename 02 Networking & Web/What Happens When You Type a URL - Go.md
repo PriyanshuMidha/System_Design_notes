@@ -23,6 +23,13 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code and Tests sections top to bottom; each big block has a plain-words opener first.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[DNS - Resolution, Records and Caching]]: a name becomes an IP; a literal IP like `127.0.0.1` needs no lookup at all.
+> - [[TCP - Handshake, Reliability, Flow and Congestion Control]]: opening a connection costs a handshake, which this code times as `Connect`.
+> - [[TLS and HTTPS]]: an `https://` request also pays a TLS handshake, timed as `TLSHandshake`.
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: `client.Do(req)` sends one request and gets a response with a body.
+> - [[HTTP Caching - Cache-Control, ETag, Conditional Requests]]: background only; this code times the network phases, not caching.
+
 **From zero** 🟢 — This file is the hands-on twin of [[What Happens When You Type a URL]]. It builds a tiny stopwatch in Go that times the four phases of one web request — finding the address (DNS), connecting (TCP), agreeing on encryption (TLS), and waiting for the first answer byte — then proves with tests that a second request on the same kept-open connection skips the connect and encryption steps entirely. Read each "In plain words" line before its code block and you can follow without deep Go knowledge.
 
 ## Before the code 🟢
@@ -57,6 +64,8 @@ go test -race ./...
 ```
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** the goal: put a stopwatch on DNS, connect, TLS and first byte for one request. **Next we read the code**: a struct with one slot per phase, and `Do`, which attaches small callbacks that fire at each phase boundary.
 
 ### The Timings type: one field per phase
 
@@ -160,7 +169,7 @@ The alternative — timing the whole `client.Do(req)` call as one block — was 
 **How it works.**
 1. Each callback (`DNSStart`, `DNSDone`, and so on) fires at an exact point inside the transport's own request lifecycle; the closures record a `time.Now()` at the start of a phase and compute the elapsed duration at its end.
 2. `req.WithContext(httptrace.WithClientTrace(...))` attaches the trace to this one request's `context.Context` — it never affects any other request on the same client, which matters because a shared `*http.Client` is often reused across many calls.
-3. Draining the body with `io.Copy(io.Discard, resp.Body)` before computing `Total` is what lets the underlying connection return to the client's connection pool for reuse — skipping this would silently defeat the exact connection-reuse behavior `TestDoReusesConnection` checks for.
+3. Draining the body with `io.Copy(io.Discard, resp.Body)` before computing `Total` is what lets the underlying connection return to the client's connection pool (the set of open connections kept for reuse) for reuse — skipping this would silently defeat the exact connection-reuse behavior `TestDoReusesConnection` checks for.
 4. A nil-check (`!dnsStart.IsZero()`) guards every "done" callback, because a phase that the transport skipped entirely (no DNS lookup for a literal IP, no TLS for a plain `http://` URL) never calls that phase's "start" callback either — the field is left at its zero value by design, not by omission.
 
 ```mermaid
@@ -183,6 +192,8 @@ sequenceDiagram
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** how `Do` records each phase and what both tests prove. **Next, the advanced part**: why the struct, body-draining and context choices were made, the misreadings and races to avoid, and exercises.
+
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
 | A `Timings` struct with named fields | A `map[string]time.Duration` | The struct catches a typo'd phase name at compile time and is self-documenting at the call site |
@@ -196,7 +207,7 @@ sequenceDiagram
 
 **In plain words:** this test starts a tiny local HTTPS server that deliberately dawdles for 5 ms, makes one request, and checks each stopwatch slot matches what the theory predicts.
 
-**Property proved:** a plain HTTPS request pays for connect and TLS (both strictly greater than zero), never pays for DNS when connecting to a literal IP (as `httptest.NewTLSServer` does), and every phase is internally consistent — nothing measures longer than the request's own `Total`.
+**Property proved:** a plain HTTPS request pays for connect and TLS (both strictly greater than zero), never pays for DNS when connecting to a literal IP (an address written as numbers, like `127.0.0.1`, as `httptest.NewTLSServer` uses), and every phase is internally consistent — nothing measures longer than the request's own `Total`.
 
 | Input | Expected output |
 | --- | --- |
@@ -259,6 +270,8 @@ The assertions check every phase against the prediction a reader should make bef
 | Two sequential `GET`s against the same `*http.Client` and server | First request: `Connect > 0`, `TLSHandshake > 0`. Second request: both `== 0` |
 
 A failure here (the second request still paying for connect or TLS) would mean the client isn't reusing its connection pool, directly contradicting the theory note's central warm-vs-cold claim.
+
+**What this code does, in plain words:** it sends two requests one after the other with the same client to the same test server, then checks the first paid for connect and TLS and the second paid for neither, because it reused the open connection.
 
 ```go
 func TestDoReusesConnection(t *testing.T) {
@@ -440,6 +453,26 @@ PASS
 1. Add a `DNSLookup` test using `httptest.NewServer` with a hostname instead of a literal IP (you'll need a fake resolver or a real hostname that resolves to loopback). Predict whether `DNSLookup` will be non-zero, then confirm.
 2. Change `Do` to also record `TLSHandshake` as zero for a plain `http://` test server (`httptest.NewServer`, not `NewTLSServer`). Predict the result before running it, then write the test.
 3. Add a `Redirects int` field to `Timings` that counts how many redirects the request followed, using `http.Client.CheckRedirect`. Predict how this interacts with a reused connection — does a redirect to the same host still reuse the connection from the first hop?
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 Which Go package provides the phase callbacks?
+> `net/http/httptrace`.
+
+> [!question]- 🟢 Why is `DNSLookup` zero in `TestDoHTTPS`?
+> The test server's URL uses a literal IP, so no DNS lookup happens.
+
+> [!question]- 🟢 What does a zero `TLSHandshake` mean?
+> That phase was skipped (no TLS, or a reused connection), not that it was instant.
+
+> [!question]- 🟡 Why must `Do` drain the response body?
+> So the connection can go back to the pool; otherwise the next request opens a new one.
+
+> [!question]- 🟡 Why attach the trace through the request's context instead of a global?
+> It applies only to that one request, so concurrent requests on a shared client don't mix readings.
+
+> [!question]- 🟡 What does the second request in `TestDoReusesConnection` skip?
+> Both `Connect` and `TLSHandshake`, because the kept-alive connection is reused.
 
 ## Links
 

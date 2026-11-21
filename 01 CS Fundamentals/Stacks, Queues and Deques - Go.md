@@ -20,6 +20,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
 > - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Stacks, Queues and Deques]]: the theory twin. Know LIFO vs FIFO, why `q = q[1:]` leaks, what a ring buffer is, and what a monotonic stack does.
+> - [[Data Structures Overview and Big-O Cheat Sheet]] and [[Arrays and Dynamic Arrays (Go Slices)]]: `O(1)` vs `O(n)`, and how Go slices grow.
+
 **From zero** 🟢: this file is the hands-on side of [[Stacks, Queues and Deques]]. It builds a stack from a slice, a proper queue as a ring buffer (and shows why a plain slice leaks as a queue), and the monotonic-stack interview pattern — all tested. Read each step's notes before the code.
 
 ## Before the code 🟢
@@ -27,6 +31,8 @@ updated: 2026-11-13
 - **Generics** (`Stack[T any]`, `RingBuffer[T any]`): one stack or queue type that works for any element type, checked at compile time.
 - **Slices** (`append`, `s[:len(s)-1]`): push and pop for a stack; a fixed slice used in a circle for the ring buffer.
 - **Sentinel errors** (`var ErrEmpty = errors.New(...)`): one shared error value callers can compare against with `errors.Is`.
+- **Ring buffer**: a fixed array used in a circle with a `head` index; the queue in this file.
+- **Data race**: two goroutines touching the same memory at once with at least one writing; `-race` catches it.
 - **Goroutines and channels** (`go func`, `chan int`): `RunPipeline` uses a buffered channel as a bounded FIFO queue between a producer and a consumer.
 - **`sync.WaitGroup` and `sync.Mutex`**: wait for goroutines to finish, and protect shared data from two goroutines writing at once.
 - **What to run:** `go vet ./sqd/... && go test -race ./sqd/...` inside the module; `-race` matters for `RunPipeline`.
@@ -117,7 +123,11 @@ None of these are bugs in the code as written — they're scope boundaries, chos
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** the seven pieces and how they relate. **Next we read the code:** seven steps from a plain stack to a concurrent pipeline, each with a one-line summary first.
+
 ### Step 1: `Stack[T]`, a generic LIFO
+
+**What this code does, in plain words:** a stack type that works for any element type: `Push` appends, `Pop` removes and returns the last item, and both return an error instead of crashing when the stack is empty.
 
 **Concept.** This is [[Stacks, Queues and Deques#In plain words a stack is a slice used LIFO|the stack idea]] made explicit and reusable: a generic type instead of a raw `[]int` everywhere, with `Pop`/`Peek` returning an error instead of panicking on empty, which is the idiomatic Go shape for "this can fail, the caller decides what to do."
 
@@ -168,6 +178,8 @@ func (s *Stack[T]) Len() int { return len(s.data) }
 **How it works.** `Pop`/`Peek` return `(T, error)` rather than panicking on empty, matching Go's convention of making "this operation can fail" visible in the signature rather than via a runtime panic the caller must remember to guard against.
 
 ### Step 2: `RingBuffer[T]`, the queue that doesn't leak
+
+**What this code does, in plain words:** a queue stored in a fixed array used in a circle; pushes go to the end, pops come from `head`, and the array doubles only when every slot is full.
 
 **Concept.** This implements [[Stacks, Queues and Deques#Tracing a ring buffer through a growth event|the grow-on-full trace]] from the theory note exactly: a fixed circular array that only reallocates when genuinely full, instead of shifting or leaking on every dequeue.
 
@@ -235,6 +247,8 @@ func (r *RingBuffer[T]) Pop() (T, error) {
 
 ### Step 3: `ValidParentheses`, a direct use of `Stack[T]`
 
+**What this code does, in plain words:** it walks a string of brackets; each opener pushes the closer it expects, and each closer must match the top of the stack.
+
 **Concept.** This is the canonical "why a stack" example from the theory note's opening: at a closing bracket, you need exactly the most recently seen unmatched opener. Pushing the *expected closer* (not the opener itself) means matching is a single equality check instead of a lookup.
 
 ```go
@@ -263,6 +277,8 @@ func ValidParentheses(s string) bool {
 3. `stack.Len() == 0` at the end catches the remaining case: openers that were never closed at all.
 
 ### Step 4: the monotonic stack — `DailyTemperatures`
+
+**What this code does, in plain words:** for each day it finds how many days you wait for a warmer one, using a stack of days still waiting.
 
 **Concept.** This implements [[Stacks, Queues and Deques#In plain words the monotonic stack — next greater element|the "next greater element" trace]] from the theory note: the stack holds indices whose answer isn't known yet, and a new, larger temperature resolves every index it's bigger than, in one pass.
 
@@ -296,6 +312,8 @@ func DailyTemperatures(temps []int) []int {
 4. Every index is pushed exactly once (at the end of its own iteration) and popped at most once (when its answer is found), which is why the total work across the whole function is `O(n)` despite the nested loop shape.
 
 ### Step 5: the monotonic deque — `SlidingWindowMax`
+
+**What this code does, in plain words:** for every window of `k` numbers it reports the biggest one, keeping a short list of candidate positions in decreasing order.
 
 **Concept.** Unlike `DailyTemperatures`, this pattern needs removal from *both* ends: the back, when a new value makes earlier smaller values useless, and the front, when the current maximum has aged out of the window. A plain slice (not `Stack[T]`) is used here because both ends need direct indexing.
 
@@ -333,6 +351,8 @@ func SlidingWindowMax(nums []int, k int) []int {
 4. `deque = deque[1:]` here is acceptable because the deque's own length is bounded by the window size and the loop's total iterations, not by the full dataset growing unboundedly — unlike the `q = q[1:]` queue anti-pattern in [[Stacks, Queues and Deques]], there is no unbounded backing-array growth here.
 
 ### Step 6: multi-source BFS — `RottingOranges`
+
+**What this code does, in plain words:** it counts how many minutes it takes for rot to spread from every rotten orange to all fresh neighbours, or returns -1 if some orange can never be reached.
 
 **Concept.** This is [[Stacks, Queues and Deques#Picture it BFS level order as multi-source expansion|the level-order diagram]] made concrete: every rotten orange is a BFS source pushed at minute 0, and processing the queue one full level at a time makes "one level" and "one minute" the same thing.
 
@@ -397,6 +417,8 @@ The main loop then expands outward one level (one minute) at a time:
 3. `fresh > 0` after the loop ends means some fresh oranges were never reachable at all, which is the `-1` case; otherwise `minutes` is exactly the number of levels processed.
 
 ### Step 7: a buffered channel as a bounded concurrent queue — `RunPipeline`
+
+**What this code does, in plain words:** one goroutine sends items into a small buffered channel, another takes them out, processes them and writes the results in order.
 
 **Concept.** This is [[Stacks, Queues and Deques#Picture it a buffered channel as a queue with backpressure|the backpressure sequence diagram]] turned into a runnable producer/consumer pipeline: the channel's capacity (`jobs`) is the queue's bound, and a mutex protects the one piece of shared, non-channel state (`out`/`idx`).
 
@@ -566,6 +588,8 @@ $ go test -race ./sqd/...
 ok  	cs1scratch/sqd	0.187s
 ```
 
+> 🟡 → 🔴 **You now know** every structure and what its test proves. **Next comes the advanced part:** the quiet bugs (wrong copy order in `grow`, popped slots not cleared, a missing mutex) that pass casual tests but fail in real use.
+
 ## Pitfalls in the code 🔴
 
 None of the pitfalls below show up as a compile error or a panic on first run — that's precisely what makes them pitfalls rather than bugs you'd catch immediately.
@@ -647,6 +671,30 @@ Keeping that purpose in view while changing the code is what separates "the test
 1. Remove the `mu.Lock()`/`mu.Unlock()` pair in `RunPipeline`'s consumer and predict what `go test -race ./sqd/...` reports (it will not simply fail the output-equality check — it flags the race itself).
 2. Add a `PushFront`/`PopFront` to `RingBuffer[T]` so it becomes a true deque, and predict what changes about the `head`/`size` bookkeeping for `PushFront`.
 3. Change `RottingOranges` to also return the coordinates of any orange that never rots, and predict what data needs to be tracked alongside `fresh`.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does `Stack.Pop` return on an empty stack?
+> A zero value and `ErrEmpty`, not a panic.
+
+> [!question]- In `RingBuffer`, where does the next push go?
+> At `(head + size) % len(buf)`.
+
+> [!question]- In `ValidParentheses`, what does an opening `(` push?
+> The closer it expects, `)`.
+
+🟡 Medium
+
+> [!question]- Why must `grow` copy in logical order, not raw array order?
+> After wrapping, the oldest item may sit in the middle of the array; copying from `head` keeps FIFO order.
+
+> [!question]- Why does `Pop` zero the slot it leaves?
+> So the old value is no longer referenced and the garbage collector can free it.
+
+> [!question]- Why does `RunPipeline` need a mutex if it already uses a channel?
+> The channel only protects the values sent through it; `out` and `idx` are ordinary shared memory.
 
 ## Links
 

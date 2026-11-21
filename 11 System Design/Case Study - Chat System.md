@@ -34,6 +34,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Real-time APIs - WebSocket, SSE and Long Polling]]: a WebSocket is a connection that stays open so the server can push data any time.
+> - [[Scaling WebSockets]]: millions of open connections need many servers and a way to know who is on which one.
+> - [[Back-of-the-Envelope Estimation]]: turning "50 million users" into messages per second and gigabytes per day.
+> - [[Wide-Column Stores and Cassandra]]: a database that stores rows grouped by a key and sorted inside each group, good for "latest messages of this chat".
+
 **From zero, in 60 seconds** 🟢
 
 In a chat app, a message you send should show up on your friend's phone within about a second.
@@ -77,6 +83,11 @@ Messages must appear in the same order for both of them, and a retry must never 
 | Ack | A reply saying "I got it" | Server returns "sent" to Alice |
 | Push notification | An alert sent through Apple/Google when the app is closed | "Alice: on my way" on the lock screen |
 | Fan-out | Copying one message to many receivers | A group message to 50 members |
+
+| Client message ID | An ID the phone puts on a message so a resend can be spotted | `a-0017` sent twice is stored once |
+| Sync cursor | The last message number a device has seen in a chat | "I have up to #41" |
+| Heartbeat | A tiny "still here" ping sent every few seconds | phone pings every 30 s |
+| Partition (shard) | One slice of the data, stored and served together | all of chat c9 lives on one shard |
 
 **Picture it**
 
@@ -122,6 +133,13 @@ A chat system keeps a connection open so the server can push a message the momen
 - Order inside a conversation is the same for every member and device.
 - High availability: a gateway crash only forces its clients to reconnect.
 
+### Real-life example: WhatsApp ticks 🟢
+
+On WhatsApp, one grey tick means the server has your message, two grey ticks mean it reached your friend's phone, and blue ticks mean they read it.
+Those three marks are exactly the "sent", "delivered" and "read" receipts in this design.
+If your friend's phone is off, you see one tick until it comes back online and catches up.
+Open WhatsApp on a laptop too and the same chat shows there, which is the multi-device part.
+
 **Out of scope:** voice and video calls, message search, media transcoding (media goes to object storage and the message carries a URL).
 
 ## 2. Mental model 🟢
@@ -146,7 +164,17 @@ flowchart LR
     C -- "no" --> P["Send a postcard<br/>(push notification)"]
 ```
 
+## Common beginner mistakes 🟢
+
+- **Polling for new messages every few seconds** → millions of mostly empty requests and late messages → keep a WebSocket open and push.
+- **Ordering by the phone's clock** → phone clocks are wrong and two phones disagree → let the server give each message the next sequence number in the chat.
+- **Showing "sent" before saving** → a crash loses a message the user thinks was sent → store first, then ack.
+- **Treating a resend as a new message** → a lost ack plus a retry makes a duplicate → keep the client message ID and return the original number.
+- **Sending a push notification to someone who is online** → buzzes their phone for nothing → check the session registry first; push only to offline devices.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the parts: open connections, numbered messages, saved history and push for offline users. **Next we open the box** and follow one message on the send path, then see how an offline phone catches up.
 
 ```mermaid
 flowchart LR
@@ -169,7 +197,17 @@ flowchart LR
     MS --> HIST["History API (REST)"]
 ```
 
-**Send path.** Alice's phone sends a `send` event to its gateway.
+**Send path.**
+
+**Step by step:**
+1. Alice types "running late" in chat c9 and taps send. Her phone tags it `a-0017` and sends it over its open line to gateway 1.
+2. The message service checks: has it seen `a-0017` from Alice before? No.
+3. It gives the message the next number in c9, say 418, and saves it.
+4. Only now does Alice see one tick ("sent").
+5. A delivery worker asks the registry "where is Bob?", gets "gateway 2", and pushes #418 there. Bob's phone shows it and replies "delivered".
+6. If Bob had no open connection, he would get a push notification instead.
+
+Full detail: Alice's phone sends a `send` event to its gateway.
 
 The message service assigns the next sequence number for the conversation, writes the message, and only then acks Alice ("sent").
 
@@ -209,7 +247,16 @@ sequenceDiagram
     M-->>G1: read receipt to Alice
 ```
 
-**Read and sync path.** When Bob's phone reconnects after being offline, it sends its sync cursor (the last sequence it acknowledged) for each conversation it knows about and receives everything after it. Scrolling back uses the REST history API.
+**Read and sync path.**
+
+**Step by step:**
+1. Bob's phone was off. Its last seen number in c9 is 415.
+2. He opens the app. The phone connects to any gateway through the load balancer.
+3. It sends "c9: after 415, please".
+4. The server reads #416, #417 and #418 from the store and sends them.
+5. The phone moves its cursor to 418, so next time it asks only for newer messages.
+
+Full detail: when Bob's phone reconnects after being offline, it sends its sync cursor (the last sequence it acknowledged) for each conversation it knows about and receives everything after it. Scrolling back uses the REST history API.
 
 ```mermaid
 sequenceDiagram
@@ -266,13 +313,13 @@ All inputs are **estimates** for this exercise.
 | Gateways | 20 M ÷ 200k connections per gateway (a conservative planning figure) | ≈ 100 gateways, plus headroom for one zone failing |
 | Heartbeat traffic | 20 M connections ÷ 30 s interval | ≈ 670k tiny frames/s, handled inside gateways |
 
-The connection count, not the message rate, sizes the gateway fleet. A single well-tuned server can hold millions of idle TCP connections (WhatsApp reported over 2 million on one server in 2012), but planning for far fewer per box keeps memory for TLS buffers and makes a gateway's failure less disruptive: fewer clients reconnect at once.
+The connection count, not the message rate, sizes the gateway fleet. A single well-tuned server can hold millions of idle TCP connections (WhatsApp reported over 2 million on one server in 2012), but planning for far fewer per box keeps memory for TLS (the encryption layer under HTTPS) buffers and makes a gateway's failure less disruptive: fewer clients reconnect at once.
 
 ### API
 
 **In plain words:** a few small JSON messages over the open line: send, receive, "I got it", and "give me what I missed".
 
-WebSocket events (JSON shown for readability; production systems often use a binary format such as Protocol Buffers):
+WebSocket events (JSON shown for readability; production systems often use a binary format such as Protocol Buffers, a compact encoding from Google that is smaller and faster than JSON):
 
 ```json
 {"type": "send", "conv": "c9", "client_msg_id": "a-0017", "body": "running late", "sent_at_device": "2026-11-04T18:02:11Z"}
@@ -342,13 +389,13 @@ CREATE TABLE device_cursors (
 );
 ```
 
-The session registry is in Redis: `sess:{user_id}` is a hash of `device_id → gateway_id`, refreshed by heartbeats, with a 90-second expiry so a crashed gateway's entries disappear on their own.
+The session registry is in Redis (a fast in-memory key-value store): `sess:{user_id}` is a hash of `device_id → gateway_id`, refreshed by heartbeats, with a 90-second expiry (a TTL, time to live: the key deletes itself if not refreshed) so a crashed gateway's entries disappear on their own.
 
 ### Ordering and idempotent send in Go
 
 **In plain words:** the code gives each chat a counter for order, and remembers each message's client ID so a retry does not create a second copy.
 
-This models the message service's write path for one shard: a per-conversation counter gives a gapless order, and `(sender, client_msg_id)` makes resends harmless.
+This models the message service's write path for one shard: a per-conversation counter gives a gapless order (1, 2, 3 with no number skipped), and `(sender, client_msg_id)` makes resends harmless.
 
 In production the counter lives with the conversation's owner shard and the dedupe key in the store; the logic is the same.
 
@@ -497,11 +544,19 @@ The gapless sequence is what lets a device detect a missed message: if it holds 
 | --- | --- | --- | --- |
 | Write fan-out to members | Each message is forwarded to every member's live gateway, and an unread count per member is updated | 1:1 and small groups (up to hundreds of members) | Work per message grows with group size |
 | Read fan-out (channel pull) | The message is stored once; members' clients fetch new messages for the channels they have open | Large channels and broadcast rooms (thousands to millions of members) | No per-member unread state for free; clients poll or subscribe per open channel |
-| Per-gateway pub/sub | Each gateway subscribes to topics for the conversations its users are in (Redis Pub/Sub or NATS); the message service publishes once per conversation | Many gateways, conversations whose members are spread widely | Subscription churn as users connect; at-most-once, so sync cursors repair gaps |
+| Per-gateway pub/sub (publish/subscribe: senders publish to a topic, everyone subscribed gets a copy) | Each gateway subscribes to topics for the conversations its users are in (Redis Pub/Sub or NATS, a lightweight messaging server); the message service publishes once per conversation | Many gateways, conversations whose members are spread widely | Subscription churn as users connect; at-most-once, so sync cursors repair gaps |
 | Server sequence per conversation | Owner shard of the conversation increments a counter | You need gapless, identical order on every device | Writes for one conversation go through one owner |
-| Time-sortable ID only (Snowflake) | Order by `msg_id`; no shared counter | Very hot channels where a single counter is a bottleneck | Two messages within the same millisecond from different servers can order differently from the send order; gaps cannot be detected |
+| Time-sortable ID only (Snowflake: an ID that starts with the timestamp, so sorting IDs sorts by time) | Order by `msg_id`; no shared counter | Very hot channels where a single counter is a bottleneck | Two messages within the same millisecond from different servers can order differently from the send order; gaps cannot be detected |
 | Server-readable messages | TLS to the server, plaintext stored and indexed | Workplace chat with search, compliance export, moderation | The operator can read messages |
-| End-to-end encryption | Devices encrypt for each recipient device (Signal protocol); the server stores ciphertext | Consumer privacy | No server-side search, no content moderation, harder multi-device history |
+| End-to-end encryption | Devices encrypt for each recipient device (Signal protocol); the server stores ciphertext (scrambled bytes it cannot read) | Consumer privacy | No server-side search, no content moderation, harder multi-device history |
+
+### Things people confuse chat with 🟡
+
+| System | What it does | How it differs from chat |
+| --- | --- | --- |
+| [[Case Study - Notification System]] | Sends one-way alerts (push, SMS, email) | No conversation, no shared order, no open connection needed |
+| [[Case Study - News Feed]] | Shows posts from people you follow | Ranked and read later; order and "delivered" ticks do not matter |
+| [[Case Study - Live Comments and Reactions]] | Comments on a live video for huge audiences | Broadcast to millions, losing a few is fine, no per-person receipts |
 
 ## 6. Trade-offs and when not to use 🟡
 
@@ -520,15 +575,17 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the send and sync paths, the data model and the Go code for ordering and dedupe. **Next is the advanced part**: crashes and reconnect storms, where the sequence number really lives, presence at scale, many devices and end-to-end encryption.
+
 - **Real systems:**
 	- Discord stores messages partitioned by channel and a time bucket, ordered by Snowflake IDs, first in Cassandra and, after a migration completed in 2022 and described in a 2023 post, in ScyllaDB.
-	- WhatsApp and Signal use the Signal protocol for end-to-end encryption; for groups, WhatsApp uses Sender Keys so a sender encrypts a message once for the group rather than once per member.
+	- WhatsApp and Signal use the Signal protocol for end-to-end encryption; for groups, WhatsApp uses Sender Keys (one shared key per sender per group) so a sender encrypts a message once for the group rather than once per member.
 - **Failure modes → fixes:**
 	- Lost ack → client resends with the same `client_msg_id`; the server returns the original `seq` (tested above).
-	- Gateway crash → registry entries expire after the heartbeat TTL; clients reconnect with jittered backoff and sync from their cursors (see [[Timeouts, Retries and Backoff]]).
-	- Reconnect storm after a deploy or zone failure → jittered reconnect delays, admission control on gateways, and slow rolling restarts.
+	- Gateway crash → registry entries expire after the heartbeat TTL; clients reconnect with jittered backoff (each waits a growing, slightly random time, so they do not all reconnect at once) and sync from their cursors (see [[Timeouts, Retries and Backoff]]).
+	- Reconnect storm after a deploy or zone failure → jittered reconnect delays, admission control (a gateway refuses new connections above a safe rate) on gateways, and slow rolling restarts.
 	- Hot group (one huge active chat) → one Kafka partition and one storage partition take its load; move huge rooms to read fan-out and bucket their partitions by time. See [[Hot Keys and Hot Partitions]].
-	- Push token invalid (app uninstalled) → APNs returns HTTP 410 and FCM returns `UNREGISTERED`; delete the token.
+	- Push token invalid (app uninstalled) → APNs (Apple's push service) returns HTTP 410 and FCM (Google's push service) returns `UNREGISTERED`; delete the token.
 - **What to monitor:**
 	- Send-to-deliver latency p50/p99, split by online and offline recipients.
 	- Connections per gateway, connect rate and reconnect rate.
@@ -544,7 +601,17 @@ If the counter lives outside the message store, write it and the message in a wa
 
 **Group fan-out cost.** For a 500-member group with 20% online, each message is 100 gateway deliveries plus 400 unread-count updates and possibly 400 push notifications. Push notifications for busy groups are usually collapsed ("12 new messages in Trip") and rate-limited per user. Typing indicators in big groups are sampled or switched off.
 
-**Presence.** Each device sends a heartbeat every 30 seconds; the registry key expires after about 90 seconds without one, at which point the user is offline and `last_seen` is written.
+**Presence.**
+
+```mermaid
+flowchart LR
+    H["phone pings every 30 s"] --> R["registry key refreshed"]
+    R --> Q{"no ping for 90 s?"}
+    Q -- "no" --> ON["shown online"]
+    Q -- "yes" --> OFF["key expires: offline, write last_seen"]
+```
+
+Each device sends a heartbeat every 30 seconds; the registry key expires after about 90 seconds without one, at which point the user is offline and `last_seen` is written.
 
 Broadcasting every status change to every contact is the expensive part: a user with 500 contacts going online creates 500 events.
 
@@ -583,6 +650,26 @@ With end-to-end encryption, each device has its own key pair, so the sender's de
 > [!question]- What breaks when you deploy a new gateway version?
 > Every connection on a restarted gateway drops and reconnects. Drain gradually, add jitter to client reconnects, cap accepted connections per second, and keep enough spare capacity to absorb a whole zone of gateways.
 
+## Self-check 🟢🟡
+
+> [!question]- Easy: why does each phone keep a WebSocket open?
+> So the server can push a new message the moment it is saved, without the phone asking again and again.
+
+> [!question]- Easy: what does a sequence number give you?
+> The same message order for every member and device in a chat.
+
+> [!question]- Easy: Bob's phone is off. How does he learn of a new message?
+> A push notification through Apple or Google; when he opens the app, it syncs from its cursor.
+
+> [!question]- Medium: Alice's ack is lost and she resends. How do you avoid a duplicate?
+> The resend has the same client message ID, so the server returns the original sequence number instead of storing it again.
+
+> [!question]- Medium: a phone holds #401 and receives #403. What should it do?
+> Ask for everything after #401 first, because the gapless sequence shows #402 is missing.
+
+> [!question]- Medium: why not write fan-out to a 100,000-member channel?
+> Each message would cost 100,000 deliveries; store it once and let members read it when they open the channel.
+
 ## 10. Cheat sheet 🟢
 
 A 45-minute script:
@@ -590,7 +677,7 @@ A 45-minute script:
 - **0-5 min, requirements:** 1:1 and groups, receipts, typing, presence, offline push, multi-device, history. Under 200 ms delivery online, no loss after "sent", same order for everyone.
 - **5-10 min, estimates:** 50 M DAU × 40 = 2 B messages/day ≈ 23k/s, ≈ 100k/s peak; 100 B each → 200 GB/day; 20 M concurrent sockets ÷ 200k ≈ 100 gateways.
 - **10-15 min, API and data:** WebSocket `send{client_msg_id}`, `ack{seq}`, `delivered`, `read{up_to}`, `typing`, `sync{cursors}`; REST `GET /conversations/{id}/messages?before=`. Messages in Cassandra keyed `(conversation_id, bucket)` clustered by `msg_id`; device cursors per device.
-- **15-25 min, high-level design:** devices → L4 LB → gateways ↔ registry; message service (dedupe, seq, store, ack) → Kafka keyed by conversation → delivery workers → gateways or push.
+- **15-25 min, high-level design:** devices → L4 LB (a load balancer that forwards raw TCP connections without reading them) → gateways ↔ registry; message service (dedupe, seq, store, ack) → Kafka keyed by conversation → delivery workers → gateways or push.
 - **25-40 min, deep dives:** per-conversation sequence and gap detection; idempotent send; small-group write fan-out vs large-channel read fan-out; presence heartbeats with TTL and fan-out cost; multi-device sync cursors; what E2E encryption removes.
 - **40-45 min, wrap-up:** bottlenecks are connections per gateway, hot groups, reconnect storms. Monitor send-to-deliver p99, reconnect rate, consumer lag, dedupe ratio.
 

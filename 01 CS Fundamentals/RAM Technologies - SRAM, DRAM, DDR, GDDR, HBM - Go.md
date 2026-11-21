@@ -23,6 +23,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
 > - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM]]: the theory twin. Know that a container's memory limit is real DRAM, and that `GOMEMLIMIT` tells Go's garbage collector to stay under a ceiling.
+> - [[Memory Hierarchy and CPU Caches]]: background only.
+
 **From zero** 🟢: this file is the hands-on side of [[RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM]]. It is a small, tested Go helper that turns a container's DRAM budget into a safe GOMEMLIMIT value — a practical capacity-planning use of knowing how much memory you really have. Read the code with its notes, then the table-driven tests.
 
 ## Before the code 🟢
@@ -31,6 +35,8 @@ updated: 2026-11-13
 - **Multiple return values:** `ForContainer` returns `(int64, error)`; callers check `err` before using the number.
 - **`int64` arithmetic:** byte counts use `int64`, and `512 << 20` is a shift meaning 512 × 2^20 bytes (512 MiB).
 - **Table-driven tests:** a slice of anonymous structs lists cases; `t.Run` runs each as a named subtest.
+- **`GOMEMLIMIT` / `GOGC`:** `GOMEMLIMIT` is a soft ceiling on Go's memory; `GOGC` controls how often the garbage collector runs as the heap grows.
+- **OOM kill:** the kernel force-stopping a process that went over its container's memory limit.
 - **What to run:** `go vet ./... && go test -race ./...` from the module root.
 
 ## What this code shows 🟢
@@ -56,7 +62,11 @@ flowchart LR
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** the goal: turn a container's memory size into a safe Go memory limit. **Next we read the code:** one short function with input checks and one line of arithmetic.
+
 ### Step 1: computing a safe GOMEMLIMIT
+
+**What this code does, in plain words:** given the container's memory in bytes and a headroom percentage, it rejects bad inputs and returns "container size minus the headroom" as the value to use for `GOMEMLIMIT`. For 512 MiB with 20% headroom, that is about 410 MiB.
 
 **Concept.** The theory note's worked example argues that `GOGC` alone can't prevent an OOM kill in a memory-constrained container, because `GOGC` paces off live-heap growth with no absolute ceiling ([[RAM Technologies - SRAM, DRAM, DDR, GDDR, HBM#Tracing the capacity-planning decision, step by step]]).
 
@@ -197,6 +207,8 @@ ok  	cs1scratch/memlimit	1.224s
 
 That mostly confirms there is nothing to race on: `ForContainer` is a pure function with no shared mutable state, so the race detector's clean pass is really a statement about the test harness rather than about the arithmetic itself.
 
+> 🟡 → 🔴 **You now know** how the function and its table-driven test work. **Next comes the advanced part:** the limits of this helper: whole-percent headroom only, no floor on a "useful" limit, and the wiring left to the caller.
+
 ## Pitfalls in the code 🔴
 
 - **`headroomPct` is an `int`, not a `float64`.** Only whole-percent headroom values are supported; a caller wanting "12.5% headroom" would need to pre-convert that into an equivalent byte-based call instead, since this function has no fractional-percent path.
@@ -210,6 +222,30 @@ That mostly confirms there is nothing to race on: `ForContainer` is a pure funct
 1. Change the headroom check from `headroomPct >= 100` to `headroomPct > 100`, which would allow exactly `100`. Predict what `ForContainer` would return for `(1<<30, 100)` with that change, then run the existing test suite and see which case catches the regression.
 2. Add a new table case for `headroomPct == 0` (no headroom at all). Predict whether it should be treated as valid or invalid, then write the case and run it.
 3. Rewrite `usable`'s calculation to divide before multiplying (`containerBytes / 100 * int64(100-headroomPct)`) and run the existing tests against a container size that is not a multiple of 100. Predict which case, if any, starts failing.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does `ForContainer(512<<20, 20)` return?
+> 80% of 512 MiB, about 410 MiB, and no error.
+
+> [!question]- Why is `headroomPct == 100` rejected?
+> It would leave zero bytes for Go's heap, and a zero limit means "no limit" to `SetMemoryLimit`.
+
+> [!question]- What does `512 << 20` mean?
+> 512 × 2²⁰ bytes, which is 512 MiB.
+
+🟡 Medium
+
+> [!question]- Why multiply before dividing?
+> Dividing first would throw away the remainder early and lose precision.
+
+> [!question]- Why return an error instead of panicking on bad input?
+> A bad operator setting should be handled cleanly, not crash the service this helper exists to protect.
+
+> [!question]- Why leave headroom at all instead of using the full container size?
+> The runtime, the OS and other memory outside Go's heap also need room before the kernel's limit.
 
 ## Links
 

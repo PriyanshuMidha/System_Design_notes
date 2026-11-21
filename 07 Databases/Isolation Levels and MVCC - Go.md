@@ -32,14 +32,19 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 2-4 and the Tests.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Transactions and ACID]]: a transaction runs from `BEGIN` to `COMMIT`, and a failed one leaves no trace.
+> - [[Storage Engines - B-tree vs LSM and WAL]]: rows live in pages on disk, and the database logs changes before applying them.
+> - The theory twin [[Isolation Levels and MVCC]] explains row versions, snapshots, write skew and `40001` in plain words; read its sections 1-3 first.
+
 **From zero** 🟢 This file is the hands-on half of [[Isolation Levels and MVCC]]: small Go programs that act out what the theory note describes. One package re-builds, in plain Go, the rule PostgreSQL uses to decide which copy of a row you can see; another shows the retry loop every real app needs when it runs transactions at SERIALIZABLE, ending with the credit-limit check done safely. Read the theory note first, then skim the code top to bottom; each step says which theory section it proves, and the tests run with no database at all.
 
 - **Packages**: three packages in one module; `mvccmini` and `mvcc` are pure logic, `txretry` talks to PostgreSQL.
 - **Function types**: `Committed` is a `func(uint32) bool`, so a test can say "105 aborted" in one line.
 - **Table-driven tests**: one slice of cases checked in one loop, each case named in its failure message.
 - **Interfaces**: `Beginner` is the small slice of `pgx` the retry helper needs, so tests can pass a fake.
-- **`context.Context` and `errors.As`**: cancel retries on shutdown, and read the SQLSTATE (`40001`, `40P01`) from a `*pgconn.PgError`.
-- **Run**: `go mod tidy && go vet ./... && go test -race ./...` (no database needed).
+- **`context.Context` and `errors.As`**: cancel retries on shutdown, and read the SQLSTATE (PostgreSQL's five-character error code: `40001`, `40P01`) from a `*pgconn.PgError`.
+- **Run**: `go mod tidy && go vet ./... && go test -race ./...` (no database needed; `-race` turns on Go's race detector).
 
 ## What this code shows 🟢
 
@@ -80,6 +85,8 @@ go test -race ./...
 ```
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** the two halves: a model of how PostgreSQL picks a row copy, and a helper that retries SERIALIZABLE transactions. **Next we open the code** in four steps, from a 15-line visibility rule to the credit-limit check made safe.
 
 ### Step 1: the visibility rule in 15 lines
 
@@ -136,7 +143,7 @@ flowchart LR
 
 PostgreSQL answers the second with the commit log (`pg_xact`), which the model represents as a `Committed` function. The snapshot has the same shape `pg_current_snapshot()` prints, `xmin:xmax:xip_list`.
 
-A function type for `Committed` was chosen over a map so tests can express "105 aborted" or "105 committed" in one line. The model still ignores wraparound, command ids and lock-only `xmax`; it is a teaching model, not a clone.
+A function type for `Committed` was chosen over a map so tests can express "105 aborted" or "105 committed" in one line. The model still ignores wraparound (the 32-bit id counter going round in a circle), command ids (the step number of each statement inside one transaction) and lock-only `xmax`; it is a teaching model, not a clone.
 
 The types come first. A `Snapshot` has the shape `pg_current_snapshot()` prints, a `Version` is one heap tuple, and `Committed` stands in for the commit log:
 
@@ -222,7 +229,7 @@ flowchart TD
 
 The guarantee is only useful if the application re-runs the aborted transaction. The alternative designs are locking everything (pessimistic, see [[Locking - Optimistic vs Pessimistic - Go]]) or accepting anomalies at lower levels.
 
-The helper retries with capped exponential backoff and full jitter ([[Timeouts, Retries and Backoff]]) so that two losers do not collide again in lock-step. It uses `github.com/jackc/pgx/v5`.
+The helper retries with capped exponential backoff (each wait doubles, up to a limit) and full jitter (each wait is a random time below that limit) ([[Timeouts, Retries and Backoff]]) so that two losers do not collide again in lock-step. It uses `github.com/jackc/pgx/v5`.
 
 The package starts with the `Beginner` interface (satisfied by `*pgxpool.Pool` and `*pgx.Conn`, and by a fake in tests) and the error classifier:
 
@@ -319,7 +326,7 @@ Neither writes a row the other wrote, so snapshot isolation lets both commit and
 
 `CreateInvoice` is the application code that needs no explicit lock: it just reads, decides, writes, and relies on `Serializable` to run it again. Alternatives are a row lock on the customer (`FOR UPDATE`) or a stored running balance with a `CHECK` constraint.
 
-The imports and the sentinel error:
+The imports and the sentinel error (one fixed error value that callers can compare against):
 
 ```go
 package txretry
@@ -398,12 +405,14 @@ sequenceDiagram
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** how the visibility model and the retry helper work. **Next comes the review view**: the design choices behind them, how the tests pin each rule without a database, and the traps, such as callbacks that run twice.
+
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
 | Model visibility as a pure function over `Snapshot` and `Version` | Test against a real PostgreSQL | Runs anywhere in microseconds and makes each rule explicit; it ignores wraparound, command ids and lock-only `xmax` |
 | `Committed` is a function type | A `map[uint32]bool` or a real commit log | One-line scripting of "committed" or "aborted" in tests; callers must write a closure |
 | A 15-line mini model next to the full one | Only the full model | The first teaches the core idea, the second covers own writes and aborts; two files to keep consistent |
-| Retry the whole transaction at SERIALIZABLE | Lock rows pessimistically | No lock waits and no deadlock risk from the check itself; costs wasted work and a need for idempotent callbacks |
+| Retry the whole transaction at SERIALIZABLE | Lock rows pessimistically | No lock waits and no deadlock risk from the check itself; costs wasted work and a need for idempotent callbacks (safe to run twice with the same result) |
 | Retry only `40001` and `40P01` | Retry every error | Business and constraint errors fail fast; a new retryable code must be added deliberately |
 | Full-jitter backoff capped at 1 s | Fixed or non-jittered doubling | Spreads competing retries; wait times are random, so tests assert counts, not durations |
 | `Beginner` interface defined by the helper | Take `*pgxpool.Pool` directly | Works with a pool, a connection or a fake; one more indirection |
@@ -725,6 +734,30 @@ ok  	example.com/mvcc/txretry
 1. In `TestEachSnapshotSeesExactlyOneVersion`, change the case "105 aborted" so that `committed` is `both`. Predict which version is seen and which case in the table it now equals, then run it.
 2. Change the `fakeDB` in `TestRetriesSerializationFailuresUntilCommit` to fail three times and keep `maxAttempts` at 3. Predict the error type and the value of `runs`.
 3. Remove the `s.Running[xid]` check in `mvccmini.committedBefore`. Predict which of the three assertions in `TestMiniVisible` fails.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What two questions does `mvccmini.Visible` ask about a row copy?
+> Did a finished transaction create it, and has no finished transaction deleted it?
+
+> [!question]- Which error codes does `Retryable` accept?
+> Only `40001` (serialization failure) and `40P01` (deadlock).
+
+> [!question]- Why do the tests need no database?
+> The visibility model is pure Go, and the retry tests use a fake `Beginner` with scripted commit errors.
+
+🟡 Medium
+
+> [!question]- Reader 104 holds the `during` snapshot. After 105 commits, which copy does it see, and why?
+> `sent`: 105 is in the snapshot's running list, so its update is never seen from that snapshot.
+
+> [!question]- Why does `Serializable` wrap the whole `BeginTxFunc` call, not just `fn`?
+> A serialization failure often appears at `Commit`, and a retry must start a fresh transaction from `BEGIN`.
+
+> [!question]- Why is sending an email inside the `Serializable` callback a bug?
+> The callback may run several times on retries, so the email would be sent more than once.
 
 ## Links 🟢
 

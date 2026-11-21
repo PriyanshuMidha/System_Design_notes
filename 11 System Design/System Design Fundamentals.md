@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (requirements, quality targets, building blocks), 4 (whiteboard and availability maths) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[What Happens When You Type a URL]]: a browser finds a server's address, opens a connection and sends a request; the server sends a page back.
+> - [[Backend Request Lifecycle and Layering]]: inside the server, a request passes through a handler, business logic and a database call, then a response goes back.
+
 **From zero, in 60 seconds** 🟢
 
 Writing code makes one feature work. System design is deciding how the whole thing holds up when real life hits.
@@ -73,6 +77,12 @@ System design is planning, before that day, how the system stays fast, safe and 
 | Cache | Fast copy of data used often | Redis holding a user profile |
 | Queue | A line of jobs processed later | Send email after signup |
 | Single point of failure | One part whose failure stops everything | The only database server |
+| Load balancer | Spreads requests across many servers and skips dead ones | request 1 to server A, request 2 to server B |
+| CDN | Servers near users that keep copies of files | an image served from Mumbai, not Virginia |
+| DNS | The internet's phone book: turns a name into an address | `api.example.com` → `13.32.1.5` |
+| p99 | 99 out of 100 requests are faster than this | p99 = 200 ms |
+| Replica | A copy of the database kept in sync | a second Postgres that takes reads |
+| Durability | Saved data is not lost, even if a disk dies | a paid invoice still exists after a crash |
 
 **Picture it**
 
@@ -123,11 +133,51 @@ Two vocabulary pairs you will use in every design:
 - **Stateless vs stateful.** A stateless component keeps nothing between requests that another copy could not also serve (a Go API that reads the session from Redis). You can add or kill copies freely. A stateful component owns data (PostgreSQL, Kafka, Redis); copying it means [[Replication]] and splitting it means [[Partitioning and Sharding]].
 - **Read-heavy vs write-heavy.** A URL shortener does about 100 reads per write, so caches and replicas fix it. A metrics ingester does mostly writes, so batching, queues and partitioning fix it. The read:write ratio decides the whole architecture.
 
+### Real-life example: ordering food on Swiggy 🟢
+
+The features are simple: browse restaurants, add to cart, pay, track the rider.
+The hard part is the "how well": menus must load in under a second, the app must stay up on a rainy Friday night when orders jump, and a paid order must never vanish.
+So menus and photos are served from caches and a CDN, many identical app servers take the traffic, and orders are saved in a database with copies.
+Sending the "order confirmed" message is pushed to a queue, so a slow message service never blocks your payment.
+Each of those choices comes from a number in the requirements, not from habit.
+
+```mermaid
+flowchart LR
+    F["Features: browse, order, pay"] --> N["Numbers: under 1 s, always up, never lose an order"]
+    N --> B["Blocks: CDN, cache, many app servers, DB + copy, queue"]
+```
+
+## Common beginner mistakes 🟢
+
+- **Drawing boxes before writing requirements** → you build things nobody asked for and miss what matters → list features, numbers and out-of-scope first.
+- **Saying "highly available" or "fast" with no number** → nobody can check it or design for it → say "99.9% a month" or "p99 under 200 ms".
+- **Mixing up availability and durability** → you can be up and still lose data, or down and lose nothing → give each its own target.
+- **Adding every building block "just in case"** → each extra hop adds delay and another thing that can fail → add a block only when a number says you need it.
+- **Two copies on the same machine or rack** → they fail together, so you gain nothing → put copies in different zones.
+
+### Words people mix up 🟡
+
+| Pair | First one | Second one |
+| --- | --- | --- |
+| Latency vs throughput | How long one request takes (80 ms) | How many requests per second (5,000 RPS) |
+| Availability vs durability | Is it answering right now? | Is saved data still there? |
+| Functional vs non-functional | What it does ("create invoice") | How well ("p99 under 200 ms") |
+| Stateless vs stateful | Keeps nothing between requests, copy freely | Owns data, copying needs replication |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that design starts from what the app must do and how well, and that state (the database) is the hard part. **Next we open the box**: how to write requirements, what unit each quality uses, what each building block is for, and the path one request takes. Each subsection starts with a plain step-by-step walk; the full detail follows.
 
 ### Requirements first
 
 **In plain words:** before drawing boxes, write three lists: what users can do, how well it must work (with numbers), and what you will not build yet.
+
+**Step by step:**
+1. Ask: what can a user do? For an invoice app: create an invoice, send it, record a payment.
+2. Ask: how well? "Lists load in under 200 ms for 99% of users, the app is up 99.9% of the month, no payment is ever lost."
+3. Ask: how much? "2,000 requests per second at the busiest hour."
+4. Write what you will NOT build now, such as multi-currency tax.
+5. Only now start choosing boxes, each one tied to a number above.
 
 | Kind | Question it answers | Example (invoice service) |
 | --- | --- | --- |
@@ -138,6 +188,13 @@ Two vocabulary pairs you will use in every design:
 ### Quality attributes and their units
 
 **In plain words:** "fast", "reliable" and "scalable" mean nothing until you put a number on them. This table gives each word its unit.
+
+**Step by step:**
+1. "Reliable" becomes availability: 99.9% means about 43 minutes down a month.
+2. "Fast" becomes latency: p99 under 200 ms, so only 1 in 100 requests is slower.
+3. "Handles lots of users" becomes throughput: 2,000 requests per second.
+4. "Never loses data" becomes durability: how likely saved data survives a year.
+5. Now each word can be tested, and each one points at a different building block.
 
 | Attribute | Definition | Unit and typical target |
 | --- | --- | --- |
@@ -156,6 +213,14 @@ The formal way to write these targets is an SLI (what you measure) and an SLO (t
 ### The building-block catalogue
 
 **In plain words:** most systems are built from the same dozen parts. This map shows what each one is for.
+
+**Step by step:**
+1. The user's phone asks DNS for the address of `api.invoiceops.example`.
+2. Images and scripts come from a nearby CDN server, not from your servers.
+3. API calls hit a load balancer, which picks one healthy app server.
+4. The app server checks the cache first, then the database if the cache has nothing.
+5. Slow jobs, like sending an email, go on a queue; a worker picks them up later.
+6. Files go to object storage (a big, cheap store for files, like S3); logs and metrics go to monitoring.
 
 ```mermaid
 flowchart LR
@@ -191,6 +256,14 @@ flowchart LR
 ### A request's lifecycle through the stack
 
 **In plain words:** follow one click from the phone, through every box, to the database and back.
+
+**Step by step:**
+1. Riya opens "unpaid invoices". Her browser looks up the server's address in DNS (and remembers it for a while).
+2. The request goes, encrypted with TLS (the lock in the address bar), to the load balancer.
+3. The load balancer hands it to one healthy API server.
+4. The API asks Redis for the list. If Redis has it (a hit), done in about 1 ms.
+5. If not (a miss), the API asks PostgreSQL, then saves the answer in Redis for 60 seconds.
+6. The answer goes back the same way. Riya sees her list.
 
 ```mermaid
 sequenceDiagram
@@ -235,6 +308,8 @@ Draw this in two minutes for any web system, then adapt it:
                        |-> [Queue] -> [Workers] -> [Object storage / email]
 NFRs on the side: p99 < 200 ms, 99.9%, 2k RPS peak, RPO 0 for payments
 ```
+
+NFR means non-functional requirement. RPO (recovery point objective) is how much recent data you may lose in a disaster; RPO 0 means "lose nothing".
 
 ### Availability is arithmetic
 
@@ -359,7 +434,7 @@ Systems fall into a few shapes, and the shape decides the first components you r
 | Shape | Read:write | First tools | Typical example |
 | --- | --- | --- | --- |
 | Read-heavy | 10:1 to 1000:1 | Cache, CDN, read replicas | URL shortener, product catalogue, news feed reads |
-| Write-heavy | 1:1 or below | Append-only logs, batching, partitioning, LSM stores | Metrics, logs, ad clicks, IoT telemetry |
+| Write-heavy | 1:1 or below | Append-only logs, batching, partitioning, LSM stores (databases built to take writes fast by appending, like Cassandra) | Metrics, logs, ad clicks, IoT telemetry |
 | Real-time / connection-heavy | Mixed | Long-lived connections, fan-out, presence | Chat, live scores; see [[Scaling WebSockets]] |
 | Transactional / correctness-heavy | Mixed, low volume | Relational DB, idempotency keys, ledgers | Payments, ticket booking |
 | Batch / analytical | Huge scans | Columnar storage, stream or batch jobs | Reporting, billing runs |
@@ -367,7 +442,7 @@ Systems fall into a few shapes, and the shape decides the first components you r
 | Trade-off pair | Choosing the left means | Example |
 | --- | --- | --- |
 | Latency vs consistency | Serve possibly stale data fast | Feed from a cache with 60 s TTL |
-| Availability vs consistency (during a partition) | Accept writes that may conflict | Shopping cart in a leaderless store; see [[CAP and PACELC]] |
+| Availability vs consistency (during a partition, when the network cuts some servers off from others) | Accept writes that may conflict | Shopping cart in a leaderless store (any copy accepts writes, no single boss copy); see [[CAP and PACELC]] |
 | Cost vs availability | Fewer replicas, one region | Internal admin tool at 99.5% |
 | Simplicity vs scalability | One database, no sharding yet | Most products below about 10k writes/s (estimate; depends on hardware and query shape) |
 | Throughput vs latency | Batch writes, wait to fill a batch | Kafka producer `linger.ms` |
@@ -381,11 +456,13 @@ Systems fall into a few shapes, and the shape decides the first components you r
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the building blocks, their units and how availability adds up. **Next comes the senior view**: the real stack companies run, how it fails, and the subtle cases where the simple maths lies (shared failures, slow tails).
+
 - **Real systems:** The canonical stack above is how most web products are built: a CDN (CloudFront, Cloudflare), a managed load balancer (AWS ALB), containers on ECS or Kubernetes, PostgreSQL or MySQL, Redis, a queue (SQS or Kafka), and S3 for files.
 - **Failure modes → fixes:**
 	- Single point of failure (one DB, one LB) → redundancy across availability zones plus automated failover.
-	- Cache outage sends all reads to the database → capacity for a cold cache, rate limits, circuit breakers; see [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
-	- Slow dependency ties up every request → timeouts and bulkheads; see [[Timeouts, Retries and Backoff]].
+	- Cache outage sends all reads to the database → capacity for a cold cache, rate limits, circuit breakers (a switch that stops calling a failing service for a while); see [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
+	- Slow dependency ties up every request → timeouts and bulkheads (separate pools per dependency, so one slow one cannot use up all workers); see [[Timeouts, Retries and Backoff]].
 	- Deploy kills in-flight requests → graceful shutdown and connection draining; see [[Graceful Shutdown and Health Checks]].
 - **What to monitor:** the four golden signals per component (latency, traffic, errors, saturation), and the SLO burn rate for each user-facing journey.
 
@@ -426,6 +503,26 @@ Systems fall into a few shapes, and the shape decides the first components you r
 - Canonical stack: DNS → CDN → LB → gateway → stateless API → cache / DB / queue → workers → object storage.
 - Stateless app tier, few stateful stores; the stores hold the hard trade-offs.
 - Read-heavy → cache and replicas; write-heavy → batch, queue, partition.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) Give one functional and one non-functional requirement for a URL shortener.
+> Functional: "a user can shorten a link". Non-functional: "redirects take under 50 ms for 99% of users".
+
+> [!question]- (easy) What does "stateless" let you do with app servers?
+> Add, remove or replace copies freely, because any copy can serve any request.
+
+> [!question]- (easy) Why put a cache in front of the database?
+> Hot reads come back in about 1 ms and the database is spared the repeat work.
+
+> [!question]- (medium) LB, API and DB are each 99.9% and in a chain. What is the total?
+> 0.999 × 0.999 × 0.999 ≈ 99.7%, about 26 hours down a year.
+
+> [!question]- (medium) Two app copies at 99% each give 99.99%. When is that false?
+> When they fail together: same rack, same bad deploy, same shared dependency.
+
+> [!question]- (medium) A system is mostly writes. Which tools come first?
+> Batching, queues and partitioning; caches and replicas only help reads.
 
 ## Links
 

@@ -31,6 +31,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Building REST Endpoints]]: a request runs through a handler that returns a status code; that is what we will count and time.
+> - [[Receiving Webhooks Idempotently]]: the payment webhook flow (verify, dedupe, update, queue) that this note traces step by step.
+
 **From zero, in 60 seconds** 🟢
 
 It is 3 a.m. and your service is slow. **Observability** is everything you set up beforehand so you can find out why without guessing.
@@ -68,6 +72,13 @@ Observability is leaving enough clues behind that you can find out without guess
 | Trace | The path and timing of one request across services | HTTP 120 ms → DB 80 ms → queue 5 ms |
 | Span | One timed step inside a trace | "SELECT invoice" took 80 ms |
 | Trace ID | The ID shared by every span and log of one request | `4bf92f35...` |
+
+| Prometheus | A tool that collects numbers from services every few seconds and stores them over time | scrapes `/metrics` every 15 s |
+| OpenTelemetry (OTel) | The standard library and protocol for sending traces (and other signals) | `otel.Tracer("invoiceops")` |
+| `traceparent` | A standard header that carries the trace ID from one service to the next | `00-4bf92f35...-00f067aa...-01` |
+| Sampling | Keeping only some traces to save cost | keep 10%, plus every error |
+| p99 | The time 99 out of 100 requests finish under | p99 = 800 ms |
+| RED metrics | Rate, Errors, Duration: the three basic request numbers | 200 req/s, 1% errors, p99 300 ms |
 
 **Picture it**
 
@@ -126,8 +137,12 @@ That chain spans an HTTP handler, a database query, and an asynchronous worker r
 Three concrete gaps show why each signal in this note earns its place:
 
 - **Logs alone can't show where time went.** A log line says `"webhook processed", "elapsed", "1.8s"`. It does not say whether that 1.8 seconds was the signature check, a slow query, or the queue publish — distinguishing those requires spans around each step, not a single elapsed-time field.
-- **An unbounded metric label silently grows until it pages someone.** A naive `requests_total{path="/invoices/482"}` counter creates a new time series per distinct invoice ID ever requested. At 50,000 invoices, that's 50,000 series for one counter, and Prometheus's memory grows with every new ID — a cardinality bug that looks fine in development and pages on-call in production, often attributed first to "a memory leak in the app."
+- **An unbounded metric label silently grows until it pages someone.** A naive `requests_total{path="/invoices/482"}` counter creates a new time series (one separate line of numbers stored over time) per distinct invoice ID ever requested. At 50,000 invoices, that's 50,000 series for one counter, and Prometheus's memory grows with every new ID — a cardinality bug that looks fine in development and pages on-call in production, often attributed first to "a memory leak in the app."
 - **A trace that stops at the queue boundary hides exactly the gap that matters.** If the HTTP handler's span ends when it publishes to the queue, and the worker that later processes the message starts an unrelated trace, you can never answer "how long between the webhook arriving and the worker actually updating the invoice" from traces alone — which is usually the first question asked when something looks delayed.
+
+### A real-life example 🟢
+
+Say UPI payments on PhonePe suddenly feel slow. A dashboard (metrics) shows the 99th-percentile time jumped from 300 ms to 3 s at 8:05 pm. Engineers click one slow example on that graph and open its trace, which shows the bank-call step took 2.7 s. The trace ID then pulls up the exact log lines for that payment, showing the bank returned "timeout, retrying". Three signals, joined by one ID, turn "it's slow" into "this bank is slow" in minutes.
 
 ## 2. Mental model 🟢
 
@@ -140,6 +155,17 @@ Picture one webhook request as a relay race with four runners (steps), and three
 The thing that ties all three together for one specific race is the **trace ID**: stamp it into every log line and it becomes the join key between "here's the graph that shows an error spike" and "here are the exact log lines from one of those failing requests."
 
 ## 3. How it works 🟡
+
+🟢 → 🟡 You now know the three signals and that the trace ID joins them. Next we open the box: how one webhook's trace stays connected across the database and even a queue, and how logs, metrics and traces travel from your service to the tools that show them.
+
+**Step by step:**
+1. A webhook arrives; the handler starts a span `webhook.process` with trace ID `T`.
+2. Child spans time each step: verify the signature, check the database, update the invoice.
+3. Before putting a message on the queue, the code writes `traceparent: 00-T-...` into the message headers.
+4. Later a worker reads the message, pulls `T` out of the headers, and starts its span as part of trace `T`.
+5. Every log line on both sides includes `trace_id = T`, so one search finds the whole story.
+
+The full detail:
 
 One webhook's trace, carried across every boundary it crosses — including the one boundary (the queue) that needs explicit propagation code, since only HTTP and gRPC get it automatically from instrumentation libraries:
 
@@ -167,7 +193,7 @@ sequenceDiagram
     W->>API: (same trace_id=T in every log line, both sides)
 ```
 
-The telemetry pipeline every signal ultimately flows through, so an app never talks to Grafana/Jaeger/Prometheus directly — it talks to one local Collector, which decides where things go:
+The telemetry pipeline (the path the data takes from your service to the tools that show it) every signal ultimately flows through, so an app never talks to Grafana/Jaeger/Prometheus directly — it talks to one local Collector (an OpenTelemetry program that receives, filters and forwards telemetry), which decides where things go. Loki stores logs, Prometheus stores metrics, and Tempo or Jaeger store traces; Grafana is the screen that shows all three:
 
 ```mermaid
 flowchart LR
@@ -187,6 +213,8 @@ flowchart LR
 ```
 
 ## 4. Worked example 🟡
+
+**What this code does, in plain words:** it wraps the normal JSON log handler so every log line automatically gets the current `trace_id` and `span_id`, and defines a `Secret` type that always logs as `[REDACTED]`.
 
 **Structured logging** with a trace-aware handler: it wraps any `slog.Handler` and stamps `trace_id`/`span_id` onto every record from an active span in the context, and a `LogValuer` type that makes a secret field unloggable by construction rather than by developer discipline:
 
@@ -252,6 +280,8 @@ func (w WebhookSignature) LogValue() slog.Value {
 	)
 }
 ```
+
+**What this code does, in plain words:** it registers a request counter and a latency histogram labelled only by route pattern, method and status class, and a middleware that records both for every request using a small status-capturing wrapper.
 
 **RED metrics** (Rate, Errors, Duration) with intentionally coarse labels, plus a `ResponseWriter` wrapper that captures the status code while still letting a streaming handler `Flush` (needed for SSE; see [[Real-time APIs - WebSocket, SSE and Long Polling]]):
 
@@ -367,6 +397,8 @@ func (s SlogAccessLogger) Log(ctx context.Context, route, method string, status,
 }
 ```
 
+**What this code does, in plain words:** it sets up the tracer with a sampler, wraps each webhook step in its own span (recording errors on failure), and provides `InjectIntoHeaders` / `ExtractFromHeaders` so a trace can ride inside a queue message.
+
 **OpenTelemetry tracing**: building the `TracerProvider` with a resource, a `ParentBased(TraceIDRatioBased)` sampler, manual spans with `RecordError`/`SetStatus`, and the propagation functions a queue hop needs by hand:
 
 ```go
@@ -450,6 +482,8 @@ func runStep(ctx context.Context, tracer trace.Tracer, name string, fn func(cont
 }
 ```
 
+**What this code does, in plain words:** at startup it connects the tracer to the local Collector over OTLP (OpenTelemetry's wire format), batches spans, and returns a `Shutdown` function you must call before exit.
+
 The real production startup wiring — an OTLP/gRPC exporter to the local Collector, batched, with a `Shutdown` that must be called (deferred, or in a graceful-shutdown hook per [[Graceful Shutdown and Health Checks]]) so buffered spans flush instead of being dropped on exit:
 
 ```go
@@ -478,6 +512,8 @@ func StartProductionTracing(ctx context.Context, collectorEndpoint, serviceName,
 `StartProductionTracing` compiles against the real `otlptracegrpc` client and is covered by `go vet`, but — unlike the rest of this section — no test below calls it: doing so would need a live OTel Collector (or a fake gRPC server standing in for one) listening on `collectorEndpoint`, which this note doesn't stand up.
 
 Treat it as reviewed for shape and API correctness, not as integration-tested; a real service should still smoke-test it once against its actual collector sidecar before relying on it.
+
+**What this code does, in plain words:** the tests use in-memory exporters, then check that a log line carries the span's trace ID, that a secret prints as `[REDACTED]`, and that a worker span built only from message headers belongs to the same trace.
 
 Tests. The trace-context ones are the load-bearing proof for this note: that a log line picks up a real trace ID, that a secret never appears in a log line, and — the part that's easy to get wrong — that a trace survives a hop through a queue with no shared Go context at all:
 
@@ -602,7 +638,26 @@ func counterValue(t *testing.T, cv *prometheus.CounterVec, labels map[string]str
 - Manual span instrumentation (the `ProcessWebhook` pattern above) is worth the code only for the steps you'd actually want to see separately in a trace; wrapping every three-line helper function in its own span adds overhead and visual noise without adding insight.
 - For a small internal tool with low traffic and one engineer on call, full OTel tracing is often more operational surface than it's worth; structured logs plus a handful of Prometheus counters frequently cover the real need.
 
+### Logs vs metrics vs traces 🟡
+
+| | Logs | Metrics | Traces |
+| --- | --- | --- | --- |
+| Answers | what happened on this request? | how is the whole system doing? | where did the time go? |
+| Unit | one event | a number over time | one request's timed steps |
+| Cost grows with | number of events | number of label combinations | number of requests kept |
+| InvoiceOps example | "evt_42 was a duplicate" | 1% of webhooks failed this minute | DB update took 1.5 s of 1.8 s |
+
+### Common beginner mistakes 🟢
+
+- Putting a user ID or raw path in a metric label → millions of time series and Prometheus runs out of memory → use the route pattern and status class.
+- Logging free text like `"paid invoice 42 for user 7"` → hard to search and filter → log key-value fields with `slog`.
+- Expecting a trace to cross a queue by itself → the worker starts a new, unrelated trace → inject `traceparent` into the message and extract it in the worker.
+- Never calling `TracerProvider.Shutdown` → the last spans before a deploy are lost → call it in graceful shutdown.
+- Tracing every request at 100% on a busy service → high cost → sample, but always keep errors and slow requests.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now wire logs, metrics and traces and join them with a trace ID. The advanced part covers running this at scale: label explosions, lost spans, broken queue traces, private data leaking into telemetry, and the design reasons behind sampling, pull vs push, and exemplars (a sample trace ID attached to a metric bucket).
 
 - **Real systems:** Google's SRE practice popularized the RED/USE framing this note's metrics follow. The OpenTelemetry project itself is the CNCF-governed merger of OpenTracing and OpenCensus, now the standard instrumentation layer most observability vendors (Grafana, Datadog, Honeycomb, Lightstep) ingest from. Grafana's stack (Loki for logs, Mimir/Prometheus for metrics, Tempo for traces) is a common fully open-source destination for exactly the three signals this note produces.
 - **Failure modes → fixes:**
@@ -650,6 +705,26 @@ func counterValue(t *testing.T, cv *prometheus.CounterVec, labels map[string]str
 - `db.Stats()`, worker queue depth, and oldest-job age need their own gauges — they are not automatic from query-level tracing.
 - Always call `TracerProvider.Shutdown` before exit (wire it into graceful shutdown) or buffered spans from the last moments before exit are silently lost.
 - Tail sampling at a Collector gateway can keep "all errors and slow requests" instead of a blind percentage, at the cost of buffering whole traces before deciding.
+
+## Self-check 🟢🟡
+
+> [!question]- Which signal tells you "where did the time go" in one request?
+> A trace.
+
+> [!question]- What joins a log line to its trace?
+> The trace ID stamped into the log line.
+
+> [!question]- Is `route="/invoices/{id}"` a safe metric label? Is `path="/invoices/482"`?
+> The route pattern is safe (few values); the raw path is not (one series per invoice).
+
+> [!question]- Why does a queue need manual trace propagation?
+> There is no shared request between producer and worker; only the message headers can carry `traceparent`.
+
+> [!question]- What does `ParentBased` sampling add?
+> Downstream services follow the first service's keep-or-drop decision, so traces are not cut in half.
+
+> [!question]- Why make secrets a `LogValuer` type instead of a team rule?
+> The type always prints `[REDACTED]`, so nobody can leak it by logging the struct that holds it.
 
 ## Links 🟢
 

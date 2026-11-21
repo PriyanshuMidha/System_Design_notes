@@ -29,6 +29,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how promotion works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Syntax, Types and Control Flow]]: you can declare variables with types, write functions, and use `if` and `for`.
+> - [[Strings, Bytes, Runes and Unicode]]: a `string` is a read-only row of bytes. Several struct fields below are strings.
+
 **From zero, in 60 seconds** 🟢
 
 Say you track a customer: a name, an email, an age. Three loose variables get messy. A **struct** is a box with labelled slots that holds them together as one thing.
@@ -72,6 +76,12 @@ Methods then let you write `c.Greet()` instead of `Greet(c)`, and embedding lets
 | Receiver | The value a method is called on | `c` in `c.Greet()` |
 | Embedding | Putting a type inside a struct without a field name | `type Admin struct{ Customer }` |
 | Padding | Unused bytes the compiler adds so fields line up in memory | `bool` then `int64` wastes 7 bytes |
+| Struct literal | Writing a struct value out directly; "keyed" means with field names | `Invoice{ID: "x", Amount: 500}` |
+| Constructor | A plain function, by convention `NewX`, that builds and checks a value | `NewInvoice(id, ...)` |
+| Promotion | An embedded type's fields and methods becoming usable straight on the outer type | `r.ID` instead of `r.Base.ID` |
+| Shadowing | The outer type's own field or method with the same name hides the embedded one | `Record.Describe` hides `Base.Describe` |
+| Alias | A second name for exactly the same type | `type MyString = string` |
+| Enum | A fixed set of named values; Go builds it from constants and `iota` | `Draft`, `Sent`, `Paid` |
 
 **Picture it**
 
@@ -110,7 +120,7 @@ Embedding solves a related, narrower problem: many domain types need the same ba
 
 ## 2. Mental model 🟢
 
-A struct is a **labeled box of fields**, stored contiguously in memory. A method is a function where the type whose box you're operating on is written before the function name instead of as the first argument in parentheses — `func (c Counter) Value() int` instead of `func Value(c Counter) int`.
+A struct is a **labeled box of fields**, stored contiguously (side by side, in one block) in memory. A method is a function where the type whose box you're operating on is written before the function name instead of as the first argument in parentheses — `func (c Counter) Value() int` instead of `func Value(c Counter) int`.
 
 That's purely syntax; mechanically a method call `c.Value()` compiles to the same thing as `Value(c)`.
 
@@ -136,6 +146,8 @@ r.Describe()  // "base:r1"     — promoted method
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that a struct bundles fields, a method is a function attached to a type, and embedding lets one struct reuse another's fields and methods. **Next we open the box**: how to build structs safely, how receivers decide what a method can change, and exactly how Go looks up `r.ID` when types are embedded.
+
 **Keyed literals and validating constructors.** A struct literal with field names (`Invoice{ID: "x", Amount: 500}`) survives field reordering and documents intent; positional literals (`Invoice{"x", "", 500, "", 0}`) break the moment someone reorders fields. A constructor function (`NewInvoice`) rejects invalid states up front instead of letting a half-built zero-value struct escape into the rest of the program:
 
 ```mermaid
@@ -153,7 +165,7 @@ flowchart LR
 
 The rule of thumb here: **use a pointer receiver whenever the method must mutate the receiver**, and keep it consistent across all of a type's methods so callers don't have to remember which methods mutate.
 
-**Embedding resolution.** When you embed a type, the compiler builds a field-and-method lookup table that includes the embedded type's exported members at "depth 1." A selector like `r.ID` or `r.Describe()` is resolved by searching outward by increasing depth:
+**Embedding resolution.** When you embed a type, the compiler builds a field-and-method lookup table that includes the embedded type's exported members at "depth 1" (one level of embedding down). A selector (the `.Name` part you write after a value) like `r.ID` or `r.Describe()` is resolved by searching outward by increasing depth:
 
 ```mermaid
 flowchart TD
@@ -275,6 +287,8 @@ func CopyDeep(a Cart) Cart {
 
 Tests, passing under `go test -race` on Go 1.24:
 
+**What this code does, in plain words:** four tests. The first checks that `Record` can use `Base`'s `ID` and `Describe` directly, and that its own method wins when it has one. The second checks that a nil embedded `*Base` panics when a promoted method runs. The third shows that copying a struct with a slice inside still shares the slice's data. The fourth uses a struct of comparable fields as a map key.
+
 ```go
 func TestEmbeddingPromotionAndShadowing(t *testing.T) {
     r := Record{Base: Base{ID: "r1"}, Name: "widgets"}
@@ -370,19 +384,22 @@ Same fields, same behavior, 33% less memory per value just from reordering — t
 
 ## 6. Trade-offs and when not to use 🟡
 
-- Embedding is composition, not inheritance: there is no polymorphism through a `Base` reference, no virtual dispatch, and `Base`'s methods have no idea `Record` exists (they only ever see the `Base` value they were called on). Don't reach for embedding expecting OOP-style subtyping.
+- Embedding is composition, not inheritance: there is no polymorphism (one call running different code depending on the real type) through a `Base` reference, no virtual dispatch, and `Base`'s methods have no idea `Record` exists (they only ever see the `Base` value they were called on). Don't reach for embedding expecting OOP-style subtyping.
 - Promoted methods make a type's full method set invisible at a glance — `go doc` and generated docs show promoted methods, but a quick scroll through the struct definition does not. For public APIs, consider whether a named field (`BaseInfo BaseInfo` instead of embedding `BaseInfo`) communicates intent better, at the cost of `r.BaseInfo.ID` everywhere.
-- Field-order-for-alignment micro-optimization only pays off for types allocated in bulk (large slices, hot structs in a cache). For a request DTO constructed once per HTTP call, readability of field order beats a few bytes of padding.
+- Field-order-for-alignment micro-optimization only pays off for types allocated in bulk (large slices, hot structs in a cache). For a request DTO (a plain struct that carries request data) constructed once per HTTP call, readability of field order beats a few bytes of padding.
 - Anonymous structs can't be named as a return type or stored in a variable's declared type elsewhere, so they only fit genuinely one-off shapes (test tables, a function's inline return value).
 
 ## 7. In production 🔴
 
-- **Real systems:** ORMs and `encoding/json` rely on exported fields and struct tags to map Go structs to database rows and JSON payloads; `sqlc`-generated code and hand-written repositories both lean on keyed struct literals so column additions don't silently misalign positional ones. Config structs across the standard library (`http.Server`, `tls.Config`) are built with keyed literals and zero-value-usable defaults (`http.Server{}` with no fields set still runs on `:80`-equivalent fallback behavior per field).
+> 🟡 → 🔴 **You now know** keyed literals, constructors, receivers, embedding lookup (shadowing, ambiguity, nil embedded pointers) and how field order changes size. **Next is the advanced part**: how real libraries use structs and tags, the bugs that show up in production, and the deeper rules on comparability, tags, alignment and type aliases.
+
+
+- **Real systems:** ORMs (libraries that map structs to database tables) and `encoding/json` rely on exported fields and struct tags to map Go structs to database rows and JSON payloads; `sqlc`-generated code and hand-written repositories both lean on keyed struct literals so column additions don't silently misalign positional ones. Config structs across the standard library (`http.Server`, `tls.Config`) are built with keyed literals and zero-value-usable defaults (`http.Server{}` with no fields set still runs on `:80`-equivalent fallback behavior per field).
 - **Failure modes → fixes:**
   - Positional literal silently reorders after a teammate adds a field → wrong data stored → lint for keyed literals (`go vet` flags composite literals that should be keyed for struct types in other packages; `golangci-lint`'s `govet`/`fieldalignment` checks catch both).
   - Copying a struct containing a slice/map and expecting independence → shared-mutation bugs → copy the backing data explicitly (`copy()` for slices, loop or `maps.Clone` for maps) when independence is required.
   - Embedding `*Base` and forgetting to initialize it → nil-pointer panic deep in a promoted method → initialize embedded pointers in every constructor, or embed by value when `nil` is never a valid state.
-  - Giant structs with many hot-path instances and no attention to field order → extra cache-line pressure → run `fieldalignment` (`golang.org/x/tools/go/analysis/passes/fieldalignment`) in CI for allocation-heavy types.
+  - Giant structs with many hot-path instances and no attention to field order → extra cache-line pressure (the CPU loads memory in 64-byte chunks, so bigger structs mean more chunks) → run `fieldalignment` (`golang.org/x/tools/go/analysis/passes/fieldalignment`) in CI for allocation-heavy types.
 - **What to monitor:** allocation counts and bytes/op from `go test -bench -benchmem` for types that appear in large slices (see [[Benchmarks, Profiling and Tracing]]); `go vet`/`fieldalignment` findings in CI.
 
 ## 8. Deep dive 🔴
@@ -428,6 +445,30 @@ Same fields, same behavior, 33% less memory per value just from reordering — t
 - `map[K]struct{}` is Go's zero-cost set idiom; the empty struct is zero bytes.
 - Custom types (`type ID string`) are distinct types that need explicit conversion; aliases (`type S = string`) are fully interchangeable.
 - Field order affects struct size via padding; `fieldalignment` finds the win automatically for hot types.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why prefer `Invoice{ID: "x", Amount: 500}` over `Invoice{"x", "", 500, "", 0}`?
+> Keyed literals keep working if someone reorders or adds fields; positional ones silently put data in the wrong field.
+
+> [!question]- Your `Inc()` method does not change the counter. What is the likely cause?
+> It has a value receiver, so it changed a copy. Use a pointer receiver: `func (c *Counter) Inc()`.
+
+> [!question]- Is embedding the same as inheritance?
+> No. It promotes fields and methods, but the inner type never knows about the outer one and there is no overriding.
+
+🟡 Medium
+
+> [!question]- `Record` embeds both `Base` and `Audited`, and both have `Describe()`. What happens with `r.Describe()`?
+> It does not compile (ambiguous selector). Write `r.Base.Describe()` or `r.Audited.Describe()`.
+
+> [!question]- `b := a` where `a` has a `Tags []string` field. Then `b.Tags[0] = "x"`. Does `a` change?
+> Yes. The copy shares the slice's backing array. Copy the slice explicitly for independence.
+
+> [!question]- `struct{ A bool; B int64; C bool }` is 24 bytes. How do you make it 16?
+> Put the `int64` first and the two `bool`s after it, so less padding is needed.
 
 ## Links 🟢
 

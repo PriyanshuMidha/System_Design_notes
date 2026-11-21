@@ -32,6 +32,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add the rest of section 3 (the other four patterns), 4 (the Go code and tests), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Caching Fundamentals]]: a cache is a fast copy of database data; a hit skips the database, a miss goes to it, and the copy can go stale.
+> - [[Redis Fundamentals]]: Redis is a shared in-memory store you talk to with commands like `GET`, `SET key value EX 30` and `DEL`.
+
 **From zero, in 60 seconds** 🟢
 
 A cache is a fast notebook of answers in front of a slow database.
@@ -76,6 +80,10 @@ Each answer is a "caching pattern", and each one fails in a different way.
 | Invalidate | Remove a cached value because the data changed | `DEL user:7` after an update |
 | TTL | Time after which a cached value expires by itself | `EX 300` = 5 minutes |
 | Write path / read path | Code that runs on updates / on reads | `UpdateUser` vs `GetUser` |
+| Jitter | A small random amount added to a TTL so keys do not all expire at the same second | 30 s plus 0-5 s random |
+| Request coalescing | Letting many callers who miss the same key share one database load | Go's `singleflight` package |
+| Tombstone (negative caching) | A cached marker that says "this ID does not exist" | `product:404:v1` = `null` for 30 s |
+| Pub/Sub | Redis's broadcast: every listener gets a message, nothing is stored | `PUBLISH cache-invalidate "product:7:v1"` |
 
 **Picture it**
 
@@ -103,7 +111,7 @@ Where it breaks: a board can be read by everyone at once without crashing; a cac
 
 ## 1. Why it exists 🟢
 
-"Put Redis in front of the database" leaves the important questions open. Take InvoiceOps, a multi-tenant invoicing API (Go + PostgreSQL) whose dashboard endpoint aggregates invoices and payments for one workspace. The aggregation takes about 120 ms (an estimate for a few thousand invoice rows), and the dashboard is opened about 300 times per second at peak.
+"Put Redis in front of the database" leaves the important questions open. Take InvoiceOps, a **multi-tenant** (many customer companies share one app and one database) invoicing API (Go + PostgreSQL) whose dashboard endpoint aggregates invoices and payments for one workspace. The aggregation takes about 120 ms (an estimate for a few thousand invoice rows), and the dashboard is opened about 300 times per second at peak.
 
 - Who fills the cache on a miss: the handler, or a cache library?
 - When a payment is recorded, do we update the cached summary, delete it, or let it expire?
@@ -122,11 +130,35 @@ Think of a **personal assistant** (the cache) in front of a **records office** (
 - **Write-behind:** the assistant says "done" right away and files your change at the records office later.
 - **Refresh-ahead:** the assistant re-checks popular answers shortly before their notes expire.
 
+### Real-life example: a movie page on BookMyShow 🟢
+
+When a big film opens, millions of people open its page on an app like BookMyShow: title, poster, cast, rating.
+That data changes rarely, so the app uses cache-aside: the first visitor's request loads it from the database and saves it in the cache, and everyone after gets the saved copy.
+When the team edits the cast list, the app updates the database and deletes the cached page data, so the next visitor reloads the fresh version.
+The live seat map is different: it changes every second and must be exact, so it is read from the booking system, not from this cache.
+
+## Common beginner mistakes 🟢
+
+- **Updating the cache with the new value on every write** → two writers can finish in the wrong order and leave the older value cached → update the database, then delete the key.
+- **Treating "key not found" and "Redis is down" as the same thing** → every miss looks like an outage, or every outage looks like a miss → check for the "not found" signal (`redis.Nil` in go-redis) separately from real errors.
+- **Letting a Redis error fail the whole request** → the page goes down even though the database is fine → give Redis a short time limit and read from the database if it fails.
+- **Using write-behind for money or orders** → the cache says "done" before the database has the data, and a crash loses it → use write-behind only for things like view counts.
+- **Caching an error as "not found"** → one short database hiccup becomes minutes of false "does not exist" answers → store a tombstone only when the database really says the row is missing.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a caching pattern is simply a plan for who fills the cache and who fixes it after a write, and that cache-aside is the default. **Next we open the box** and walk each of the five patterns step by step, with what happens when something fails halfway.
 
 ### Cache-aside (lazy loading)
 
 **In plain words:** your code does it all: look in the cache, and on a miss fetch from the database and save the result.
+
+**Step by step:**
+1. A user opens the dashboard of workspace `ws_123`. The handler asks Redis for `dashboard:ws_123:summary:v2`.
+2. Hit: Redis returns the summary, and the handler sends it back. Done in about 1 ms.
+3. Miss: Redis says "nothing here". The handler runs the 120 ms query on PostgreSQL.
+4. The handler saves the result in Redis with a TTL of 30 seconds plus a little jitter, then returns it.
+5. Later a payment is recorded. The handler updates PostgreSQL first, then deletes the key, so the next reader starts again at step 3 with fresh data.
 
 ```mermaid
 sequenceDiagram
@@ -145,7 +177,7 @@ sequenceDiagram
     Note over H,P: On write: UPDATE in PostgreSQL, then DEL the key
 ```
 
-- Only data that someone reads gets cached, so memory goes to the working set.
+- Only data that someone reads gets cached, so memory goes to the **working set** (the part of the data that is actually being read right now).
 - A cache failure only slows reads; the database is always in the path for misses.
 - Each miss costs three trips (cache, database, cache), and the first read after expiry is slow.
 - Writes **delete** rather than set the key. Two concurrent writers that each *set* the cache can leave the older value there; a delete leaves nothing to be wrong, and the next read reloads. A narrower race still remains (a slow reader filling an old value after the delete); [[Cache Invalidation, TTL and Consistency]] covers it and its fixes.
@@ -154,9 +186,16 @@ sequenceDiagram
 
 **In plain words:** same idea as cache-aside, but a library does the fetching for you, so every caller follows the same rules.
 
+**Step by step:**
+1. At startup you give the cache library one **loader** function, for example "load product by ID from PostgreSQL".
+2. Your handler only ever calls `cache.Get("product:7:v1")`. It never talks to the database directly.
+3. On a hit, the library returns the value.
+4. On a miss, the library itself calls your loader, saves the result with the TTL, and returns it.
+5. Because every caller goes through the same library, they all get the same TTL and the same merging of duplicate misses.
+
 The application calls `cache.Get(key)` and the cache layer runs a **loader** on a miss. The logic is the same as cache-aside, but it lives in a library or a caching proxy, so every caller gets the same miss handling, coalescing and TTLs.
 
-Examples: a Go wrapper with a loader function, Caffeine's `LoadingCache` in Java, or a caching proxy in front of a service. Redis itself does not load from your database.
+Examples: a Go wrapper with a loader function, Caffeine's `LoadingCache` in Java (a popular Java caching library), or a caching proxy (a separate server that sits in front of a service and stores its answers) in front of a service. Redis itself does not load from your database.
 
 **Read-through, as a picture.** The app only ever talks to the cache layer.
 
@@ -171,6 +210,13 @@ flowchart LR
 ### Write-through
 
 **In plain words:** every change is written to the database and the cache together, so the cache is warm right after a write.
+
+**Step by step:**
+1. A user marks invoice 999 as paid. The handler calls `save(invoice 999, status=paid)` on the cache layer.
+2. The cache layer runs the `UPDATE` in PostgreSQL first.
+3. When PostgreSQL says OK, the cache layer writes the new invoice into Redis with `SET`.
+4. Only after both writes does the handler hear "done".
+5. The next read of invoice 999 is a hit with the new status. But if step 3 fails, Redis keeps the old status until its TTL runs out.
 
 ```mermaid
 sequenceDiagram
@@ -187,11 +233,18 @@ sequenceDiagram
 
 - Reads after a write usually hit a warm cache.
 - Every write pays for two writes, and data that is written but never read still fills memory.
-- **It is not strong consistency.** The two writes are not one transaction. If the database commit succeeds and the cache write fails (or the process crashes in between), the cache is stale. Two concurrent writers can also apply their cache writes in the opposite order to their database commits. Keep a TTL as a safety net, or delete instead of set.
+- **It is not strong consistency** (the promise that every read sees the latest saved write). The two writes are not one transaction. If the database commit succeeds and the cache write fails (or the process crashes in between), the cache is stale. Two concurrent writers can also apply their cache writes in the opposite order to their database commits. Keep a TTL as a safety net, or delete instead of set.
 
 ### Write-behind (write-back)
 
 **In plain words:** the cache says "done" at once and writes to the database later. Fast, but if the cache dies first, those changes are lost.
+
+**Step by step:**
+1. Someone views post 77. The handler adds 1 to a counter in Redis (`HINCRBY views:post_77 count 1`) and replies at once.
+2. 500 more views arrive in the next few seconds. Each one only touches Redis.
+3. Every 5 seconds a flush worker reads the pending counters and resets them.
+4. The worker sends one batched `UPDATE posts SET views = views + 501` to PostgreSQL instead of 501 separate writes.
+5. If Redis crashes between step 2 and step 3, those up to 5 seconds of views are gone, unless Redis saves its data to disk.
 
 ```mermaid
 sequenceDiagram
@@ -209,13 +262,20 @@ sequenceDiagram
 ```
 
 - Writes are as fast as the cache, and many small writes collapse into one batched database write.
-- The cache now holds data that exists nowhere else. Losing a Redis node loses those writes unless Redis persistence and replication are configured (see [[Redis Persistence - RDB and AOF]]).
+- The cache now holds data that exists nowhere else. Losing a Redis node loses those writes unless Redis **persistence** (saving its memory to disk) and **replication** (keeping a live copy on another server) are configured (see [[Redis Persistence - RDB and AOF]]).
 - Other readers of the database see old values until the flush; ordering and retries of the flush are your problem.
 - Good fit: counters, view counts, analytics, rate-limit windows, where losing a few seconds is acceptable. Bad fit: money and orders.
 
 ### Refresh-ahead
 
 **In plain words:** reload popular answers just before they expire, so users of those keys almost never wait.
+
+**Step by step:**
+1. The home page's "top 10 products" key is cached with a TTL of 60 seconds.
+2. Each time it is read, the app checks its age.
+3. At 48 seconds old (80% of 60), the next read still gets the cached copy, but it also starts a reload in the background.
+4. The reload finishes and replaces the value with a fresh 60-second TTL.
+5. The key never actually expires while people keep reading it, so nobody waits on a miss.
 
 A background job (or the read path, once a key passes, say, 80% of its TTL) reloads hot keys before they expire. Users of hot keys almost never see a miss, at the cost of reloading keys that might not be read again.
 
@@ -235,7 +295,7 @@ flowchart LR
 
 Cache-aside for product reads, with the four protections a production version needs:
 
-1. **Request coalescing** with `singleflight`: 100 concurrent misses on one key run one database query.
+1. **Request coalescing** with `singleflight` (a Go package that makes callers asking for the same key at the same moment wait for one shared result): 100 concurrent misses on one key run one database query.
 2. **Negative caching:** a missing product ID is cached as a tombstone with a short TTL, so repeated lookups of a non-existent ID do not hit the database every time.
 3. **Cache-down fallback:** the cache gets a small time budget (50 ms here, well below the database latency); on any cache error the request reads the database instead of failing.
 4. **Delete on write:** `Update` commits to the database first, then deletes the key.
@@ -617,6 +677,13 @@ Result: all six tests passed with `-race`. In `TestConcurrentMissesCoalesce`, 10
 
 **In plain words:** a tiny cache inside each app server plus the shared Redis cache. When data changes, a broadcast tells every server to drop its local copy.
 
+**Step by step:**
+1. Product 7's price changes. The writer commits the change in PostgreSQL.
+2. The writer deletes `product:7:v1` in Redis.
+3. The writer publishes "product:7:v1 changed" on a Redis Pub/Sub channel.
+4. Instances A and B are listening, so each drops product 7 from its own little in-memory cache.
+5. An instance that was disconnected at that moment misses the message, so its copy stays old until its short L1 TTL (say 5 seconds) runs out.
+
 ```mermaid
 sequenceDiagram
     participant W as Writer instance
@@ -654,11 +721,13 @@ Whatever the format, put a schema version in the key (`:v1`) so a deploy that ch
 
 - **Cache-aside** is the safest default because the cache can vanish without losing data. Its weakness is the miss path: the first reader after expiry pays full price, and the delete-then-refill sequence has a race.
 - **Write-through** only helps if written data is read soon. For write-heavy data that is rarely read, it doubles write cost for nothing.
-- **Write-behind** turns the cache into a database. Use it only when you would also accept losing those writes, or when Redis has AOF persistence and replicas and you have accepted the remaining window.
+- **Write-behind** turns the cache into a database. Use it only when you would also accept losing those writes, or when Redis has AOF persistence (an append-only file that logs every write to disk) and replicas and you have accepted the remaining window.
 - **Refresh-ahead** wastes work on keys that cool down. Limit it to an explicit hot list.
 - **Do not cache** permission checks, balances or anything a user acts on immediately after a write, unless the read path can prove freshness (for example, by version).
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how all five patterns move data between the app, the cache and the database, and what each one costs. **Next is the advanced part**: what big systems such as Facebook and AWS actually recommend, the failures you will see in production, the race that "delete on write" still leaves open, and why a Redis write can never be part of a database transaction.
 
 - **Real systems:** Facebook's memcache deployment is the classic cache-aside system with delete-on-write (*Scaling Memcache at Facebook*, NSDI 2013). The AWS Redis caching whitepaper and ElastiCache docs describe lazy loading and write-through, and suggest adding a TTL to write-through writes as well, so entries that are never read or that miss an update still age out. (The AWS caching best-practices page phrases its rule as a TTL on every key except those updated by write-through; this vault keeps a TTL on every key as the safer default.)
 - **Failure modes → fixes:**
@@ -666,13 +735,13 @@ Whatever the format, put a schema version in the key (`:v1`) so a deploy that ch
 	- Accidental negative caching (a `null` stored for 5 minutes because the loader returned nothing on an error) → cache "not found" only on a real not-found, with its own short TTL, and never cache errors.
 	- Many misses for one key → `singleflight` in-process; across instances, see [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
 	- Write-behind flush falls behind → alert on queue depth and the age of the oldest unflushed write.
-- **What to monitor:** hit ratio per key prefix; cache errors and timeouts (fallbacks); database QPS from the miss path; `singleflight` shared-result rate; tombstone count; for write-behind, pending writes and flush lag.
+- **What to monitor:** hit ratio per key prefix; cache errors and timeouts (fallbacks); database QPS (queries per second) from the miss path; `singleflight` shared-result rate; tombstone count; for write-behind, pending writes and flush lag.
 
 ## 8. Deep dive 🔴
 
-- **Why delete beats set on write.** Writer 1 commits price 399, writer 2 commits price 349. If each then *sets* the cache, the network can deliver writer 1's set last, leaving 399 in the cache while the database says 349, until the TTL. Deleting is idempotent and order-insensitive: whichever delete arrives last, the key is gone, and the next reader loads 349.
-- **The remaining race.** A reader that missed *before* the write can still fill the old value *after* the delete. Facebook's fix is **leases**; other fixes are versioned values or delayed double delete. These are the subject of [[Cache Invalidation, TTL and Consistency]].
-- **Write-through and transactions.** You cannot put a Redis write inside a PostgreSQL transaction. If you set the cache before `COMMIT`, a rollback leaves a value that never existed. If you set it after `COMMIT`, a crash in between leaves the cache stale. The reliable form is: commit, then let a change-data-capture stream or an outbox event drive the cache update ([[Transactional Outbox and CDC]]).
+- **Why delete beats set on write.** Writer 1 commits price 399, writer 2 commits price 349. If each then *sets* the cache, the network can deliver writer 1's set last, leaving 399 in the cache while the database says 349, until the TTL. Deleting is **idempotent** (doing it twice has the same effect as doing it once) and order-insensitive: whichever delete arrives last, the key is gone, and the next reader loads 349.
+- **The remaining race.** A reader that missed *before* the write can still fill the old value *after* the delete. Facebook's fix is **leases** (a token the cache hands to one reader on a miss; a fill without a valid token is rejected); other fixes are versioned values or delayed double delete. These are the subject of [[Cache Invalidation, TTL and Consistency]].
+- **Write-through and transactions.** You cannot put a Redis write inside a PostgreSQL transaction. If you set the cache before `COMMIT`, a rollback leaves a value that never existed. If you set it after `COMMIT`, a crash in between leaves the cache stale. The reliable form is: commit, then let a **change-data-capture** stream (a feed of every committed row change, read from the database's log) or an **outbox** event (a row saved in the same transaction that a worker later publishes) drive the cache update ([[Transactional Outbox and CDC]]).
 - **Read-through ownership.** Moving the loader into a shared cache service centralises coalescing and TTL policy, but every team's database access now runs through that service. Most Go shops keep a small read-through wrapper as a library rather than a separate service.
 - **Coalescing scope.** `singleflight` only coalesces within one process. With 40 instances, a hot-key expiry can still trigger 40 queries. That is usually fine; when it is not, use a distributed rebuild lock or serve stale while one instance refreshes (see [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]).
 
@@ -708,6 +777,30 @@ Whatever the format, put a schema version in the key (`:v1`) so a deploy that ch
 - Refresh-ahead: reload hot keys before expiry.
 - Production must-haves: coalescing, a short cache timeout with DB fallback, negative caching with a short TTL, a TTL on every key.
 - Two-level caches: the L1 TTL bounds staleness; Pub/Sub only speeds it up.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- In cache-aside, who loads the database on a miss?
+> Your application code: it reads the database and then saves the result in the cache.
+
+> [!question]- What is the safe default on a write in cache-aside?
+> Update the database first, then delete the cache key.
+
+> [!question]- Which pattern can lose writes if the cache crashes?
+> Write-behind, because the cache says "done" before the database has the change.
+
+🟡 Medium
+
+> [!question]- Two writers each SET the cache after committing. What can go wrong?
+> Their SETs can arrive in the opposite order to their commits, leaving the older value cached until the TTL.
+
+> [!question]- Why must code tell `redis.Nil` apart from other Redis errors?
+> `redis.Nil` is a normal miss; other errors mean Redis is broken, and the request should fall back to the database instead.
+
+> [!question]- With 40 app instances, why can a hot key's expiry still cause 40 database queries?
+> `singleflight` only merges misses inside one process, so each instance still runs its own load.
 
 ## Links 🟢
 

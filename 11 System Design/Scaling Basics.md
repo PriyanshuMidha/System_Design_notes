@@ -31,6 +31,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5 (variants).
 > - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Fundamentals]]: an app is a few parts (users, servers, a database) passing requests to each other, and we judge it by speed, uptime and cost.
+
 **From zero, in 60 seconds** 🟢
 
 You build a small website. It runs on one computer (one **server**).
@@ -81,6 +84,12 @@ That is scaling.
 | Stateless | Server keeps no user data between requests | Session lives in Redis, not RAM |
 | Bottleneck | The slowest part that limits everything | The single database |
 | p99 latency | 99% of requests finish faster than this | p99 = 120 ms |
+| VM / vCPU | A rented virtual computer / one of its CPU cores | a 4-vCPU VM has 4 cores |
+| Cache | A fast copy of popular data kept in memory | Redis holds today's top invoices |
+| Read replica | A copy of the database that only serves reads | the primary takes writes, 2 replicas take reads |
+| Shard | One slice of the data on its own machine | workspaces 0-49 on shard A |
+| Availability zone | A separate data centre in the same city region | 3 zones, 2 servers in each |
+| Headroom | Spare capacity you keep on purpose | run at 60% so a spike fits |
 
 **Picture it**
 
@@ -125,11 +134,45 @@ A supermarket at rush hour.
 - **Horizontal:** open more checkout lanes. Customers must be able to use any lane, so no lane may keep a customer's half-finished basket (that would be state).
 - **The stockroom** is the database. Ten lanes all sending runners to one stockroom door just moves the queue to the door.
 
+### Real-life example: a big movie release 🟢
+
+When tickets for a huge film open on BookMyShow, traffic can jump 10 times in a minute.
+The ticket pages are served by many identical app servers, so more servers are simply switched on.
+Any server can show you the seat map, because none of them keeps your session in its own memory.
+The hard part is the seat database: every booking must change one true copy of "seat D7 is taken".
+So the team scales the app servers out, and protects the database with caches, queues and careful locking.
+
+## Common beginner mistakes 🟢
+
+- **Adding app servers when the database is the slow part** → the requests just queue at the database instead → measure first, and fix or scale the database (index, cache, replica).
+- **Keeping login sessions in one server's memory** → the next request lands on another server and the user looks logged out → keep sessions in Redis or a signed token.
+- **Running servers at 90-100% busy to save money** → waiting time explodes near full load, and there is no room if one zone dies → plan for 50-70% busy at the worst hour.
+- **Sharding the database on day one** → it is the most costly move and hard to undo → try indexes, a bigger machine, caches and replicas first.
+- **Expecting caches or replicas to speed up writes** → every write still goes to the one primary → for writes, batch, queue, then shard.
+
+### Scaling vs things people mix it up with 🟡
+
+| Idea | Question it answers | Example |
+| --- | --- | --- |
+| Performance | How fast is one request? | p99 drops from 800 ms to 120 ms after an index |
+| Scalability | Does it stay fast when load grows? | still 120 ms at 2,500 RPS instead of 800 RPS |
+| Availability | Does it stay up when parts break? | one zone dies, users barely notice |
+| Autoscaling | Who adds machines, and when? | a rule adds pods when CPU passes 60% |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the two moves (bigger machine or more machines) and why the database is the hard part. **Next we open the box**: what "stateless" really needs, the three ways to split work, how reads and writes scale differently, and the usual growth path. Each subsection starts with a plain step-by-step walk; the full detail follows.
 
 ### Vertical vs horizontal
 
 **In plain words:** vertical = one bigger machine, horizontal = many small machines. Like one super-cashier vs many normal cashiers.
+
+**Step by step:**
+1. Your API runs on one 4-core VM and handles 800 requests per second.
+2. Load grows to 2,500 per second. The VM is maxed out.
+3. Vertical: stop it, resize to 16 cores, start it again. No code change, a few minutes of downtime.
+4. Horizontal: start 3 more 4-core VMs and put a load balancer in front. Code must be stateless first.
+5. Next year load hits 10,000 per second. Vertical may have no bigger box left; horizontal just adds more VMs.
 
 | | Vertical (scale up) | Horizontal (scale out) |
 | --- | --- | --- |
@@ -146,13 +189,29 @@ Do vertical first for the database (it is cheap and keeps one source of truth), 
 
 **In plain words:** "stateless" means a server remembers nothing personal between requests, so any server can take any request. Everything it would remember gets moved to a shared place.
 
+**Step by step:**
+1. Asha logs in. Server A creates her session.
+2. If the session lives in Server A's memory, her next click may go to Server B, which has never heard of her.
+3. So Server A writes the session to Redis (a shared in-memory store) instead.
+4. Her next click lands on Server B. B reads the session from Redis and serves her.
+5. Now you can add or remove servers freely, because none of them holds anything personal.
+
+```mermaid
+flowchart LR
+    U["Asha"] --> LB["Load balancer"]
+    LB --> A["Server A"]
+    LB --> B["Server B"]
+    A --> R[("Redis: sessions")]
+    B --> R
+```
+
 A service is stateless when any instance can serve any request. Move each kind of local state out:
 
 | Local state | Where it goes |
 | --- | --- |
 | Login session in memory | Redis or a signed token; see [[Sessions and Cookies]] |
 | Uploaded file on local disk | Object storage; see [[File Uploads and Object Storage]] |
-| In-process cache | Shared cache (Redis) or accept per-instance caches with short TTLs |
+| In-process cache | Shared cache (Redis) or accept per-instance caches with short TTLs (time to live: how long a cached copy is kept before it is thrown away) |
 | In-memory lock or counter | Database row lock, Redis, or [[Distributed Locks and Fencing Tokens]] |
 | Cron job running on "the" server | A scheduler with leader election or a job queue; see [[Scheduled Jobs - Cron to Durable Schedulers]] |
 | WebSocket connections | Allowed, but need a routing layer; see [[Scaling WebSockets]] |
@@ -160,6 +219,13 @@ A service is stateless when any instance can serve any request. Move each kind o
 ### The scale cube (three axes)
 
 **In plain words:** there are only three ways to split work: make copies (X), split by job (Y), or split by data (Z). Like a restaurant adding more identical kitchens, or splitting into a bakery and a grill, or giving each kitchen half the customers.
+
+**Step by step:**
+1. Start with one invoice app on one server.
+2. X axis: run 5 identical copies of it behind a load balancer. Each copy does everything.
+3. Y axis: split it into a billing service, an invoice service and a notification service, so a slow report cannot block checkout.
+4. Z axis: give workspaces 0-49 to database shard A and 50-99 to shard B, so each holds half the data.
+5. You can mix all three at once.
 
 The three axes are independent: a system can clone (X), split by function (Y) and split by data (Z) at the same time, in any combination. X is usually the first move because it is cheapest.
 
@@ -188,6 +254,20 @@ flowchart TB
 
 **In plain words:** reading data is easy to scale because you can hand out copies; writing is hard because every change must land in one true place.
 
+**Step by step:**
+1. 1,000 users open the same invoice list. That is 1,000 reads of the same data.
+2. The first read goes to the database; the answer is saved in a cache. The next 999 come from the cache.
+3. Reads that miss the cache can go to a read replica, so the primary is left alone.
+4. Now 1,000 users each pay an invoice. Each payment is a write, and every write must reach the primary.
+5. The cache and replicas cannot help here. You batch writes, queue slow work, buy a bigger primary, and last of all split the data.
+
+```mermaid
+flowchart LR
+    R["Reads"] --> C["Cache"] --> RR[("Replica")]
+    W["Writes"] --> P[("Primary DB")]
+    P -. "copies changes" .-> RR
+```
+
 | Read scaling (cheapest first) | Write scaling (cheapest first) |
 | --- | --- |
 | 1. Fix the query and the index | 1. Fix the query and the index |
@@ -199,6 +279,13 @@ flowchart TB
 Caches and replicas do nothing for writes: every write still lands on the primary.
 
 ### The growth journey
+
+**Step by step:**
+1. Stage 1: one VM runs the Go API and Postgres together. Fine for a few hundred requests per second.
+2. CPU runs out, and one crash takes everything down. Stage 2: move Postgres to its own box, run 3 API copies behind a load balancer.
+3. The database spends most of its time on reads. Stage 3: add a Redis cache, a read replica, a queue with workers, and a CDN (servers near users that hold copies of static files).
+4. The primary cannot keep up with writes. Stage 4: split data by `workspace_id` into shards, and move hot services out.
+5. You only move to the next stage when a measurement shows the current one is the limit.
 
 ```mermaid
 flowchart LR
@@ -321,7 +408,7 @@ The lesson: before adding nodes, shrink the serial part (the shared lock, the si
 
 **In plain words:** never plan to run machines flat out. Buy enough so each one runs at about half to two-thirds busy at your worst hour; the spare room absorbs spikes and failures.
 
-Peak load 2,500 RPS. A load test shows one API pod handles 800 RPS before p99 breaks the SLO. Running at 60% utilisation at peak leaves room for a zone failure and a traffic spike:
+Peak load 2,500 RPS. A load test shows one API pod (one running copy of the app in Kubernetes) handles 800 RPS before p99 breaks the SLO (service level objective: the speed target you promised, for example "p99 under 300 ms"). Running at 60% utilisation at peak leaves room for a zone failure and a traffic spike:
 
 `pods = ⌈2,500 ÷ (800 × 0.6)⌉ = ⌈5.21⌉ = 6`, spread over 3 zones (2 per zone). Losing one zone leaves 4 pods × 800 = 3,200 RPS of raw capacity, still above the 2,500 peak.
 
@@ -342,6 +429,8 @@ More sizing arithmetic lives in [[Back-of-the-Envelope Estimation]].
 
 ## 6. Trade-offs and when not to use 🔴
 
+> 🟡 → 🔴 **You now know** how each scaling move works and how to size a fleet with spare room. **Next comes the senior view**: what each move costs you, what breaks in real production systems, and the queueing maths behind "never run at 95%".
+
 - **Do not shard first.** Sharding is the most expensive move and hard to undo. Exhaust indexes, query fixes, a bigger primary, caching and replicas first.
 - **Caches and replicas add staleness.** A user who edits an invoice and reloads may read an old replica; see read-your-writes in [[Consistency Models]].
 - **Async adds eventual completion.** A queue flattens a spike but turns "done" into "accepted"; the UI and API must say so (`202 Accepted`).
@@ -350,10 +439,10 @@ More sizing arithmetic lives in [[Back-of-the-Envelope Estimation]].
 
 ## 7. In production 🔴
 
-- **Real systems:** Typical web stacks run stateless app containers behind an ALB on ECS or Kubernetes with a Horizontal Pod Autoscaler on CPU or RPS, a managed PostgreSQL primary with read replicas, Redis in front, and SQS or Kafka for async work.
+- **Real systems:** Typical web stacks run stateless app containers behind an ALB (AWS's managed HTTP load balancer) on ECS or Kubernetes (platforms that run and restart containers) with a Horizontal Pod Autoscaler (a Kubernetes rule that adds or removes pods) on CPU or RPS, a managed PostgreSQL primary with read replicas, Redis in front, and SQS or Kafka (message queues) for async work.
 - **Failure modes → fixes:**
 	- Scale-out does nothing because the DB is saturated → check DB CPU, locks and connection count; add a pooler, cache or replica; see [[Connection Pooling]].
-	- More pods exhaust the database's connection limit (20 pods × 25 connections = 500 > `max_connections` 100 by default in PostgreSQL 17) → size pools from the DB backwards, add PgBouncer.
+	- More pods exhaust the database's connection limit (20 pods × 25 connections = 500 > `max_connections` 100 by default in PostgreSQL 17) → size pools from the DB backwards, add PgBouncer (a small proxy that lets many app connections share a few real database connections).
 	- Autoscaler flaps up and down → longer stabilisation windows, scale on a smoother signal.
 	- One hot key or hot shard caps throughput → see [[Hot Keys and Hot Partitions]].
 - **What to monitor:** utilisation and saturation per tier (CPU, connections, queue depth), p99 latency against load, the max/average ratio across instances, and DB replication lag.
@@ -395,6 +484,26 @@ More sizing arithmetic lives in [[Back-of-the-Envelope Estimation]].
 - Amdahl: max speed-up `1/(1 − p)`. USL: coherency makes extra nodes hurt past `√((1 − α)/β)`.
 - Headroom: 50-70% at peak, N+1 zones. Autoscaling lags by minutes.
 - The database is usually the bottleneck; measure before scaling.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is the difference between vertical and horizontal scaling?
+> Vertical makes one machine bigger; horizontal adds more machines and splits the work between them.
+
+> [!question]- (easy) What does "stateless" mean for a server?
+> It keeps nothing personal between requests, so any server can handle any request.
+
+> [!question]- (easy) Which part of a typical web app is usually the hardest to scale?
+> The database, because every write must land in one true copy.
+
+> [!question]- (medium) Why do caches and read replicas not help a write-heavy system?
+> Every write still has to go to the primary database; copies only take reads off it.
+
+> [!question]- (medium) Peak is 2,500 RPS and one pod handles 800 RPS. How many pods at 60% target?
+> 2,500 ÷ (800 × 0.6) ≈ 5.2, so 6 pods, 2 in each of 3 zones.
+
+> [!question]- (medium) Why can adding nodes make throughput go down?
+> Nodes spend more and more time keeping each other in sync (USL coherency cost), which grows with every pair of nodes.
 
 ## Links
 

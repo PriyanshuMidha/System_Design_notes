@@ -30,6 +30,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[LLD Interview Method]]: the solving steps for one LLD problem (requirements, entities, methods, code, test). This note wraps those steps in the clock and the conversation of a real round.
+
 **From zero, in 60 seconds** 🟢
 
 An **LLD round** (low-level design) is an interview where you design and often code a small system, like a parking lot or a booking app, in 45-90 minutes.
@@ -73,6 +76,12 @@ This note is the game plan for the hour itself: what to do, when, and what to sa
 | Edge case | An unusual input that can break the code | Lot full, same car parks twice |
 | Trade-off | What you gain and what you give up with a choice | Lock per spot: faster, more complex |
 | Time-box | A fixed time limit for one phase | 10 minutes for scope, then move on |
+| HLD (high-level design) | Designing whole services, databases and how they connect | "Design WhatsApp" |
+| UML | A standard way to draw classes and their links | Boxes for `Lot`, `Spot`, arrows between |
+| Mutex | A lock so only one goroutine changes some data at a time | `mu.Lock()` around find-and-assign spot |
+| Race test | A test where many goroutines try the same thing at once, run with `-race` | 2 goroutines book the same room; 1 must win |
+| Dry run | Walking one small input through the code by hand, out loud | "car A parks, spot 1 taken, car B parks…" |
+| Half-open interval | A time range that includes its start but not its end | 10:00–11:00 and 11:00–12:00 don't overlap |
 
 **Picture it**
 
@@ -104,7 +113,7 @@ Most candidates who fail an LLD round knew the content. They lose on execution: 
 A concrete scenario: a 60-minute round for "design a parking lot".
 
 - Candidate A spends 0–10 on scope, 10–25 on entities and methods, 25–50 on `Park` and `Exit` with a concurrency test, and 50–60 on extensions.
-- Candidate B spends 0–35 on a full UML diagram with 14 classes and starts typing at minute 36.
+- Candidate B spends 0–35 on a full UML diagram (the standard boxes-and-arrows class drawing) with 14 classes and starts typing at minute 36.
 
 Both know the same patterns; A gets a hire signal because the evaluator saw working code, an invariant and trade-offs. This note exists so you are always candidate A.
 
@@ -114,11 +123,34 @@ An LLD round is a **paired work session with a senior colleague who is also writ
 
 Analogy: a cooking exam. The examiner does not want every dish in the cookbook. They want one dish, cooked on time, tasted before serving, with you explaining why you added salt. The menu (requirements) is short on purpose; the clock is the real test.
 
+### Real-life example 🟢
+
+Say a 60-minute round asks: "design seat booking for a movie app like BookMyShow".
+In the first minute you say your plan: scope, then classes, then code the booking method, then test.
+You agree scope fast: one theatre, pick seats, hold them for 10 minutes, then pay. Payments and refunds are out of scope.
+By minute 20 you are coding `HoldSeats(showID, seats, userID)`, the method with the hard rule "a seat is held by one user at a time". By minute 50 a race test shows two users grabbing seat D7 and only one winning. That is a working round.
+
+## Common beginner mistakes 🟢
+
+- **Staying silent while thinking** → the interviewer can't score or help what they can't hear → think out loud, in short sentences.
+- **Drawing a full class diagram for 30 minutes** → no working code at the end → list the main classes in 5 minutes, then code the core method.
+- **Coding before agreeing scope** → you build the wrong thing → ask 4-6 questions, write in-scope and out-of-scope, and confirm.
+- **Listing patterns to impress** → each one needs a reason, or it reads as a red flag → name a pattern only when a requirement varies along that line.
+- **Restarting when the design feels wrong** → you run out of time → name the flaw and make the smallest fix.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that the clock and the conversation decide the round. **Next we open the box**: how to tell which kind of round you are in, how to split the minutes, how to talk while you work, and what goes on the interviewer's scorecard.
 
 ### Step 1: identify the round format
 
 **In plain words:** First figure out the type of round: talk-only, code-only, or a mix. Each one wants a different focus.
+
+**Step by step:**
+1. Read the invite. "Bring your laptop, runnable code" means machine coding.
+2. "LLD + API + DB" at a product company means a hybrid round.
+3. Just "object-oriented design" usually means a discussion with one core method.
+4. Still unsure? Ask the recruiter: "Is the LLD round a discussion or do I need runnable code?"
 
 | Format | Signals in the invite | Typical length | Code expected | What to optimise |
 | --- | --- | --- | --- | --- |
@@ -138,6 +170,13 @@ flowchart LR
 ### Step 2: run the clock
 
 **In plain words:** Split your time into boxes and watch the clock, so you always end with something working.
+
+**Step by step (60-minute parking lot):**
+1. Minutes 0-5: say the plan, ask scope questions, write in-scope list.
+2. Minutes 5-20: entities `Lot`, `Level`, `Spot`, `Ticket`, and method names.
+3. Minutes 20-45: code `Park` and `Exit`.
+4. Minutes 45-52: race test with two cars and one spot; dry-run a full lot.
+5. Minutes 52-60: extensions (pricing, many gates) and questions.
 
 ```mermaid
 flowchart LR
@@ -164,15 +203,29 @@ Rule of thumb: in a 45 or 60-minute round you should be typing real code by abou
 
 **In plain words:** Say your plan out loud, check it with the interviewer, and keep them in the loop.
 
+**Step by step:**
+1. Minute 1: "I'll clarify scope, list classes, code the core method, test it, then discuss extensions. Does that work?"
+2. Write the agreed requirements at the top of the file.
+3. Before coding, say the rule: "a spot is held by at most one ticket".
+4. At each phase change, check in: "Model done; shall I code `Park` now?"
+
 - **Say the plan** in the first minute (script below) and ask "does that match what you want?".
 - **Write requirements as a short list** on the board or at the top of the file, marked in-scope and out-of-scope. It becomes your contract.
-- **Narrate decisions, not keystrokes:** "I keep `Spot` state inside `Level` so one mutex covers find-and-assign" is useful; "now I type a for loop" is not.
+- **Narrate decisions, not keystrokes:** "I keep `Spot` state inside `Level` so one mutex (a lock that lets one goroutine in at a time) covers find-and-assign" is useful; "now I type a for loop" is not.
 - **Name the invariant before the code:** "a spot is held by at most one ticket".
 - **Check in at phase boundaries:** "I have the model; shall I code `Park` now?" Interviewers often know which method they want to see.
 
 ### Step 4: know what the evaluator writes down
 
 **In plain words:** The interviewer fills a scorecard. Know the boxes so you show each one.
+
+**Step by step:**
+1. Scope: did you ask and write down what is in and out?
+2. Model: are the classes and the key rule clear?
+3. Code: does the core method work?
+4. Edge cases: lot full, same car twice, two cars at once?
+5. Trade-offs: did you say what your choices cost?
+6. Communication: did they always know what you were doing?
 
 ```mermaid
 flowchart TD
@@ -205,9 +258,9 @@ minutes for edge cases and extensions. Does that work for you?
 
 **Minute 20–45, core code.** `Book` checks overlap and inserts under one lock per room; returns a typed `ErrConflict`. Full solution in [[Meeting Room Scheduler]].
 
-**Minute 45–52, prove it.** Two goroutines book the same room and slot; exactly one succeeds under `go test -race`. Dry-run back-to-back meetings (10:00–11:00 and 11:00–12:00 must both succeed with a half-open interval).
+**Minute 45–52, prove it.** Two goroutines (lightweight Go threads) book the same room and slot; exactly one succeeds under `go test -race` (Go's test run with its race detector on). Dry-run back-to-back meetings (10:00–11:00 and 11:00–12:00 must both succeed with a half-open interval, one that includes its start but not its end).
 
-**Minute 52–60, extend.** Interviewer asks "what if two app servers run this?". Answer: move the invariant to PostgreSQL with an exclusion constraint, `EXCLUDE USING gist (room_id WITH =, tstzrange(starts_at, ends_at) WITH &&)` (needs the `btree_gist` extension for the `=` on `room_id`); mention recurring meetings expand into instances.
+**Minute 52–60, extend.** Interviewer asks "what if two app servers run this?". Answer: move the invariant to PostgreSQL with an **exclusion constraint** (a database rule that refuses any new row overlapping an existing one), `EXCLUDE USING gist (room_id WITH =, tstzrange(starts_at, ends_at) WITH &&)` (needs the `btree_gist` extension for the `=` on `room_id`); mention recurring meetings expand into instances.
 
 What the evaluator likely wrote: clear scope, correct invariant, working `Book`, tested race, good DB answer. That is a hire signal for the LLD part.
 
@@ -223,6 +276,14 @@ What the evaluator likely wrote: clear scope, correct invariant, working `Book`,
 | Concurrency-heavy (rate limiter, LRU, pub-sub) | Code is the whole round | Small API, clear locking, a race test | Over-designing interfaces |
 | Senior (SDE-3) bar | Same question, deeper follow-ups | Bring failure paths, multi-instance, observability yourself | Waiting to be asked |
 
+### LLD round vs HLD round vs machine coding 🟡
+
+| Round | What you design | Output | Typical length |
+| --- | --- | --- | --- |
+| LLD (discussion) | Classes, methods and one core rule | Class list + one working method | 45–60 min |
+| Machine coding | A small program end to end | Code that runs, often with tests | 90–120 min |
+| HLD (system design) | Services, databases, queues, scale | Boxes-and-arrows architecture + numbers | 45–60 min |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - **The time boxes are a default, not a law.** If the interviewer says "skip requirements, start coding", do it. Following your plan over their hint is a red flag.
@@ -233,12 +294,15 @@ What the evaluator likely wrote: clear scope, correct invariant, working `Book`,
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to run the clock and what the scorecard checks. **Next is the senior view**: the red flags interviewers write down, how to recover when stuck, and what extra an SDE-3 must show.
+
+
 Here "production" means the real interview loop.
 
 **Red flags evaluators note:**
 
 - Coding before agreeing on scope, or never coding at all.
-- Raw strings for states, exported fields that bypass invariants, one god struct.
+- Raw strings for states, exported fields that bypass invariants, one god struct (one type that does everything).
 - "I would use a mutex" with no mention of what happens across instances (in product rounds).
 - Patterns listed without a reason ("I'll use Factory, Singleton and Observer").
 - Ignoring a hint, or arguing with a requirement change.
@@ -311,7 +375,7 @@ flowchart LR
 **In plain words:** Keep it in one package, show a small test, and use plain Go features over clever tricks.
 
 - Keep one package for a 45-minute round; split files (`model.go`, `service.go`, `service_test.go`) only if the editor makes it easy. The layout is in [[LLD Interview Method]].
-- Use typed constants for states and sentinel or typed errors for failures.
+- Use typed constants for states and sentinel (fixed, named error values like `ErrConflict`) or typed errors for failures.
 - A `go test -race` winner test is the fastest way to prove a concurrency claim ([[Testing LLD Code]], [[Concurrency for LLD]]).
 
 ## 9. Interview questions 🔴
@@ -344,6 +408,26 @@ flowchart LR
 - Stuck: narrate → shrink the problem → ask for a hint.
 - Never restart; fix the smallest thing.
 - SDE-3: failure paths, multi-instance, extensions with costs.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What do you say in the first minute?
+> Your plan (scope, model, core method, test, extensions) and "does that match what you want?".
+
+> [!question]- (easy) In a 60-minute round, when should you be typing real code?
+> By about minute 20, one third of the way in.
+
+> [!question]- (easy) Which method should you code?
+> The one that guards the hard rule or the race, like `Park` or `Book`.
+
+> [!question]- (medium) Your model is wrong at minute 40. What now?
+> Name the flaw, make the smallest fix, and carry on; don't restart.
+
+> [!question]- (medium) Why are 10:00–11:00 and 11:00–12:00 not a clash?
+> With half-open intervals the end is excluded, so `a.start < b.end && b.start < a.end` is false for them.
+
+> [!question]- (medium) What extra does an SDE-3 show compared with SDE-2?
+> Invariants named first, the failure path coded, multi-instance correctness, testability, and prioritised extensions with costs.
 
 ## Links 🟢
 

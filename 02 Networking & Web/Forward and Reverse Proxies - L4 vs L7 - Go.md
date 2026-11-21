@@ -21,6 +21,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add the "Code", "Design decisions" and "Tests" sections.
 > - 🔴 **Interview / SDE-3 prep?** Add "Pitfalls" and do the exercises. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: requests carry headers like `Host`, and a 502 status means "the server behind me failed".
+> - [[TCP - Handshake, Reliability, Flow and Congestion Control]]: a connection to a dead server is refused, which is what the 502 test simulates.
+> - [[Forward and Reverse Proxies - L4 vs L7]] (theory twin): what a reverse proxy is and why `X-Forwarded-For` must be read from the right.
+
 **From zero, in 60 seconds** 🟢
 
 In plain words: this file builds a tiny receptionist (a **reverse proxy**) in Go. It takes each incoming request, notes down who really sent it (the `X-Forwarded-For` list), passes the request to the real server, and answers with a clean "502" error when that server is down. It also includes the one function everyone gets wrong — reading that sender list *safely*, trusting only the entries our own machines wrote. Read the short explanation around each code block first; the code just does what the sentence above it says.
@@ -28,7 +33,7 @@ In plain words: this file builds a tiny receptionist (a **reverse proxy**) in Go
 ## Before the code 🟢
 
 - **`net/http/httputil.ReverseProxy`**: a ready-made reverse proxy from the standard library; we only customize it.
-- **Closures (`Director`, `ErrorHandler`)**: functions stored in struct fields; the proxy calls them per request.
+- **Closures (`Director`, `ErrorHandler`)**: functions stored in struct fields (a closure is a function that remembers variables from where it was created); the proxy calls them per request.
 - **`log/slog`**: structured logging with key/value pairs.
 - **`net/http/httptest`**: starts real local HTTP servers inside tests, so the proxy is tested end to end.
 - **Goroutines (implicit)**: every request is served on its own goroutine, which is why tests run with `-race`.
@@ -57,6 +62,8 @@ go test -race ./...
 ```
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** what the proxy must do: forward, note the sender, answer 502 on failure. **Next we read the code**: the two hooks we customize on Go's built-in proxy, the header-append helper, and the safe reader for the sender list.
 
 ### Building the proxy and rewriting outbound requests
 
@@ -105,11 +112,11 @@ The second half wires in the failure path — what happens when the origin can't
 
 `httputil.ReverseProxy`'s own `Director` is wrapped rather than replaced — calling the original `director` first keeps all of the standard library's own rewriting (scheme, path, query merging) and only adds the two things it doesn't do: forcing `req.Host` to match the origin, and appending `X-Forwarded-For`.
 
-Writing a reverse proxy entirely from scratch (manual `http.Client` calls) was rejected because `httputil.ReverseProxy` already handles streaming bodies, header hop-by-hop stripping, and connection reuse correctly.
+Writing a reverse proxy entirely from scratch (manual `http.Client` calls) was rejected because `httputil.ReverseProxy` already handles streaming bodies, header hop-by-hop stripping (removing headers like `Connection` that only apply to one link, not the whole path), and connection reuse correctly.
 
 **How it works.**
 1. `director := proxy.Director` captures the standard library's default rewriting function before replacing it, so the override can still call it.
-2. `req.Host = origin.Host` matters because many origins route on the `Host` header, not just the URL — without this line, a multi-tenant origin could route to the wrong backend.
+2. `req.Host = origin.Host` matters because many origins route on the `Host` header, not just the URL — without this line, a multi-tenant origin (one server hosting many customers' sites, told apart by `Host`) could route to the wrong backend.
 3. `ErrorHandler` is the only hook `httputil.ReverseProxy` gives for "the backend didn't answer correctly"; returning `502` here is what turns a raw Go error (connection refused, timeout) into the correct HTTP status for the client.
 
 ### Appending X-Forwarded-For and X-Forwarded-Proto
@@ -280,6 +287,8 @@ flowchart TD
 
 A failure where `X-Forwarded-For` is empty would mean `appendForwardedFor` never ran or `RemoteAddr` parsing failed silently — the backend would then have no way to recover the real client IP at all.
 
+**What this code does, in plain words:** it starts a fake origin server that records the headers it receives, puts the proxy in front of it, sends `GET /widgets/7` through the proxy, and keeps what the origin saw for the checks below.
+
 ```go
 func TestReverseProxyForwardsAndSetsHeaders(t *testing.T) {
 	var gotHost, gotXFF, gotProto string
@@ -342,6 +351,8 @@ The assertions confirm both the body passed through untouched and every header t
 
 A failure here (the client request hanging, or getting a `200`) would mean `ErrorHandler` never fired — exactly the silently-dropped-connection failure mode the theory note warns against.
 
+**What this code does, in plain words:** it starts a server, shuts it down at once so nothing is listening, points the proxy at that dead address, and checks the answer is 502.
+
 ```go
 func TestReverseProxyReturns502OnUnreachableOrigin(t *testing.T) {
 	// A closed listener: nothing answers, so the proxy must report 502, not hang or 200.
@@ -375,6 +386,8 @@ func TestReverseProxyReturns502OnUnreachableOrigin(t *testing.T) {
 
 A failure returning `"attacker-spoofed"` would mean the hop-counting logic is reading from the wrong end of the list — the exact bug the theory note's trap interview question describes.
 
+**What this code does, in plain words:** it feeds `TrustedClientIP` a header with one forged entry and two real proxy entries, says "I run 2 proxies", and checks it returns the real client `203.0.113.9`.
+
 ```go
 func TestTrustedClientIPTrustsOnlyKnownHops(t *testing.T) {
 	// attacker, then two of our own proxies appending in order.
@@ -405,6 +418,8 @@ Reading it: all three tests pass under `-race`; since `httptest.NewServer` spins
 
 ## Pitfalls in the code 🔴
 
+> 🟡 → 🔴 **You now know** how each hook and helper works and what the tests prove. **Next, the advanced part**: the small edits that would silently break hop counting or hide outages, and exercises that add 504 handling and path routing.
+
 - **Forgetting to call the original `director` before the override's own logic** would silently lose the standard library's own request rewriting (path/query merging), producing requests the origin can't route correctly — this is why `director(req)` is called first, not skipped.
 - **Setting `X-Forwarded-For` instead of appending** would make a multi-hop deployment indistinguishable from a single-hop one, breaking `TrustedClientIP`'s hop-counting for everyone downstream.
 - **Returning `200` or leaving the response unwritten in `ErrorHandler`** would hide a real backend outage from monitoring that watches for `5xx` rates, since the client would see success or a hang instead of a clear signal.
@@ -414,6 +429,26 @@ Reading it: all three tests pass under `-race`; since `httptest.NewServer` spins
 1. Change `ErrorHandler` to distinguish a context-deadline-exceeded error (slow backend) from any other error (backend refused/reset), returning `504` for the former and `502` for the rest. Predict which existing test still passes unmodified, then verify.
 2. Add a `MaxTrustedHops` guard to `TrustedClientIP` that returns `""` instead of clamping when `trustedHops > len(parts)`, on the reasoning that a shorter-than-expected header might itself be a sign of tampering. Predict which call sites in a real proxy would need to handle an empty-string "unknown" result, then update the test to cover it.
 3. Add a second origin and extend `NewReverseProxy` into a `NewPathRouter(routes map[string]*url.URL, logger *slog.Logger) http.Handler` that picks an origin by path prefix. Predict how `X-Forwarded-For` behavior should change, if at all, then write a test with two origins and two paths.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 Which standard library type does the forwarding work?
+> `httputil.ReverseProxy`; this code only customizes its `Director` and `ErrorHandler` hooks.
+
+> [!question]- 🟢 What status does the proxy return when the origin is down?
+> 502 Bad Gateway, written by the custom `ErrorHandler`.
+
+> [!question]- 🟢 Does the proxy overwrite or append `X-Forwarded-For`?
+> It appends the caller's IP after any existing entries.
+
+> [!question]- 🟡 Why call the original `director(req)` first in the override?
+> It keeps Go's own rewriting of scheme, path and query; skipping it breaks routing to the origin.
+
+> [!question]- 🟡 With `"attacker-spoofed, 203.0.113.9, 10.0.0.5"` and `trustedHops = 1`, what does `TrustedClientIP` return?
+> `10.0.0.5`, the last entry, because only one hop is trusted.
+
+> [!question]- 🟡 Why does this code always return 502, never 504?
+> It keeps one error path for simplicity; exercise 1 adds a timeout check to return 504.
 
 ## Links
 

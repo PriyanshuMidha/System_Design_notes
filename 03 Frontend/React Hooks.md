@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (the main hooks) and 4 (the fetch race traced and fixed).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[React Fundamentals - Components, JSX, Props, State]]: a component is a function React re-runs whenever its props or state change, and `useState` gives it a value plus a setter.
+> - [[JavaScript Async - Event Loop, Promises, async-await]]: a `fetch` returns a promise that finishes later, so its answer can arrive after the user has moved on.
+
 **From zero, in 60 seconds** 🟢
 
 A React component is a function, and a function forgets everything when it finishes. But a counter needs to remember its number between clicks. **Hooks** are small helper functions, all starting with `use`, that give a component memory and other powers.
@@ -75,6 +79,12 @@ Hooks are small `use...` functions that give a component memory and a place for 
 | Cleanup | Code that undoes an effect | `clearInterval(id)` |
 | Closure | A function that remembers variables from where it was created | a callback still seeing an old `productId` |
 | Dependency array | List of values that decide when an effect re-runs | `useEffect(fn, [productId])` |
+| Unmount | React removing a component from the page | closing a popup unmounts it |
+| Ref | A box from `useRef` that keeps a value without causing re-renders | `timerRef.current = id` |
+| Memoize | Save a computed result and reuse it while inputs stay the same | `useMemo(() => sort(list), [list])` |
+| Reference | Which exact object or function something is; a new one is made each render unless cached | `() => {}` is new every render |
+| Stale closure | A callback still using an old value from an earlier render | an interval stuck at `count = 0` |
+| Race condition | Two async jobs finish in an unlucky order and the wrong one wins | old price overwrites the new one |
 
 **Picture it**
 
@@ -106,7 +116,7 @@ A function component is, each render, just a function call: its local variables 
 
 That had a real cost. Two unrelated concerns — say, a data subscription and a window-resize listener — ended up interleaved inside the same `componentDidMount`/`componentWillUnmount` pair, because a class only has one of each lifecycle method, not one per concern.
 
-Splitting them apart meant extracting a whole higher-order component or render-prop wrapper, both of which added a layer of indirection just to share logic.
+Splitting them apart meant extracting a whole **higher-order component** (a function that takes a component and returns a wrapped one) or **render-prop** (a component that takes a function telling it what to draw) wrapper, both of which added a layer of indirection just to share logic.
 
 Hooks solve this by giving a *function* component access to React's internal per-component storage, without a class. `useState` hands you a slot of memory.
 
@@ -114,6 +124,30 @@ Hooks solve this by giving a *function* component access to React's internal per
 
 > [!tip] Remember
 > Hooks exist to give a plain function the one thing it was missing: memory across calls, without the ceremony of a class.
+
+### Real-life example: the seat-hold timer 🟢
+
+On BookMyShow, after you pick seats you see "Complete payment in 09:59", counting down.
+The time left is `useState`; a `useEffect` starts a `setInterval` that ticks it down every second.
+If you go back and leave the page, the effect's cleanup clears that interval, so it stops ticking in the background.
+When you switch from one show time to another, an effect fetches that show's seat map, and an `ignore` flag makes sure a slow answer for the old show never replaces the new one.
+
+## Common beginner mistakes 🟢
+
+- **Calling a hook inside an `if`** → hook slots shift and state gets mixed up → call every hook at the top of the component; put the `if` inside the hook.
+- **Leaving a used value out of the dependency array** → the effect keeps an old value (stale closure) → list every value the effect reads, or use the functional updater.
+- **Starting a timer or listener with no cleanup** → it keeps running after the component is gone → `return () => clearInterval(id)` from the effect.
+- **Using an effect to compute a value from props** → an extra render for nothing → compute it directly in the component body.
+- **Wrapping everything in `useMemo`** → more work, not less, for cheap values → use it only for heavy work or to keep a reference stable for `React.memo`.
+
+## Often confused 🟡
+
+| These two | First one | Second one |
+| --- | --- | --- |
+| `useState` vs `useRef` | Changing it re-renders the screen | Changing it never re-renders |
+| `useEffect` vs `useLayoutEffect` | Runs after the screen is painted | Runs before paint; blocks the screen until done |
+| `useMemo` vs `useCallback` | Caches a value | Caches a function |
+| `[]` vs no dependency array | Effect runs once after first render | Effect runs after every render |
 
 ## 2. Mental model 🟢
 
@@ -140,9 +174,18 @@ The analogy breaks down because a real coat-check has one ticket per item; React
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that hooks give a component memory and a place for "after render" work, and that React finds them by call order. **Next we open the box**: the two rules, how `useState` decides to re-render, how `useEffect` runs and cleans up, and when `useLayoutEffect` is needed.
+
 ### Rules of hooks, and why
 
 **In plain words:** two rules, one reason. Always call hooks at the top of the component, never inside an `if` or loop, because React only knows each hook by its position in line — like a coat check that works by ticket number.
+
+**Step by step:**
+1. First render: `useState("")` (name) is call 1, `useState(0)` (age) is call 2. React stores "" in slot 1 and 0 in slot 2.
+2. Next render, if every hook is called again in the same order, call 1 gets slot 1 and call 2 gets slot 2. All good.
+3. Now suppose the name hook sits inside `if (showName)` and `showName` becomes false.
+4. The age hook is now call 1, so React hands it slot 1: the name. Age now shows "".
+5. Keeping every hook at the top level, with no `if` around it, prevents this.
 
 1. Only call hooks at the top level of a component (or another hook) — never inside `if`, loops, or after an early `return`.
 2. Only call hooks from React function components or custom hooks — not plain JS functions.
@@ -156,13 +199,20 @@ Both rules exist purely to keep the slot list's order identical across renders, 
 
 **In plain words:** `useState` gives a component one piece of memory that survives between renders, plus a function to change it that also tells React "please re-render."
 
+**Step by step:**
+1. `const [items, setItems] = useState([])` gives an empty list on the first render.
+2. You call `setItems([...items, "Dosa"])`. That makes a **new** array with Dosa in it.
+3. React compares old and new with `Object.is` (are they the very same object?). They are different, so it re-renders.
+4. On the re-render, `useState` returns the stored `["Dosa"]`, not the starting `[]`.
+5. Had you done `items.push("Dosa"); setItems(items)`, the array would be the same object, and React would skip the re-render.
+
 ```jsx
 const [count, setCount] = useState(0);
 setCount(count + 1);          // direct form: computed from the render's own `count`
 setCount((c) => c + 1);       // functional form: always sees the latest pending value
 ```
 
-State updates must be treated as immutable: build a new object/array rather than mutating the old one, or React's equality check (`Object.is`) won't notice a change and will skip the re-render:
+State updates must be treated as immutable: build a new object/array rather than mutating the old one, or React's equality check (`Object.is`, which asks "is it the very same object?") won't notice a change and will skip the re-render:
 
 ```jsx
 // Wrong: mutates the existing array, same reference, React sees "no change"
@@ -181,6 +231,13 @@ The array *is* mutated in memory, but the screen never updates to show it, becau
 ### `useEffect`: dependency array and cleanup
 
 **In plain words:** `useEffect` lets you run code *after* React has already updated the real DOM — the right place for anything that reaches outside React itself, like starting a timer, subscribing to an external data source, or logging.
+
+**Step by step:**
+1. The component renders with `productId = 1` and React updates the page.
+2. After the page is painted, React runs the effect: it starts a fetch for product 1.
+3. The user picks product 2. React re-renders, sees `[productId]` changed from 1 to 2.
+4. React runs the old effect's **cleanup** first (stop or ignore product 1), then runs the effect again for product 2.
+5. When the component is removed from the page (unmounted), the cleanup runs one last time.
 
 ```jsx
 useEffect(() => {
@@ -265,7 +322,18 @@ Before reaching for an effect at all, ask "can this be computed during render in
 
 ### `useLayoutEffect`
 
-**In plain words:** same API as `useEffect`, but it runs synchronously after the DOM mutates and *before* the browser paints the screen.
+**In plain words:** same API as `useEffect`, but it runs synchronously (right away, holding everything else up) after the DOM mutates and *before* the browser paints the screen.
+
+**Step by step:**
+1. A tooltip renders below a button, at a guessed position.
+2. `useLayoutEffect` runs before the screen is drawn and measures the tooltip: it would go off the right edge.
+3. It moves the tooltip left.
+4. Only now does the browser paint, so the user never sees it jump.
+
+```mermaid
+flowchart LR
+    R["render"] --> D["DOM updated"] --> L["useLayoutEffect<br/>(measure, fix)"] --> P["paint"] --> E["useEffect"]
+```
 
 **Why it matters:** use it only when you must measure or mutate the DOM before the user sees a flicker (e.g. positioning a tooltip based on a just-rendered element's size); otherwise `useEffect` is preferred because it doesn't block painting, keeping the UI responsive.
 
@@ -351,10 +419,10 @@ function ProductList({ products, query }) {
 
 **Why it matters:** both hooks trade memory and a comparison of the dependency array for *skipping* work. They help when either:
 - the computation is genuinely expensive (sorting/filtering a large list, not adding two numbers), or
-- the cached value/function is passed to a `React.memo`-wrapped child or another hook's dependency array, where a **new** reference every render would defeat that optimization anyway.
+- the cached value/function is passed to a `React.memo`-wrapped child (`React.memo` makes a component skip re-rendering when its props are the same references as last time) or another hook's dependency array, where a **new** reference every render would defeat that optimization anyway.
 
 > [!warning] Common mistake
-> Wrapping every value in `useMemo` "just in case." Computing `a + b` is cheaper than the memoization bookkeeping itself, and it adds a dependency array that can silently go stale just like `useEffect`'s. React 19's React Compiler automates much of this specific decision by inserting memoization where it actually pays off, reducing how often `useMemo`/`useCallback` need to be hand-written.
+> Wrapping every value in `useMemo` "just in case." Computing `a + b` is cheaper than the memoization bookkeeping itself, and it adds a dependency array that can silently go stale just like `useEffect`'s. React 19's React Compiler (a build-time tool that rewrites your components) automates much of this specific decision by inserting memoization where it actually pays off, reducing how often `useMemo`/`useCallback` need to be hand-written.
 
 ### `useRef`: DOM access and renderless mutable storage
 
@@ -445,13 +513,13 @@ flowchart TD
 | Hook | What it's for | Use when | Cost / gotcha |
 | --- | --- | --- | --- |
 | `useState` | A value the UI depends on | Any value that should trigger a re-render when it changes | Must be replaced immutably, not mutated |
-| `useReducer` | State transitions via a reducer function and dispatched actions | Several related state fields that change together, or transition logic worth testing on its own | More ceremony than `useState` for simple cases |
+| `useReducer` | State transitions via a **reducer** function (takes the current state and an action, returns the next state) and **dispatched** (sent) actions | Several related state fields that change together, or transition logic worth testing on its own | More ceremony than `useState` for simple cases |
 | `useEffect` | Side effects after commit (subscriptions, fetches, timers, manual DOM work tied to an external system) | Syncing with something outside React | Needs a correct dependency array and cleanup, or it leaks or goes stale |
 | `useLayoutEffect` | Same as `useEffect`, but before paint | Measuring/mutating the DOM before the user sees a flicker | Blocks painting; use sparingly |
 | `useMemo` | Cache a computed value between renders | An expensive computation, or a value whose identity another memoized thing depends on | Comparing the dependency array itself costs something; don't wrap trivial computations |
 | `useCallback` | Cache a function's identity between renders | Passing a callback to a `React.memo`-wrapped child, or into another hook's dependency array | Same cost profile as `useMemo`; it's `useMemo` specialized for functions |
-| `useRef` | A mutable value, or a DOM node, that doesn't trigger renders | Timer ids, previous values, imperative DOM access | Reading `.current` during render (not in an effect/handler) is a footgun — it can read a stale value |
-| `useContext` | Read a value provided higher in the tree | Avoiding prop drilling for cross-cutting values (theme, auth) | Every consumer re-renders when the context value changes, even if it only reads one field |
+| `useRef` | A mutable value, or a DOM node, that doesn't trigger renders | Timer ids, previous values, **imperative** (direct "do this now", like `.focus()`) DOM access | Reading `.current` during render (not in an effect/handler) is a **footgun** (an easy way to hurt yourself) — it can read a stale value |
+| `useContext` | Read a value provided higher in the tree | Avoiding **prop drilling** (passing a prop down through many layers that do not use it) for cross-cutting values (theme, auth) | Every consumer re-renders when the context value changes, even if it only reads one field |
 
 ## 6. Trade-offs and when not to use 🟡
 
@@ -462,18 +530,20 @@ flowchart TD
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the main hooks, how effects clean up, how to stop a fetch race, and when caching hooks pay off. **Next is the advanced part**: how libraries build on hooks, the errors you will see in real apps, why `StrictMode` double-runs effects, and how React stores hooks inside.
+
 - **Real systems:** essentially all React code written since 2019 uses hooks; data-fetching libraries like TanStack Query and RTK Query are themselves built as custom hooks (`useQuery`, `useMutation`) wrapping exactly the fetch-in-an-effect-with-cleanup pattern shown above, plus caching and retries.
 - **Failure modes → fixes:**
   - A counter or interval always increments by the same stale amount → stale closure from a missing dependency; add the dependency or switch to the functional updater form.
   - A fetch's result overwrites a newer one after fast navigation → missing cancellation; add the `ignore` flag or an `AbortController`.
   - "Rendered more hooks than during the previous render" error → a hook call was placed after an early `return` or inside a conditional; move it to the top level.
   - A `React.memo`-wrapped child still re-renders every time → a new inline object/array/function literal is passed as a prop every render (new reference each time); wrap it in `useMemo`/`useCallback`.
-  - Effects seem to double-fire in development → React 18+ `StrictMode` intentionally mounts, unmounts, and remounts each component once in development to surface effects with missing or broken cleanup; it does not happen in production builds.
-- **What to monitor:** number of unnecessary re-renders per interaction (React DevTools Profiler, "why did this render" flame graph); effect cleanup correctness is a code-review concern, not a runtime metric — missing cleanup usually shows up as a memory/listener leak over a long session instead.
+  - Effects seem to double-fire in development → React 18+ `StrictMode` (a development-only checking wrapper) intentionally mounts, unmounts, and remounts each component once in development to surface effects with missing or broken cleanup; it does not happen in production builds.
+- **What to monitor:** number of unnecessary re-renders per interaction (React DevTools Profiler, "why did this render" **flame graph**, a chart of nested bars showing where time went); effect cleanup correctness is a code-review concern, not a runtime metric — missing cleanup usually shows up as a memory/listener leak over a long session instead.
 
 ## 8. Deep dive 🔴
 
-- **Why call order, not names, identifies a hook.** React doesn't know the hooks are named `useState`/`useEffect`; it simply keeps, per component instance, a linked list of "hook records" and advances one node per hook call during render. This is a deliberate simplicity trade-off (no need to track hook identity by name or location) that makes the two rules of hooks non-negotiable rather than stylistic.
+- **Why call order, not names, identifies a hook.** React doesn't know the hooks are named `useState`/`useEffect`; it simply keeps, per component instance, a **linked list** (items chained one after another, each pointing to the next) of "hook records" and advances one node per hook call during render. This is a deliberate simplicity trade-off (no need to track hook identity by name or location) that makes the two rules of hooks non-negotiable rather than stylistic.
 - **`useReducer` for complex state.**
   ```jsx
   function reducer(state, action) {
@@ -523,6 +593,26 @@ flowchart TD
 - `useRef` persists a value across renders without ever causing one; good for DOM nodes, timers, "previous value" bookkeeping.
 - `StrictMode`'s double-invoked effects in development are meant to expose a missing cleanup, not a bug in React.
 - A custom hook is just a function starting with `use` that calls other hooks, following the same rules.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: which hook gives a component memory that causes a re-render when it changes?
+> `useState`.
+
+> [!question]- Easy: when does `useEffect(fn, [])` run?
+> Once, after the first render; its cleanup runs once when the component is removed.
+
+> [!question]- Easy: where must hooks be called?
+> At the top level of a component or custom hook, never inside `if`, loops or after an early `return`.
+
+> [!question]- Medium: `items.push(x); setItems(items)` does not update the screen. Why?
+> It is the same array object, so `Object.is` says nothing changed. Use `setItems([...items, x])`.
+
+> [!question]- Medium: an interval inside `useEffect(..., [])` always shows `count + 1 = 1`. Fix?
+> Use `setCount(c => c + 1)`, or add `count` to the dependency array.
+
+> [!question]- Medium: fast switching between products shows the wrong price. What goes in the cleanup?
+> Set an `ignore` flag (or call `abort()` on an `AbortController`) so the old fetch cannot call `setPrice`.
 
 ## Links
 

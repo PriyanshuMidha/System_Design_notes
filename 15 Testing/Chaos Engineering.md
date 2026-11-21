@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Testing Strategy and the Test Pyramid]]: different tests answer different questions, and each runs at its own stage; chaos experiments sit above end-to-end tests.
+> - [[Load and Performance Testing]]: load tests prove the system copes with lots of traffic when nothing is broken; chaos tests what happens when something *is* broken.
+
 **From zero, in 60 seconds** 🟢
 
 Big systems break in small ways all the time: a server dies, a network gets slow, a database stops answering.
@@ -70,6 +74,11 @@ Chaos engineering is pressing the test button on purpose, on a quiet day, while 
 | SLO | A target for how well a service must behave | 99.5% of checkouts succeed |
 | Blast radius | How much of the system an experiment can hurt | 1 pod, or 1% of traffic |
 | Steady state | The normal value of a key metric | Checkout success rate near 99.8% |
+| AZ (availability zone) | One data-centre building inside a cloud region | `ap-south-1a` |
+| Fault injection | Causing a failure on purpose (delay, error, kill) | Make payment calls return 500 for 5 min |
+| Abort condition | A rule that stops the experiment automatically if things get too bad | Stop if success rate < 99.5% |
+| Game day | A scheduled team exercise where faults are injected while people watch and respond | Quarterly "Redis is down" drill |
+| Jitter | A small random extra wait added to retries so clients don't all retry at the same moment | Retry after 100 ms ± 30 ms |
 
 **Picture it**
 
@@ -102,6 +111,10 @@ A chaos experiment that injects a 100% failure rate on that one dependency, for 
 
 It might show that the circuit breaker's threshold is misconfigured and every request hangs for the full client timeout instead, which is exactly the finding you want before a real payment-provider outage happens in production, not during one.
 
+### Real-life example: Netflix and a dead server 🟢
+
+Netflix famously runs a tool called Chaos Monkey that switches off random servers during working hours. The bet is simple: if the app cannot survive one server dying on a normal Tuesday, it will not survive it during a big launch night either. Because servers die on purpose every day, engineers build every service to cope, and viewers keep streaming without noticing. A food app like Swiggy could do the same on a smaller scale: make its restaurant-search cache slow for 1% of staging traffic and check that menus still load.
+
 ```mermaid
 flowchart LR
     A["Timeout set in code"] --> B{"Ever tested with a slow DB?"}
@@ -126,7 +139,26 @@ flowchart LR
 
 The loop never starts with "inject everywhere, see what breaks" — it starts with a falsifiable prediction ("checkout success rate stays above 99.5% if the payment provider returns errors"), and only grows in scope once the smaller version has passed.
 
+## Common beginner mistakes 🟢
+
+- **Breaking things at random across the whole fleet on day one** → the experiment becomes the outage → start with one pod in staging, then 1% of production.
+- **Measuring CPU instead of a user metric** → CPU can look fine while orders fail → use a business number like checkout success rate.
+- **No automatic stop** → a bad experiment runs while people scramble → wire an abort tied to an SLO before you start.
+- **Injecting several faults at once** → you cannot tell which one caused the drop → one fault per experiment.
+- **Writing up findings and never fixing them** → the same gap bites in a real outage → turn each finding into an owned, tracked fix.
+
+### Chaos engineering vs load testing 🟡
+
+| | Load testing | Chaos engineering |
+| --- | --- | --- |
+| Question | Can it handle this much traffic? | Does it cope when a part breaks? |
+| What you change | Traffic volume | One failure (slow DB, dead pod) |
+| Typical finding | Pool too small at 1,800 req/s | Timeout never fires, breaker misconfigured |
+| Needs first | A staging copy and a load tool | Monitoring, on-call and an abort switch |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a chaos experiment is a small, measured test of one fault against a "healthy" number. **Next we open the box**: the five principles, the menu of faults, how to keep the damage small, the main tools, and what exactly an experiment proves.
 
 ```mermaid
 sequenceDiagram
@@ -152,7 +184,7 @@ sequenceDiagram
 **In plain words: measure health, guess what will happen, break one real-world thing, do it in real traffic if safe, and keep it small.**
 
 1. **Define steady state** as a measurable output metric (not an internal signal like CPU) — something a business or user actually cares about.
-2. **Hypothesize** that steady state holds in both the control group and the experimental (faulted) group.
+2. **Hypothesize** that steady state holds in both the control group (normal traffic, no fault) and the experimental (faulted) group.
 3. **Vary real-world events**: the fault types that actually occur — hardware failure, network partition, dependency errors, traffic spikes — not arbitrary code bugs.
 4. **Run in production, or as close to it as possible** — staging with production-like traffic and data shape is the realistic minimum when running directly in prod isn't yet safe.
 5. **Automate and minimize blast radius**: an abort condition tied to real SLOs, so a bad experiment can't become its own incident.
@@ -161,13 +193,20 @@ sequenceDiagram
 
 **In plain words: a menu of things you can break: servers, network, disks, clocks, other services.**
 
+**Step by step:**
+1. List the failures that have really happened to you or are common: a pod dying, a slow database, a payment API returning errors.
+2. Pick the one your team is least sure about, e.g. "payment API returns 500".
+3. Write the hypothesis: "checkout success stays above 99.5% because we fall back to retrying later".
+4. Choose the smallest scope: 1% of staging traffic for 5 minutes.
+5. Run it, then move to the next fault on the list.
+
 | Category | Example faults |
 | --- | --- |
 | Compute | Pod/instance kill, CPU pressure, memory pressure, disk full |
-| Network | Added latency, packet loss, DNS failure, partition between two services |
+| Network | Added latency, packet loss, DNS failure, partition (two services cut off from each other) between two services |
 | Dependency | Forced 5xx/error responses, timeouts, slow responses from a downstream service |
 | Infrastructure | AZ or region loss, clock skew between nodes |
-| Application | Duplicate messages, poison messages in a queue, slow DB query injection |
+| Application | Duplicate messages, poison messages (a message that crashes the consumer every time it is read) in a queue, slow DB query injection |
 
 ### Blast-radius control
 
@@ -187,15 +226,22 @@ Running this first in staging, then at 1% of production traffic, then higher, is
 
 **In plain words: tools that inject faults for you, mostly on Kubernetes or AWS.**
 
-- **Chaos Mesh** — Kubernetes-native, CRD-based (`PodChaos`, `NetworkChaos`, `StressChaos`); experiments are declarative YAML applied to a cluster.
-- **LitmusChaos** — CNCF, also Kubernetes-native (`ChaosExperiment`/`ChaosEngine` CRDs via a hub of pre-built experiments); a declarative alternative to Chaos Mesh with a similar scope.
+- **Chaos Mesh** — Kubernetes-native, CRD-based (CRD: a custom resource type added to Kubernetes, here `PodChaos`, `NetworkChaos`, `StressChaos`); experiments are declarative YAML applied to a cluster.
+- **LitmusChaos** — CNCF (the foundation that hosts Kubernetes and related open-source projects), also Kubernetes-native (`ChaosExperiment`/`ChaosEngine` CRDs via a hub of pre-built experiments); a declarative alternative to Chaos Mesh with a similar scope.
 - **Gremlin** — SaaS, UI-driven, supports host and container-level attacks plus a "halt all" safety switch.
 - **AWS Fault Injection Service (FIS)** — native to AWS, targets EC2/ECS/EKS/RDS resources, integrates with CloudWatch alarms as automatic stop conditions.
-- **Toxiproxy** (Shopify) — a TCP proxy you put in front of a dependency in tests or local/CI environments to inject latency, bandwidth limits, and connection resets; lightweight enough to run inside an integration test, unlike the cluster-level tools above.
+- **Toxiproxy** (Shopify) — a TCP proxy (a small middle program that forwards network connections and can tamper with them) you put in front of a dependency in tests or local/CI environments to inject latency, bandwidth limits, and connection resets; lightweight enough to run inside an integration test, unlike the cluster-level tools above.
 
 ### What an experiment validates
 
 **In plain words: chaos proves your safety features (timeouts, retries, fallbacks) really work.**
+
+**Step by step:**
+1. Make the payment API slow (5 s) for 1% of staging traffic.
+2. Check the timeout: does checkout give up after 2 s instead of hanging?
+3. Check retries: do they spread out with jitter, or does every client retry at once (a retry storm)?
+4. Check the circuit breaker opens after a few failures and the fallback answer is shown.
+5. Check the alert you expect ("payment errors high") actually fires within minutes.
 
 Timeouts actually firing instead of hanging indefinitely, retries with jitter instead of a retry storm, circuit breakers opening and the fallback path actually working, autoscaling reacting in time, failover to a secondary actually completing, and — critically — that the alerts you expect to fire during a real incident actually do fire during the experiment.
 
@@ -363,6 +409,9 @@ Labeled **representative output** because no chaos-tooling cluster is available 
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the principles, the fault menu, blast-radius control, the tools and what experiments prove. **Next we look at real practice**: Netflix's origins, common findings and fixes, how scope grows from staging to regular game days, and the deeper points about steady-state metrics and running chaos inside CI.
+
+
 - **Real systems:** Netflix's Chaos Monkey (the originating tool, random instance termination) and the broader Simian Army; e-commerce and ticketing platforms run scheduled game days before known high-traffic events, combining dependency-failure injection with load testing.
 - **Failure modes → fixes:**
   - Experiment reveals a client hangs past its intended timeout → audit `context.WithTimeout` usage on every outbound call, not just the one tested.
@@ -419,6 +468,26 @@ Otherwise the same gap resurfaces the next time the same dependency actually fai
 - Start in staging or at a tiny percentage of production traffic; expand scope only after passing.
 - Prerequisites: observability and on-call already working — chaos engineering validates, it doesn't substitute for them.
 - An experiment's findings only count once turned into a tracked, owned fix.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is a steady-state hypothesis?
+> A prediction that a business metric (like checkout success rate) stays normal while a fault is injected.
+
+> [!question]- (easy) What is the blast radius?
+> How much of the system or traffic an experiment can affect.
+
+> [!question]- (easy) Is chaos engineering random breaking?
+> No. It is a small, planned, measured experiment with an automatic stop.
+
+> [!question]- (medium) Why inject only one fault per early experiment?
+> So any drop in the metric can be traced to that one cause.
+
+> [!question]- (medium) When would you use Toxiproxy rather than Chaos Mesh?
+> For quick, per-test fault injection in local or CI integration tests; Chaos Mesh is for cluster-level experiments.
+
+> [!question]- (medium) What must exist before you start chaos experiments?
+> Good observability (metrics, logs, alerts) and an on-call/incident process.
 
 ## Links 🟢
 

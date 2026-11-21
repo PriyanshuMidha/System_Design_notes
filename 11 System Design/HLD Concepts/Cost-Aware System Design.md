@@ -35,6 +35,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (cost levers), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Back-of-the-Envelope Estimation]]: you can turn users and requests into rough numbers like "150 TB a day"; here we multiply those numbers by a price.
+> - [[Scaling Basics]]: you add servers, caches and replicas as load grows; each of those has a monthly cost.
+
 **From zero, in 60 seconds** 🟢
 
 In the cloud you do not buy computers. You rent them by the hour, and you pay for every GB you store and send.
@@ -84,6 +88,12 @@ A good design checks what each choice costs before the bill arrives.
 | Spot | Spare capacity, cheap, can be taken back any time | Nightly batch job |
 | Storage tier | Hot (fast, pricey) vs cold (slow, cheap) storage | S3 Standard vs Glacier |
 | CDN | Edge caches near users | Serves images so origin does not pay egress each time |
+| GB-month | One GB stored for one month, the unit storage is billed in | 1 TB for a month = 1,000 GB-months |
+| IOPS | Disk reads and writes per second; some disks charge for a reserved amount | 3,000 IOPS provisioned |
+| NAT gateway | A cloud box that lets private servers reach the internet; charged per GB | servers pulling images through NAT |
+| Hit ratio | Share of requests answered by the cache | 90% hit = 1 in 10 reaches the DB |
+| Right-sizing | Picking the smallest machine that still meets the load | 16 vCPU at 25% busy → 4 vCPU |
+| Cost per request | Monthly bill divided by requests served | $0.05 per 1,000 requests |
 
 **Picture it**
 
@@ -159,11 +169,35 @@ flowchart TD
 > [!tip] Remember
 > Four buckets: compute, storage, network, managed services. Ask which one dominates before optimising any of them.
 
+### Real-life example: IPL streaming on Hotstar 🟢
+
+During an IPL final, millions of people watch the same video at once. Sending each viewer's video straight from Hotstar's own servers would mean a giant bill for data sent out, plus servers that cannot keep up.
+So video pieces are cached on CDN servers close to viewers; nearly every request is answered there, and only a small share reaches the origin.
+The video is also stored in a few quality levels, so a phone on weak signal gets a smaller file, which means fewer bytes to pay for.
+Transcoding new videos runs on cheap spare machines that can be taken back at any time, because a stopped job can simply restart.
+
+## Common beginner mistakes 🟢
+
+- **Counting servers and ignoring data transfer** → the biggest line (egress) is missing from your estimate → multiply GB sent out by the price per GB.
+- **Keeping all data on the fastest storage forever** → old data you rarely read costs as much as new data → move it to cheaper tiers with lifecycle rules.
+- **Buying everything on-demand at peak size** → you pay for peak all day → reserve the always-on base, autoscale the peak, use spot for batch.
+- **Cutting a second zone to save money on a user-facing service** → one data centre outage takes you down → say the availability hit out loud before cutting.
+- **Saying "it should be cheap"** → nobody can check it → give one number: "about $0.02 per order".
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the bill has four buckets and that the network is usually the surprise. **Next we open the box**: what each driver costs, cost per request, how caches and CDNs pay for themselves, storage tiers, ways to buy compute, hidden network charges, and build vs buy. Most subsections start with a plain walk-through; the full detail follows.
 
 ### 3.1 The main cost drivers
 
 **In plain words:** cloud prices are not uniform. Some things are nearly free (inbound traffic, small storage), and some are expensive per unit (outbound traffic, provisioned IOPS, managed enterprise features). Knowing the shape of the price list lets you estimate before you build.
+
+**Step by step:**
+1. Write your estimate: 100 servers, 50 TB stored, 150 TB a month sent to users.
+2. Multiply each by its rough price: servers per month, storage per GB-month, egress per GB.
+3. Add the hidden ones: traffic between zones, NAT, logs and metrics.
+4. Look at which line is biggest. That is the one to attack first.
+5. Usually it is egress or the database, not the app servers.
 
 | Driver | How it is billed | Typical surprise | Rough scale (approximate list prices) |
 | --- | --- | --- | --- |
@@ -217,6 +251,13 @@ Third-party per-call costs matter. Maps and routing APIs, SMS, payment fees and 
 
 **In plain words:** a cache costs money (memory is more expensive than disk), but each hit removes work from a more expensive resource. Worth it when the **hit ratio** times the savings per hit exceeds the cache's own cost.
 
+**Step by step:**
+1. The database must handle 10,000 reads a second. That needs 1 primary + 3 replicas, about $6,000 a month.
+2. Add a Redis cache. 90% of reads (9,000 a second) are answered from it.
+3. The database now sees 1,000 reads a second. One primary + 1 replica is enough.
+4. Subtract: database savings minus the cache's own cost. If positive, the cache pays for itself.
+5. A CDN does the same for bytes: every image served at the edge is egress you do not pay at origin.
+
 ```mermaid
 flowchart LR
     R["10,000 reads per second"] --> C{"Cache hit?"}
@@ -236,6 +277,13 @@ Break-even rule of thumb: cache when hit ratio is high and values are small, sha
 ### 3.4 Storage tiers and lifecycle
 
 **In plain words:** most data is read often when new and almost never when old. Storing all of it on the fastest, priciest tier wastes money. **Tiering** moves data to cheaper, slower storage as it ages, and **lifecycle rules** do it automatically.
+
+**Step by step:**
+1. A user uploads a photo. It sits on the hot tier, read many times in the first weeks.
+2. After 30 days a lifecycle rule moves it to the infrequent-access tier, about half the price.
+3. After 90 days it moves to an archive tier, a small fraction of the price, but slower and with a fee to read.
+4. When the retention period ends, it is deleted.
+5. No person has to remember any of this; the rules run on their own.
 
 ```mermaid
 flowchart LR
@@ -260,6 +308,13 @@ Other storage levers: compress (columnar formats and zstd for logs and analytics
 
 **In plain words:** there are three ways to pay for compute, and they suit different load shapes.
 
+**Step by step:**
+1. Your app needs 20 servers at night and 100 at the evening peak.
+2. Reserve 20 for 1-3 years at a big discount; they are always busy anyway.
+3. Let autoscaling add up to 80 on-demand servers for the peak and remove them after.
+4. Run the nightly batch job on spot machines at up to about 90% off; if one is taken back, the job retries.
+5. Check each service's real CPU use and shrink machines that are mostly idle.
+
 | Model | Price | Commitment | Use for |
 | --- | --- | --- | --- |
 | On-demand | Full price | None | Spiky, unknown, short-lived |
@@ -279,7 +334,7 @@ flowchart TD
 
 **Example (illustrative):** traffic runs between 20 and 100 servers across the day, average 45. Reserve 20 (the floor), autoscale 20-80 more on-demand, and run the nightly batch on spot. Paying on-demand for 100 servers all day would cost about 2.2 times the average need.
 
-Right-sizing: look at p95 CPU and memory of each service. If a 16 vCPU service never exceeds 25 percent, drop to 8 or 4 vCPU. Check Go service memory limits and `GOMAXPROCS` against the container limit. See [[Autoscaling]] and [[AWS 04 - Compute Choices - EC2, ECS-Fargate, EKS, Lambda]].
+Right-sizing: look at p95 CPU and memory of each service. If a 16 vCPU service never exceeds 25 percent, drop to 8 or 4 vCPU. Check Go service memory limits and `GOMAXPROCS` (how many CPU cores the Go runtime uses) against the container limit. See [[Autoscaling]] and [[AWS 04 - Compute Choices - EC2, ECS-Fargate, EKS, Lambda]].
 
 Serverless versus containers: functions are cheapest at low or spiky traffic and become more expensive than always-on containers when the load is steady and high. There is a break-even request rate; estimate it per workload rather than guessing.
 
@@ -288,6 +343,13 @@ Serverless versus containers: functions are cheapest at low or spiky traffic and
 ### 3.6 Hidden network costs: egress, cross-AZ, NAT
 
 **In plain words:** some network traffic is free (inside one AZ over private IPs, inbound from internet), and some is billed per GB. The surprises are the paths that look internal but are billed.
+
+**Step by step:**
+1. A user downloads an image: data leaves the cloud, billed per GB (egress).
+2. The app in zone A reads from a database replica in zone B: billed per GB, both ways.
+3. A private server fetches files from S3 through a NAT gateway: billed per GB processed.
+4. The same S3 fetch through a gateway VPC endpoint (a private door from your network to S3) has no NAT charge.
+5. So: CDN for users, same-zone calls where safe, and private endpoints for cloud storage.
 
 ```mermaid
 flowchart LR
@@ -303,7 +365,7 @@ Fixes, in order of effect:
 1. **CDN and compression** for user-facing egress.
 2. **Gateway VPC endpoints** for S3 and DynamoDB so traffic skips NAT charges.
 3. **Zone-aware routing**: prefer same-AZ replicas and service instances when latency and failure isolation allow.
-4. **Batch and compress** inter-service payloads (Protobuf over JSON, gzip for bulk).
+4. **Batch and compress** inter-service payloads (Protobuf, a compact binary format, over JSON; gzip for bulk).
 5. **Keep chatty pairs together** (service plus its cache in the same zone) while still keeping a copy in another zone for availability.
 6. **Avoid cross-region replication** of everything. Replicate only what the SLA demands. See [[Multi-Region Architecture]].
 
@@ -312,6 +374,13 @@ Fixes, in order of effect:
 ### 3.7 Managed services versus build
 
 **In plain words:** a managed database costs more per unit than a self-run one, but you do not pay engineers to patch, back up and fail it over. The honest comparison is the whole cost, including the people.
+
+**Step by step:**
+1. Managed Postgres costs, say, 50% more than the same machine you run yourself.
+2. Running it yourself means upgrades, backups, failover and a person on call at 3 a.m.
+3. Add those people's time to the self-run cost.
+4. For a small team, managed is almost always cheaper in total.
+5. Only at very large scale with a platform team (like Dropbox's storage) does building win.
 
 | Factor | Managed (RDS, MSK, ElastiCache) | Self-run (on VMs or Kubernetes) |
 | --- | --- | --- |
@@ -369,7 +438,7 @@ sequenceDiagram
 1. **Traffic.** 3 Mbps is 0.375 MB per second, 1.35 GB per hour. 4 hours per viewer per month is 5.4 GB. For 2M viewers: 10.8 PB per month.
 2. **Naive cost.** Origin egress at a blended $0.05 per GB: 10,800,000 GB x $0.05 = $540,000 per month. The design is dead on arrival.
 3. **CDN with 98 percent hit ratio** (video segments are highly cacheable): origin serves 216 TB, about $10,800 of egress. CDN delivery at a negotiated $0.01-0.02 per GB for 10.8 PB is about $108,000-216,000. Still large, so negotiate, or consider multi-CDN and committed-use pricing.
-4. **Reduce bytes.** Adaptive bitrate with better codecs (AV1 or HEVC for supported devices) can cut bytes at equal quality. A 20 percent drop in average bitrate is 20 percent off the biggest line.
+4. **Reduce bytes.** Adaptive bitrate (the player switches quality to match the network) with better codecs (AV1 or HEVC, newer video compression formats, for supported devices) can cut bytes at equal quality. A 20 percent drop in average bitrate is 20 percent off the biggest line.
 5. **Storage.** 50,000 titles, multiple renditions, say 20 GB each: 1 PB. Keep popular renditions hot, rarely watched ones on infrequent access, regenerate the long tail on demand.
 6. **Compute.** Transcoding is batch, restartable, parallel: run it on spot instances with checkpointing per segment.
 7. **Cost per user.** (CDN $150,000 + storage $20,000 + compute $15,000 + other $15,000) / 2M = $0.10 per viewer per month (estimate). Compare that to subscription revenue.
@@ -418,10 +487,12 @@ All savings above are broad, commonly cited ranges and estimates, not guarantees
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** each cost lever and how to estimate a bill. **Next comes the senior view**: how teams keep cost under control in production (tags, budgets, alerts), and how cost trades against availability, consistency and lock-in.
+
 - **Tag everything** (team, service, environment) so each bill line has an owner. Untagged spend cannot be fixed.
 - **Budgets and anomaly alerts.** A daily spend alarm catches a runaway loop or a forgotten test cluster within a day, not at month end.
 - **Cost dashboards per service**, with cost per request next to latency and error rate. See [[Performance Engineering and Capacity Planning]].
-- **Metric cardinality and log volume.** A label with user IDs in a metric can create millions of series and a large observability bill. Review before shipping.
+- **Metric cardinality and log volume.** Cardinality is the number of distinct label values. A label with user IDs in a metric can create millions of series and a large observability bill. Review before shipping.
 - **Idle resources.** Schedule dev and staging off at night; delete unattached volumes, old snapshots and unused load balancers.
 - **Review commitments** quarterly. Reserved capacity bought for one architecture stays after you migrate.
 - **Test with load, not guesses.** Autoscaling that thrashes (scale up and down every few minutes) pays for instance warm-up repeatedly. See [[Autoscaling]].
@@ -433,7 +504,7 @@ All savings above are broad, commonly cited ranges and estimates, not guarantees
 
 **In plain words:** Set a money budget per order (or per user) first. Then check every design idea against it, like you check against a speed target.
 
-Define the target first: "infra cost under 3 percent of GMV" or "under $0.02 per order". Then every design choice is checked against the budget, the same way latency budgets work. A p99 budget splits across hops; a cost budget splits across components.
+Define the target first: "infra cost under 3 percent of GMV (gross merchandise value: the total money of all orders)" or "under $0.02 per order". Then every design choice is checked against the budget, the same way latency budgets work. A p99 budget splits across hops; a cost budget splits across components.
 
 ```mermaid
 flowchart LR
@@ -527,7 +598,27 @@ Say it in 30 seconds: "Four buckets: compute, storage, network, managed. I estim
 
 Interview habit: estimate, find the dominant line, one lever, one number, one trade-off.
 
-## 11. Links 🟢
+## Self-check 🟢🟡
+
+> [!question]- (easy) What are the four big cost buckets?
+> Compute, storage, network (especially egress) and managed services.
+
+> [!question]- (easy) What is egress?
+> Data leaving the cloud provider's network, billed per GB.
+
+> [!question]- (easy) Why is a CDN a cost tool, not just a speed tool?
+> Every byte served from the edge is a byte you do not pay origin egress for.
+
+> [!question]- (medium) 10M users × 50 images × 300 KB a day at $0.09/GB. Rough daily egress cost?
+> 150 TB ≈ 150,000 GB × $0.09 ≈ $13,500 a day.
+
+> [!question]- (medium) Load swings between 20 and 100 servers. How do you buy compute?
+> Reserve the 20 baseline, autoscale the rest on-demand, and run batch work on spot.
+
+> [!question]- (medium) Why is cross-AZ traffic a hidden cost?
+> It looks internal but is billed per GB in both directions, so chatty services split across zones add up.
+
+## Links 🟢
 
 - Estimation and scale: [[Back-of-the-Envelope Estimation]], [[Scaling Basics]], [[Performance Engineering and Capacity Planning]]
 - Network and caching: [[CDN and Edge]], [[Caching Patterns]], [[Choosing a Caching Strategy - Decision Guide]]
@@ -535,7 +626,7 @@ Interview habit: estimate, find the dominant line, one lever, one number, one tr
 - Resilience cost: [[Multi-Region Architecture]]
 - Framework: [[System Design Interview Framework]], [[Security, Privacy and Compliance in HLD]]
 
-## Links 🟢
+ 🟢
 
 ### Watch on YouTube
 

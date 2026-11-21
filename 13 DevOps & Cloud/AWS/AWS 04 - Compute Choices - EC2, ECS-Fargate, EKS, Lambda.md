@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[AWS 01 - Core Concepts (Regions, AZs, Accounts, Shared Responsibility)]]: you rent capacity in a Region spread over AZs, and the more managed a service is, the less of it you must patch and secure.
+> - [[AWS 03 - VPC Networking]]: your servers live in subnets of a private network, guarded by security groups.
+
 **From zero, in 60 seconds** 🟢
 
 AWS gives you four main places to run your code.
@@ -76,6 +80,12 @@ AWS offers four ways to run code, and this note is about choosing the right one 
 | Cold start | Extra delay when a new copy of your code must start up | First request after idle takes 300 ms |
 | vCPU | One virtual CPU core you rent | "2 vCPU, 8 GiB" task size |
 | Concurrency | How many requests are being handled at the same moment | 40 requests in flight at once |
+| Invocation | One run of a Lambda function for one event | One photo upload = one invocation |
+| AMI | The saved disk image an EC2 server boots from | "Amazon Linux 2023 + our agent" |
+| Auto Scaling Group (ASG) | A set of identical EC2 servers that AWS grows, shrinks and replaces | min 2, max 10 instances |
+| Launch type | Where ECS runs your containers: on servers you manage (EC2) or on AWS-managed ones (Fargate) | `launchType: FARGATE` |
+| Little's Law | Busy workers = requests per second × seconds each request takes | 50 req/s × 2 s = 100 at once |
+| Provisioned concurrency | Lambda copies you pay to keep warm so there is no cold start | 10 always-ready copies |
 
 **Picture it**
 
@@ -111,12 +121,20 @@ AWS's compute services exist because no single operational model fits both.
 
 EC2 gives full control of the box (useful for unusual OS/kernel requirements, GPU workloads, or licensing that is per-host).
 
-ECS and Fargate package the app as a container and let AWS place and restart it. EKS gives you the actual Kubernetes API when your team already standardizes on it or needs its ecosystem (operators, CRDs, multi-cloud portability). Lambda removes the server entirely and bills per invocation and per millisecond.
+ECS and Fargate package the app as a container and let AWS place and restart it. EKS gives you the actual Kubernetes API when your team already standardizes on it or needs its ecosystem (operators and CRDs, meaning custom programs and custom object types that extend Kubernetes; multi-cloud portability). Lambda removes the server entirely and bills per invocation and per millisecond.
 
 **Concrete numbers (estimate, AWS pricing as of late 2026, prices vary by region — always confirm in the AWS Pricing Calculator before committing to a choice):**
 - An `m7g.large` EC2 on-demand instance (2 vCPU, 8 GiB) runs roughly $0.08/hour ≈ $58/month, continuously, whether or not it serves traffic.
 - A Fargate task with the same 2 vCPU / 8 GiB (Linux/x86) runs roughly $0.04/vCPU-hour + $0.004/GiB-hour ≈ $0.12/hour ≈ $85/month if kept at 1 task around the clock — more than EC2 because you are paying AWS to manage the host, not for the compute.
-- Lambda at 50 invocations/day × 200ms × 128 MB costs cents a month; the same function receiving 2,000 req/sec continuously costs far more than a warm EC2 fleet, because you are paying full price for every millisecond of every invocation with no amortization.
+- Lambda at 50 invocations/day × 200ms × 128 MB costs cents a month; the same function receiving 2,000 req/sec continuously costs far more than a warm EC2 fleet, because you are paying full price for every millisecond of every invocation with no amortization (no spreading of a fixed cost over lots of use).
+
+### Real-life example: a menu API and a photo resizer 🟢
+
+Think of a food-delivery app like Zomato.
+The menu API answers thousands of requests every second, all day, so it runs as always-on containers on ECS/Fargate behind a load balancer.
+When a restaurant uploads a new dish photo, a small function resizes it into thumbnails; that happens a few thousand times a day, in bursts, so it runs on Lambda and costs almost nothing while idle.
+Their data team runs a GPU-heavy model on EC2, because it needs special hardware.
+One company, three compute choices, each picked by the shape of the work.
 
 ## 2. Mental model 🟢
 
@@ -124,12 +142,28 @@ Think of it as renting progressively smaller slices of "a computer":
 
 - **EC2** rents the whole machine. You choose the OS, you patch it, you decide what runs on it.
 - **ECS/Fargate** rents a container's worth of CPU and memory. AWS picks (Fargate) or you provide (EC2 launch type) the host underneath it.
-- **EKS** rents the same container slice, but through the Kubernetes API instead of AWS's own ECS API — useful because Kubernetes is a portable, if more complex, lingua franca.
+- **EKS** rents the same container slice, but through the Kubernetes API instead of AWS's own ECS API — useful because Kubernetes is a portable, if more complex, lingua franca (a shared language every cloud speaks).
 - **Lambda** rents a few hundred milliseconds of a CPU, on demand, per request. There is no "always on" at all: between invocations, nothing of yours is running (unless you pay separately for provisioned concurrency).
+
+## Common beginner mistakes 🟢
+
+- **Believing serverless is always cheaper** → at steady high traffic you pay for every millisecond with no idle time saved → use always-on containers for busy, steady APIs.
+- **Running a long batch job on Lambda** → it is killed at 15 minutes → use Fargate or EC2 for long work.
+- **Choosing EKS for one small service** → you take on Kubernetes upgrades and plumbing you do not need → start with ECS/Fargate.
+- **Ignoring Lambda's concurrency limit** → a spike gets throttled across every function in the account → reserve concurrency for critical functions and ask for a higher limit before big launches.
+- **Sizing servers by guess** → too few drop requests, too many waste money → load-test one task, then divide target traffic by its capacity and add headroom.
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the four places to run code on AWS and that each step up hands more work to AWS. **Next we open the box**: what you still manage in each option, how a request reaches a Lambda function, and what really happens during a cold start.
+
 **In plain words:** the same picture four times: each step to the right, AWS takes over one more layer you used to manage.
+
+**Step by step (choosing for one workload):**
+1. Does it need special hardware, a custom kernel or per-server licences? EC2.
+2. Is it a steady, containerised service and you do not want to look after servers? ECS on Fargate.
+3. Does your company already run everything on Kubernetes? EKS.
+4. Is it short (under 15 minutes), triggered by events, and often idle? Lambda. Events can come from API Gateway (AWS's front door for HTTP APIs), SQS queues, S3 uploads or EventBridge (AWS's event bus and scheduler).
 
 ```mermaid
 flowchart TD
@@ -148,6 +182,13 @@ flowchart TD
 ### The cold-start mechanism (Lambda's defining cost)
 
 **In plain words:** when no warm copy is ready, Lambda must start a fresh one before handling your request. That adds a pause, from tens of ms to a few seconds.
+
+**Step by step:**
+1. A request arrives. Lambda looks for a warm, idle copy of your function.
+2. Found one: your handler runs at once.
+3. None free (first request after a quiet spell, or a sudden burst): Lambda creates a new execution environment, downloads your code and starts the runtime.
+4. It runs your setup code outside the handler (for example, opening a DB pool), then the handler. This extra time is the cold start.
+5. The copy stays warm for a few minutes; later requests reuse it with no extra delay.
 
 Lambda does not keep a process running between requests by default. When a new request arrives and no warm "execution environment" is free, AWS must provision one: download your code, start the runtime, run any top-level initialization, then call your handler.
 
@@ -170,7 +211,7 @@ sequenceDiagram
     Note over Env: Environment stays warm for a few minutes<br/>of inactivity, then is reclaimed
 ```
 
-A VPC-attached Lambda historically added ENI-attachment latency to cold starts; since 2019 AWS pre-creates and shares ENIs across functions in the same subnet/security-group combination, so this is no longer the dominant cost it was, but cold start still scales with package size and runtime (compiled Go binaries start faster than large interpreted-language bundles with many dependencies).
+A VPC-attached Lambda historically added ENI-attachment (attaching a virtual network card in your VPC) latency to cold starts; since 2019 AWS pre-creates and shares ENIs across functions in the same subnet/security-group combination, so this is no longer the dominant cost it was, but cold start still scales with package size and runtime (compiled Go binaries start faster than large interpreted-language bundles with many dependencies).
 
 ## 4. Worked example 🟡
 
@@ -185,6 +226,13 @@ func LambdaConcurrency(targetRPS, durationMS float64) int {
     seconds := durationMS / 1000
     return int(targetRPS * seconds) // round up in the real version
 }
+```
+
+```mermaid
+flowchart LR
+    R["50 requests/s"] --> X["× 2 s each"]
+    X --> C["= 100 copies busy at once"]
+    C --> L{"under the account limit<br/>(1,000 by default)?"}
 ```
 
 A slow handler needs much more concurrency than its request rate alone suggests: 50 req/s at 2,000ms/request needs 100 concurrent executions, not 50 — and each account has a default concurrency ceiling (1,000 as of late 2026, raisable by support request) shared across every function unless you reserve concurrency per function.
@@ -252,6 +300,8 @@ func ColdStartImpact(newBurstRPS, coldStartMS, totalRequests float64) float64 {
 ```
 
 Tests (Go 1.24, `go vet` and `go test -race` pass):
+
+**What this code does, in plain words:** the tests check three sums: 1,000 requests/s at 150 per task with 30% headroom needs 9 Fargate tasks; 500 requests/s at 200 ms needs 100 Lambda copies at once; and the same burst of cold starts becomes a tiny share as total traffic grows.
 
 ```go
 package capacity
@@ -324,14 +374,17 @@ func TestColdStartImpactShrinksAsTrafficGrows(t *testing.T) {
 - **EC2**: most operational burden (patching, AMI pipeline, kernel CVEs) but the most control and often the best steady-state price.
 - **ECS/Fargate**: no host management, but Fargate's per-vCPU/GB pricing is a real premium over EC2 at scale — reach for the EC2 launch type if host ops are acceptable and the bill matters.
 - **EKS**: brings Kubernetes's power (and its learning curve) — not worth it for a single small service; valuable once you run many services and want one control plane and one set of operational tools.
-- **Lambda**: a 15-minute hard execution-time limit, no good fit for long-lived connections (WebSockets need API Gateway's separate WebSocket support, not a long-running Lambda), and cost scales badly past a certain sustained request volume. Cold starts also make it a poor fit for strict single-digit-millisecond p99 latency budgets unless you pay for provisioned concurrency.
+- **Lambda**: a 15-minute hard execution-time limit, no good fit for long-lived connections (WebSockets need API Gateway's separate WebSocket support, not a long-running Lambda), and cost scales badly past a certain sustained request volume. Cold starts also make it a poor fit for strict single-digit-millisecond p99 latency (the time within which 99% of requests finish) budgets unless you pay for provisioned concurrency.
 - A small team with one Go API and predictable traffic is very often best served by ECS/Fargate alone — EKS adds operational surface you do not need yet.
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** what each compute option leaves you to manage, how cold starts work, and how to size tasks and Lambda concurrency with simple maths. **Next is the advanced part**: how real teams mix these options, the failures they hit (throttling, timeouts, over-built EKS), and the deeper details (Firecracker, control-plane isolation, Graviton, provisioned concurrency).
+
+
 - **Real systems:** Most AWS-hosted backend APIs with steady traffic run on ECS/Fargate or EKS behind an ALB (see [[AWS 05 - ECS, Fargate and ECR]] and [[AWS 06 - Load Balancing (ALB vs NLB)]]). Lambda dominates event-driven glue: S3 upload processing, SQS consumers for bursty background work, and API Gateway backends for low-to-moderate-traffic APIs. EKS is common where a platform team already runs Kubernetes across multiple clouds or on-prem and wants one control plane for AWS workloads too.
 - **Failure modes → fixes:**
-  - Lambda throttling (`TooManyRequestsException`) under a traffic spike → request a concurrency limit increase ahead of a known launch, or reserve concurrency per critical function so noisy neighbors cannot starve it.
+  - Lambda throttling (`TooManyRequestsException`) under a traffic spike → request a concurrency limit increase ahead of a known launch, or reserve concurrency per critical function so noisy neighbors (other functions in the same account using up the shared limit) cannot starve it.
   - EC2 Auto Scaling Group too slow to add capacity during a spike → use Lambda or Fargate for the bursty portion of traffic, keep EC2 for the steady baseline (a hybrid pattern).
   - A "lift and shift" of a long-running batch job to Lambda hits the 15-minute timeout → split the job or move it to Fargate/EC2 for anything that can run long.
   - Choosing EKS for a one-service team → operational overhead (node upgrades, CNI/IAM-for-service-accounts plumbing) outweighs the Kubernetes ecosystem benefit; ECS/Fargate does the same container job with less to manage.
@@ -339,7 +392,7 @@ func TestColdStartImpactShrinksAsTrafficGrows(t *testing.T) {
 
 ## 8. Deep dive 🔴
 
-- **Fargate is not magic**: under the hood it still runs your container on an EC2-class VM managed by AWS using Firecracker microVMs for isolation — this is why Fargate has its own (slightly higher) per-vCPU/GB price instead of being free.
+- **Fargate is not magic**: under the hood it still runs your container on an EC2-class VM managed by AWS using Firecracker microVMs (tiny virtual machines that boot in a fraction of a second) for isolation — this is why Fargate has its own (slightly higher) per-vCPU/GB price instead of being free.
 - **EKS control-plane isolation**: the managed control plane runs per-cluster in AWS-owned accounts; what you operate is the data plane (worker nodes or Fargate profiles) and the Kubernetes objects you deploy to it. Multiple clusters do not share a control plane, which is part of why many small clusters cost more than fewer large ones.
 - **Lambda's execution environment reuse** is why global/package-level initialization (opening a DB connection pool, loading a config file) is cheap per-invocation but expensive per-cold-start: code outside the handler runs once per environment, not once per request, so a warm environment amortizes that cost across many invocations — but a sudden concurrency spike provisions many environments at once, each paying that cost fresh.
 - **Graviton (ARM) instances** (the `m7g`/`c7g` family, and Lambda's `arm64` architecture option) typically cost ~20% less than the equivalent x86 instance type for compatible workloads — Go cross-compiles trivially to `arm64`, making this one of the easiest cost wins available.
@@ -378,6 +431,30 @@ func TestColdStartImpactShrinksAsTrafficGrows(t *testing.T) {
 - EKS earns its complexity only once you operate many services or need the Kubernetes ecosystem specifically.
 - Fargate runs on AWS-managed hosts via Firecracker microVMs; that host management is what you pay its premium for.
 - Graviton (`arm64`) instances and Lambda functions are typically ~20% cheaper for compatible workloads — an easy win for Go.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Which option makes you patch the operating system yourself?
+> EC2.
+
+> [!question]- What is a Lambda cold start?
+> The extra delay when Lambda must create and start a fresh copy of your function before running it.
+
+> [!question]- What is the longest a single Lambda invocation may run?
+> 15 minutes.
+
+🟡 Medium
+
+> [!question]- 200 requests per second, each taking 0.5 seconds. How many Lambda copies are busy at once?
+> 200 × 0.5 = 100 (Little's Law).
+
+> [!question]- Why is Fargate pricier per vCPU than EC2?
+> You also pay AWS to run, patch and place the host for you.
+
+> [!question]- A steady 2,000 req/s Go API: Lambda or Fargate, and why?
+> Fargate (or EC2): steady load has no idle time for Lambda to save, so per-millisecond billing costs more.
 
 ## Links
 

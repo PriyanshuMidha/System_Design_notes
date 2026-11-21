@@ -35,6 +35,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Strategy and Template Method]]: a rule behind an interface you can swap, here EQUAL, EXACT or PERCENT splits.
+> - [[Factory and Abstract Factory]]: one function that picks and builds the right type from a name like `"percent"`.
+
 **From zero, in 60 seconds** 🟢
 
 Friends on a trip pay for things at different times. Splitwise keeps track of who owes whom. Each expense is split equally, by exact amounts or by percentages. The app keeps one **net balance** per person: what they paid minus their share. All the nets in a group always add up to zero. At the end, it suggests the fewest payments to settle up, which is called **simplifying debts**.
@@ -66,6 +70,10 @@ At the end they want to know who owes whom, with as few payments as possible, an
 | Strategy | One interface, many swappable implementations | `EqualSplit`, `ExactSplit`, `PercentSplit` |
 | Factory | A function that picks the right implementation by name | `"percent"` → `PercentSplit` |
 | Invariant | A fact that must always stay true | All nets in a group add up to zero |
+| Greedy | Make the best-looking move now and never go back | Biggest debtor pays biggest creditor first |
+| Idempotent | Doing it twice has the same effect as once | Same `RequestID` added twice = one expense |
+| NP-hard | No known fast way to find the perfect answer for big inputs | The true minimum number of transfers |
+| Lost update | Two writers change the same number at once and one change vanishes | Two expenses both read A's net, both write |
 
 **Picture it**
 
@@ -122,9 +130,9 @@ Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 
 | --- | --- |
 | Can the payer be outside the participants? | Yes, but the payer must be a group member |
 | Several payers for one expense? | Yes: `Payers` maps user to paise and must sum to the total |
-| Percent precision? | Basis points: 10000 = 100%, so 33.33% is exact |
+| Percent precision? | Basis points (hundredths of a percent): 10000 = 100%, so 33.33% is exact |
 | Several currencies in one group? | Designed in Step 10; the code keeps one currency per group, in paise |
-| Who gets the leftover paisa? | Sorted user order by default; largest remainder as a pluggable alternative |
+| Who gets the leftover paisa? | Sorted user order by default; largest remainder (give the leftover to whoever lost the most to rounding down) as a pluggable alternative |
 | Simplify debts: optimal or good enough? | Greedy (the true minimum is NP-hard); at most n−1 transfers |
 | Edit or delete? | Delete reverses the stored deltas; edit is delete plus add |
 
@@ -140,7 +148,7 @@ Time box: 10 minutes for requirements and entities, 10 for APIs and storage, 25 
 | Group member | Sees their net and the suggested transfers |
 | System | Validates splits and payers, updates balances, simplifies debts |
 
-The hardest use case: `AddExpense` (normalise payers, pick the strategy, split exactly, validate membership, apply deltas atomically). `SimplifyDebts` is the algorithm to explain. Code both.
+The hardest use case: `AddExpense` (normalise payers, pick the strategy, split exactly, validate membership, apply deltas (the plus/minus changes to each net) atomically, as one step nobody can cut into). `SimplifyDebts` is the algorithm to explain. Code both.
 
 ## Step 3: Entities 🟢
 
@@ -152,11 +160,13 @@ The hardest use case: `AddExpense` (normalise payers, pick the strategy, split e
 | `Rounding` | `func(total, users, weights)` | Who gets the leftover paise: sorted order or largest remainder |
 | `Transfer` | `From`, `To`, `Amount` | Output of simplify, or a recorded settlement |
 
-Two modeling insights. First, **store one net per user per group, not a pairwise debt graph**: "A owes B" edges are derived by simplify, add and delete cost O(payers + participants), and the invariant is easy (nets sum to zero).
+Two modeling insights. First, **store one net per user per group, not a pairwise debt graph**: "A owes B" edges are derived by simplify, add and delete cost O(payers + participants) (work grows only with the people on that bill), and the invariant is easy (nets sum to zero).
 
 Second, **an expense stores its computed maps**: delete reverses those exact numbers and never re-runs the strategy, whose rounding could change between versions.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know splits, net balances and the zero-sum rule. Next we open the box: how groups, expenses and strategies link, the API, the tables, and the Go code that splits without losing a paisa.
 
 ```mermaid
 classDiagram
@@ -325,7 +335,7 @@ splitwise/
 cmd/demo/main.go   -> wiring: repositories, service, HTTP handlers
 ```
 
-- `split.go` is pure functions with no locks, so it is unit-tested alone.
+- `split.go` is pure functions (same input always gives the same output, no shared state) with no locks, so it is unit-tested alone.
 - `service.go` owns validation, membership, the lock and the balance deltas.
 - `simplify.go` works on a copy of the balances and never holds the lock while computing.
 
@@ -362,7 +372,7 @@ How it works:
    It returns `ErrGroupExists` instead, matching the primary key in SQL.
 
    The idempotency key is scoped the same way as in SQL: `(group, RequestID)`, so a reused key in another group never returns the wrong group's expense.
-6. **`SimplifyDebts`** copies the nets (no lock held while computing), matches the biggest creditor with the biggest debtor (ties by user ID), moves `min(credit, debt)`, and repeats. Each step zeroes at least one person, so there are at most n−1 transfers.
+6. **`SimplifyDebts`** copies the nets (no lock held while computing), matches the biggest creditor (owed the most) with the biggest debtor (owes the most) (ties by user ID), moves `min(credit, debt)`, and repeats. Each step zeroes at least one person, so there are at most n−1 transfers.
 
 **In plain words:** The full service. Start with the split types, then `AddExpense`, then `SimplifyDebts`.
 
@@ -1028,25 +1038,27 @@ func TestConcurrentAdd(t *testing.T) {
 }
 ```
 
-Run in a scratch module with Go 1.24.4: `go vet` clean and `go test -race -count=1` passes all seven tests.
+Run in a scratch module with Go 1.24.4: `go vet` clean and `go test -race -count=1` (`-race` is Go's race detector, which flags unsafe shared access) passes all seven tests.
 
 ## Step 9: Edge cases 🔴
+
+🟡 → 🔴 You now know the working service and its tests. Next is interview depth: lost updates and deadlocks in SQL, retried adds, overflow, true-minimum transfers and multi-currency groups.
 
 | Edge case | What happens | How the design handles it |
 | --- | --- | --- |
 | Two expenses update one user's net at once | Lost update | Mutex in code; one transaction with relative `net = net + $1` in SQL |
-| Two expenses update the same balance rows in different orders | Deadlock: PostgreSQL aborts one transaction | Apply the relative updates in sorted `user_id` order; retry the aborted transaction |
+| Two expenses update the same balance rows in different orders | Deadlock (each transaction waits for a row the other holds): PostgreSQL aborts one transaction | Apply the relative updates in sorted `user_id` order; retry the aborted transaction |
 | Same participant twice in one expense | Their share counted twice | `ErrDuplicateMember`; the primary key `(expense_id, user_id)` in SQL |
 | Percent not 100, exact not summing | Shares do not equal the total | Strategy returns an error before anything changes |
 | Payers not summing, or both payer fields set | Nets no longer sum to zero | `ErrPayersNotTotal` before the lock |
-| Payer or participant outside the group | A balance for a stranger | Membership checked under the lock; composite foreign keys in SQL |
+| Payer or participant outside the group | A balance for a stranger | Membership checked under the lock; composite foreign keys in SQL (a two-column rule: `(group_id, user_id)` must exist in members) |
 | Rounding | 100/3 loses a paisa | Floor plus a `Rounding` that hands out the gap; shares always sum to the total |
 | Delete, and delete again | Balances must return once | Stored maps reversed; the `Deleted` flag (or `WHERE deleted_at IS NULL`) makes a retry a no-op |
 | Retried add | Counted twice | `RequestID` idempotency scoped to the group; `UNIQUE (group_id, request_id)` |
 | Retried settlement | The payment is recorded twice | `Settle` has no key in this code; give settlements a request ID with the same `UNIQUE (group_id, request_id)` pattern |
 | Creating a group that exists | An unconditional insert into the map would wipe its balances | `ErrGroupExists`; the primary key in SQL |
 | A member leaves with a non-zero net | Money disappears | Block removal until their net is zero |
-| Overflow | `total × weight` must fit in int64 | Weights are at most 10000, so totals up to about 9.2 × 10^14 paise are safe; say so |
+| Overflow (a number grows past the biggest value the type can hold) | `total × weight` must fit in int64 | Weights are at most 10000, so totals up to about 9.2 × 10^14 paise are safe; say so |
 
 ## Step 10: Tradeoffs and extensions 🔴
 
@@ -1068,9 +1080,9 @@ Run in a scratch module with Go 1.24.4: `go vet` clean and `go test -race -count
 
   Convert the **total once** and then split it, so shares still sum exactly; delete reverses the stored converted maps, never re-converts at today's rate.
 
-  Currencies have different minor units (ISO 4217: JPY has 0 decimals, INR 2, KWD 3), so store amounts in each currency's own minor unit.
+  Currencies have different minor units (ISO 4217, the currency-code standard: JPY has 0 decimals, INR 2, KWD 3), so store amounts in each currency's own minor unit.
 
-Choices made: nets over a pairwise ledger (O(participants) updates, a simple invariant); a running balance table over recomputing (fast reads, expense rows remain the source of truth); soft delete with exact reversal; greedy simplify (deterministic, at most n−1 transfers, not always the minimum); one mutex, then per-group locks if contention appears.
+Choices made: nets over a pairwise ledger (O(participants) updates, a simple invariant); a running balance table over recomputing (fast reads, expense rows remain the source of truth); soft delete (mark the row deleted, keep it) with exact reversal; greedy simplify (deterministic, at most n−1 transfers, not always the minimum); one mutex, then per-group locks if contention appears.
 
 ## Drawing 🟢
 
@@ -1115,6 +1127,26 @@ I keep money as int64 paise and make splitting a Strategy: equal, exact and perc
 - `RequestID` makes add idempotent; `CreateGroup` refuses an existing ID.
 - Simplify: biggest debtor pays biggest creditor; at most n−1 transfers; minimum is NP-hard.
 - Multi-currency: per-currency nets, or convert the total once with a stored integer rate.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 A pays Rs 9 for A, B and C, split equally. What are the three nets?
+> A +6, B -3, C -3; they add up to zero.
+
+> [!question]- 🟢 Why `int64` paise and not `float64` rupees?
+> Floats cannot hold 0.1 exactly, so sums drift by a paisa; whole paise are exact.
+
+> [!question]- 🟢 What does the factory do here?
+> Turns the API string (`"equal"`, `"exact"`, `"percent"`) into the right split strategy in one place.
+
+> [!question]- 🟡 101 paise split 66.67% / 33.33%. Sorted order vs largest remainder?
+> Sorted order gives 68 / 33; largest remainder gives 67 / 34, because b lost more to rounding down.
+
+> [!question]- 🟡 Why does delete reverse the stored maps instead of re-running the split?
+> If the rounding code changed since the add, a re-run could differ by a paisa and the balances would drift forever.
+
+> [!question]- 🟡 Is greedy simplify always the minimum number of transfers?
+> No. It gives at most n-1, but a subgroup that nets to zero on its own can need fewer; the true minimum is NP-hard.
 
 ## Links 🟢
 

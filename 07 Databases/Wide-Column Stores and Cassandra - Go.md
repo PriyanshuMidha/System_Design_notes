@@ -23,6 +23,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 2 to 5 and the Tests.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Wide-Column Stores and Cassandra]]: the theory half. Each value carries a timestamp, the newest wins, and a delete is a tombstone that must reach every copy before it is purged.
+> - [[NoSQL Data Modeling]]: design one table per question, keyed by what that question filters on.
+> - [[Storage Engines - B-tree vs LSM and WAL]]: compaction merges files and drops old versions and old tombstones.
+> - [[Consistent Hashing]]: the partition key is hashed to pick which nodes hold the copies.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on twin of [[Wide-Column Stores and Cassandra]]. Cassandra keeps 3 copies of every row on 3 different machines, and the copies can briefly disagree. When they disagree, the copy with the newest time stamp wins; this rule is called **last write wins**. A delete does not erase anything; it writes a "deleted" marker called a **tombstone**, which is copied around like any other value. After about 10 days the tombstone is thrown away, and if one machine missed the delete, the old row can come back to life. The Go code models all of this in a few small functions, and the tests show the "zombie row" and the repair that stops it. Read it top to bottom: each step is a short Concept, the code, then a walkthrough.
@@ -44,7 +50,7 @@ flowchart LR
 - **Methods on a map type**: `r.Apply(key, c)` changes the map in place, because maps are reference-like in Go.
 - **Variadic parameters** (`replicas ...Replica`): `Read` and `Repair` take any number of replicas, like a coordinator asking several nodes.
 - **`switch` with no value**: `Reconcile` uses `switch { case ...: }` as a clean if/else chain for the last-write-wins rules.
-- **What to run**: `go vet ./... && go test -race ./...` (standard library only; the CQL is reference only).
+- **What to run**: `go vet ./... && go test -race ./...` (standard library only; the CQL, Cassandra's SQL-like query language, is reference only).
 
 ## What this code shows 🟢
 
@@ -83,6 +89,8 @@ flowchart LR
 - The CQL runs on Cassandra 5.0 (`cqlsh`); it was not executed in this vault, so it is shown as reference DDL.
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** what the model shows: newest timestamp wins, and a missed delete can come back. **Next we open the box**: the CQL tables for one query, then the Go cell, the reconcile rule, a replica with `Apply` and `Compact`, and `Read` and `Repair` across replicas.
 
 The note has two parts. Steps 1 and 2 are CQL: they show how the primary key is written for one query. Steps 3 to 7 are Go: a small model of what replicas do with writes, deletes, compaction and repair, which explains why a deleted row can come back.
 
@@ -399,6 +407,8 @@ flowchart TD
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** how each function behaves. **Next is the senior view**: why the model is simplified the way it is, the tests that replay the zombie-row bug and its fix, and where the toy differs from real Cassandra.
+
 | Choice in the code | Alternative | Trade-off |
 | --- | --- | --- |
 | One winning cell per key per replica | a list of versions per key (like SSTables) | simple and focused on reconciliation; cannot show read amplification |
@@ -411,6 +421,8 @@ flowchart TD
 ## Tests 🟡
 
 The tests replay the failure and its fix. Three replicas A, B and C hold a row; the delete reaches A and B while C is down longer than the hint window, so C never receives the tombstone. All tests share these constants and the `setup` helper.
+
+**What this code does, in plain words:** `setup` builds three replicas A, B and C that all hold the row, then delivers the delete only to A and B, leaving C with the old live value, which is exactly the state that leads to a zombie row.
 
 ```go
 package lww
@@ -575,6 +587,30 @@ Reading the output line by line:
 1. In `TestDeleteResurrectsWithoutRepair`, compact at `9*day` instead of `11*day`. Predict whether the row still resurrects and why.
 2. In `setup`, change the tombstone `WriteTS` from 2,000 to 500. Predict what `Read` returns before any compaction.
 3. Call `Repair` after compacting A and B (at day 11) instead of before. Predict whether the delete survives and which replica "wins".
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Two copies of a cell have timestamps 1,000 and 2,000. Which wins?
+> The one with 2,000, the newer write.
+
+> [!question]- On equal timestamps, which wins: a tombstone or a live value?
+> The tombstone.
+
+> [!question]- What does `Repair` do?
+> Merges the replicas' cells, keeping the winner, and writes that winner back to every replica.
+
+🟡 Medium
+
+> [!question]- In `TestDeleteResurrectsWithoutRepair`, why does the row come back?
+> C never got the tombstone; A and B purged theirs after `gc_grace_seconds`, so C's old live value wins on the next read or repair.
+
+> [!question]- Why does the fix test run `Repair` before `Compact`?
+> So every replica holds the tombstone before any replica is allowed to purge it.
+
+> [!question]- How can a node with a slow clock lose a real write?
+> Its later write carries an older timestamp, so an earlier write with a newer timestamp wins.
 
 ## Links 🟢
 

@@ -37,6 +37,11 @@ Without it, a queue between a 1,000-per-second producer and a 800-per-second con
 > - 🟡 **Know the basics?** Add section 3 (strategies and credits), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Goroutines and Channels]]: a buffered channel holds up to N values; sending to a full channel waits.
+> - [[select and Concurrency Patterns]]: `select` with a `default` branch lets you try a send and do something else if it would wait.
+> - [[Background Jobs and Worker Pools]]: a fixed number of workers take jobs from a queue.
+
 **From zero, in 60 seconds** 🟢
 
 One part of a system makes work, another part does it.
@@ -82,6 +87,10 @@ Backpressure is the kitchen telling the waiters "slow down" or "we are full" bef
 | Latency | How long one item takes end to end | 2 s from send to done |
 | Load shedding | Refusing some work on purpose to stay healthy | Reply 503 to extra requests |
 | Window / credit | How much more the receiver says it can take | TCP receive window |
+| Little's Law | Items waiting = arrival rate × time each waits | 800/s × 2 s = 1,600 items |
+| Throttle | Limit how fast the producer may send | At most 800 events/s |
+| Semaphore | A counter that lets only N tasks run at once | Max 20 calls to the database |
+| Retry storm | Clients retrying all at once and making overload worse | 1,000 req/s becomes 3,000 |
 
 **Picture it**
 
@@ -116,7 +125,9 @@ An ingest service accepts 1,000 events per second. Its workers can process 800 p
 - A new event joins the back of the queue, so it waits for the whole backlog ahead of it to drain: 720,000 events at 800 per second is 900 seconds, about **15 minutes**, before a worker touches it.
 
   (Little's Law, `L = λ × W`, describes a queue in steady state; this one is not steady, it grows without limit, so the wait comes from simple drain arithmetic.)
-- At 2 KB per event, 720,000 events is about 1.4 GB of heap (an estimate). The pod hits its memory limit, is OOM-killed, and every queued event is lost at once.
+- At 2 KB per event, 720,000 events is about 1.4 GB of heap (an estimate). The pod hits its memory limit, is OOM-killed (stopped by the system for using too much memory), and every queued event is lost at once.
+
+**Real-life example.** When a big cricket match ends, millions of people open a streaming app like Hotstar at once to watch highlights. If the servers accepted every request into an endless waiting line, everyone would wait minutes and the servers could crash. Instead, the system keeps its lines short, tells some clients "busy, try again in a few seconds", and lets them back in gradually. That "slow down" signal is backpressure.
 
 The queue did not fix the overload. It hid it for an hour, made every request slow, and then lost the data. A **bounded** queue would have made the problem visible in the first second, and a deliberate policy would have decided who waits and what is dropped.
 
@@ -144,6 +155,14 @@ Terms:
 - **Credit (window):** a number of items or bytes the receiver has said it can accept. The sender may send up to that much, then must wait for more credit.
 - **Consumer lag:** in a log-based broker, how far a consumer group is behind the newest message.
 
+## Common beginner mistakes 🟢
+
+- **Using a queue with no size limit** → it hides overload until memory runs out and every queued item is lost → bound every queue.
+- **Making a bigger buffer to "fix" a slow consumer** → it only adds waiting time; the consumer is still too slow → add capacity, or shed work.
+- **Blocking the producer with no deadline** → blocked requests pile up as goroutines and connections → always wait with a `ctx` deadline shorter than the client's timeout.
+- **Dropping data without counting it** → you cannot tell how much was lost → count every drop and reject, and alert on it.
+- **Letting clients retry a 503 immediately** → retries triple the load on an already overloaded service → retry with backoff and jitter, and honour `Retry-After`.
+
 **The on-ramp, drawn:**
 
 ```mermaid
@@ -155,9 +174,18 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that a pile with no limit always ends badly, and that a bounded queue forces a decision when it fills. **Next we open the box**: where the extra work can go, the strategies and when each fits, and how a receiver can hand out "credit" in advance.
+
 ### Where the pressure goes when the buffer is full
 
 **In plain words:** when the box is full, the extra work has to go somewhere: back to the sender, onto the floor, or into a bigger box. This picture shows each road.
+
+**Step by step:**
+1. Events arrive at 1,000 per second. Workers handle 800. The queue holds at most 1,600.
+2. For 8 seconds the queue fills by 200 a second, then it is full.
+3. The next event must go somewhere. Back to the sender: the API waits or replies 503.
+4. Onto the floor: the event is dropped, and a counter goes up by one.
+5. Into a bigger, durable box: the event goes to Kafka or SQS, which only helps if the load later falls below 800.
 
 ```mermaid
 flowchart LR
@@ -175,6 +203,13 @@ flowchart LR
 
 **In plain words:** there are only a few choices when the line is full: make them wait, turn them away, throw some away, or keep only the newest. The table says when each one is right.
 
+**Step by step (choosing a strategy):**
+1. Ask: can this item be lost? An order cannot. A CPU metric sample can.
+2. Cannot be lost: block the producer with a deadline, or write it to a durable queue.
+3. Only the latest matters (a driver's location): drop the oldest item and keep the newest.
+4. A user is waiting for an answer: reject fast with 429 or 503 so the client can retry later.
+5. Whatever you pick, count what was blocked, rejected or dropped.
+
 | Strategy | What happens at the bound | Good for | Danger |
 | --- | --- | --- | --- |
 | **Block the producer** | The producer waits until there is room | Work that must not be lost: orders, payments | Without a deadline, blocked callers pile up upstream instead (goroutines, threads, connections) |
@@ -188,6 +223,13 @@ flowchart LR
 ### Credit-based flow control
 
 **In plain words:** the receiver hands out tickets in advance, like "you may send me 10 more". The sender stops when it runs out of tickets.
+
+**Step by step:**
+1. The consumer tells the producer: "you may send me 10".
+2. The producer sends 10 items and then stops. It has no credit left.
+3. The consumer finishes 4 of them and says: "4 more".
+4. The producer sends 4 more. At no point can more than 10 be waiting at the consumer.
+5. TCP, HTTP/2, gRPC and RabbitMQ prefetch (a cap on unacknowledged messages per consumer) all use this idea.
 
 Instead of reacting when the buffer is already full, the receiver **grants** credit in advance. TCP's receive window, HTTP/2 and gRPC flow-control windows, AMQP prefetch, and Reactive Streams' `request(n)` all work this way.
 
@@ -428,16 +470,28 @@ Other Go tools for the same job:
 | SQS | Consumer pulls with `ReceiveMessage` (up to 10 per call); in-flight message quota (about 120,000 for a standard queue) | SQS | The queue is durable, so pressure becomes queue age |
 | Reactive Streams | Subscriber calls `request(n)`; publisher may send at most `n` | Project Reactor, RxJava, Akka Streams | Pure credit-based flow control in a library |
 
+### Backpressure vs rate limiting vs load shedding 🟡
+
+The three are often confused. They differ in who decides the limit.
+
+| | Backpressure | Rate limiting | Load shedding |
+| --- | --- | --- | --- |
+| Limit comes from | The consumer's real capacity right now | A fixed rule or quota | The server protecting itself under overload |
+| Example | Full channel makes the producer wait | 100 requests per minute per user | Reply 503 when the queue is 90% full |
+| Adapts to a slower consumer? | Yes | No | Yes, by refusing work |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - **Blocking spreads upstream.** If an HTTP handler blocks on a full queue with no deadline, each blocked request holds a goroutine, a connection and memory. Always block with `ctx` and a deadline shorter than the client's timeout.
 - **Dropping is a product decision.** For metrics, dropping 1% during a spike is fine. For orders, it is data loss. Write down per data type which policy applies.
 - **A durable broker is a big buffer, not a cure.** Kafka can hold days of backlog, which absorbs bursts well. If the average arrival rate exceeds the average processing rate, lag grows forever. Add capacity or shed.
-- **Autoscaling on lag has limits.** Kafka consumers beyond the partition count sit idle, so lag-based scaling (KEDA) caps at the partition count. Scaling consumers also moves the pressure to the database they write to.
-- **Retries amplify overload.** A client that retries a 503 twice, immediately, turns 1,000 requests per second into 3,000. Rejection only works with exponential backoff, jitter and `Retry-After` on the client side.
+- **Autoscaling on lag has limits.** Kafka consumers beyond the partition count sit idle, so lag-based scaling (KEDA, a Kubernetes tool that adds pods when a queue grows) caps at the partition count. Scaling consumers also moves the pressure to the database they write to.
+- **Retries amplify overload.** A client that retries a 503 twice, immediately, turns 1,000 requests per second into 3,000. Rejection only works with exponential backoff, **jitter** (a small random extra wait so clients do not retry in step) and `Retry-After` on the client side.
 - **When not to bother:** a batch job reading a file at its own pace already has natural backpressure; adding queues and policies only adds code.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the strategies for a full queue, credit-based flow control, a bounded queue in Go and how to size it with Little's Law. **Next is the advanced part**: how real systems push back, the production failures that hide overload, and why queues explode near full load.
 
 - **Real systems:**
 	- Kafka's pull model: producers write to the log as fast as brokers accept, consumers read at their own pace, and the backlog lives on broker disk as consumer lag.
@@ -465,7 +519,7 @@ Other Go tools for the same job:
 
   Latency rises sharply long before the queue is "full", which is why systems shed load at about 80 to 90% of capacity rather than at 100% (this is a model, not a measurement; real systems differ).
 - **Bufferbloat.** Large buffers keep throughput high but make every item wait behind the backlog. The same thing happens in network routers and in application queues. Small buffers plus early rejection give lower latency for the work you accept.
-- **Adaptive concurrency limits.** Instead of a fixed worker count, adjust the limit by observed latency, like TCP congestion control: increase while latency is flat, cut it when latency rises (AIMD or gradient algorithms, as in Netflix's concurrency-limits library). Rejected requests become the pressure signal. See [[Bulkheads and Concurrency Limits]].
+- **Adaptive concurrency limits.** Instead of a fixed worker count, adjust the limit by observed latency, like TCP congestion control: increase while latency is flat, cut it when latency rises (AIMD: add a little when things are fine, halve when latency rises; or gradient algorithms, as in Netflix's concurrency-limits library). Rejected requests become the pressure signal. See [[Bulkheads and Concurrency Limits]].
 - **End-to-end propagation.** In a chain `client → API → queue → worker → DB`, the DB being slow should eventually reach the client as a 429/503 or as slower responses.
 
   Each hop must either pass the signal back (bounded buffer, rejection, flow-control window) or shed explicitly. A hop with an unbounded buffer cuts the signal, and the overload appears later and larger somewhere else.
@@ -517,6 +571,30 @@ flowchart RL
 - Pull-based brokers (Kafka) move backlog to disk as lag; lag still needs capacity or shedding.
 - Propagate pressure end to end; an unbounded hop hides it.
 - Payments block or queue durably; metrics may drop.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is backpressure?
+> The slow side telling the fast side to slow down, so work does not pile up without limit.
+
+> [!question]- What happens to an unbounded queue when arrivals beat processing?
+> It grows until memory runs out, and every item waits longer and longer.
+
+> [!question]- What does a full buffered Go channel do to a sender?
+> The send waits until there is room, unless you use `select` with `default`.
+
+🟡 Medium
+
+> [!question]- Workers handle 500 items/s and the queueing budget is 4 s. How big should the queue be?
+> About 2,000 items (500 × 4), by Little's Law.
+
+> [!question]- Why is a huge Kafka backlog not a fix for overload?
+> If the average arrival rate is above the processing rate, lag grows forever; you still need capacity or shedding.
+
+> [!question]- For driver location updates, which strategy fits when the queue is full?
+> Drop the oldest (or keep only the latest per driver), since only the newest position matters.
 
 ## Links
 

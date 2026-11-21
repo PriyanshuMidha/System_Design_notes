@@ -31,6 +31,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Library Management]]: one lock around "check, then claim" so two people never get the same last unit.
+> - [[Concurrency for LLD]]: goroutines run at the same time; a mutex makes them take turns on shared data.
+> - [[Strategy and Template Method]]: a rule behind an interface you can swap, here "which room to try first".
+
 **From zero, in 60 seconds** 🟢
 
 People in an office book rooms for meetings. Two meetings in the same room clash if their times overlap. A meeting from 10:00 to 11:00 and one from 11:00 to 12:00 do not clash, because the end time is not included. The hard case is two people booking the same room at the same moment. Only one must win. Repeating meetings, like every Monday, are turned into a list of single meetings, and they are booked all together or not at all.
@@ -61,6 +66,10 @@ Everything else in this note is just these 3 questions:
 | Strategy | A swappable rule behind an interface | "Pick the smallest room that fits" |
 | Time zone (IANA) | A named region with its own clock rules | `America/New_York` shifts for DST |
 | Recurring series | One rule that makes many meetings | Every Monday 10:00 for 26 weeks |
+| UTC | One world clock with no time zones or DST, used for storing times | 10:00 IST = 04:30 UTC |
+| Invariant | A rule that must always be true | No two BOOKED meetings in Room A overlap |
+| Idempotent | Doing it twice has the same effect as once | Cancelling an already cancelled booking just returns ok |
+| `EXCLUDE` constraint | A Postgres rule that rejects a row overlapping another row | Second 10:00-11:00 booking for Room A fails |
 
 **Picture it**
 
@@ -121,7 +130,7 @@ Two people must never hold the same room at overlapping times, even if they clic
 
 ### Non-functional
 
-- No double booking under concurrent requests; different rooms never block each other; an O(log n) overlap check; an injected clock.
+- No double booking under concurrent requests; different rooms never block each other; an O(log n) overlap check (time grows very slowly: 1,000 bookings take about 10 steps); an injected clock.
 
 ### Out of scope
 
@@ -134,7 +143,7 @@ Two people must never hold the same room at overlapping times, even if they clic
 | Admin | Add a room, set its capacity |
 | Employee | Search free rooms; book a named room or "any room for N"; book a weekly series; cancel own booking |
 
-The hardest use case is **BookRoom**: check-for-overlap and insert must be atomic per room, or two people get the same slot.
+The hardest use case is **BookRoom**: check-for-overlap and insert must be atomic (one step nobody can cut into) per room, or two people get the same slot.
 
 ## Step 3: Entities 🟢
 
@@ -143,13 +152,15 @@ The hardest use case is **BookRoom**: check-for-overlap and insert must be atomi
 | `Room` | ID, Name, Capacity | The resource being booked |
 | `Booking` | ID, RoomID, UserID, SeriesID, Start, End (UTC), Attendees, Status (BOOKED, CANCELLED; DONE is derived from `now >= End`) | One reservation of a room for `[Start, End)`; `BookingRequest` is its input (empty RoomID = auto-pick) |
 | `calendar` | room, mutex, bookings sorted by Start | One room's bookings and lock: where "no overlap" lives |
-| `Series` | First, Duration, Until, Except, Loc | A weekly rule (RRULE-like) with skipped dates (EXDATE) |
+| `Series` | First, Duration, Until, Except, Loc | A weekly rule (RRULE-like: RRULE is the calendar-standard way to write "repeat every Monday") with skipped dates (EXDATE: the standard's list of dates to skip) |
 | `RoomSelector` | `Order(rooms, n)` | Strategy for which free room to try first |
-| `Service` | rooms, byID index, selector, clock | The facade with the use cases |
+| `Service` | rooms, byID index, selector, clock | The facade (one front object that hides the parts behind it) with the use cases |
 
 Modelling insight: **do not store slots** (30-minute cells). Store intervals and check overlap; slots break on odd times and bloat storage. Give each room its own calendar, because the invariant "no two BOOKED intervals overlap" is per room, so the room is the unit of locking.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know the overlap rule, half-open intervals and why each room gets its own calendar. Next we open the box: how the parts link, the API, the Postgres guard against overlaps, and the Go code with the binary search.
 
 ```mermaid
 classDiagram
@@ -184,7 +195,7 @@ GET    /bookings/{id}                                                     -> boo
 DELETE /bookings/{id}                                                     -> 204 | 403 not owner | 409 already started
 ```
 
-Times on the wire are RFC 3339 with an offset (`2026-10-12T10:00:00+05:30`); the server converts to UTC. The Go surface is this interface, which `*Service` in Step 8 implements, plus the pure function `Overlaps(s1, e1, s2, e2 time.Time) bool`:
+Times on the wire are RFC 3339 (the standard text format for date and time) with an offset (`2026-10-12T10:00:00+05:30`); the server converts to UTC. The Go surface is this interface, which `*Service` in Step 8 implements, plus the pure function (no state, same input always gives the same answer) `Overlaps(s1, e1, s2, e2 time.Time) bool`:
 
 ```go
 type SchedulerService interface {
@@ -318,11 +329,11 @@ cmd/demo/main.go  -> wiring: NewService(SmallestFit{}, time.Now), add rooms, boo
 5. **Lock the room's mutex.** From here to unlock, nobody else can check or insert for this room. Other rooms are unaffected.
 6. `conflictIndex`: binary search for the first booking with `Start >= start`. Because the list is sorted and non-overlapping, only the booking just before and the booking at that index can overlap. Check both with `s1 < e2 && s2 < e1`.
 7. Clash: `ErrConflict`. Free: insert at that index with `slices.Insert` (the list stays sorted), build the `Booking`, unlock, then index it by ID.
-8. Auto-pick: the candidate list was a snapshot. If someone booked a candidate in between, `bookIn` returns `ErrConflict` and the loop tries the next room. Out of rooms: `ErrNoRoomAvailable`.
+8. Auto-pick: the candidate list was a snapshot (a picture taken at one moment that can go stale). If someone booked a candidate in between, `bookIn` returns `ErrConflict` and the loop tries the next room. Out of rooms: `ErrNoRoomAvailable`.
 
 `CancelBooking`: find the booking, lock its room, check the owner, return early if already cancelled (idempotent), refuse if `now >= Start`, set `CANCELLED` and remove it from the sorted slice so the slot is free.
 
-**Recurring meetings:** `Series.Occurrences` steps with `AddDate(0, 0, 7*k)` on a time in the rule's `Loc`, so "Mondays 10:00 New York" stays at 10:00 local when DST starts (15:00 UTC on 2 March 2026, 14:00 UTC from 9 March), skips `Except` dates (EXDATE), and stops at `Until` or the 26-week expansion window, whichever comes first; a periodic job materializes the next window.
+**Recurring meetings:** `Series.Occurrences` steps with `AddDate(0, 0, 7*k)` on a time in the rule's `Loc`, so "Mondays 10:00 New York" stays at 10:00 local when DST starts (15:00 UTC on 2 March 2026, 14:00 UTC from 9 March), skips `Except` dates (EXDATE), and stops at `Until` or the 26-week expansion window, whichever comes first; a periodic job materializes (actually creates the booking rows for) the next window.
 
 `BookSeries` checks every occurrence and inserts them all under the one room lock, or returns a `ConflictError` listing the clashing starts. Cancelling one occurrence later is how an exception is recorded after creation.
 
@@ -694,7 +705,7 @@ func (s *Service) find(id string) (*Booking, *calendar, error) {
 | `TestBookSeriesDSTExceptionsAllOrNothing` | 4 of 5 Mondays (one EXDATE), 15:00 then 14:00 UTC across US DST, one clash rejects the whole series, a cancelled occurrence frees its slot, the window caps a long rule at 26 |
 | `TestConcurrentSameSlotOneWinner` | 50 goroutines, overlapping requests for one room: exactly 1 wins, 49 get `ErrConflict` |
 
-All six pass under `go test -race` (Go 1.24.4). The test imports `time/tzdata` so `America/New_York` loads on any machine.
+All six pass under `go test -race` (Go's race detector, which flags unsafe shared access) (Go 1.24.4). The test imports `time/tzdata` so `America/New_York` loads on any machine.
 
 **In plain words:** Tests for the overlap rule, booking, finding a free room, cancelling and repeating meetings across time zones.
 
@@ -915,9 +926,11 @@ func TestConcurrentSameSlotOneWinner(t *testing.T) {
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working scheduler and its tests. Next is interview depth: races, client retries, DST in repeating meetings, all-or-nothing series and the trade-off between a sorted list and an interval tree.
+
 | Edge case | What happens | How the design handles it |
 |---|---|---|
-| Two users book the same room and time at once (race) | Both could see "free" and both insert | Check + insert under the per-room mutex; in the database `EXCLUDE` rejects the second insert (23P01, 409) |
+| Two users book the same room and time at once (race) | Both could see "free" and both insert | Check + insert under the per-room mutex; in the database `EXCLUDE` rejects the second insert (23P01 is Postgres's "exclusion violated" error code; the API returns HTTP 409 Conflict) |
 | Client retries POST after a timeout | Could create two bookings | `Idempotency-Key` with `UNIQUE (user_id, idempotency_key)`; on conflict return the existing booking |
 | Back-to-back meetings 10-11 and 11-12 | Must be allowed | Half-open: `10 < 11 && 11 < 11` is false, so both are allowed |
 | `start >= end` or zero length | Meaningless | `ErrInvalidRange`; the database `CHECK (lower < upper)` |
@@ -929,7 +942,7 @@ func TestConcurrentSameSlotOneWinner(t *testing.T) {
 | Cancel twice | The second call should not fail | Idempotent: an already `CANCELLED` booking returns nil |
 | Room picked by search is taken before Book | Stale search result | Book re-checks under the lock; auto-pick tries the next room |
 | Attendees > capacity | Room too small | `ErrTooSmall`; search filters by capacity |
-| Room deleted with future bookings | Dangling bookings | Soft-delete the room; cancel or move future bookings and notify (follow-up) |
+| Room deleted with future bookings | Dangling bookings | Soft-delete the room (mark it deleted with a flag instead of removing the row); cancel or move future bookings and notify (follow-up) |
 
 ## Step 10: Tradeoffs and extensions 🔴
 
@@ -946,11 +959,11 @@ func TestConcurrentSameSlotOneWinner(t *testing.T) {
 
 An interval tree is a balanced search tree keyed by start in which every node also stores the maximum end in its subtree; an overlap query descends only into subtrees whose max end is after the query start, so both insert and "any overlap?" cost O(log n).
 
-Postgres gets the same effect from the GiST index behind `EXCLUDE`. Below a few hundred meetings per room the slice is simpler and faster in practice (an estimate, not a benchmark).
+Postgres gets the same effect from the GiST index (a Postgres index type that can search ranges) behind `EXCLUDE`. Below a few hundred meetings per room the slice is simpler and faster in practice (an estimate, not a benchmark).
 
 ### Tradeoffs I chose
 
-- **Per-room mutex versus one global mutex.** Per room lets different rooms book in parallel; a global lock is simpler but serializes the office.
+- **Per-room mutex versus one global mutex.** Per room lets different rooms book in parallel; a global lock is simpler but serializes the office (makes every booking wait in one line).
 - **In-memory mutex versus database constraint.** The mutex only works on one instance. In production the `EXCLUDE` constraint is the real guard; the code's lock shows the same idea.
 - **Sorted slice versus interval tree.** The slice gives an O(log n) check and an O(n) insert, which is fine for a few hundred meetings per room; the interval tree above is O(log n) for both but much more code.
 - **Intervals versus time slots.** Intervals handle any start time and store one row per meeting.
@@ -1032,6 +1045,26 @@ I store all times in UTC; a weekly series is expanded in the organizer's IANA ti
 - Search is a snapshot; Book re-checks under the lock; auto-pick tries the next room on conflict.
 - Postgres: `tstzrange` + `EXCLUDE USING gist` with `btree_gist`; 23P01 maps to 409.
 - Store UTC; expand recurring rules in the organizer's IANA zone inside a bounded window; a series books all or nothing; a cancelled occurrence is a later exception; an interval tree only for very dense calendars.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 Do 10:00-11:00 and 11:00-12:00 in the same room clash?
+> No. Intervals are half-open `[start, end)`, so 11:00 belongs only to the second meeting.
+
+> [!question]- 🟢 What is the one-line overlap test?
+> `s1 < e2 && s2 < e1`.
+
+> [!question]- 🟢 Why store intervals instead of 30-minute slots?
+> Slots break on odd times like 10:10 and fill storage with empty cells; one interval row per meeting handles any time.
+
+> [!question]- 🟡 After the binary search, why check only two bookings?
+> The list is sorted and has no overlaps, so only the booking just before and the one at the found index can touch the new interval.
+
+> [!question]- 🟡 Why expand a weekly series in its IANA zone and not in UTC?
+> In UTC, "10:00 every Monday" shifts by an hour when DST starts; `AddDate` in the local zone keeps it at 10:00 local.
+
+> [!question]- 🟡 The per-room mutex only works on one server. What guards many servers?
+> The Postgres `EXCLUDE USING gist` constraint on room and time range; a clashing insert fails with 23P01 (HTTP 409).
 
 ## Links 🟢
 

@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Authentication vs Authorization]]: login proves who a caller is; abuse traffic often passes login with real (stolen or fake) accounts, so it needs extra checks.
+> - [[Access and Refresh Tokens]]: callers carry tokens on every request; abuse defenses watch how many requests each token, account and device makes.
+
 **From zero, in 60 seconds** 🟢
 
 Some traffic follows every rule but still hurts you. Think of bots buying all concert tickets in 2 seconds.
@@ -74,6 +78,13 @@ The site must spot the *pattern* of bot traffic and slow it down without annoyin
 | CAPTCHA | A small test that is easy for humans and costly for bots | "Click every traffic light" |
 | Risk score | A number built from several signals saying how suspicious a request is | New device + bad IP = high risk |
 | HTTP 429 | The status code for "too many requests, slow down" | Returned once a limit is hit |
+| WAF | Web application firewall: a filter in front of your site that drops known-bad traffic | Cloudflare, AWS WAF |
+| Residential proxy | A paid network that routes bot traffic through real home internet connections, so it looks like normal users | 10,000 home IPs for one bot |
+| Device fingerprint | A near-unique ID built from a browser's or phone's settings | Same fingerprint on 300 signups |
+| Honeypot field | A form box hidden from humans; only bots fill it in | `<input name="website" style="display:none">` |
+| Step-up auth | Asking for extra proof (OTP, MFA) only when something looks risky | "Enter the code we sent you" |
+| Shadow-ban | Letting a suspected bot think it succeeded while quietly ignoring it | Scraper keeps getting stale data |
+| OTP pumping | Bots trigger thousands of SMS codes to paid numbers the attacker profits from | 50,000 SMS to one country in an hour |
 
 **Picture it**
 
@@ -102,7 +113,7 @@ Where it breaks: a bouncer sees faces, but a server only sees signals that bots 
 
 ## 1. Why it exists 🟢
 
-A ticketing platform opens sales for a popular concert at 10:00 AM. Within seconds, bots using thousands of residential proxy IPs have bought most of the floor section, reselling tickets at a markup minutes later.
+A ticketing platform opens sales for a popular concert at 10:00 AM. Within seconds, bots using thousands of residential proxy IPs (real home internet connections rented out to route bot traffic) have bought most of the floor section, reselling tickets at a markup minutes later.
 
 Separately, that same week, an attacker runs a list of 2 million leaked username/password pairs from an unrelated breach against the platform's login endpoint — a **credential stuffing** attack. Security vendors who publish credential-stuffing statistics (Akamai, Imperva) commonly report hit rates of roughly 0.1–2% of attempted pairs succeeding, depending on how much the target's user base overlaps with the breached source — an estimate, not a figure measured on this platform.
 
@@ -112,15 +123,45 @@ Both attacks used perfectly valid requests: correct JSON, a real (if automated) 
 
 That is what this note is about — the layer above "is this request well-formed," which [[OWASP API Security Top 10]]-style validation already handles.
 
+### Real-life example: OTP login on a food app 🟢
+
+Apps like Swiggy and Zomato log you in with a one-time SMS code. Each SMS costs the company money. A bot can hit "send OTP" for thousands of phone numbers every minute, either to run up the bill or to earn a cut from premium-rate numbers (OTP pumping). Every single request looks normal: a valid phone number, a valid app version. The app catches it with per-phone and per-device send limits, a wait time between resends, country checks, and a quiet challenge for devices that look automated.
+
 ## 2. Mental model 🟢
 
 Think of a nightclub's door policy, not a single bouncer but several checks in sequence: an ID check (authentication), a dress code (basic request validation), a headcount limit per hour (rate limiting), a bouncer watching for group behavior that looks like trouble before anyone does anything wrong (risk signals and velocity rules), and a manager who can eject someone retroactively once a pattern becomes clear (post-hoc detection and account action). No single person at the door catches everything; the combination does.
 
+## Common beginner mistakes 🟢
+
+- **Rate-limiting only by IP** → bots spread across thousands of IPs → also limit per account, per device and per API key.
+- **Blocking on the first failed login** → real users who mistype get locked out, and attackers learn the rule → act on a pattern (count over a window), and challenge before blocking.
+- **Different error text for "no such user" and "wrong password"** → attackers learn which accounts exist → one generic message, same status, similar timing.
+- **Same limits for OTP and login as for the rest of the API** → these are the endpoints bots hit hardest → give them their own, stricter limits.
+- **Measuring only "abuse blocked"** → the rules creep tighter and silently block real users → also track false positives (support tickets, appeals).
+
+### Rate limiting vs bot protection 🟡
+
+| | Plain rate limiting | Bot / abuse protection |
+| --- | --- | --- |
+| Looks at | How many requests one key sends | Patterns across many requests and signals |
+| Catches | One noisy client | Many quiet clients working together |
+| Answer | 429 "slow down" | Allow, challenge, slow, or block based on a risk score |
+| Example | 100 requests/minute per API key | 300 signups from one device fingerprint |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that abuse traffic looks normal one request at a time, so you stack several checks. **Next we open the box**: the layers in order, the common attack types, how to count on many keys at once, when to challenge instead of block, and the clues that give bots away.
 
 ### Defense in depth
 
 **In plain words:** several cheap checks in a row. The first ones are fast and rough, the later ones are slower and smarter.
+
+**Step by step:**
+1. A login request from IP `203.0.113.7` first hits the edge WAF. The IP belongs to a data center known for bots, so its reputation score is high.
+2. If it gets past, the gateway counts it: is this IP, account, device or API key over its limit for the last minute?
+3. The risk engine adds clues: 30 failed logins from this IP in 15 minutes, and a brand-new device.
+4. Low risk → the app handles it. Medium → show a CAPTCHA. High → block.
+5. Every outcome is logged, so a dashboard can later spot patterns no rule was written for.
 
 ```mermaid
 flowchart LR
@@ -147,7 +188,7 @@ The risk engine combines signals the first two layers do not see individually. O
 | --- | --- | --- |
 | Credential stuffing | Many login attempts, one leaked password list, spread across accounts and IPs | Per-account + per-IP login throttles, breached-password check, MFA |
 | Account enumeration | Login or signup response reveals whether a username/email exists | Identical response message, status code, and timing for "wrong password" and "unknown user" |
-| Scraping | High-volume reads of catalog/listing endpoints, often via headless browsers | Per-IP/device rate limits, response randomization for detection, licensing/ToS enforcement |
+| Scraping | High-volume reads of catalog/listing endpoints, often via headless browsers (real browsers driven by a script, with no screen) | Per-IP/device rate limits, response randomization for detection, licensing/ToS enforcement |
 | OTP / SMS pumping | Attacker triggers thousands of OTP sends to premium-rate numbers for a cut of the telco revenue | Per-phone and per-IP send caps, cooldown between sends, country allowlist/denylist |
 | Fake signups | Bulk account creation for referral abuse, spam, or inventory hoarding | CAPTCHA/Turnstile at signup, email/phone verification, device fingerprint clustering |
 | Card testing | Many small authorization attempts with stolen card numbers to find valid ones | Velocity limits on payment attempts, CVV/AVS checks, step-up auth above a threshold |
@@ -159,6 +200,13 @@ This maps onto OWASP API Security Top 10 (2023) **API4: Unrestricted Resource Co
 ### Rate limits per dimension
 
 **In plain words:** limit by IP alone and attackers just switch IPs. So count per account, per device and per IP at the same time.
+
+**Step by step:**
+1. A bot tries account `riya@x.com` from 500 different IPs, once each. The per-IP counter never trips.
+2. But the per-account counter for `riya@x.com` hits 5 failures in 15 minutes → challenge.
+3. Another bot tries 500 different accounts from one IP. The per-account counters stay low.
+4. But the per-IP counter hits 50 failures → block.
+5. A request must pass every counter, so dodging one still trips another.
 
 ```mermaid
 flowchart LR
@@ -192,6 +240,12 @@ An attacker rotating IPs still hits the per-account limit on the account they ar
 
 **In plain words:** start soft (small delay), then get stricter (CAPTCHA, extra login step) only when something looks off. Real users rarely feel it.
 
+**Step by step:**
+1. Attempts 1-49 from one IP fail. Each gets the same "invalid username or password", nothing more.
+2. Attempt 50 pushes the IP's 15-minute failure count over the line → the gateway blocks it or shows a CAPTCHA.
+3. Separately, one targeted account has failed 5 times → the next try on that account needs an OTP, even from a clean IP.
+4. A real user who mistyped twice sees nothing different at all.
+
 Login endpoints get stricter, separate handling from the rest of the API, because credential stuffing concentrates there:
 
 ```mermaid
@@ -215,16 +269,32 @@ sequenceDiagram
     L-->>A: step-up challenge required on next attempt for THIS account,<br/>even from a clean IP
 ```
 
-Hardening specific to login: check new passwords (and flag existing ones) against known breach corpora, apply **both** a per-account and a per-IP throttle (neither alone is enough, as the diagram shows), return the same generic failure message and status code whether the username does not exist or the password is wrong, and offer MFA as a second factor that credential stuffing cannot satisfy even with a correct password.
+Hardening specific to login: check new passwords (and flag existing ones) against known breach corpora (big public lists of leaked passwords), apply **both** a per-account and a per-IP throttle (neither alone is enough, as the diagram shows), return the same generic failure message and status code whether the username does not exist or the password is wrong, and offer MFA as a second factor that credential stuffing cannot satisfy even with a correct password.
 
 ### Detection signals
 
 **In plain words:** clues that add up to "this is a bot": too many fails, too fast, odd device, IP from a data center.
 
+**Step by step:**
+1. Count: 40 failed logins from this device in 15 minutes (velocity).
+2. Look at the device: same fingerprint as 300 signups yesterday, and keystrokes all exactly 10 ms apart.
+3. Check the hidden honeypot field: it came back filled in, which no human does.
+4. Check the network: the IP is in a cloud data-center range, and the TLS handshake looks like a script library, not Chrome.
+5. Add the clues into one risk score; several weak clues together give a confident answer.
+
+```mermaid
+flowchart LR
+    V["Velocity"] --> S["Risk score"]
+    D["Device"] --> S
+    H["Honeypot"] --> S
+    N["IP / TLS"] --> S
+    S --> A["allow / challenge / block"]
+```
+
 - **Velocity rules:** request or failure counts over a rolling window, per dimension (the `FailedLoginsLast15m` / `FailedLoginsFromIP15m` style counters in the worked example below).
 - **Device fingerprinting and behavioral signals:** canvas/font fingerprint stability, mouse movement or keystroke timing entropy (bots tend to be too fast or too mechanically uniform), consistent device ID across sessions.
 - **Honeypot fields:** a form field hidden from real users (no label, `display:none`, excluded from tab order) that only an automated form-filler sets.
-- **Edge signals:** IP/ASN reputation (data-center ranges, known proxy/VPN exit nodes), TLS fingerprinting (JA3/JA4 — the specific cipher suite and extension order a TLS client offers, which differs between a real browser and most HTTP client libraries).
+- **Edge signals:** IP/ASN reputation (ASN: the network owner an IP belongs to; data-center ranges, known proxy/VPN exit nodes), TLS fingerprinting (JA3/JA4 — the specific cipher suite and extension order a TLS client offers, which differs between a real browser and most HTTP client libraries).
 - **Anomaly dashboards:** aggregate views (signups per minute, login failure rate, checkout velocity) that catch a pattern no single request-level rule was written for yet.
 
 ## 4. Worked example 🟡
@@ -403,16 +473,19 @@ func TestLoginDoesNotRevealEnumeration(t *testing.T) {
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the layers, the multi-key limits, the challenge ladder and the bot clues. **Next we look at real systems**: what Cloudflare, ticketing sites and Stripe do, how these defenses fail (shared office IPs, adaptive bots, CAPTCHA farms), what to monitor, and the subtler ideas like timing leaks and shadow-bans.
+
+
 - **Real systems:**
   - Cloudflare Turnstile and Google reCAPTCHA provide managed, mostly invisible proof-of-human challenges used across most large consumer platforms.
   - Ticketing platforms (Ticketmaster's Verified Fan, similar systems elsewhere) combine queueing, per-account purchase limits, and bot-detection vendors specifically against scalping bots.
   - Have I Been Pwned's breached-password API (or a locally synced copy of the same corpus) is the standard way to check new and existing passwords against known breach dumps, per NIST SP 800-63B guidance.
   - Stripe Radar and similar fraud-scoring products apply the same signals-plus-risk-engine pattern specifically to card-testing and payment fraud.
 - **Failure modes → fixes:**
-  - Legitimate users behind a shared corporate NAT trip IP-based limits together → weight the per-account dimension more heavily than per-IP for authenticated traffic, and allowlist known-good corporate ranges case by case.
+  - Legitimate users behind a shared corporate NAT (many office machines sharing one public IP) trip IP-based limits together → weight the per-account dimension more heavily than per-IP for authenticated traffic, and allowlist known-good corporate ranges case by case.
   - A risk engine tuned too aggressively silently blocks real signups during a viral traffic spike → monitor the false-positive proxy metric (support tickets tagged "couldn't sign up," appeal-approval rate) alongside the abuse-caught metric, not abuse-caught alone.
   - Attackers adapt to a published threshold (e.g. staying at 49 requests when the limit is 50) → combine multiple independent signals so no single threshold is the whole defense, and rotate thresholds without announcing them.
-  - CAPTCHA farms (cheap human solvers) defeat a weak challenge → escalate to a harder challenge or step-up MFA for repeat offenders rather than relying on CAPTCHA alone indefinitely.
+  - CAPTCHA farms (cheap human solvers paid per puzzle) defeat a weak challenge → escalate to a harder challenge or step-up MFA for repeat offenders rather than relying on CAPTCHA alone indefinitely.
 - **What to monitor:**
   - Login failure rate, broken down by per-account vs per-IP triggers, to separate "someone forgot their password" from "a stuffing run is in progress."
   - Challenge pass/fail rate — a collapsing pass rate on a previously effective CAPTCHA is a sign it has been defeated.
@@ -457,6 +530,26 @@ func TestLoginDoesNotRevealEnumeration(t *testing.T) {
 - Challenge before you block, when confidence is moderate; blocking on one data point creates false positives and teaches attackers what tripped the alarm.
 - Measure false positives (support tickets, appeal rate) alongside abuse caught, or tuning will silently drift too aggressive.
 - Map threats to OWASP API Security Top 10 2023: API4 for cost/volume attacks, API6 for business-logic abuse.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What makes abuse traffic hard to stop with normal validation?
+> Each request is valid on its own; only the pattern across many requests is wrong.
+
+> [!question]- (easy) What does HTTP 429 mean?
+> Too many requests: slow down.
+
+> [!question]- (easy) What is a honeypot field?
+> A form field hidden from humans; if it comes back filled, a bot filled it.
+
+> [!question]- (medium) Why limit per account as well as per IP?
+> Credential-stuffing bots spread one account's attempts across many IPs; only the per-account counter sees them.
+
+> [!question]- (medium) Why challenge instead of block when risk is medium?
+> A real user can pass a challenge, so false positives cost little, while most bots stop there.
+
+> [!question]- (medium) Why must login failures also take the same time, not just show the same text?
+> If "unknown user" answers faster than "wrong password", timing alone reveals which accounts exist.
 
 ## Links
 - **Before this:** [[Service-to-Service Auth - API Keys, HMAC, mTLS]], [[OWASP API Security Top 10]]

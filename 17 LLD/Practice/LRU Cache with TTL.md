@@ -39,6 +39,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code) and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Heaps and Priority Queues]]: a min-heap always hands back the smallest item first, here the entry that expires soonest.
+> - [[Concurrency for LLD]]: goroutines run at the same time; a mutex makes them take turns on shared data.
+
 **From zero, in 60 seconds** 🟢
 
 A cache is a small fast box of saved answers. It has room for only N items. When it is full and a new item comes, it must throw one out. **LRU** means "least recently used": throw out the item nobody touched for the longest time. Items can also have a **TTL**, a time after which they expire. The trick is doing both in constant time with a map plus a linked list.
@@ -73,6 +77,10 @@ An LRU cache with TTL throws out the least recently used entry and never hands b
 | Doubly linked list | Nodes with next and prev pointers; move or remove in O(1) | Move a node to the front on `Get` |
 | Min-heap | Always gives the smallest item first | Entry that expires soonest |
 | Mutex | Lets only one goroutine change shared data at a time | `mu.Lock()` in `Get` and `Put` |
+| O(1), O(log n) | How cost grows with size: O(1) is constant, O(log n) grows very slowly | O(log n): 1,000 entries take about 10 steps |
+| Lazy vs active expiry | Lazy: remove a dead entry when someone reads it. Active: a background job removes it | `Get` finds it expired vs the janitor sweeps it |
+| Sentinel node | An empty dummy node at each end of the list | `head` and `tail`, so the list is never truly empty |
+| Sharding | Splitting one cache into N smaller ones, each with its own lock | Key hash % 16 picks the shard |
 
 **Picture it**
 
@@ -111,8 +119,8 @@ Expired entries must never be returned. Get and Put must be O(1) (O(log n) is
 acceptable for entries that carry a TTL). Many goroutines use the cache.
 ```
 
-- It tests data-structure choice (map plus doubly linked list), pointer handling, generics and guarding shared state with one mutex.
-- The TTL part tests time handling: lazy plus active expiry, an injected clock, and keeping the hot path cheap.
+- It tests data-structure choice (map plus doubly linked list), pointer handling, generics (Go types with a type parameter, like `LRU[K, V]`, so one cache works for any key and value) and guarding shared state with one mutex.
+- The TTL part tests time handling: lazy plus active expiry, an injected clock, and keeping the hot path (the code that runs on every call) cheap.
 
 ### Solving path
 
@@ -129,17 +137,17 @@ Questions to ask, with the answer this design assumes:
 
 - Is capacity counted in entries or bytes? *Entries.*
 - Is a miss an error? *No: `(zero, false)`, like a Go map.*
-- One TTL for the cache or one per entry? Does `Get` extend it? *Per entry, set by `Put`. `Get` refreshes recency only (absolute expiry, not sliding). `ttl <= 0` means never expires.*
+- One TTL for the cache or one per entry? Does `Get` extend it? *Per entry, set by `Put`. `Get` refreshes recency only (absolute expiry, not sliding: a sliding TTL would restart the countdown on every read). `ttl <= 0` means never expires.*
 - Must expired entries free memory at once? *They must never be returned. Memory is reclaimed lazily on `Get`, by an active `Sweep`, and first in line when the cache is full.*
-- Concurrent access? How read-heavy? *Concurrent; one mutex first, sharding when profiling shows contention.*
-- Callback on eviction? *Yes, with a reason (capacity or expired), for metrics or write-back.*
-- One process or shared? *One process. Shared across instances means Redis.*
+- Concurrent access? How read-heavy? *Concurrent; one mutex first, sharding when profiling (measuring where time goes) shows contention (goroutines waiting on the lock).*
+- Callback on eviction? *Yes, with a reason (capacity or expired), for metrics or write-back (saving a changed value to the database when it leaves the cache).*
+- One process or shared? *One process. Shared across instances means Redis (a separate in-memory cache server).*
 
 **Functional:** `Get`, `Put` (insert or update, resets TTL), `Delete`, `Len`, `Sweep(limit)`, `RunJanitor`, optional `onEvict(key, val, reason)`, generic `LRU[K comparable, V any]`.
 
-**Non-functional:** `Get` and `Put` are O(1) when the expiry heap does not change, and O(log n) when it does (an entry with a TTL is added, updated or removed, including as an eviction victim); safe for concurrent use; deterministic tests (clock injected as `now func() time.Time`); the callback can never deadlock the cache.
+**Non-functional:** `Get` and `Put` are O(1) when the expiry heap does not change, and O(log n) when it does (an entry with a TTL is added, updated or removed, including as an eviction victim); safe for concurrent use; deterministic tests (same result every run; clock injected as `now func() time.Time`); the callback can never deadlock (freeze waiting on a lock it already holds) the cache.
 
-**Out of scope:** size in bytes, LFU, read-through loading (see Step 10).
+**Out of scope:** size in bytes, LFU (evict the least often used), read-through loading (the cache fetches a missing value itself) (see Step 10).
 
 ## Step 2: Actors and use cases 🟢
 
@@ -173,6 +181,8 @@ The node stores its own `key` because eviction starts from a node (`tail.prev` o
 It stores `heapIdx` so `heap.Remove` and `heap.Fix` run in O(log n) without searching.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know what LRU and TTL mean and the "one node, three indexes" idea. Next we open the box: how map, list and heap point at the same node, the method set and its costs, and the Go code.
 
 ```mermaid
 classDiagram
@@ -238,7 +248,7 @@ This is a library component, so the API is the Go method set (no REST):
 | `Sweep(limit) int` | Removes up to `limit` expired entries, earliest deadline first | O(k log n) |
 | `RunJanitor(ctx, ticks, perTick)` | Calls `Sweep(perTick)` on every tick until `ctx` ends | per tick |
 
-No `context.Context` on `Get`/`Put`: they never block on I/O. Only the janitor, which runs for the life of the process, takes one.
+No `context.Context` on `Get`/`Put`: they never block on I/O (waiting for disk or network). Only the janitor, which runs for the life of the process, takes one.
 
 ## Step 6: Storage and repositories 🟡
 
@@ -261,7 +271,7 @@ That is close to this design's expired-first rule, but it evicts live keys that 
 | [[Decorator and Middleware]] | Extension: metrics or read-through loader wrapping the cache | Adds behaviour without touching the cache |
 | [[Strategy and Template Method]] | Extension: pluggable eviction (LRU, LFU, FIFO) | Only once a second policy is asked for |
 
-Not used, and why: a Strategy interface for eviction in the base version is YAGNI with one policy. One mutex guards map, list and heap together because they must change atomically ([[Concurrency for LLD]]).
+Not used, and why: a Strategy interface for eviction in the base version is YAGNI ("you aren't gonna need it") with one policy. One mutex guards map, list and heap together because they must change atomically ([[Concurrency for LLD]]).
 
 ## Step 8: Core code 🟡
 
@@ -534,7 +544,7 @@ func (h *expiryHeap[K, V]) Pop() any {
 5. Insert the node in the map, at the list front and (with a TTL) in the heap.
 6. Unlock, then run `onEvict`. A callback that calls `Get` or `Put` cannot deadlock.
 
-`Get(key)` looks up the node; if `now >= expiresAt` it removes it (lazy expiry), unlocks, fires the callback and returns a miss. Otherwise it moves the node to the front. It needs a full `Lock`, not `RLock`, because moving a node is a write.
+`Get(key)` looks up the node; if `now >= expiresAt` it removes it (lazy expiry), unlocks, fires the callback and returns a miss. Otherwise it moves the node to the front. It needs a full `Lock`, not `RLock` (the shared read lock of a `sync.RWMutex`), because moving a node is a write.
 
 `Sweep(limit)` pops expired nodes from the heap top only, so a sweep that finds nothing costs O(1) instead of an O(n) scan of the whole list. `limit` bounds how long one sweep holds the lock, like Redis's time-bounded active expiry cycle.
 
@@ -820,6 +830,8 @@ func checkInvariants[K comparable, V any](t *testing.T, c *LRU[K, V]) {
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working cache and its tests. Next is interview depth: lock mistakes like `RLock` in `Get`, clock jumps, callbacks that re-enter the cache, and how to scale a hot cache on many cores.
+
 | Edge case | Risk | Handling |
 |---|---|---|
 | Two goroutines `Put` at once | Corrupted `prev`/`next` pointers | One `sync.Mutex`; `go test -race` checks it |
@@ -831,8 +843,8 @@ func checkInvariants[K comparable, V any](t *testing.T, c *LRU[K, V]) {
 | Update changes or removes the TTL | Stale heap position | `setExpiry` calls `heap.Fix` or `heap.Remove` |
 | Capacity `<= 0` / 1 | Useless cache / edge of the list | Error / works: one node between sentinels |
 | Callback calls the cache | Deadlock | Callbacks run after `Unlock` |
-| Wall clock jumps backwards | Entries live longer or die early | `time.Now()` carries a monotonic reading and `Add` keeps it, so `Before` ignores wall-clock jumps |
-| Copying the struct | Copies the mutex | Always use `*LRU`; `go vet` flags copies |
+| Wall clock jumps backwards | Entries live longer or die early | `time.Now()` carries a monotonic reading (a counter that only goes forward, unlike the wall clock) and `Add` keeps it, so `Before` ignores wall-clock jumps |
+| Copying the struct | Copies the mutex | Always use `*LRU`; `go vet` (Go's built-in code checker) flags copies |
 | Callback order under concurrency | Callback may run after another goroutine re-inserted the key | Document it; callbacks must not assume the key is still absent |
 
 Common mistakes: a map without a list (no order) or a slice for order (O(n) move); not storing the key in the node; skipping the sentinels, so the empty and one-node cases need nil checks and break; forgetting to move on `Get`; evicting on update; firing callbacks under the lock; calling `time.Now()` directly so tests need `time.Sleep`.
@@ -871,7 +883,7 @@ Common mistakes: a map without a list (no order) or a slice for order (O(n) move
 | LFU instead of LRU | Map key to node plus map frequency to list, track `minFreq`; still O(1) ([[Cache Eviction Policies - LRU, LFU, TTL]]) |
 | Several policies | `EvictionPolicy` interface with `OnAccess`, `OnInsert`, `Victim` (Strategy) |
 | Capacity in bytes | Track used bytes; evict in a loop until the new value fits |
-| Thundering herd on a miss | `singleflight.Group` around the loader ([[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]) |
+| Thundering herd on a miss (many callers miss the same key at once and all hit the database) | `singleflight.Group` around the loader ([[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]) |
 | Read-through and write-back | A decorator with a loader func; `onEvict` writes dirty entries back |
 | Distributed cache | Redis, or many cache nodes placed with [[Consistent Hashing]] |
 
@@ -920,6 +932,26 @@ I combine a hash map from key to node with a doubly linked list ordered by recen
 - One mutex over map, list and heap; `Get` writes, so no `RLock`.
 - Callbacks run after `Unlock`; clock and ticker are injected for deterministic tests.
 - Scale reads with sharding or approximate LRU (Redis samples 5 keys by default); in production use ristretto or golang-lru.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 Cache holds A, B, C (A oldest). You `Get(A)`, then `Put(D)` on a full cache. What is evicted?
+> B. Reading A moved it to the front, so B is now the least recently used.
+
+> [!question]- 🟢 What does the map do, and what does the list do?
+> The map finds a key's node in one step; the list keeps the order of use, front newest, back oldest.
+
+> [!question]- 🟢 An entry with a 60 s TTL is read at 61 s. What does `Get` return?
+> A miss. It is expired (`now >= expiresAt`), so `Get` removes it and returns `(zero, false)`.
+
+> [!question]- 🟡 Why can't `Get` use `RLock`?
+> A hit moves the node to the front, which writes `prev`/`next`; two readers doing that together would corrupt the list.
+
+> [!question]- 🟡 Why is the eviction callback run after `Unlock`?
+> A callback that calls `Get` or `Put` would try to take the same lock and deadlock.
+
+> [!question]- 🟡 What does the expiry heap buy you, and what does it cost?
+> A full cache can drop an expired entry before a live one, and `Sweep` finds dead entries without a scan; the cost is O(log n) on puts with a TTL and a `heapIdx` per node.
 
 ## Links 🟢
 

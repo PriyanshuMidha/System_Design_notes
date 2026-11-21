@@ -34,6 +34,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+> - [[Clocks and Ordering]]: machine clocks disagree, so a fair order comes from one counter, not from timestamps.
+> - [[Event Sourcing]]: store every change as an event in a log, and rebuild the current state by replaying it.
+> - [[Back-of-the-Envelope Estimation]]: turning a billion orders a day into orders per second.
+
 **From zero, in 60 seconds** 🟢
 
 A stock exchange matches people who want to buy with people who want to sell.
@@ -71,6 +77,10 @@ And nobody may ever lose a trade because a server crashed.
 | Log | An append-only list of events kept on disk | Every order, in order |
 | Deterministic | Same input always gives the same output | Replay the log, get the same trades |
 
+| Sequencer | The one component that gives every order its number | order gets `seq = 8,120,433` |
+| Tick | The smallest price step; prices are stored as whole ticks | 5010 ticks = ₹50.10 |
+| Hot-warm replica | A standby engine that replays the same log and can take over | backup is 2 events behind, catches up, takes over |
+
 **Picture it**
 
 ```mermaid
@@ -101,14 +111,21 @@ Picture a vegetable market with one rule: the highest buyer and the lowest selle
 
 A stock exchange exists to be that fair referee, at machine speed.
 
+### Real-life example: buying shares on Zerodha 🟢
+
+You open Zerodha at 9:15 am and place an order to buy 10 shares of a company at ₹1,500.
+Your broker sends it to the exchange (NSE), where thousands of other buy and sell orders for that stock are waiting.
+If a seller is waiting at ₹1,500 or less, you get your shares within a fraction of a second; if not, your order waits in the book.
+If two people offered ₹1,500 at almost the same moment, the one the exchange numbered first is filled first.
+
 **Functional requirements**
-- Place an order: **limit** (buy at most X, sell at least X), **market** (any price), and time-in-force variants such as **IOC** (immediate-or-cancel) and **FOK** (fill-or-kill). Stop orders are optional.
+- Place an order: **limit** (buy at most X, sell at least X), **market** (any price), and time-in-force (how long the order stays valid) variants such as **IOC** (immediate-or-cancel) and **FOK** (fill-or-kill). Stop orders are optional.
 - Cancel or amend an open order.
 - Match orders by **price-time priority**: best price first, earliest arrival first at the same price.
 - Publish **market data**: the best bid and ask, depth of book, and every trade ("the tape").
 - Send each participant execution reports (acknowledged, partially filled, filled, cancelled, rejected).
 - Pre-trade risk checks: enough cash or shares, price within limits, rate limits per participant.
-- Hand finished trades to **clearing and settlement** (moving the actual shares and money). Settlement in the US is T+1 since 28 May 2024.
+- Hand finished trades to **clearing and settlement** (moving the actual shares and money). Settlement in the US is T+1 (one business day after the trade) since 28 May 2024.
 - Scope for the interview: a few thousand symbols, equities only, one region. Ignore options, auctions and cross-market routing unless asked.
 
 **Non-functional requirements**
@@ -153,12 +170,29 @@ flowchart LR
     O --> RP["Reporting, audit,<br/>analytics"]
 ```
 
+## Common beginner mistakes 🟢
+
+- **Keeping the order book in a SQL table** → each match costs a database round trip of hundreds of microseconds → keep the book in memory, fed by the log.
+- **Ordering orders by their timestamps** → clocks on different machines disagree → let one sequencer number every order.
+- **Running several engines for the same stock to scale** → two books mean the same order could match twice → one single-threaded engine per stock (or group of stocks).
+- **Storing prices as floats** → `50.1` cannot be stored exactly → store prices as whole ticks.
+- **Acknowledging an order before it is safely logged** → a crash loses an order the trader thinks was accepted → write it to the replicated log, then ack.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the core idea: one numbered log of orders, and one engine per stock that matches them in that order. **Next we open the box** and follow one order from the broker's connection through checks, numbering, matching and reporting.
+
+**Step by step (plain):**
+1. Your broker sends "BUY 350 @ 50.10" over its always-open connection to an exchange gateway.
+2. The gateway checks the stock exists and that your broker has the money reserved.
+3. The sequencer gives the order number 130, writes it to the log on two machines, and tells the broker "accepted".
+4. The matching engine for that stock reads order 130, sees sellers waiting at 50.10, and fills 300 from the first seller and 50 from the second.
+5. Trades go out as reports to both sides and as market data to everyone; settlement happens later, away from this fast path.
 
 Read the diagram above left to right, then follow one order through these steps.
 
 1. **Connect.** A broker's trading system opens a long-lived TCP session to a **gateway** using the **FIX** protocol (the industry text protocol for orders) or an exchange-specific binary protocol. The gateway authenticates the session and applies a per-participant rate limit.
-2. **Validate and risk-check.** The order is checked for sanity (known symbol, tick size, quantity limits) and for risk (does the buyer have the cash reserved, is the price within, say, 10% of the last trade). A failed check is rejected immediately and never reaches the log.
+2. **Validate and risk-check.** The order is checked for sanity (known symbol, tick size: the allowed price step, quantity limits) and for risk (does the buyer have the cash reserved, is the price within, say, 10% of the last trade). A failed check is rejected immediately and never reaches the log.
 3. **Sequence.** The sequencer gives the order the next number, for example `seq=8,120,433`, plus a timestamp, and appends it to the event log. The log write is replicated to at least one other machine before the order is acknowledged. This number is the order's permanent place in the queue.
 4. **Match.** The matching engine for that symbol reads events in sequence order. It looks at the opposite side of the book, fills what it can, rests the remainder in the book, and emits events: `OrderAccepted`, `Trade`, `OrderCancelled`.
 5. **Publish.** Outbound events fan out. Participants get execution reports; the **market data publisher** sends book updates to everyone at the same time; the **clearing** service records the trade for settlement; the audit store keeps a copy.
@@ -393,11 +427,19 @@ flowchart TD
     Q3 -->|"yes"| E4["Warm replicas replay the same log<br/>(hot-warm)"]
 ```
 
+### Things people confuse this with 🟡
+
+| System | What it does | How it differs from an exchange |
+| --- | --- | --- |
+| Broker app (Zerodha, Groww) | Takes your order and sends it to the exchange | Holds your account and money; does not match buyers with sellers |
+| [[Case Study - Payment System]] | Moves money between parties | Correctness matters, but no order book, price-time priority or microsecond race |
+| [[Case Study - Ride Sharing and Proximity]] | Matches riders with drivers | Matching too, but seconds of delay and approximate fairness are fine |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - **Single thread per symbol** gives determinism and no locking, but a hot symbol cannot use more than one core. The workaround is a faster thread (cache-friendly data, no allocation, no GC pauses), not more threads.
 - **Synchronous log replication** before the ack protects against loss but adds a network round trip, around tens to hundreds of microseconds inside one data centre (an estimate). Asynchronous replication is faster and can lose the last few orders on a crash. Exchanges choose durability.
-- **Hot-warm** failover is simple but wastes standby capacity and needs careful promotion so two engines never both think they are primary (**split brain**).
+- **Hot-warm** failover is simple but wastes standby capacity and needs careful promotion so two engines never both think they are primary (**split brain**: two leaders acting at once).
 - **One log for all symbols** gives a single global order, which is easy to audit but a throughput ceiling. **A log per symbol group** scales further but loses cross-symbol ordering, which matters for spreads and multi-leg orders.
 - **Not for you** if your problem is "match riders to drivers" or "assign jobs": those tolerate seconds of latency and eventual consistency, so use [[Case Study - Ride Sharing and Proximity]] or [[Case Study - Distributed Job Scheduler]] patterns instead.
 
@@ -413,10 +455,12 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the order path, the sizing, the messages, the order book and how a match works. **Next is the advanced part**: what real exchanges do, the sequencer and log, determinism, failover and fairness, pre-trade risk, scaling and failures.
+
 - **Real-life example, LMAX.** LMAX Exchange (a London retail FX trading venue) published its architecture: business logic on one thread, input and output through a ring buffer (the **Disruptor**), and the whole state rebuilt by replaying events. Fowler reports about 6 million orders per second on one thread. This is the canonical public reference for the single-thread design.
-- **Kernel-bypass networking and pinned cores.** Matching hosts run on bare metal with the thread pinned to a CPU core, no other work on that core, and often kernel-bypass network cards, so the OS scheduler never interrupts matching.
-- **Clock sync.** Hosts sync to GPS or PTP time. Timestamps are for audit and not for ordering; ordering comes from the sequence number.
-- **Market data fairness.** The publisher sends the same packet to all subscribers at the same moment, typically with UDP multicast. Participants colocated in the exchange data centre use equal-length cables so nobody has a physical latency edge.
+- **Kernel-bypass networking and pinned cores.** Matching hosts run on bare metal (real servers, no virtual machines) with the thread pinned to a CPU core, no other work on that core, and often kernel-bypass network cards, so the OS scheduler never interrupts matching.
+- **Clock sync.** Hosts sync to GPS or PTP (Precision Time Protocol, accurate to under a microsecond on a good network) time. Timestamps are for audit and not for ordering; ordering comes from the sequence number.
+- **Market data fairness.** The publisher sends the same packet to all subscribers at the same moment, typically with UDP multicast (one packet the network copies to every subscriber at once). Participants colocated in the exchange data centre use equal-length cables so nobody has a physical latency edge.
 - **Circuit breakers.** The exchange halts trading in a symbol when price moves too fast. This is a business rule inside the matching engine, enforced by an event in the log.
 - **Observability.** The key metrics are tail latency (p99, p99.99) of gateway to ack, sequencer log write time, queue depth at each stage, replication lag to the warm engine, and number of rejected orders by reason.
 
@@ -473,7 +517,7 @@ flowchart LR
 
 Performance rules that follow from "one fast thread":
 - Allocate memory up front (object pools, arrays) and avoid garbage collection pauses; in Go, avoid per-order heap allocation and keep the working set small enough to stay in CPU cache (see [[Memory Hierarchy and CPU Caches]]).
-- Use a ring buffer between threads instead of a locked queue; the Disruptor paper reports this as the reason for its latency profile.
+- Use a ring buffer (a fixed-size circular array that one thread writes and another reads, with no locks) between threads instead of a locked queue; the Disruptor paper reports this as the reason for its latency profile.
 - Keep I/O out of the matching thread. A separate thread reads from the network, another writes the journal and publishes.
 
 ### Deep dive 3: high availability, recovery and fairness
@@ -494,6 +538,14 @@ stateDiagram-v2
 ```
 
 **Example (failover).** The primary dies after emitting trades for seq 9,000. The warm engine had processed up to seq 8,998 and the log is durable to 9,001. The warm node reads 8,999 to 9,001 from the log, ends in exactly the same state, and starts accepting new events at 9,002. Trade ids derive from `seq`, so the trades for 8,999 and 9,000 that the old primary already sent are recognised as duplicates by downstream consumers (dedupe by id; see [[Delivery Semantics and Exactly-Once]]).
+
+```mermaid
+flowchart LR
+    L["replicated log, up to seq 9,001"] --> P["primary engine (dies at 9,000)"]
+    L --> W["warm engine at 8,998"]
+    W --> C["replays 8,999 to 9,001"]
+    C --> T["promoted with a new epoch"]
+```
 
 **Fencing.** A frozen old primary that wakes up must not keep publishing. Use an epoch number in the log: events from a lower epoch are rejected (see [[Distributed Locks and Fencing Tokens]]).
 
@@ -532,7 +584,7 @@ flowchart TD
 ```
 
 - **Bottleneck 1: the sequencer log write.** Fix by batching, by replicating in memory first, and by sharding symbols across several logs when one is saturated.
-- **Bottleneck 2: a hot symbol (an index ETF or a meme stock).** Give it its own core and its own log, and keep other symbols off that core.
+- **Bottleneck 2: a hot symbol (an index ETF, a fund that trades like one share, or a meme stock).** Give it its own core and its own log, and keep other symbols off that core.
 - **Bottleneck 3: market data fan-out to thousands of subscribers.** Use multicast inside the data centre and a distribution tier (a pub-sub tier built on Kafka or WebSockets, see [[Scaling WebSockets]]) for the slower outside world. Public retail apps are fine with 100 ms delayed feeds; trading firms get the raw feed.
 - **Bottleneck 4: recovery time.** Long replays are slow. Snapshot every few minutes and keep the tail short.
 
@@ -587,6 +639,26 @@ flowchart TD
 
 > [!question]- What do you do if the replica is unreachable and you cannot get durability for new orders?
 > Fail closed: stop acknowledging new orders, or halt trading, rather than accept orders that could be lost. Fairness and correctness beat availability here, which is the CP side of CAP (see [[CAP and PACELC]]).
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is an order book?
+> All waiting buy and sell orders for one stock, sorted by price.
+
+> [!question]- Easy: two buyers offer the same price. Who wins?
+> The one with the earlier sequence number.
+
+> [!question]- Easy: why is the book kept in memory, not in a database?
+> A database round trip is far slower than matching in memory.
+
+> [!question]- Medium: asks at 50.10 are S1 (300) then S2 (100). A BUY 350 @ 50.10 arrives. What trades happen?
+> 300 with S1 and 50 with S2; S2 keeps 50 at the front of the queue.
+
+> [!question]- Medium: why one thread per symbol instead of many with locks?
+> Locks cost more than the match itself, and one thread makes results deterministic and replayable.
+
+> [!question]- Medium: how does a standby engine take over without losing a trade?
+> It replays the same durable log up to the last event, then is promoted with a higher epoch so the old primary is fenced off.
 
 ## 10. Cheat sheet 🟢
 

@@ -35,6 +35,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (the five steps), 4 (worked example), 5, 6 and the scenario drills.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 9 and "How to say it in the interview". Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Choosing an API Style]]: REST, gRPC and GraphQL are different ways for one program to ask another for data.
+> - [[Event-Driven Architecture Basics]]: instead of calling each other, services can publish "this happened" events that others react to later.
+
 **From zero, in 60 seconds** 🟢
 
 Programs talk to each other all the time. The question is how.
@@ -79,6 +83,12 @@ Picking an API style means picking the right kind of conversation for each.
 | GraphQL | Client asks for exactly the fields it wants in one query | `{ order { id total } }` |
 | WebSocket / SSE | Long-lived connection so the server can push | Live score updates |
 | Webhook | An HTTP call your system makes to another company's URL on an event | Payment provider calls `/payment-done` |
+| Protocol Buffers | A compact binary format with a typed schema, used by gRPC | `message Order { int64 id = 1; }` |
+| Polling / long polling | Asking "anything new?" again and again / asking once and the server waits until there is news | poll every 5 s |
+| Message queue | A list of jobs; each job is taken by one worker | SQS, RabbitMQ |
+| Event log | An ordered, replayable list of events many readers can read | Kafka topic `orders` |
+| Idempotent | Safe to repeat: doing it twice has the effect of once | webhook handled twice, order paid once |
+| Saga | A long process split into steps, each with an "undo" step | reserve, charge, confirm; refund if a step fails |
 
 **Picture it**
 
@@ -137,6 +147,23 @@ Compare ways of getting a pizza and its updates.
 
 The analogy breaks on failure: a phone call that drops tells you at once, while a note in a box can sit unread. Async needs explicit acknowledgements and retries.
 
+### Real-life example: one food order, five conversations 🟢
+
+You tap "Pay" in a food app: the app makes a REST call and waits, because you need to know the order was placed.
+The payment provider (for example Razorpay) later calls the app's server with a webhook saying "payment captured".
+Inside, the order service publishes an `OrderPlaced` event; the restaurant tablet, the receipt email and analytics each pick it up on their own time.
+The live rider map on your phone gets location updates pushed every few seconds over SSE or a WebSocket.
+Services inside the company talk to each other with fast gRPC calls.
+
+## Common beginner mistakes 🟢
+
+- **Making everything async "for scale"** → the user sees "order placed" with no idea if payment worked → keep sync the few steps the user must wait for.
+- **Long chains of sync calls** → five services at 99.9% each give about 99.5% together, and one slow service stalls all → make non-essential steps async.
+- **Polling every second for live updates** → thousands of wasted requests → push with SSE (one-way) or WebSocket (two-way).
+- **Handling webhooks without checking duplicates or signatures** → retries create double orders, and fakes get in → verify the signature and make the handler idempotent.
+- **gRPC straight from the browser or to outside partners** → browsers need extra proxies and partners expect plain HTTP → REST at the edge, gRPC inside.
+
+
 ```mermaid
 flowchart LR
     subgraph Sync
@@ -155,9 +182,17 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the style follows the conversation: who talks, which way, and how long they can wait. **Next we open the box** in five steps, plus one big comparison table. Most steps start with a plain walk-through; the full detail follows.
+
 ### Step 1: who is the caller?
 
 **In plain words:** the caller decides what you can use. Browsers speak HTTP and WebSocket well. Your own Go services can use any binary protocol. Other companies can only reach you through public, simple, documented endpoints.
+
+**Step by step:**
+1. A browser or phone app? Use REST (or GraphQL if screens need very different fields).
+2. Another of your own services? gRPC gives typed, fast calls.
+3. An outside company calling you, or you calling them? Plain HTTPS: REST for requests, webhooks for "something happened".
+4. Write the caller next to each arrow on the diagram before picking a style.
 
 ```mermaid
 flowchart TD
@@ -190,6 +225,12 @@ flowchart TD
 ### Step 3: must the caller wait?
 
 **In plain words:** if the user cannot proceed without the answer (the price, the login result), the call is **synchronous**. If the work can finish later (send an email, update a search index), make it **asynchronous**.
+
+**Step by step:**
+1. Checkout must know "payment OK" before showing "order placed". That call is sync.
+2. Once the order exists, the app publishes `OrderPlaced` and replies to the user.
+3. The email service, the restaurant tablet and analytics read the event later, each at its own pace.
+4. If the email service is down, checkout still works; the email goes out when it recovers.
 
 ```mermaid
 sequenceDiagram
@@ -225,7 +266,7 @@ The user waits only for what must be true before the order exists (payment). The
 | Direction | Request and response | Unary and three streaming modes | Request and response (plus subscriptions) | Full duplex | Server to client | Server to server, you push | Producer to many consumers |
 | Contract | OpenAPI (optional) | `.proto`, strict, generated code | Typed schema | None, you design it | None | Documented payload | Schema registry or convention |
 | Latency (estimate) | Low | Lowest of the request styles | Low plus resolver cost | Lowest once connected | Low | Depends on retry schedule | Seconds or less, not request-bound |
-| Caching | Native HTTP caching, CDN | Hard | Hard (POST), needs persisted queries | None | None | None | None |
+| Caching | Native HTTP caching, CDN | Hard | Hard (POST), needs persisted queries (queries saved on the server and called by ID) | None | None | None | None |
 | Browser support | Native | Needs gRPC-Web | Native | Native | Native (`EventSource`) | n/a | n/a |
 | Consistency model | Per request | Per request | Per request | Per message you define | Per message | At-least-once with retries | Usually at-least-once |
 | Scaling model | Stateless, easy | Stateless, needs L7 balancing per call | Stateless but query cost can explode | Stateful connections, harder | Stateful connections | Receiver controls rate | Partitions or queues scale consumers |
@@ -238,6 +279,12 @@ Related deep notes: [[Choosing an API Style]], [[REST and HTTP API Design]], [[g
 ### Step 4: pick the real-time option
 
 **In plain words:** For live updates: server-to-client only means SSE; both ways means WebSocket; rare updates can just poll.
+
+**Step by step:**
+1. Rider location changes every 3 seconds and only flows server → phone: use SSE.
+2. A chat screen where both sides type: use a WebSocket.
+3. An order status that changes 4 times in 40 minutes: simple polling every 15-30 s is fine.
+4. The app is closed: send a mobile push notification instead.
 
 ```mermaid
 flowchart TD
@@ -254,6 +301,12 @@ flowchart TD
 ### Step 5: pick the style for events
 
 **In plain words:** Match the need to the tool: a work queue for jobs, a log like Kafka for replayable history, a webhook for outside partners.
+
+**Step by step:**
+1. "Send this receipt email once, retry if it fails": a queue job.
+2. "Many teams want every order event, and may replay last week": a Kafka topic.
+3. "Tell the restaurant's own system about a new order": a signed webhook with retries.
+4. "Reserve, charge, assign a rider, and undo if one step fails": a saga or workflow engine.
 
 | Need | Choice |
 | --- | --- |
@@ -356,6 +409,8 @@ An API gateway can terminate TLS, authenticate, rate limit, and route REST, gRPC
 > Calling REST "stateless so it scales" and WebSocket "does not scale". Both scale; WebSocket just needs more care because the server holds state per connection.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how to pick a style for each conversation. **Next comes the senior view**: running these in production, then why gRPC streams can overload one pod, how webhooks guarantee delivery, events vs commands, the dual-write trap and timeouts everywhere.
 
 Public, documented examples:
 
@@ -508,6 +563,26 @@ Every sync call needs a deadline shorter than its caller's deadline, or the chai
 - "Webhooks are at least once, so the receiver verifies and deduplicates."
 - "The cost of async is eventual consistency and harder debugging, so I add tracing across the broker and a dead-letter queue."
 - Trade-off line: "gRPC gives me speed and contracts but costs browser support, so I keep REST at the edge."
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is the difference between sync and async?
+> Sync: the caller waits for the answer. Async: it sends a message and moves on.
+
+> [!question]- (easy) Which style for live rider location sent only from server to phone?
+> SSE (server-sent events).
+
+> [!question]- (easy) What is a webhook?
+> An HTTP call one company's system makes to another's URL when something happens.
+
+> [!question]- (medium) Five sync services in a chain, each 99.9% up. Rough total?
+> About 99.5%, because the chain multiplies.
+
+> [!question]- (medium) Queue or Kafka log for "many teams read every order event and may replay"?
+> A Kafka log: many independent readers and replay.
+
+> [!question]- (medium) Two things every webhook handler must do?
+> Verify the signature and be idempotent, because the sender retries.
 
 ## Links 🟢
 

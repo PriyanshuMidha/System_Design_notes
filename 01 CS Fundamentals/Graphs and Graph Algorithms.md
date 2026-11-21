@@ -28,6 +28,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how each algorithm works), 4 and 5.
 > - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Heaps and Priority Queues]]: a min-heap always hands you the smallest item quickly. Dijkstra uses it to pick "the closest place not yet visited".
+> - [[Stacks, Queues and Deques]]: a queue is first in, first out; a stack is last in, first out. BFS uses a queue, DFS uses a stack.
+> - [[Hash Tables and Go Maps]]: a map finds a value by key in about one step. We store "who connects to whom" in a map.
+
 **From zero, in 60 seconds** 🟢
 
 Think of a city map. The corners are points, and the streets join them.
@@ -81,6 +86,11 @@ That "places joined by connections" picture is a graph.
 | Stack | Last in, first out pile | A pile of plates |
 | Heap (min-heap) | Structure that always hands back the smallest item fast | "Give me the closest unvisited corner" |
 | `O(V+E)` | Work grows with number of vertices plus edges | 10 corners + 20 streets ≈ 30 steps |
+| Path / cycle | A path is a chain of edges; a cycle is a path that comes back to its start | Home → Shop → Park → Home |
+| DAG | A one-way graph with no cycles, like a list of "must happen before" rules | "install B before A" |
+| Adjacency list | For each vertex, a list of the vertices it links to | `Home: [Shop, Park]` |
+| In-degree | How many edges point into a vertex | D needs B and C → in-degree 2 |
+| Sparse / dense | Sparse: few edges compared to all possible pairs; dense: nearly every pair linked | A social network is sparse |
 
 **Picture it**
 
@@ -123,6 +133,14 @@ Both are graphs, and both have a standard, well-understood algorithm: topologica
 > [!tip] Remember
 > A tree is a special case of a graph (no cycles, exactly one path between any two vertices). Reach for graph algorithms the moment "depended on by many" or "can get back to where you started" is true of your data.
 
+### Real-life example: a Swiggy delivery route 🟢
+
+A Swiggy rider must get from the restaurant to your home.
+The city is a graph: junctions are vertices, roads are edges, and the minutes to drive each road are weights.
+Finding the fastest route is Dijkstra's job (or a faster cousin, A\*).
+"People you may know" on LinkedIn is a graph too: you, your friends, and their friends are two hops away, which BFS finds.
+And when a Go project builds, the list of "which package needs which" is a DAG, put in order by topological sort.
+
 ## 2. Mental model 🟢
 
 A graph is a map of "what connects to what."
@@ -135,7 +153,17 @@ Most of this note is "how do you walk this map systematically" (BFS/DFS) and "ho
 
 Routing services handle this by re-running the algorithm on a fresh snapshot rather than mutating state mid-traversal.
 
+## Common beginner mistakes 🟢
+
+- **Forgetting the `visited` set** → on a graph with a cycle the walk goes round forever → mark each vertex as visited the first time you reach it.
+- **Using BFS for "fastest route" when roads have different times** → BFS counts hops, not minutes → use Dijkstra when edges have weights.
+- **Running Dijkstra with negative weights** → it returns a wrong answer with no error → use Bellman-Ford.
+- **Calling any edge to a visited vertex a cycle (in a one-way graph)** → it may just be two paths meeting → only an edge back to a vertex still on the current path (gray) is a cycle.
+- **Storing a big sparse graph as a V × V matrix** → a million users means a trillion cells → use an adjacency list.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a graph is things plus connections, and that every algorithm here is a careful way to walk it. **Next we open the box:** how to store a graph in memory, then BFS, DFS, cycle detection, topological sort, Dijkstra and Kruskal, each with a small step-by-step walk before the full detail.
 
 ### Terms
 
@@ -154,6 +182,12 @@ Routing services handle this by re-running the algorithm on a fresh snapshot rat
 ### Representations
 
 **In plain words:** a graph needs to answer "what does this vertex connect to?" — the three common representations trade off space against how fast that question is to answer.
+
+**Step by step (store the 4-vertex graph drawn below):**
+1. Adjacency list: give each vertex a short list of its neighbours. `A: [(B,1), (C,4)]`, `B: [(D,2)]`, and so on. 4 vertices + 4 edges ≈ 8 entries.
+2. Adjacency matrix: a 4 × 4 grid with a mark where an edge exists. 16 cells, most of them empty.
+3. Edge list: just the 4 edges in a row, `(A,B,1), (A,C,4), (B,D,2), (C,D,2)`.
+4. Pick the list by default; the matrix only pays off when almost every pair is linked.
 
 | Representation | Space | Edge lookup `(u,v)` | Iterate u's neighbors | Use when |
 |---|---|---|---|---|
@@ -187,6 +221,13 @@ flowchart LR
 
 ### BFS: breadth-first search
 
+**Step by step (start at vertex 0; edges `0→1`, `0→2`, `1→3`, `2→3`):**
+1. Put 0 in the queue and mark it visited.
+2. Take 0 out. Its neighbours 1 and 2 are new: mark them and add them to the queue. Queue: `[1, 2]`.
+3. Take 1 out. Neighbour 3 is new: mark it and add it. Queue: `[2, 3]`.
+4. Take 2 out. Neighbour 3 is already marked, so skip it. Queue: `[3]`.
+5. Take 3 out. No new neighbours. Queue empty: done. Vertex 3 is 2 hops from 0.
+
 **In plain words:** explore level by level using a **queue** — visit the start vertex, enqueue its neighbors, then repeatedly dequeue a vertex and enqueue any of *its* unvisited neighbors.
 
 The first time you reach any vertex, you've reached it by the shortest path **in edge count** (not weight) — this only holds for unweighted graphs.
@@ -207,11 +248,32 @@ flowchart TD
 
 ### DFS: depth-first search
 
-**In plain words:** explore as deep as possible before backtracking, using a **stack** — either the call stack (recursive) or an explicit stack (iterative, avoiding Go's goroutine stack limits on very deep graphs).
+**Step by step (same graph, start at 0):**
+1. Visit 0. Go to its first neighbour, 1.
+2. Visit 1. Go to its first neighbour, 3.
+3. Visit 3. It has no neighbours, so step back (backtrack) to 1, then to 0.
+4. From 0, try the next neighbour, 2. Visit 2. Its neighbour 3 is already visited, so step back. Done.
+5. Visit order: `0, 1, 3, 2` (BFS gave `0, 1, 2, 3`).
+
+```mermaid
+flowchart LR
+    V0["0"] -- "1st: go deep" --> V1["1"]
+    V1 -- "2nd" --> V3["3: dead end,<br/>back up"]
+    V0 -- "3rd: next branch" --> V2["2"]
+    V2 -. "3 already seen" .-> V3
+```
+
+**In plain words:** explore as deep as possible before backtracking (stepping back to the last place with an untried road), using a **stack** — either the call stack (the stack of function calls Go keeps while a recursive function calls itself) (recursive) or an explicit stack (iterative, avoiding Go's goroutine stack limits on very deep graphs).
 
 **Why it matters:** DFS is the natural tool for cycle detection and topological sort because it naturally tracks "what's on the current path," which the next two subsections depend on directly.
 
 ### Cycle detection (directed graphs): three-color DFS
+
+**Step by step (edges `A→B`, `B→C`, `C→A`):**
+1. Everything starts white. Visit A: paint it gray (it is on the current path).
+2. Follow `A→B`: paint B gray. Follow `B→C`: paint C gray.
+3. Follow `C→A`. A is gray, so A is still on the path we are walking: that is a loop. Cycle found.
+4. Without that edge, C would have no more roads, so C turns black (finished), then B, then A.
 
 **In plain words:** mark every vertex **white** (unvisited), **gray** (on the current DFS path, not yet fully explored), or **black** (fully explored, including all its descendants).
 
@@ -239,6 +301,12 @@ If instead the edge were `C → D` where D was already black (fully explored on 
 
 ### Topological sort: Kahn's algorithm
 
+**Step by step (packages: A must come before B and C, and both B and C before D):**
+1. Count arrows coming in: `A:0, B:1, C:1, D:2`.
+2. A has 0, so it can go first. Output `A`; remove its arrows, so B and C drop to 0.
+3. Output B, then C; each removes one arrow into D, so D drops to 0.
+4. Output D. All 4 are out, so the order `A, B, C, D` is valid. If some were stuck above 0, there would be a cycle.
+
 **In plain words:** only defined for a DAG. Repeatedly remove any vertex with **in-degree 0** (no remaining unprocessed dependency), append it to the output order, and decrement the in-degree of everything it pointed to.
 
 **Picture it:**
@@ -262,7 +330,14 @@ stateDiagram-v2
 
 ### Dijkstra's algorithm: shortest paths with non-negative weights
 
-**In plain words:** maintain a `dist` map (shortest known distance to each vertex) and a min-heap frontier keyed by distance — exactly the [[Heaps and Priority Queues]] mechanism.
+**Step by step (edges `0→1` 1 min, `1→3` 2 min, `0→2` 4 min, `2→3` 2 min):**
+1. Start: `dist[0] = 0`. Put 0 in the heap.
+2. Pop 0 (closest). Road to 1 gives 1, road to 2 gives 4. Push both.
+3. Pop 1 (distance 1, the smallest). Road to 3 gives 1 + 2 = 3. Push 3.
+4. Pop 3 (distance 3, smaller than 2's 4). Its distance is now final: 3.
+5. Pop 2 (distance 4). The road `2→3` would give 6, worse than 3, so nothing changes. Done.
+
+**In plain words:** maintain a `dist` map (shortest known distance to each vertex) and a min-heap frontier (the set of places found but not yet finished) keyed by distance — exactly the [[Heaps and Priority Queues]] mechanism.
 
 Repeatedly pop the closest unvisited vertex, and for each of its edges, check if going through it gives a shorter path to the neighbor (**relaxation**); if so, update `dist` and push the neighbor.
 
@@ -295,9 +370,16 @@ A later negative-weight edge could invalidate that commitment, which Bellman-For
 
 ### Union-find and Kruskal's MST
 
+**Step by step (connect 4 towns with the cheapest cables):**
+1. Sort all possible cables by cost: 1, 2, 3, 4, 5.
+2. Take cost 1: it joins two separate groups, so keep it.
+3. Take cost 2: also joins separate groups, keep it.
+4. Take the next cable: if both ends are already in the same group, it would make a loop, so skip it.
+5. Stop once you have 3 cables (towns - 1). Union-find answers "same group?" in one quick step.
+
 **In plain words:** a **minimum spanning tree (MST)** connects every vertex with the cheapest possible total edge weight and no cycles.
 
-**Kruskal's algorithm** sorts all edges by weight, then greedily adds each edge that connects two *different* components, skipping any edge that would close a cycle.
+**Kruskal's algorithm** sorts all edges by weight, then greedily (always taking the cheapest choice right now, never undoing it) adds each edge that connects two *different* components, skipping any edge that would close a cycle.
 
 **Picture it:**
 
@@ -347,7 +429,7 @@ Tracing Dijkstra on that sample graph by hand is exactly the sequence diagram ab
 | DFS | Reachability, cycle detection, topological order | Nothing special | O(V+E) |
 | Dijkstra | Shortest weighted path | Non-negative weights | O((V+E) log V) with a binary heap |
 | Bellman-Ford | Shortest weighted path, detects negative cycles | Works with negative weights | O(VE) |
-| A\* | Shortest weighted path, faster in practice | An admissible heuristic (never overestimates) | O((V+E) log V), fewer nodes expanded than Dijkstra |
+| A\* | Shortest weighted path, faster in practice | An admissible heuristic (a guess of the remaining distance that never overestimates) | O((V+E) log V), fewer nodes expanded than Dijkstra |
 | Kahn's (topological sort) | A valid processing order | A DAG (no cycles) | O(V+E) |
 | Kruskal's (MST) | Minimum spanning tree | Undirected, weighted | O(E log E) (dominated by the sort) |
 | Union-find | Connected components, cycle checks | — | Near O(1) amortized per op (see [[Union-Find and Skip Lists]]) |
@@ -366,11 +448,13 @@ Tracing Dijkstra on that sample graph by hand is exactly the sequence diagram ab
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to store a graph and how BFS, DFS, cycle detection, topological sort, Dijkstra and Kruskal walk it. **Next comes the advanced part:** where these run in real systems, how they fail, why Dijkstra breaks on negative weights, and what interviewers ask.
+
 - **Real systems:**
 	- Facebook's TAO (the social graph serving layer) and Neo4j (a dedicated graph database) store and query relationship data as a graph natively, rather than reconstructing it from SQL joins every time.
-	- Map and routing services (road networks) run Dijkstra- or A\*-family algorithms over a graph of intersections and road segments, often precomputed with contraction hierarchies for speed at scale.
+	- Map and routing services (road networks) run Dijkstra- or A\*-family algorithms over a graph of intersections and road segments, often precomputed with contraction hierarchies (shortcut edges computed ahead of time that skip over small roads) for speed at scale.
 	- Build systems and package managers (Go's own module graph, `npm`, `make`) use topological sort to decide a valid build/install order from a dependency graph.
-	- Service dependency graphs (which microservice calls which) use the same representation to compute blast radius for an outage or a safe deployment order.
+	- Service dependency graphs (which microservice calls which) use the same representation to compute blast radius (everything that breaks when one service goes down) for an outage or a safe deployment order.
 	- Deadlock detection in databases and OS schedulers models "who's waiting on whom" as a directed graph and checks for cycles — a wait-for cycle is a deadlock.
 	- Go's own garbage collector uses **tri-color marking** (white/gray/black, the exact same three states as the cycle-detection DFS above) to track which heap objects have been visited during a mark phase, covered in [[Process Memory Layout - Stack vs Heap]].
 - **Failure modes → fixes:**
@@ -461,6 +545,26 @@ DFS's three-color scheme makes that distinction explicit (gray = on the current 
 - Dijkstra: min-heap frontier, non-negative weights only, O((V+E) log V). Bellman-Ford handles negative weights at O(VE).
 - Union-find: near-O(1) amortized Find/Union via path compression + union by rank; powers Kruskal's MST's cycle check.
 - Real uses: dependency resolution (build systems, package managers), routing (maps), service dependency graphs, deadlock detection (wait-for cycles), Go's GC tri-color marking.
+
+## Self-check 🟢🟡
+
+> [!question]- What are vertices and edges?
+> Vertices are the points (places, people); edges are the links between them.
+
+> [!question]- BFS uses which structure, and DFS uses which?
+> BFS uses a queue; DFS uses a stack (or recursion).
+
+> [!question]- Which algorithm finds the fewest hops on an unweighted graph?
+> BFS.
+
+> [!question]- In three-color DFS, which edge means a cycle?
+> An edge to a gray vertex, one still on the current path.
+
+> [!question]- Kahn's algorithm outputs 5 of the graph's 7 vertices. What does that tell you?
+> The graph has a cycle, so no valid topological order exists.
+
+> [!question]- Why is an adjacency list better than a matrix for a social network?
+> The graph is sparse; the list uses `O(V+E)` space, the matrix `O(V²)`.
 
 ## Links
 

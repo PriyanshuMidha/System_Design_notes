@@ -33,6 +33,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Unit, Integration and E2E Tests]]: a unit test fakes everything around the code under test; this note is about how to build those fakes well in Go.
+
 **From zero, in 60 seconds** 🟢
 
 Your code often calls something slow or risky, like a payment company.
@@ -73,6 +76,11 @@ That pretend object is a test double, and Go makes swapping easy through small i
 | Fake | A small working version of the real thing | An in-memory map instead of Postgres |
 | Spy / mock | A double that records or checks how it was called | "Was `NotifyPaid` called once?" |
 | Table-driven test | One test looping over many input/expected rows | `[]struct{name string; in, want int}` |
+| Dummy | A double that only fills a required slot and is never used | `dummyNotifier{}` |
+| Consumer-side interface | An interface declared in the package that *uses* a dependency, listing only the methods it calls | `PaymentProvider` in the invoice package |
+| Codegen | A tool that writes mock code for you from an interface | `mockgen`, `mockery`, `moq` |
+| sqlmock | A fake SQL driver that matches query text and returns canned rows | Pretends `SELECT amount_cents` returned 4500 |
+| Outcome vs process assertion | Checking the end result vs checking the exact calls made | "invoice is paid" vs "MarkPaid called once" |
 
 **Picture it**
 
@@ -109,6 +117,10 @@ In a test, actually calling a payment provider is unacceptable:
 
 Test doubles solve this: replace `PaymentProvider` with something that behaves predictably, in-process, for free, in under a millisecond — while still letting the test prove `Pay` handles a decline, a timeout, and a success correctly.
 
+### Real-life example: testing a Zomato order without charging anyone 🟢
+
+When engineers at a food app like Zomato test "place order", they cannot charge a real card or send a real SMS every time the tests run, thousands of times a day. So in tests the payment client is swapped for a stub that answers "payment succeeded" (or "declined", to test that branch) instantly, the order database is swapped for an in-memory fake, and the SMS sender is a spy that just writes down "would have sent SMS to order 123". The order logic runs for real; only its outside helpers are pretend.
+
 ## 2. Mental model 🟢
 
 Picture a stage play.
@@ -121,6 +133,14 @@ Picture a stage play.
 
 All five let the play (the test) go ahead without the real other actor (the real dependency). Which one to use depends on what the test needs to check.
 
+## Common beginner mistakes 🟢
+
+- **Calling every double a "mock" and always using a mock library** → tests break on every harmless refactor → use a stub or fake unless the exact call is what you are testing.
+- **Using a concrete SDK type like `*stripe.Client` in your service** → nothing can be swapped in tests → depend on a small interface you declare.
+- **Mocking the thing the test is supposed to check** → a "repository test" with a mocked database proves nothing about SQL → use a real database for repository tests.
+- **Growing a fake into a mini database** → you now maintain and debug a second database → switch to a real test database (testcontainers).
+- **Asserting every call and argument** → the test locks in *how* the code works, not *what* it achieves → assert the final outcome where you can.
+
 ```mermaid
 flowchart LR
     DU["Dummy<br/>just fills a slot"] --> ST["Stub<br/>fixed answer"] --> FA["Fake<br/>works, in memory"]
@@ -129,9 +149,19 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the five kinds of stand-ins and that Go swaps them through small interfaces. **Next we open the box**: each kind written against one real interface, why the interface must live where it is used, how fakes plug into table-driven tests, and when to use `httptest`, sqlmock or generated mocks.
+
 ### The vocabulary, on one interface
 
 **In plain words: the same interface, replaced five different ways, so you can see the difference side by side.**
+
+**Step by step:**
+1. Take one interface: `Notifier` with one method, `NotifyPaid(ctx, invoiceID)`.
+2. Dummy: a struct whose `NotifyPaid` returns `nil`; the test never looks at it.
+3. Stub: a provider that always answers "succeeded" (or always "failed") to force one branch.
+4. Fake: a store backed by a map, so "mark paid" really changes what "amount owing" returns next.
+5. Spy: like the dummy, but it appends each `invoiceID` to a list the test checks afterwards.
+6. Mock: told before the call "expect `inv-7`, once"; it fails the test by itself if that does not happen.
 
 Every example below replaces this consumer-declared interface from InvoiceOps (full service in [[Unit, Integration and E2E Tests]]):
 
@@ -203,6 +233,13 @@ sequenceDiagram
 
 **In plain words: the package that uses a dependency declares the small interface it needs. That makes it easy to fake.**
 
+**Step by step:**
+1. The invoice package only ever calls `Charge` on the payment client.
+2. So, inside the invoice package, declare `type PaymentProvider interface { Charge(...) }` with just that method.
+3. `InvoiceService` holds a `PaymentProvider`, not a concrete SDK (software development kit: the vendor's client library) type.
+4. In production, the real HTTP client has a `Charge` method, so it fits automatically; no `implements` needed.
+5. In tests, a three-line struct in `_test.go` with a `Charge` method fits just as well.
+
 `PaymentProvider` is declared inside the package that **uses** it (the invoice service), not inside a payment-provider SDK package:
 
 ```go
@@ -220,6 +257,12 @@ This is the Go idiom usually summarized as "accept interfaces, return structs," 
 ### Table-driven tests over the fakes
 
 **In plain words: a list of cases, each using a fake set up a bit differently.**
+
+**Step by step:**
+1. Each row says: starting amounts, which invoice to pay, what the stub payment should answer, and the expected error.
+2. For each row, build a fresh `fakeStore` from the amounts, a `stubProvider` with the canned answer, and a `dummyNotifier`.
+3. Call `svc.Pay(ctx, invoiceID)`.
+4. Compare the error with the row's expected error; rows run in parallel because each has its own doubles.
 
 ```go
 func TestInvoiceService_Pay(t *testing.T) {
@@ -270,6 +313,12 @@ Covered in depth in [[Unit, Integration and E2E Tests]]; in double terms, `httpt
 
 **In plain words: sqlmock checks the SQL text; a real database checks the SQL actually works.**
 
+**Step by step:**
+1. `sqlmock.New()` gives a fake `*sql.DB` and a controller.
+2. Tell the controller: "expect a query like `SELECT amount_cents FROM invoices WHERE id = $1` with `inv-1`, return 4500".
+3. Run `store.AmountCents(ctx, "inv-1")`; it gets 4500 back.
+4. This proves your Go code builds the query and reads the row; it does not prove the column exists in the real table.
+
 `sqlmock` replaces `*sql.DB`'s driver with one that matches query text against a regex and returns programmed rows — a **stub** at the SQL level:
 
 ```go
@@ -293,6 +342,12 @@ The real-database alternative (testcontainers-go, detailed in [[Unit, Integratio
 ### gomock / mockery codegen vs hand-written fakes
 
 **In plain words: tools can write mocks for you, but a small hand-written fake is often simpler.**
+
+**Step by step:**
+1. Count the interface's methods and how many test files use it.
+2. One or two methods, few users → write a small fake or spy by hand in `_test.go`.
+3. Many methods, used everywhere, changing often → generate mocks with `mockgen` or `mockery`, run through `go generate` (Go's command for running code generators).
+4. Either way, prefer checking the final result over checking the exact call order.
 
 Generated mocks (`mockgen` for gomock, `mockery` or `moq` for a similar style) read an interface and emit a type with an `EXPECT()` builder:
 
@@ -357,7 +412,7 @@ Which double for which test?
 
 **In plain words: the full service with its tests. Read the comments first, then the code.**
 
-The service, four double kinds, table-driven tests, an `httptest` example for both directions (handler and client), and an sqlmock test all live together, compiled and tested, in a scratch Go module at `/private/tmp/claude-502/-Users-priyanshumidha-Documents-OBZEDIAN/00fc1435-48e1-42f0-9888-340e4e0fbca2/scratchpad/work/15-g1/testdoubles/` (`invoice.go`, `fakes.go`, `handler.go`, `sqlstore.go`, and their `_test.go` files). `go vet ./...` and `go test -race ./...` both pass (13 tests).
+The service, four double kinds, table-driven tests, an `httptest` example for both directions (handler and client), and an sqlmock test were written as one small Go module (`invoice.go`, `fakes.go`, `handler.go`, `sqlstore.go`, and their `_test.go` files) and checked when this note was written: `go vet ./...` and `go test -race ./...` both passed (13 tests). The code below is that module.
 
 ## 5. Variants and comparison 🟡
 
@@ -386,10 +441,13 @@ flowchart TD
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the five kinds, how consumer-side interfaces make Go code swappable, and when to hand-write versus generate doubles. **Next we look at real codebases**: which tools teams use, how over-specified mocks and drifting fakes cause pain, and the deeper reasons a fake often beats a mock.
+
+
 - **Real systems**: gomock (`go.uber.org/mock`, the maintained fork of `golang/mock`) and `vektra/mockery` are the two most common Go mocking-codegen tools in production codebases; `DATA-DOG/go-sqlmock` is near-universal for a fast SQL-adjacent unit test layered on top of a slower testcontainers-go integration suite.
 - **Failure modes → fixes**:
   - *A mock's expectations are so specific that every small refactor breaks dozens of tests* → switch the double to a fake or a looser stub, and assert on outcome instead of call sequence.
-  - *A hand-written fake silently drifts from the real implementation's behavior* (e.g., the real store enforces "can't mark an already-paid invoice paid again," the fake doesn't) → add that same invariant to the fake deliberately, and add one integration test against the real store specifically for that invariant.
+  - *A hand-written fake silently drifts from the real implementation's behavior* (e.g., the real store enforces "can't mark an already-paid invoice paid again," the fake doesn't) → add that same invariant (a rule that must always hold) to the fake deliberately, and add one integration test against the real store specifically for that invariant.
 - **What to monitor**: how often a test breaks on an unrelated refactor (a proxy for over-specified mocks) and whether the fake's assumptions have ever diverged from a bug found only against the real dependency.
 
 ## 8. Deep dive 🔴
@@ -462,6 +520,26 @@ Any test whose assertion is "state X holds *after* a sequence of operations," ra
 - gomock/mockery/moq earn their codegen step on large or frequently-changing interfaces; hand-written fakes are usually clearer for small ones.
 - Prefer asserting outcome (a fake's final state) over process (a mock's exact call sequence) unless the sequence itself is the contract.
 - Never mock the dependency a given test's whole job is to verify.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is a test double?
+> Any stand-in used instead of a real dependency during a test.
+
+> [!question]- (easy) Which double always returns the same fixed answer?
+> A stub.
+
+> [!question]- (easy) Which double records the calls so the test can check them afterwards?
+> A spy.
+
+> [!question]- (medium) Why declare `PaymentProvider` in the invoice package, not use the SDK's type?
+> It lists only what the invoice code calls, so any tiny test struct can satisfy it.
+
+> [!question]- (medium) When does a fake beat a stub?
+> When the test needs state to carry across calls, like "after paying, the invoice is no longer owing".
+
+> [!question]- (medium) Why can over-using mocks make tests fragile?
+> Mocks pin the exact calls and order, so a harmless refactor breaks the test even when behaviour is unchanged.
 
 ## Links 🟢
 - **Before this:** [[Unit, Integration and E2E Tests]]

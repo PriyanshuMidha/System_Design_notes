@@ -32,6 +32,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[State Machines in Go]]: a thing is always in one named mode, and each action moves it to a known next mode.
+> - [[Parking Lot]]: one mutex around "check and change" so two callers never grab the same last unit.
+
 **From zero, in 60 seconds** 🟢
 
 A vending machine takes coins, lets you pick a snack and drops it out with your change. The same button acts differently depending on what the machine is doing. Pressing "cancel" when idle does nothing; after you put coins in, it gives them back. Each of these situations is a **state**, like idle, has money or dispensing. The **State pattern** puts each state's behaviour in its own small piece of code.
@@ -64,6 +68,10 @@ If the drink gets stuck, you must also get a full refund.
 | Greedy change | Always take the biggest coin first | Fails with a finite box |
 | Mutex | A lock so one action changes the machine at a time | Two buyers cannot both get the last can |
 | Jam | The motor fails and the item does not drop | Refund and go out of service |
+| Context object | The main object that holds the current state and hands each action to it | `Machine` passes `Select` to its state |
+| DP (dynamic programming) | Solve a big sum by building answers for all smaller sums first | Best coins for Rs 60 built from Rs 0..59 |
+| Invariant | A rule that must always be true | A failed sale never keeps the user's money |
+| Idempotency key | An ID sent with a request so a retry is not done twice | App retries `Buy`, gets the first result |
 
 **Picture it**
 
@@ -130,7 +138,7 @@ exact change unavailable, and a jammed dispenser.
 ### Non-functional
 
 - Balance, coin box and stock stay consistent under concurrent calls (keypad and app).
-- The user never loses money: every failed sale keeps or refunds the balance; an invalid action returns a typed error, never a panic.
+- The user never loses money: every failed sale keeps or refunds the balance; an invalid action returns a typed error (a named error such as `ErrSoldOut` the caller can check), never a panic (a Go crash).
 - Money is `int64` paise; a slow motor must not block the display for seconds.
 
 ### Out of scope
@@ -162,6 +170,8 @@ The hardest use case is **select in the has-money state**: validate slot, stock 
 Modelling insight: keep **escrow separate from the coin box**. Inserted coins join the box only after a successful dispense, so cancel and jam refunds always work, and change is computed from box plus escrow.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know the states, the slots, and why escrow is kept apart from the coin box. Next we open the box: how the pieces link, the method set, what a fleet stores, and the Go code that makes change and handles a jam.
 
 ```mermaid
 classDiagram
@@ -305,8 +315,8 @@ type SaleRepo interface {
 
 Patterns not used, and why:
 
-- No Factory for states: states are empty structs, and `hasMoneyState{}` is clearer than a factory (KISS).
-- Change-making is a method, not yet an interface: there is one algorithm today; extract the interface when a second one appears (YAGNI).
+- No Factory for states: states are empty structs, and `hasMoneyState{}` is clearer than a factory (KISS: "keep it simple").
+- Change-making is a method, not yet an interface: there is one algorithm today; extract the interface when a second one appears (YAGNI: "you aren't gonna need it", so do not build it yet).
 
 ## Folder structure 🟡
 
@@ -346,18 +356,18 @@ Two design points are worth saying out loud in the interview:
 
    `makeChange` is a DP over coin counts: `best[v]` is the fewest coins for value `v` using the denominations seen so far, each used at most `box + escrow` times, and `take[i][v]` lets it rebuild the coins.
 
-   Values are counted in units of the denominations' GCD (Rs 1 = 100 paise for INR), so change of Rs 60 needs a table of only 61 cells (0 to 60).
+   Values are counted in units of the denominations' GCD (greatest common divisor: the biggest amount every coin is a whole multiple of) (Rs 1 = 100 paise for INR), so change of Rs 60 needs a table of only 61 cells (0 to 60).
 2. **`dispensingState` is real.** `hasMoneyState.Select` only validates and reserves a `sale`, then switches to dispensing.
 
    `vend` releases the mutex while the motor turns and re-locks to commit or refund, so the display shows "dispensing" and other calls get `ErrBusy` instead of blocking for seconds.
 
    Every invariant holds at the unlock point: the money is still in escrow and stock is untouched.
 
-   `context.WithoutCancel` (Go 1.21+) keeps a caller who hangs up from aborting a motor that is already turning.
+   `context.WithoutCancel` (Go 1.21+; it copies the request context but drops its "cancel" signal) keeps a caller who hangs up from aborting a motor that is already turning.
 
 ### Walkthrough
 
-`SelectProduct(ctx, code)` locks the machine and calls `vend`, which delegates to the current state. The real logic is `hasMoneyState.Select` followed by the rest of `vend`:
+`SelectProduct(ctx, code)` locks the machine and calls `vend`, which delegates to (hands the work to) the current state. The real logic is `hasMoneyState.Select` followed by the rest of `vend`:
 
 1. Look up the slot. Unknown code: `ErrInvalidSlot`, state unchanged.
 2. `Qty == 0`: `ErrSoldOut`; the state stays has-money and the user keeps the balance.
@@ -730,7 +740,7 @@ func (m *Machine) StateName() string {
 | `TestJamThenRepair` | App `Buy` on a jammed motor refunds; the machine rejects money until `Repair` |
 | `TestConcurrentBuyExactWinners` | 100 concurrent `Buy` calls (retrying on `ErrBusy`) on 5 items: exactly 5 sold, 95 `ErrOutOfStock` |
 
-All five pass under `go test -race` (Go 1.24.4, run three times). The old greedy `makeChange` fails the greedy-trap row with `ErrExactChange`.
+All five pass under `go test -race` (Go's race detector, which flags unsafe shared access) (Go 1.24.4, run three times). The old greedy `makeChange` fails the greedy-trap row with `ErrExactChange`.
 
 **In plain words:** Tests for each state, the full flow, a jam and many buyers racing for the last item.
 
@@ -917,10 +927,12 @@ func TestConcurrentBuyExactWinners(t *testing.T) {
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working machine and its tests. Next is interview depth: races between buyers, retries from the app, coin boxes that cannot make change, and the trade-offs behind unlocking while the motor turns.
+
 | Edge case | What happens | How the design handles it |
 |---|---|---|
 | Race: two buyers for the last item | Both pass the stock check if it runs outside the lock | Check and reserve under one mutex, then `dispensingState` blocks everyone until the commit; the fleet uses `UPDATE ... WHERE qty > 0` |
-| Race: insert and cancel at the same time | A refund could miss a coin | Both serialize on the mutex; the refund equals the balance at that moment |
+| Race: insert and cancel at the same time | A refund could miss a coin | Both serialize on the mutex (run one after the other, never together); the refund equals the balance at that moment |
 | Insert, select or cancel while the motor turns | The lock is released during the dispense | `dispensingState` returns `ErrBusy` for every action |
 | Keypad session and app `Buy` at once | Mixed balances | `Buy` returns `ErrBusy` while any balance is held (a keypad session or a dispense) |
 | App retries a purchase | Could vend twice | Idempotency key unique in `sales`; the retry returns the first result |
@@ -960,7 +972,7 @@ func TestConcurrentBuyExactWinners(t *testing.T) {
 
   Holding the lock through the dispense is simpler and also correct (one physical customer at a time), but nobody can ever observe the dispensing state.
 - **Escrow plus coin box instead of one balance number.** A little more code, but exact change and refunds become correct.
-- **DP instead of greedy.** O(denominations x value x count) with values in GCD units; for change up to Rs 500 that is tiny, and it never refuses change that exists.
+- **DP instead of greedy.** O(denominations x value x count) (work grows with all three) with values in GCD units; for change up to Rs 500 that is tiny, and it never refuses change that exists.
 - **`Buy` reuses the State methods instead of a separate code path.** One set of rules serves the keypad and the app.
 
 ## Drawing 🟢
@@ -1010,7 +1022,7 @@ sequenceDiagram
 > Five modes times four actions is twenty cases. State types keep each mode's rules together, make invalid actions return typed errors in one obvious place, and let you add a maintenance state without editing every method. A switch is fine for two states.
 
 > [!question]- Trap: greedy change-making is optimal for INR, so is it safe here?
-> No. Greedy is optimal for canonical coin systems like INR only with unlimited coins. With a box of {Rs 50 x1, Rs 20 x3} and Rs 60 to return, greedy takes the 50 and fails, while 3 x Rs 20 works. Use a bounded DP or backtracking over the real counts.
+> No. Greedy is optimal for canonical coin systems (coin sets where greedy always gives the fewest coins) like INR only with unlimited coins. With a box of {Rs 50 x1, Rs 20 x3} and Rs 60 to return, greedy takes the 50 and fails, while 3 x Rs 20 works. Use a bounded DP or backtracking over the real counts.
 
 > [!question]- Why keep escrow separate from the coin box?
 > So that a refund never depends on the box. Inserted coins stay in escrow until the dispenser confirms, which makes cancel and jam refunds always possible, and the change search can still use them.
@@ -1035,6 +1047,26 @@ I model the machine with the State pattern: a State interface with Insert, Selec
 - Release the lock during the dispense; `dispensingState` answers `ErrBusy`.
 - Jam: refund all, stock unchanged, out of service until repair.
 - Fleet: conditional `qty > 0` update plus an idempotency key on sales.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What is escrow in a vending machine?
+> The coins you inserted, held aside until your item drops; only then do they join the coin box.
+
+> [!question]- 🟢 What happens to your money if the motor jams?
+> All of it is refunded, stock stays the same, and the machine goes out of service until repaired.
+
+> [!question]- 🟢 Why does each mode get its own State type?
+> The same button means different things per mode; one type per mode keeps each mode's rules in one place instead of a big switch everywhere.
+
+> [!question]- 🟡 Price Rs 40, paid Rs 100, box {Rs 50 x1, Rs 20 x3}. Why does greedy fail?
+> Greedy takes the Rs 50, then needs Rs 10 it does not have; the DP finds 3 x Rs 20 = Rs 60.
+
+> [!question]- 🟡 The lock is released while the motor turns. What keeps that safe?
+> The machine is in `dispensingState`, which answers `ErrBusy` to insert, select and cancel until the sale is committed or refunded.
+
+> [!question]- 🟡 In a fleet, how is the last item sold to exactly one app request?
+> `UPDATE slots SET qty = qty - 1 WHERE ... AND qty > 0` lets only one request win, and a unique idempotency key stops a retry vending twice.
 
 ## Links 🟢
 

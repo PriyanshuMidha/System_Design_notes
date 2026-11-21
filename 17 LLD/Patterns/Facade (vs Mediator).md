@@ -29,6 +29,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works, with the small whiteboard code), section 4 (the full worked example) and sections 5 and 6 (variants and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Interfaces]]: the facade takes small interfaces for inventory, payments and orders, so tests can pass fakes.
+> - [[Design Patterns Overview and Chooser]]: Facade is the structural pattern for "a messy subsystem behind one call".
+> - [[Error Handling]]: each step returns an `error`, and `errors.Is` checks which error it was, even inside a joined error.
+
 **From zero, in 60 seconds** 🟢
 
 Placing an order touches many systems: stock, payment, shipping.
@@ -69,6 +74,9 @@ That one person is a facade. A mediator is different: a hub that many peers repo
 | Coupling | How much one piece depends on another | Every handler calling all three services is tight coupling |
 | Colleague | A peer object that talks only to the mediator | One plane talking to the control tower |
 | Orchestration | One coordinator calling steps in order | `Checkout` calling reserve, charge, create |
+| Idempotency key | A client-chosen ID that makes a retried request return the first result instead of running again | `k1` sent with checkout |
+| Saga | A long workflow across services where each step has an undo, and progress is saved to survive crashes | Book flight, then hotel; cancel the flight if the hotel fails |
+| Deadlock | Code waits forever for a lock it (or another task) already holds | The tower calls a plane that calls the tower back |
 
 **Picture it**
 
@@ -99,7 +107,7 @@ Where it breaks: a real concierge improvises when things fail; code compensation
 
 **Facade.** Placing an order touches three services: reserve 2 units of milk in inventory, charge ₹136 through payments, create the order.
 
-If the HTTP handler, the mobile BFF and the admin tool each make those three calls themselves, each one must also get the order right and undo the earlier steps when a later one fails.
+If the HTTP handler, the mobile BFF (backend-for-frontend: a small server made just for the mobile app) and the admin tool each make those three calls themselves, each one must also get the order right and undo the earlier steps when a later one fails.
 
 One of them will forget: the payment is declined, the 2 reserved units are never released, and the product shows "out of stock" while 2 units sit in a dead reservation.
 
@@ -109,10 +117,16 @@ A facade puts the sequence and its undo logic in one place, so every caller make
 
 With a control tower, each plane talks only to the tower (30 links) and the rule lives in one object. The mediator turns many-to-many coupling into many-to-one.
 
+### Real-life example 🟢
+
+Picture tapping "Place order" on Flipkart. Behind that one button, the app has to hold the item in the warehouse, take your money, and create the order record. If the payment fails, the held item must be put back, or it shows "out of stock" while sitting unsold. You never see these steps; you see one button and one answer. That single front door is a Facade. Now picture an Uber or Ola driver app: drivers do not talk to each other to decide who gets a ride; a central dispatcher decides for everyone. That central decider is a Mediator, like the control tower in the code below.
+
 ## 2. Mental model 🟢
 
 - **Facade = a hotel concierge.** You say "book me dinner and a taxi at 8". The concierge calls the restaurant and the taxi firm; they never call you or the concierge back with their own requests. You could still call the restaurant yourself; the concierge is a convenience, not a wall.
 - **Mediator = an air-traffic control tower.** Pilots never talk to each other. Each one reports to the tower ("requesting landing", "landed"), and the tower tells the others what to do ("hold", "cleared to land"). The pilots know the tower; the tower knows all the pilots.
+
+> 🟢 → 🟡 **You now know** the two ideas: a facade is one front door that calls many parts in order, and a mediator is a hub that peers report to. **Next we open the box**: the exact steps of a checkout facade, how it undoes earlier steps, why the undo needs its own context, and how the control tower decides without deadlocking.
 
 ## 3. How it works 🟡
 
@@ -168,7 +182,7 @@ classDiagram
 4. `Create` the order. On failure, `Refund` the payment and `Release` the reservation.
 5. Store the outcome under the key, failures included, and return it.
 
-Compensations run under `context.WithoutCancel(ctx)` with their own 2-second timeout, created at the moment the undo starts. A step may have failed precisely because the caller's context was cancelled or timed out, and that context would make the `Release` fail too.
+Compensations run under `context.WithoutCancel(ctx)` (a copy of the context that ignores the caller's cancel) with their own 2-second timeout, created at the moment the undo starts. A step may have failed precisely because the caller's context was cancelled or timed out, and that context would make the `Release` fail too.
 
 ```mermaid
 sequenceDiagram
@@ -196,7 +210,7 @@ sequenceDiagram
     end
 ```
 
-**Mediator steps (`ControlTower.Notify`):** a colleague calls `Notify(self, event)`. Under its lock, the tower updates its state (who holds the runway, who waits) and decides which colleague to call. It makes that call **after unlocking**, so a colleague that reacts by notifying the tower again cannot deadlock it.
+**Mediator steps (`ControlTower.Notify`):** a colleague calls `Notify(self, event)`. Under its lock, the tower updates its state (who holds the runway, who waits) and decides which colleague to call. It makes that call **after unlocking**, so a colleague (a peer such as one plane) that reacts by notifying the tower again cannot deadlock it.
 
 ```mermaid
 sequenceDiagram
@@ -262,6 +276,15 @@ func main() {
 **In plain words:** One program with both patterns: a checkout facade that undoes earlier steps on failure, and a mediator hub. Read the facade first, then the mediator.
 
 One `package main` with both patterns and distinct code: the checkout facade with compensation, idempotency and in-memory fakes, and the control-tower mediator. It compiles with Go 1.24 and passes `go vet` and `go test -race`, with no dependencies outside the standard library.
+
+**Step by step:**
+
+1. `InventoryService`, `PaymentService` and `OrderService` are the three services the facade hides; the fakes (`fakeInventory`, `fakePayment`, `fakeOrders`) stand in for them.
+2. `CheckoutService.Checkout` is the one call a caller makes. It first checks the `IdempotencyKey` with `begin`, so a retry gets the first answer.
+3. `checkout` runs the steps in order: `Reserve`, then `Charge`, then `Create`. If one fails, it undoes the earlier ones in reverse, using `undoContext` so the undo has its own time.
+4. `finish` stores the result (success or failure) under the key.
+5. For the mediator, each `Plane` tells the `ControlTower` about events, and `Notify` decides who lands and who holds. Planes never talk to each other.
+6. `main` runs a good checkout, a retry with the same key (no second charge), a declined payment that puts the stock back, and two planes sharing one runway, and prints the results.
 
 ```go
 // Command checkout contrasts two patterns. CheckoutService is a Facade:
@@ -775,13 +798,21 @@ func count(l *Log, word string) int {
 
 `go test -race -count=1 -v` passes all six tests and the four subtests.
 
+## Common beginner mistakes 🟢
+
+- **Mistake:** forgetting the undo step when a later step fails. → **Why it's wrong:** a declined payment leaves the reserved stock stuck, and the product looks sold out. → **Do this instead:** undo earlier steps in reverse order, as `checkout` does: `Release` after a failed `Charge`, and `Refund` then `Release` after a failed `Create`.
+- **Mistake:** running the undo with the caller's context. → **Why it's wrong:** if the user closed the app, that context is already cancelled, so the undo never runs. → **Do this instead:** give the undo its own time budget that ignores the caller's cancel, as `undoContext` does.
+- **Mistake:** charging again every time the client retries. → **Why it's wrong:** a shaky network makes the app retry, and the user pays twice. → **Do this instead:** remember each `IdempotencyKey` (a unique ID per checkout attempt) and return the first result, as `begin` and `finish` do.
+- **Mistake:** letting the facade grow business rules and every service call in the app. → **Why it's wrong:** it becomes one huge class that every team edits. → **Do this instead:** keep `CheckoutService` to one job (checkout steps and their undo) and keep the rules inside each service.
+- **Mistake:** calling a colleague back while the mediator still holds its lock. → **Why it's wrong:** if that plane calls `Notify` again, the program freezes (a deadlock). → **Do this instead:** decide under the lock, unlock, then call, as `ControlTower.Notify` does with `tell`.
+
 ## 5. Variants and comparison 🟡
 
 | Pattern | Who knows whom | Direction | Owns logic? | Use when |
 | --- | --- | --- | --- | --- |
 | Facade | The facade knows the subsystems; they do not know it | One way, down | Only sequencing, compensation and idempotency | Many callers need the same multi-step use case |
 | Mediator | Colleagues know the mediator; the mediator knows every colleague | Both ways | Yes: the coordination rule (runway, form validity, chat routing) | Peers would otherwise call each other many-to-many |
-| [[Observer and Event Bus]] | Publishers know only the bus; the bus knows only topic → handlers | Publisher → subscribers | No: it delivers by topic and never decides | Fan-out of facts to listeners you do not want to know about |
+| [[Observer and Event Bus]] | Publishers know only the bus; the bus knows only topic → handlers | Publisher → subscribers | No: it delivers by topic and never decides | Fan-out (sending one event to many listeners) of facts to listeners you do not want to know about |
 | [[Adapter]] | The adapter knows one adaptee | One way | No | One existing type has the wrong interface |
 | [[Proxy]] | The proxy knows one subject with the same interface | One way | Access control only | Caching, auth, lazy or remote access to one object |
 
@@ -797,7 +828,7 @@ func count(l *Log, word string) int {
 
 - **There is only one caller and one step.** Wrapping a single repository call in a "service" adds a type and nothing else.
 - **Callers need the full power of the subsystem.** A facade over `http.Client` that hides timeouts and headers forces people around it. GoF facades do not forbid direct access to the parts, so keep that door open.
-- **The steps cross processes and must survive crashes.** In-memory compensation is lost if the process dies mid-checkout; use a persisted saga or an outbox.
+- **The steps cross processes and must survive crashes.** In-memory compensation is lost if the process dies mid-checkout; use a persisted saga or an outbox (a table written in the same transaction, then sent by a worker).
 
 **When not to use a Mediator in Go:**
 
@@ -811,17 +842,19 @@ func count(l *Log, word string) int {
 - **A fat facade.** Business rules (coupon maths, stock policy) belong in the domain services; HTTP parsing and status codes belong in the handler. The facade only sequences, compensates and de-duplicates.
 - **The god facade.** One `OrderFacade` with 25 methods and 9 constructor arguments. Split it by use case: `CheckoutService`, `CancellationService`, `RefundService`, each taking only the interfaces it calls. A constructor with more than 4 or 5 dependencies is the usual warning sign (a rule of thumb, not a law).
 - **The god mediator.** All rules of the system drift into one `Notify` switch. Keep one mediator per interaction (one runway, one form), and move rules that are not about coordination back into the colleagues.
-- **Calling colleagues while holding the mediator's lock.** A colleague that notifies again deadlocks on a non-reentrant `sync.Mutex`. Decide under the lock, call after unlocking.
+- **Calling colleagues while holding the mediator's lock.** A colleague that notifies again deadlocks on a non-reentrant `sync.Mutex` (a lock the same caller cannot take twice). Decide under the lock, call after unlocking.
+
+> 🟡 → 🔴 **You now know** how to build a checkout facade with undo and idempotency, a control-tower mediator, and how to test both. **Next comes the production view**: facades inside Go's own library, the leaks and double charges they prevent, and why step order and lock discipline matter.
 
 ## 7. In production 🔴
 
 - **Real systems:**
-	- `http.Get(url)` is a facade: it calls `DefaultClient.Get`, which builds the request and runs it through `http.DefaultTransport` (connection pooling, proxy settings from the environment, TLS, HTTP/2). Most callers never touch `Transport`; those who need timeouts build their own `http.Client`.
+	- `http.Get(url)` is a facade: it calls `DefaultClient.Get`, which builds the request and runs it through `http.DefaultTransport` (connection pooling, meaning reuse of open connections; proxy settings from the environment; TLS, the encryption behind HTTPS; HTTP/2). Most callers never touch `Transport`; those who need timeouts build their own `http.Client`.
 	- `os.ReadFile(name)` is a facade over `os.Open`, a size hint from `Stat`, a read loop until `io.EOF`, and `Close`.
 	- In Go backends the facade is the application service that an HTTP or gRPC handler calls: the handler decodes, the service runs the use case, the handler maps errors to status codes.
 	- Mediators appear where peers must coordinate: chat rooms that route messages between members, form widgets that enable or disable each other through a dialog (GoF's own example), and schedulers that hand a shared resource to waiting clients.
 - **Failure modes → fixes:**
-	- Reservation leaked after a failed charge → compensation on every failure branch, plus a reservation TTL in inventory as a safety net.
+	- Reservation leaked after a failed charge → compensation on every failure branch, plus a reservation TTL (a time limit after which the reservation frees itself) in inventory as a safety net.
 	- Double charge on client retry → idempotency key checked at the facade and passed to the payment provider; see [[Idempotency and Idempotency Keys]].
 	- Two concurrent requests with the same key → the in-flight marker returns `ErrInProgress` (in SQL: a unique key on the idempotency table).
 	- Compensation itself fails → return both errors with `errors.Join` (Go 1.20+), log them, and queue a retry or alert; never swallow them.
@@ -869,6 +902,26 @@ func count(l *Log, word string) int {
 - Mediator: colleagues notify one coordinator that owns the rule and commands the others; two-way.
 - Decide under the mediator's lock, call colleagues after unlocking.
 - Event bus routes by topic with no rule; mediator routes by rule.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What does a facade give its callers?
+> One simple call (like `Checkout`) that runs several services in the right order.
+
+> [!question]- 🟢 What is compensation?
+> Undoing an earlier step after a later one fails, such as releasing reserved stock when payment is declined.
+
+> [!question]- 🟢 Facade or Mediator: the parts never call back into the middle object?
+> Facade. In a mediator the peers do call the hub.
+
+> [!question]- 🟡 Why are the checkout steps ordered reserve → charge → create?
+> Easiest-to-undo first: releasing stock is cheap, a refund is visible to the customer, and an order may already have sent emails.
+
+> [!question]- 🟡 Why do compensations use `context.WithoutCancel` plus a fresh timeout?
+> The step may have failed because the caller's context was cancelled, and that same context would make the undo fail too.
+
+> [!question]- 🟡 Why does the control tower call planes only after unlocking?
+> A plane may call `Notify` again, and taking the same `sync.Mutex` twice would deadlock.
 
 ## Links 🟢
 

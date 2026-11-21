@@ -32,6 +32,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (producing, consuming, storage, replication), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Queues vs Streams and Broker Comparison]]: a queue deletes a message once one worker finishes it; a log keeps messages and lets many readers each keep a bookmark.
+> - [[Message Ordering and Partition Keys]]: order is kept only among messages with the same key, because they go to the same partition.
+> - [[Replication]]: data is copied to other servers so one dying server loses nothing.
+
 **From zero, in 60 seconds** 🟢
 
 Kafka is a giant shared notebook that only grows at the bottom.
@@ -80,6 +85,10 @@ Kafka keeps every record in a long, numbered list so each team can read at its o
 | Server / broker | A machine that stores the records and answers reads | 3 Kafka brokers in a cluster |
 | Replica | An extra copy of data on another machine | Same partition stored on 3 brokers |
 | Acknowledge (ack) | "I got it" reply that says it is safe | Broker acks after writing to disk copies |
+| Replication factor (RF) | How many brokers keep a copy of each partition | RF = 3: three copies |
+| Commit (an offset) | A consumer saving its bookmark: "I have done everything before here" | Commit offset 812 on partition 0 |
+| Rebalance | The group reshuffling which consumer reads which partition, when members join or leave | A new pod joins, takes partition 2 |
+| Retention | How long records stay, read or not | 7 days by default |
 
 **Picture it**
 
@@ -151,6 +160,14 @@ Terms used below:
 - **Consumer group:** a set of consumers sharing one bookmark per partition.
 - **Lag:** the log end offset minus the group's committed offset: how far behind the group is.
 
+## Common beginner mistakes 🟢
+
+- **Adding consumers to go faster without adding partitions** → one partition is read by at most one consumer per group, so extras sit idle → plan the partition count for the parallelism you need.
+- **Expecting order across the whole topic** → Kafka keeps order only inside one partition → give related events (one order, one user) the same key.
+- **Committing the offset before the work is done** → a crash then skips those records for good → commit after processing, and make handlers safe to run twice.
+- **Using `acks=1` for data you cannot lose** → if the leader dies before followers copy the record, it is gone → use `acks=all` with `min.insync.replicas=2` on a 3-copy topic.
+- **Changing the partition count on a live keyed topic** → most keys move to new partitions and order breaks → pick enough partitions up front, or create a new topic and migrate.
+
 **Bookmarks per team, per page:**
 
 ```mermaid
@@ -164,6 +181,8 @@ flowchart TB
 ```
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that Kafka is a notebook split into pages (partitions), where readers keep their own bookmarks (offsets) and nothing is erased by reading. **Next we open the box**: how a producer picks a page and confirms a write, how a group shares pages and saves bookmarks, how records are stored and expired, and how copies keep data safe.
 
 ```mermaid
 flowchart LR
@@ -193,7 +212,16 @@ flowchart LR
 
 **In plain words:** the sender picks a page (partition), packs events into small bundles, and waits for enough servers to say "saved" before it calls the write done.
 
-1. The producer picks a partition. With a key, the Java client's default is `toPositive(murmur2(keyBytes)) % numPartitions`, so the same key always goes to the same partition while the partition count stays the same.
+**Step by step (plain version first):**
+1. The trip service sends `{trip: 42, fare: 310}` with key `trip-42`.
+2. The key is turned into a number (a hash), and that number picks the partition, say partition 0. `trip-42` will always land there.
+3. The producer waits a few milliseconds to collect more records for partition 0 into one bundle (a batch), which is cheaper to send.
+4. The bundle goes to partition 0's leader broker, which writes it. Two follower brokers copy it.
+5. With `acks=all`, the producer hears "saved" only once the in-sync copies have it. If it retries, the broker drops the repeat.
+
+**Full detail:**
+
+1. The producer picks a partition. With a key, the Java client's default is `toPositive(murmur2(keyBytes)) % numPartitions` (murmur2 is a fast hash function that turns the key bytes into a number), so the same key always goes to the same partition while the partition count stays the same.
    Without a key, since Kafka 3.3 (KIP-794) the client fills a batch for one partition and then moves on ("uniform sticky"), which gives bigger batches than round-robin.
 2. Records are grouped into **batches** per partition. `batch.size` (default 16,384 bytes) caps a batch; `linger.ms` lets the producer wait a few milliseconds to fill it. Batches are compressed as a unit (`compression.type` = `lz4`, `zstd`, `snappy` or `gzip`).
 3. The leader appends the batch to its log; followers fetch it.
@@ -206,6 +234,13 @@ flowchart LR
 ### Consuming
 
 **In plain words:** readers in one team split the pages between them, read a batch, do the work, then move their bookmark forward.
+
+**Step by step:**
+1. The billing group has one consumer, c1. It reads all three partitions.
+2. A second consumer, c2, starts and joins the group. The group **coordinator** (one broker that manages this group) starts a rebalance.
+3. c1 gives up partition 2 and saves its bookmark there. It keeps reading partitions 0 and 1 without stopping.
+4. c2 gets partition 2, looks up the saved bookmark, and carries on from there.
+5. Each consumer loops: fetch a batch, process it, save the new bookmark. If it crashes before saving, the batch is read again.
 
 A consumer group's members agree on who reads which partitions (**assignment**), then loop: `poll()` a batch, process it, **commit** the offset of the next record to read. Committed offsets are stored in the internal topic `__consumer_offsets`.
 
@@ -242,6 +277,13 @@ sequenceDiagram
 
 **In plain words:** each page is stored as a set of files on disk; old files are thrown away after a set time, or squeezed so only the newest value per key stays.
 
+**Step by step:**
+1. Partition 0 is a folder on disk. New records are added to the end of the newest file (a **segment**).
+2. When that file reaches 1 GiB, it is closed and a new one starts.
+3. With delete retention, any closed file whose records are all older than 7 days is removed.
+4. With compaction, Kafka rewrites old files keeping only the latest record per key, so `user-7` keeps just its newest address.
+5. A record with key `user-7` and an empty value (a tombstone) removes `user-7` after a day.
+
 - A partition is a directory of **segments** (`log.segment.bytes`, default 1 GiB) plus offset and time index files. Only the active segment is written; old segments are deleted or compacted whole.
 - **Delete retention:** remove segments older than `retention.ms` or beyond `retention.bytes`.
 - **Log compaction** (`cleanup.policy=compact`): keep at least the latest record for each key. A record with a null value (a **tombstone**) deletes the key after `delete.retention.ms` (default 24 h). Used for changelogs and "current state of each entity" topics, including `__consumer_offsets` itself.
@@ -250,6 +292,13 @@ sequenceDiagram
 ### Replication and the controller
 
 **In plain words:** every page is copied to a few servers; one is the boss that takes writes, and if it dies, a fully caught-up copy takes over.
+
+**Step by step:**
+1. Partition 0 lives on brokers 1, 2 and 3. Broker 1 is the leader; 2 and 3 are followers that keep fetching new records.
+2. Followers that are caught up form the ISR. Broker 3 falls 30 seconds behind, so it is dropped from the ISR.
+3. A record counts as committed once every ISR member has it. Only committed records are shown to consumers.
+4. Broker 1 dies. The **controller** (the node that manages cluster metadata) picks broker 2, which is in the ISR, as the new leader.
+5. Broker 3 was out of sync, so by default it may not become leader. Kafka prefers a pause over losing data.
 
 - The leader tracks the **ISR**. A follower that falls behind for longer than `replica.lag.time.max.ms` (default 30 s) is removed from it.
 - A record is **committed** once every ISR member has it; consumers only see records up to that point (the **high watermark**).
@@ -598,6 +647,8 @@ Partition 2's lag of 425 while the others are near zero points to a slow consume
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how producing, consuming, storage and replication work, and you have traced keys, offsets and lag by hand and in Go. **Next is the advanced part**: real deployments, the failures and tuning that matter in production, and the internals interviewers ask about.
+
 - **Real systems:** Kafka was built at LinkedIn and open-sourced in 2011. Common uses: CDC pipelines with Debezium ([[Transactional Outbox and CDC]]), log and metrics transport ([[Case Study - Metrics and Logging Platform]]), event-driven microservices, and stream processing with Kafka Streams or Flink ([[Stream Processing Basics]]).
 - **Failure modes → fixes:**
 	- *Consumer lag grows without end.* Handlers too slow for the input rate. Fix: more partitions and consumers, batch work, or make the handler async with bounded concurrency per key; see [[Backpressure and Flow Control]].
@@ -666,6 +717,30 @@ flowchart LR
 - Retention by time/size (7 days default) or compaction (latest per key, tombstones).
 - Watch lag, under-replicated partitions, rebalances.
 - KRaft only since 4.0; tiered storage for long retention.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Does reading a record from Kafka delete it?
+> No. Records stay until retention or compaction removes them; readers only move their offset.
+
+> [!question]- Where is order guaranteed in Kafka?
+> Only inside one partition.
+
+> [!question]- What decides which partition a keyed record goes to?
+> A hash of the key, modulo the number of partitions.
+
+🟡 Medium
+
+> [!question]- With RF=3, `acks=all` and `min.insync.replicas=2`, two brokers die. What happens to writes?
+> They fail with NotEnoughReplicas, because only one in-sync copy is left; reads still work.
+
+> [!question]- Your group commits after processing and a consumer crashes mid-batch. What happens?
+> The next owner starts from the last committed offset and processes part of the batch again (at-least-once).
+
+> [!question]- Why does a consumer whose handler takes 10 minutes cause rebalances?
+> It misses `max.poll.interval.ms` (5 minutes by default), so the group thinks it is dead and moves its partitions.
 
 ## Links
 

@@ -29,6 +29,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[LLM Fundamentals]]: you pay per token in and out, the model resends nothing by itself, and the first word only appears after all input is read.
+> - [[Calling LLM APIs from Go]]: each call returns a `usage` block with exact token counts, and streaming sends the answer piece by piece.
+
 **From zero, in 60 seconds** 🟢
 
 Every AI call costs money and time. You pay per **token** (a small piece of text), both for what you send and for what comes back.
@@ -74,6 +78,11 @@ This note is about paying less and waiting less without making answers worse.
 | TTFT | Time to first token: how long until the first word appears | 400 ms before text starts streaming |
 | Streaming | Sending the answer piece by piece as it is made | Text appearing word by word in a chat |
 | Model routing | Choosing a cheaper or stronger model per request | Small model for "hi", large model for hard questions |
+| Prompt caching | The provider reuses its work on an unchanged start of your prompt | Same 1,200-token system prompt on every call |
+| TTL (time to live) | How long a cached item stays before it is thrown away | 5 minutes |
+| Semantic cache | Reuse an old answer for a question with similar meaning | "how to cancel?" ≈ "I want to cancel" |
+| Batch API | Send many jobs at once, get results hours later, at a lower price | Nightly summaries at about half price |
+| Cascade | Try a cheap model first, move up only if it fails a check | Small → large on a failed validation |
 
 **Picture it**
 
@@ -109,6 +118,8 @@ A support bot answers 100,000 questions a day. Each call sends a 1,200-token sys
 
 Without caching: every call pays full price for all 1,500 input tokens. With prompt caching, the 1,200-token stable prefix is cached after the first call and billed at the cache-read price (commonly about a tenth of the fresh-input price; check your provider's documented rate) on the other 99,999.
 
+At the illustrative $3 / $15 per million prices used below, that moves each call from about $0.0083 to about $0.0050: roughly 40% cheaper, with no change in answers.
+
 That one design choice — put the stable part first, the question last — is most of the cost difference between a careless integration and a production one.
 
 ## 1. Why it exists 🟢
@@ -123,17 +134,51 @@ At 100,000 calls a day that is about $830/day, or roughly $25,000/month, before 
 
 None of this shows up in a dashboard that only tracks request count and p50 latency — it needs its own accounting.
 
+### Real-life example 🟢
+
+Think of the chat helper in a travel app like MakeMyTrip. Every call sends the same long instructions and tool list (about 1,200 tokens), then the user's question.
+Caching that fixed start cuts the bill for each call. "What's the baggage limit on IndiGo?" is asked thousands of times a day, so an exact-match cache can answer repeats without a model call.
+Easy questions go to a small, cheap model; only hard ones like "rebook my whole trip around this cancelled flight" go to the large model.
+Answers stream, so users see words within half a second, and the nightly "summarise yesterday's chats" job runs through the batch API at a lower price.
+
+### Common beginner mistakes 🟢
+
+- **Putting a timestamp or request ID at the top of the prompt** → the start changes every call, so the cache never hits → put all changing content after the fixed part.
+- **Setting `max_tokens` very high "to be safe"** → the model can ramble, and output is the most expensive token type → set the smallest limit the task needs.
+- **Using a semantic cache for money or medical answers** → "cancel my order" can match "cancel my subscription" and return the wrong answer → use it only where a wrong answer is cheap, or verify first.
+- **Watching only request count** → cost grows with tokens, not requests → log `usage` on every call, per tenant.
+- **Switching everything to the smallest model** → worse answers cause retries and follow-ups that cost more overall → route by difficulty and check quality with evals.
+
 ## 2. Mental model 🟢
 
 Treat an LLM call like a cab ride billed by distance in two different currencies: input tokens are the distance you've already driven before the meter even starts near full price (unless it's road you drove yesterday and the meter remembers — the cache), and output tokens are the distance still ahead, billed at a much higher per-mile rate because *generating* each one takes a full forward pass through the model, while reading cached input tokens does not.
 
 Latency has the same two-part shape: TTFT is how long the cab takes to leave the curb (routing, queueing, plus processing the whole input before any output can start), and the rest of the trip is paced by how fast output tokens stream out, which is roughly constant per model.
 
+### Prompt caching vs the things people confuse it with 🟡
+
+| Thing | What gets reused | When it is safe |
+| --- | --- | --- |
+| Prompt caching (provider) | The model's work on your unchanged prompt start; you still get a fresh answer | Always; only the cost and wait change |
+| Exact response cache (yours) | A whole saved answer for the identical request | When the same question should get the same answer |
+| Semantic response cache (yours) | A saved answer for a similar-meaning question | Only where a wrong answer is cheap to fix |
+| Batch API | Nothing reused; same work, slower, at a discount | Jobs nobody is waiting on |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that you pay per token, output costs most, and a fixed prompt start can be cached. **Next we open the box**: the four token lines on your bill, how prompt caching really works, exact vs similar-meaning caches, batching, routing between models, and trimming input and output. Each subsection starts with a plain step-by-step walk.
 
 ### Token accounting
 
 **In plain words:** Your bill has four lines: new input, input written to cache, input read from cache, and output.
+
+**Step by step:**
+1. Call 1 sends 1,200 fixed tokens plus a 300-token question. The 1,200 are written to cache (`cache_creation_input_tokens`, a small premium); 300 are fresh `input_tokens`.
+2. The model writes 250 `output_tokens`, the priciest line.
+3. Call 2 sends the same 1,200 plus a new question. Now the 1,200 show up as `cache_read_input_tokens`, about a tenth of the normal price.
+4. Multiply each line by its own price and add them up: that is the cost of the call.
+
+Full detail:
 
 Every response carries the exact counts the call is billed on. The Anthropic Messages API's `usage` object (as of 2026) breaks them into four classes:
 
@@ -158,9 +203,18 @@ flowchart LR
 
 **In plain words:** The provider remembers the model having "read" your fixed opening text, so the next call skips that work.
 
+**Step by step:**
+1. Build every prompt as: fixed instructions and tools first, then a cache marker (`cache_control`), then the changing question.
+2. The first call stores the model's work on everything before the marker, for a set time (TTL, say 5 minutes).
+3. A call within those 5 minutes with the exact same start reuses it: cheaper and a faster first word.
+4. Change even one character before the marker, such as a timestamp, and it is a miss: you pay the write price again.
+5. If no call comes for 5 minutes, the entry expires.
+
+Full detail:
+
 A provider's prompt cache stores the processed state of a prefix of your input — not the text, the model's internal representation of having already "read" it — keyed by exact content and position. [[Prompt Engineering]] covers the cache-friendly prompt shape (stable system instructions and template first, variable content last); this note covers the mechanism and its economics.
 
-As of 2026, Anthropic's API lets you mark a cache breakpoint with a `cache_control: {type: "ephemeral", ttl: "5m"|"1h"}` block on a content block, and bills a short-term write premium (documented as roughly 1.25x the input price for a 5-minute TTL; verify current numbers) to create the entry, then a steep discount (documented as roughly a tenth of the input price) on every read within the TTL.
+As of 2026, Anthropic's API lets you mark a cache breakpoint with a `cache_control: {type: "ephemeral", ttl: "5m"|"1h"}` block (ephemeral means short-lived) on a content block, and bills a short-term write premium (documented as roughly 1.25x the input price for a 5-minute TTL; verify current numbers) to create the entry, then a steep discount (documented as roughly a tenth of the input price) on every read within the TTL.
 
 ```mermaid
 sequenceDiagram
@@ -188,7 +242,16 @@ flowchart LR
 
 **In plain words:** Exact cache = same question, reuse the answer. Semantic cache = similar question, reuse the answer (riskier).
 
-An **exact cache** keys on the literal request (normalized prompt, or a hash of it) and only returns a stored answer for a byte-identical repeat. It is always correct when it hits, and it only helps for genuinely repeated questions (FAQ-shaped traffic, retries, idempotency keys).
+**Step by step:**
+1. "What is your refund window?" arrives. Hash the cleaned text and look it up. Found? Return the saved answer: always right.
+2. Not found? For a semantic cache, embed the question and find the closest saved question.
+3. "How long do I have to get a refund?" scores 0.95 similarity: reuse that answer. Good.
+4. "Cancel my order" vs saved "cancel my subscription" may also score high, but needs a different answer. Bad.
+5. Below the threshold, call the model and save the new answer.
+
+Full detail:
+
+An **exact cache** keys on the literal request (normalized prompt, or a hash of it) and only returns a stored answer for a byte-identical repeat. It is always correct when it hits, and it only helps for genuinely repeated questions (FAQ-shaped traffic, retries, idempotency keys: an ID sent with a request so a repeat is recognised as the same request).
 
 A **semantic cache** instead embeds the incoming query and serves the stored answer for the nearest previously-answered query above a similarity threshold. It catches paraphrases ("how do I cancel?" vs. "I want to cancel my plan") that an exact cache misses — but cosine similarity measures how alike two vectors are, not whether they mean the same thing for this use case.
 
@@ -209,7 +272,16 @@ flowchart LR
 
 **In plain words:** Send a big pile of non-urgent jobs at once, get answers later, pay less.
 
-Where answers are not needed synchronously (nightly summarization, bulk classification, backfills), a provider's batch endpoint accepts many requests in one submission and returns results asynchronously, typically within a documented SLA window (hours), at a lower per-token price (publicly documented as roughly 50% off standard pricing for several major providers as of 2026; verify your provider's current batch discount and turnaround).
+**Step by step:**
+1. At midnight, collect 50,000 support chats that need a one-line summary.
+2. Submit them all in one batch request.
+3. The provider runs them when it has spare capacity, within its promised window (hours).
+4. Collect the results in the morning, at roughly half the normal per-token price.
+5. Never use this for anything a user is waiting on.
+
+Full detail:
+
+Where answers are not needed synchronously (nightly summarization, bulk classification, backfills), a provider's batch endpoint accepts many requests in one submission and returns results asynchronously, typically within a documented SLA (service level agreement: the provider's promised turnaround) window (hours), at a lower per-token price (publicly documented as roughly 50% off standard pricing for several major providers as of 2026; verify your provider's current batch discount and turnaround).
 
 Batching trades latency for cost — it is the opposite choice from streaming, and the two are not mutually exclusive across your workload: user-facing chat streams, nightly reports batch.
 
@@ -222,6 +294,15 @@ flowchart LR
 ### Model routing and cascades
 
 **In plain words:** Try the cheap model first. Move up to the big model only when the cheap one clearly fails.
+
+**Step by step:**
+1. Check the exact cache, then the semantic cache. Hit? Done, no model call.
+2. A cheap router (rules, a token count, or a tiny classifier) looks at the request: short and no tools → small model.
+3. The small model answers; your code validates the answer (right shape, passes checks).
+4. Passes: return it. Fails: retry once on the large model.
+5. Most easy traffic stays cheap; you pay double only on the few escalations.
+
+Full detail:
 
 A model router sends a request to the cheapest model estimated to handle it, and escalates only on a concrete failure signal:
 
@@ -246,6 +327,15 @@ The router itself must be cheap (a classifier, a token-count check, a regex over
 ### Context trimming and output limits
 
 **In plain words:** Don't resend the whole chat every time, and don't let the reply run longer than needed.
+
+**Step by step:**
+1. A chat reaches turn 30; resending all of it costs 9,000 input tokens per call.
+2. Keep the last 5 turns in full and replace turns 1-25 with a 300-token summary.
+3. Now each call sends about 2,000 input tokens.
+4. On the output side, set `max_tokens` to what the task needs, say 300 for a short reply.
+5. If a reply hits the limit, treat it as an error to fix, not something to hide with a bigger limit.
+
+Full detail:
 
 Every token of conversation history resent on each turn is billed again; summarizing or truncating history (see [[RAG Pipeline]] for retrieval-side trimming) keeps the input side of the bill from growing with conversation length.
 
@@ -550,6 +640,8 @@ func Route(r RouteRequest) Tier {
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the four token lines, how prompt caching, response caches, batching, routing and trimming each save money or time. **Next comes the senior view**: how real products combine them, how each one fails, what to monitor, why cache reads and input are cheaper than output, and how to stop one tenant from blowing the budget.
+
 - **Real systems:** chat products stream by default for perceived latency; high-volume classification/extraction pipelines batch or use a small routed model; most providers' own docs recommend prompt caching for any repeated system prompt or long few-shot set, and several (Anthropic, OpenAI, Google) publish a documented batch discount as of 2026.
 - **Failure modes → fixes:**
   - Cache never hits because variable content (a timestamp, a request id) sits before the cache breakpoint → move all variable content after the breakpoint.
@@ -560,10 +652,10 @@ func Route(r RouteRequest) Tier {
 
 ## 8. Deep dive 🔴
 
-- **Why cache-read is so much cheaper than fresh input.** A cache hit skips the attention computation over the cached tokens entirely — the provider stores the already-computed key/value state for that prefix and splices it in, rather than reprocessing the text.
+- **Why cache-read is so much cheaper than fresh input.** A cache hit skips the attention computation (the model step that relates every token to every other token) over the cached tokens entirely — the provider stores the already-computed key/value state (the model's saved notes about each token) for that prefix and splices it in, rather than reprocessing the text.
 
   That is also why the match must be exact and positional: the stored state is a function of the exact tokens and their position, not their meaning, so any edit before the breakpoint (even whitespace) invalidates it.
-- **Why output tokens cost so much more than input tokens.** Each output token requires a full forward pass through the model, one token at a time, sequentially — input tokens are processed once, in parallel, across the whole prompt.
+- **Why output tokens cost so much more than input tokens.** Each output token requires a full forward pass (one complete run of the model) through the model, one token at a time, sequentially — input tokens are processed once, in parallel, across the whole prompt.
 
   That asymmetry (commonly 4-8x the per-token price as of 2026; always verify against current pricing) is also why trimming `max_tokens` and avoiding unnecessary verbosity in system prompts ("be thorough", "explain in detail") has an outsized effect on cost compared to trimming input.
 - **Semantic cache thresholds are not transferable across embedding models.** A threshold of 0.93 tuned against one embedding model's score distribution has no guaranteed meaning for another model — re-tune after any embedding model change (see the migration note in [[Embeddings]]), and prefer measuring hit precision/recall on a labeled query-pair set over picking a threshold by eye.
@@ -603,6 +695,26 @@ func Route(r RouteRequest) Tier {
 - TTFT and total latency are different metrics; streaming only improves TTFT.
 - Trim context and cap `max_tokens`; don't pad output "to be safe."
 - Enforce per-tenant budgets as a hard stop before the call, not just an alert after it.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: Which costs more per token, input or output?
+> Output, often several times more.
+
+> [!question]- Easy: What is TTFT?
+> Time to first token: how long until the first word of the answer appears.
+
+> [!question]- Easy: What must stay the same for prompt caching to hit?
+> The exact start of the prompt, up to the cache marker.
+
+> [!question]- Medium: Cache hit rate is near zero with a big fixed system prompt. Likely cause?
+> Something changing, like a timestamp or request ID, sits before the cache marker.
+
+> [!question]- Medium: Streaming is on but total latency did not drop. Is that a bug?
+> No. Streaming improves time to first word, not the time to finish the whole answer.
+
+> [!question]- Medium: Where is a semantic cache a bad idea?
+> Where a wrong but confident answer causes harm, like billing actions or medical advice.
 
 ## Links 🟢
 

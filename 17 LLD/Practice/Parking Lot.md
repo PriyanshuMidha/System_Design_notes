@@ -30,6 +30,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[LLD Interview Method]]: the 10-step order this note follows (clarify, entities, APIs, storage, code, edge cases).
+> - [[Strategy and Template Method]]: a rule hidden behind an interface so you can swap it, like "how to pick a spot".
+> - [[Concurrency for LLD]]: goroutines run at the same time, and a mutex makes them take turns on shared data.
+
 **From zero, in 60 seconds** 🟢
 
 A car drives into a parking lot. The gate finds a free spot that fits the car and gives a **ticket**. When the car leaves, the gate looks at the ticket, works out the fee and frees the spot. How to pick a spot and how to price are kept as swappable parts, called **strategies**. The one hard rule: two gates must never hand out the same spot, so "find a free spot and mark it taken" is one step.
@@ -61,6 +66,10 @@ Everything else in this note is just these 3 questions:
 | Race condition | Two actions interleave and break the result | Both gates get spot 7 |
 | Paise (`int64`) | Money stored as whole smallest units | ₹40.50 = 4050 |
 | Injected clock | Code asks an interface for "now" so tests can fake it | Pretend 3 hours passed |
+| Atomic | Done as one step that nobody can cut into | Pick spot 7 and mark it taken together |
+| Row lock (`FOR UPDATE`) | The database version of the mutex: other gates wait or skip that row | Gate B skips spot 7 while gate A holds it |
+| Partial unique index | A database rule "no two rows alike" that only checks some rows | Only one open ticket per spot |
+| Idempotency key | An ID sent with a request so a retry is not done twice | Gate retries entry, gets the same ticket |
 
 **Picture it**
 
@@ -129,7 +138,7 @@ Handle lost tickets and many entry gates working at the same time.
 - Concurrent entries from many gates never double-assign a spot.
 - The same plate cannot be parked twice at the same time.
 - Allocation and pricing rules can be swapped without touching the lot.
-- Money is `int64` paise, and the clock is injected so fee tests are deterministic.
+- Money is `int64` paise, and the clock is injected so fee tests are deterministic (give the same answer every run).
 
 ### Out of scope
 
@@ -165,6 +174,8 @@ The hardest use case is **Park** under concurrency: pick a free spot and claim i
 Modelling insight: the **ticket is the visit**, not the vehicle. Index open tickets by ID (normal exit) and by plate (duplicate-entry check and lost-ticket exit). Keep Floor as a slice index, not a class, until it needs behaviour.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know the problem, the actors and the five entities. Next we open the box: how the entities link up, what the API looks like, how the database stops double booking, and the Go code that does it.
 
 ```mermaid
 classDiagram
@@ -239,7 +250,7 @@ GET  /tickets/{ticketId}                                            -> 200 ticke
 Errors: 409 already parked, 409 lot full for type, 404 ticket not found / not parked
 ```
 
-The Go surface the HTTP handlers call is this interface; `*ParkingLot` in Step 8 implements it. Each mutating method takes a `context.Context` and returns a typed error that maps to the status codes above.
+The Go surface the HTTP handlers call is this interface; `*ParkingLot` in Step 8 implements it. Each mutating method (one that changes data) takes a `context.Context` (Go's way to pass a deadline or a "cancel" signal) and returns a typed error (a named error value such as `ErrNoSpot` that callers can check) that maps to the status codes above.
 
 ```go
 type ParkingService interface {
@@ -327,8 +338,8 @@ type TicketRepo interface {
 
 Patterns not used, and why:
 
-- No State pattern for Spot or Ticket: two or three states with no per-state behaviour; a bool and an exit time are enough (YAGNI). Reach for [[State Machines in Go]] when transitions carry rules, as in the [[Vending Machine]].
-- No Floor or Gate classes: they carry no behaviour in this scope; a slice index and a parameter are enough (KISS).
+- No State pattern for Spot or Ticket: two or three states with no per-state behaviour; a bool and an exit time are enough (YAGNI: "you aren't gonna need it", so do not build it yet). Reach for [[State Machines in Go]] when transitions carry rules, as in the [[Vending Machine]].
+- No Floor or Gate classes: they carry no behaviour in this scope; a slice index and a parameter are enough (KISS: "keep it simple").
 
 ## Folder structure 🟡
 
@@ -364,7 +375,7 @@ cmd/demo/main.go  -> builds floors, picks strategies, injects time.Now, runs a p
 `Park(ctx, v)`:
 
 1. Return early if the context is already cancelled.
-2. Take `l.mu`. Everything after this is one critical section.
+2. Take `l.mu`. Everything after this is one critical section (code only one goroutine can run at a time).
 3. Reject the plate if `byPlate` already holds it (`ErrAlreadyParked`): the same car was scanned twice.
 4. Ask `AllocationStrategy.Pick` for a free spot. It only reads.
 5. None free: return `ErrNoSpot`.
@@ -633,7 +644,7 @@ func (l *ParkingLot) FreeCount(t VehicleType) int {
 | `TestFallbackBikeTakesCarSpotAndPaysBikeRate` | Bike falls back to a car spot only when bike spots are full, pays the bike rate, frees the car spot; a truck with no fallback still gets `ErrNoSpot` |
 | `TestConcurrentParkNeverDoubleAssigns` | 50 goroutines, 2 car spots: exactly 2 winners on 2 different spots, 48 get `ErrNoSpot` |
 
-All five pass under `go test -race` (Go 1.24.4).
+All five pass under `go test -race` (Go's race detector, which flags unsafe shared access) (Go 1.24.4).
 
 **In plain words:** Tests with a fake clock to check hourly fees and the fallback when small spots run out.
 
@@ -849,9 +860,11 @@ func TestConcurrentParkNeverDoubleAssigns(t *testing.T) {
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the full working design and its tests. Next comes the interview depth: the odd cases that break naive code (lost tickets, retries, double exit) and the trade-offs you must defend.
+
 | Edge case | What happens | How the design handles it |
 |---|---|---|
-| Two gates pick the same free spot | Check-then-act bug: both see it free | Pick + `Occupied = true` under one mutex; in the database `FOR UPDATE SKIP LOCKED` plus the partial unique index per spot |
+| Two gates pick the same free spot | Check-then-act bug (check "is it free?", then act, with a gap in between where another gate sneaks in): both see it free | Pick + `Occupied = true` under one mutex; in the database `FOR UPDATE SKIP LOCKED` plus the partial unique index per spot |
 | Same car scanned twice at entry | Two open tickets for one plate | `byPlate` check gives `ErrAlreadyParked`; the partial unique index per plate in the database |
 | Gate retries entry after a timeout | Could issue two tickets | `Idempotency-Key` is unique on tickets; the retry returns the first ticket |
 | Lot full for a type | No spot | `ErrNoSpot` (409); the display board shows 0 |
@@ -878,8 +891,8 @@ func TestConcurrentParkNeverDoubleAssigns(t *testing.T) {
 | Follow-up | Design change |
 |---|---|
 | Bike can use a car spot when bike spots are full | `FallbackAllocation` (coded above); price by vehicle type |
-| Nearest spot to the entry gate | The strategy takes a gate ID; precomputed distances; a min-heap of free spots per type |
-| Weekend or night pricing | A new `PricingStrategy`, or a decorator over the base pricing ([[Decorator and Middleware]]) |
+| Nearest spot to the entry gate | The strategy takes a gate ID; precomputed distances; a min-heap (a structure that always hands back the smallest item first, here the nearest spot) of free spots per type |
+| Weekend or night pricing | A new `PricingStrategy`, or a decorator (a wrapper that adds a rule on top of another pricing) over the base pricing ([[Decorator and Middleware]]) |
 | Payment at exit | Exit returns the fee; a payment service charges; the ticket closes only after payment succeeds |
 | Many lots, many service instances | State in the database, `FOR UPDATE SKIP LOCKED` claim, idempotency key on entry |
 | Live display boards | Observer: publish `spot.taken` and `spot.freed` events |
@@ -887,9 +900,9 @@ func TestConcurrentParkNeverDoubleAssigns(t *testing.T) {
 
 Tradeoffs chosen:
 
-- **One `sync.Mutex` for the whole lot.** It is the simplest correct answer and is fine for one lot; shard only if profiling shows contention. Sharding by type breaks the fallback strategy, which then needs two locks taken in a fixed order.
+- **One `sync.Mutex` for the whole lot.** It is the simplest correct answer and is fine for one lot; shard (split into several smaller locks) only if profiling (measuring where time goes) shows contention (gates waiting on each other). Sharding by type breaks the fallback strategy, which then needs two locks taken in a fixed order.
 - **In-memory maps versus a database.** In memory for the interview; in production the row lock and the partial unique indexes are the real guarantee.
-- **Linear scan in `LowestFloorFirst`.** O(spots), fine for a few thousand spots; a free list per type is O(1) but more code.
+- **Linear scan in `LowestFloorFirst`.** O(spots) (time grows with the number of spots), fine for a few thousand spots; a free list per type is O(1) but more code.
 - **Lost-ticket penalty as a field, not a strategy.** It is one number today; promote it to a strategy if the rules grow.
 
 ## Drawing 🟢
@@ -946,7 +959,7 @@ sequenceDiagram
 > `ExitLostTicket` closes the same open ticket that the ticket ID points to, so both indexes are deleted. A later `Exit` with the found ticket returns `ErrTicketNotFound`; in the database, `UPDATE ... WHERE exit_at IS NULL` updates 0 rows.
 
 > [!question]- When would you shard the single mutex, and what gets harder?
-> Only when profiling shows gates waiting on the lock, which one lot rarely produces. Per-type or per-floor locks raise throughput, but `FreeCount` across shards is no longer one snapshot, and the fallback strategy must take two locks in a fixed order to avoid deadlock.
+> Only when profiling shows gates waiting on the lock, which one lot rarely produces. Per-type or per-floor locks raise throughput, but `FreeCount` across shards is no longer one snapshot, and the fallback strategy must take two locks in a fixed order to avoid deadlock (two goroutines each waiting forever for the other's lock).
 
 ## Interview explanation 🔴
 
@@ -966,6 +979,26 @@ For a lost ticket the attendant looks up the open ticket by plate and charges th
 - Price by the vehicle type stored on the ticket, never by the spot type.
 - Per started hour, minimum one hour, `int64` paise, injected clock.
 - Lost ticket: find by plate, fee + flat penalty, the old ticket ID dies.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What is a ticket in this design: the car, or the visit?
+> The visit. It links one vehicle to one spot with an entry time, and it dies at exit.
+
+> [!question]- 🟢 Why is money stored as `int64` paise and not `float64`?
+> Floats cannot hold amounts like ₹0.10 exactly, so fees drift; whole paise are always exact.
+
+> [!question]- 🟢 Name the two swappable strategies.
+> Allocation (which spot to pick) and pricing (how much to charge).
+
+> [!question]- 🟡 Two gates, one free spot, same second. What stops both getting it?
+> Pick and "mark taken" happen inside one mutex lock, so the second gate sees the spot already taken and gets `ErrNoSpot`.
+
+> [!question]- 🟡 A bike parks in a car spot under fallback. Which rate does it pay, and why?
+> The bike rate, because the fee uses the vehicle type saved on the ticket, not the spot type.
+
+> [!question]- 🟡 With many servers and one database, what replaces the mutex?
+> `SELECT ... FOR UPDATE SKIP LOCKED` to claim a row, backed by partial unique indexes so one spot or plate can never have two open tickets.
 
 ## Links 🟢
 

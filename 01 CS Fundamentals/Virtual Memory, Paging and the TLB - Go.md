@@ -21,11 +21,17 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
 > - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Virtual Memory, Paging and the TLB]]: the theory twin. Know the four outcomes of a memory access: TLB hit, TLB miss, minor fault, major fault.
+> - [[Memory Hierarchy and CPU Caches]] and [[Processes, Threads and Context Switching]]: caches and processes, background only.
+
 **From zero** 🟢: this file is the hands-on side of [[Virtual Memory, Paging and the TLB]]. It builds a tiny pretend MMU in Go — a page table, a small LRU TLB and a few physical frames — so that TLB hits, TLB misses and page faults become things a test can trigger and check on purpose. Read the notes, then the tests.
 
 ## Before the code 🟢
 
 - **Maps** (`map[uint64]*pte`): Go's built-in hash table. Here it plays the page table and the TLB's storage.
+- **PTE (page table entry)**: one row of the page table: which physical frame a virtual page uses, and whether it is present or swapped out.
+- **VPN (virtual page number)**: the address divided by the page size (4096); the offset is the remainder.
 - **Pointers to structs** (`*pte`, `*MMU`): changing `entry.swapped` through a pointer changes the one shared entry, not a copy.
 - **Defined types** (`type Event string`): a new named type built on `string`, so only the four named constants are meant to be used.
 - **Slices** (`order []uint64`): a growable list. The TLB uses one to remember which page was used least recently.
@@ -58,11 +64,15 @@ flowchart LR
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** what the toy MMU simulates. **Next we read the code:** steps 1-5 build the MMU, steps 6-8 build the small LRU TLB.
+
 **Reading order.** Steps 1-5 build `mmu.go`: the outcome names, the MMU's state, the two cheap translation paths, the two fault paths, and frame allocation with eviction.
 
 Steps 6-8 build `tlb.go`, the small LRU cache that sits in front of the page table. The tests at the end pin each of the four outcomes to one concrete access sequence, so read a step and then find the test that exercises it.
 
 ### Step 1: naming the four outcomes
+
+**What this code does, in plain words:** it names the four possible results of an access and defines a page-table entry with a frame number plus "present" and "swapped" flags.
 
 **Concept.** The theory note's translation-path diagram ends in one of four named outcomes ([[Virtual Memory, Paging and the TLB#The translation path]]).
 
@@ -101,6 +111,8 @@ type pte struct {
 
 ### Step 2: the MMU's state and constructor
 
+**What this code does, in plain words:** it builds the pretend MMU: an empty page table, an empty TLB of a given size, and a cap on how many physical frames it may use.
+
 **Concept.** `MMU` holds exactly the state the theory note's mental model needs: a page table (the big, slow map), a TLB (the small, fast cache in front of it), and a bounded pool of physical frames.
 
 The frame pool is bounded because demand paging only becomes observable once frames can run out ([[Virtual Memory, Paging and the TLB#Multi-level page tables]]).
@@ -138,6 +150,8 @@ func offset(addr uint64) uint64 { return addr % pageSize }
 
 ### Step 3: Translate — the fast paths
 
+**What this code does, in plain words:** it splits the address into page and offset, returns a TLB hit if the page is cached, a TLB miss if the page table has it, and otherwise hands off to the fault handler.
+
 **Concept.** `Translate` is the code form of the theory note's translation-path flowchart: check the TLB first, and if that misses, check the page table for an already-resident mapping ([[Virtual Memory, Paging and the TLB#The translation path]]).
 
 This piece handles the two cheap outcomes; the next step handles the two fault outcomes.
@@ -170,6 +184,8 @@ func (m *MMU) Translate(vaddr uint64) (paddr uint64, event Event) {
 
 ### Step 4: Translate — the two fault outcomes
 
+**What this code does, in plain words:** if the page was swapped out it reports a major fault, otherwise a minor fault; either way it gets a frame, updates the page table and caches the translation.
+
 **Concept.** The theory note draws a sharp line between a minor fault (no disk I/O) and a major fault (data must come back from "swap") ([[Virtual Memory, Paging and the TLB#The translation path]]).
 
 `handleFault` is where that distinction actually lives in code: it is entirely about whether a page-table entry already exists in the swapped state.
@@ -201,6 +217,8 @@ func (m *MMU) handleFault(vp, vaddr uint64, entry *pte, existed bool) (paddr uin
 3. Both branches fill the TLB before returning, matching `Translate`'s TLB-miss path — every successful translation, fault or not, ends with the TLB primed for the next access to the same page.
 
 ### Step 5: allocating (and evicting) physical frames
+
+**What this code does, in plain words:** it hands out the next free frame, or, when all frames are used, takes one back from another page, marks that page as swapped, and removes it from the TLB.
 
 **Concept.** This is where the theory note's "the hotel only has so many rooms" idea becomes concrete: once `maxFrames` is reached, giving a new page a frame means taking one away from some other page first ([[Virtual Memory, Paging and the TLB#6. Trade-offs and when not to use 🟡]]).
 
@@ -251,6 +269,8 @@ func (m *MMU) evictAndReuse(forPage uint64) uint64 {
 
 ### Step 6: the TLB's shape and constructor
 
+**What this code does, in plain words:** it defines the TLB as a map (page → frame) plus a list that remembers which page was used least recently.
+
 **Concept.** `lruTLB` is the code form of "the TLB is just a small, fast cache" ([[Virtual Memory, Paging and the TLB#The TLB is just a small, fast cache]]) — a fixed-capacity map plus a recency-ordered list of keys, the classic shape of any hand-rolled LRU cache.
 
 ```go
@@ -275,6 +295,8 @@ func newLRUTLB(capacity int) *lruTLB {
 2. Capacity is fixed at construction and never grows — matching real hardware, where a TLB has a fixed number of hardware slots, not a dynamically resizable one.
 
 ### Step 7: lookup, insert and touch
+
+**What this code does, in plain words:** `lookup` finds a cached translation and marks it recently used; `insert` adds one, first evicting the least recently used entry if the TLB is full.
 
 **Concept.** `lookup` and `insert` are the TLB's two operations from the theory note's diagrams: check for a cached translation, and record a new one, evicting the oldest if the TLB is already full.
 
@@ -315,6 +337,8 @@ func (t *lruTLB) touch(page uint64) {
 3. `touch`'s linear scan to remove `page` from `order` before re-appending it is `O(capacity)`, not `O(1)` — acceptable here because a TLB's capacity is small by definition (dozens to a few thousand entries in real hardware), but a production software LRU cache at a much larger scale would use a doubly linked list with a side map for `O(1)` moves instead.
 
 ### Step 8: invalidate and eviction
+
+**What this code does, in plain words:** it removes one page's cached translation, and finds the oldest entry to evict.
 
 **Concept.** `invalidate` is what `allocateFrame`'s eviction path calls when a page's physical frame is reclaimed — a stale TLB entry must not survive past the point its underlying mapping stopped being true.
 
@@ -464,6 +488,8 @@ That function marks whichever page it evicts (the lowest-numbered frame, here fr
 
 That is a correctness bug that would look like "re-accessing lost data silently becomes a fresh zero-filled page," which is a much worse failure than a slow major fault.
 
+> 🟡 → 🔴 **You now know** the whole MMU model and the four tests that pin each outcome. **Next comes the advanced part:** where this model is simpler than a real kernel (eviction choice, no real swap data, no locking) and the `O(capacity)` cost hidden in the TLB.
+
 ## Pitfalls in the code 🔴
 
 - **The eviction policy is not a real LRU over frames.** `evictAndReuse` picks the *lowest-numbered* occupied frame, not the least-recently-accessed page — two different things.
@@ -481,6 +507,30 @@ That is a correctness bug that would look like "re-accessing lost data silently 
 1. Change `evictAndReuse`'s victim selection from "lowest-numbered frame" to true LRU (track access order per *frame*, not per TLB entry) and re-run `TestFrameExhaustionCausesMajorFaultOnReaccess` with a third page added. Predict which page gets evicted under each policy before running it.
 2. Add a `Stats() (hits, misses, minorFaults, majorFaults int)` method to `MMU` that counts each `Event` across every `Translate` call. Write a test asserting the exact counts after a fixed sequence of accesses.
 3. `lruTLB.touch` and `invalidate` both scan `order` linearly to find a page. Refactor `lruTLB` to use a `map[uint64]int` of page→index into a doubly linked list (or Go's `container/list`) for `O(1)` touch and invalidate, then confirm all four existing tests still pass unchanged.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does the very first `Translate` on a new page return?
+> `MinorFault`: the page was never mapped.
+
+> [!question]- Why is `Translate(0x1004)` right after `Translate(0x1000)` a TLB hit?
+> Both addresses are in page 1 (4096-8191), which the first call cached.
+
+> [!question]- What does a 2-frame MMU do when a third page arrives?
+> It evicts a frame, marks that page swapped, and reuses the frame.
+
+🟡 Medium
+
+> [!question]- Why does evicting a TLB entry give a `TLBMiss`, not a fault, on re-access?
+> The page table still has the mapping; only the cached copy was dropped.
+
+> [!question]- Why must `evictAndReuse` call `tlb.invalidate`?
+> Otherwise a stale TLB entry would point at a frame that now holds another page's data.
+
+> [!question]- Why is the re-access in Test 4 a `MajorFault`?
+> The evicted page's entry was kept but marked swapped, which means its data must come back from "disk".
 
 ## Links
 

@@ -33,6 +33,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+> - [[Back-of-the-Envelope Estimation]]: turning keys × bytes into terabytes and machine counts.
+> - [[Consistent Hashing]]: a way to map keys to servers so adding a server moves only a few keys.
+> - [[Caching Patterns]]: cache-aside means "check the cache, on a miss read the database and save a copy".
+
 **From zero, in 60 seconds** 🟢
 
 A **cache** is a fast memory store that keeps answers you asked for recently.
@@ -73,6 +79,11 @@ So you keep recent answers in fast memory, spread over many machines, and ask th
 | TTL | How long an entry lives before it expires | Keep the price for 300 s |
 | Eviction | Throwing out entries when memory is full | LRU drops the least recently used key |
 
+| Hit / miss | The cache had the answer / did not have it | 95 hits and 5 misses in 100 reads |
+| Hash slot | One of 16,384 fixed buckets Redis Cluster splits keys into | `user:42` falls in slot 9,189 |
+| Smart client | An app library that knows which node owns which keys | it sends `GET` straight to node B |
+| Stampede | Many requests missing the cache at once and all hitting the database | a hot key expires, 5,000 queries follow |
+
 **Picture it**
 
 ```mermaid
@@ -106,8 +117,15 @@ A big product needs terabytes and millions of operations per second. You cannot 
 
 **Everyday picture.** A library has one librarian with one desk. When 10,000 people arrive, you open 50 desks, each responsible for a range of the alphabet. A person must know which desk to walk to. That is partitioning. If a desk closes, only its alphabet range is disrupted. That is why you use consistent hashing and not "key mod number-of-desks".
 
+### Real-life example: a big sale day 🟢
+
+On a flash-sale day on a shopping app like Flipkart, millions of people open the same few product pages within minutes.
+If every page view asked the database for the price and photos, the database would fall over.
+Instead, the app keeps each product's details in a cache cluster. The first visitor's read fills it, and the next million reads come from memory.
+If one cache machine dies, its backup takes over in seconds and only a small slice of reads goes to the database.
+
 **Functional requirements**
-- `GET key`, `SET key value [TTL]`, `DELETE key`. Optionally `INCR`, `MGET` (batch reads) and compare-and-set.
+- `GET key`, `SET key value [TTL]`, `DELETE key`. Optionally `INCR`, `MGET` (batch reads) and compare-and-set (write only if the value has not changed since you read it).
 - Every entry may have a time-to-live (TTL).
 - Values are opaque blobs up to a limit (assume 1 MB hard limit, 1 KB typical).
 - Clients in many languages and many services share the cache.
@@ -155,9 +173,26 @@ Three ideas carry the whole design:
 > [!tip] Remember
 > A cache is a bet that "the future looks like the recent past". Everything else (hashing, replication, eviction) exists to make that bet cheap and safe.
 
+## Common beginner mistakes 🟢
+
+- **Using `hash(key) mod N` to pick a node** → adding one node moves almost every key and the database gets flooded → use consistent hashing or fixed slots.
+- **Caching with no TTL** → stale data can stay forever after a missed invalidation → always set a TTL as a safety net.
+- **Treating the cache as the only copy** → a crash or eviction loses data for good → keep the database as the source of truth.
+- **Updating the cache on write instead of deleting it** → two writers can leave the older value in the cache → write the database, then delete the key.
+- **Letting many popular keys expire at the same second** → a burst of misses hits the database → add a little random jitter to each TTL.
+
 ## 3. How it works - high-level design 🟡
 
+> 🟢 → 🟡 **You now know** why one cache box is not enough and that the database stays the truth. **Next we open the box**: how a request finds its node, what happens on a hit and a miss, and three ways to decide which node owns a key.
+
 ### Cluster layout and request flow
+
+**Step by step:**
+1. The app wants `user:42:profile`. Its client library turns the key into a number, then into a slot, say 9,189.
+2. Its local map says slot 9,189 belongs to node B. It sends `GET` straight to node B.
+3. Node B has it: the answer comes back in well under a millisecond.
+4. Node B also streams every write to its replica B', so B' has a near-copy ready.
+5. If node B dies, B' takes over the same slots and the client updates its map.
 
 ```mermaid
 flowchart TB
@@ -201,7 +236,7 @@ flowchart TB
 
 **In plain words:** first check the cache. If it has the answer, done. If not, read the database and save a copy in the cache for next time.
 
-1. The client takes the key `user:42:profile` and computes the hash (CRC16 in Redis Cluster, a ring hash in Memcached clients).
+1. The client takes the key `user:42:profile` and computes the hash (CRC16, a simple checksum function, in Redis Cluster; a ring hash in Memcached clients).
 2. It looks up which node owns that hash in its local map.
 3. It sends `GET` straight to that node. One network round trip.
 4. The node does a hash-table lookup, checks the TTL, and updates the LRU or LFU metadata.
@@ -233,10 +268,16 @@ sequenceDiagram
 
 **In plain words:** three different rules for "which machine owns this key", and how many keys each rule moves when you add a machine.
 
+**Step by step:**
+1. You have 10 cache nodes and 1 million keys.
+2. With `hash mod 10`, adding an 11th node changes the answer for about 910,000 keys. Nearly all reads miss at once.
+3. With a ring, each node sits at many points on a circle; a key goes to the next node clockwise. Adding node 11 takes only about 90,000 keys from its neighbours.
+4. With Redis's 16,384 fixed slots, you hand node 11 about 1,500 slots. Only the keys in those slots move.
+
 | Approach | How the owner is found | Resize cost | Used by |
 | --- | --- | --- | --- |
 | `hash(key) mod N` | N is the node count | Changing N from N to N+1 remaps about `N/(N+1)` of keys (almost all), so the cache goes nearly cold | Toy designs only |
-| Consistent hashing ring with virtual nodes | Nodes sit on a ring; a key belongs to the next node clockwise | Only about `1/N` of keys move | Memcached clients (ketama style), Dynamo, Cassandra |
+| Consistent hashing ring with virtual nodes (many points on the ring for each real server) | Nodes sit on a ring; a key belongs to the next node clockwise | Only about `1/N` of keys move | Memcached clients (ketama style), Dynamo, Cassandra |
 | Fixed hash slots | Key goes to one of 16,384 slots; slots are assigned to nodes | Move whole slots between nodes; only those keys move | Redis Cluster |
 
 Decision guide: [[Choosing Consistency, Replication and Partitioning - Decision Guide]]. Background theory: [[Consistent Hashing]].
@@ -266,7 +307,7 @@ miss -> [DB] -> SET with TTL (jittered)
 | Keys | given | 1.5 billion |
 | Bytes per entry | 1 KB value plus about 100 B for key, pointers, TTL, LRU bits | about 1.1 KB |
 | Total data | 1.5 × 10^9 × 1.1 KB | about 1.65 TB |
-| Usable RAM per node | 64 GB machine, leave headroom for the OS, fragmentation, and fork copy-on-write | about 50 GB |
+| Usable RAM per node | 64 GB machine, leave headroom for the OS, fragmentation, and fork copy-on-write (extra memory Redis may need while saving a snapshot in the background) | about 50 GB |
 | Primaries needed (memory bound) | 1.65 TB / 50 GB | 33 |
 | With one replica each | 33 × 2 | 66 nodes |
 | Throughput per primary | 1.1M ops/s / 33 | about 33k ops/s, comfortable |
@@ -278,7 +319,7 @@ miss -> [DB] -> SET with TTL (jittered)
 
 **In plain words:** basically get, set with an expiry time, and delete.
 
-The cache's client API is tiny. The server speaks a text or binary protocol (RESP for Redis, the memcached protocol for Memcached).
+The cache's client API is tiny. The server speaks a text or binary protocol (RESP, the Redis Serialization Protocol, for Redis, the memcached protocol for Memcached).
 
 | Operation | Behaviour | Notes |
 | --- | --- | --- |
@@ -287,7 +328,7 @@ The cache's client API is tiny. The server speaks a text or binary protocol (RES
 | `SET key value EX ttl` | Write with TTL | Always set a TTL; never cache forever |
 | `DEL key` | Remove | Used for invalidation on write |
 | `INCR key` | Atomic counter | Single node owns it, so it is atomic |
-| `CAS key token value` | Set only if unchanged | Memcached `cas`, Redis `WATCH` or Lua |
+| `CAS key token value` | Set only if unchanged | Memcached `cas`, Redis `WATCH` or Lua (a small script Redis runs as one step) |
 
 Multi-key commands in Redis Cluster only work when all keys live in the same slot. Use **hash tags**: `{user:42}:profile` and `{user:42}:settings` hash only the text inside the braces, so they share a slot.
 
@@ -309,16 +350,16 @@ flowchart LR
 
 - **Entry:** key, value bytes, absolute expiry time, and bits for the eviction policy.
 - **Memcached** groups memory into **slab classes** (fixed chunk sizes such as 96 B, 120 B, 152 B) so allocation is fast and fragmentation is bounded, at the cost of some wasted space inside each chunk.
-- **Redis** uses a general allocator (jemalloc) and approximated LRU: it samples a handful of random keys and evicts the oldest, which avoids keeping a full linked list.
+- **Redis** uses a general allocator (jemalloc, the library that hands out memory) and approximated LRU: it samples a handful of random keys and evicts the oldest, which avoids keeping a full linked list.
 
 ### One request traced through a failover
 
 **In plain words:** a machine crashes; for a few seconds its keys fail, then its backup takes over and things work again.
 
 1. Node B (slots 5461-10922) crashes at 10:00:00.
-2. Other nodes stop hearing B's gossip pings. After a timeout (Redis `cluster-node-timeout`, often 15 s by default; an assumed setting), a majority of primaries mark B as failed.
+2. Other nodes stop hearing B's gossip pings (small "I'm alive, here is what I know" messages nodes swap with each other). After a timeout (Redis `cluster-node-timeout`, often 15 s by default; an assumed setting), a majority of primaries mark B as failed.
 3. B's replica B' is promoted to primary and takes ownership of the same slots.
-4. Clients get `MOVED` errors or refresh their map and start talking to B'.
+4. Clients get `MOVED` errors (the node's reply "this slot now lives on another node") or refresh their map and start talking to B'.
 5. Writes made to B in the last milliseconds and not yet replicated are lost. That is acceptable for a cache. The database still has the truth.
 6. Cache misses for those lost keys go to the database. Because only the lost writes (not the whole slice) are missing, the database sees a small bump, not a flood.
 
@@ -332,7 +373,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | Client-side sharding (Memcached clients) | Library holds the node list and ring | No extra hop, no proxy to run | Every language needs the library; changing the node list means redeploying or pushing config; nodes do not coordinate |
 | Smart client plus cluster-aware nodes (Redis Cluster) | Client caches the slot map; nodes answer `MOVED` | One hop, nodes self-heal using gossip | Clients must understand the cluster protocol; multi-key ops limited to one slot |
-| Proxy tier (twemproxy, mcrouter, Envoy) | Clients talk to a proxy that shards | Thin clients, central place for routing policy, pooling, and failover | Extra network hop (about 0.1-0.5 ms, an estimate); proxy becomes a fleet to scale |
+| Proxy tier (twemproxy, mcrouter, Envoy: middle servers that forward each request to the right cache node) | Clients talk to a proxy that shards | Thin clients, central place for routing policy, pooling, and failover | Extra network hop (about 0.1-0.5 ms, an estimate); proxy becomes a fleet to scale |
 
 ### Which engine?
 
@@ -342,7 +383,7 @@ flowchart LR
 | --- | --- | --- |
 | Data types | Strings only | Strings, hashes, lists, sets, sorted sets, streams |
 | Threading | Multi-threaded | Mostly single-threaded command execution per node (I/O threads optional) |
-| Persistence | None | Optional (RDB snapshots, AOF) |
+| Persistence | None | Optional (RDB snapshots: a full dump to disk now and then; AOF: a log of every write) |
 | Replication | None built in | Built in |
 | Clustering | Client-side ring | Server-side with hash slots and gossip |
 | Memory efficiency for plain small values | Very good (slabs) | Good; per-key overhead is higher |
@@ -381,6 +422,14 @@ flowchart LR
     DEL --> R["Next read misses,<br/>loads fresh value"]
 ```
 
+### Things people confuse a distributed cache with 🟡
+
+| Thing | What it is | How it differs |
+| --- | --- | --- |
+| Database | The source of truth, kept safely on disk | A cache may forget anything at any time |
+| CDN ([[CDN and Edge]]) | Servers near users that hold files and pages | Caches whole responses at the network edge; this cache holds data for your app servers |
+| In-process (local) cache | A map inside each app server's memory | Fastest, but each server has its own copy and they drift apart |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - **Consistent hashing over modulo because** a node change moves only about `1/N` of keys. Price: you need virtual nodes to even out load, and the ring or slot map must be distributed to all clients.
@@ -403,7 +452,9 @@ flowchart TD
 
 ## 7. In production 🔴
 
-- **Facebook (public paper):** *Scaling Memcache at Facebook* describes memcached clusters in each region, a proxy called mcrouter that does routing and connection pooling, and **leases** to prevent stale sets and thundering herds. A **gutter pool** of spare servers takes traffic when a primary memcached server fails so the database is shielded. Invalidations were sent by tailing the database commit log (the paper calls the daemon McSqueal).
+> 🟡 → 🔴 **You now know** the layout, sizing, API, engines, eviction and write strategies. **Next is the advanced part**: how Facebook and Redis run this for real, hot keys, stampedes, keeping cache and database in step, failover and adding nodes without a cold cache.
+
+- **Facebook (public paper):** *Scaling Memcache at Facebook* describes memcached clusters in each region, a proxy called mcrouter that does routing and connection pooling, and **leases** to prevent stale sets and thundering herds (crowds of requests rushing the database at the same moment). A **gutter pool** of spare servers takes traffic when a primary memcached server fails so the database is shielded. Invalidations were sent by tailing the database commit log (the paper calls the daemon McSqueal).
 - **Redis Cluster (documented):** 16,384 hash slots, nodes exchange state through a gossip cluster bus, clients follow `MOVED` and `ASK` redirections, and a replica is promoted when a majority of primaries agree the primary has failed.
 - **Memcached (documented):** servers do not know about each other; sharding is done by the client, and memory uses slab classes with a per-class LRU.
 - **Twitter's twemproxy (documented):** a lightweight proxy that shards across many memcached or Redis servers and reduces connection counts.
@@ -464,7 +515,7 @@ sequenceDiagram
 
 **In plain words:** one super popular key sends all its traffic to one machine. The fix is to keep extra copies of that key in more places.
 
-A celebrity profile or a flash-sale product can send 200,000 reads per second to one key. Consistent hashing sends all of them to one node, which saturates its CPU or NIC while the other 32 nodes idle.
+A celebrity profile or a flash-sale product can send 200,000 reads per second to one key. Consistent hashing sends all of them to one node, which saturates its CPU or NIC (network card) while the other 32 nodes idle.
 
 ```mermaid
 flowchart TB
@@ -513,7 +564,7 @@ sequenceDiagram
     C-->>B: hit
 ```
 
-Cheaper alternatives in the app: **single-flight** (one in-process call per key, others wait for its result), **early refresh** (refresh at 80% of the TTL in the background), and **stale-while-revalidate**.
+Cheaper alternatives in the app: **single-flight** (one in-process call per key, others wait for its result), **early refresh** (refresh at 80% of the TTL in the background), and **stale-while-revalidate** (serve the old value while one caller fetches the new one).
 
 ### 8.4 Keeping the cache and the database consistent
 
@@ -536,7 +587,7 @@ sequenceDiagram
     R->>C: SET key new value
 ```
 
-A small race remains: a reader that loaded the old value just before the update can store it just after the delete. Remedies: a short TTL, a lease, or invalidation driven by the database's change stream (CDC), which is how Facebook's design invalidated keys. See [[Cache Invalidation, TTL and Consistency]] and [[Transactional Outbox and CDC]].
+A small race remains: a reader that loaded the old value just before the update can store it just after the delete. Remedies: a short TTL, a lease, or invalidation driven by the database's change stream (CDC, change data capture: reading every change from the database's log), which is how Facebook's design invalidated keys. See [[Cache Invalidation, TTL and Consistency]] and [[Transactional Outbox and CDC]].
 
 ### 8.5 Failure detection and failover
 
@@ -595,6 +646,26 @@ flowchart LR
 
 > [!question]- Would you ever make the cache strongly consistent with the database?
 > Rarely. It needs distributed transactions or synchronous invalidation, which costs latency and availability. Prefer short TTLs plus invalidation from the change stream, and bypass the cache for the few reads that must be exact (for example a balance check inside a payment).
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is the source of truth, the cache or the database?
+> The database. The cache can lose anything at any time.
+
+> [!question]- Easy: what does a TTL do?
+> It makes a cached entry expire after a set time, such as 300 seconds.
+
+> [!question]- Easy: what is eviction?
+> Throwing out entries when memory is full, for example the least recently used ones.
+
+> [!question]- Medium: why not `hash(key) mod N`?
+> Changing N remaps almost all keys, so the cache goes cold and the database is flooded.
+
+> [!question]- Medium: 1.5 billion keys of about 1.1 KB, 50 GB usable per node. How many primaries?
+> 1.65 TB ÷ 50 GB ≈ 33 primaries, 66 nodes with one replica each.
+
+> [!question]- Medium: a popular key expires and 5,000 requests miss at once. Fix?
+> Let one caller refill it (lease or single-flight) and serve stale data to the rest; add TTL jitter.
 
 ## 10. Cheat sheet 🟢
 

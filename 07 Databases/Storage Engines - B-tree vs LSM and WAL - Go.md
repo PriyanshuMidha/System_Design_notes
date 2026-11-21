@@ -37,6 +37,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Work through the Code steps, Design decisions, Tests and Running it.
 > - 🔴 **Interview / SDE-3 prep?** Add Pitfalls and do the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Storage Engines - B-tree vs LSM and WAL]]: the theory half. Log first and flush, then answer; LSM trees write sorted files and merge them later.
+> - [[Indexing Fundamentals]]: data is kept sorted by key so lookups are fast.
+> - [[Transactions and ACID]]: a committed change must survive a crash.
+> - [[Page Cache, File Systems and fsync]]: a normal write sits in the OS's memory until `fsync` pushes it to disk.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on half of [[Storage Engines - B-tree vs LSM and WAL]]. It builds two tiny toys in plain Go: a **WAL** (a diary file the database writes before saying "saved", with checksums so a crash cannot leave a lie in it) and a mini **LSM tree** (writes pile up in memory, get dumped as sorted files, and get merged later). You then run real tests and benchmarks on your own machine and see the theory's numbers appear: one disk flush per commit is about 100 times slower than one flush shared by 100 commits, and merging files more often makes writes expensive but reads cheap. Read it top to bottom; every code block is followed by a "How it works" list that explains it line by line.
@@ -83,6 +89,8 @@ flowchart LR
 - The tests use real files in `t.TempDir()`, so `File.Sync` really flushes. On macOS Go issues `F_FULLFSYNC`, which is why a single flush costs milliseconds.
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** the two toys: a crash-safe log and a tiny LSM tree. **Next we open the box**: how each log record is framed and checked, how recovery stops at a torn record, how group commit saves flushes, then the LSM write path, compaction and reads.
 
 The code is two independent pieces that a real engine would combine. `wal.go` is the durability half: a log you append to and replay after a crash. `lsm.go` is the speed half: an in-memory table that spills to sorted runs and merges them. The WAL is left out of the LSM tree on purpose, to keep each lesson small.
 
@@ -227,6 +235,8 @@ Where each failure kind is caught, for a log of three good frames followed by da
 | full header, half payload | payload `ReadFull` fails |
 | full frame, flipped bit | CRC mismatch |
 | garbage header with length 4 GiB | `n > 1<<20` guard |
+
+**What this code does, in plain words:** this is the second half of recovery. For each good record it unpacks the key and value from the payload and hands the record to `apply`; after the loop it cuts the file at the last good record so new appends start clean.
 
 ```go
 		klen, w := binary.Uvarint(p)
@@ -449,6 +459,8 @@ Before and after one compaction with a tombstone, `maxRuns` 1:
 | --- | --- | --- |
 | before | `a` tombstone, `c`=3 | `a`=1, `b`=2 |
 | after (one run) | `b`=2, `c`=3 | none |
+
+**What this code does, in plain words:** `Get` looks in the in-memory table first, then in each sorted run from newest to oldest, and returns the first version it finds; if that version is a tombstone, the key counts as deleted.
 
 ```go
 // Get checks the memtable, then each run from newest to oldest.
@@ -719,6 +731,8 @@ BenchmarkCommitGrouped-10      	       3	   3953264 ns/op
 
 ## Pitfalls in the code 🔴
 
+> 🟡 → 🔴 **You now know** how both toys work and what the tests and benchmarks measure. **Next are the traps** that separate a toy from a real engine: unsynced appends, half-applied batches, unsafe tombstone drops and missing concurrency control.
+
 - **`Append` without `sync` is not a commit.** The write sits in the OS page cache until something flushes it; a machine crash can lose it. Only `Append(true, ...)` is the commit point.
 - **A grouped `Append` is all or nothing only up to the first torn record.** If the crash happens mid-way through a batch, recovery keeps the intact leading records and drops the rest, so a caller must not acknowledge any record in a batch before `Append` returns.
 - **The length check in `OpenWAL` matters.** Without the `n > 1<<20` guard, a garbage length in a torn header could make `make([]byte, n)` allocate gigabytes.
@@ -731,6 +745,30 @@ BenchmarkCommitGrouped-10      	       3	   3953264 ns/op
 1. In `TestCompactionTradeoff`, change the memtable limit from 1,000 to 5,000 keys. Predict the direction of write amplification and of runs probed per miss for `maxRuns = 4`, then run it.
 2. Call `Append(false, rec)` in the torn-tail test instead of `Append(true, rec)`. Does the test still pass on your machine? Explain why that does not prove the unsynced version is crash safe.
 3. Add a `Tree.Delete` test: put a key, flush it into a run, delete it, and check that `Get` reports it missing before and after `compact`. Predict how `DiskBytes` changes after the compaction.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why does each WAL record carry a CRC and a length?
+> So recovery can tell a complete record from a half-written or damaged one and stop there.
+
+> [!question]- When is an `Append` actually a commit?
+> Only after `Sync` (the `fsync`) returns; before that the bytes may still be only in OS memory.
+
+> [!question]- What does `Get` return if the newest version of a key is a tombstone?
+> "Not found": it must not look in older runs, or the deleted key would come back.
+
+🟡 Medium
+
+> [!question]- Why did 100 commits get about 100 times cheaper with one grouped `fsync`?
+> The flush is the expensive part, and one flush makes all 100 records durable.
+
+> [!question]- In `TestCompactionTradeoff`, what happens as `maxRuns` grows?
+> Write amplification falls (fewer merges) and runs probed per read rise (more files to check).
+
+> [!question]- Why is it safe for `compact` to drop tombstones here but not in a leveled engine?
+> Here everything merges into one run, so no older copy is left; with levels, an older copy could still exist below.
 
 ## Links 🟢
 

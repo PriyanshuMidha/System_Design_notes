@@ -36,6 +36,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: a `POST` request sends a body to a URL, with headers like `Content-Type`.
+> - [[Choosing an API Style]]: REST is the normal default; SOAP appears mostly when an old partner forces it.
+
 **From zero, in 60 seconds** 🟢
 
 Some partners — banks, insurers, governments — built their systems 20 years ago, and those systems speak only one very strict format: **SOAP**.
@@ -81,6 +85,9 @@ That strict format is SOAP, and the form's rule book is WSDL.
 | Fault | The SOAP error message, sent in the Body instead of a reply | `<faultstring>Account not found</faultstring>` |
 | WSDL | XML contract listing operations, message shapes and the endpoint URL | `AccountService.wsdl` |
 | Adapter | Your code that translates between the partner's format and your own types | `BankClient.Balance(ctx, id)` |
+| `SOAPAction` | A header (SOAP 1.1) naming which operation you call | `SOAPAction: "urn:example:bank#GetBalance"` |
+| `mustUnderstand` | A flag on a header block: reject the message if you cannot handle it | `mustUnderstand="1"` on a security header |
+| WS-Security | A standard for putting login tokens and signatures in the SOAP Header | `wsse:UsernameToken` |
 
 **Picture it.**
 
@@ -116,6 +123,12 @@ The scenario today: your Go checkout service must check an account balance at a 
 - add timeouts and safe retries,
 - and keep XML out of the rest of your codebase.
 
+### Real-life example: an old bank partner 🟢
+
+Many Indian banks, insurers and government systems (for example older payment or tax-filing gateways) still expose SOAP services built in the 2000s.
+A modern app like a lending or insurance app talks REST internally, but one small adapter service speaks SOAP to that bank.
+The rest of the app never sees XML; it just calls `Balance(account)`.
+
 The cost is real. Measured with the Go client below: the `GetBalance` request is **251 bytes** of XML; the equivalent JSON `{"accountId":"ACC-1"}` is **21 bytes**, about 12 times smaller.
 
 ## 2. Mental model 🟢
@@ -130,11 +143,37 @@ SOAP is **registered post with a strict form**:
 
 The name: SOAP 1.1 stood for "Simple Object Access Protocol". SOAP 1.2 dropped the expansion; it is just "SOAP" now.
 
+## Common beginner mistakes 🟢
+
+- **Letting XML types spread through the codebase** → every service now depends on the bank's format → keep SOAP inside one adapter that returns your own types.
+- **Treating HTTP 500 as "server down"** → SOAP faults arrive as 500 with a useful Fault body → parse the Fault before deciding.
+- **Wrong `Content-Type` or `SOAPAction` for the SOAP version** → the server rejects the call → 1.1 uses `text/xml` + `SOAPAction`; 1.2 uses `application/soap+xml; action=...`.
+- **Retrying a money-moving call blindly** → double payments → retry only reads, or use the partner's own idempotency or status-check operation.
+- **No timeouts** → one slow bank call ties up your service → set a deadline on every call.
+
+## Often confused 🟡
+
+| These two | First one | Second one |
+| --- | --- | --- |
+| SOAP vs REST | One XML envelope format, operations named in a WSDL | Resources with URLs and HTTP verbs, usually JSON |
+| SOAP 1.1 vs 1.2 | `text/xml` + `SOAPAction` header | `application/soap+xml` with an `action` parameter |
+| WSDL vs XSD | The whole contract: operations, binding, address | Only the shape of the XML data |
+| Fault vs normal reply | The error, sent in the Body | The answer, sent in the Body |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** SOAP is an XML envelope posted over HTTP and described by a WSDL. **Next we open the box**: what is inside the envelope, how the two SOAP versions differ on the wire, and how to read a WSDL file.
 
 ### The envelope
 
 **In plain words:** every SOAP message is the same onion: Envelope outside, optional Header for stamps and seals, Body for the actual question or answer — or the Fault rejection slip.
+
+**Step by step:**
+1. Your adapter wants the balance of account `ACC-1`.
+2. It writes `<soap:Envelope>`, puts a security token in `<soap:Header>`, and `<b:GetBalance><b:AccountId>ACC-1</b:AccountId></b:GetBalance>` in `<soap:Body>`.
+3. It sends that as an HTTP `POST` with the right `Content-Type` and `SOAPAction`.
+4. Success: the Body holds `GetBalanceResponse` with the amount.
+5. Failure: usually HTTP 500, and the Body holds a `soap:Fault` with a code and a message.
 
 ```mermaid
 flowchart TD
@@ -194,6 +233,13 @@ Content-Type: application/soap+xml; charset=utf-8; action="urn:example:bank#GetB
 ### The WSDL contract
 
 **In plain words:** read a WSDL top to bottom as "what the data looks like → which messages exist → which operations → how they travel → where to send them".
+
+**Step by step:**
+1. `types`: "an `AccountId` is a string; a `Balance` is a decimal".
+2. `message`: "`GetBalanceRequest` contains one `GetBalance` element".
+3. `portType`: "operation `GetBalance` takes that request and returns `GetBalanceResponse`".
+4. `binding`: "send it as SOAP 1.1, document/literal, with this `SOAPAction`".
+5. `service`: "the address is `https://bank.example.com/soap/account`".
 
 A WSDL 1.1 file has five parts, read from abstract to concrete:
 
@@ -665,6 +711,8 @@ A version mismatch is a classic first-day bug: sending a 1.1 envelope to a 1.2-o
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the envelope, faults, both SOAP versions and the WSDL. **Next is the advanced part**: running a SOAP integration safely in production, WS-Security, MTOM attachments and keeping the legacy format behind an anti-corruption layer.
+
 - **Where it still lives:**
 	- Banks and payment processors (core banking, account and mandate services).
 	- Insurance carriers (quotes, policies, claims).
@@ -759,6 +807,26 @@ It owns the timeouts, retries, circuit breaker and caching. When the bank later 
 - In Go: `encoding/xml`, decode the Body with a token stream, read faults even on 500, decimals as strings or integers, never `float64`.
 - Timeouts always; retries only for reads or deduplicated operations; circuit breaker on the partner.
 - Hide the partner behind an anti-corruption adapter so it can be replaced.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what are the three main parts of a SOAP message?
+> Envelope, an optional Header, and the Body.
+
+> [!question]- Easy: what does a WSDL describe?
+> The operations, message shapes, how they travel, and the endpoint address.
+
+> [!question]- Easy: where does a SOAP error go?
+> In a `soap:Fault` inside the Body, usually with HTTP 500.
+
+> [!question]- Medium: how do you stop SOAP XML from spreading through your services?
+> Put all of it in one adapter that exposes plain domain types and errors.
+
+> [!question]- Medium: name one wire difference between SOAP 1.1 and 1.2.
+> 1.1 uses `Content-Type: text/xml` plus a `SOAPAction` header; 1.2 uses `application/soap+xml` with an `action` parameter.
+
+> [!question]- Medium: what does `mustUnderstand="1"` on a header block mean?
+> The receiver must process that block or reject the whole message.
 
 ## Links 🟢
 

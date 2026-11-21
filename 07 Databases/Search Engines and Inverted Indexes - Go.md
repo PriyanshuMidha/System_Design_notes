@@ -22,6 +22,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Walk the Code section step by step, then the Tests: each code block has a numbered walkthrough right under it.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Search Engines and Inverted Indexes]]: the theory half. Text is cleaned into terms, each term points to the documents containing it, and BM25 ranks the matches.
+> - [[Indexing Fundamentals]]: an index is a prepared structure that saves scanning everything.
+> - [[Index Types and Index Design]]: GIN is PostgreSQL's inverted-index type, used in Step 5.
+> - [[Storage Engines - B-tree vs LSM and WAL]]: real engines store the index in write-once segments; this toy keeps it in memory.
+
 **From zero, in one paragraph** 🟢
 
 This file builds a tiny search engine in plain Go, small enough to read in one sitting. It teaches by doing what the theory note explains in words: clean text into search words (the analyzer), keep a map from each word to the documents that contain it (the inverted index), rank matches with the BM25 formula, and answer quoted-phrase searches from stored word positions. Read each short code block, then the numbered notes right below it; nothing uses anything outside Go's standard library, and you can run the whole thing with one test command.
@@ -108,6 +114,8 @@ go vet ./... && go test -race -v ./...
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** what the toy engine does: clean text, record where each term appears, score with BM25 and check phrases. **Next we open the box** one function at a time, then compare it with Postgres full-text search.
+
 The package implements the analyzer, postings with positions, BM25 with Lucene's default parameters, and a phrase query. It is a teaching model: Lucene compresses postings, keeps position gaps where stop words were removed (this toy compacts them), and stores everything in immutable segments.
 
 ### Step 1: the analyzer
@@ -147,6 +155,8 @@ var stopWords = map[string]bool{"the": true, "a": true, "an": true, "for": true,
 3. `stopWords` is a `map[string]bool` used as a set. Looking up a missing key returns `false`, so `stopWords[t]` works without a presence check.
 
 Now the analysis function itself.
+
+**What this code does, in plain words:** it walks through the text, cuts it into words at anything that is not a letter or digit, lowercases each word, drops stop words like "the", and strips a trailing plural `s`. "Overdue invoices for Acme" becomes `overdue`, `invoice`, `acme`.
 
 ```go
 // Analyze is the analysis chain: tokenize on non-letters/digits,
@@ -196,6 +206,8 @@ flowchart LR
 
 The types come first.
 
+**What this code does, in plain words:** it defines one posting (a document ID plus the positions where the term appears) and the index itself: a map from term to its postings, plus each document's length and the total length, which BM25 needs.
+
 ```go
 // Posting records one document that contains a term and where.
 type Posting struct {
@@ -221,6 +233,8 @@ func NewIndex() *Index {
 4. `NewIndex` initializes the maps. Writing to a nil map panics in Go, so the constructor matters.
 
 Now the write method.
+
+**What this code does, in plain words:** `Add` cleans a document's text, then for each term appends "document N, at position P" to that term's list, and records the document's length.
 
 ```go
 // Add indexes one document. Doc IDs must be added in increasing order,
@@ -288,6 +302,8 @@ const (
 
 Then the scoring loop.
 
+**What this code does, in plain words:** for each query term it works out how rare the term is (IDF), then for every document containing it adds that term's BM25 score to the document's running total.
+
 ```go
 // Search scores every document that contains at least one query term
 // (OR semantics) with BM25 and returns hits, best first.
@@ -320,6 +336,8 @@ func (ix *Index) Search(query string) []Hit {
 5. For each posting, `tf` is the number of positions and `dl` the document length. The score contribution is added into `scores[docID]`, so a document that matches several query terms accumulates a sum.
 
 Then the map of scores is turned into a ranked slice.
+
+**What this code does, in plain words:** it turns the "document → score" map into a list and sorts it best first, breaking ties by document ID so results are always in the same order.
 
 ```go
 	// Search, continued: rank the accumulated scores.
@@ -364,6 +382,8 @@ sequenceDiagram
 
 The entry point walks the postings of the first term.
 
+**What this code does, in plain words:** for every document that contains the phrase's first word, it tries each position of that word as a possible start and asks the helper whether the other words follow right after.
+
 ```go
 // Phrase returns docs where the analyzed query terms appear next to each
 // other, in order, using the positions stored in the postings.
@@ -391,6 +411,8 @@ func (ix *Index) Phrase(query string) []int {
 4. `followedBy` checks the remaining terms. On the first successful start the document is added once and `break` stops looking at other starts in the same document.
 
 The helper verifies that each remaining term sits exactly one position further along.
+
+**What this code does, in plain words:** given a start position, it checks that word 2 sits at start + 1, word 3 at start + 2, and so on, in the same document.
 
 ```go
 func (ix *Index) followedBy(doc int, rest []string, at int) bool {
@@ -497,6 +519,8 @@ Limits: `ts_rank` uses term frequency and proximity but **no IDF**, so it is not
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** how each function works. **Next is the senior view**: why the toy is built this way, the tests that check every number by hand, and where it differs from a real engine (stemming, OR semantics, per-index IDF).
+
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
 | Hash map from term to postings | Sorted term dictionary (FST) | Simple and O(1) lookup, but no prefix or range queries on terms |
@@ -515,6 +539,8 @@ Limits: `ts_rank` uses term frequency and proximity but **no IDF**, so it is not
 The five tests below share one fixture of four documents, then check the analyzer, the postings layout, BM25 behavior and the phrase query.
 
 The fixture:
+
+**What this code does, in plain words:** it builds one small index from the same four invoice notes used in the theory note, so every test can predict exact terms, positions and scores.
 
 ```go
 package search
@@ -694,6 +720,30 @@ Reading the table: in the first query, only length separates doc 1 and doc 3. In
 1. Change `k1` to `0` and run `TestBM25PrefersShortDocAndRareTerms`. Predict whether term frequency still matters, and which of the two documents wins.
 2. Change `b` to `0` and re-run the same test. Predict the order of documents 1 and 3, then confirm the scores are equal.
 3. Add a document `ix.Add(5, "invoice invoice invoice")` and search `invoice`. Predict whether it takes first place and how much the third occurrence adds compared with the second (saturation).
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does `Analyze("Overdue invoices for Acme")` return?
+> `overdue`, `invoice`, `acme`: lowercased, stop word dropped, plural stripped.
+
+> [!question]- Why must `Add` receive document IDs in increasing order?
+> So every postings list stays sorted, which merge-style AND intersection relies on.
+
+> [!question]- What extra data does a posting store so phrase queries work?
+> The positions of the term inside the document.
+
+🟡 Medium
+
+> [!question]- Why does doc 4 (`globex`) beat docs containing `invoice` for the query `invoice globex`?
+> `globex` is in 1 of 4 documents, so its IDF (about 1.204) is over three times that of `invoice` (about 0.357).
+
+> [!question]- Why might `overdue for invoice` match the phrase `overdue invoice` here?
+> Stop words are dropped before positions are assigned, so `invoice` ends up right after `overdue`.
+
+> [!question]- What is Postgres's `ts_rank` missing compared with BM25?
+> IDF: it does not weight rare terms higher.
 
 ## Links
 

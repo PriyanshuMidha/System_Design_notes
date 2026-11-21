@@ -31,6 +31,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: a browser sends a request, a server sends back a response, and both carry small labels called headers.
+> - [[DNS - Resolution, Records and Caching]]: before connecting, your device turns a name like `myshop.com` into an IP address.
+
 **From zero, in 60 seconds** 🟢
 
 You open a shopping app. The pictures live on one computer far away (that computer is called the **origin**).
@@ -72,6 +76,11 @@ A CDN keeps copies of those images on servers inside India, so the shopper gets 
 | DNS | The internet's phone book: name to IP address | `myshop.com` to `104.16.1.1` |
 | PoP | One CDN data center in a city | The CDN's Mumbai PoP |
 | Header | Extra key-value info sent with an HTTP message | `Cache-Control: public` |
+| Anycast | Many servers share one IP address; the network sends you to the closest one | Every PoP answers on `104.16.1.1` |
+| Origin shield | One middle cache that all PoPs ask before the origin | A Singapore shield in front of Virginia |
+| Cache key | The "name tag" a cache uses to match a request to a saved copy | host + path, e.g. `myshop.com/product/42` |
+| Purge | Telling the CDN to throw away saved copies now | Purge `product:42` after a price change |
+| Handshake | The few back-and-forth messages that open a connection before data flows | TCP hello, then TLS key exchange |
 
 **Picture it**
 
@@ -99,7 +108,9 @@ Where it breaks: a warehouse cannot know the factory changed a product; a CDN ke
 
 ## 1. Why it exists 🟢
 
-A user in Mumbai requests `product.jpg` from an origin server in Virginia. Round-trip time alone is typically 180–250 ms each way on the open internet for an India-to-US-East route (a representative range for that geography, not a specific measurement); add TCP and TLS handshakes and the first byte of a cold connection can take 400–600 ms before the image even starts downloading.
+🟢 **Plain version:** Far away means slow. A message from Mumbai to Virginia and back takes about 200 ms, and opening a secure connection needs a few of those trips. So one picture can wait half a second before it even starts to download. A CDN keeps a copy in Mumbai, so the trip is a few milliseconds and the far server does almost no work. The `curl` output below is a real check; you can skip its details on a first read.
+
+A user in Mumbai requests `product.jpg` from an origin server in Virginia. Round-trip time alone is typically 180–250 ms each way on the open internet for an India-to-US-East route (a representative range for that geography, not a specific measurement); add TCP and TLS handshakes (the opening messages that set up a connection, then make it secure) and the first byte of a cold connection can take 400–600 ms before the image even starts downloading.
 
 Serve 50,000 users a day and the Virginia server also now has to open and hold 50,000 TLS connections and push every byte itself.
 
@@ -119,9 +130,25 @@ x-cache: MISS, HIT, MISS
 x-served-by: cache-sin-wsat1880030-SIN, cache-sin-wsat1880030-SIN, cache-sin-wsat1880086-SIN, cache-ccu830028-CCU
 ```
 
-`age: 2205` means this exact response has been sitting in a cache for 2205 seconds — the origin did not see this request.
+In the output, `ttfb` is time to first byte (how long until the first piece of the answer arrives). `age: 2205` means this exact response has been sitting in a cache for 2205 seconds — the origin did not see this request.
 
 `x-cache` shows three tiers: the page missed at one shield node, hit at a nearby one, and missed again going toward a further tier — this is the shield/regional/origin tier structure in a single header, not a single flat cache.
+
+### Real-life example: a trailer launch 🟢
+
+A new movie trailer drops and millions open BookMyShow or YouTube in the same ten minutes.
+The poster and the video pieces are the same file for everyone.
+If every phone pulled them from one server, that server would melt and India-to-USA trips would make the video stutter.
+With a CDN, the Mumbai, Delhi and Chennai PoPs each fetch the file once, then serve it to everyone nearby.
+The booking step itself (your seat, your payment) is per-user, so it still goes to the origin, just over a faster connection.
+
+```mermaid
+flowchart LR
+    U1["Fans in Mumbai"] --> M["Mumbai PoP"]
+    U2["Fans in Delhi"] --> D["Delhi PoP"]
+    M -- "first request only" --> O["Origin"]
+    D -- "first request only" --> O
+```
 
 ## 2. Mental model 🟢
 
@@ -133,11 +160,28 @@ Think of a CDN as a chain of warehouses between a factory (the origin) and a cus
 
 **Edge compute** is a small workbench installed inside every warehouse: it can repack a box, check an ID, or redirect an order, without ever calling the factory.
 
+## Common beginner mistakes 🟢
+
+- **Thinking a CDN is only for images and JS files** → it also speeds up logins and checkouts by opening the slow connection nearby → put dynamic routes behind the CDN too, just mark them `no-store`.
+- **Using `no-cache` when you mean "never store"** → `no-cache` still stores the copy, it only checks with the origin before using it → use `no-store` for secrets.
+- **Changing a file but keeping the same URL** → PoPs keep the old copy until its time runs out → put a version or hash in the file name, like `app.8f3a1c.js`.
+- **Adding `Vary: Cookie` to be "safe"** → every user gets their own copy, so the CDN stops sharing anything → strip cookies before the cache lookup instead.
+- **Forgetting `private` on a logged-in page** → the CDN may save one user's page and show it to others → mark per-user responses `private` or `no-store`.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** what a CDN is: nearby helper servers holding copies so users skip the long trip. **Next we open the box**: how a user finds the nearest helper, how the helper decides a copy is still good, and how it protects the origin when many people ask at once. Each subsection starts with a plain step-by-step walk; the full detail follows it.
 
 ### Getting the user to a PoP
 
 **In plain words:** your request should land on the *nearest* helper server. There are two tricks for that, and you only need to know their names.
+
+**Step by step:**
+1. You type `myshop.com` in Mumbai. Your phone asks DNS for its IP address.
+2. With **anycast**, DNS returns one IP, say `104.16.1.1`, that every PoP in the world uses. Internet routers carry your packets to the closest PoP that answers on it, here Mumbai.
+3. With **GeoDNS**, DNS itself looks at where the question came from and hands back the Mumbai PoP's own IP.
+4. Either way you land in Mumbai. If Mumbai has a copy, you are done in a few milliseconds.
+5. If not, Mumbai asks a shield, and only the shield may call the origin in Virginia.
 
 ```mermaid
 flowchart TD
@@ -153,12 +197,19 @@ flowchart TD
     O --> S --> P --> U2
 ```
 
-- **Anycast**: every PoP announces the *same* IP address over BGP. Internet routers naturally send a packet to the announcing PoP with the fewest network hops. No DNS trickery is needed, and failover is just BGP withdrawing a bad PoP's route. Cloudflare and Fastly run this way.
-- **GeoDNS**: the CDN's own DNS servers look at the resolver's IP (via EDNS Client Subnet, or the resolver's own location) and return a different A/AAAA record per region. CloudFront and classic Akamai setups use this. It is coarser-grained than anycast and depends on the *resolver* being close to the user, not the user directly.
+- **Anycast**: every PoP announces the *same* IP address over BGP (Border Gateway Protocol: the system internet providers use to tell each other which addresses they can reach). Internet routers naturally send a packet to the announcing PoP with the fewest network hops. No DNS trickery is needed, and failover is just BGP withdrawing a bad PoP's route. Cloudflare and Fastly run this way.
+- **GeoDNS**: the CDN's own DNS servers look at the resolver's IP (via EDNS Client Subnet, an extra field where the resolver passes along part of the user's IP, or the resolver's own location) and return a different A/AAAA record (the DNS answer that holds an IPv4 or IPv6 address) per region. CloudFront and classic Akamai setups use this. It is coarser-grained than anycast and depends on the *resolver* (the DNS helper your device asks, usually run by your ISP or a service like 8.8.8.8) being close to the user, not the user directly.
 
 ### Hit, miss and revalidation
 
 **In plain words:** the helper either has a fresh copy (hit = instant), has an old copy (it quickly asks the origin "is this still right?"), or has nothing (miss = it fetches one copy for everyone).
+
+**Step by step:**
+1. A request for `/product.jpg` reaches the Mumbai PoP.
+2. The PoP looks up its saved copy. Fresh (saved 10 minutes ago, allowed 1 hour)? It answers at once: a **HIT**.
+3. Copy too old? The PoP asks the origin "I have version `abc`, is it still current?" using the `If-None-Match` header.
+4. Origin says **304 Not Modified** (tiny reply, no body). The PoP marks its copy fresh again and serves it.
+5. Origin sends **200** with a new body instead? The PoP swaps in the new copy. No copy at all? It fetches one: a **MISS**.
 
 ```mermaid
 flowchart LR
@@ -173,11 +224,18 @@ flowchart LR
 
 A **304** is cheap: the origin confirms the cached copy is still correct without resending the body.
 
-This needs the origin to send a validator (`ETag`, or `Last-Modified`) in the first place — see [[HTTP Caching - Cache-Control, ETag, Conditional Requests]] for how the validator itself is computed and compared; this note only covers what the CDN tier does with it.
+This needs the origin to send a validator (`ETag`, a short fingerprint of the file's contents, or `Last-Modified`, the time it last changed) in the first place — see [[HTTP Caching - Cache-Control, ETag, Conditional Requests]] for how the validator itself is computed and compared; this note only covers what the CDN tier does with it.
 
 ### Cache-Control: who may cache, and for how long
 
 **In plain words:** the origin sticks a label on every answer saying *who may keep a copy and for how long*. The labels are just expiry dates and "do not store" stickers.
+
+**Step by step:**
+1. The origin answers with `Cache-Control: public, max-age=60, s-maxage=3600`.
+2. `public` says any cache may keep it, including the CDN.
+3. `max-age=60` tells the browser: reuse it for 60 seconds.
+4. `s-maxage=3600` tells the CDN, a **shared cache** (one cache used by many people): reuse it for 1 hour.
+5. A logged-in page instead says `private` (browser only) or `no-store` (nobody keeps it).
 
 ```http
 Cache-Control: public, max-age=31536000, immutable
@@ -201,15 +259,29 @@ Cache-Control: no-store
 
 **In plain words:** the cache key is the name tag on each saved copy. Two requests with the same name tag share one copy. Wrong name tag = either everyone gets the wrong copy, or nobody shares anything.
 
+**Step by step:**
+1. Ana asks for `myshop.com/product/42`. The key is that host + path. Miss, so the PoP stores the copy under that key.
+2. Ben asks for the same URL. Same key, so he gets Ana's saved copy: a hit.
+3. Chen asks for `/product/42?utm_source=ad`. If the tracking part stays in the key, it is a new key and a needless miss.
+4. If the response says `Vary: Accept-Encoding`, the gzip and brotli versions get two keys. That is fine, only two copies.
+5. If it says `Vary: Cookie`, nearly every user has a different cookie, so nearly every request gets its own key and nothing is shared.
+
 The **cache key** is the set of request attributes the CDN uses to decide whether two requests share a cached entry. By default it's usually scheme + host + path + query string.
 
 - Adding a header to the key via `Vary: Accept-Encoding` is normal and safe — it just means gzip and brotli variants get separate entries.
-- `Vary: Cookie` is close to disabling caching: since almost every request carries a different cookie, almost every request becomes its own cache key, and the hit ratio collapses toward zero. Strip session cookies at the edge before the cache lookup instead, or move personalization out of the cached response entirely.
+- `Vary: Cookie` is close to disabling caching: since almost every request carries a different cookie, almost every request becomes its own cache key, and the hit ratio (the share of requests answered from cache) collapses toward zero. Strip session cookies at the edge before the cache lookup instead, or move personalization out of the cached response entirely.
 - Tracking query parameters (`utm_source`, `gclid`) that don't change the response should be stripped from the cache key (most CDNs call this a "cache key normalization" or "query string allowlist" rule) — otherwise `/product/42?utm_source=a` and `/product/42?utm_source=b` are two cache misses for the same page.
 
 ### Request collapsing and the origin shield
 
 **In plain words:** when a popular copy expires, thousands ask for it in the same second. Instead of thousands of calls to the origin, the CDN lets ONE call go through and everyone else waits for that answer.
+
+**Step by step:**
+1. The cached `/product/42` expires at 12:00:00.
+2. In the next 5 ms, 100 users across 3 PoPs ask for it. All 100 see "no fresh copy".
+3. Inside each PoP, the first request goes out; the rest of that PoP's requests wait for it. That is **request collapsing**.
+4. All 3 PoPs send their one request to the same **origin shield**, which also lets just one through.
+5. The origin answers once. The answer flows back to all 100 users.
 
 When a popular object's TTL expires, hundreds of edge requests can arrive within milliseconds of each other, all seeing a miss at the same instant.
 
@@ -244,6 +316,13 @@ sequenceDiagram
 
 **In plain words:** you changed the file, but the world still holds old copies. These are the four ways to get rid of old copies, from "free" to "dangerous".
 
+**Step by step:**
+1. You fix a typo in `app.js` and deploy.
+2. Easiest fix: the build names the new file `app.9b2d.js`. Pages now point to the new name, so the old copy is simply never asked for again.
+3. For a product page that changed price, you purge by tag: "drop everything tagged `product:42`". Only those pages refetch.
+4. A soft purge marks those copies old instead of deleting them, so users still get an answer while one fresh copy is fetched.
+5. "Purge everything" drops all copies at once, so every user's next request goes to the origin together. Use it only in an emergency.
+
 | Strategy | How | When to use |
 | --- | --- | --- |
 | Versioned URLs | `/app.8f3a1c.js`; a new deploy produces a new URL | Static build assets — pair with `immutable, max-age=31536000`; the old URL is simply abandoned, no purge needed |
@@ -267,25 +346,60 @@ flowchart TD
 
 ### Private content: never cache what shouldn't be shared
 
+**In plain words:** a shared cache must never hand one person's private page to someone else. And paid files need a ticket that only the CDN can check.
+
+**Step by step:**
+1. Your account page sets a login cookie with `Set-Cookie`. It must be marked `private` or `no-store`, so the CDN never saves it.
+2. For a paid video, your server builds a link like `/movie.mp4?expires=1700000000&sig=ab12`.
+3. The `sig` is a signature made with a secret that only your server and the CDN know.
+4. The PoP recomputes the signature and checks the time. Wrong or expired? It refuses. Correct? It serves the file from cache.
+
+```mermaid
+flowchart LR
+    S["Your server"] -- "signed link, expires in 1 hour" --> U["User"]
+    U --> P["PoP checks signature + time"]
+    P -- "ok" --> C["Serve video from cache"]
+    P -- "bad or expired" --> X["403 refused"]
+```
+
 - Never let a response carrying `Set-Cookie` get cached by a shared cache — most CDNs refuse this by default, but an explicit `private` or `no-store` on authenticated responses is the safer habit.
-- For paid downloads or video, use **signed URLs** (a query string with an expiry and an HMAC signature, verified by the CDN edge) or **signed cookies** (one signed cookie grants access to a whole path prefix, useful for an entire video's segment files).
+- For paid downloads or video, use **signed URLs** (a query string with an expiry and an HMAC signature, a code made by mixing the URL with a secret key so nobody can forge it, verified by the CDN edge) or **signed cookies** (one signed cookie grants access to a whole path prefix, useful for an entire video's segment files).
 - **Cache poisoning**: if the cache key ignores a header the origin's response actually varies on (e.g. `X-Forwarded-Host`, or an unkeyed `Accept-Language` that the origin still uses to render), an attacker's single poisoned response can get cached and served to every other user who shares that key. **Cache deception**: tricking a CDN into caching a response that *looks* static (by appending `/nonexistent.css` to a dynamic, authenticated URL) when the origin actually ignores the extra path and returns the private page anyway. Fix: make every cache-key input match every response-varying input, and have the origin reject or correctly route unexpected path suffixes rather than silently serving the same handler.
 
 ### Dynamic content acceleration
 
 **In plain words:** even things that can never be cached (your cart, your login) get faster, because the slow hello-handshake happens with the nearby helper instead of across the ocean.
 
+**Step by step:**
+1. You open your cart in Mumbai. The cart is per-user, so it can never come from cache.
+2. Your phone still connects to the Mumbai PoP. The TCP and TLS handshakes take a few short trips of about 5 ms each.
+3. The PoP already has an open, warm connection to the origin. It reuses it, so no new handshakes cross the ocean.
+4. Your request takes one long trip (about 200 ms) instead of three or four.
+
+```mermaid
+flowchart LR
+    U["You, Mumbai"] -- "handshakes: short trips" --> P["Mumbai PoP"]
+    P -- "one long trip on a warm,<br/>already-open connection" --> O["Origin, Virginia"]
+```
+
 Not everything a CDN speeds up is cacheable. For a request that must always reach the origin (checkout, a logged-in dashboard), the CDN still helps:
 
-- **TLS and TCP terminate at the nearby PoP.** The slow part of a connection — the handshake round trips — happens over the short, low-latency hop to the PoP; the PoP already holds a warm, keep-alive connection pool to the origin and reuses it.
-- **HTTP/3 (QUIC)** between the user and the PoP avoids TCP head-of-line blocking and survives a Wi-Fi-to-cellular network change without restarting the connection (see [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]).
-- **Route optimization**: some providers carry the request over their own private backbone from the PoP to the origin region instead of the public internet for the long leg.
+- **TLS and TCP terminate at the nearby PoP.** The slow part of a connection — the handshake round trips — happens over the short, low-latency hop to the PoP; the PoP already holds a warm, keep-alive connection pool (a set of connections kept open between requests instead of closed after each one) to the origin and reuses it.
+- **HTTP/3 (QUIC)** between the user and the PoP avoids TCP head-of-line blocking (one lost packet making everything behind it wait) and survives a Wi-Fi-to-cellular network change without restarting the connection (see [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]).
+- **Route optimization**: some providers carry the request over their own private backbone (the provider's own long-distance network cables) from the PoP to the origin region instead of the public internet for the long leg.
 
 This is why "dynamic site acceleration" is a real CDN product, separate from caching.
 
 ### Edge compute
 
 **In plain words:** the helper servers can also *run small bits of your code*, like a doorman who checks tickets and gives directions so most visitors never walk to the main office.
+
+**Step by step:**
+1. A request arrives at the PoP. First, the WAF (web application firewall: a filter that blocks known attack patterns) and bot checks run.
+2. If a fresh cached copy exists, it is served. Done.
+3. If not, your small edge function runs. Say it checks that the login token is not expired.
+4. Expired token? The function answers `401` right there, no trip to the origin.
+5. Valid token? The function adds a header (say, which A/B test group the user is in) and forwards the request to the origin.
 
 Edge compute runs your own code at the PoP, before (or instead of) a round trip to the origin.
 
@@ -301,16 +415,16 @@ flowchart LR
 
 | Platform | Model | Typical limit |
 | --- | --- | --- |
-| Cloudflare Workers | V8 isolate, runs on every request path | CPU time capped per request (tens of ms), no local filesystem |
-| AWS Lambda@Edge | Full Lambda, runs at a CloudFront regional edge cache, not every PoP | Up to 30s (origin-response) but adds cold-start latency; fewer locations than CloudFront's full PoP count |
+| Cloudflare Workers | V8 isolate (a light sandbox from Chrome's JavaScript engine that starts in milliseconds), runs on every request path | CPU time capped per request (tens of ms), no local filesystem |
+| AWS Lambda@Edge | Full Lambda, runs at a CloudFront regional edge cache, not every PoP | Up to 30s (origin-response) but adds cold-start latency (extra delay when a new copy of the function has to boot); fewer locations than CloudFront's full PoP count |
 | AWS CloudFront Functions | Tiny JS subset, runs at every PoP | Sub-millisecond budget; no network calls — header/URL rewrites and redirects only |
-| Fastly Compute | WebAssembly, runs at every PoP | Millisecond-scale CPU budget, no local disk |
+| Fastly Compute | WebAssembly (a compact, safe code format many languages can compile to), runs at every PoP | Millisecond-scale CPU budget, no local disk |
 
-What belongs at the edge: a JWT **signature and expiry** pre-check (so a clearly invalid or expired token gets a fast 401 without a trip to origin) — but the **authoritative** authorization decision (does this specific user own this specific resource) stays at the origin, where the source of truth for permissions lives.
+What belongs at the edge: a JWT (JSON Web Token: a signed login token the client sends with each request) **signature and expiry** pre-check (so a clearly invalid or expired token gets a fast 401 without a trip to origin) — but the **authoritative** authorization decision (does this specific user own this specific resource) stays at the origin, where the source of truth for permissions lives.
 
 Also at the edge: A/B bucket assignment, geo-based redirects, header normalization, and lightweight WAF rules.
 
-What stays at origin: anything that needs strongly consistent reads, writes with business logic, or a decision that must never be wrong because the edge's view of the world (its JWT public keys, its feature-flag snapshot) is only **eventually consistent** — edge KV stores typically replicate globally in seconds, not instantly.
+What stays at origin: anything that needs strongly consistent reads, writes with business logic, or a decision that must never be wrong because the edge's view of the world (its JWT public keys, its feature-flag snapshot) is only **eventually consistent** (every PoP gets the update, but not at the same instant) — edge KV (key-value) stores typically replicate globally in seconds, not instantly.
 
 An edge function's own deploy should be versioned and roll out gradually with the ability to roll back, exactly like an origin deploy, because a bad edge rule affects every PoP at once.
 
@@ -318,9 +432,16 @@ An edge function's own deploy should be versioned and roll out gradually with th
 
 ### Push vs pull, and media delivery
 
+**In plain words:** either the CDN fetches a file the first time someone asks (pull), or you upload it to the CDN ahead of time (push).
+
+**Step by step:**
+1. Pull: user asks Mumbai PoP for `poster.jpg`, it has none, it fetches from the origin once and keeps it.
+2. Push: before a 6 pm release, you upload `poster.jpg` to the CDN yourself, so the first user at 6 pm already gets a hit.
+3. Video: a 2-hour movie is cut into small pieces of a few seconds each, so each piece is cached and served on its own.
+
 - **Pull CDN** (the default): the CDN fetches from origin lazily, on the first miss. Simple, and the common choice.
 - **Push CDN**: you upload content to the CDN's storage ahead of time. Useful when you want to guarantee every PoP has the content before the first user asks (e.g. a scheduled release), at the cost of managing that upload yourself.
-- **Video**: large files are split into short segments (HLS `.m3u8` + `.ts`/`.fmp4`, or DASH `.mpd` + segments) specifically so a CDN can cache and serve each segment independently, and a client can switch bitrate mid-stream by requesting a different segment variant without re-downloading what it already has.
+- **Video**: large files are split into short segments (HLS, Apple's streaming format: a `.m3u8` list file + `.ts`/`.fmp4` pieces, or DASH, the open-standard equivalent: `.mpd` + segments) specifically so a CDN can cache and serve each segment independently, and a client can switch bitrate (video quality, measured in bits per second) mid-stream by requesting a different segment variant without re-downloading what it already has.
 
 ## 4. Worked example 🟡
 
@@ -369,6 +490,15 @@ x-served-by: marketing-site
 | AWS CloudFront | GeoDNS to regional edge caches, origin shield as an explicit opt-in feature | Deep integration with S3/ALB/Lambda@Edge | Pay for requests + data transfer, cheaper within AWS |
 | Self-hosted (Varnish/Nginx at a few regions) | Manual GeoDNS or anycast you operate yourself | Full control of cache logic | You own the hardware, the BGP sessions, and the on-call |
 
+### CDN vs the things people mix it up with 🟡
+
+| Thing | Where it sits | What it does | Not the same as a CDN because |
+| --- | --- | --- | --- |
+| Browser cache | On the user's own device | Saves copies for one user | Nobody else shares it |
+| Reverse proxy (Nginx) | In front of your servers, in one region | Routes, terminates TLS, may cache | It is in one place, not in 100 cities |
+| Load balancer | In front of your server fleet | Spreads requests across servers | Usually caches nothing and is not near users |
+| CDN | Hundreds of PoPs worldwide | Caches near users and shields the origin | (this note) |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - A CDN adds a layer that can itself fail or serve stale data; debugging "it works from my laptop but not for users in Brazil" now means checking a PoP you don't control.
@@ -378,6 +508,8 @@ x-served-by: marketing-site
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how a CDN routes, caches, collapses misses and purges. **Next comes the advanced part**: what breaks in real deployments, what to watch on dashboards, and the questions an SDE-3 interviewer uses to check you understand the trade-offs.
+
 - **Real systems:** Akamai (the original 1998 commercial CDN), CloudFront in front of S3-hosted sites and APIs, Cloudflare and Fastly for both static and dynamic acceleration, video platforms building on HLS/DASH segment caching.
 - **Failure modes → fixes:**
   - Stale content after a deploy → purge failed or TTL too long → use versioned asset URLs so the old cache entry is simply abandoned, not relied upon to expire.
@@ -385,11 +517,11 @@ x-served-by: marketing-site
   - Private data cached publicly → audit for missing `private`/`no-store` on any response with `Set-Cookie` or per-user content; add automated tests that assert this header on authenticated routes.
   - Origin overload right after a "purge everything" → prefer tag-based or soft purge; if a full purge is unavoidable, pre-warm critical URLs or rate-limit the resulting origin traffic.
   - Cache poisoning via an unkeyed header → ensure the cache key includes every header the origin's response actually varies on.
-- **What to monitor:** request hit ratio (and separately, byte hit ratio, since one giant cached video skews the request ratio), origin offload (% of requests that never reached origin), TTFB broken down by PoP region, purge success/latency, and egress/bandwidth cost per region.
+- **What to monitor:** request hit ratio (and separately, byte hit ratio, the share of *bytes* served from cache, since one giant cached video skews the request ratio), origin offload (% of requests that never reached origin), TTFB (time to first byte) broken down by PoP region, purge success/latency, and egress (data sent out, which providers bill per GB)/bandwidth cost per region.
 
 ## 8. Deep dive 🔴
 
-- **Anycast stability.** Anycast's biggest operational risk is route flapping: if BGP announcements change mid-session (a user's packets start arriving at a different PoP), a stateful connection (a WebSocket, a long HTTP/2 stream) can break. Providers mitigate this by keeping anycast announcements maximally stable and terminating connections at a consistent tier.
+- **Anycast stability.** Anycast's biggest operational risk is route flapping (routes switching back and forth quickly): if BGP announcements change mid-session (a user's packets start arriving at a different PoP), a stateful connection (a WebSocket, a long HTTP/2 stream) can break. Providers mitigate this by keeping anycast announcements maximally stable and terminating connections at a consistent tier.
 - **Why `s-maxage` exists at all.** `max-age` predates the shared/private distinction being commonly needed; `s-maxage` was added so an operator could give a CDN a longer (or shorter) freshness window than the end-user's own browser without needing two different response bodies.
 - **Cost shape.** CDN egress is usually priced per GB and varies sharply by region (serving out of some regions costs several times more per GB than others) — a cost-aware CDN config routes large downloads toward cheaper egress paths or a provider with flat-rate bandwidth, and a high hit ratio directly reduces the *origin's* egress bill even where the CDN's own bandwidth is a separate line item.
 - **Edge KV consistency.** Most edge key-value stores (Cloudflare KV, CloudFront KeyValueStore) are optimized for fast, frequent *reads* at every PoP and slow, infrequent *writes* that propagate over seconds to tens of seconds — fine for a feature flag or an A/B bucket assignment, wrong for a counter or anything needing read-your-writes consistency.
@@ -420,6 +552,8 @@ x-served-by: marketing-site
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** A CDN is many copy-holding servers near users. You reach the nearest one automatically. Headers on each answer say who may keep a copy and for how long. When many people ask at once, only one request goes to your server. Put a version in file names so you never need to clear the cache by hand.
+
 - Anycast (same IP everywhere, BGP picks nearest) or GeoDNS (region-specific DNS answer) gets the user to a PoP.
 - PoP → regional shield → origin; the shield collapses concurrent misses into one origin fetch.
 - `max-age` = every cache; `s-maxage` = shared caches only; `no-cache` = must revalidate; `no-store` = never cache.
@@ -429,6 +563,26 @@ x-served-by: marketing-site
 - Never cache a response with `Set-Cookie`; use signed URLs/cookies for private content.
 - Edge compute: fast pre-checks and routing at the edge, authoritative decisions and strongly consistent writes at origin.
 - Monitor hit ratio (request and byte), origin offload, TTFB by region, and egress cost.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What is the "origin"?
+> Your own server, the real source of the content that the CDN copies from.
+
+> [!question]- 🟢 What does a cache HIT mean at a PoP?
+> The PoP already had a fresh copy and answered without asking the origin.
+
+> [!question]- 🟢 Why does a CDN make a page faster for a user in Mumbai when the server is in Virginia?
+> The copy sits a few km away instead of 12,000 km, so each trip takes milliseconds instead of about 200 ms.
+
+> [!question]- 🟡 What is the difference between `no-cache` and `no-store`?
+> `no-cache` may store the copy but must check with the origin before using it; `no-store` must never store it.
+
+> [!question]- 🟡 100 users ask for an expired object at the same moment. How many requests reach the origin with a shield and collapsing?
+> One. Each PoP lets one request through, and the shield collapses those into one origin fetch.
+
+> [!question]- 🟡 Why are versioned file names better than purging?
+> A new name is a new cache key, so the old copy is simply never asked for; no purge, no burst of origin traffic.
 
 ## Links
 

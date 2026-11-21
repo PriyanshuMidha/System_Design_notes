@@ -35,6 +35,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (the job life cycle), 4 (worked example) and 5-6 (sizing and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Queues vs Streams and Broker Comparison]]: a queue hands each message to one worker and deletes it when the worker says "done"; if the worker dies, the message comes back.
+
 **From zero, in 60 seconds** 🟢
 
 Some work is slow, like making a PDF or sending an email.
@@ -79,6 +82,10 @@ A separate helper program picks up the note, builds the PDF, and marks it done.
 | Retry with backoff | Try again later, waiting longer each time | 1 s, 2 s, 4 s, ... |
 | Idempotent | Running it twice has the same effect as once | Upsert, not insert |
 | 202 Accepted | HTTP reply meaning "got it, will do later" | Returned with a job id |
+| Heartbeat | A "still working" signal a long job sends to extend its lease | Every 10 s on a 30 s lease |
+| Dead letter | A job given up on after too many failures, kept for a human | Invalid email address |
+| `SKIP LOCKED` | A Postgres option that makes a query skip rows other workers have locked | Two workers grab two different jobs |
+| Graceful shutdown | Stop taking new jobs, finish or hand back running ones, then exit | Pod gets a deploy signal |
 
 **Picture it**
 
@@ -110,11 +117,13 @@ Where it breaks: a real cook never cooks the same ticket twice, but a worker tha
 
 An invoicing API generates a PDF (≈2 s of CPU), stores it in S3 (≈300 ms), and emails it (≈500 ms at the provider) when the user clicks "Send invoice". Inline, that request takes about 2.8 s (an estimate for this example). Three things go wrong:
 
-- **Latency:** the user stares at a spinner; the load balancer may time out at its idle timeout.
+- **Latency:** the user stares at a spinner; the **load balancer** (the server in front that spreads requests across app servers) may time out at its idle timeout.
 - **Coupling to outages:** when the email provider is down, the "Send" button fails, although the invoice is fine.
 - **Capacity:** at 50 clicks per second, the API needs 50 × 2.8 ≈ 140 requests in flight at once (Little's Law: in-flight = arrival rate × time in system), all holding memory and DB connections.
 
 With a background job, the API writes the invoice and a job row and returns in about 20 ms. Eight workers make PDFs at their own pace, the email provider's outage only delays emails, and a burst of 5,000 clicks becomes a queue that drains over a few minutes instead of 5,000 concurrent requests.
+
+**Real-life example.** After you book a ticket on BookMyShow, the confirmation screen appears in about a second, but the email with your ticket PDF may come half a minute later. Building the PDF and sending the email run as background jobs. If the email provider is slow that evening, your booking still succeeds; only the email waits in the queue.
 
 Typical work that leaves the request path: transactional emails and SMS, PDF and report generation, image and video processing, webhook fan-out to customers ([[Webhooks - Sending and Receiving]]), search indexing, data exports, and calls to slow third parties.
 
@@ -139,6 +148,14 @@ If the cook walks out, the ticket goes back on the rail after a while (lease exp
 
 The number of cooks is set by the number of stoves (downstream capacity), not by the number of tickets.
 
+## Common beginner mistakes 🟢
+
+- **Saving the invoice, then enqueuing the job as a separate step** → a crash in between leaves an invoice with no email → enqueue in the same database transaction, or use an outbox.
+- **Assuming each job runs exactly once** → a worker that dies after sending the email but before marking it done causes a second send → make handlers idempotent.
+- **Retrying every 10 seconds with no jitter and no limit** → thousands of jobs hit a recovering provider in waves → use exponential backoff with jitter and a max attempt count.
+- **Setting the job timeout longer than the lease** → the lease expires mid-job and a second worker starts the same job → keep the job timeout below the lease, and heartbeat long jobs.
+- **Scaling workers on CPU** → I/O-bound workers sit idle on CPU while the backlog grows → scale on queue depth or oldest job age.
+
 **The kitchen, drawn:**
 
 ```mermaid
@@ -150,6 +167,8 @@ flowchart LR
 ```
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that slow work becomes a job in a queue, picked up later by a small team of workers. **Next we open the box**: the life of one job from enqueue to done or dead, the pool around the queue, and the single Postgres query that lets many workers grab jobs safely.
 
 ### The job lifecycle
 
@@ -173,13 +192,20 @@ stateDiagram-v2
 2. **Claim with a lease.** A worker takes one job and marks it `running` until `now + lease`. SQS calls the lease a **visibility timeout**; Postgres queues store a `locked_until` column; Redis Streams keep the entry in the pending entries list.
 3. **Run.** The handler gets a context with a timeout shorter than the lease. Long jobs **heartbeat**: they extend the lease every third of its length (SQS: `ChangeMessageVisibility`).
 4. **Ack.** On success, mark it done (or delete it).
-5. **Retry.** On a transient error (timeout, 503, connection reset), schedule the next attempt after a backoff that grows: 10 s, 20 s, 40 s, with jitter. See [[Timeouts, Retries and Backoff]].
+5. **Retry.** On a transient error (timeout, 503, connection reset), schedule the next attempt after a backoff that grows: 10 s, 20 s, 40 s, with **jitter** (a small random extra wait so jobs do not retry in lockstep). See [[Timeouts, Retries and Backoff]].
 6. **Dead-letter.** On a permanent error (invalid email address, schema mismatch) or after the last attempt, move it to `dead` with the error, for a person to inspect and replay. See [[Dead Letter Queues and Poison Messages]].
 7. **Crash.** If the worker dies mid-job, nothing acks. The lease expires and another worker claims it as the next attempt. That is the "at least once" in at-least-once.
 
 ### The pool around the queue
 
 **In plain words:** the API drops jobs in, a fixed team of workers takes them out, and a small timer brings back jobs whose worker went quiet.
+
+**Step by step:**
+1. A user clicks "Send invoice". The API saves the invoice and a job row, then replies `202` with job id 90412.
+2. Eight worker goroutines loop: claim a job, run it, mark it done.
+3. Worker 3 claims job 90412, holds a 30-second lease, and starts making the PDF.
+4. Worker 3's pod is killed. Nobody marks the job done.
+5. After 30 seconds a small timer (the reaper) sees the expired lease and makes the job claimable again. Worker 5 picks it up as attempt 2.
 
 ```mermaid
 flowchart LR
@@ -201,11 +227,18 @@ flowchart LR
     C -->|GET /jobs/job_id| API
 ```
 
-**Returning the job to the client.** The API returns `202 Accepted` with a `Location: /jobs/{id}` header (or the id in the body). The client polls `GET /jobs/{id}` for `{state, progress, result_url, error}`, or the server pushes completion through a webhook, SSE or WebSocket.
+**Returning the job to the client.** The API returns `202 Accepted` with a `Location: /jobs/{id}` header (or the id in the body). The client polls `GET /jobs/{id}` for `{state, progress, result_url, error}`, or the server pushes completion through a webhook, SSE (server-sent events: a one-way stream from server to browser) or WebSocket (a two-way connection that stays open).
 
 ### Claiming jobs in PostgreSQL
 
 **In plain words:** one database query lets many workers grab different rows at the same time, each skipping rows that someone else already holds.
+
+**Step by step:**
+1. Worker A runs: "give me the oldest job that is queued, lock it, and skip any row already locked".
+2. It gets row 90412, sets it to `running` with `locked_until = now + 30 s`, and commits at once.
+3. Worker B runs the same query at the same moment. Row 90412 is locked, so B skips it and gets 90413.
+4. A runs the job outside any transaction, so no row stays locked while the PDF is built.
+5. When done, A updates the row only if `attempts` still matches, so a worker whose lease expired cannot overwrite a newer attempt.
 
 A Postgres table is a complete job queue for most teams up to thousands of jobs per second (an estimate; it depends on the hardware and row churn). `FOR UPDATE SKIP LOCKED` makes concurrent workers skip rows another transaction has locked instead of waiting.
 
@@ -708,7 +741,7 @@ Run with `go test -race ./jobs` (Go 1.24): all 7 tests pass, also with `-count=3
 
 | Backend | How claim and ack work | Use when | Cost |
 | --- | --- | --- | --- |
-| Postgres table (River, or your own `SKIP LOCKED`) | Row lock + `locked_until`; ack is an `UPDATE` | Already on Postgres; want enqueue in the same transaction as business data | Table and index churn (vacuum); polling or `LISTEN/NOTIFY` for wake-ups; one DB carries both loads |
+| Postgres table (River, or your own `SKIP LOCKED`) | Row lock + `locked_until`; ack is an `UPDATE` | Already on Postgres; want enqueue in the same transaction as business data | Table and index churn (vacuum: Postgres's clean-up of old row versions); polling or `LISTEN/NOTIFY` for wake-ups; one DB carries both loads |
 | Redis (asynq, or Streams directly) | asynq: lists and sorted sets with a lease; Streams: consumer groups + `XACK` ([[Redis as a Queue - Lists, Streams and Pub-Sub]]) | High rate, low latency, scheduled and unique tasks | Enqueue is a separate system from your DB (needs outbox); durability depends on AOF and failover |
 | Amazon SQS | Visibility timeout; `DeleteMessage`; redrive to DLQ after `maxReceiveCount` | On AWS; want zero ops and elastic scale | Delay at most 15 min; no priorities (use separate queues); per-request cost ([[AWS SQS, SNS and EventBridge]]) |
 | RabbitMQ | `basic.ack`/`nack`, `prefetch` per consumer; priorities; dead-letter exchanges | Need routing, priorities, low latency | Run a cluster (quorum queues) |
@@ -736,6 +769,8 @@ Run with `go test -race ./jobs` (Go 1.24): all 7 tests pass, also with `-count=3
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the job life cycle, leases, retries, dead letters, `SKIP LOCKED`, a tested Go pool and how to size it. **Next is the advanced part**: real job libraries, the classic production failures, shutdown and autoscaling, and the deeper trade-offs of leases and Postgres queues.
+
 - **Real systems:** River (Go, Postgres), asynq (Go, Redis), Sidekiq (Ruby, Redis), Celery (Python, RabbitMQ/Redis), BullMQ (Node, Redis), and SQS with Lambda or ECS consumers. River and Postgres-backed queues are popular in Go because `INSERT job` joins the business transaction.
 - **Failure modes → fixes** (the classic list: backlog, duplicates, stuck workers, retry storms, poison messages, lost acks, uneven concurrency):
 	- **Backlog grows for hours** → alert on oldest-job age, scale workers on queue depth; check whether a downstream is slow rather than adding workers blindly.
@@ -745,7 +780,7 @@ Run with `go test -race ./jobs` (Go 1.24): all 7 tests pass, also with `-count=3
 	- **Poison message** crashes the worker on every attempt → catch panics per job, classify as permanent, dead-letter after the max.
 	- **Lost ack** (job done, ack failed) → it will run again; idempotency covers it.
 	- **Uneven concurrency** (one queue or tenant hogs workers) → separate queues with weights, per-tenant caps.
-- **Graceful shutdown on deploy:** on SIGTERM stop claiming, let in-flight jobs finish within a drain window shorter than the orchestrator's grace period (Kubernetes default `terminationGracePeriodSeconds` is 30 s), then cancel and hand the rest back. See [[Graceful Shutdown and Health Checks]].
+- **Graceful shutdown on deploy:** on SIGTERM (the "please stop" signal sent before a process is killed) stop claiming, let in-flight jobs finish within a drain window shorter than the orchestrator's grace period (Kubernetes default `terminationGracePeriodSeconds` is 30 s), then cancel and hand the rest back. See [[Graceful Shutdown and Health Checks]].
 - **Autoscaling:** scale worker replicas on queue depth or oldest-job age, not CPU (IO-bound workers idle on CPU while the backlog grows). KEDA has scalers for SQS, Redis Streams, PostgreSQL queries and Kafka lag. See [[Autoscaling]].
 - **What to monitor:** queue depth per queue, oldest job age, enqueue and completion rate, success/failure/retry rate per job kind, dead-job count, job runtime p50 and p99, lease expiries (a sign of crashes or too-short leases), and trace context carried from the request into the job.
 
@@ -755,7 +790,7 @@ Run with `go test -race ./jobs` (Go 1.24): all 7 tests pass, also with `-count=3
 
 **Leases are not locks.** Even with heartbeats, a paused worker can wake up after its lease expired and finish the work. The `attempts` check stops it from *recording* a stale result, but its side effect (the email) already happened. The real defence is an idempotent side effect, or a **fencing token**: pass the attempt number to the downstream, which rejects writes from older attempts.
 
-**Postgres queue at scale.** Each claim updates a row, creating a dead tuple; a queue that processes 1,000 jobs/s creates 1,000+ dead tuples per second in a small hot table. Autovacuum must keep up, long-running transactions elsewhere (a 30-minute report) stop vacuum from removing them, and the claim query slows down as it skips dead rows. Mitigations: partial index on runnable states, delete or archive finished jobs in batches, keep transactions short, and partition by time for very large volumes.
+**Postgres queue at scale.** Each claim updates a row, creating a **dead tuple** (an old row version left behind until vacuum removes it); a queue that processes 1,000 jobs/s creates 1,000+ dead tuples per second in a small hot table. Autovacuum must keep up, long-running transactions elsewhere (a 30-minute report) stop vacuum from removing them, and the claim query slows down as it skips dead rows. Mitigations: partial index on runnable states, delete or archive finished jobs in batches, keep transactions short, and partition by time for very large volumes.
 
 **Wake-up latency.** Polling every second adds up to 1 s of latency and constant queries. Postgres `LISTEN/NOTIFY` (River uses it) or Redis blocking reads wake workers immediately; keep polling as a fallback because notifications are not durable.
 
@@ -808,6 +843,30 @@ flowchart LR
 - Separate queues for priority, caps per tenant and per downstream.
 - SIGTERM: stop claiming, drain, requeue the rest.
 - Alert on oldest-job age and dead jobs; scale on depth or age, not CPU.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why move PDF generation into a background job?
+> The user gets a fast reply, and slow or failing providers no longer break the request.
+
+> [!question]- What does a worker's lease do?
+> It hides the job from other workers for a while; if the worker dies, the job becomes claimable again.
+
+> [!question]- What HTTP status does the API return when it queues a job?
+> `202 Accepted`, with a job id the client can check.
+
+🟡 Medium
+
+> [!question]- How does `FOR UPDATE SKIP LOCKED` help many workers?
+> Each worker skips rows another worker has locked, so they grab different jobs without waiting.
+
+> [!question]- You need 200 emails/s and each takes 500 ms. How many in flight?
+> About 100 (200 × 0.5 s).
+
+> [!question]- Why can a job still run twice even with leases?
+> A worker can finish the side effect, then die before marking it done, so the job is retried.
 
 ## Links
 

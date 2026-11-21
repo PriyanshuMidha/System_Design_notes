@@ -34,6 +34,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[CQRS]]: writes and reads can use different models; read models are copies built for screens and may lag a little.
+> - [[Transactions and ACID]]: a database change either fully happens or not at all, even after a crash.
+> - [[Locking - Optimistic vs Pessimistic]]: "save only if the version is still what I read" stops two writers overwriting each other.
+> - [[Event-Driven Architecture Basics]]: services tell each other "this happened" with events instead of direct calls.
+
 **From zero, in 60 seconds** 🟢
 
 Most apps store only the current state, like "invoice paid: 50,000".
@@ -80,6 +86,9 @@ Event sourcing stores data the same way: keep the statement, compute the balance
 | Projection | A query table built from events | "Unpaid invoices by customer" |
 | Snapshot | A saved state at some version, to skip early events | State of INV-7 at version 500 |
 | Expected version | "Only append if the stream is still at version N" | Append at v8 only if current is v7 |
+| Upcasting | Converting an old event shape to the new one while reading it | A v1 payment with no currency is read as INR |
+| Crypto-shredding | Deleting a person's encryption key so their data in old events becomes unreadable | Erase a user without editing the log |
+| Optimistic concurrency | No locks; the save fails if someone else changed it first, and you retry | Second payer gets "wrong version", reloads |
 
 **Picture it**
 
@@ -109,7 +118,7 @@ Where it breaks: chess moves never change meaning, but business event formats ev
 
 InvoiceOps stores invoices as rows: `status = 'paid', paid = 50000`. A customer disputes an invoice: "We paid ₹30,000 on 3 March and ₹20,000 on 9 March, and then you voided and reissued it." The row only says `paid`. The `updated_at` column says when it last changed, not what happened before.
 
-Teams usually bolt on an audit table written by triggers or application code. Now there are two records of the truth, and they drift: a bulk fix applied with plain SQL updates the row and skips the audit.
+Teams usually bolt on an audit table written by triggers (code the database runs automatically on each change) or application code. Now there are two records of the truth, and they drift: a bulk fix applied with plain SQL updates the row and skips the audit.
 
 Event sourcing turns this around. The history **is** the data:
 
@@ -129,6 +138,13 @@ flowchart LR
     E --> Y["Paid 20,000 on 3 Mar, 30,000 on 9 Mar"]
 ```
 
+### Real-life example 🟢
+
+Your UPI app's transaction history works like this. Your bank does not just keep "balance ₹2,000" and overwrite it.
+It keeps every credit and debit, each with a time and a reference number, and never edits them.
+If a payment is reversed, a new "refund" entry is added; the old one stays.
+When you raise a dispute, the bank replays that list to show exactly how your balance came to be. That is event sourcing.
+
 ## 2. Mental model 🟢
 
 A bank statement. The bank does not store "balance = ₹12,400" and overwrite it; it stores every deposit and withdrawal, and the balance is the sum. A chess game is the same: the list of moves is the record, and the board is what you get when you replay them.
@@ -136,17 +152,34 @@ A bank statement. The bank does not store "balance = ₹12,400" and overwrite it
 Terms used below:
 
 - **Event:** an immutable fact, named in the past tense, that happened to one aggregate.
-- **Aggregate:** a cluster of data that is changed as one unit and guards its own rules, such as one invoice (from domain-driven design; see [[Domain-Driven Design - Tactical Patterns in Go]]).
+- **Aggregate:** a cluster of data that is changed as one unit and guards its own rules, such as one invoice (from **domain-driven design**, a way of modelling software around business concepts; see [[Domain-Driven Design - Tactical Patterns in Go]]).
 - **Stream:** the ordered events of one aggregate, for example `invoice-INV-1`.
 - **Fold (replay, rehydrate):** apply events one by one to an empty state to get the current state.
 - **Projection:** a read model built by folding events into a shape made for queries (see [[CQRS]]).
 - **Snapshot:** a saved copy of state at version N, so a load can start there instead of at event 1.
 
+## Common beginner mistakes 🟢
+
+- **Using Kafka alone as the event store** → it cannot refuse a write because the invoice moved past version 7 → keep events in a store with expected-version appends (Postgres, EventStoreDB) and use Kafka to publish them.
+- **Events like `InvoiceUpdated` with every field** → you lose the "why" and every reader has to diff → name business facts in past tense: `PaymentRecorded`.
+- **Editing old events to fix a bug** → projections and other services already saw the old version → add a correcting event, or upcast on read.
+- **Putting names and emails straight into events** → you cannot delete them later when a user asks → store an ID, or encrypt with a per-user key.
+- **Sending emails or charging cards inside `apply`** → replaying history would resend them all → trigger side effects from a separate subscriber that remembers what it handled.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that event sourcing stores every change as a fact and computes current state by replaying them, like a bank statement. **Next we open the box**: how a command loads, decides and safely appends, how snapshots keep loading fast, and how to design events that will still make sense in five years.
 
 ### The command cycle
 
 **In plain words:** load the past events, decide what new events the command causes, then save them only if nobody else wrote in the meantime.
+
+**Step by step:**
+1. A client says "pay ₹20,000 on INV-1".
+2. The handler reads the stream: v1 `InvoiceIssued ₹50,000`, v2 `PaymentRecorded ₹30,000`. Replaying gives "₹20,000 still due".
+3. The rule passes, so it decides one new event: `PaymentRecorded ₹20,000`.
+4. It appends that event "only if the stream is still at version 2". It is, so the stream becomes version 3.
+5. If someone else had appended v3 first, the append fails; the handler reloads and decides again.
 
 ```mermaid
 sequenceDiagram
@@ -182,6 +215,13 @@ Three rules make this work:
 
 **In plain words:** every so often, save the state so far. Next time, start from that saved point and replay only the newer events.
 
+**Step by step:**
+1. INV-1 has 10 events. Every 8 events, the system saves a snapshot: "state at v8: paid ₹40,000".
+2. A new command loads INV-1. It finds the v8 snapshot.
+3. It reads only v9 and v10 and applies them on top of the snapshot.
+4. Result: the same state as replaying all 10, with far less reading.
+5. If the snapshot code has a bug, delete the snapshots; they rebuild from the events.
+
 A long-lived aggregate (a bank account with 40,000 transactions) would be slow to replay on every command. Take a snapshot every N events and fold only the tail:
 
 ```mermaid
@@ -201,6 +241,13 @@ A snapshot is a cache. It can be deleted at any time and rebuilt from events, so
 ### Designing events
 
 **In plain words:** name events as things that already happened in business words, like PaymentRecorded, not "row updated".
+
+**Step by step:**
+1. Ask "what happened, in business words?": a payment was recorded.
+2. Name it in the past tense: `PaymentRecorded`, not `UpdatePaid`.
+3. Put in the facts a reader needs: amount ₹20,000, currency INR, date.
+4. Add `schema_version: 2`, because the shape will change one day.
+5. Leave out personal data such as the payer's email; store a customer ID instead.
 
 - **Past tense and business-meaningful:** `PaymentRecorded`, not `InvoiceUpdated` or `SetPaidColumn`. An event should say why something changed.
 - **Small and specific:** one fact per event. A giant `InvoiceChanged` with every field forces every consumer to diff.
@@ -627,7 +674,7 @@ Revoke `UPDATE` and `DELETE` on the table from the application role so "append-o
 | --- | --- | --- | --- | --- |
 | EventStoreDB / KurrentDB | Built in (expected revision on append) | Built in, per stream | Built in, catch-up and persistent | Purpose-built; another database to run |
 | PostgreSQL append-only table | `UNIQUE (stream_id, version)` | Index range scan | Poll by global position, or logical decoding | Good default when you already run PostgreSQL |
-| DynamoDB | Conditional put on `(stream_id, version)` | Query by partition key | DynamoDB Streams | Scales well; 400 KB item limit |
+| DynamoDB | Conditional put (write only if a condition holds) on `(stream_id, version)` | Query by partition key | DynamoDB Streams | Scales well; 400 KB item limit |
 | Kafka alone | Not possible: no conditional append per key | Scan a whole partition and filter | Native | Good as the publication channel, weak as the store |
 | Axon Server, Marten (on PostgreSQL) | Built in | Built in | Built in | Framework-specific |
 
@@ -640,7 +687,15 @@ Revoke `UPDATE` and `DELETE` on the table from the application role so "append-o
 | State + audit table | Current-state rows | Separate, can drift | Low |
 | State + outbox events | Current-state rows | Events are notifications, may be pruned | Medium |
 | Event sourcing | The event log | Complete by construction | High: projections, versioning, replays |
-| Temporal tables (system-versioned) | Current rows + row history | Row-level, not business intent | Low to medium, database-specific |
+| Temporal tables (system-versioned: the database keeps old row versions automatically) | Current rows + row history | Row-level, not business intent | Low to medium, database-specific |
+
+### Event sourcing versus things people confuse it with 🟡
+
+| Thing | What it is | Key difference |
+| --- | --- | --- |
+| CQRS | Separate models for writes and reads | Says nothing about storing events; often paired with event sourcing, but each stands alone |
+| Event-driven architecture | Services notifying each other with events | Those events are messages between services; in event sourcing, events are the stored truth of one service |
+| Audit log | A side record of changes | Can drift from the real rows; in event sourcing there is nothing else to drift from |
 
 ## 6. Trade-offs and when not to use 🟡
 
@@ -653,6 +708,8 @@ Revoke `UPDATE` and `DELETE` on the table from the application role so "append-o
 - **Do not use it** for CRUD screens, settings, catalogues and anything where history has no business value. Event sourcing is a per-aggregate decision, not a whole-system one: an event-sourced ledger can sit next to plain tables.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the load-decide-append cycle with expected versions, snapshots, event design, and where to store events. **Next comes the advanced part**: real systems such as ledgers and EventStoreDB, production failure modes, schema evolution with upcasters, GDPR erasure, and why Kafka alone is a weak store.
 
 - **Real systems:**
 	- Accounting ledgers are the original event-sourced systems: journal entries are never edited, corrections are new entries (see [[Practice/Digital Wallet and Ledger]]).
@@ -695,7 +752,7 @@ flowchart LR
 
 **In plain words:** you cannot delete from the log, so you encrypt personal data per person and throw away the key when asked.
 
-GDPR Article 17 gives a person the right to have their personal data erased, but the event log is immutable. Two patterns:
+GDPR (the EU's data protection law) Article 17 gives a person the right to have their personal data erased, but the event log is immutable. Two patterns:
 
 - **Keep personal data out of events.** Store a `customer_id`; keep name, email and address in a normal table you can delete from.
 - **Crypto-shredding.** Encrypt personal fields inside events with a per-person key held in a key store. To erase, delete the key: the ciphertext in every event, backup and replica becomes unreadable. Projections must treat "cannot decrypt" as "erased".
@@ -706,7 +763,7 @@ GDPR Article 17 gives a person the right to have their personal data erased, but
 
 - **No conditional append.** Kafka cannot reject a write because the invoice moved past version 7, so two handlers can both append on stale state. (Kafka's idempotent producer prevents duplicates from retries; it does not provide per-key optimistic concurrency.)
 - **No efficient per-aggregate read.** To load one invoice you read its whole partition and filter.
-- **Retention and compaction are easy to get wrong.** The default time-based retention (`retention.ms`, 7 days) deletes old events unless you set it to keep data forever, and compaction keeps only the latest record per key, which is state, not history.
+- **Retention and compaction are easy to get wrong** (retention = how long Kafka keeps messages; compaction = keeping only the newest message per key). The default time-based retention (`retention.ms`, 7 days) deletes old events unless you set it to keep data forever, and compaction keeps only the latest record per key, which is state, not history.
 
 A common, sound design: PostgreSQL or EventStoreDB as the store, and Kafka as the channel that publishes committed events to other services (see [[Kafka and Event Streaming]]).
 
@@ -755,6 +812,30 @@ Replaying events must rebuild state, not resend emails or recharge cards. Keep s
 - Queries need projections (CQRS), which are eventually consistent and idempotent.
 - GDPR: keep PII out of events or crypto-shred it.
 - Kafka publishes events well but cannot be the store alone.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- In event sourcing, what is the source of truth?
+> The append-only list of events; current state and query tables are computed from it.
+
+> [!question]- How do you get an invoice's current state?
+> Replay (fold) its events in order, starting from empty.
+
+> [!question]- What is a snapshot for?
+> Saving state at some version so loading can skip the early events; it is a disposable cache.
+
+🟡 Medium
+
+> [!question]- Two handlers both load INV-1 at version 2 and append. What happens?
+> Only one append succeeds; the other gets "wrong expected version", reloads at version 3 and decides again.
+
+> [!question]- The event shape changed and old events lack a currency. What do you do?
+> Write an upcaster that fills in the default when reading v1 events; never edit stored events.
+
+> [!question]- A user asks you to delete their personal data. How, if events are immutable?
+> Keep personal data out of events, or encrypt it with a per-user key and delete that key (crypto-shredding).
 
 ## Links
 

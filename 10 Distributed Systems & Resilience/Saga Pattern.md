@@ -33,6 +33,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Transactions and ACID]]: inside one database, a transaction's changes all happen or none do.
+> - [[Two-Phase Commit]]: one coordinator can make several databases commit together, but everyone is stuck holding locks if it crashes.
+> - [[Transactional Outbox and CDC]]: save "something happened" in the same database transaction as the change, then publish it reliably later.
+> - [[Idempotency and Idempotency Keys]]: a unique key on a request lets the receiver skip a repeat, so retries are safe.
+
 **From zero, in 60 seconds** 🟢
 
 Checkout in an online shop touches three services: stock, payment and shipping.
@@ -79,6 +85,10 @@ A saga is the plan that runs these steps in order and runs "undo" steps when a l
 | Idempotent | Safe to run twice with the same result | Refund #77 only refunds once |
 | Orchestrator | One component that tells each step what to do | A checkout workflow runner |
 | Event | A message saying something happened | `PaymentCharged` |
+| Choreography | No boss: each service reacts to the previous event and emits the next | Inventory hears `OrderPlaced`, emits `StockReserved` |
+| Authorize / capture / void | Hold money on the card / actually take it / cancel the hold for free | Hold ₹4,998, then take it after stock is reserved |
+| Pivot | The point of no return in a saga | Capturing the payment |
+| Saga log | The saved record of which steps finished | `order-42: step 2 done` |
 
 **Picture it**
 
@@ -107,7 +117,7 @@ Where it breaks: phone cancellations are done by you on the spot, but a saga mus
 
 An online shop splits checkout across three services, each with its own database:
 
-- **Inventory** reserves 2 units of SKU `kb-01`.
+- **Inventory** reserves 2 units of SKU (stock-keeping unit, a product code) `kb-01`.
 - **Payments** charges ₹4,998 through a payment provider such as Stripe or Razorpay.
 - **Shipping** books a courier pickup.
 
@@ -119,19 +129,45 @@ Inside one PostgreSQL database you would wrap all three in `BEGIN … COMMIT`. A
 
 Without a pattern, a crash between "charge card" and "book courier" leaves a customer charged with no shipment, and nobody notices until a support ticket arrives. A saga makes that gap explicit: every step either completes, or the steps before it are compensated, and the saga's own state is persisted so a crash cannot lose track.
 
+### Real-life example 🟢
+
+When you order on Swiggy, several services take part: your payment, the restaurant accepting the order, and a delivery partner being assigned.
+Each lives in its own system, so there is no single database transaction across them.
+If the restaurant rejects the order after your UPI payment went through, the app does not "roll back time": it runs a new action, a refund, and tells you.
+That chain of steps, with an "undo" for each finished step, is a saga.
+
 ## 2. Mental model 🟢
 
 A saga is a **travel booking done by phone**. You book a flight, then a hotel, then a car. If the car company has nothing, you do not "roll back time". You call the hotel and cancel, then call the airline and cancel. Each cancellation is a new, real action with its own rules: the airline may keep a fee.
 
 Three terms used throughout:
 
-- **Local transaction:** one ACID transaction inside one service's database.
+- **Local transaction:** one ACID (all-or-nothing, rule-keeping, isolated, durable) transaction inside one service's database.
 - **Compensating action (compensation):** a new local transaction that semantically undoes an earlier one. It is a business action (a refund, a release, an apology email), not a database rollback. The original row stays in history.
 - **Saga log:** the persisted record of which steps finished, so the saga can resume after a crash.
 
+## Common beginner mistakes 🟢
+
+- **Charging the card before reserving stock** → every stock-out now needs a refund, with fees and angry customers → reserve first, charge later.
+- **Treating a compensation like a database rollback** → the original action really happened (a refund is a new action, with its own cost) → design each undo as a real business step.
+- **Compensating steps after the point of no return** → you cannot "un-ship" a parcel → after the pivot, only retry forward.
+- **Steps that are not safe to repeat** → the orchestrator retries after a crash and reserves stock twice → use the saga id as an idempotency key in every step.
+- **Forgetting that others can see half-done work** → a report counts a reservation that is later released → use "pending" states and commutative updates.
+
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that a saga runs one local step per service and, if a later step fails, runs undo steps for the earlier ones. **Next we open the box**: who drives the steps, in what order steps must go, how the orchestrator survives crashes, and how each step is made safe to retry. Each subsection starts with a short walk-through.
+
 ### Two ways to coordinate
+
+**In plain words:** either one boss tells each service what to do, or each service reacts to the previous one's event.
+
+**Step by step:**
+1. Orchestration: the order orchestrator calls Inventory "reserve 2 x kb-01" and waits for "reserved".
+2. It then calls Payments "authorize ₹4,998", then "capture", then Shipping "create shipment", saving progress after each.
+3. Choreography: instead, Orders publishes `OrderPlaced`. Inventory hears it, reserves, and publishes `StockReserved`.
+4. Payments hears `StockReserved`, charges, and publishes `PaymentCaptured`; Shipping hears that and books the courier.
+5. In both styles, a failure (like "card declined") leads to undo steps for what already finished.
 
 - **Orchestration:** one component, the **orchestrator**, tells each service what to do next and records progress. The flow lives in one place.
 - **Choreography:** there is no central brain. Each service listens for events and reacts with its own step, emitting the next event.
@@ -189,7 +225,14 @@ sequenceDiagram
 
 **In plain words:** do the easy-to-undo steps first, then the one point of no return, then only steps that can be retried until they work.
 
-Not every step can be undone. Richardson's *Microservices Patterns* names three kinds:
+**Step by step:**
+1. Reserve stock: easy to undo (release it).
+2. Authorize the card (put a hold on ₹4,998): easy to undo (void the hold, free).
+3. Capture the payment: the pivot. Once this works, the saga must finish.
+4. Create the shipment and send the receipt: never undone, only retried until they work.
+5. So if stock runs out at step 1, nothing needs undoing at all.
+
+Not every step can be undone. Chris Richardson's book *Microservices Patterns* names three kinds:
 
 | Step kind | Meaning | Checkout example | On failure |
 | --- | --- | --- | --- |
@@ -210,6 +253,13 @@ flowchart LR
 ### The orchestrator as a state machine
 
 **In plain words:** the orchestrator saves where it is after each step, so after a crash it continues from the right place.
+
+**Step by step:**
+1. Saga order-42 starts as `Pending` and is saved in a table.
+2. Stock is reserved: the row becomes `InventoryReserved`. The card is authorized: `PaymentAuthorized`.
+3. The orchestrator process crashes here. A new process starts and reads the row: `PaymentAuthorized`.
+4. It carries on with "capture", not from the beginning.
+5. If shipping keeps failing after capture, the saga becomes `Stuck` and an alert goes to a person.
 
 The orchestrator persists its state after every transition, so a restarted process knows where it was:
 
@@ -236,6 +286,13 @@ stateDiagram-v2
 ### Making each step reliable
 
 **In plain words:** messages can be lost or sent twice, so each step must be safe to repeat and must save its result reliably.
+
+**Step by step:**
+1. Inventory reserves stock and, in the same database transaction, writes a `StockReserved` row into its outbox table.
+2. A relay publishes that event. If it crashes and publishes twice, that is fine.
+3. Payments gets "authorize for order-42" twice. It sees order-42 already done and returns the saved result.
+4. "Reserve for order-42" timed out, so the orchestrator sent "release for order-42". Inventory notes "order-42 cancelled".
+5. The late "reserve for order-42" finally arrives. Inventory sees the order is cancelled and ignores it.
 
 A saga step talks to another service, so every message can be lost, delayed or duplicated:
 
@@ -707,7 +764,7 @@ WHERE status IN ('running', 'compensating')
 | Coupling | Orchestrator knows every participant's API | Services know only event types |
 | Seeing the state of one order | Read one row or one workflow | Join events from several services by correlation id |
 | Adding a step | Change the orchestrator | Add a subscriber, and check nobody else breaks |
-| Risk | The orchestrator grows into a "god service" | Cyclic event chains nobody can draw from memory |
+| Risk | The orchestrator grows into a "god service" (one service that knows and controls too much) | Cyclic event chains nobody can draw from memory |
 | Use when | 4+ steps, compensations, timeouts, a business that asks "where is order 42?" | 2–3 steps owned by teams that want independence |
 
 ### Saga vs other ways to stay consistent
@@ -732,21 +789,23 @@ WHERE status IN ('running', 'compensating')
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** orchestration and choreography, the compensatable → pivot → retriable order, the orchestrator as a saved state machine, and how outbox plus idempotency make steps safe. **Next comes the advanced part**: workflow engines such as Temporal and Step Functions, production failure modes, and how to live with sagas' lack of isolation.
+
 - **Real systems:**
 	- **Temporal** (and Cadence, which it forked from): the workflow is ordinary code whose state is persisted by replaying an event history; activities have retry policies; compensation is written as deferred calls in the workflow (see [[Workflow Engines and Durable Execution]]).
 	- **AWS Step Functions:** a JSON state machine (Amazon States Language) with `Retry` and `Catch` per state; a `Catch` routes to compensation states.
-	- **Camunda:** BPMN models with compensation events and boundary timers.
+	- **Camunda:** BPMN models (a standard flowchart format for business processes) with compensation events and boundary timers.
 	- **Payment providers** support the authorize-then-capture split that makes capture a clean pivot, for example Stripe PaymentIntents with `capture_method=manual`.
 - **Failure modes → fixes:**
 	- Orchestrator crashes between a step and its log write → the step runs again on resume, so every step must be idempotent by saga id.
 	- Step times out, then succeeds late → compensations must win over a late original: the participant remembers cancelled saga ids.
 	- Compensation fails forever (refund API down) → retry with capped backoff, then `Stuck` and a human queue; never drop it silently.
 	- Saga waits forever on a reply that was lost → every waiting state has a timeout transition.
-	- Two orchestrator replicas drive the same saga → optimistic lock on `saga_instance.version`, or one consumer per saga id via partitioning.
+	- Two orchestrator replicas drive the same saga → optimistic lock (update only if the version number has not changed) on `saga_instance.version`, or one consumer per saga id via partitioning.
 - **What to monitor:**
 	- Sagas by status, and the count stuck longer than N minutes (the stuck-saga dashboard).
 	- Compensation rate per step: a spike in "card declined" compensations points at the payment provider.
-	- End-to-end saga duration p50 and p99.
+	- End-to-end saga duration p50 and p99 (the typical time, and the time 99 of 100 sagas beat).
 	- One **correlation id** (the saga id) in every log line, trace span and message header, so one order can be followed across services (see [[Distributed Tracing with OpenTelemetry]]).
 
 ## 8. Deep dive 🔴
@@ -817,6 +876,30 @@ An orchestrator is stateless code over the `saga_instance` table, so it scales h
 - Persist saga state; resume after crash; `Stuck` + alert when retries run out.
 - Countermeasures: semantic lock, commutative updates, reread/version check, pessimistic view.
 - Tools: Temporal/Cadence, AWS Step Functions, Camunda.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is a compensating action?
+> A new business step that undoes an earlier one, such as a refund or releasing reserved stock.
+
+> [!question]- Why can't checkout across services use one database transaction?
+> Each service has its own database, and outside APIs (payments, couriers) cannot join your transaction.
+
+> [!question]- Orchestration or choreography: which has one central boss?
+> Orchestration.
+
+🟡 Medium
+
+> [!question]- Why reserve stock before charging the card?
+> A stock-out then needs no refund; undoing a reservation is free, undoing a charge costs fees and time.
+
+> [!question]- Shipping keeps failing after the payment was captured. Do you refund?
+> No. After the pivot you only retry; when retries run out, mark the saga stuck and alert someone.
+
+> [!question]- Name one way to stop two sagas from clashing on stock.
+> A commutative, conditional update: `available = available - 2 WHERE available >= 2`, plus a pending status on the order.
 
 ## Links
 

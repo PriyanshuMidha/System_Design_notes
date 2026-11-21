@@ -40,6 +40,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (the eight decisions), 4 (e-commerce example), 5, 6 and 9 (drills).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 10 and 11. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[SQL vs NoSQL]]: relational databases keep tables with strict rules and joins; NoSQL stores trade some of that for easier scaling or flexible shapes.
+> - [[Search Engines and Inverted Indexes]]: search works by keeping, for each word, the list of documents that contain it.
+> - [[Time-Series and Columnar Storage]]: storing data column by column makes "sum one column over millions of rows" fast.
+> - [[AWS 07 - S3]]: S3 is Amazon's object storage, where files are saved and fetched by a key over HTTP.
+
 **From zero, in 60 seconds** 🟢
 
 Your main database is great at one job: saving and reading orders and users safely.
@@ -84,6 +90,12 @@ So each job goes to a store built for it, and the main database stays the truth.
 | OLTP | Many small, fast reads and writes (the app's daily work) | Place one order |
 | OLAP / warehouse | Big scans and sums over lots of history | Revenue by city for last year |
 | CDC | Change data capture: stream every database change out | New row in `orders` → event to the warehouse |
+| Block storage | A virtual disk attached to one machine | an EBS volume under PostgreSQL |
+| Presigned URL | A short-lived link that lets a client upload or download one file directly | valid for 15 minutes |
+| Facets | Filter counts shown next to search results | "Brand: Nike (42), Puma (17)" |
+| Reindex | Rebuilding the search index from the source data | after a mapping change |
+| Parquet | A compressed, column-by-column file format | sales data in the lake |
+| Data lake | Raw data kept as files on cheap object storage | years of events in S3 |
 
 **Picture it**
 
@@ -128,6 +140,21 @@ Picture a company with three rooms. The **filing warehouse** (object storage) ho
 
 The analogy breaks down because these rooms stay in sync through automatic copying, and the copies can lag. Plan for that lag.
 
+### Real-life example: shopping on Flipkart or Amazon 🟢
+
+Product photos are files, so they live in object storage and reach your phone through a CDN server near you.
+When you type "red running shoes" and tick "Nike" and "under ₹3,000", a search engine answers, with counts next to each filter.
+The product's price and stock come from the main database, which is the source of truth; the search index is only a copy kept in sync.
+Every night, analysts ask "sales by city last year" from a separate warehouse, so those huge queries never slow down checkout.
+
+## Common beginner mistakes 🟢
+
+- **Storing images or PDFs inside database rows** → backups and replicas get huge and slow → put files in object storage and keep only the key and metadata in the DB.
+- **Sending every upload through your app servers** → they burn bandwidth and memory on bytes → give the client a presigned URL to upload straight to storage.
+- **Using Elasticsearch as the main database** → it is a copy that can lag and needs reindexing → keep the truth in the DB and feed the index from it.
+- **Writing to the DB and the search index from app code** → one write can fail and they drift apart → let the index follow DB changes through CDC.
+- **Running big reports on the production database** → checkout slows down → run analytics on a warehouse copy.
+
 ```mermaid
 flowchart LR
     U["Users and apps"] --> DB["OLTP database<br/>source of truth"]
@@ -143,9 +170,18 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the three rooms: files, search and analytics, each with its own store. **Next we open the box**, one decision at a time. Several decisions start with a plain walk-through; the full detail follows.
+
 ### Decision 1: object, block or file storage?
 
 **In plain words.** **Object storage** keeps whole objects (bytes plus metadata) under a key in a flat namespace and exposes them over HTTP. **Block storage** is a raw disk volume that one machine formats and mounts. **File storage** is a shared network file system with directories and POSIX-style access.
+
+**Step by step:**
+1. A user uploads an avatar. It goes to object storage under the key `users/42/avatar.jpg`.
+2. Your database stores only that key, the size and the owner.
+3. PostgreSQL itself runs on block storage, a virtual disk that only its own machine uses.
+4. A folder of config files that many servers must read at once sits on file storage (a shared network drive).
+5. Each kind fits one job; mixing them up makes things slow or costly.
 
 ```mermaid
 flowchart TD
@@ -160,7 +196,7 @@ flowchart TD
 
 | Dimension | Object (S3) | Block (EBS) | File (EFS) |
 | --- | --- | --- | --- |
-| Access | HTTP API by key | Raw device, one host | NFS mount, many hosts |
+| Access | HTTP API by key | Raw device, one host | NFS (a network file-sharing protocol) mount, many hosts |
 | Consistency | Strong read-after-write (S3, since Dec 2020) | Strong (it is a disk) | Close-to-open style, NFS semantics |
 | Durability | 11 nines design goal | Replicated inside one AZ | Across AZs |
 | Latency | Tens of ms first byte (estimate) | Sub-ms to ms | Low ms |
@@ -176,6 +212,13 @@ flowchart TD
 ### Decision 2: how do uploads and downloads flow?
 
 **In plain words.** Do not stream big files through your app servers. Hand the client a **presigned URL**, a time-limited URL signed by your server, so the client uploads straight to object storage.
+
+**Step by step:**
+1. The app asks your server: "I want to upload a 200 MB video".
+2. The server checks the user is allowed, then returns a presigned URL valid for 15 minutes.
+3. The app uploads the video straight to object storage using that URL, in parallel parts.
+4. Storage tells your server "upload done" (or the app does), and the server saves the key in the database.
+5. Your servers never carried the 200 MB.
 
 ```mermaid
 sequenceDiagram
@@ -204,6 +247,12 @@ See [[AWS 07 - S3]] and [[Case Study - File Storage and Sync]].
 
 **In plain words.** A **CDN** (content delivery network) caches copies of content on servers near users. It cuts latency and takes load off your origin.
 
+**Step by step:**
+1. A user in Chennai asks for `app.3fa9c.js`.
+2. The nearest CDN server does not have it yet, so it fetches it once from your storage and keeps a copy.
+3. The next thousand users in Chennai get it from that CDN server in a few milliseconds.
+4. You ship a new version as `app.8b21d.js`, a new name, so old copies never need clearing.
+
 ```mermaid
 flowchart TD
     A["Serving content to users"] --> B{"Same bytes requested<br/>by many users?"}
@@ -225,6 +274,12 @@ Good practice: put a content hash or version in the file name (`app.3fa9c.js`) s
 
 **In plain words.** A search engine builds an **inverted index**: for each word, a list of documents that contain it. Queries become list lookups and merges, then a relevance score ranks the results. See [[Search Engines and Inverted Indexes]].
 
+**Step by step:**
+1. Product 42 is "Red Running Shoes". The index adds 42 to the lists for `red`, `run` and `shoe`.
+2. A user searches "red shoe". The engine looks up both lists and finds products in both.
+3. It ranks them (more matching words, title matches, popularity) and counts brands for the filters.
+4. Postgres can do simple versions of this inside your database; Elasticsearch does richer ranking and filters but is a separate cluster.
+
 ```mermaid
 flowchart TD
     S["Need text search"] --> A{"Simple keyword match on one table,<br/>fewer than a few million rows?"}
@@ -242,7 +297,7 @@ flowchart TD
 | Setup | Already there | Separate cluster to run |
 | Consistency | Transactional with your data | Near-real-time: new documents visible after the refresh (default 1 second) |
 | Relevance | Basic (`ts_rank`), limited tuning | Rich scoring, boosting, analyzers, synonyms |
-| Features | Stemming, phrase search, trigram for typos | Facets and aggregations, fuzzy, autocomplete, highlighting |
+| Features | Stemming (matching "running" to "run"), phrase search, trigram for typos | Facets and aggregations, fuzzy, autocomplete, highlighting |
 | Scale | One node plus replicas | Shards across many nodes |
 | Source of truth | Yes | No, derived index |
 | Operational cost | Lowest | Higher: shards, heap, reindexing, mapping changes |
@@ -278,7 +333,7 @@ sequenceDiagram
 Steps:
 
 1. The database commit is the single write.
-2. A CDC tool (for example Debezium reading the WAL) emits events.
+2. A CDC tool (for example Debezium reading the WAL, the database's log of every change) emits events.
 3. The indexer upserts documents using the entity's version or timestamp to ignore stale events.
 4. A nightly or on-demand full reindex repairs drift.
 
@@ -287,6 +342,12 @@ Related: [[Materialized Views and Denormalization]] for the same "derived copy" 
 ### Decision 6: OLTP or OLAP?
 
 **In plain words.** **OLTP** (online transaction processing) means many small reads and writes of single rows, such as "place order 123". **OLAP** (online analytical processing) means few queries that scan many rows but only a few columns, such as "revenue by city by month".
+
+**Step by step:**
+1. "Place order 991" touches one row: the app database (OLTP) does this in milliseconds.
+2. "Revenue by city for last year" must read 500 million rows.
+3. A row store would read every column of every row. A column store reads only `city` and `amount`, compressed.
+4. So orders are copied (often by CDC) into a warehouse, and the big question runs there.
 
 ```mermaid
 flowchart LR
@@ -424,6 +485,8 @@ See [[Case Study - Metrics and Logging Platform]] and [[Case Study - Search Auto
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** where files, search and analytics each belong and how they stay in sync. **Next comes the senior view**: production habits, then the details of object storage guarantees, why column scans are fast, search as derived state, deletes and privacy, and cost levers.
+
 - **Dropbox** stored file blocks on S3 at first, then built its own storage system, Magic Pocket, to cut cost and gain control at huge scale (Dropbox engineering blog, 2016). Smaller companies rarely reach the point where that pays.
 - **Netflix** operates Open Connect appliances inside ISPs, and created Apache Iceberg for lake tables.
 - **Uber** created Apache Hudi and published its move of log analytics to ClickHouse.
@@ -540,6 +603,26 @@ Object storage tiers (infrequent access, archive) cut cost for old data. CDN off
 - OLTP rows for transactions, OLAP columns for scans. Never run analytics on the primary.
 - ClickHouse for fast fresh dashboards, BigQuery for no ops, Snowflake for elastic isolation, Redshift on AWS.
 - Lake for raw, cheap, many consumers. Warehouse for curated reporting.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) Where should user photos live?
+> In object storage, with only the key and metadata in the database.
+
+> [!question]- (easy) What is a presigned URL for?
+> Letting the client upload or download one file directly to storage for a short time, without passing through your servers.
+
+> [!question]- (easy) What is an inverted index?
+> A map from each word to the documents that contain it.
+
+> [!question]- (medium) Why keep the database, not Elasticsearch, as the source of truth?
+> The index is a derived copy that can lag and must sometimes be rebuilt; it is not transactional.
+
+> [!question]- (medium) Why is dual-writing to DB and search index risky, and what is better?
+> One write can succeed and the other fail; let the index follow DB changes via CDC, plus periodic reindex.
+
+> [!question]- (medium) Why does a column store answer "sum amount by city" faster?
+> It reads only the two needed columns, compressed, instead of whole rows.
 
 ## Links 🟢
 

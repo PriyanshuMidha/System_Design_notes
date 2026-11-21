@@ -29,6 +29,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Testing Strategy and the Test Pyramid]]: flaky tests usually come from shared state, the clock or randomness; this note fixes those for test data.
+> - [[Unit, Integration and E2E Tests]]: integration tests run against a real database, so each test needs rows in it, and those rows must not clash.
+
 **From zero, in 60 seconds** 🟢
 
 Most tests need some data first, like a user or an order in the database.
@@ -69,6 +73,11 @@ Test data strategy is the set of habits that stops tests from tripping over each
 | Deterministic | Same input gives the same result every run | A fixed clock instead of `time.Now()` |
 | PII | Personal data that identifies a real person | Real names, emails, phone numbers |
 | Flaky test | Passes sometimes, fails sometimes, same code | Fails only when run in parallel |
+| Functional option | A tiny function that changes one field of a builder's default object | `WithAmount(500)` |
+| Seed / RNG | RNG = random number generator; a fixed seed makes it give the same "random" numbers every run | `rand.NewSource(1)` |
+| UUID | A long random ID, different every run | `8f2a19e3-...` |
+| Masking | Replacing real personal data with fake but realistic values | "Priya Shah" → "Asha Rao" |
+| TTL | Time to live: delete after this long | Clean staging rows older than 24 h |
 
 **Picture it**
 
@@ -104,6 +113,10 @@ A test for "place an order" needs a customer, a product, a price, and a timestam
 
 The fix is a **builder** for shape, **isolation** for independence, and **fixed inputs** for determinism, chosen separately because they solve three different problems.
 
+### Real-life example: testing Swiggy coupons 🟢
+
+Say a team at Swiggy tests the rule "a first-order coupon works only on a user's first order". One test needs a brand-new user with no orders; another needs a user with three past orders. If both tests share one "test user" row, whichever runs first changes what the other sees, and the suite fails at random in CI. With a builder, each test creates its own user (`NewUser(WithOrders(0))`, `NewUser(WithOrders(3))`) in its own isolated database, with a fixed clock so "today" is always the same date. And nobody copies real customers' phone numbers into the test database to do this.
+
 ```mermaid
 flowchart LR
     A["Test A adds user 'bob'"] --> DB[("Shared DB")]
@@ -124,11 +137,27 @@ flowchart LR
     B["Builder with defaults"] -- "set only what matters" --> O["Valid test object"] --> T["Test"] --> C["Clean up / roll back"]
 ```
 
+## Common beginner mistakes 🟢
+
+- **One shared fixture file for the whole suite** → tests change each other's data and order starts to matter → build the rows each test needs, inside that test.
+- **Using `time.Now()` and random UUIDs in test data** → failures cannot be reproduced → inject a fixed clock and use sequential IDs.
+- **Copying the production database to a laptop** → real personal and card data leaks → use synthetic data or a masked subset.
+- **Only one tenant in fixtures** → a missing `WHERE tenant_id = ?` goes unnoticed → always build at least two tenants.
+- **Storing money as `float64` in test data** → totals drift by tiny amounts → use integer paise or cents.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the three knobs: shape, isolation and determinism. **Next we open the box**: the three ways to make rows, the four ways to keep tests' data apart in Postgres, and how to make every run produce the same data.
 
 ### Fixtures vs factories vs builders
 
 **In plain words: three ways to make test data: a fixed file, a function, or a builder with defaults you can change.**
+
+**Step by step:**
+1. Fixture: load `orders.sql` with 50 fixed rows before all tests. Easy, but every test shares the same rows.
+2. Factory: call `MakeOrder(map{"amount": 500})`; it fills defaults for the rest. Better, but long override maps get messy.
+3. Builder: call `NewOrder(WithAmount(500))`. Defaults fill everything else; each option names one change.
+4. When the table gains a new required column, you add its default in one place, the builder, and no test changes.
 
 | Term | What it is | Problem it has |
 | --- | --- | --- |
@@ -139,6 +168,13 @@ flowchart LR
 ### Per-test isolation on PostgreSQL 17
 
 **In plain words: give each test its own clean database, or roll its changes back at the end.**
+
+**Step by step:**
+1. Once per suite run, create a database `tmpl`, run all migrations on it, and add shared seed rows.
+2. Test 7 starts: run `CREATE DATABASE test_7 TEMPLATE tmpl`. Postgres copies the files in a few milliseconds.
+3. Test 7 runs against `test_7`, committing freely; nobody else can see its rows.
+4. At the end, `DROP DATABASE test_7`.
+5. For a small serial suite, the cheaper choice is to wrap each test in `BEGIN` ... `ROLLBACK` on one shared database.
 
 ```mermaid
 flowchart TB
@@ -152,16 +188,22 @@ Four isolation techniques, in increasing cost and increasing realism:
 
 | Technique | How | Cost | Catches |
 | --- | --- | --- | --- |
-| Transaction rollback | `BEGIN`, run the test, `ROLLBACK` | Cheapest; one shared DB | Nothing that itself needs a committed transaction (e.g. testing `SERIALIZABLE` retries, triggers that fire `AFTER COMMIT`) |
-| Truncate between tests | `TRUNCATE ... RESTART IDENTITY CASCADE` after each test | Cheap, but serial (one suite can't parallelize against one DB) | Commit-dependent code, at the cost of full serial runs |
+| Transaction rollback | `BEGIN`, run the test, `ROLLBACK` | Cheapest; one shared DB | Nothing that itself needs a committed transaction (e.g. testing `SERIALIZABLE` retries, the strictest isolation level, or triggers, code the database runs automatically, that fire `AFTER COMMIT`) |
+| Truncate between tests | `TRUNCATE ... RESTART IDENTITY CASCADE` (empty the tables and reset ID counters) after each test | Cheap, but serial (one suite can't parallelize against one DB) | Commit-dependent code, at the cost of full serial runs |
 | Template-database cloning | `CREATE DATABASE test_N TEMPLATE tmpl` per test/worker, drop after | A few ms per clone (`TEMPLATE` copies files, no migration re-run) | Full commit behaviour, safe parallel workers |
-| Schema per parallel test | One physical DB, one Postgres schema (`search_path`) per worker | Cheapest way to parallelize without extra databases | Same as template cloning, minus cross-schema foreign keys if your schema design needs them |
+| Schema per parallel test | One physical DB, one Postgres schema (a named folder of tables, picked via `search_path`) per worker | Cheapest way to parallelize without extra databases | Same as template cloning, minus cross-schema foreign keys if your schema design needs them |
 
 Template cloning is usually the best default once a suite runs in parallel: each Go test worker (`go test -p N`) gets its own real, empty-of-other-tests database, so committed transactions and triggers behave exactly as in production, and clones are dropped at the end of the run.
 
 ### Determinism
 
 **In plain words: remove anything random, like the clock or random IDs, so tests give the same answer every run.**
+
+**Step by step:**
+1. The code under test asks an injected `now()` function for the time; the test passes one that always returns 1 Jan 2026, 00:00 UTC.
+2. Any random choice uses `rand.New(rand.NewSource(1))`, so run 1 and run 500 see the same numbers.
+3. IDs come from a counter: `ord_1`, `ord_2`, reset at the start of each test.
+4. A failure message like "expected ord_1" now means the same thing every run, and you can replay it exactly.
 
 - **Clock:** inject `func() time.Time` (or an interface) instead of calling `time.Now()` inside logic under test; tests pass a fixed `time.Date(...)`.
 - **Randomness:** seed the RNG explicitly (`rand.New(rand.NewSource(1))`) so a failing run can be replayed with the same sequence.
@@ -303,7 +345,7 @@ A builder's defaults should be boring, but your test *suite* must also exercise:
 
 - **Unicode:** customer names with combining characters, emoji, right-to-left text — a column with a byte-length limit can silently truncate a multi-byte character mid-codepoint.
 - **Money precision:** always integer minor units (`AmountPaise int64`), never `float64`; a float total over many line items drifts from the sum of its parts.
-- **Time zones and DST:** a booking that starts the day of a DST transition, and a customer timezone that differs from the server's — stored timestamps should be UTC with the zone attached only at render time.
+- **Time zones and DST:** a booking that starts the day of a DST (daylight saving time, when clocks jump an hour) transition, and a customer timezone that differs from the server's — stored timestamps should be UTC with the zone attached only at render time.
 - **Large payloads:** the biggest row your API accepts (max description length, max line items) to catch truncation and timeout bugs before customers do.
 
 ### Synthetic data and provider states
@@ -334,8 +376,8 @@ flowchart LR
 | Need | Technique | Rule |
 | --- | --- | --- |
 | Realistic distribution for load tests | Subsetting: copy a slice of real tables (e.g. last 30 days), at close to production row counts, not a handful of rows | Still contains PII — mask before it leaves the production network boundary |
-| Realistic access pattern for load tests | Match production's key skew (a Zipf-like distribution: a few customers/products get most of the traffic) instead of uniformly random keys | Uniform synthetic keys hide hot-partition and hot-row bugs (lock contention, cache misses) that only show up when a handful of keys take most of the load — see [[Load and Performance Testing]] |
-| Masking / anonymisation | Replace names, emails, phone numbers, card numbers with synthetic-but-plausible values, keep referential integrity (same customer id masks to the same fake name everywhere) | Deterministic masking (hash-based) so joins still work across tables |
+| Realistic access pattern for load tests | Match production's key skew (a Zipf-like distribution, a mathematical shape where a few items are very popular: a few customers/products get most of the traffic) instead of uniformly random keys | Uniform synthetic keys hide hot-partition and hot-row bugs (lock contention, cache misses) that only show up when a handful of keys take most of the load — see [[Load and Performance Testing]] |
+| Masking / anonymisation | Replace names, emails, phone numbers, card numbers with synthetic-but-plausible values, keep referential integrity (links between tables still match: same customer id masks to the same fake name everywhere) | Deterministic masking (hash-based) so joins still work across tables |
 | Regulatory constraints | GDPR, PCI-DSS | Raw PII and card data never leave production; a right-to-be-forgotten request must also purge any exported copy |
 
 ### Multi-tenant isolation and golden datasets
@@ -371,6 +413,9 @@ A staging environment shared by many CI runs needs row-level isolation too: pref
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to build rows, isolate them per test and keep them deterministic. **Next we look at real suites**: common "passes locally, fails in CI" causes, what to monitor, and deeper points such as why template cloning is fast, the blind spot of rollback-based tests, and masking without breaking joins.
+
+
 - **Real systems:** Rails' fixtures/factory_bot and Go's `go-faker/gofakeit` popularized factory-style test data; PostgreSQL's `CREATE DATABASE ... TEMPLATE` is the standard way Postgres-backed Go suites (e.g. using `testcontainers-go` or a local instance) get cheap per-test databases.
 - **Failure modes → fixes:**
   - "Passes locally, fails in CI" → almost always two tests sharing one un-isolated table, or a test depending on wall-clock time; add isolation or inject a fixed clock.
@@ -380,8 +425,8 @@ A staging environment shared by many CI runs needs row-level isolation too: pref
 
 ## 8. Deep dive 🔴
 
-- **Why `TEMPLATE` cloning is fast in Postgres:** `CREATE DATABASE ... TEMPLATE tmpl` uses the filesystem-level file copy Postgres already does for template databases, not a logical replay of DDL; it is close to a file copy, not a migration re-run, so timing scales with data size, not schema complexity.
-- **Transaction rollback's blind spot:** code that relies on `pg_notify`, `AFTER COMMIT` triggers, or `SERIALIZABLE` retry logic only runs its real path after a commit.
+- **Why `TEMPLATE` cloning is fast in Postgres:** `CREATE DATABASE ... TEMPLATE tmpl` uses the filesystem-level file copy Postgres already does for template databases, not a logical replay of DDL (the `CREATE TABLE`-style schema statements); it is close to a file copy, not a migration re-run, so timing scales with data size, not schema complexity.
+- **Transaction rollback's blind spot:** code that relies on `pg_notify` (Postgres's built-in message that is sent only when a transaction commits), `AFTER COMMIT` triggers, or `SERIALIZABLE` retry logic only runs its real path after a commit.
   A test wrapped in an outer transaction that's always rolled back never actually commits, so that code path goes untested.
   This is why integration tests for exactly that logic need template cloning or truncation instead.
 - **Why sequential test IDs, not UUIDs:** a UUID per test run makes `t.Fatalf` output ("expected customer 8f2a19e3-...") useless to compare across runs; a sequential counter reset per test makes failure output diffable and makes golden files for regression tests stable.
@@ -417,6 +462,26 @@ A staging environment shared by many CI runs needs row-level isolation too: pref
 - Multi-tenant fixtures always include at least two tenants, to catch a missing tenant filter.
 - Golden datasets pin known-good output for regression; regenerate deliberately when behaviour legitimately changes.
 - "Passes locally, fails in CI" → check isolation and determinism first.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is a builder in test data?
+> A helper that creates a valid object with defaults, so each test sets only the fields it cares about.
+
+> [!question]- (easy) Why not use `time.Now()` in test data?
+> The value changes every run, so results and failures cannot be repeated.
+
+> [!question]- (easy) Is it fine to copy real production customers into a test database?
+> No. Use synthetic data or a masked subset; raw personal data must not leave production.
+
+> [!question]- (medium) Why can't a test wrapped in a rolled-back transaction test an `AFTER COMMIT` trigger?
+> The transaction never commits, so the trigger never fires.
+
+> [!question]- (medium) When is template-database cloning better than transaction rollback?
+> When tests run in parallel or need real commits; each test gets its own real database.
+
+> [!question]- (medium) Why must masking be deterministic?
+> So the same real customer becomes the same fake customer in every table, keeping joins working.
 
 ## Links 🟢
 

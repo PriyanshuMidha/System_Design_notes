@@ -35,6 +35,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[TCP - Handshake, Reliability, Flow and Congestion Control]]: TCP turns lost, jumbled packets into one ordered stream of bytes, but only while the connection stays open.
+> - [[Context Package]]: in Go, a `context` carries a deadline, so a call can give up after, say, 2 seconds.
+
 **From zero, in 60 seconds** 🟢
 
 A **distributed system** is a set of programs on different machines that work together by sending messages.
@@ -81,6 +85,11 @@ Every program that talks to another machine lives in this situation all the time
 | Idempotent | Safe to repeat with the same result | Charge with key `order-42` once only |
 | Latency | Time a request takes end to end | 0.5 ms round trip in one data centre |
 | System model | The list of failures you assume can happen | "Nodes crash and restart; nobody lies" |
+| Failure detector | Code that marks a node "probably dead" after a long silence | No heartbeat for 3 s: suspect db-2 |
+| Gray failure | A part that looks healthy to its monitor but fails real users | Health check says 200, every order times out |
+| GC pause | The program freezes while its memory cleaner runs | A Java service stops for 10 s |
+| p99 latency | The time that 99 of 100 requests beat; the slow tail | p99 = 800 ms while the average is 50 ms |
+| fsync | Forcing data from memory onto the disk before replying | Save the log entry, then say "ok" |
 
 **Picture it**
 
@@ -109,12 +118,14 @@ Where it breaks: post rarely duplicates letters, but networks and retries can de
 
 ## 1. Why it exists 🟢
 
+🟢 **Plain version:** One program on one machine either works or stops. Once the program is split over many machines, one piece can break while the others keep going. A caller then often hears nothing and cannot tell what happened. The more machines a request touches, the more often one of them is slow or down. This note is about living with that.
+
 A single process either works or crashes as a whole. Spread the same program over machines and a new kind of failure appears: **partial failure**, where some parts work and some do not, and nobody has a complete view.
 
 A concrete scenario. A checkout service calls a payment service to charge ₹500, with a 2-second timeout.
 
 1. The request reaches the payment service, which charges the card.
-2. The reply packet is lost (a switch drops it, or the connection is reset).
+2. The reply packet is lost (a **switch**, the network box that forwards packets, drops it, or the connection is **reset**, meaning one side abruptly closes it).
 3. After 2 seconds the checkout service gives up with `context deadline exceeded`.
 
 The checkout service now has three possible worlds: the charge never happened, it happened, or it is still in progress. Nothing in the error tells them apart. A naive retry charges ₹1,000. Never retrying loses sales. This note is about the rules that make such situations manageable.
@@ -122,8 +133,16 @@ The checkout service now has three possible worlds: the charge never happened, i
 The numbers make it worse as systems grow:
 
 - **Serial dependencies multiply.** If a request needs 10 services and each is up 99.9% of the time, the request succeeds `0.999^10 ≈ 99.0%` of the time (arithmetic): ten times the downtime of any one service.
-- **Fan-out amplifies tails.** If one server is slow (over 1 s) on 1% of requests, a request that fans out to 100 servers is slow `1 − 0.99^100 ≈ 63%` of the time. This is the example from *The Tail at Scale*.
+- **Fan-out amplifies tails.** (**Fan-out** means one request is sent to many servers at once; the **tail** is the slowest few requests.) If one server is slow (over 1 s) on 1% of requests, a request that fans out to 100 servers is slow `1 − 0.99^100 ≈ 63%` of the time. This is the example from *The Tail at Scale*.
 - **The network is slow compared with memory.** A round trip inside one data centre is about 0.5 ms, and California to the Netherlands and back is about 150 ms (Jeff Dean's "numbers everyone should know"; treat them as orders of magnitude). A chatty design that makes 50 sequential cross-region calls spends 7.5 s on the wire.
+
+### Real-life example 🟢
+
+You pay ₹500 for a movie ticket on BookMyShow with UPI. The app shows "payment pending" for a minute.
+Your bank has taken the money, but the reply to BookMyShow got stuck somewhere on the way.
+BookMyShow does not know yet whether you paid, so it neither gives you the seat nor charges you again.
+A little later it checks with the payment provider, finds the payment, and confirms your ticket (or refunds you).
+That "pending" screen is a distributed system admitting "I do not know yet".
 
 ## 2. Mental model 🟢
 
@@ -136,7 +155,7 @@ Think of the network as a **postal service with no tracking**. You post a letter
 Three ideas follow from this picture and run through the whole folder:
 
 1. **Unknown is a real outcome.** Code paths must handle "maybe".
-2. **Make repeats harmless** with idempotency keys, so "maybe" can be resolved by retrying ([[Idempotency and Idempotency Keys]]).
+2. **Make repeats harmless** with **idempotency keys** (a unique ID sent with the request, so the server can spot a repeat and skip it), so "maybe" can be resolved by retrying ([[Idempotency and Idempotency Keys]]).
 3. **Suspect, do not know.** A node that stays silent is *suspected* dead. You never get proof.
 
 ```mermaid
@@ -156,18 +175,35 @@ Peter Deutsch (with an eighth added by James Gosling) listed the assumptions tha
 | --- | --- | --- |
 | 1. The network is reliable | Packets drop, connections reset, links partition | Timeouts, retries with idempotency, [[Delivery Semantics and Exactly-Once]] |
 | 2. Latency is zero | Each hop costs 0.5 ms in a DC and up to 150 ms across the world | Batch calls, avoid chatty APIs, keep calls in-region |
-| 3. Bandwidth is infinite | Large payloads saturate NICs and cross-AZ links cost money | Pagination, compression, streaming |
-| 4. The network is secure | Traffic can be read or forged inside the DC | mTLS, authentication on internal calls |
-| 5. Topology doesn't change | Pods move, IPs change, nodes join and leave | Service discovery, health checks, short DNS TTLs |
+| 3. Bandwidth is infinite | Large payloads fill up NICs (network cards) and cross-AZ links (between data-centre buildings) cost money | Pagination, compression, streaming |
+| 4. The network is secure | Traffic can be read or forged inside the DC | mTLS (both sides prove who they are and encrypt), authentication on internal calls |
+| 5. Topology doesn't change | Pods (running copies of a service) move, IPs change, nodes join and leave | Service discovery (a live phone book of addresses), health checks, short DNS TTLs (how long an address is cached) |
 | 6. There is one administrator | Many teams, many configs, many rollout schedules | Versioned APIs, backward compatibility |
-| 7. Transport cost is zero | Serialization CPU and egress fees are real | Efficient encodings (Protobuf), co-location |
+| 7. Transport cost is zero | Serialization CPU (turning objects into bytes) and egress fees (paying for data leaving the cloud) are real | Efficient encodings (Protobuf, a compact binary format), co-location |
 | 8. The network is homogeneous | Mixed hardware, kernels, languages and middleboxes | Standard protocols, explicit timeouts at every hop |
 
+## Common beginner mistakes 🟢
+
+- **Treating a timeout as "it failed"** → the server may have done the work and only the reply was lost → treat it as "unknown" and retry with the same idempotency key, or ask the server.
+- **Retrying a payment without a key** → a lost reply plus a retry charges the user twice → send one unique key per action, such as `order-42`.
+- **Calling another service with no timeout** → one hung dependency makes your threads wait forever → set a deadline on every remote call.
+- **Trusting a green health check** → a server can answer `/health` while every real request fails → check the real path and watch error rates from the caller's side.
+- **Splitting into many services "for scale" too early** → every extra hop adds delay and a new way to fail → start with one well-sized service and split only when you measure a limit.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a remote call can end in "yes", "no" or silence, and that silence means "maybe". **Next we open the box**: what exactly a caller can conclude, which failures we agree to plan for, and how partitions and half-broken servers fool everyone. Each subsection starts with a short step-by-step walk.
 
 ### What the caller can conclude
 
 **In plain words:** you get yes, no, or silence. Silence is "maybe", so plan for the work having happened.
+
+**Step by step:**
+1. Checkout sends "charge ₹500, key order-42" to the payment service.
+2. The payment service charges the card and saves the key order-42.
+3. Its "200 OK" reply is lost on the way back.
+4. After 2 seconds, checkout gives up. It now knows only "unknown".
+5. Checkout retries with the same key. The server sees order-42 already done and just returns the old result. The card is charged once.
 
 Every remote call ends in one of three states for the caller: **succeeded** (a reply said so), **failed** (a reply said nothing was done), or **unknown** (no reply). The sequence below shows how the unknown state arises even though the server did its job.
 
@@ -193,13 +229,20 @@ sequenceDiagram
 
 **In plain words:** before you design anything, write down which failures you expect: crashes, lost messages, slow clocks.
 
+**Step by step:**
+1. Pick a timing rule: "messages can be slow, but usually arrive within 1 second".
+2. Pick a node rule: "a server can crash and restart, and it keeps only what it saved to disk".
+3. Pick a message rule: "messages can be lost or repeated, but a resent message gets through in the end".
+4. Design for exactly that list. For example, since restarts lose memory, save each log entry to disk before saying "ok".
+5. Write down what you do NOT handle, such as "servers never lie", so nobody assumes more.
+
 Before reasoning about an algorithm you fix a **system model**: an explicit list of the failures you assume are possible. There are two independent axes.
 
 **Timing (how slow can things be?):**
 
 - **Synchronous:** every message and every step has a known upper bound on delay. Easy to reason about, but real networks and garbage-collected processes do not give such bounds.
-- **Asynchronous:** no bound at all. A message may take any finite time. Here, the **FLP result** (1985) proves that no deterministic algorithm can guarantee consensus if even one process may crash, because a crashed process and a very slow one look identical.
-- **Partially synchronous:** the system behaves asynchronously for a while but eventually respects bounds. This is the realistic model, and Raft and Paxos are designed for it: they are always safe, and they make progress whenever the network behaves well for long enough.
+- **Asynchronous:** no bound at all. A message may take any finite time. Here, the **FLP result** (a 1985 proof named after its authors Fischer, Lynch and Paterson) proves that no deterministic algorithm can guarantee consensus if even one process may crash, because a crashed process and a very slow one look identical.
+- **Partially synchronous:** the system behaves asynchronously for a while but eventually respects bounds. This is the realistic model, and Raft and Paxos (algorithms that let a group of servers agree on one value; see [[Consensus - Raft and Paxos]]) are designed for it: they are always safe, and they make progress whenever the network behaves well for long enough.
 
 **Node failures (how can a machine misbehave?):**
 
@@ -218,14 +261,21 @@ stateDiagram-v2
 
 - **Crash-stop:** a node runs correctly until it stops forever.
 - **Crash-recovery:** a node can stop and come back, keeping only what it wrote to durable storage. Most databases and consensus systems assume this model, which is why they `fsync` before acknowledging.
-- **Byzantine:** a node may send wrong or contradictory messages. Tolerating `f` such nodes needs at least `3f + 1` nodes. Ordinary backends inside one organisation assume non-Byzantine nodes and guard against corruption with checksums. Blockchains and some aerospace systems use Byzantine tolerance.
-- **Process pauses** are not a separate model but matter in every model: a node paused for 10 s by a stop-the-world GC or a VM migration wakes up and keeps acting on stale beliefs, such as "I still hold the lock". See [[Distributed Locks and Fencing Tokens]].
+- **Byzantine:** a node may send wrong or contradictory messages (named after a puzzle about generals who might be traitors). Tolerating `f` such nodes needs at least `3f + 1` nodes. Ordinary backends inside one organisation assume non-Byzantine nodes and guard against corruption with **checksums** (a short fingerprint of the data that changes if any byte changes). Blockchains and some aerospace systems use Byzantine tolerance.
+- **Process pauses** are not a separate model but matter in every model: a node paused for 10 s by a stop-the-world GC or a VM migration (the cloud moving a running virtual machine to another host) wakes up and keeps acting on stale beliefs, such as "I still hold the lock". See [[Distributed Locks and Fencing Tokens]].
 
 **Links (how can messages misbehave?):** reliable links deliver every message exactly once; **fair-loss** links may drop, duplicate or reorder, but a message sent infinitely often eventually arrives. TCP turns fair-loss packets into a reliable byte stream *while the connection lives*, but a reset connection still leaves the application not knowing what the other side processed.
 
 ### Partitions, gray failures and suspicion
 
 **In plain words:** sometimes machines cannot reach each other, or a machine is half broken. Other machines can only suspect, never be sure.
+
+**Step by step:**
+1. Servers A, B and C run in one data centre. A bad firewall rule blocks traffic between B and C.
+2. A and B still talk. C talks to nobody. That is a partition, and C is not dead.
+3. B stops hearing from C. After 3 seconds of silence it marks C "suspected".
+4. Meanwhile server D has a failing disk. It still answers health checks, but every real request hangs. That is a gray failure.
+5. The monitor says D is fine and C is dead. Both guesses are wrong, which is why detection is only ever suspicion.
 
 - **Network partition:** some nodes can talk to each other but not to the others. A partition need not be a cut cable: a full queue, a misconfigured firewall rule or a long GC pause produces the same symptoms. How systems choose between consistency and availability during a partition is [[CAP and PACELC]].
 - **Gray failure:** a component is broken for its users but looks healthy to its monitor. Huang et al. (HotOS 2017) call this *differential observability*. Example: a server answers health checks on a separate thread while every real request times out because its disk is failing.
@@ -559,6 +609,14 @@ And the failure types a backend engineer meets weekly:
 | Gray failure | Failing disk, half-broken dependency | Health checks pass, users fail | Health checks that exercise the real path; client-side outlier detection |
 | Byzantine | Memory corruption, bad deploy, attacker | Wrong data | Checksums, validation, authentication |
 
+### Distributed versus things people confuse it with 🟡
+
+| Thing | What it means | Key difference from a distributed system |
+| --- | --- | --- |
+| Concurrent program (threads on one machine) | Many tasks share one memory and one clock | Threads share memory and crash together; nodes share nothing and fail separately |
+| Microservices | One way to split an app into small services | Microservices are one kind of distributed system, not the only kind |
+| Parallel computing (one big batch job) | Split work to finish faster | The goal is speed, and a failed piece can just be rerun; online services must keep answering |
+
 ## 6. Trade-offs and when not to use 🟡
 
 Distribution is a cost you pay for something specific: scale beyond one machine, fault tolerance, or being close to users. Do not distribute without one of those reasons.
@@ -571,11 +629,13 @@ Distribution is a cost you pay for something specific: scale beyond one machine,
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the three outcomes of a remote call, the failure models, and how partitions and gray failures fool detectors. **Next comes the advanced part**: how real systems such as Kubernetes, etcd and Envoy live with these limits, what breaks in production, and the theory (FLP, Two Generals) behind it.
+
 - **Real systems:**
 	- Kubernetes liveness and readiness probes are timeout-based failure detectors. A liveness probe that is too strict restarts pods during GC pauses or load spikes.
 	- etcd and Consul use Raft and assume crash-recovery with durable logs. They stop accepting writes without a majority. See [[Consensus - Raft and Paxos]].
 	- DynamoDB replicates each partition with a leader elected by Multi-Paxos. It is not a Dynamo-style leaderless store, despite the similar name.
-	- Envoy's outlier detection ejects a host after consecutive 5xx responses, which catches some gray failures that health checks miss.
+	- Envoy (a proxy that sits in front of services and routes their traffic) uses outlier detection, which ejects a host after consecutive 5xx responses, which catches some gray failures that health checks miss.
 - **Failure modes → fixes:**
 	- Duplicate side effects after a timeout → idempotency keys and deduplication on the server.
 	- Health check passes while users fail (gray failure) → health checks that exercise the real dependency path, plus client-side error-rate tracking.
@@ -595,6 +655,14 @@ Distribution is a cost you pay for something specific: scale beyond one machine,
 - **Two Generals.** Two parties communicating over a lossy link cannot both be certain they agree to act, because the last acknowledgement can always be lost. That is why "exactly-once delivery" on the wire is impossible and systems build *effectively-once processing* from at-least-once delivery plus idempotency instead. See [[Delivery Semantics and Exactly-Once]].
 - **Unknown outcomes need a resolution path.** Options, in order of preference: retry with the same idempotency key; query the remote side by key ("did order-42 get charged?"); wait for an asynchronous callback; run a periodic reconciliation job against the provider's records.
 - **Metastable failures.** Some systems stay broken after the trigger disappears: a brief slowdown causes timeouts, timeouts cause retries, and the extra load keeps the system slow. Retry budgets and load shedding break the loop ([[Load Shedding and Graceful Degradation]]).
+
+```mermaid
+flowchart LR
+    S["Brief slowdown"] --> T["Timeouts"]
+    T --> R["Retries"]
+    R --> L["Extra load"]
+    L --> T
+```
 - **Tail at scale.** When one user request fans out to many servers, the slowest server sets the response time. Engineering for the tail (hedged requests, tied requests, micro-partitioning) matters more than lowering the median.
 - **The end-to-end argument.** Reliability in a lower layer (TCP's retransmission) does not remove the need for checks at the application ends (did the payment get recorded exactly once?). Only the endpoints know what "done" means.
 
@@ -630,6 +698,30 @@ Distribution is a cost you pay for something specific: scale beyond one machine,
 - Majority quorum tolerates f crashes with 2f + 1 nodes; Byzantine needs 3f + 1.
 - Failure detection is suspicion; gray failures fool health checks.
 - Availability multiplies across serial dependencies; fan-out amplifies tails.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Your call times out. What do you know about the work?
+> Nothing for sure: it may not have arrived, may still be running, or may be done with the reply lost.
+
+> [!question]- What does an idempotency key let you do?
+> Retry safely: the server sees the same key again and returns the first result instead of doing the work twice.
+
+> [!question]- What is a partial failure?
+> Some parts of the system are broken while the rest keeps running, such as the payment DB being down while checkout is up.
+
+🟡 Medium
+
+> [!question]- Ten services in a row are each up 99.9% of the time. About how often does a request through all ten succeed?
+> About 99.0% (0.999 to the power 10), so roughly ten times the downtime of one service.
+
+> [!question]- Why can a health check pass while users see errors?
+> The check uses a different path from real requests (a gray failure), for example it skips the broken disk that real requests need.
+
+> [!question]- How many nodes do you need to survive 1 crash with a majority quorum, and to survive 1 lying node?
+> 3 nodes (2f + 1) for one crash; 4 nodes (3f + 1) for one Byzantine node.
 
 ## Links
 

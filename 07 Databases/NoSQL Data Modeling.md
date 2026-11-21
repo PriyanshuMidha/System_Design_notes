@@ -33,6 +33,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6 (comparison and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[SQL vs NoSQL]]: NoSQL stores give up joins and free-form queries to scale out across many machines.
+> - [[Relational Schema Design]]: in SQL each fact lives in one table and tables are linked by IDs, like `invoices.client_id`.
+> - [[Partitioning and Sharding]]: big data is split into partitions by a key, and each partition lives on some machine.
+
 **From zero, in 60 seconds** 🟢
 
 Think of a normal database (SQL) as a big, tidy filing cabinet. You can ask it almost any question later, and it will dig out the answer.
@@ -76,6 +81,11 @@ Then you shape the data so each question is one cheap lookup.
 | Partition key | Decides where an item is stored | `WS#acme` |
 | Sort key | Decides the order of items under one partition key | `INV#2026-11#0042` |
 | Index (GSI) | A second copy of the data keyed differently, for another pattern | Invoices by client |
+| QPS | Queries per second: how often a pattern runs | 300 reads per second |
+| RCU / WCU | DynamoDB's units of read and write capacity per second | 1 WCU = one 1 KB write per second |
+| Eventually consistent | A copy that catches up a moment later, so a read right after a write may miss it | a GSI read just after `PutItem` |
+| Hot partition | One partition key getting far more traffic than the rest, so it hits its limit | every write of the day under one date key |
+| Denormalize | Copy a field into several places so reads need no join | client name stored inside each invoice |
 
 **Picture it**
 
@@ -129,9 +139,27 @@ sequenceDiagram
 
 The data model did not fail because NoSQL is slow. It failed because it was designed for a database that can answer any query, and DynamoDB answers only the queries its keys were designed for. NoSQL data modeling is the discipline of designing those keys.
 
+🟢 **Plain version:** If you copy SQL tables one-for-one into DynamoDB, one page that used to be a single SQL query becomes four separate requests, because DynamoDB cannot join tables. And a question like "show this client's invoices" has no key to jump to, so DynamoDB reads every invoice to find them. Nothing is wrong with DynamoDB here; the data was just shaped for the wrong kind of database.
+
+### Real-life example 🟢
+
+Think of a chat app like WhatsApp storing messages.
+The app asks almost one question: "give me the latest 50 messages of this chat".
+So the messages are stored with the chat ID as the partition key and the send time as the sort key.
+Opening a chat is then one range read of items already sitting together in time order.
+Asking "find every message that mentions 'pizza' across all chats" does not fit this shape at all; that question goes to a separate search system.
+
+## Common beginner mistakes 🟢
+
+- **Copying SQL tables into DynamoDB one-for-one** → every page needs several requests and some questions need a full `Scan` → list the access patterns first and design keys for them.
+- **Using `FilterExpression` instead of a key** → you still pay to read every item, then most are thrown away → put the thing you filter on into the sort key or a GSI.
+- **Embedding a list that never stops growing** (audit entries, comments) → the document is rewritten on every append and heads for the 16 MB cap → keep such children in their own collection with a parent ID, or bucket them.
+- **Writing everything under one partition key** such as today's date → that one key hits 1,000 writes per second and is throttled → spread writes over several keys (`#0` to `#9`).
+- **Reading a GSI right after writing** → GSIs catch up a moment later, so the new item may be missing → read the base item by its primary key for that user.
+
 ## 2. Mental model 🟢
 
-**Relational:** model the *data* (entities, relationships, normal forms), then any query works, with indexes added for speed.
+**Relational:** model the *data* (entities, relationships, normal forms, the rules that keep each fact in one place), then any query works, with indexes added for speed.
 
 **NoSQL:** model the *questions*. Write the access patterns down, then build the storage so that each answer is already sitting together, in the right order, under one key.
 
@@ -162,9 +190,17 @@ Key terms used below:
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the big idea: write the questions down first, then shape the data so each one is a single grab. **Next we open the box**: how to list the patterns, when MongoDB embeds or references, how DynamoDB keys and indexes work, and what transactions cost. Each subsection starts with a short step-by-step walk.
+
 ### 3.1 Step 1: list the access patterns
 
 **In plain words: before building anything, write a shopping list of every question the app will ask and how often, like planning a kitchen around the dishes you actually cook.**
+
+**Step by step:**
+1. Write each screen's question as a sentence: "show invoice 812 with its lines and payments".
+2. Add how often it runs, for example 300 per second.
+3. Mark it read or write.
+4. Anything not on the list (like "revenue by country for all tenants") is sent to a different system.
 
 The first design step is a table of every read and write, with its rate. For InvoiceOps (rates are estimates for a mid-sized deployment):
 
@@ -185,6 +221,12 @@ Example with numbers: the read patterns add up to 300 + 80 + 40 + 20 + 200 = 640
 ### 3.2 MongoDB: embed or reference
 
 **In plain words: "embed" means stapling related pages into one folder so you grab them together; "reference" means writing "see folder 42" instead, for things that are big, shared, or never stop growing.**
+
+**Step by step:**
+1. An invoice has 3 line items that are always shown with it, so put the items inside the invoice document (embed).
+2. A workspace has 2,000 clients, too many to carry around, so each client is its own document with `workspace_id` (reference).
+3. An invoice's audit log grows forever, so each log entry stores the invoice's ID and lives in its own collection (parent reference).
+4. Reading invoice 812 is now one `findOne`; the audit log is only read when someone asks for it.
 
 The relational schema maps onto documents like this:
 
@@ -228,6 +270,12 @@ Example with numbers: an invoice with 3 lines of 200 bytes is about 1 KB, so emb
 
 **In plain words: these are six ready-made tricks, each one a fix for a common document problem, like a cookbook of repairs (too many small items? bucket them; sums too slow? store the total).**
 
+**Step by step (the bucket pattern):**
+1. Invoice 812 gets reminder events every day, about 4,000 over its life.
+2. Instead of one growing array, make one document per invoice per day: `inv_812 / 2026-11-01`.
+3. Each new event goes into today's document and adds 1 to its `count`.
+4. A day's document stays small, so each write is cheap and nothing nears 16 MB.
+
 MongoDB's documented design patterns each fix one specific problem:
 
 | Pattern | Idea | InvoiceOps example |
@@ -258,6 +306,13 @@ Bucketing caps each document at one day of events, so appends touch only the ope
 
 **In plain words: the partition key is the street address (which building your data lives in) and the sort key is the order of files inside that building; an index (GSI) is a second copy of the files, sorted a different way for a different question.**
 
+**Step by step:**
+1. You ask: `Query PK = WS#acme, SK begins with INV#2026-11`.
+2. DynamoDB hashes `WS#acme` (turns it into a number) to pick the one partition that holds it.
+3. Inside that partition, items are already sorted by sort key, so it jumps to `INV#2026-11` and reads forward.
+4. It stops when the prefix no longer matches and returns `inv_811` and `inv_812`. Nothing else was read.
+5. For "invoices of client c_1" there is no matching key, so a GSI keeps a second copy keyed by `CLIENT#c_1`.
+
 ```mermaid
 flowchart LR
     Q["Query: PK = WS#acme<br/>AND begins_with(SK, 'INV#2026-11')"] --> R[request router]
@@ -277,7 +332,7 @@ flowchart LR
 - **Composite sort keys** encode a hierarchy so one prefix serves several patterns: `INV#2026-11#inv_812` serves "this month" (`begins_with INV#2026-11`), "this year" (`begins_with INV#2026`) and "all invoices" (`begins_with INV#`).
 - **Global secondary index (GSI):** a second copy of the items with a different partition and sort key. It can be added at any time, is replicated asynchronously, and is **eventually consistent**: `ConsistentRead` is not supported on a GSI.
 - **Local secondary index (LSI):** same partition key, different sort key. It must be created with the table, supports strongly consistent reads, and limits each item collection (base items plus LSI copies for one partition key) to **10 GB**.
-- **Per-partition limits:** one partition serves at most **3,000 RCU and 1,000 WCU** per second. An item is at most **400 KB**.
+- **Per-partition limits** (going over them gets requests **throttled**, meaning refused with a "slow down" error): one partition serves at most **3,000 RCU and 1,000 WCU** per second. An item is at most **400 KB**.
 
 | | GSI | LSI |
 | --- | --- | --- |
@@ -291,6 +346,12 @@ Example with numbers: sort keys `INV#2026-10#inv_700`, `INV#2026-11#inv_811`, `I
 ### 3.5 Single-table design
 
 **In plain words: instead of one table per thing (users, clients, invoices), you throw every kind of item into one big table and use clever key labels, so one read fetches everything a page needs — like one drawer organised so each request grabs a pre-packed bundle.**
+
+**Step by step:**
+1. Give every item generic key names: `PK` and `SK`.
+2. Store the invoice, its lines and its payments all under `PK = INVOICE#inv_812`, with `SK` values `META`, `ITEM#001`, `PAY#...`.
+3. One `Query PK = INVOICE#inv_812` now returns the whole invoice page in one request.
+4. Fill `GSI1PK` with different things on different item types (a client on invoices, a user on memberships) so one extra index serves several questions.
 
 Single-table design puts every entity type in one table, with generic key names (`PK`, `SK`, `GSI1PK`, `GSI1SK`), so that related items share a partition and come back from one `Query`.
 
@@ -348,12 +409,18 @@ The sparse index above is this lifecycle: membership in `GSI2` is controlled by 
 
 **In plain words: a transaction is an "all or nothing" bundle of writes; both stores offer it, but it costs roughly double, so good designs keep most writes to one document or one item.**
 
+**Step by step (recording a ₹1,000 payment):**
+1. In MongoDB, the payment goes inside the invoice document, so one update adds the payment and raises `paid_minor` together. No transaction needed.
+2. In DynamoDB, the payment is its own item and the invoice exists in two copies, so `TransactWriteItems` writes all three or none.
+3. That DynamoDB transaction costs about twice the normal write capacity, because every item is written in two phases.
+4. So the design goal is: make the common write touch one document or one item.
+
 Both stores have them; neither makes them free.
 
 | | MongoDB | DynamoDB |
 | --- | --- | --- |
 | Single unit always atomic | one document, including nested arrays | one item |
-| Multi-unit transactions | multi-document ACID: replica sets since 4.0, sharded clusters since 4.2 | `TransactWriteItems` / `TransactGetItems`: up to 100 actions and 4 MB, within one Region |
+| Multi-unit transactions | multi-document ACID: replica sets (a primary plus copies) since 4.0, sharded clusters since 4.2 | `TransactWriteItems` / `TransactGetItems`: up to 100 actions and 4 MB, within one Region |
 | Limits and cost | default 60 s lifetime; docs advise at most 1,000 documents modified per transaction; write conflicts abort and must be retried | each item costs two underlying reads or writes (prepare and commit), so about twice the capacity |
 | Modeling consequence | embed what changes together so most writes are single-document | keep most writes to one item; use transactions for the few cross-item invariants |
 
@@ -478,13 +545,15 @@ flowchart TD
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to design keys, documents and indexes for a list of patterns. **Next is the senior view**: what breaks at scale (hot partitions, GSI lag, giant documents, empty pages), what to monitor, and why the internals behave the way they do.
+
 **Real systems.**
 - Amazon's own guidance and public talks (Rick Houlihan, re:Invent 2018) popularised single-table design with overloaded GSIs.
 - MongoDB's published patterns (bucket, computed, subset, outlier, extended reference, schema versioning) come from its consulting practice and are documented in its "Building with Patterns" series.
 
 **Failure modes and fixes.**
-- *Hot partition:* one partition key takes most traffic (a viral workspace, today's date) and is throttled at 3,000 RCU or 1,000 WCU. Fix: write sharding (`KEY#0`…`KEY#9`) with a scatter-gather read, or cache hot reads ([[Hot Keys and Hot Partitions]]). DynamoDB's adaptive capacity and split-for-heat help with uneven load but cannot make one item exceed per-partition limits.
-- *GSI throttling backs up the table:* in provisioned mode, a GSI without enough write capacity throttles writes to the base table. Fix: provision GSIs for the base write rate, or use on-demand mode.
+- *Hot partition:* one partition key takes most traffic (a viral workspace, today's date) and is throttled at 3,000 RCU or 1,000 WCU. Fix: write sharding (`KEY#0`…`KEY#9`) with a scatter-gather read (ask all ten keys and merge the answers), or cache hot reads ([[Hot Keys and Hot Partitions]]). DynamoDB's adaptive capacity and split-for-heat help with uneven load but cannot make one item exceed per-partition limits.
+- *GSI throttling backs up the table:* in provisioned mode (you pay for a fixed capacity; on-demand mode instead bills per request), a GSI without enough write capacity throttles writes to the base table. Fix: provision GSIs for the base write rate, or use on-demand mode.
 - *Reading your own write from a GSI fails:* GSIs are eventually consistent. Fix: read the base item for the user who just wrote, or design the read to use the primary key.
 - *Unbounded array hits 16 MB:* Fix: move the growing list into its own collection (parent reference) or bucket it.
 - *`Limit` returns nothing:* in DynamoDB, `Limit` counts items *read* before the `FilterExpression` runs, so a page can come back empty with a `LastEvaluatedKey`. Fix: loop until no `LastEvaluatedKey`, and prefer key conditions over filters.
@@ -532,7 +601,7 @@ flowchart LR
 
 **Item collections and LSIs.** With an LSI, one partition key's item collection is limited to 10 GB, because the index lives on the same partitions. Without an LSI, an item collection can grow beyond one partition: DynamoDB splits it by sort key range. Avoid LSIs unless you need strongly consistent alternative sort orders.
 
-**Multi-document transactions in MongoDB under the hood.** A transaction runs on a snapshot (WiredTiger MVCC); a concurrent write to the same document causes a write conflict, and the driver retries with `TransientTransactionError`.
+**Multi-document transactions in MongoDB under the hood.** A transaction runs on a snapshot (WiredTiger, MongoDB's storage engine, keeps several versions of each document, called MVCC); a concurrent write to the same document causes a write conflict, and the driver retries with `TransientTransactionError`.
 
 On sharded clusters, a transaction across shards uses a two-phase commit run by a coordinator on one of the participating shards (`mongos` only routes) ([[Two-Phase Commit]]), with higher latency. Embedding what changes together avoids all of it.
 
@@ -576,6 +645,9 @@ stateDiagram-v2
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** Write down every question the app asks before designing anything. In MongoDB, put small things that are read together inside one document, and keep big or growing things separate. In DynamoDB, the partition key says where data lives and the sort key says its order, so each question becomes one read of one key. Spread busy keys out, and remember that indexes catch up a moment later.
+
+
 - Access patterns first, with QPS; every pattern is a key lookup or range query.
 - MongoDB: embed one-to-few, reference one-to-many, parent-reference one-to-squillions; 16 MB documents; no unbounded arrays.
 - Patterns: bucket, computed, extended reference, subset, outlier, schema versioning with lazy migration.
@@ -584,6 +656,30 @@ stateDiagram-v2
 - Single-table + overloaded GSIs + sparse indexes + adjacency lists; denormalized copies need fan-out on update.
 - Transactions exist in both (Mongo 4.0+/4.2+, DynamoDB 100 actions) but cost more; model so most writes touch one unit.
 - Paginate with `LastEvaluatedKey` → `ExclusiveStartKey`; `Limit` applies before filters.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is an access pattern?
+> One exact read or write the app makes, with how often it runs, such as "list a workspace's invoices for a month, 80 per second".
+
+> [!question]- In MongoDB, should 3 invoice line items be embedded or referenced?
+> Embedded: they are few, small and always read with the invoice.
+
+> [!question]- What does the sort key do in DynamoDB?
+> It sets the order of items that share a partition key, so you can read a range of them.
+
+🟡 Medium
+
+> [!question]- Why is a `FilterExpression` costly?
+> DynamoDB reads every item first and filters afterwards, so you pay for the items it throws away.
+
+> [!question]- What is a sparse index?
+> A GSI that only contains items carrying its key attribute, such as only overdue invoices having `GSI2PK`.
+
+> [!question]- All of today's events are written under one partition key and get throttled. What do you do?
+> Write-shard: spread them over keys like `EVENTS#2026-11-03#0` to `#9` and read all of them on the way out.
 
 ## Links 🟢
 

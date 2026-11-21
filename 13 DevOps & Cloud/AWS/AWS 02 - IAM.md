@@ -32,6 +32,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[AWS 01 - Core Concepts (Regions, AZs, Accounts, Shared Responsibility)]]: everything lives inside an AWS account, accounts can be grouped under an Organization with SCPs, and access rules are your half of the security job.
+
 **From zero, in 60 seconds** 🟢
 
 In AWS, every action is a request: "read this file", "start this server".
@@ -80,6 +83,12 @@ IAM is the system that hands each person or program exactly the keys it needs, a
 | Role | An identity anyone trusted can "wear" for a short time | The role your ECS task assumes |
 | Credentials | The secret proof of who you are | An access key, or a temporary token |
 | Least privilege | Give only the permissions actually needed | Read-only, one bucket, not `*` |
+| STS | AWS's Security Token Service: hands out temporary keys for a role | `AssumeRole` → keys valid ~1 hour |
+| Trust policy | The rule on a role saying who may wear it | "ECS tasks may assume this role" |
+| Explicit / implicit deny | A written "Deny" rule / the default "no" when nothing allows | Deny always wins; no rule = no |
+| Resource-based policy | A policy attached to the thing itself, not to the caller | An S3 bucket policy |
+| Permission boundary | A cap on the most one user or role can ever be allowed | "this role may never touch IAM" |
+| SCP | An org-wide cap on what any identity in an account can do | "nobody may disable CloudTrail" |
 
 **Picture it**
 
@@ -109,17 +118,32 @@ Where it breaks: real cards rarely expire in an hour, but IAM role credentials a
 
 A backend service needs to read objects from an S3 bucket, write logs to CloudWatch, and nothing else.
 
-Without a permissions system, the two options are "give it the account's root credentials" (catastrophic if the service is compromised — it can do literally anything, including deleting every resource and disabling billing alarms) or "write custom access-control code per service" (a security team's nightmare to audit consistently across hundreds of services).
+Without a permissions system, the two options are "give it the account's root credentials" (catastrophic if the service is compromised — it can do literally anything, including deleting every resource and disabling billing alarms, the alerts that warn when spending jumps) or "write custom access-control code per service" (a security team's nightmare to audit consistently across hundreds of services).
 
 IAM exists to give every principal exactly the permissions it needs and nothing more — the **principle of least privilege** — enforced centrally and auditable in one place.
 
 Concretely: the 2019 Capital One breach is the textbook case.
 
-An SSRF bug in a misconfigured web application firewall running on EC2 let an attacker make that WAF query the instance metadata service and retrieve the temporary credentials for its attached IAM role.
+An SSRF bug (server-side request forgery: tricking a server into fetching a URL the attacker chooses) in a misconfigured web application firewall (WAF, a filter in front of a website that blocks bad requests) running on EC2 let an attacker make that WAF query the instance metadata service (a special address inside every EC2 server that hands out, among other things, the server's role keys) and retrieve the temporary credentials for its attached IAM role.
 
 That role, by several public post-incident analyses, had far more S3 access than a WAF needs, which is what let the attacker list and read private buckets once they had those credentials.
 
 The attacker didn't need to break IAM itself; IAM did exactly what its policy said, and the policy said too much. This is the recurring theme in nearly every IAM-related incident.
+
+```mermaid
+flowchart LR
+    S["SSRF bug in the WAF"] --> M["Asks the metadata service<br/>for the role's keys"]
+    M --> K["Gets temporary keys"]
+    K --> B["Role allowed far too much S3:<br/>reads private buckets"]
+```
+
+### Real-life example: a delivery app's many services 🟢
+
+Think of a food-delivery app like Swiggy, with separate services for orders, payments, maps and notifications, all on AWS.
+The notification service only needs to send messages; the payments service only needs its own database and one secrets store.
+With IAM, each service runs under its own role that allows just that, so if the notification service is hacked, the attacker cannot read payment data.
+Engineers also log in with roles that expire after an hour, so a laptop left logged in is not a permanent key.
+That "each thing gets only its own keys" idea is the whole point of IAM.
 
 ### Whiteboard version
 
@@ -140,13 +164,30 @@ A **role** is a visitor badge issued at the front desk for a limited time, rathe
 
 And an **Organizations SCP** is a building-wide rule the landlord sets that applies on top of every tenant's own door list — the landlord can say "no tenant's card may ever open the roof access door," and no tenant's own policy can override that.
 
+## Common beginner mistakes 🟢
+
+- **Granting `"Action": "*", "Resource": "*"` to get it working** → the role can do anything, and it is never narrowed later → list only the actions and the exact resources needed.
+- **Putting long-lived access keys in code, images or CI secrets** → a leak works until someone notices → use roles, and OIDC for CI.
+- **Using the root user for daily work** → it can do everything, including closing the account → lock root away with MFA (a second login step, such as a phone code) and use roles.
+- **Mixing up the ECS task role and the task execution role** → your app gets the wrong powers → give image pulling and logs to the execution role, and app calls to the task role.
+- **Expecting an SCP or permission boundary to grant access** → they only cap → grant with an identity or resource policy.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that IAM answers "who may do what to which thing", that everything starts as "no", and that a written deny always wins. **Next we open the box**: what a policy looks like, the exact order AWS checks policies in, how roles hand out short-lived keys, and how ECS, EC2, EKS and GitHub Actions get their roles.
 
 ### Principals and policy anatomy
 
 **In plain words:** a policy line says: Effect (allow/deny), Action (what), Resource (which thing), and maybe a Condition (only when...).
 
-A **principal** is the IAM user, role, or federated identity making a request. A policy **statement** has this shape:
+**Step by step (reading one statement):**
+1. `"Effect": "Allow"`: this line gives permission (or `"Deny"` to forbid).
+2. `"Action": "s3:GetObject"`: the one API call it covers, here "read a file from S3".
+3. `"Resource": "arn:aws:s3:::invoices/*"`: only files in the `invoices` bucket.
+4. `"Condition"` (optional): only when, for example, the request comes from your company network.
+5. Attach the policy to a role (identity-based) or to the bucket itself (resource-based).
+
+A **principal** is the IAM user, role, or federated identity (a login from an outside system such as your company SSO or GitHub) making a request. A policy **statement** has this shape:
 
 ```json
 {
@@ -166,12 +207,19 @@ A **principal** is the IAM user, role, or federated identity making a request. A
 ```
 
 - **Identity-based policies** attach to a user, group, or role.
-- **Resource-based policies** attach to the resource itself (an S3 bucket policy, an SQS queue policy). These are the only kind that can grant *cross-account* access without the other account assuming a role.
+- **Resource-based policies** attach to the resource itself (an S3 bucket policy, an SQS queue policy, SQS being AWS's message queue service). These are the only kind that can grant *cross-account* access without the other account assuming a role.
 - **Condition** keys scope a statement further: source IP, MFA presence, request time, tag values, and dozens more.
 
 ### Evaluation logic
 
 **In plain words:** AWS checks layers in order. A deny anywhere stops it. Otherwise, every layer that applies must allow it.
+
+**Step by step (one real request):**
+1. The `orders` role asks for `s3:GetObject` on `invoices/42.pdf`.
+2. Any "Deny" for this anywhere? No.
+3. The account's SCP allows S3? Yes. The role has no permission boundary, so that check is skipped.
+4. Does the role's own policy, or the bucket's policy, allow it? The role's policy does.
+5. Result: allowed. If step 4 had found nothing, the answer would be the default "no".
 
 AWS's own documentation (IAM User Guide, "Policy evaluation logic", accessed 2026-11-07) specifies this order, and it is one of the most commonly misremembered things in an AWS interview:
 
@@ -198,6 +246,13 @@ flowchart TD
 
 **In plain words:** a role is a hat you put on. Wearing it gives you keys that expire in about an hour, so a leaked key doesn't last.
 
+**Step by step:**
+1. An ECS task starts with the role `orders-task`.
+2. It asks STS: "may I assume `orders-task`?" STS checks the role's trust policy, which says ECS tasks may.
+3. STS returns three values: an access key, a secret key and a session token, valid for about an hour.
+4. The task signs its S3 calls with them. The SDK fetches fresh ones before they expire.
+5. If the keys leak, they stop working within the hour on their own.
+
 A **role** has no permanent credentials of its own. A principal calls `sts:AssumeRole` (or a service does it on your behalf), STS verifies the role's trust policy allows that principal to assume it, and returns a temporary access key, secret key, and session token — valid for anywhere from 15 minutes to 12 hours, then automatically useless.
 
 ```mermaid
@@ -218,10 +273,16 @@ sequenceDiagram
 
 **In plain words:** each AWS service gives your code a role in its own way. ECS has two roles that people often mix up.
 
-- **ECS**: a task has *two* roles, commonly confused. The **task execution role** is what ECS itself uses to pull the container image from ECR and write logs to CloudWatch before your code even starts; the **task role** is what your application code uses at runtime (e.g., to call S3). Giving your app code the execution role's permissions — or vice versa — is a common, over-broad misconfiguration.
+**Step by step:**
+1. ECS: the execution role pulls your image and writes logs before your code runs; the task role is what your code uses.
+2. EC2: an instance profile attaches a role to the server, and the metadata service inside the server hands out its keys.
+3. EKS: a Kubernetes service account (an identity for pods) is linked to an IAM role (IRSA or Pod Identity).
+4. GitHub Actions: the run shows AWS a signed GitHub token and gets short-lived keys for a role that trusts only that repo and branch.
+
+- **ECS**: a task has *two* roles, commonly confused. The **task execution role** is what ECS itself uses to pull the container image from ECR (AWS's container image registry) and write logs to CloudWatch before your code even starts; the **task role** is what your application code uses at runtime (e.g., to call S3). Giving your app code the execution role's permissions — or vice versa — is a common, over-broad misconfiguration.
 - **EC2**: an **instance profile** attaches a role to an EC2 instance; the instance metadata service hands temporary credentials to anything running on the instance, which is why SSRF vulnerabilities that can reach the metadata endpoint are a serious IAM-adjacent risk (the historical reason AWS pushes IMDSv2, which requires a signed session token for metadata requests).
-- **EKS**: **IRSA** (IAM Roles for Service Accounts) maps a Kubernetes service account to an IAM role via OIDC federation between the cluster's OIDC provider and AWS; **EKS Pod Identity** (newer) does the same mapping without requiring the cluster to expose an OIDC provider URL, simplifying the trust relationship.
-- **CI/CD (GitHub Actions)**: federate GitHub's own OIDC provider directly into IAM with an identity provider trust, and scope the role's trust policy to a specific repository and branch (via `Condition` on the `sub` claim, e.g. `repo:my-org/my-repo:ref:refs/heads/main`). This removes the need to store `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` as long-lived pipeline secrets entirely — a GitHub Actions run gets a one-off, minutes-long credential instead.
+- **EKS**: **IRSA** (IAM Roles for Service Accounts) maps a Kubernetes service account to an IAM role via OIDC federation (AWS trusts tokens signed by the cluster's own login service) between the cluster's OIDC provider and AWS; **EKS Pod Identity** (newer) does the same mapping without requiring the cluster to expose an OIDC provider URL, simplifying the trust relationship.
+- **CI/CD (GitHub Actions)**: federate GitHub's own OIDC provider directly into IAM with an identity provider trust, and scope the role's trust policy to a specific repository and branch (via `Condition` on the `sub` claim, the token field naming the repo and branch, e.g. `repo:my-org/my-repo:ref:refs/heads/main`). This removes the need to store `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` as long-lived pipeline secrets entirely — a GitHub Actions run gets a one-off, minutes-long credential instead.
 
 ## 4. Worked example 🟡
 
@@ -242,6 +303,8 @@ func evaluate(identityAllows, resourceAllows, boundaryAllows, explicitDeny bool)
 ```
 
 The full version below models statements with wildcard actions/resources (`s3:*`, `*`), handles SCPs separately from permission boundaries, and is the exact code tested for this note.
+
+**What this code does, in plain words:** it stores each policy as a list of allow/deny lines with simple `*` wildcards, then answers one request by walking the same order as above: any deny → no; SCP or boundary missing the action → no; role policy or resource policy allows → yes; otherwise no.
 
 ```go
 // Package iamsim is a deliberately simplified model of the IAM policy
@@ -379,6 +442,8 @@ func Evaluate(r Request, action, resource string) Decision {
 
 Tests covering each rule in the evaluation order:
 
+**What this code does, in plain words:** six small cases, one per rule: a plain allow works, a deny beats an allow, a boundary and an SCP each cut access, a bucket policy lets another account in, and with no rule at all the answer is no.
+
 ```go
 // allowAll builds a single-statement policy that allows one action pattern
 // against one resource pattern, to keep the tests below terse.
@@ -515,6 +580,9 @@ ok  	aws02	1.428s
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how a policy is written, the exact evaluation order, how roles and STS hand out expiring keys, and how each AWS compute service gets its role. **Next is the advanced part**: the IAM mistakes behind real incidents, what to watch in CloudTrail, and deeper points (cross-account access, IMDSv2, OIDC trust conditions).
+
+
 - **Real systems:** every production AWS workload authenticates through IAM in some form; GitHub Actions' own documentation recommends OIDC federation over static keys for exactly the reasons above; EKS's IRSA and Pod Identity are both AWS-documented, supported mechanisms used widely by teams running Kubernetes on AWS.
 - **Failure modes → fixes:**
   - `"Action": "*", "Resource": "*"` left in place after prototyping → the single most common real-world over-permission; fix by running IAM Access Analyzer's policy generation against actual CloudTrail activity, then narrowing.
@@ -527,7 +595,7 @@ ok  	aws02	1.428s
 
 - **Why evaluation checks SCPs/boundaries before the identity-resource union, not after.** If AWS evaluated identity+resource first and then applied the ceiling, the net result would be identical for a simple allow/deny outcome — but conceptually, treating the ceiling as an earlier, independent gate is what makes it correct that an SCP denial is indistinguishable from "this account was never given S3 at all," which is the guarantee organizations rely on for security boundaries.
 - **Why resource-based policies are the only in-account path to cross-account access without role assumption.** An identity-based policy can only ever grant permissions to the account's own principals (you can't write an identity policy in account A that grants account B's user anything) — permissions flow outward from an identity policy only to resources, never to other accounts' principals. A resource-based policy flips that: it names a principal ARN from *any* account, which is what makes S3 bucket policies and SQS queue policies usable for direct cross-account sharing, as an alternative to cross-account role assumption.
-- **IMDSv2 and the SSRF connection.** EC2's instance metadata service (used to fetch a role's temporary credentials from inside the instance) originally had no required authentication (IMDSv1), so an SSRF bug that could make the server fetch an arbitrary URL could silently exfiltrate the instance's IAM credentials. IMDSv2 requires a short-lived, non-forwardable session token fetched via a `PUT` request first, which most SSRF payloads (which only control the target URL of a `GET`) can't produce — closing off a whole class of credential-theft bugs without changing IAM policy at all.
+- **IMDSv2 and the SSRF connection.** EC2's instance metadata service (used to fetch a role's temporary credentials from inside the instance) originally had no required authentication (IMDSv1), so an SSRF bug that could make the server fetch an arbitrary URL could silently exfiltrate (secretly copy out) the instance's IAM credentials. IMDSv2 requires a short-lived, non-forwardable session token fetched via a `PUT` request first, which most SSRF payloads (which only control the target URL of a `GET`) can't produce — closing off a whole class of credential-theft bugs without changing IAM policy at all.
 - **OIDC federation's trust is entirely in the `Condition` block, not the identity provider registration alone.** Registering GitHub's OIDC provider with IAM is necessary but not sufficient — without a `Condition` restricting the trust policy's `sub` claim to a specific `repo:org/repo:ref:refs/heads/main` pattern, *any* repository in *any* GitHub org could assume that role, since the OIDC provider itself is shared infrastructure, not scoped to your organization.
 
 ## 9. Interview questions 🔴
@@ -560,6 +628,30 @@ ok  	aws02	1.428s
 - IMDSv2 closes the classic SSRF → stolen-credentials path that plain IMDSv1 metadata requests allowed.
 - Run IAM Access Analyzer continuously; it flags external sharing and generates least-privilege policies from real CloudTrail activity.
 - MFA and no routine root-account use remain the baseline, not an advanced practice.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is the default answer when no policy mentions an action?
+> Denied (implicit deny).
+
+> [!question]- If one policy allows an action and another explicitly denies it, what happens?
+> Denied. An explicit deny always wins.
+
+> [!question]- Why should apps use roles instead of access keys?
+> Role keys are temporary and expire on their own, so a leak does far less damage.
+
+🟡 Medium
+
+> [!question]- A role's policy allows `s3:GetObject`, but its permission boundary only allows `dynamodb:*`. Can it read S3?
+> No. The boundary is a ceiling, and S3 is outside it.
+
+> [!question]- Which ECS role pulls the image from ECR, and which one does your Go code use to call S3?
+> The task execution role pulls the image; the task role is used by your code.
+
+> [!question]- How can a role in account B read a bucket in account A without assuming a role in A?
+> Account A's bucket policy (a resource-based policy) names B's role and allows it.
 
 ## Links
 

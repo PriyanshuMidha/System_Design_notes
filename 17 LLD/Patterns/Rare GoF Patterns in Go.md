@@ -31,6 +31,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Design Patterns Overview and Chooser]]: the 23 GoF patterns fall into creational, structural and behavioural groups, and Go shrinks many of them.
+> - [[Interfaces]]: a type fits an interface just by having its methods, and a type switch can ask which concrete type is inside.
+> - [[Strategy and Template Method]]: one interface field lets you swap behaviour; Bridge is that idea applied on two sides at once.
+
 **From zero, in 60 seconds** 🟢
 
 Some of the 23 classic patterns rarely come up in Go interviews, but you should know their names and shapes. This note covers six of them, each in plain Go: Bridge, Prototype, Flyweight, Visitor, Interpreter and Mediator. For each, it shows when it helps and the simpler Go idiom you would usually use instead. Read the plain-words line above each code block first.
@@ -52,6 +57,10 @@ In an interview you are asked "implement Visitor in Go". The good answer shows t
 | Shallow copy | Copying a struct but sharing its slices and maps | Two copies editing one `[]string` |
 | Immutable | Never changed after creation, so safe to share | A glyph's shape in a font |
 | AST | A tree of nodes built from parsed text | `1 + 2` -> `Add(Num 1, Num 2)` |
+| Interning | Keeping one shared copy of each distinct value | Every "Amul" brand string points to one copy |
+| Double dispatch | Two calls in a row so the code chosen depends on two types | `item.Accept(v)` then `v.VisitFood(item)` |
+| Precedence | Which operator binds first | `AND` before `OR`, like `×` before `+` |
+| Basis point | One hundredth of a percent | 500 bp = 5% |
 
 **Picture it**
 
@@ -81,6 +90,10 @@ Interviewers still ask "implement Visitor in Go" or "what is Flyweight?". Writin
 
 Section 5 puts the six coded patterns (plus Memento, as a table row only) side by side: the problem, the Go answer, a standard-library example, and when the full pattern still pays.
 
+### Real-life example 🟢
+
+Picture the filter bar on Flipkart: "brand is Samsung AND price under ₹20,000 AND NOT refurbished". The app reads that little rule and checks it against every phone, which is the Interpreter idea. Picture a WhatsApp group: you send one message to the group, and the group decides who receives it, so members never message each other one by one (Mediator). Picture "Reorder" in Swiggy, which copies a past order and lets you change it (Prototype), or a sale where thousands of carts hold the same phone and all share one copy of its name and brand (Flyweight). These patterns are rare in Go backends, but each still shows up in apps you use.
+
 ## 2. Mental model 🟢
 
 - **Bridge:** a TV remote and the TV. Remote models and TV brands vary independently; the infrared protocol between them is the bridge.
@@ -91,6 +104,8 @@ Section 5 puts the six coded patterns (plus Memento, as a table row only) side b
 - **Mediator:** an air-traffic controller. Pilots talk to the tower, never to each other; the tower decides who lands.
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the six names and an everyday picture for each. **Next we open the box**: each pattern in its smallest Go form, the Go idiom that usually replaces it, a real standard-library example, and when the full pattern still earns its place.
 
 **In plain words: six less common patterns, each in its smallest Go form.**
 
@@ -238,7 +253,7 @@ func (t *InvoiceTemplate) Clone() *InvoiceTemplate {
 }
 ```
 
-- **Deep-copy rules:** `slices.Clone` and `maps.Clone` are shallow. `slices.Clone(t.Items)` gives a deep copy here only because `LineItem` has no pointers or maps; a `[]*LineItem` would still share every item. The test proves the clone has its own copied item slice, and that a plain struct copy does not.
+- **Deep-copy rules:** `slices.Clone` and `maps.Clone` are shallow (they copy one level; anything a pointer leads to stays shared). `slices.Clone(t.Items)` gives a deep copy here only because `LineItem` has no pointers or maps; a `[]*LineItem` would still share every item. The test proves the clone has its own copied item slice, and that a plain struct copy does not.
 - **Real examples:** `http.Request.Clone(ctx)` (documented as a deep copy, except that the `Body` is shared), `http.Header.Clone`, and `tls.Config.Clone` (documented as a shallow clone, so slices such as `Certificates` stay shared).
 - **Worth it when:** an object is costly to configure and is copied per use, such as a base `tls.Config` cloned per client, or a recurring invoice template cloned each month and given a new number and dates.
 
@@ -246,7 +261,7 @@ func (t *InvoiceTemplate) Clone() *InvoiceTemplate {
 
 **In plain words: share the parts that never change across many objects to save memory.**
 
-**Intent:** keep the intrinsic state (the same for many objects, never changing) in one shared copy, and keep the extrinsic state (different per object) in each object. Since Go 1.23, `unique.Make` interns any comparable value and returns a `unique.Handle`; equal values give equal handles, and comparing handles is a pointer comparison.
+**Intent:** keep the intrinsic state (the same for many objects, never changing) in one shared copy, and keep the extrinsic state (different per object) in each object. Since Go 1.23, `unique.Make` interns (keeps one shared copy of) any comparable value and returns a `unique.Handle`; equal values give equal handles, and comparing handles is a pointer comparison.
 
 ```mermaid
 classDiagram
@@ -285,7 +300,7 @@ func NewItem(sku, name, brand string, qty int) CartItem {
 ```
 
 - **Fixes to the old factory:** its map was not goroutine-safe, and `Get(sku, name, brand)` returned the cached product even when the name or brand differed. Interning the whole value fixes both: `unique.Make` is safe for concurrent use (the test calls it from 8 goroutines under `-race`), and a different brand is a different value.
-- **`sync.Pool` is not a flyweight.** A pool hands an object to one user at a time so it can be reused, and may drop it at any garbage collection. A flyweight is shared by many users at once and must be immutable.
+- **`sync.Pool` is not a flyweight.** A pool hands an object to one user at a time so it can be reused, and may drop it at any garbage collection (Go's automatic memory clean-up). A flyweight is shared by many users at once and must be immutable.
 - **Real example:** `net/netip` interns IPv6 zone names with `unique` handles.
 - **Worth it when:** millions of objects repeat a few distinct values, such as service names on log records. For a few thousand objects, plain strings are fine.
 
@@ -381,7 +396,7 @@ func CountFuncs(src string) (int, error) {
 ```
 
 - **In Go, a type switch usually replaces it.** `TaxSwitch` computes the same tax with no `Accept` methods. The cost: Go does not check that a type switch covers every type, while a `Visitor` interface makes a missing `VisitX` method a compile error.
-- **Money:** the old code truncated integer tax. Here prices are integer paise, rates are basis points, and `pct` rounds half up, so 5% of 999 paise is 50, not 49. Pick the rounding rule on purpose; do not inherit integer division's.
+- **Money:** the old code truncated integer tax. Here prices are integer paise, rates are basis points (hundredths of a percent), and `pct` rounds half up, so 5% of 999 paise is 50, not 49. Pick the rounding rule on purpose; do not inherit integer division's.
 - **Real examples:** `go/ast.Walk` takes an `ast.Visitor`; `ast.Inspect` takes a callback that type-switches on each node, as `CountFuncs` does. `fs.WalkDir` is a visitor over files.
 - **Worth it when:** many operations run over a stable set of types (compilers, linters, AST tools) and each operation must handle every type.
 
@@ -532,7 +547,7 @@ func (p *queryParser) atom() (Expr, error) {
 ```
 
 - **Consistency:** `size>1MB` means strictly greater than 1,048,576 bytes, and the code uses `>`. A file of exactly 1 MB passes `NOT size>1MB` (tested).
-- **Real examples:** `text/template` parses a template into a tree and `Execute` walks it; `regexp/syntax` parses a pattern into a syntax tree before compiling it; `go/parser` builds `go/ast` trees. For business rules, embed CEL (`cel-go`) or `expr-lang/expr` instead of writing a language.
+- **Real examples:** `text/template` parses a template into a tree and `Execute` walks it; `regexp/syntax` parses a pattern into a syntax tree before compiling it; `go/parser` builds `go/ast` trees. For business rules, embed CEL (`cel-go`, Google's small language for rule expressions) or `expr-lang/expr` instead of writing a language.
 - **Worth it when:** users or configuration write the rules (search filters, coupon conditions, alert rules) and the language is small. Add parentheses and a depth limit before exposing it to users.
 
 ### Mediator: colleagues talk only to the hub
@@ -623,7 +638,7 @@ func (r *Room) Send(from *Member, text string) {
 - **Not a Facade:** a facade is one-way; it simplifies a subsystem's API for callers, and the subsystem does not know it exists. A mediator is two-way: colleagues call it and it calls them back. If it only simplifies a public API, call it Facade ([[Facade (vs Mediator)]]).
 - **Not an event bus:** a bus delivers by topic and knows no rules. A mediator owns the routing logic, such as the mute list here ([[Observer and Event Bus]]).
 - **The risk:** every new interaction rule lands in the mediator until it becomes a god object. Split it by concern (one mediator per form, per room) when it grows.
-- **Concurrency:** the sketch runs on one goroutine. In a server, members speak from different goroutines, so the room must guard its maps and inboxes with a mutex, or run as one goroutine that reads messages from a channel. A mediator that calls colleagues back must not hold its lock during the call; the lock discipline is in [[Facade (vs Mediator)]].
+- **Concurrency:** the sketch runs on one goroutine. In a server, members speak from different goroutines, so the room must guard its maps and inboxes with a mutex, or run as one goroutine (a light Go task) that reads messages from a channel. A mediator that calls colleagues back must not hold its lock during the call; the lock discipline is in [[Facade (vs Mediator)]].
 - **Worth it when:** many components interact through rules that change together: form widgets that enable each other, a game lobby, a chat room. The standard library has no clear example.
 
 ### Whiteboard version
@@ -665,6 +680,14 @@ func main() {
 **In plain words: small runnable examples for each pattern, with tests.**
 
 The six files above form one package with this `main` and one test file. `main` runs the File Search query; the tests cover all six patterns.
+
+**Step by step:**
+
+1. `Parse` splits the query `"ext=.go AND NOT size>1MB"` into words and reads them with `queryParser` (`or`, `and`, `not`, `atom`).
+2. `atom` turns `ext=.go` into `ExtIs(".go")` and `size>1MB` into `SizeGT(1 << 20)`; anything else is an error.
+3. The result is a small tree of `Expr` values: an `And` holding `ExtIs` and a `Not` around `SizeGT`.
+4. `main` loops over three `File` values and calls `q.Eval(f)` on each; each node asks its children and combines the answers.
+5. It prints `true` only for `main.go` (a Go file under 1 MB). The test file then checks all six patterns.
 
 ```go
 // main.go
@@ -821,6 +844,14 @@ notes.md false
 
 The query trace: `or` calls `and`, which calls `not`, which reads the atom `ext=.go`; `and` accepts `AND`, and `not` accepts `NOT` and reads `size>1MB` as `SizeGT(1048576)`. The tree is `And{ExtIs(".go"), Not{SizeGT(1048576)}}`, printed above. `main.go` (4 KB) matches, `vendor.go` (3 MB) fails the `NOT`, and `notes.md` fails the extension.
 
+## Common beginner mistakes 🟢
+
+- **Mistake:** writing the full Visitor (`Accept`, `VisitFood`, `VisitGadget`) for one or two operations. → **Why it's wrong:** it is twice the code for the same answer. → **Do this instead:** start with a type switch, as `TaxSwitch` does, and move to Visitor only when many operations run over a fixed set of node types.
+- **Mistake:** a `Clone` that only copies the struct (`c := *t` and return). → **Why it's wrong:** `Items` and `Meta` are still shared, so editing the copy changes the template. → **Do this instead:** also copy the slice and map, as `InvoiceTemplate.Clone` does with `slices.Clone` and `maps.Clone`.
+- **Mistake:** putting per-cart data (like `Qty`) inside the shared flyweight. → **Why it's wrong:** one cart changing quantity would change it for every cart. → **Do this instead:** share only fixed data (`ProductData`) and keep `Qty` in each `CartItem`.
+- **Mistake:** building the filter by gluing strings or silently skipping unknown words. → **Why it's wrong:** a typo matches the wrong files, and string-built queries invite injection. → **Do this instead:** parse into an `Expr` tree and return an error for anything unknown, as `Parse` and `atom` do.
+- **Mistake:** letting `Member`s append to each other's `Inbox` directly. → **Why it's wrong:** the mute rule gets copied into every member. → **Do this instead:** send through the `Room`, which owns who hears whom.
+
 ## 5. Variants and comparison 🟡
 
 | Pattern | Problem it solves | Go's usual answer | Standard-library example | The full pattern still pays when |
@@ -846,6 +877,8 @@ Why each is rare in Go backends:
 - **Interpreter:** most rules change with a deploy, not at run time. When they must change at run time, an embedded expression language beats a homemade one.
 - **Mediator:** request-scoped services call each other directly; the many-to-many chatter that Mediator tames is mostly a UI problem.
 
+> 🟡 → 🔴 **You now know** each rare pattern in Go, its lighter Go idiom and when the full form pays. **Next comes the production view**: where these patterns live in real Go code, the bugs they cause (shared maps, silent type switches, injection), and deeper ideas such as the expression problem and weak interning.
+
 ## 7. In production 🔴
 
 - **Real systems:** `slog` handlers and `database/sql` drivers (Bridge); `http.Request.Clone` in middleware that changes a request without touching the caller's copy (Prototype); `go vet` analyzers and code generators walking `go/ast` (Visitor); CEL in Kubernetes validation rules (CRD `x-kubernetes-validations` and ValidatingAdmissionPolicy) and `text/template` in Helm charts (Interpreter).
@@ -854,16 +887,16 @@ Why each is rare in Go backends:
 	- A clone shares a map with its prototype → clone each reference field, and add a test that edits the clone and checks the prototype.
 	- A new node type is silently ignored by a type switch → add a `default` case that returns an error, or use a Visitor interface so the compiler forces the new method.
 	- A user query with thousands of nested `NOT`s exhausts the stack or the CPU → limit the query length and nesting depth, and set a timeout on evaluation.
-	- A user filter is translated to SQL by pasting its values into the query text → SQL injection. Compile the AST to a parameterised query: values become placeholders, and column names come from an allowlist.
+	- A user filter is translated to SQL by pasting its values into the query text → SQL injection. Compile the AST to a parameterised query (SQL with `$1`-style slots the driver fills safely): values become placeholders, and column names come from an allowlist.
 	- A mediator becomes the place for every rule → split it per screen, room or workflow.
-- **What to monitor:** for an interpreter, the parse error rate and the evaluation time per query; for interning, heap size before and after, with `pprof`.
+- **What to monitor:** for an interpreter, the parse error rate and the evaluation time per query; for interning, heap size before and after, with `pprof` (Go's built-in profiler).
 
 ## 8. Deep dive 🔴
 
 - **The expression problem.** Visitor makes adding an operation easy (one new visitor) and adding a type hard (every visitor changes). Methods on an interface do the reverse. Choose by which side grows; a type switch sits with Visitor, minus the compile-time check.
-- **How `unique` avoids leaks.** Interned values are held weakly: once no `Handle` refers to a value, the runtime can drop it from the intern table. A handwritten `map[string]*ProductData` cache keeps every entry forever unless you evict.
+- **How `unique` avoids leaks.** Interned values are held weakly (the table does not, by itself, keep them alive): once no `Handle` refers to a value, the runtime can drop it from the intern table. A handwritten `map[string]*ProductData` cache keeps every entry forever unless you evict.
 - **Bridge in `database/sql`.** Adding a database means writing a driver; adding an API feature such as `QueryContext` means changing `sql.DB` and, optionally, extending the driver interfaces. That independent growth is the reason for the split.
-- **Parser design.** One function per precedence level (`or`, `and`, `not`, `atom`) is recursive descent; precedence comes from which function calls which. `ext=.md OR ext=.go AND size>1KB` parses as `Or{.md, And{.go, size}}` (tested). Add a tokenizer when values can contain spaces.
+- **Parser design.** One function per precedence level (`or`, `and`, `not`, `atom`) is recursive descent; precedence comes from which function calls which. `ext=.md OR ext=.go AND size>1KB` parses as `Or{.md, And{.go, size}}` (tested). Add a tokenizer (a step that splits text into words and symbols first) when values can contain spaces.
 - **Deep copies through reflection or JSON** copy only what they can see: JSON drops unexported fields and turns pointers into new values. Prefer an explicit `Clone` per type, with a test.
 
 ## 9. Interview questions 🔴
@@ -895,6 +928,26 @@ Why each is rare in Go backends:
 - Visitor = a type switch first; double dispatch when exhaustiveness matters; `ast.Inspect`.
 - Interpreter = parser + AST + `Eval`; embed CEL or expr-lang for real rule engines.
 - Mediator = colleagues talk only to the hub, which owns the rules; watch for god objects.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 Which Go feature usually replaces Visitor?
+> A type switch over the concrete types.
+
+> [!question]- 🟢 What does Flyweight share, and what must be true of it?
+> The data that repeats across many objects, and it must never change (immutable).
+
+> [!question]- 🟢 Facade or Mediator: the parts call back into the middle object?
+> Mediator. A facade is one-way; the subsystem never knows it exists.
+
+> [!question]- 🟡 When is Bridge better than plain Strategy?
+> When both sides vary and grow on their own, such as 5 report kinds × 4 export formats (9 types instead of 20).
+
+> [!question]- 🟡 Why is `c := *t` not a full Prototype clone when `t` has a slice?
+> The copy shares the slice's storage with the original; clone each slice and map.
+
+> [!question]- 🟡 What does a Visitor interface give you that a type switch does not?
+> The compiler forces every visitor to handle a new type; a type switch silently skips it.
 
 ## Links 🟢
 

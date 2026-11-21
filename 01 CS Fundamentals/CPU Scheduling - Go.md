@@ -23,6 +23,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add the Code steps, Design decisions and Tests.
 > - 🔴 **Interview / SDE-3 prep?** Add Pitfalls and do the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Processes, Threads and Context Switching]]: the OS can pause a running thread and resume it later. Read [[CPU Scheduling]] first too: it explains round robin, FCFS, vruntime and `cpu.max` in words; this note only turns them into code.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on twin of [[CPU Scheduling]]. That note explains, in words, how an operating system shares a few CPU cores between many waiting programs. This note turns those explanations into four small, runnable Go programs: two toy schedulers (round robin and first-come-first-served), a parser that reads a container's CPU limit, and a tiny model of Linux's fairness rule. Each program is tested against the exact numbers the theory note worked out by hand, so the two notes check each other. Read the theory note first. Then read this top to bottom: each code step starts with the idea in plain words, shows the code, and then walks through how it works line by line. You do not need advanced Go — just structs, slices, maps and basic tests.
@@ -63,13 +66,15 @@ Each has a direct code counterpart below, and each counterpart is tested against
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** what the four programs are and how to run them. **Next we read the code**, one step at a time: round robin, FCFS, the `cpu.max` parser and the vruntime model. Each step opens with the idea in plain words before any Go.
+
 ### Step 1: round robin
 
 **In plain words:** a toy scheduler where everyone gets a short fixed turn, then goes to the back of the line — like a carousel.
 
 **Concept.** `RoundRobin` is the code form of the hand-traced example in [[CPU Scheduling#Whiteboard version: round robin vs. FCFS]]: a queue of processes, each one capped to a fixed `quantum` per turn, cycling until all are done.
 
-The alternative — not capping the run length — degrades to FCFS and reintroduces the convoy effect, which is exactly the problem round robin exists to avoid.
+The alternative — not capping the run length — degrades to FCFS and reintroduces the convoy effect (short jobs stuck waiting behind one long job), which is exactly the problem round robin exists to avoid.
 
 ```go
 // Proc is one runnable unit in the scheduling simulations below. Burst is
@@ -81,6 +86,8 @@ type Proc struct {
 ```
 
 **How it works.** `Burst` is mutated as the simulation runs, so each simulator (`RoundRobin`, `FCFS`) keeps its own local copy of the input slice rather than mutating the caller's — the next block's `copy(queue, procs)` is why.
+
+**What this code does, in plain words:** put every process in a line; take the first one, let it run for at most `quantum` ticks, and if it still has work left, send it to the back of the line; write down the clock time when each one finishes.
 
 ```go
 // RoundRobin simulates non-preemptive-arrival, preemptive-execution
@@ -196,6 +203,8 @@ func CPUQuota(path string) (cpus int, unlimited bool, err error) {
 
 The function isn't done yet — the closing brace above is inside the `if`, not the function. The rest parses the two numbers and rounds.
 
+**What this code does, in plain words:** turn the two text numbers into real numbers, divide quota by period (150000 / 100000 = 1.5), round up to 2, and never return less than 1.
+
 ```go
 	quota, err := strconv.ParseFloat(fields[0], 64)
 	if err != nil {
@@ -259,6 +268,8 @@ func TraceVRuntime(names []string, ticks int) []VRuntimeStep {
 
 `sorted` is a stable, alphabetically ordered copy of the thread names, used only to make tie-breaking deterministic — the trace needs to be reproducible, not because alphabetical order has any scheduling meaning in real CFS.
 
+**What this code does, in plain words:** for each tick, look at every thread, pick the one with the smallest tally (ties go to the name that comes first alphabetically), add 1 to its tally, and save a photo of all the tallies.
+
 ```go
 	steps := make([]VRuntimeStep, 0, ticks)
 	for t := 1; t <= ticks; t++ {
@@ -308,7 +319,7 @@ This mirrors a broader pattern worth naming: when a theory note makes a claim ab
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
 | `RoundRobin`/`FCFS` return a plain `map[string]int` | A slice of structs preserving order | Simpler for tests to assert against by name; loses the original arrival order, which the simulators don't need to report |
-| `CPUQuota` returns `(cpus, unlimited, err)` | Encode "unlimited" as a sentinel value like `-1` | Explicit about the no-limit case; avoids a caller accidentally treating a sentinel as a real CPU count |
+| `CPUQuota` returns `(cpus, unlimited, err)` | Encode "unlimited" as a sentinel value (a special fake number that means "none") like `-1` | Explicit about the no-limit case; avoids a caller accidentally treating a sentinel as a real CPU count |
 | `TraceVRuntime` uses equal weight for all threads | Model `nice`-derived weights too | Keeps the function focused on the core "lowest vruntime always wins" rule; real CFS's weight scaling is a multiplier on top of this same rule |
 | Tie-break by alphabetical name | Tie-break by arrival order or random | Deterministic and reproducible for tests and for the worked-example table in the theory note |
 
@@ -392,6 +403,8 @@ func TestCPUQuota(t *testing.T) {
 
 The three cases are the table above in code form; each is run as its own `t.Run` subtest below.
 
+**What this code does, in plain words:** for each case, write a small fake `cpu.max` file, call `CPUQuota` on it, and check both the CPU count and the "unlimited" flag.
+
 ```go
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -473,8 +486,10 @@ If a future Go version changed `cpu.max` parsing semantics, or if a bug crept in
 
 ## Pitfalls in the code 🔴
 
+> 🟡 → 🔴 **You now know** how each simulator works and how the tests pin it to the theory note's numbers. **Next comes the advanced part:** where these simplified models differ from a real kernel, and exercises that make you predict before you run.
+
 - **`RoundRobin` and `FCFS` key their result maps by `Proc.Name`.** Two processes with the same name silently overwrite each other's completion time in the map — fine for these simulations' distinct test names, but a real scheduler needs a unique process ID, not a human-readable label. If you adapt this code to simulate a larger, generated workload, switch the map key to an index or a synthetic ID first.
-- **`CPUQuota`'s `1e-9` epsilon** is a floating-point tolerance for the rounding comparison; an even smaller quota/period fraction near that epsilon could in principle round the wrong way, though cgroup quotas in practice use round microsecond values that don't get close to it.
+- **`CPUQuota`'s `1e-9` epsilon** (a tiny allowed error, 0.000000001) is a floating-point tolerance for the rounding comparison; an even smaller quota/period fraction near that epsilon could in principle round the wrong way, though cgroup quotas in practice use round microsecond values that don't get close to it.
 - **`TraceVRuntime`'s tie-break is alphabetical, not FIFO.** This differs from real CFS, which breaks ties by tree-insertion order (effectively arrival order); the alphabetical choice here is purely to make the trace reproducible in a doc, not a claim about kernel internals. Don't read anything into *which* thread happens to win a tie — only that one of them must, deterministically, for the trace to be checkable at all.
 - **None of the simulators model preemption cost.** A real context switch has a cost (see the theory note's deep dive on cache/TLB pollution); these simulators treat every switch as free, which is correct for comparing *algorithms* but would understate real wall-clock time if used to predict an actual system's throughput.
 
@@ -491,6 +506,26 @@ The value is in noticing *where* your prediction and the actual result diverge, 
 1. Change `TraceVRuntime`'s tie-break from alphabetical to reverse-alphabetical (iterate `sorted` from the end) and predict the new `Ran` sequence for `["A","B"]` over 6 ticks. Then run it.
 2. Add a third thread `"C"` to `TestTraceVRuntimeAlternatesFairly`'s input and predict the `Ran` sequence for 9 ticks, matching the three-thread table in [[CPU Scheduling#Linux: CFS and EEVDF, step by step]]. Then verify.
 3. Change `RoundRobin`'s quantum from 4 to 100 in `TestRoundRobinMatchesHandTrace` and predict what the completion times become (hint: it should match `FCFS`'s completion times for the same input). Then run it to confirm.
+
+## Self-check 🟢🟡
+
+> [!question]- Why does `RoundRobin` copy `procs` before running?
+> It changes each `Burst` as it goes; copying keeps the caller's list unchanged.
+
+> [!question]- What does `FCFS` return for bursts P1=3, P2=2, P3=7?
+> `{P1:3, P2:5, P3:12}`: each finish time is the running total.
+
+> [!question]- What does `CPUQuota` return for a file containing `max 100000`?
+> `unlimited = true`; there is no CPU cap.
+
+> [!question]- Why does `150000 100000` give 2 CPUs and not 1?
+> 1.5 CPUs is rounded up, because you cannot run half an OS thread.
+
+> [!question]- In `RoundRobin`, what happens if the quantum is bigger than every burst?
+> Every job finishes in its first turn, so it behaves exactly like FCFS.
+
+> [!question]- How does `TraceVRuntime` break ties, and how does real CFS differ?
+> Alphabetically by name; real CFS goes by position in its tree, roughly arrival order.
 
 ## Links
 

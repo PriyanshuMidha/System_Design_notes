@@ -22,6 +22,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
 > - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Processes, Threads and Context Switching]]: the theory twin. Know that a process owns memory, a thread runs inside it, `fork` copies a process, `exec` swaps its program, and a context switch is the kernel swapping which thread runs.
+> - [[How a Computer Runs a Program]]: the CPU keeps the current state in registers and a program counter.
+
 **From zero** 🟢: this file is the hands-on side of [[Processes, Threads and Context Switching]]. It measures, in real numbers on your machine, how cheap goroutine switches are compared to OS thread/process operations. Read the code with its notes, then run the benchmarks and compare your numbers.
 
 ## Before the code 🟢
@@ -31,6 +35,8 @@ updated: 2026-11-13
 - **`runtime.LockOSThread`**: pins the calling goroutine to one OS thread, so switching to another pinned goroutine needs a real kernel context switch.
 - **`defer`**: runs a call when the function returns (even on panic); used here to always unpin the thread.
 - **Maps and structs (`map[int]*PCB`)**: the in-memory process table is a plain map from PID to a struct pointer.
+- **PCB (process control block)**: the kernel's record card for one process: its ID, state, program counter and registers.
+- **Userspace**: code running as a normal program, outside the kernel. Staying there avoids the cost of a kernel switch.
 - **What to run**: `go vet ./... && go test -race ./...` for correctness, then `go run ./cmd/pingpong` for the timing numbers.
 
 ## What this code shows 🟢
@@ -58,6 +64,8 @@ flowchart LR
         OP["OSThreadPingPongLatency\n(LockOSThread)"] -->|"~7 us/handoff"| R2["real kernel switch"]
     end
 ```
+
+> 🟢 → 🟡 **You now know** what the module contains: a toy process table and two timing benchmarks. **Next we see why** the code measures two almost identical handoffs, then read the code step by step.
 
 ## Why measure both sides instead of citing one number 🟡
 
@@ -97,6 +105,8 @@ Where a function was naturally longer than that, it is split across two blocks t
 ## Code 🟡
 
 ### Step 1: a minimal process control block and table
+
+**What this code does, in plain words:** it defines a small record for each process (ID, state, program counter, registers, thread list) and a map that holds them all by ID, like the kernel's process table.
 
 **Concept.** The theory note's whiteboard model says a PCB is just a struct the kernel keeps one of per process, and `fork`/`exec`/thread creation are operations on it ([[Processes, Threads and Context Switching#Whiteboard version]]). `PCB` and `ProcessTable` turn that into something you can actually call and test. The alternative — a real `fork()` via `syscall.ForkExec` — would require actually spawning OS processes from inside a test binary, which is fragile and platform-specific; this in-memory model keeps the **scheduling-relevant** fields (PID, state, saved registers, thread membership) without needing a real kernel underneath it.
 
@@ -169,7 +179,9 @@ func NewProcessTable() *ProcessTable {
 
 ### Step 2: fork, exec and adding a thread
 
-**Concept.** These three methods are the whole "fork copies, exec resets, a thread joins" story from the theory note's lifecycle section, each one a few lines because the real complexity (copy-on-write page tables, loading an ELF binary) lives in the kernel, not in this model. The alternative would be to model copy-on-write explicitly with a simulated page table — intentionally left out here, because [[Virtual Memory, Paging and the TLB]] already covers that mechanism on its own.
+**What this code does, in plain words:** `Fork` makes a new record copied from the parent, `Exec` wipes and restarts an existing record under the same ID, and `AddThread` just adds a new thread ID to an existing record.
+
+**Concept.** These three methods are the whole "fork copies, exec resets, a thread joins" story from the theory note's lifecycle section, each one a few lines because the real complexity (copy-on-write page tables, loading an ELF binary, the standard Linux program-file format) lives in the kernel, not in this model. The alternative would be to model copy-on-write explicitly with a simulated page table — intentionally left out here, because [[Virtual Memory, Paging and the TLB]] already covers that mechanism on its own.
 
 ```go
 // Create starts a brand-new process with one thread (the "main thread").
@@ -255,6 +267,8 @@ func (t *ProcessTable) Get(pid int) (*PCB, bool) {
 
 ### Step 3: a goroutine handoff the scheduler can keep in userspace
 
+**What this code does, in plain words:** two goroutines pass a token back and forth thousands of times over channels, and the function returns the average time of one pass.
+
 **Concept.** `PingPongLatency` measures the cheap side of the comparison: two goroutines trading a token over unbuffered channels, with neither pinned to a particular OS thread. Each send/receive pair forces the Go scheduler to park one goroutine and run another — the userspace equivalent of a context switch — but because nothing pins either goroutine, the Go scheduler is free to keep both on the same OS thread and never enter the kernel at all ([[Processes, Threads and Context Switching#Measuring a goroutine handoff against a real OS-thread handoff]]).
 
 The setup spawns the responding goroutine:
@@ -309,6 +323,8 @@ The timed loop and the return close the function:
 3. `<-done` after the loop waits for the spawned goroutine to notice the loop ended and exit cleanly, so the function never returns while that goroutine is still running.
 
 ### Step 4: forcing the same handoff through a real kernel context switch
+
+**What this code does, in plain words:** the same token passing, but each goroutine is first glued to its own OS thread, so every pass needs a real kernel context switch.
 
 **Concept.** `OSThreadPingPongLatency` is the expensive side of the comparison, built to be as close as possible to `PingPongLatency` except for one change: both goroutines call `runtime.LockOSThread`, which pins each one to its own, dedicated OS thread for as long as it holds the lock. Because the two goroutines can now never share one OS thread, every hand-off through the unbuffered channels forces the **OS scheduler itself** to park one kernel thread and run the other — a real kernel context switch, not a Go-runtime one. The alternative — citing a published `lmbench`-style number — tells you the order of magnitude on someone else's machine; this measures the actual number on this one, with the same channel-based handoff shape as the unpinned version, so the two numbers are directly comparable.
 
@@ -563,6 +579,8 @@ Both groups are also worth comparing against the theory note's lifecycle diagram
 
 Every handoff in the pinned group is the same pair of transitions, but now enforced by the kernel's scheduler across two OS threads, which is precisely why it pays the page-table and cache costs the theory note's third section describes.
 
+> 🟡 → 🔴 **You now know** how the model and both benchmarks work and what the numbers mean. **Next comes the advanced part:** the quiet ways this code could mislead or leak, such as a missing unlock, a missing `ready` signal, or a buffered channel.
+
 ## Pitfalls in the code 🔴
 
 None of the four pitfalls below were found by `go vet` or the race detector — they are the kind of thing only a careful reading, or a deliberate experiment like the exercises below, would surface.
@@ -595,6 +613,30 @@ It's worth stating plainly what each part of this note does and does not prove, 
 - The tests prove the model's internal consistency (fork copies what it should, exec resets what it should, a thread joins rather than duplicates) and the benchmark harness's basic sanity (it returns a positive duration), not the benchmark's absolute numbers — there is deliberately no test asserting "the pinned benchmark must be slower than the unpinned one," because that would make the test suite's pass/fail status depend on machine-specific timing, which is exactly the kind of flaky assertion a benchmark should avoid even when its printed output is the whole point of the exercise.
 
 A natural follow-on question, if this measurement surprised you, is why production Go services still bother with worker pools and bounded concurrency if goroutine hand-offs are this cheap — the trade-offs section of the theory note answers that directly: a cheap *hand-off* says nothing about a goroutine's memory footprint or about what happens when thousands of them are simultaneously runnable rather than mostly blocked, which is a different cost entirely from the one measured here.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- In the model, what is the difference between `AddThread` and `Fork`?
+> `AddThread` adds an ID to the same PCB; `Fork` creates a new PCB with a new PID.
+
+> [!question]- What does `Exec` keep and what does it reset?
+> It keeps the PID; it resets the program counter and registers.
+
+> [!question]- Why are the channels unbuffered?
+> So every send waits for a receiver, forcing a real handoff each time.
+
+🟡 Medium
+
+> [!question]- Why must both goroutines call `LockOSThread` in the pinned benchmark?
+> If only one is pinned, the scheduler can still keep the other nearby and the switch may not go through the kernel.
+
+> [!question]- What is the `ready` channel for?
+> It makes the clock start only after both sides are pinned, so setup cost is not counted.
+
+> [!question]- Is `ProcessTable` safe for many goroutines at once?
+> No. It has no mutex; concurrent use would race.
 
 ## Links
 

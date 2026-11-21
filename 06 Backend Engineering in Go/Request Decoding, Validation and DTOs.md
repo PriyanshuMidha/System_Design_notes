@@ -29,6 +29,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Building REST Endpoints]]: a handler reads the request body, calls a service, and answers with a status code such as 400 (bad input) or 422 (failed a rule).
+
 **From zero, in 60 seconds** 🟢
 
 JSON from a client is a stranger's parcel: it can be huge, mis-shaped, or carry fields you never asked for. You never unpack it straight into your real domain objects.
@@ -64,6 +67,12 @@ Careful decoding and validation decide exactly which fields a request may set, a
 | Domain model | The struct your business logic trusts | `Invoice` with `Status` |
 | Validation | Checking values make sense after decoding | `due_date` must not be in the past |
 | Mass assignment | A client setting fields it should not control | Sending `"status": "paid"` |
+
+| Unknown field | A JSON key the struct has no field for | `"status"` sent to a DTO without `Status` |
+| Trailing data | Extra bytes after the first JSON value | `{"a":1}{"a":2}` |
+| Domain command | The validated, typed input the service trusts | `CreateInvoiceCommand{DueDate time.Time}` |
+| Pointer field | A field of type `*T` that is `nil` when the key was absent | `Status *string` on a PATCH |
+| Minor units | Money stored as a whole number of the smallest unit | ₹12.50 stored as `1250` paise |
 
 **Picture it**
 
@@ -106,6 +115,10 @@ And `{"status":"draft","status":"paid"}` sets it to `"paid"`, because with dupli
 
 Neither of these is a bug in your code — they are `encoding/json`'s documented, default behavior, and a handler that doesn't know about them will ship surprises.
 
+### A real-life example 🟢
+
+When you edit your delivery address in Zomato, the app sends a small JSON body with only the address fields. If someone changed that request by hand to add `"wallet_balance": 99999`, a careless server that copies every key into its user record would give them free money. Zomato's server decodes the body into a struct that has only address fields, rejects any extra key, checks the pincode and phone number, and only then updates the real user record.
+
 ## 2. Mental model 🟢
 
 Decoding is a sequence of gates the request body passes through before any of it is trusted, and each gate can only make the data more restricted, never add information back:
@@ -117,6 +130,15 @@ raw bytes → size gate → parse (decode gate) → shape gate (unknown fields, 
 A request DTO is the type that exists only between "parsed" and "validated". Once validation succeeds, the DTO's job is done — the rest of the service never sees it again, only the domain command.
 
 ## 3. How it works 🟡
+
+🟢 → 🟡 You now know the rule: decode strictly into a request-only struct, validate every field, then build the trusted command. Next we open the box: the exact gates in `readJSON`, how each decode error becomes a clear message, the `encoding/json` surprises, and why three separate types are worth it.
+
+**Step by step:**
+1. The body is checked against a 1 MiB cap; bigger → 413.
+2. It is decoded into `CreateInvoiceRequest` with unknown fields switched off; bad JSON, wrong types or unknown keys → 400.
+3. A second decode must hit the end of the body; anything left over → 400 "trailing data".
+4. `Validate` checks every field and collects all problems → 422 with the full list.
+5. Only then is a `CreateInvoiceCommand` built and passed to the service.
 
 ### The gates, as code
 
@@ -136,6 +158,12 @@ flowchart LR
 ### `readJSON`: the size, decode and shape gates
 
 **In plain words:** one reusable doorman function: not too big, decodes cleanly, no unknown fields, nothing extra after the JSON.
+
+**Step by step:**
+1. Wrap `r.Body` with `http.MaxBytesReader(w, r.Body, 1<<20)`.
+2. Make a decoder and call `DisallowUnknownFields()`.
+3. `Decode(dst)` reads one JSON object into the DTO.
+4. Call `Decode` again into an empty struct; it must return `io.EOF` (end of input), or there was trailing data.
 
 ```go
 const maxRequestBody = 1 << 20 // 1 MiB
@@ -169,6 +197,12 @@ func readJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 
 **In plain words:** each way a body can be wrong has its own error type; naming it tells the client exactly what to fix.
 
+**Step by step:**
+1. Body too big → `*http.MaxBytesError` → "body must be at most 1 MiB" (413).
+2. Broken JSON → `*json.SyntaxError` with `Offset` → "malformed JSON at byte 47".
+3. Wrong type → `*json.UnmarshalTypeError` with `Field` → `"total": expected number, got string`.
+4. Unknown key → error text starts with `json: unknown field` → `unknown field "status"`.
+
 ```go
 func classifyDecodeErr(err error) error {
     var maxErr *http.MaxBytesError
@@ -201,6 +235,12 @@ func classifyDecodeErr(err error) error {
 
 **In plain words:** the decoder's friendly defaults — loose name matching, silent extras — are exactly what an attacker leans on.
 
+**Step by step:**
+1. A client sends `{"STATUS":"paid"}`. Go matches it to `json:"status"` anyway, ignoring case.
+2. A client sends `{"status":"draft","status":"paid"}`. Go keeps the last one, `"paid"`.
+3. A client sends a key you do not have. Go drops it silently, unless you turned on `DisallowUnknownFields`.
+4. So the safest fix is a DTO with no `status` field at all, plus strict decoding.
+
 | Behavior | What happens without a gate | Documented since |
 |---|---|---|
 | Case-insensitive key matching | `{"STATUS":"paid"}` sets a field tagged `json:"status"` | always (encoding/json) |
@@ -222,11 +262,19 @@ type statusHolder struct{ Status string `json:"status"` }
 
 ### `json/v2` (experimental, Go 1.25)
 
-Go 1.25 ships an experimental `encoding/json/v2` (behind `GOEXPERIMENT=jsonv2`) that is case-sensitive by default and rejects duplicate object keys outright, closing the first two gotchas at the decoder level instead of needing `DisallowUnknownFields` plus manual case-sensitivity checks. It is not yet the default decoder as of Go 1.24, so `readJSON` above still has to guard against both.
+**In plain words:** a newer JSON package that is strict by default; useful later, but not the default yet.
+
+Go 1.25 ships an experimental `encoding/json/v2` (behind `GOEXPERIMENT=jsonv2`, a build setting that turns on unfinished features) that is case-sensitive by default and rejects duplicate object keys outright, closing the first two gotchas at the decoder level instead of needing `DisallowUnknownFields` plus manual case-sensitivity checks. It is not yet the default decoder as of Go 1.24, so `readJSON` above still has to guard against both.
 
 ### DTO vs domain model vs response DTO
 
 **In plain words:** three shapes for three jobs: receive JSON, hold business truth, present JSON back — merging them lets a client write fields they never should.
+
+**Step by step:**
+1. `CreateInvoiceRequest` holds wire strings: `"due_date": "2026-12-01"`, `"amount": "1250"`.
+2. `Validate` parses them and returns a `CreateInvoiceCommand` with a real `time.Time` and an `int64`.
+3. The service saves an `Invoice`, which also has internal fields like `fraud_score`.
+4. `toDTO` copies only client-visible fields into `InvoiceResponse` before encoding.
 
 ```mermaid
 flowchart LR
@@ -282,6 +330,12 @@ The three types look similar today. They diverge the moment the database needs a
 
 ### PATCH: telling absent from null
 
+**Step by step:**
+1. Body `{}`: `Notes *string` stays `nil`, so do not touch notes.
+2. Body `{"notes": ""}`: `Notes` points to `""`, so clear the notes.
+3. Body `{"notes": "Pay by Friday"}`: set the new text.
+4. A plain `string` field would be `""` in both case 1 and case 2, so you could not tell them apart.
+
 `*string` on a PATCH request distinguishes "the client didn't mention this field" (`nil`) from "the client wants to clear it" (non-nil pointer to `""`). A plain `string` field cannot make that distinction — it would be the zero value either way.
 
 The alternative at larger scale is JSON Merge Patch (RFC 7396): the whole body is a partial document and any key present, even with value `null`, means "set this field to null".
@@ -305,6 +359,8 @@ func readJSONNaive(r *http.Request, dst any) error {
 The full version adds the size gate, the trailing-data check and error classification; it is exactly what the tests below run against.
 
 **Validation collecting every error, not just the first:**
+
+**What this code does, in plain words:** `Validate` checks each field (client ID present, due date present and in `YYYY-MM-DD` form, at least one item, each item with a unique description and a positive price and quantity), adds every problem to a `ValidationErrors` list, and returns the trusted command only when the list is empty.
 
 ```go
 func (req CreateInvoiceRequest) Validate() (CreateInvoiceCommand, error) {
@@ -365,6 +421,8 @@ func DecodeAndValidate(w http.ResponseWriter, r *http.Request) (CreateInvoiceCom
     return req.Validate()
 }
 ```
+
+**What this code does, in plain words:** the tests send a body over the limit (expect 413), an unknown field and trailing data (each expect 400), a body with several broken fields (expect all of them reported), and reproduce the case-insensitive, duplicate-key and number-into-`any` surprises with the real decoder.
 
 Tests, covering the gates in order plus the documented `encoding/json` gotchas:
 
@@ -464,7 +522,26 @@ func TestGotcha_NumbersInAny_AreFloat64UnlessUseNumber(t *testing.T) {
 - A tiny internal service with one trusted caller (another of your own services, not a browser) can skip the size gate and strict JSON rules if both ends are versioned together — the risk `DisallowUnknownFields` and `MaxBytesReader` guard against mostly comes from untrusted or independently-deployed clients.
 - Hand-written `Validate()` doesn't scale well past a few dozen fields across many DTOs; at that point the boilerplate `go-playground/validator` removes starts to outweigh the tag-syntax awkwardness.
 
+### Decoding vs validation 🟡
+
+| | Decoding | Validation |
+| --- | --- | --- |
+| Question | Is this well-formed JSON of the right shape? | Do the values make business sense? |
+| Example failure | `"amount": "abc"` into a number | due date in the past |
+| Status code | 400 (413 if too big) | 422 |
+| Done by | `readJSON` | `Validate()` |
+
+### Common beginner mistakes 🟢
+
+- Decoding straight into the domain model → clients can set fields like `status` (mass assignment) → use a request DTO with only the allowed fields.
+- Forgetting `MaxBytesReader` → a huge body can exhaust memory → cap the body before the first `Decode`.
+- Returning on the first validation error → users fix one field per round trip → collect all errors.
+- Using `float64` for money → cents get lost in rounding → use `int64` minor units.
+- Indexing `req.Items[0]` without checking length → an empty list panics → check `len` first.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now decode strictly, validate fully and keep wire, domain and response types apart. The advanced part covers what shows up in production: old clients hitting strict decoding, missing size caps, unclear errors, fuzzing finds, and the details behind trailing data, money and `omitzero`.
 
 - **Real systems:** Stripe's and GitHub's APIs reject unknown fields on write endpoints and return field-level error arrays, the same shape this note's `ValidationErrors` produces. The "DTO separate from domain model separate from response shape" split is the standard shape of any Go service built with a hexagonal/ports-and-adapters layering.
 - **Failure modes → fixes:**
@@ -511,6 +588,26 @@ func TestGotcha_NumbersInAny_AreFloat64UnlessUseNumber(t *testing.T) {
 - Validation collects every field error in one pass; it never stops at the first.
 - Money is `int64` minor units plus a currency code, never `float64`.
 - `omitzero` (Go 1.24) omits any zero-value field, including structs like `time.Time{}` that `omitempty` could not.
+
+## Self-check 🟢🟡
+
+> [!question]- What is a request DTO?
+> A struct that exists only to receive the JSON body, with only the fields a client may send.
+
+> [!question]- What does `DisallowUnknownFields` do?
+> Makes decoding fail when the JSON has a key the struct does not have.
+
+> [!question]- Which status code for a failed business rule like a past due date?
+> 422.
+
+> [!question]- Why decode a second time after the first succeeds?
+> To make sure nothing follows the first JSON value; trailing data must be rejected.
+
+> [!question]- Why does `{"STATUS":"paid"}` set a field tagged `json:"status"`?
+> `encoding/json` matches keys case-insensitively when there is no exact match.
+
+> [!question]- On a PATCH, how do you tell "field not sent" from "set to empty"?
+> Use a pointer field: `nil` means not sent, a pointer to `""` means clear it.
 
 ## Links 🟢
 

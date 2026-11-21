@@ -34,6 +34,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (replication, Sentinel, Cluster), 4 (slots and redirects in Go), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Redis Fundamentals]]: Redis is one in-memory server that runs commands on one main thread.
+> - [[Redis Persistence - RDB and AOF]]: Redis can save a full snapshot (RDB) of its memory; replicas get their first copy this way.
+> - [[Replication]]: a main server sends its changes to copies, and copies can fall a little behind.
+> - [[Partitioning and Sharding]]: splitting data so each server holds only part of it.
+
 **From zero, in 60 seconds** 🟢
 
 One Redis server has two limits: if it dies, everything stops, and it can only hold as much as one machine's memory.
@@ -80,6 +86,10 @@ You need copies of the data on other machines, and a way to split data across ma
 | Sharding | Splitting data so each server holds only part of it | Keys A-M on server 1, N-Z on server 2 |
 | Hash slot | One of 16,384 buckets a key is mapped to in Redis Cluster | `CRC16("user:42") mod 16384` |
 | Quorum / majority | Enough voters agreeing before acting | 2 of 3 Sentinels agree the primary is down |
+| Availability Zone (AZ) | A separate data centre inside one cloud region, with its own power and network | Primary in AZ a, replica in AZ b |
+| Network partition | A network break that splits servers into groups that cannot reach each other | Sentinel A cannot see the primary, B can |
+| Backlog | A small buffer of recent changes the primary keeps for replicas that drop off briefly | 1 MB of recent writes |
+| Hash tag | The part of a key inside `{}`; only it decides the slot | `{user:42}:cart` and `{user:42}:orders` share a slot |
 
 **Picture it**
 
@@ -115,6 +125,8 @@ InvoiceOps runs one Redis 8 instance with 20 GB of data serving 80,000 operation
 
 Replication solves the first two, Sentinel automates the first, and Cluster solves all three.
 
+**Real-life example.** A food-delivery app like Zomato cannot let its session and cart store stop for minutes when one server dies at dinner time. So the Redis that holds them has replicas in other data centres, and an automatic watcher promotes one within seconds. As the number of users grows past what one machine's memory can hold, the data is split across several primaries, each owning a range of slots. Users never notice either step, except that a failover can drop the last second or so of writes.
+
 **Which tool fixes which problem, as a picture.**
 
 ```mermaid
@@ -136,11 +148,28 @@ Terms:
 - **Split brain**: two nodes both acting as primary after a network partition.
 - **Hash slot**: one of 16,384 buckets; every key belongs to exactly one.
 
+## Common beginner mistakes 🟢
+
+- **Hard-coding the primary's IP address in the app** → after a failover the app keeps talking to the old, dead or demoted server → use a Sentinel-aware or cluster-aware client, or the managed DNS endpoint.
+- **Running only two Sentinels** → after one fails, the other cannot form a majority, so no failover happens → run at least three on separate machines.
+- **Reading your own write from a replica** → the replica may not have it yet, so the user sees old data → read from the primary right after a user's own write.
+- **Moving to Cluster without hash tags** → multi-key commands and Lua scripts fail with `CROSSSLOT` → put related keys under one tag, like `{user:42}:cart`.
+- **Believing replicas make writes safe** → replication is asynchronous, so a failover can lose acknowledged writes → keep the real record in a database, and use `WAIT` for critical writes.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that replicas are live copies, Sentinel swaps in a replica when the primary dies, and Cluster splits keys into 16,384 slots across several primaries. **Next we open the box**: how a replica catches up, how Sentinels vote, and how a cluster client finds the right server for each key.
 
 ### Replication
 
 **In plain words:** the main server streams every change to its copies. A copy that drops off briefly catches up from a short buffer; one that was gone too long gets a full fresh copy.
+
+**Step by step:**
+1. A new replica connects and says "I have nothing". The primary takes an RDB snapshot and streams it over the network.
+2. From then on, every write the primary runs (say `SET a 1`) is sent to the replica too, a moment later.
+3. The replica loses its network for 2 seconds. When it comes back it says "I last saw position 5,000,000".
+4. If those missed bytes are still in the primary's backlog, the primary sends just those: a cheap partial resync.
+5. If the replica was gone so long that the backlog no longer has them, it needs a full snapshot again.
 
 ```mermaid
 sequenceDiagram
@@ -175,6 +204,13 @@ sequenceDiagram
 
 **In plain words:** three or more small watchers ping the main server. When enough of them agree it is dead, they pick the best copy and make it the new main.
 
+**Step by step:**
+1. Three Sentinels ping the primary every second.
+2. Sentinel A gets no answer for 30 seconds and marks it "subjectively down" (SDOWN: down in its own opinion).
+3. A asks the others. When 2 of 3 agree (the quorum), the primary is "objectively down" (ODOWN).
+4. The Sentinels vote for a leader among themselves; a majority is needed. The leader picks the replica with the highest priority and the most data.
+5. The leader promotes that replica, points the other replicas at it, and announces `+switch-master` so clients reconnect to the new primary.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Up
@@ -187,7 +223,7 @@ stateDiagram-v2
     Reconfigure --> Up: clients told via +switch-master, old primary rejoins as replica
 ```
 
-- Deploy at least **three** Sentinels on separate failure domains. `quorum` (often 2) is how many must agree the primary is down (**ODOWN**, objectively down); a **majority** of all Sentinels must still vote to authorise the failover, so a minority side of a partition cannot fail over.
+- Deploy at least **three** Sentinels on separate **failure domains** (machines or zones that do not fail together). `quorum` (often 2) is how many must agree the primary is down (**ODOWN**, objectively down); a **majority** of all Sentinels must still vote to authorise the failover, so a minority side of a partition cannot fail over.
 - Defaults from the Sentinel docs: `down-after-milliseconds 30000`, `failover-timeout 180000`, `parallel-syncs 1`. Sentinel listens on port 26379.
 - Clients connect to Sentinels, ask `SENTINEL get-master-addr-by-name <name>`, and reconnect when they see `+switch-master`. Never hard-code the primary's IP.
 - **Lost writes.** If the old primary is cut off with some clients still writing to it, those writes are discarded when it rejoins as a replica. `min-replicas-to-write 1` and `min-replicas-max-lag 10` bound this to about 10 seconds of writes.
@@ -195,6 +231,13 @@ stateDiagram-v2
 ### Redis Cluster
 
 **In plain words:** keys are spread over several main servers by bucket number. Ask the wrong server and it tells you which one to ask instead.
+
+**Step by step:**
+1. The cluster has 3 primaries. Primary 1 owns slots 0-5,460, primary 2 owns 5,461-10,922, primary 3 owns the rest.
+2. The app wants `user:42`. It computes the slot: 15,880. Its map says primary 3, so it sends `GET user:42` there.
+3. If an operator moved that slot meanwhile, primary 3 answers `MOVED 15880 <new address>`. The app updates its map and retries.
+4. Primary 3 dies. Its replica asks the other primaries for votes, wins, and takes over slots 10,923-16,383.
+5. The app sees a few seconds of errors, retries, and carries on with the new owner.
 
 ```mermaid
 flowchart TB
@@ -219,11 +262,11 @@ flowchart TB
     P2 <--> P3
 ```
 
-- **Slot of a key** = `CRC16(key) mod 16384`. If the key contains `{...}` with at least one character between the braces, only that part is hashed. That is a **hash tag**: `{user:42}:cart` and `{user:42}:orders` share a slot.
+- **Slot of a key** = `CRC16(key) mod 16384` (CRC16 is a fast checksum that turns any key into a 16-bit number). If the key contains `{...}` with at least one character between the braces, only that part is hashed. That is a **hash tag**: `{user:42}:cart` and `{user:42}:orders` share a slot.
 - **Routing.** A client may send a command to any node. If that node does not own the slot it replies `-MOVED <slot> <host:port>`; the client updates its slot map and retries. Smart clients load the map at start with `CLUSTER SHARDS` (or the older `CLUSTER SLOTS`) and almost never get redirected.
 - **Resharding.** An operator moves a slot from node A to node B. During the move, A marks the slot *migrating* and B *importing*. A key already moved gets `-ASK <slot> <B>`: the client sends `ASKING` and the command to B once, without updating its map. When the move finishes, A answers `MOVED`.
 - **Failure detection and failover.**
-	- Nodes gossip on the cluster bus (port + 10000 by default).
+	- Nodes **gossip** (pass health news to each other, a few nodes at a time) on the cluster bus (port + 10000 by default).
 	- A node not answering for `cluster-node-timeout` (default 15,000 ms, measured on Redis 8.2) is marked PFAIL, and FAIL once a majority of primaries report it.
 	- Its replicas then ask the other primaries for votes; the one with the most up-to-date offset waits the shortest delay and usually wins.
 	- A majority of primaries must vote, so a cluster needs at least three primaries.
@@ -467,7 +510,7 @@ func NewClusterClient(password string) *redis.ClusterClient {
 }
 ```
 
-During a failover, commands fail for a few seconds (connection refused, `READONLY` from the demoted primary, or `CLUSTERDOWN`). Retries with backoff ([[Timeouts, Retries and Backoff]]) and idempotent writes let the service ride through; a cache read can fall back to the database.
+During a failover, commands fail for a few seconds (connection refused, `READONLY` from the demoted primary, or `CLUSTERDOWN`). Retries with backoff ([[Timeouts, Retries and Backoff]]) and **idempotent** writes (writes that are safe to repeat, because doing them twice has the same effect as once) let the service ride through; a cache read can fall back to the database.
 
 ## 5. Variants and comparison 🟡
 
@@ -493,12 +536,14 @@ During a failover, commands fail for a few seconds (connection refused, `READONL
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how replicas sync, how Sentinel fails over, and how Cluster routes keys by slot, plus how to connect from Go. **Next is the advanced part**: managed services such as ElastiCache, the failures seen in production, what to monitor, and the inner details of slots, epochs and lost writes.
+
 ### Managed: ElastiCache and Valkey
 
 **In plain words:** the cloud-hosted options, and what changed after Redis's licence change.
 
 - **Engines.** In March 2024 Redis moved from the BSD license to RSALv2/SSPLv1 (from Redis 7.4), and the Linux Foundation started **Valkey**, a BSD-licensed fork of Redis 7.2.4. Redis 8.0 (2025) added AGPLv3 as a license option. ElastiCache offers both Valkey and Redis OSS engines, with lower prices for Valkey.
-- **Cluster mode disabled**: one shard, a primary and up to 5 read replicas. Clients use the **primary endpoint** (a DNS name that follows failover) for writes and the **reader endpoint** to spread reads across replicas.
+- **Cluster mode disabled**: one shard, a primary and up to 5 read replicas. Clients use the **primary endpoint** (a **DNS** name, the internet's address book entry, that follows failover) for writes and the **reader endpoint** to spread reads across replicas.
 - **Cluster mode enabled**: Redis Cluster with many shards (AWS documents up to 500 shards per cluster on recent engine versions). Clients connect to the **configuration endpoint** and must be cluster-aware.
 - **Multi-AZ with automatic failover** places replicas in other Availability Zones and promotes one when the primary fails; the endpoint DNS moves with it.
 - **ElastiCache Serverless** removes node sizing: one endpoint, capacity scales automatically, encryption in transit (TLS) is always on, and AWS recommends a cluster-mode-capable client.
@@ -525,7 +570,7 @@ During a failover, commands fail for a few seconds (connection refused, `READONL
 
 ## 8. Deep dive 🔴
 
-- **Why 16,384 slots?** The cluster bus heartbeat carries a bitmap of the sender's slots: 16,384 bits is 2 KB. 65,536 slots would make each heartbeat 8 KB. The Redis author also states the cluster is not designed for more than about 1,000 primaries, so 16,384 slots are enough to balance them.
+- **Why 16,384 slots?** The cluster bus **heartbeat** (the regular "I am alive" message between nodes) carries a bitmap of the sender's slots: 16,384 bits is 2 KB. 65,536 slots would make each heartbeat 8 KB. The Redis author also states the cluster is not designed for more than about 1,000 primaries, so 16,384 slots are enough to balance them.
 - **Epochs.** Each primary has a `configEpoch`; a failover winner takes a new, higher epoch. When two nodes claim the same slot, the higher epoch wins, which is how a returning old primary learns it was replaced.
 - **Replica selection in Cluster.** A replica waits `500 ms + random(0-500 ms) + rank × 1000 ms` before asking for votes, where rank 0 is the replica with the largest replication offset. So the most up-to-date replica usually wins without a tie.
 - **Where writes are lost.** A client writes to primary P, P replies OK, then P dies before streaming the write; the promoted replica never had it. In a partition, a primary on the minority side keeps accepting writes until `cluster-node-timeout` passes and it stops serving; those writes are lost when it rejoins.
@@ -564,6 +609,30 @@ During a failover, commands fail for a few seconds (connection refused, `READONL
 - Multi-key, `MULTI`, Lua in Cluster: one slot or `CROSSSLOT`.
 - ElastiCache: cluster mode disabled (1 shard, ≤ 5 replicas, primary + reader endpoints) vs enabled (configuration endpoint) vs Serverless; Valkey is the BSD fork.
 - Failover takes seconds: retries, timeouts and a DB fallback in the client.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does a replica do?
+> It keeps a live copy of the primary's data and can take over if the primary dies.
+
+> [!question]- What does Sentinel add on top of replication?
+> Automatic failover: it notices the primary is down and promotes a replica.
+
+> [!question]- How many hash slots does Redis Cluster have?
+> 16,384; each key belongs to exactly one.
+
+🟡 Medium
+
+> [!question]- Why can a failover lose writes the primary already said "OK" to?
+> Replication is asynchronous, so the promoted replica may never have received the last writes.
+
+> [!question]- What is the difference between `MOVED` and `ASK`?
+> `MOVED` means the slot lives elsewhere for good, so update the map; `ASK` is a one-off redirect during a slot move.
+
+> [!question]- Two keys `cart:42` and `orders:42` fail with `CROSSSLOT` in a Lua script. How do you fix it?
+> Rename them with a shared hash tag, like `{user:42}:cart` and `{user:42}:orders`, so they land in one slot.
 
 ## Links 🟢
 

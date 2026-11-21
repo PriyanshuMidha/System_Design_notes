@@ -31,6 +31,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (select semantics and the patterns) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Goroutines and Channels]]: `go f()` starts a goroutine; a channel send or receive waits until the other side is ready; only the sender closes a channel; a `sync.WaitGroup` waits for a group of goroutines to finish.
+
 **From zero, in 60 seconds** 🟢
 
 In Go, pieces of your program can run at the same time (**goroutines**) and pass values to each other through pipes (**channels**). Normally, reading from a pipe means waiting at that one pipe.
@@ -75,6 +78,12 @@ Waiting on one, then the other, then a clock, in order, does not work: you would
 | Timeout | Giving up after a set time | `time.After(time.Second)` |
 | Context | A value that carries a "stop now" signal | `<-ctx.Done()` |
 | Worker pool | A fixed number of goroutines sharing a job queue | 4 workers reading `jobs` |
+| Pipeline | Stages connected by channels, each doing one step and passing results on | generate → square → print |
+| Fan-out / fan-in | Split work across several goroutines, then merge their results into one channel | 4 workers, 1 merged output |
+| Semaphore | A counter of free slots that limits how many things run at once | at most 3 downloads at a time |
+| Backpressure | Telling the sender "I'm full" instead of queuing forever | `Submit` returns `ErrQueueFull` |
+| `errgroup` | A helper that runs goroutines, returns the first error, and cancels the rest | `g.Go(fn)`, `g.Wait()` |
+| Cache stampede | Many requests missing the same expired cache key at once and all hitting the database | a hot product page at 9 pm |
 
 **Picture it**
 
@@ -101,7 +110,7 @@ Where it breaks: a waiter can serve several tables in a row, but one `select` ha
 
 ## 1. Why it exists 🟢
 
-A request handler that calls three downstream services wants to run them in parallel, give up with a clear error if one takes too long, and stop the other two immediately so they do not keep burning CPU and connections after the client has already gotten a timeout response.
+A request handler that calls three downstream services (other services this one depends on) wants to run them in parallel, give up with a clear error if one takes too long, and stop the other two immediately so they do not keep burning CPU and connections after the client has already gotten a timeout response.
 
 Doing this with plain channels alone needs a way to wait on "whichever happens first — a result, a timeout, or a cancellation" without picking one channel in advance.
 
@@ -116,6 +125,8 @@ A `default` case means "if no line is ringing right now, don't wait — go do so
 The patterns below are all team structures built from that one primitive: a pipeline is workers in a row, each handing finished work to the next; a worker pool is many workers pulling from one shared queue; fan-out/fan-in is splitting work out to several workers and merging their results back into one stream.
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that `select` watches several channels and runs whichever is ready first, and that `default` makes it not wait. **Next we open the box**: the exact `select` rules, timeouts, the for-select loop, and the standard team shapes (pipeline, fan-out/fan-in, worker pool), plus ways to cap concurrency, stop on first error, merge duplicate requests and rate-limit.
 
 ### `select` semantics
 
@@ -152,7 +163,7 @@ case <-ctx.Done():
 }
 ```
 
-`time.After(d)` returns a channel that receives once after `d`. Before Go 1.23, a `time.After` timer that never fired (because another case won the `select` first) stayed referenced by the runtime's timer heap until it actually fired, so a `select` with `time.After` inside a hot loop could accumulate live timers.
+`time.After(d)` returns a channel that receives once after `d`. Before Go 1.23, a `time.After` timer that never fired (because another case won the `select` first) stayed referenced by the runtime's timer heap (the runtime's internal list of pending timers) until it actually fired, so a `select` with `time.After` inside a hot loop could accumulate live timers.
 
 **Since Go 1.23**, an unreferenced, unfired timer created this way can be garbage collected before it fires, which removes that leak for the common one-shot case; it is still wasteful to create a new timer on every iteration of a tight loop; prefer creating one `time.Timer` with `time.NewTimer` and calling `Reset` on it when the same deadline is checked repeatedly.
 
@@ -240,6 +251,8 @@ Fan-out starts several goroutines reading from the same input channel (splitting
 
 The part that trips people up is **who closes the merged output, and when**: it must close only after every fan-out worker has finished, which needs a `sync.WaitGroup` plus a dedicated "closer" goroutine, because `wg.Wait()` cannot run on the same goroutine that is also ranging over the channel it is waiting to close — that would deadlock the goroutine waiting on itself.
 
+**What this code does, in plain words:** starts `workers` goroutines that all read from `in`, apply `f`, and send results to `out`. A separate goroutine waits for all workers with a `WaitGroup` and only then closes `out`, so the reader's `range out` ends cleanly.
+
 ```go
 func FanOutFanIn(ctx context.Context, in <-chan int, workers int, f func(int) int) <-chan int {
     out := make(chan int)
@@ -306,9 +319,9 @@ func (p *Pool) Submit(j Job) error {
 }
 ```
 
-`Submit` never blocks: a full queue returns `ErrQueueFull` immediately instead of making the caller wait, which is **backpressure** — the caller finds out the system is saturated and can choose to retry, persist the job durably, or reject the request with an HTTP 429.
+`Submit` never blocks: a full queue returns `ErrQueueFull` immediately instead of making the caller wait, which is **backpressure** — the caller finds out the system is saturated and can choose to retry, persist the job durably, or reject the request with an HTTP 429 ("Too Many Requests").
 
-`Stop` closes the queue so the workers' `for range` loops drain whatever was already accepted before exiting (full code and tests in the worked example). This in-process pool is for bounded, best-effort background work inside one process; durable job queues (Postgres `SKIP LOCKED` tables, SQS, Kafka) that survive a crash belong to [[Background Workers and Job Queues]] in `06 Backend Engineering in Go`.
+`Stop` closes the queue so the workers' `for range` loops drain whatever was already accepted before exiting (full code and tests in the worked example). This in-process pool is for bounded, best-effort background work inside one process; durable job queues (Postgres `SKIP LOCKED` tables, SQS, Kafka: queue systems that store jobs outside your process) that survive a crash belong to [[Background Workers and Job Queues]] in `06 Backend Engineering in Go`.
 
 ### Bounded parallelism: three ways to cap concurrency
 
@@ -319,6 +332,8 @@ func (p *Pool) Submit(j Job) error {
 | `errgroup.Group.SetLimit(n)` | `golang.org/x/sync` | How many of the group's `Go` calls run concurrently |
 
 A buffered channel of empty structs works as a semaphore with zero extra dependencies: acquiring a slot is a send, releasing it is a receive.
+
+**What this code does, in plain words:** `tokens` has `n` slots. Before starting work on each item, the loop puts a token in (waiting if all `n` are taken, or stopping if the context is cancelled). Each goroutine takes its token back out when it finishes, freeing a slot. At the end, `wg.Wait()` waits for the last ones.
 
 ```go
 func BoundedChanSemaphore(ctx context.Context, items []int, n int, work func(int)) {
@@ -400,7 +415,7 @@ A `time.Ticker` fires at a fixed interval and is useful for "do this roughly eve
 
 ### Broadcast / pub-sub
 
-Fanning one event out to many subscribers needs a decision for what happens when a subscriber is slow: **block** the publisher (one slow subscriber stalls everyone — rarely acceptable), **drop** that subscriber's message (give every subscriber its own buffered channel, and if a send would block, drop the message instead of blocking the publisher), or disconnect slow subscribers entirely past some threshold.
+Fanning one event out to many subscribers (pub-sub: publish once, every subscriber gets a copy) needs a decision for what happens when a subscriber is slow: **block** the publisher (one slow subscriber stalls everyone — rarely acceptable), **drop** that subscriber's message (give every subscriber its own buffered channel, and if a send would block, drop the message instead of blocking the publisher), or disconnect slow subscribers entirely past some threshold.
 
 Per-subscriber buffered channels with a drop-on-full policy is the usual default: it isolates one slow consumer from the rest and from the publisher.
 
@@ -432,6 +447,8 @@ func firstOf(work <-chan int, timeout <-chan time.Time) (int, bool) {
 ```
 
 The full version below adds the worker pool, fan-out/fan-in, `errgroup` with a weighted semaphore, and a channel-based semaphore, tested under the race detector with `go vet ./...` clean and `go test -race ./...` passing.
+
+**What this code does, in plain words:** `TryRecv` reads from a channel without waiting. `CallWithTimeout` runs a call with its own deadline and gives up when it passes. `Pool` is the worker pool: `NewPool` starts the workers, `Submit` adds a job or returns `ErrQueueFull` at once, and `Stop` closes the queue and waits (up to a deadline) for the workers to finish what was accepted. `FetchAll` fetches many IDs with at most `maxInFlight` at once and stops everything on the first error.
 
 ```go
 package patterns
@@ -565,6 +582,8 @@ func FetchAll(ctx context.Context, ids []string, maxInFlight int64, fetch func(c
 
 Tests, including the pool's backpressure and drain-on-stop guarantees, and `errgroup`'s bound on concurrency:
 
+**What this code does, in plain words:** the first test blocks the workers on purpose, fills the queue, and checks that further `Submit` calls get `ErrQueueFull`, then releases the workers and stops the pool. The second test counts how many fetches run at the same time (never more than the limit) and checks that one failing fetch makes `FetchAll` return that error.
+
 ```go
 func TestPool_QueueFullIsBackpressure(t *testing.T) {
     release := make(chan struct{})
@@ -646,6 +665,9 @@ func TestFetchAll_RespectsMaxInFlightAndPropagatesError(t *testing.T) {
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the `select` rules and how to build timeouts, for-select loops, pipelines, fan-out/fan-in, worker pools, semaphores, `errgroup`, `singleflight` and rate limiters, with tests. **Next is the advanced part**: how these show up in real services, the failure patterns during incidents, and the precise guarantees behind each tool.
+
+
 - **Real systems:** `errgroup` fanning out parallel backend calls behind one HTTP handler; worker pools processing webhook deliveries or outbound notifications with a bounded concurrency ceiling; `singleflight` protecting a database from a stampede when a popular cache key expires; `x/time/rate` throttling calls to a third-party API with a published rate limit.
 - **Failure modes → fixes:**
   - A downstream API starts rate-limiting the whole fleet → add an `x/time/rate.Limiter` sized to the documented quota, shared per process or via a distributed limiter across instances.
@@ -699,6 +721,30 @@ func TestFetchAll_RespectsMaxInFlightAndPropagatesError(t *testing.T) {
 - Bound concurrency with a buffered-channel semaphore, `x/sync/semaphore.Weighted`, or `errgroup.SetLimit` — never leave a fan-out unbounded.
 - `errgroup.WithContext` cancels on the first error, but every goroutine must itself check that derived context for cancellation to actually stop its work.
 - `singleflight` fixes cache stampedes; `x/time/rate` fixes "too many calls per second"; they solve different problems.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Two cases in a `select` are ready at once. Which runs?
+> One of them, picked at random.
+
+> [!question]- How do you check a channel without waiting?
+> Put the receive in a `select` with a `default` case.
+
+> [!question]- Why does every long-running worker loop have `case <-ctx.Done(): return`?
+> So cancelling the context actually stops the goroutine instead of leaking it.
+
+🟡 Medium
+
+> [!question]- In fan-in, why must `wg.Wait(); close(out)` run in its own goroutine?
+> The goroutine reading `out` would otherwise be stuck in `Wait`, while the workers are stuck sending to `out`: a deadlock.
+
+> [!question]- Your worker pool's queue is full. What should `Submit` do, and why?
+> Return `ErrQueueFull` at once (backpressure), so the caller can retry, store the job, or reply 429 instead of waiting forever.
+
+> [!question]- 500 requests miss the same expired cache key at once. Which tool stops 500 database queries?
+> `singleflight`: one shared `Group` runs the load once and gives every waiting caller the same result.
 
 ## Links 🟢
 

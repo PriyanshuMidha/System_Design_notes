@@ -34,6 +34,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Arrays and Dynamic Arrays (Go Slices)]]: a slice holds items in order, and you can jump to any index instantly.
+> - [[Complexity Analysis - Big-O and Amortized Cost]]: `O(n)`, `O(log n)` and `O(n log n)` describe how work grows as the input grows.
+
 **From zero, in 60 seconds** 🟢
 
 Sorting means putting things in order. Searching means finding a thing. The two are best friends: once data is sorted, searching becomes dramatically faster.
@@ -73,6 +77,12 @@ Sorting costs work up front; searching then gets cheap.
 | Binary search | Halve a sorted range each step | Guessing a number 1-100 in 7 tries |
 | Monotonic | Once a condition becomes true, it stays true | `x >= 5` over sorted numbers |
 | Pattern | A reusable trick that solves a family of problems | Two pointers, sliding window |
+| pdqsort | The fast, unstable sorting algorithm Go uses in `slices.Sort` | `slices.Sort(prices)` |
+| Two pointers | Two indexes walking a sorted array, often from both ends | find a pair summing to 9 |
+| Sliding window | A range `[left, right]` that moves across an array, updated bit by bit | best 3-day sales total |
+| Prefix sums | A running-total array so any range sum is one subtraction | `sum(i..j) = pre[j+1] - pre[i]` |
+| BFS / DFS | Explore a graph level by level / one branch as deep as possible first | fewest hops / cycle check |
+| Dynamic programming (DP) | Solve small sub-problems once, store the answers, build the big answer from them | fewest coins for ₹11 |
 
 **Picture it**
 
@@ -110,6 +120,13 @@ Most coding-interview problems are really asking "do you recognize which of thes
 > [!tip] Remember
 > Sorting and most interview patterns are the same trade: pay a little more work up front (or recognize the right shape) so that every query or step afterward gets dramatically cheaper.
 
+### Real-life example 🟢
+
+When you tap "Sort by price: low to high" on Flipkart or Amazon, the server sorts the matching products, and since two products may have the same price, a stable sort keeps their earlier "relevance" order.
+When BookMyShow shows "next show after 6 pm", the showtimes are already sorted, so a binary search finds the first one `>= 18:00` in a few steps.
+A "trending in the last 5 minutes" counter is a sliding window over time.
+And the "fewest stops" route in a metro app is a BFS over the station map.
+
 ## 2. Mental model 🟢
 
 Think of sorting as the one-time cost of **organizing a library** so that later, finding any book by title is a quick jump to a shelf instead of scanning every book.
@@ -137,17 +154,41 @@ flowchart TD
 > [!warning] Common mistake
 > Treating this flowchart as exhaustive. It covers the handful of patterns this note details; many problems combine two patterns (e.g. sort, then two pointers) or need a structure not listed here (a heap, a trie). Use it to narrow the search, not to replace reading the problem.
 
+## Common beginner mistakes 🟢
+
+- **Sorting when a hash set would do** → "does any pair sum to k?" needs only `O(n)` with a set, but sorting costs `O(n log n)` → ask if order is really needed.
+- **Assuming `slices.Sort` keeps equal items in order** → it is pdqsort, which is not stable → use `slices.SortStableFunc` when ties matter.
+- **Binary searching unsorted data** → the "go left / go right" rule only works on sorted data → sort first, or check the condition is monotonic.
+- **Using DFS to find the shortest path** → DFS can return a long path first → use BFS for fewest steps in an unweighted graph.
+- **Writing plain recursion for a DP problem** → the same sub-problem is solved again and again, so it blows up → add a cache (memoization) or fill a table bottom-up.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that sorting costs work up front so that searching later is fast, and that most interview problems fit a few patterns. **Next we open the box:** why `O(n log n)` is the best a comparison sort can do, what stability means, how binary search shrinks its range, and how each pattern moves step by step.
 
 ### In plain words: comparison sorts and the `O(n log n)` floor
 
 A **comparison sort** decides order only by comparing pairs of elements — nothing more. It turns out no comparison sort can beat `O(n log n)` comparisons in the worst case, no matter how cleverly it's written.
 
-**Why:** there are `n!` possible orderings of `n` elements, and each comparison gives at most one bit of information (true/false). Distinguishing `n!` possibilities needs at least `log₂(n!)` bits of information, and `log₂(n!) = Θ(n log n)` by Stirling's approximation.
+**Step by step:**
+1. Take 3 cards: A, B, C. There are 3 × 2 × 1 = 6 possible orders.
+2. Each comparison ("is A < B?") has two answers, so it can at best cut the possibilities in half.
+3. 6 → 3 → 2 → 1 needs at least 3 comparisons in the worst case.
+4. For n items there are n! orders, and halving n! down to 1 takes about n × log₂ n steps.
+5. So no sort that only compares can beat about n log n comparisons.
+
+**Why:** there are `n!` possible orderings of `n` elements, and each comparison gives at most one bit of information (true/false). Distinguishing `n!` possibilities needs at least `log₂(n!)` bits of information, and `log₂(n!) = Θ(n log n)` (Θ means "grows at exactly this rate") by Stirling's approximation (a known formula for estimating n!).
 
 **Example with numbers:** sorting just 10 elements has `10! ≈ 3.6 million` possible orderings. `log₂(3.6M) ≈ 22` — so even a perfect comparison sort needs roughly 22 comparisons in the worst case to pin down which of those 3.6 million orderings the input actually is.
 
 ### Picture it: stability
+
+**Step by step:**
+1. Orders arrive in time order: (Asha, ₹30), (Bala, ₹20), (Chitra, ₹30), (Dev, ₹20).
+2. Sort them by amount.
+3. A stable sort gives Bala, Dev, Asha, Chitra: within each amount, the original time order is kept.
+4. An unstable sort may give Dev, Bala, Chitra, Asha: still sorted by amount, but ties shuffled.
+5. If your screen promised "oldest first within the same amount", only the stable sort keeps that promise.
 
 **Stability** means elements that compare equal keep their original relative order. It matters whenever you sort by one key but care about an earlier sort's order among ties — for example, sort a list of orders by customer, then (stably) by amount, and within a customer the orders stay time-ordered.
 
@@ -160,7 +201,7 @@ flowchart LR
 > [!warning] Common mistake
 > Assuming any sort that "looks right" on a quick test is stable. Both outputs above are correctly sorted by the second field — the only difference is tie order, which a small test is unlikely to catch unless it's specifically checking for it.
 
-Go's `slices.Sort` and the older `sort.Sort`/`sort.Slice` all use **pdqsort** (pattern-defeating quicksort) — a hybrid of quicksort, heapsort and insertion sort that picks good pivots, falls back to heapsort to avoid quicksort's `O(n²)` worst case, and detects already-sorted or few-distinct-value patterns to go faster on them.
+Go's `slices.Sort` and the older `sort.Sort`/`sort.Slice` all use **pdqsort** (pattern-defeating quicksort) — a hybrid of quicksort, heapsort and insertion sort (three classic sorts: split-around-a-pivot, build-a-heap, and slot-each-item-into-place) that picks good pivots (the value used to split the array into "smaller" and "bigger" halves), falls back to heapsort to avoid quicksort's `O(n²)` worst case, and detects already-sorted or few-distinct-value patterns to go faster on them.
 
 `sort.Sort`/`sort.Slice` switched to pdqsort in Go 1.19; the `slices` package (and `slices.Sort` with it) was added later, in Go 1.21, using the same algorithm from its first release. It is fast but **not stable**.
 
@@ -172,6 +213,12 @@ Go's `slices.Sort` and the older `sort.Sort`/`sort.Slice` all use **pdqsort** (p
 ### Picture it: binary search as a shrinking range
 
 Binary search works only on data where a yes/no condition is **monotonic** — all false values, then all true values (or vice versa), with no mixing. Each step halves the remaining range by checking the midpoint, giving `O(log n)` total steps.
+
+**Step by step:**
+1. Sorted showtimes in minutes: `[600, 720, 900, 1080, 1260]`. Find the first show at or after 1000.
+2. Look at the middle (900). 900 < 1000, so the answer is to the right. Drop the left half.
+3. Look at the middle of what is left (1080). 1080 >= 1000, so this could be the answer; drop the right side.
+4. Only one candidate left: 1080 (6 pm). Found in about 3 looks instead of 5.
 
 ```mermaid
 flowchart TD
@@ -191,6 +238,12 @@ This generalization is what lets the same function solve "find the first element
 
 ### Picture it: two pointers converging
 
+**Step by step:**
+1. Sorted array `[1, 2, 4, 6, 8]`, target sum 10. Put `lo` at 1 and `hi` at 8.
+2. 1 + 8 = 9, too small. Move `lo` right to 2.
+3. 2 + 8 = 10. Found the pair.
+4. If it had been too big, we would move `hi` left instead. Each move rules out one number forever, so one pass is enough.
+
 ```mermaid
 flowchart LR
     subgraph arr["sorted array, target sum = 9"]
@@ -206,6 +259,13 @@ Walking it through: `1 + 8 = 9` on the first check — done in one step, because
 If the sum is too small, `lo` moves right (toward larger values); if too large, `hi` moves left (toward smaller values) — each move discards one element permanently from consideration, which is why the whole pass is `O(n)`, not `O(n²)`.
 
 ### Picture it: a sliding window
+
+**Step by step:**
+1. Daily orders `[2, 1, 5, 3, 4]`. Find the best total over any 3 days in a row.
+2. First window: 2 + 1 + 5 = 8.
+3. Slide right: add the new day (3), remove the old one (2): 8 + 3 − 2 = 9.
+4. Slide again: 9 + 4 − 1 = 12. Best is 12.
+5. Each slide is one add and one subtract, never a full re-sum.
 
 ```mermaid
 flowchart LR
@@ -226,13 +286,19 @@ flowchart TD
     B --> E["E"]
 ```
 
-- **BFS order:** start → A, B (both distance 1) → C, D, E (all distance 2). Every node at distance *k* is visited before any node at distance *k+1* — which is exactly why BFS is guaranteed to find the shortest path first in an unweighted graph.
+- **BFS order:** start → A, B (both distance 1) → C, D, E (all distance 2). Every node at distance *k* is visited before any node at distance *k+1* — which is exactly why BFS is guaranteed to find the shortest path first in an unweighted graph (a graph where every edge counts as one step).
 - **DFS order:** start → A → C (fully explore A's branch before touching B at all) → back out → D → back out → B → E. DFS commits to one branch as deep as possible before trying the next.
 
 > [!warning] Common mistake
 > Using DFS and expecting a shortest path. DFS has no distance guarantee at all — it can return *a* path, but not necessarily the shortest one. Shortest-path-in-an-unweighted-graph always means BFS.
 
 ### Picture it: backtracking vs DP on overlapping subproblems
+
+**Step by step (fewest coins for ₹11 with coins 1, 2, 5):**
+1. Backtracking tries every combination: 5+5+1, 5+2+2+2, 2+2+2+2+2+1, … and keeps the best. Many branches repeat the same leftovers.
+2. DP instead makes a table: `best[0] = 0`.
+3. For each amount from 1 to 11, `best[a]` = 1 + the smallest of `best[a−1]`, `best[a−2]`, `best[a−5]`.
+4. Each cell is filled once from cells already done. `best[11] = 3` (5 + 5 + 1).
 
 ```mermaid
 flowchart TD
@@ -304,10 +370,12 @@ Runnable Go version (all six interview patterns, tested): [[Sorting, Searching a
 - DP trades time for memory (the table of subproblem answers); for very large state spaces, memory becomes the real bottleneck, and techniques like rolling arrays (keeping only the last row or two) help.
 - Two pointers and sliding window only work cleanly when the data has the right structure (sorted, or a window condition that changes monotonically as the window grows/shrinks) — forcing them onto data that doesn't fit usually produces a subtly wrong answer, not a slow one.
 
+> 🟡 → 🔴 **You now know** how the sorts, binary search and the main patterns work, and when not to sort. **Next comes the advanced part:** where these show up in real systems (databases, Go's own library, rate limiters), the bugs they cause in production, and the deeper theory: the sorting lower bound, how pdqsort avoids its worst case, and designing DP state.
+
 ## 7. In production 🔴
 
 - **Real systems:**
-	- Database query planners choose a sort-merge join (sort both sides, then a two-pointer-style merge) versus a hash join depending on whether the inputs are already sorted or indexed — see [[Query Plans and EXPLAIN]].
+	- Database query planners (the part of a database that picks how to run a query) choose a sort-merge join (sort both sides, then a two-pointer-style merge) versus a hash join depending on whether the inputs are already sorted or indexed — see [[Query Plans and EXPLAIN]].
 	- Go's own standard library leans on `sort.Search` internally wherever a sorted slice needs a lookup — for example, `go/types` uses it to find a method by name in a sorted method set, and `debug/dwarf` and `debug/gosym` use it to search their sorted offset and program-counter tables.
 	- Rate limiters and analytics pipelines use prefix-sum-style running totals (often as a sliding window over time buckets) to answer "requests in the last 5 minutes" without rescanning raw events.
 	- BFS underlies shortest-path features in maps and networking tools (fewest hops, unweighted); DFS underlies dependency resolution and cycle detection in build systems (see the topological-sort note on [[Graphs and Graph Algorithms]]).
@@ -323,7 +391,7 @@ Runnable Go version (all six interview patterns, tested): [[Sorting, Searching a
 ## 8. Deep dive 🔴
 
 - **Why `O(n log n)` is a hard floor for comparison sorts.** There are `n!` possible orderings of `n` elements, and a decision tree where each internal node is one comparison (two outcomes) needs at least `log₂(n!)` levels to distinguish all `n!` outcomes. By Stirling's approximation, `log₂(n!) = Θ(n log n)`. Non-comparison sorts (counting sort, radix sort) can beat this floor only because they exploit structure in the keys (small integer range, fixed-width keys) instead of comparing elements pairwise.
-- **How pdqsort avoids quicksort's `O(n²)` worst case.** Plain quicksort degrades to `O(n²)` on adversarial or already-sorted input with a naive pivot choice. pdqsort (the algorithm behind `sort.Sort`/`sort.Slice` since Go 1.19, and `slices.Sort` since the `slices` package's introduction in Go 1.21) picks pivots more carefully (median-of-three or median-of-medians on recursion), detects patterns like many equal elements or already-sorted runs and switches strategy, and falls back to heapsort entirely if it detects it's making bad progress (too many bad partitions) — guaranteeing `O(n log n)` worst case while staying fast on the common case.
+- **How pdqsort avoids quicksort's `O(n²)` worst case.** Plain quicksort degrades to `O(n²)` on adversarial or already-sorted input with a naive pivot choice. pdqsort (the algorithm behind `sort.Sort`/`sort.Slice` since Go 1.19, and `slices.Sort` since the `slices` package's introduction in Go 1.21) picks pivots more carefully (median-of-three, the middle of three sampled values, or median-of-medians on recursion), detects patterns like many equal elements or already-sorted runs and switches strategy, and falls back to heapsort entirely if it detects it's making bad progress (too many bad partitions) — guaranteeing `O(n log n)` worst case while staying fast on the common case.
 - **"Binary search on the answer."** Many optimization problems ("minimum X such that condition holds") are solvable by binary searching over the space of possible answers rather than the input data, as long as the condition is monotonic in the candidate answer. `sort.Search`'s generalized signature (`func(i int) bool`) is built exactly for this: pass a predicate over candidate answers, not over array indices.
 - **DP state design is the real skill.** The hard part of dynamic programming is rarely the transition (`dp[a] = min(dp[a], dp[a-c]+1)`) — it's identifying what the state needs to capture so that the "optimal substructure" property holds (the optimal answer to a subproblem can be built purely from optimal answers to smaller subproblems, without needing to know how you got there). Getting the state definition wrong is the most common reason a DP solution produces a wrong answer that still "looks" like DP.
 - **Backtracking vs DP on the same problem.** Both explore a space of choices, but backtracking enumerates all valid configurations (and prunes dead branches), while DP collapses overlapping subproblems into a cache so the same sub-answer is never recomputed. A problem asking "how many ways" or "the minimum cost" is usually DP; a problem asking "list all valid configurations" is usually backtracking — recognizing which is being asked is often the actual interview signal.
@@ -367,6 +435,30 @@ Runnable Go version (all six interview patterns, tested): [[Sorting, Searching a
 - BFS = shortest path in unweighted graphs, level by level; DFS = explore deep then backtrack, used for connectivity/cycles/ordering.
 - Backtracking enumerates and prunes; DP caches overlapping subproblems — "how many ways / min cost" usually means DP, "list all configurations" usually means backtracking.
 - "Just sort it" isn't always right: check if a hash set or two pointers solves the same problem in `O(n)`.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- About how many steps does binary search need for 1,000,000 sorted items?
+> About 20, because 2²⁰ ≈ 1,000,000.
+
+> [!question]- What does "stable sort" mean?
+> Items that compare equal keep their original order.
+
+> [!question]- Is Go's `slices.Sort` stable?
+> No. Use `slices.SortStableFunc` when tie order matters.
+
+🟡 Medium
+
+> [!question]- Why does BFS, not DFS, find the fewest-steps path?
+> BFS visits every node at distance k before any at distance k+1, so the first time it reaches the target is the shortest way.
+
+> [!question]- How do prefix sums answer a range sum in `O(1)`?
+> Precompute running totals once; then `sum(i..j) = pre[j+1] − pre[i]`, one subtraction.
+
+> [!question]- When does memoization help a slow recursive solution?
+> When the same sub-problem (same arguments) is computed more than once; caching makes each one run only once.
 
 ## Links
 

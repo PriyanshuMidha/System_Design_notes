@@ -27,6 +27,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example, LRU cache).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Data Structures Overview and Big-O Cheat Sheet]]: `O(1)` means "same work at any size", `O(n)` means "work grows with the number of items".
+> - [[Arrays and Dynamic Arrays (Go Slices)]]: a slice keeps items side by side in memory, so jumping to item 37 is instant but inserting in the middle shifts the rest.
+
 **From zero, in 60 seconds** 🟢
 
 An array stores items side by side, like numbered seats in a row. To squeeze a new item into the middle, everyone after it must shift over.
@@ -69,6 +73,11 @@ A linked list lets you just "unhook" it and "re-hook" it at the front.
 | Big-O (`O(1)`, `O(n)`) | How work grows with list size: constant vs grows with `n` | walking to item 37 is `O(n)` |
 | Cache locality | CPUs read neighbouring memory fast; scattered memory is slow | a slice beats a list when scanning |
 | LRU cache | A cache that evicts the Least Recently Used item when full | "recently viewed" capped at 50 |
+| Singly / doubly linked | Each node points forward only / forward and backward | `A → B` vs `A ⇄ B` |
+| Garbage collector (GC) | Go's automatic cleaner that frees memory nothing points to any more | an unlinked node is freed later |
+| Dummy (sentinel) node | A fake first node so code never has to special-case "empty list" | `dummy.Next` is the real head |
+| `memmove` | The fast machine-level copy that shifts a block of memory over | how a slice insert shifts items |
+| `container/list` | Go's built-in doubly linked list | `l.PushFront(x)` |
 
 **Picture it.**
 
@@ -106,6 +115,14 @@ It's rarely the right default collection (see "Trade-offs" below for why), but i
 > [!tip] Remember
 > A linked list trades fast *random access* for fast *local* insert/delete — it is a specialist tool for the second job, not a general-purpose replacement for a slice.
 
+### Real-life example 🟢
+
+Think of the "Continue watching" row on Netflix or the "Recently viewed" strip on Flipkart.
+When you open a show you watched last week, it jumps to the front, and the oldest item drops off when the row is full.
+Behind a strip like this, a common design is a map (show ID → its node) plus a doubly linked list in recency order.
+The map finds the show's node instantly; the list moves it to the front by changing a few pointers.
+The same pair powers in-memory caches such as Memcached, which drop the least recently used entry when memory is full.
+
 ## 2. Mental model 🟢
 
 Picture a treasure hunt where each clue tells you only the location of the *next* clue. You can't skip ahead, and you can't see every clue laid out at once — you only know "here," plus how to get to "next" (a **singly linked list**), or "here," "next," **and** "previous" (a **doubly linked list**).
@@ -113,13 +130,29 @@ Picture a treasure hunt where each clue tells you only the location of the *next
 A slice is the opposite: a numbered map where you can jump straight to clue 37 without visiting clues 1 through 36 first. The trade is that inserting a new clue 20 means renumbering everything after it.
 
 > [!warning] Common mistake
-> Treating "linked lists are O(1) to insert" as a blanket win over slices. The `O(1)` only applies *after* you've already reached the right node — and reaching it, for a linked list, is `O(n)` with no shortcut. A slice's `O(n)` insert is often faster in practice precisely because *finding* the spot is `O(1)` (you already have the index) and the shift itself is one fast, cache-friendly `memmove`.
+> Treating "linked lists are O(1) to insert" as a blanket win over slices. The `O(1)` only applies *after* you've already reached the right node — and reaching it, for a linked list, is `O(n)` with no shortcut. A slice's `O(n)` insert is often faster in practice precisely because *finding* the spot is `O(1)` (you already have the index) and the shift itself is one fast, cache-friendly `memmove` (a single bulk memory copy).
+
+## Common beginner mistakes 🟢
+
+- **Overwriting `cur.Next` before saving it** → the rest of the list is lost the moment you change the pointer → copy `next := cur.Next` first, then rewire.
+- **Forgetting to update `head` or `tail`** → deleting the first or last node leaves `head`/`tail` pointing at a removed node → handle the ends, or use a dummy node so there are no special ends.
+- **Following `.Next` without checking for `nil`** → the program panics at the end of the list → loop with `for cur != nil`.
+- **Picking a list because "insert is `O(1)`"** → you still walk `O(n)` to find the spot, and the scattered memory is slow → use a slice unless you already hold the node.
+- **Deleting in a singly linked list while holding only that node** → you cannot reach the node before it → keep the previous node while walking, or use a doubly linked list.
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a linked list is a chain of boxes joined by pointers: quick to rewire, slow to search. **Next we open the box:** singly vs doubly linked, exactly which pointers change in an `O(1)` delete, and circular lists. Each subsection starts with a short step-by-step walk.
 
 ### Whiteboard version
 
 The same chain, drawn two ways: a singly linked list that can only walk forward, and a doubly linked list that can walk either direction.
+
+**Step by step:**
+1. Create node 10. It is the head and the tail.
+2. Create node 20 and set `10.Next = 20`. In a doubly linked list, also set `20.Prev = 10`.
+3. Create node 30 and set `20.Next = 30` (and `30.Prev = 20`). `30.Next` stays `nil`, which marks the end.
+4. To read the list, start at the head and follow `Next` until you hit `nil`.
 
 ```mermaid
 flowchart LR
@@ -140,6 +173,12 @@ flowchart LR
 
 **In plain words.** A singly linked node only knows what comes *after* it. A doubly linked node also knows what came *before* it. That one extra pointer per node is the entire difference between the two.
 
+**Step by step:**
+1. List: `10 → 20 → 30`. You hold only node 20 and want to delete it.
+2. Singly linked: 20 does not know about 10, so you walk from the head to find 10. That walk is `O(n)`.
+3. Then set `10.Next = 30`. Done.
+4. Doubly linked: 20 already stores `Prev = 10`, so you skip the walk and rewire straight away: `O(1)`.
+
 **Picture it.** The diagram above: the singly linked chain only has forward arrows; the doubly linked chain has both directions, drawn as solid forward arrows and dashed backward ones.
 
 **Example.** To delete node `20` from the singly linked chain, you must already be holding node `10` (its predecessor), because only `10` can have its `next` pointer rewritten to skip over `20`. If you only have a reference to `20` itself, you're stuck walking from the head to find `10` first — `O(n)`.
@@ -154,6 +193,13 @@ In the doubly linked chain, `20` already stores a pointer to `10` directly, so n
 ### O(1) delete at a known node, before and after
 
 **In plain words.** Deleting node `B` from the middle of a doubly linked list touches exactly two pointers: `A`'s forward pointer and `C`'s backward pointer. Nothing else in the list moves or is even visited.
+
+**Step by step:**
+1. Start with `A ⇄ B ⇄ C`. You hold a pointer to B.
+2. Read B's neighbours: `B.Prev` is A, `B.Next` is C.
+3. Set `A.Next = C`, so walking forward now skips B.
+4. Set `C.Prev = A`, so walking backward also skips B.
+5. Nothing points to B any more; Go's garbage collector frees it later.
 
 **Picture it.**
 
@@ -170,13 +216,19 @@ flowchart LR
     end
 ```
 
-**Example.** Deleting `B` from `A ⇄ B ⇄ C` is two assignments: `A.next = C` and `C.prev = A`. `B` itself is left untouched (and becomes eligible for garbage collection once nothing else references it) — the list simply stops pointing at it.
+**Example.** Deleting `B` from `A ⇄ B ⇄ C` is two assignments: `A.next = C` and `C.prev = A`. `B` itself is left untouched (and becomes eligible for garbage collection, meaning Go's runtime will free its memory, once nothing else references it) — the list simply stops pointing at it.
 
 **Why it matters.** Compare this to a slice: removing the middle element of a 1,000-element slice shifts up to 999 elements over by one. The linked list's two-pointer delete is the entire appeal of the data structure for this one operation.
 
 ### Circular lists
 
 **In plain words.** A circular linked list is an ordinary linked list where the tail's `next` points back to the head instead of to `nil` — there is no end, only "the next item," forever.
+
+**Step by step:**
+1. Playlist nodes: song A → song B → song C.
+2. Instead of `C.Next = nil`, set `C.Next = A`.
+3. The player keeps calling "next": A, B, C, A, B, C… with no "end of list" check.
+4. To stop, remember where you started and stop when you get back to it, or you loop forever.
 
 **Picture it.**
 
@@ -257,7 +309,7 @@ flowchart LR
 | Singly linked list | Forward pointer only | You only ever traverse forward and never need to delete a middle node without first finding its predecessor | `O(1)` insert/delete at head; `O(n)` to find or delete elsewhere |
 | Doubly linked list | Forward and backward pointers | You hold node references and need `O(1)` delete/move from the middle | `O(1)` insert/delete/move at a known node; double the pointer overhead per node |
 | Circular linked list | Tail links back to head | Round-robin iteration with no natural "end" | Same as singly/doubly, plus no nil check needed to wrap around |
-| `container/list` | Go's built-in doubly linked list, `any`-typed | You want the pattern without writing it yourself, and the type-assertion cost is acceptable | Same as doubly linked list; extra type assertion per access |
+| `container/list` | Go's built-in doubly linked list, `any`-typed (each value is stored as "any type") | You want the pattern without writing it yourself, and the type-assertion cost (a runtime check like `v.(int)` to get the real type back) is acceptable | Same as doubly linked list; extra type assertion per access |
 | Slice (for comparison) | Contiguous array | Almost everything else: iteration, index access, append at the end | See [[Arrays and Dynamic Arrays (Go Slices)]] |
 
 ## 6. Trade-offs and when not to use 🟡
@@ -278,9 +330,11 @@ flowchart TD
 > [!warning] Common mistake
 > Reaching for a linked list because "insert is O(1)" without checking whether you actually hold a node reference. If you don't, every insert or delete first pays an `O(n)` search to find the right spot — at which point a slice's `O(n)` shift, which skips that search entirely, is usually both simpler and faster in practice.
 
+> 🟡 → 🔴 **You now know** how lists work, how the map + list LRU cache fits together, and why a slice usually wins in Go. **Next comes the advanced part:** how Memcached, Java and Redis handle LRU in real life, the bugs that hit hand-written lists, garbage-collector cost, and the classic interview questions.
+
 ## 7. In production 🔴
 
-- **Real systems:** Memcached maintains an exact LRU list per slab class this way — a hash table for `O(1)` key lookup plus a doubly linked list for `O(1)` move-to-front on every `get`. Java's `LinkedHashMap` in access-order mode is the same pairing exposed as a library call (override `removeEldestEntry` and you have an LRU cache in a few lines). Redis, by contrast, deliberately avoids an exact recency list: `maxmemory-policy allkeys-lru` approximates LRU by sampling a few random keys and evicting the oldest of that sample, because a full doubly linked list reordered on every access doesn't scale to Redis's typical keyspace sizes. Browser history and most undo/redo UIs model "back/forward" as two stacks rather than a list, but editors that need arbitrary jump-to-any-point-in-history sometimes use a doubly linked list of states.
+- **Real systems:** Memcached maintains an exact LRU list per slab class (a group of same-sized memory chunks) this way — a hash table for `O(1)` key lookup plus a doubly linked list for `O(1)` move-to-front on every `get`. Java's `LinkedHashMap` in access-order mode is the same pairing exposed as a library call (override `removeEldestEntry` and you have an LRU cache in a few lines). Redis, by contrast, deliberately avoids an exact recency list: `maxmemory-policy allkeys-lru` approximates LRU by sampling a few random keys and evicting the oldest of that sample, because a full doubly linked list reordered on every access doesn't scale to Redis's typical keyspace sizes. Browser history and most undo/redo UIs model "back/forward" as two stacks rather than a list, but editors that need arbitrary jump-to-any-point-in-history sometimes use a doubly linked list of states.
 - **Failure modes → fixes:**
   - Using a linked list as a general-purpose Go collection where a slice would do → benchmark before choosing.
   - A linked list silently degrading into `O(n)` lookups when code forgets to keep the side map up to date (for example, an LRU cache whose map and list disagree after a bug) → keep map and list mutations atomic with respect to each other, ideally behind one method, as `LRU.Get`/`Put` do in the Go note.
@@ -326,6 +380,30 @@ flowchart TD
 - LRU cache = map (O(1) lookup by key) + doubly linked list (O(1) reorder by recency), with the map's values pointing directly into the list's nodes.
 - `q = q[1:]` on a slice is not a substitute for a ring buffer: it leaks the dropped prefix's backing-array space.
 - Classic patterns: reverse (prev/cur/next), Floyd's cycle detection (slow/fast), slow/fast for the middle, dummy node for merges and nth-from-end.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does each node in a singly linked list hold?
+> A value and a pointer to the next node (`nil` for the last one).
+
+> [!question]- Why is reaching item 37 slow in a linked list?
+> There is no index; you must follow 36 pointers from the head, one hop at a time.
+
+> [!question]- What does a circular list's last node point to?
+> Back to the head, instead of `nil`.
+
+🟡 Medium
+
+> [!question]- Which two pointers change when you delete B from `A ⇄ B ⇄ C`?
+> `A.Next` becomes C and `C.Prev` becomes A.
+
+> [!question]- Why does an LRU cache need both a map and a doubly linked list?
+> The map gives `O(1)` lookup by key; the list gives `O(1)` move-to-front and evict-from-tail. Neither does both.
+
+> [!question]- Why is a Go slice often faster than a list even for middle inserts?
+> The list must first walk `O(n)` scattered nodes (cache misses), while the slice shift is one fast contiguous `memmove`.
 
 ## Links 🟢
 

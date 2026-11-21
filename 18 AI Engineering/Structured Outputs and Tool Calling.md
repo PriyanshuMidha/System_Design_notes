@@ -33,6 +33,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[LLM Fundamentals]]: the model writes one token at a time, picking each from a list of likely next tokens.
+> - [[Prompt Engineering]]: asking clearly for a format helps, but wording alone cannot guarantee the shape of the reply.
+
 **From zero, in 60 seconds** 🟢
 
 An AI model writes text, one small piece at a time. Your code wants clean data it can read, not a friendly sentence.
@@ -78,6 +82,11 @@ Structured outputs force the reply into the exact shape your code expects, and t
 | Parse / unmarshal | Turn text into a Go struct | `json.Unmarshal(b, &inv)` |
 | Tool (function) | A named action your backend can run for the model | `get_weather(location)` |
 | Round trip | One request to the model and its reply | Each tool call adds one more |
+| `tool_use` | The block where the model asks your code to run a tool | `get_weather(location="Pune")` |
+| `tool_result` | The block your code sends back with the tool's answer | `"31 C, sunny"` |
+| Constrained decoding | The provider blocks any next token that would break the schema | A `"` cannot appear where a number must go |
+| Strict mode | A setting that turns on that hard schema check | `strict: true` |
+| Enum | A field that may only take one of a fixed list of values | `"unit": "celsius"` or `"fahrenheit"` |
 
 **Picture it**
 
@@ -116,13 +125,29 @@ For one invoice reviewed by a human, a markdown fence is a shrug.
 
 For ten thousand invoices a day parsed by `encoding/json`, a 1% unparseable rate is ten thousand incidents a month, each needing a special-cased retry path, logged separately from the "LLM said something reasonable but wrong" failures you already have to handle.
 
-Structured outputs and tool calling close most of that gap. The provider's inference server restricts what tokens are even legal at each step, so the output is guaranteed to parse as JSON and to match your schema's required fields and types — turning a parsing problem into a (much smaller) semantic-correctness problem.
+Structured outputs and tool calling close most of that gap. The provider's inference server (the machine that runs the model and produces its reply) restricts what tokens are even legal at each step, so the output is guaranteed to parse as JSON and to match your schema's required fields and types — turning a parsing problem into a (much smaller) semantic-correctness problem.
+
+### Real-life example 🟢
+
+Think of a food app like Swiggy reading restaurant menus uploaded as PDFs. A model pulls out each dish as `{"name": "Paneer Tikka", "price": 280, "veg": true}`.
+With structured outputs, every reply fits that shape, so the Go importer never crashes on "Sure! Here's the menu".
+For the support chat, the model has a tool `get_order_status(order_id)`. When a user asks "where is my order?", the model asks for that tool, Swiggy's own code checks that the order belongs to this user, looks it up, and sends back "rider 2 km away", which the model turns into a friendly reply.
+
+### Common beginner mistakes 🟢
+
+- **Asking for JSON in the prompt and calling it done** → a small share of replies (often under 1 in 100, more for deeply nested shapes) still breaks the parser, which is a lot at 10,000 calls a day → use structured outputs or a tool schema with strict mode.
+- **Running a tool because the input "parsed"** → the shape is right but the `order_id` may belong to someone else or not exist → check the ID and the user's permission in your code every time.
+- **Throwing an error when a tool fails** → the model never learns what happened and the turn dies → send a `tool_result` with `is_error: true` and a one-line reason.
+- **Sending one reply per tool when the model asked for two** → the API expects all results together → send every `tool_result` in one following user message, matched by `tool_use_id`.
+- **Vague tool names and descriptions** (`doStuff`, "gets data") → the model picks the wrong tool or none → name it verb-noun and say *when* to use it.
 
 ## 2. Mental model 🟢
 
+🟢 **Plain version:** Normally the model can write any next piece of text. With a schema switched on, the provider checks every next piece before it is written and blocks anything that would break the form. So if `amount` must be a number, the model simply cannot start writing letters there. Tool calling uses the same lock, but on a "please run this tool" form instead of on the final answer.
+
 Picture a text editor with autocomplete so aggressive it refuses to let you type a character that would make the file invalid.
 
-That is constrained decoding: the model's probability distribution over the next token is masked, at every step, down to only the tokens that keep the output a valid instance of your schema.
+That is constrained decoding: the model's probability distribution over the next token (its list of chances for every possible next token) is masked (some choices blocked), at every step, down to only the tokens that keep the output a valid instance of your schema.
 
 The model cannot emit `amount": "abc"` if `amount` is typed `number`, because `"` after the colon is not in the allowed token set.
 
@@ -132,11 +157,30 @@ The model cannot emit `amount": "abc"` if `amount` is typed `number`, because `"
 
 The model's job changes from "answer the question" to "decide whether to answer directly or to request `get_weather(location="Bengaluru, IN")` first" — and your code is what actually calls the weather service.
 
+### Structured outputs vs the things people confuse them with 🟡
+
+| Thing | What it guarantees | What it does not |
+| --- | --- | --- |
+| Prompted JSON | Nothing; the model usually follows the request | Valid JSON or the right fields |
+| JSON mode | The reply is valid JSON | The right fields or types |
+| Structured outputs | The reply matches your JSON Schema | That the values are true or allowed |
+| Tool calling | The tool request matches the tool's schema | That the tool runs; your code runs it |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a schema locks the shape of the reply, and that a tool call is a form the model fills for your code to run. **Next we open the box**: the two-trip request loop, every state one tool call can end in, and how to design a tool the model uses well. Each subsection starts with a plain step-by-step walk.
 
 ### Whiteboard version
 
 **In plain words:** The model writes a request, your code does the work, and the model turns the result into an answer.
+
+**Step by step:**
+1. Send the user's message plus one tool schema, `get_weather(location)`.
+2. The model decides: can I answer directly, or do I need data?
+3. "Hi!" → it answers directly: `stop_reason = end_turn`.
+4. "Weather in Pune?" → it stops and asks for the tool: `stop_reason = tool_use`, with `input = {"location": "Pune"}`.
+
+Full detail:
 
 One request, one tool, no back-and-forth: you want the model to decide if a tool is needed, nothing more.
 
@@ -152,6 +196,15 @@ The full version below adds the part every real integration needs: executing the
 ### The full request-response loop
 
 **In plain words:** One tool call costs two trips to the model: one to ask for the tool, one to read the result.
+
+**Step by step:**
+1. Trip 1: your app sends "What's the weather in Bengaluru?" plus the `get_weather` schema.
+2. The model replies with a `tool_use` block: id `toolu_1`, input `{"location": "Bengaluru, IN"}`.
+3. Your Go code calls the real weather service and gets "18°C, overcast".
+4. Trip 2: send the whole chat again, plus the model's `tool_use` turn, plus a `tool_result` for `toolu_1`.
+5. The model replies with plain text: "It's 18°C and overcast in Bengaluru."
+
+Full detail:
 
 A tool-using turn is always at least two round trips to the API, because the model cannot call the tool itself — your process is the only thing with network access, database credentials, or filesystem permissions:
 
@@ -174,13 +227,22 @@ sequenceDiagram
 
 Three rules fall out of this diagram directly:
 
-1. The assistant's `tool_use` turn must be replayed back verbatim as an `assistant` message — you are reconstructing the conversation, not starting a new one.
+1. The assistant's `tool_use` turn must be replayed back verbatim (word for word, unchanged) as an `assistant` message — you are reconstructing the conversation, not starting a new one.
 2. Every `tool_use` block in a turn needs exactly one matching `tool_result` (keyed by `tool_use_id`) in the next `user` message. A model that asks for three tools in parallel expects three results back together.
 3. A failed tool call is still a `tool_result` — with `is_error: true` and a short, model-readable error string — not an HTTP error you throw away. The model reads that error and can retry with different input or explain the failure to the user.
 
 ### The lifecycle of one tool call
 
 **In plain words:** Think of a waiter: takes the order (tool_use), the kitchen cooks (your code), the waiter brings the plate back (tool_result).
+
+**Step by step:**
+1. The model asks for `create_refund(order_id=991, amount=500)`.
+2. Check the shape: is `amount` a number and present? If not, reply with an error result.
+3. Check permission: does order 991 belong to this user? If not, reply with an error result.
+4. Run it, with a timeout. It succeeds, fails or times out.
+5. Every path ends the same way: one `tool_result` goes back, with `is_error` true or false.
+
+Full detail:
 
 ```mermaid
 stateDiagram-v2
@@ -198,11 +260,20 @@ stateDiagram-v2
     ResultSent --> [*]: model continues the turn
 ```
 
-`SchemaRejected` and `AuthDenied` matter as much as `Succeeded`: a schema that type-checks is not automatically a request your backend should honor. Validate ownership and permissions in your own code even when `Strict: true` already guarantees the shape (see [[OWASP API Security Top 10]] on excessive agency and broken object-level authorization).
+`SchemaRejected` and `AuthDenied` matter as much as `Succeeded`: a schema that type-checks is not automatically a request your backend should honor. Validate ownership and permissions in your own code even when `Strict: true` already guarantees the shape (see [[OWASP API Security Top 10]] on excessive agency, meaning the model can do more than it should, and broken object-level authorization, meaning one user can reach another user's records by changing an ID).
 
 ### Designing a tool
 
 **In plain words:** A tool is a mini job ad for the model: a clear name, when to use it, and exactly what inputs it needs.
+
+**Step by step:**
+1. Name it as verb + noun: `get_weather`.
+2. Describe when to use it: "Use whenever the user asks about weather in a named place."
+3. Give typed inputs: `location` (text, required), `unit` (only `celsius` or `fahrenheit`).
+4. Turn on strict mode so bad input is blocked before it reaches you.
+5. Return a short readable result, like "31 C, sunny", not a huge raw JSON blob.
+
+Full detail:
 
 A tool definition is four things, and all four affect whether the model calls it correctly:
 
@@ -513,7 +584,7 @@ flowchart LR
 - **Latency doubles (at least) for any tool call.** Every tool-use turn is a second full round trip to the model; a chain of three dependent tool calls is three sequential inferences, not one.
   For latency-critical paths, consider whether a deterministic function call in your own code can replace the tool entirely.
 - **Not a sandbox.** Tool calling does not run anything — your code does.
-  A tool that shells out or hits a payment API carries the same blast radius as any other code path that an untrusted caller (here, the model, steered by untrusted user and retrieved content) can trigger. Treat tool input as adversarial input, same as any other API request (see [[OWASP API Security Top 10]]).
+  A tool that shells out (runs a command on the server) or hits a payment API carries the same blast radius (how much damage one bad call can do) as any other code path that an untrusted caller (here, the model, steered by untrusted user and retrieved content) can trigger. Treat tool input as adversarial input, same as any other API request (see [[OWASP API Security Top 10]]).
 - **Simpler alternative:** for a fixed, small set of fields with no real decision to make, plain prompted output you validate with a Go struct and `json.Unmarshal` plus manual checks is sometimes less code than wiring up strict schemas and tool loops — reach for structured outputs when the parse-failure rate actually hurts.
 
 ```mermaid
@@ -524,6 +595,8 @@ flowchart LR
 ```
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the two-trip loop, the life of one tool call, and how to write a good tool. **Next comes the senior view**: real provider APIs, how tool calls fail in production, how constrained decoding works inside the provider, streaming and running several tools in parallel in Go.
 
 - **Real systems:** Anthropic's Messages API (`tool_use`/`tool_result` blocks, `strict`), OpenAI's function calling and Structured Outputs (`response_format: json_schema`, `strict`), Google's Gemini function calling.
   Agent frameworks (LangGraph, the Go agent SDKs) build their tool loops on exactly this primitive — see [[LangChain and LangGraph]] and [[Model Context Protocol (MCP)]] for the transport that standardizes tool discovery across servers.
@@ -540,7 +613,7 @@ flowchart LR
 
 ## 8. Deep dive 🔴
 
-- **How constrained decoding actually works.** Your JSON Schema is compiled into a grammar (conceptually a finite-state or pushdown automaton over JSON syntax plus your field constraints).
+- **How constrained decoding actually works.** Your JSON Schema is compiled into a grammar (a set of rules for which text may come next; conceptually a finite-state or pushdown automaton, a small machine that tracks where you are inside the JSON, over JSON syntax plus your field constraints).
   1. At each decoding step, the inference server computes the model's normal next-token logits.
   2. It masks out (sets to `-inf`) every token that would leave the grammar's valid-continuation set.
   3. It samples from what remains.
@@ -549,7 +622,7 @@ flowchart LR
   The performance cost is a grammar-state lookup per token, not a second model call — current implementations report it as a low single-digit percentage overhead, but treat any specific number as vendor-documented, not a cross-provider constant.
 - **Streaming tool calls.** Tool `input` can arrive incrementally as partial JSON deltas during a streamed response (`input_json_delta` events in Anthropic's streaming format).
   Accumulate the raw string and only attempt `json.Unmarshal` once the block closes — partial JSON is, by definition, invalid JSON, and parsing it early just produces confusing errors.
-- **Parallel tool execution in Go.** When a turn contains several independent `tool_use` blocks, execute them concurrently and collect results with `errgroup`, preserving each result's `tool_use_id` so you can still build the correct `tool_result` set even if calls finish out of order:
+- **Parallel tool execution in Go.** When a turn contains several independent `tool_use` blocks, execute them concurrently and collect results with `errgroup` (a Go helper that runs several goroutines and waits for all of them), preserving each result's `tool_use_id` so you can still build the correct `tool_result` set even if calls finish out of order:
 
 ```go
 g, ctx := errgroup.WithContext(ctx)
@@ -601,6 +674,26 @@ _ = g.Wait()
 - Schema-valid ≠ correct or authorized — validate business meaning and permissions in your own code every time.
 - Strict mode guarantees shape at generation time, at the cost of a narrower supported schema language.
 - Treat tool_result content from the outside world (fetched pages, user files) as untrusted data, same as RAG context.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: Does the model run the tool itself?
+> No. It only writes a `tool_use` request; your code runs the tool.
+
+> [!question]- Easy: What is a JSON Schema?
+> A rulebook for what a JSON object must look like: which fields, which types, which are required.
+
+> [!question]- Easy: How many trips to the model does one tool call need at minimum?
+> Two: one to get the `tool_use`, one to send the `tool_result` and get the answer.
+
+> [!question]- Medium: The model sends `order_id: 991` in perfect shape. Can you just run the refund?
+> No. Check that order 991 exists and belongs to this user; schema-valid is not the same as allowed.
+
+> [!question]- Medium: A tool times out. What do you send back?
+> A `tool_result` with `is_error: true` and a short reason, so the model can retry or explain.
+
+> [!question]- Medium: JSON mode vs structured outputs?
+> JSON mode only promises valid JSON; structured outputs also promise your exact fields and types.
 
 ## Links 🟢
 

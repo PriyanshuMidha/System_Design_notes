@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: requests have a method (GET, POST, PUT), headers, and the browser attaches cookies by itself.
+> - [[Authentication vs Authorization]]: the server must check who you are and what you may do; CORS does neither, and this note shows why.
+
 **From zero, in 60 seconds** 🟢
 
 Your browser has a safety rule: a page from one site can't read answers from another site.
@@ -75,6 +79,12 @@ Browsers block this by default; CORS is how a server allows the sites it trusts 
 | HTTP header | A key-value line sent with a request or response | `Origin: https://app.example.com` |
 | Preflight | A browser's `OPTIONS` check before a non-simple request | Asking "may I send `PUT` with JSON?" |
 | Credentials | Cookies or `Authorization` sent with a request | Session cookie |
+| Simple request | A plain GET/HEAD/POST with only basic headers; it is sent without asking first | A normal form post |
+| Allowlist | The exact list of origins the server agrees to share with | `{"https://app.example.com"}` |
+| Reflected origin | The server copies whatever `Origin` arrived back into `Allow-Origin` | Dangerous with cookies |
+| CDN | A network of cache servers near users that store and serve copies of responses | Cloudflare, CloudFront |
+| curl / Postman | Tools that send HTTP requests outside a browser, so CORS does not apply | `curl https://api.example.com` |
+| CSRF | Another site making your browser send a request with your cookies | A hidden form on evil.com |
 
 **Picture it**
 
@@ -110,6 +120,10 @@ CORS is the server's way to carve out exceptions to SOP: `api.example.com` can t
 
 A concrete failure mode this prevents: without any CORS header, if `evil.com` embeds a `<script>` that calls `https://api.example.com/account` with the user's existing session cookie, the request still fires and the server still processes it — but the browser discards the response before `evil.com`'s JavaScript can read it, because no origin was allowlisted.
 
+### Real-life example: Swiggy's website and its API 🟢
+
+When you open swiggy.com in a browser, the page is served from one address, but the restaurant list and your cart come from an API on a different address. Because the two origins differ, the browser would hide those answers from the page's JavaScript unless the API says "pages from swiggy.com may read me" with CORS headers. If some random site you visit tries to call the same API with your cookies, the API does not name that site, so the browser keeps the answer hidden from it. The Swiggy mobile app is not a browser at all, so CORS never comes into play for it.
+
 ## 2. Mental model 🟢
 
 Same-origin policy is the browser acting as a **mail carrier who also has to approve who's allowed to open the mail**. Any script can address an envelope (send the request) to any origin — the carrier always delivers it, and the destination (the server) still opens and answers it.
@@ -118,11 +132,36 @@ But when the response envelope comes back addressed to the page's own origin, th
 
 No sticker, or the wrong origin on it, and the carrier keeps the envelope sealed from the calling script — even though the destination already did whatever the letter asked.
 
+## Common beginner mistakes 🟢
+
+- **Thinking CORS protects the API** → curl, Postman and other servers ignore it completely → still require real login and permission checks.
+- **"Fixing" a CORS error with `Allow-Origin: *` plus credentials, or by echoing any `Origin`** → every site can read logged-in users' data → list exact origins.
+- **Matching origins with "ends with example.com"** → `evil-example.com` also matches → use exact string equality.
+- **Testing in Postman and calling it done** → Postman skips the browser's checks → test in the real browser and read the preflight in the Network tab.
+- **Forgetting `Vary: Origin` behind a CDN** → one site's allowed header is served to another → always add it.
+
+### CORS vs CSRF 🟡
+
+| | CORS | CSRF defenses |
+| --- | --- | --- |
+| Question it answers | May this other site's script *read* my response? | May this other site make the browser *send* a change with my cookies? |
+| Stops the request being sent? | No | Yes (SameSite cookies, CSRF tokens) |
+| Set up with | `Access-Control-*` response headers | Cookie flags and a secret token in forms |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that the browser hides other origins' answers unless the server allows it with CORS. **Next we open the box**: which requests get an extra "may I?" check, what that check looks like, which headers the server sends back, and why none of it protects the server itself.
 
 ### Simple vs preflighted requests
 
 **In plain words:** plain GETs and basic form posts go straight through. Anything fancier (JSON body, custom headers, PUT/DELETE) makes the browser ask permission first.
+
+**Step by step:**
+1. The page on `app.example.com` calls `fetch` on `api.example.com`.
+2. The browser asks: is the method GET, HEAD or POST? A `PUT` → preflight needed.
+3. Are the headers only the basic ones? An `Authorization` header → preflight needed.
+4. Is the body type a form or plain text? `application/json` → preflight needed.
+5. If all three answers are "basic", the request goes straight out, and the browser only decides later whether the page may read the reply.
 
 ```mermaid
 flowchart TD
@@ -141,6 +180,13 @@ A JSON `POST` (`Content-Type: application/json`) is **not** simple — it needs 
 ### The preflight exchange
 
 **In plain words:** the browser sends an OPTIONS request asking "may I do this?". Only if the server says yes does the real request go out.
+
+**Step by step:**
+1. The page wants `PUT /orders/42` with an `Authorization` header.
+2. The browser first sends `OPTIONS /orders/42` with `Origin: https://app.example.com`, "method: PUT, header: authorization".
+3. The server answers 204 with "this origin is OK, PUT is OK, Authorization is OK, remember this for 600 seconds".
+4. The browser now sends the real `PUT`, with cookies and the token.
+5. The reply also names `app.example.com`, so the page's script may read it. For the next 10 minutes the same kind of call skips step 2.
 
 ```mermaid
 sequenceDiagram
@@ -162,6 +208,13 @@ sequenceDiagram
 
 **In plain words:** a few headers say which origins, methods and headers are OK. If cookies are involved, you must name the exact origin, never "*".
 
+**Step by step:**
+1. A request arrives with `Origin: https://app.example.com`.
+2. The server looks it up in its exact list. Found.
+3. It replies `Access-Control-Allow-Origin: https://app.example.com` (the exact name, not `*`) and `Access-Control-Allow-Credentials: true`.
+4. It also adds `Vary: Origin`, so a cache never hands this reply to a different site.
+5. A request from `https://evil.com` is not in the list, so it gets no `Allow-Origin` header, and the browser hides the reply.
+
 | Header | Purpose |
 | --- | --- |
 | `Access-Control-Allow-Origin` | The one origin (or `*` for non-credentialed public responses) allowed to read this response |
@@ -170,13 +223,20 @@ sequenceDiagram
 | `Access-Control-Allow-Credentials` | `true` if cookies/`Authorization` may be included — **requires** an exact origin, never `*` |
 | `Access-Control-Expose-Headers` | Response headers, beyond the small default safelist, that JS may read |
 | `Access-Control-Max-Age` | How long the browser may cache a preflight result |
-| `Vary: Origin` | Tells any cache (CDN, reverse proxy) that the response differs per `Origin`, so it must not serve one origin's CORS headers to another |
+| `Vary: Origin` | Tells any cache (CDN, reverse proxy: a server in front of yours that forwards and may cache responses) that the response differs per `Origin`, so it must not serve one origin's CORS headers to another |
 
 **The credentials + wildcard rule, precisely:** the Fetch spec forbids `Access-Control-Allow-Origin: *` together with `Access-Control-Allow-Credentials: true` — browsers reject that combination outright rather than silently downgrading it. The real, exploitable mistake is not the wildcard; it is **reflecting whatever `Origin` header arrived** (`Access-Control-Allow-Origin: <echoed Origin>`) while also setting `Allow-Credentials: true`. That passes the spec's letter (one exact origin, not literally `*`) while in effect allowing every origin to make credentialed requests and read the response — any site a logged-in user visits can read their authenticated data.
 
 ### Why "CORS is not server protection"
 
 **In plain words:** CORS only controls what a browser page may read. Attackers using scripts don't care, so your server still needs real auth.
+
+**Step by step:**
+1. You are logged in to `api.example.com`. You open `evil.com` in another tab.
+2. evil.com's script calls `api.example.com/account`; your browser attaches your session cookie.
+3. The server runs the request normally. It has no idea anything is "cross-origin".
+4. The reply has no `Allow-Origin` for evil.com, so the browser hides it from evil.com's script.
+5. But the work on the server already happened. If that call changed data, CORS did not stop it; CSRF defenses must.
 
 ```mermaid
 sequenceDiagram
@@ -331,12 +391,15 @@ func TestSuffixLookalikeOriginRejected(t *testing.T) {
 
 ## 7. In production 🔴
 
-- **Real systems:** `rs/cors` and `gorilla/handlers` are the common Go middleware choices; Express's `cors` package and Spring's `@CrossOrigin`/`CorsConfiguration` are the equivalents elsewhere; most API gateways (Kong, AWS API Gateway, NGINX) can also terminate CORS at the edge instead of in application code.
+> 🟡 → 🔴 **You now know** simple vs preflighted requests, the CORS headers and the credentials rule. **Next we look at real systems**: the common CORS failures in production (CDNs, missing origins, reflected origins), how to debug them, and the finer points interviewers like, such as CORS vs CSRF and exposing custom headers.
+
+
+- **Real systems:** `rs/cors` and `gorilla/handlers` are the common Go middleware choices; Express's `cors` package and Spring's `@CrossOrigin`/`CorsConfiguration` are the equivalents elsewhere; most API gateways (the front-door servers in front of your services: Kong, AWS API Gateway, NGINX) can also terminate CORS at the edge instead of in application code.
 - **Failure modes → fixes:**
   - API works in Postman, fails in the browser → expected; Postman is not subject to SOP. Check the preflight response and the exact `Access-Control-Allow-*` values instead of re-testing with Postman.
   - `localhost` works, production origin does not → the allowlist was never updated for the deployed frontend domain; keep it per-environment and in configuration, not hardcoded.
   - A CDN or reverse proxy strips or caches CORS headers → set `Vary: Origin`, and confirm the CDN config passes `Access-Control-*` headers through unmodified.
-  - Reflected-origin-plus-credentials misconfiguration → run a config linter (like `IsVulnerableReflection` above) in CI against the deployed CORS configuration.
+  - Reflected-origin-plus-credentials misconfiguration → run a config linter (like `IsVulnerableReflection` above) in CI (the automatic build-and-test pipeline) against the deployed CORS configuration.
 - **What to monitor:** preflight failure rate and latency, origin-allowlist changes (should be a reviewed, logged config change), and 4xx responses with a cross-origin `Origin` header that was not in the allowlist (useful signal for both misconfigurations and probing).
 
 ## 8. Deep dive 🔴
@@ -376,6 +439,26 @@ func TestSuffixLookalikeOriginRejected(t *testing.T) {
 - Match origins by exact string equality; a suffix or substring check is a vulnerability (`evil-example.com`).
 - CORS is not authentication, authorization, or CSRF protection — it is a browser read-block only.
 - Debug with the browser's Network tab preflight entry; Postman and curl tell you nothing about CORS.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What three parts make an origin?
+> Scheme, host and port, like `https` + `app.example.com` + `443`.
+
+> [!question]- (easy) Does CORS stop curl from calling your API?
+> No. Only browsers follow CORS.
+
+> [!question]- (easy) What is a preflight?
+> An `OPTIONS` request the browser sends first to ask the server whether the real request is allowed.
+
+> [!question]- (medium) Does a JSON `POST` need a preflight? Why?
+> Yes, because `application/json` is not one of the basic content types.
+
+> [!question]- (medium) Why is echoing the incoming `Origin` with `Allow-Credentials: true` dangerous?
+> It lets every website read a logged-in user's data, as if all origins were allowed.
+
+> [!question]- (medium) Why should a CORS response include `Vary: Origin`?
+> So a cache or CDN does not serve one origin's allow header to another origin.
 
 ## Links
 

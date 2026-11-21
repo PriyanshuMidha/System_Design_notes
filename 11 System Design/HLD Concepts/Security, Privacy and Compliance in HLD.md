@@ -40,6 +40,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (the controls one by one), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: in an HLD round you first draw the main boxes and arrows, then go deep on the risky parts; security is applied to those same boxes.
+> - [[Authentication vs Authorization]]: authentication proves who is calling; authorization checks what they are allowed to do.
+
 **From zero, in 60 seconds** 🟢
 
 Your app holds people's names, phones, addresses and cards. Bad things can happen to that data.
@@ -84,6 +88,12 @@ Security in system design means planning, while you draw the boxes, how data is 
 | Token (tokenization) | A meaningless stand-in for sensitive data | `tok_8f3a` instead of a card number |
 | Authentication / authorization | Proving who you are / checking what you may do | Login / "only admins can refund" |
 | Trust boundary | A line where data passes between parts that trust each other differently | Internet to your API gateway |
+| GDPR | The EU's personal-data law: limits use, gives a right to deletion | "delete everything about me" |
+| Envelope encryption | Encrypt data with a small data key, then lock that key with a master key | one key per user, master key in KMS |
+| Zero trust | Being inside the network proves nothing; check every call | payment service checks who is calling |
+| mTLS | TLS where both sides show a certificate, so both prove who they are | checkout ↔ payment |
+| WAF | Web application firewall: filters bad-looking requests at the edge | blocks SQL injection attempts |
+| Audit log | A separate, append-only record of who did what to sensitive data | "support agent read 40 addresses at 10:02" |
 
 **Picture it**
 
@@ -164,11 +174,44 @@ flowchart LR
 > [!tip] Remember
 > Draw the boundary, then ask of every arrow that crosses it: who is calling, may they, is it encrypted, is it logged.
 
+### Real-life example: saved cards in Indian apps 🟢
+
+Since 2022 the RBI has required card-on-file tokenization: apps like Swiggy, Zomato or Amazon may not keep your real card number to "save" it.
+Instead the card network gives the app a token, a stand-in that only works for that one merchant. If the app's database ever leaks, the tokens are useless elsewhere.
+That is exactly the "store the least, replace the rest with tokens" idea in this note.
+India's DPDP Act 2023 and Europe's GDPR add the other half: you must know where each person's data lives and be able to delete it when asked.
+
+## Common beginner mistakes 🟢
+
+- **Trusting calls because they come from "inside the network"** → one hacked pod can then call the payment service freely → check identity and permission on every call (zero trust, mTLS).
+- **Logging full request bodies** → phone numbers, tokens and passwords end up in logs that many people can read → redact sensitive fields in the logging layer.
+- **Putting secrets in git, images or plain environment files** → one leak exposes every system → keep them in a secrets manager and use short-lived credentials.
+- **Encrypting passwords** → anyone with the key can read them all → hash them with a slow, salted algorithm (bcrypt, Argon2id).
+- **Forgetting the copies when deleting a user** → data still sits in caches, search, events and backups → keep a data map, and use per-user keys so deleting one key makes every copy unreadable.
+
+### Encryption vs things people confuse it with 🟡
+
+| Technique | Can you get the original back? | Use for |
+| --- | --- | --- |
+| Encryption | Yes, with the key | Data you must read later: addresses, files |
+| Hashing (slow, salted) | No, you can only check a guess | Passwords |
+| Tokenization | Only by asking the vault | A few high-risk values: card numbers, ID numbers |
+| Masking | No, part is hidden for display | `+91-98xxxxxx21` in logs and screens |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the big ideas: lock data on the wire and on disk, check every call, store as little personal data as possible, and know where every copy is. **Next we open the box**: each control one by one, with how it works and what it costs. Most subsections start with a plain walk-through; the full detail follows.
 
 ### 3.1 Encryption in transit
 
 **In plain words:** data moving between machines can be read or changed by anyone on the path. We wrap each connection in an encrypted channel. The standard is **TLS** (Transport Layer Security): the client checks the server's certificate, both sides agree on a session key, and the rest of the traffic is encrypted and tamper-evident.
+
+**Step by step:**
+1. Your phone connects to the app's load balancer and says "let's talk securely".
+2. The server sends its certificate, a signed ID card for its domain name.
+3. The phone checks the signature and that the name matches. If not, it stops.
+4. Both sides agree on a fresh secret key; from now on every byte is encrypted.
+5. The same is done again for each hop inside: service to service, service to database.
 
 ```mermaid
 sequenceDiagram
@@ -184,14 +227,14 @@ sequenceDiagram
 
 Where TLS is needed in a typical design:
 
-1. **Client to edge:** TLS 1.3 (RFC 8446), with HSTS so browsers never fall back to HTTP.
-2. **Edge to service, service to service:** also TLS. "Inside the VPC is safe" is the assumption zero trust removes.
+1. **Client to edge:** TLS 1.3 (RFC 8446), with HSTS (a header that tells browsers "always use HTTPS for this site") so browsers never fall back to HTTP.
+2. **Edge to service, service to service:** also TLS. "Inside the VPC (your private cloud network) is safe" is the assumption zero trust removes.
 3. **Service to database, cache, broker:** enable TLS on Postgres, Redis and Kafka clients. Cheap insurance.
 4. **Cross-region links:** always, since traffic leaves your physical control.
 
 **Example:** terminating TLS at a load balancer and sending plain HTTP behind it is acceptable only if the segment is genuinely isolated and you accept that a compromised host can sniff it.
 
-PCI DSS requires strong cryptography for card data sent over open, public networks; many auditors and security teams also expect internal hops to be encrypted, and it is cheap to do.
+PCI DSS (the card industry's security standard) requires strong cryptography for card data sent over open, public networks; many auditors and security teams also expect internal hops to be encrypted, and it is cheap to do.
 
 **Why it matters:** the cost is a handshake per connection (about one round trip with TLS 1.3, and connection reuse hides it). The benefit is that a stolen packet capture is useless.
 
@@ -239,6 +282,13 @@ Three benefits you can state in the interview:
 
 **In plain words:** database passwords, API keys and signing keys are not config. If they sit in git, container images or environment dumps, one leak gives an attacker everything.
 
+**Step by step:**
+1. The order service starts. It has no password baked into its image.
+2. It proves its identity to the secrets manager using its cloud role (IAM: the cloud's system of who may do what).
+3. The secrets manager hands it a database password that is valid for one hour, and logs who asked.
+4. Before the hour ends, the service fetches a fresh one. The old one expires.
+5. If the password leaks, it is useless within the hour.
+
 Design rules:
 
 1. Secrets live in a **secrets manager** (Vault, AWS Secrets Manager), fetched at start-up or on demand over an authenticated call.
@@ -263,6 +313,13 @@ flowchart LR
 ### 3.4 PII classification and tokenization
 
 **In plain words:** not all data is equally dangerous. First **classify** it, then spend protection effort where it matters, and then reduce how much sensitive data you hold at all.
+
+**Step by step (tokenizing a card):**
+1. You type your card number into the checkout page.
+2. The page sends it straight to the payment provider, not to the app's servers.
+3. The provider stores the real card number in its vault and returns a token like `tok_8f3a`, plus the last 4 digits.
+4. The app stores only the token and `4242`. Its database never holds the real number.
+5. To charge you later, the app sends the token; only the provider can turn it back into the card.
 
 A simple four-tier scheme:
 
@@ -312,6 +369,13 @@ Design points:
 
 **In plain words (zero trust):** the old model was a castle: tough perimeter, soft inside. Once an attacker is in, everything is reachable. **Zero trust** (NIST SP 800-207) says never assume trust from network location. Every request is authenticated, authorized and encrypted, even between two internal services.
 
+**Step by step:**
+1. The recommendation pod is hacked. It tries to call `POST /charge` on the payment service.
+2. The connection uses mTLS, so the payment service sees the caller's identity: "recommendations".
+3. The policy says only "checkout" may call `POST /charge`. The call is refused.
+4. The refusal is written to the audit log and raises an alert.
+5. Being "inside the cluster" bought the attacker nothing.
+
 ```mermaid
 flowchart TD
     C["Caller service"] --> I{"Identity proven?"}
@@ -325,7 +389,7 @@ flowchart TD
 
 Practical building blocks:
 
-- **mTLS** with workload identities (SPIFFE IDs issued by a mesh or SPIRE) so both sides prove who they are. See [[Service-to-Service Auth - API Keys, HMAC, mTLS]].
+- **mTLS** with workload identities (SPIFFE IDs, a standard name format for services, issued by a mesh or SPIRE) so both sides prove who they are. See [[Service-to-Service Auth - API Keys, HMAC, mTLS]].
 - **Authorization policy** per service pair ("only checkout may call `POST /charge`").
 - **Propagate the user's identity** (a signed token) rather than letting an internal service act as an all-powerful super user.
 - **Network policy** as a second layer, not the only one.
@@ -338,6 +402,13 @@ Practical building blocks:
 ### 3.6 GDPR erasure, retention and data residency
 
 **In plain words (erasure):** under GDPR Article 17, a person can ask you to delete their personal data, and you must do so without undue delay, unless a legal reason requires keeping it (for example tax records). That sounds easy until you remember where the data went.
+
+**Step by step:**
+1. Anna asks to be deleted. The request is recorded with a deadline.
+2. A job looks up the data map: orders DB, profile cache, search index, Kafka events, analytics, backups.
+3. Rows that must stay for accounting are anonymised; the rest are deleted; cache and index entries are removed.
+4. Anna's personal data key is deleted, so every encrypted copy in events and backups becomes unreadable (crypto-shredding).
+5. Backups age out within their retention window, and the job records that erasure is complete.
 
 ```mermaid
 flowchart TD
@@ -413,7 +484,7 @@ The cost: cross-region features (a user travelling, global search) get harder. S
 Walk it as the interview answer.
 
 1. **Classify.** Card data is Restricted. Name, address, phone are Confidential. Dish names are Internal.
-2. **Minimise.** Card capture goes browser to the payment provider. We store `token`, `brand`, `last4`, `exp`. We never see the PAN, so our PCI scope stays small.
+2. **Minimise.** Card capture goes browser to the payment provider. We store `token`, `brand`, `last4`, `exp`. We never see the PAN (the full card number), so our PCI scope stays small.
 3. **Boundary.** Checkout may call Payment. Recommendations may not. Enforced by mTLS identity plus a policy file reviewed in code review.
 4. **Encrypt.** TLS 1.3 everywhere. Orders DB and S3 exports encrypted with envelope encryption. Address and phone fields are encrypted with a per-user DEK.
 5. **Residency.** Home region chosen at signup. EU users' rows and keys stay in the EU region. Global analytics gets pseudonymous IDs and aggregates only.
@@ -445,7 +516,7 @@ sequenceDiagram
 
 | Choice | Option A | Option B | Pick A when | Pick B when |
 | --- | --- | --- | --- | --- |
-| Key custody | Provider-managed KMS key | Customer-managed key (CMK) or HSM, or bring your own key | Default, low ops | Regulation or customers demand control and revocation |
+| Key custody | Provider-managed KMS key | Customer-managed key (CMK) or HSM (a tamper-resistant hardware box that holds keys), or bring your own key | Default, low ops | Regulation or customers demand control and revocation |
 | Sensitive value | Encrypt field | Tokenize via vault | Many fields, you need to read them | Few high-risk values, want smaller compliance scope |
 | Service auth | mTLS with mesh | Signed JWT per request | Strong identity, many internal calls | Need user context across hops (use both) |
 | Deletion in logs | Crypto-shred | Rewrite or compact log | Immutable event stores | Small mutable stores |
@@ -460,7 +531,7 @@ sequenceDiagram
 | Envelope encryption | Cheap rotation, audit, revocation | KMS dependency: if KMS is down you cannot unwrap new DEKs; cache DEKs briefly |
 | Field-level encryption | Limits DB-admin exposure | No SQL search on the field, harder analytics |
 | Tokenization | Smaller scope | Vault becomes a critical, highly available dependency |
-| Zero trust and mTLS | Contains lateral movement | Cert lifecycle, debugging complexity, mesh overhead |
+| Zero trust and mTLS | Contains lateral movement (an intruder hopping from one hacked service to others) | Cert lifecycle, debugging complexity, mesh overhead |
 | Regional cells | Meets residency law | Duplicated infrastructure, harder global features |
 | Short retention | Less to leak, easier erasure | Less data for analytics and disputes |
 
@@ -468,6 +539,8 @@ sequenceDiagram
 > Treating encryption at rest as a full defence. If the app has the key and the app is compromised (or has an injection bug), the attacker reads plaintext. Encryption at rest protects lost disks and stolen backups, not a compromised application.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** each control, a full worked design and what each control costs. **Next comes the senior view**: running keys, certificates and logs safely in production, being ready for a breach, and the deeper details (AES-GCM, searchable encryption, passwords, tenant isolation, threat modelling).
 
 - **KMS outage.** Cache DEKs in memory for minutes, set alarms on KMS error rate, and decide the failure mode (fail closed for restricted data).
 - **Key rotation.** Automatic annual KEK rotation is typical, and re-wrap rather than re-encrypt. Test restoring from backup with a rotated key.
@@ -483,13 +556,13 @@ sequenceDiagram
 
 **In plain words:** Use a well-known, tested lock (AES-GCM) that also notices if someone changed the data. Home-made crypto almost always has holes.
 
-GCM is an authenticated mode: it encrypts and also detects tampering. The classic mistakes are reusing a nonce with the same key (which breaks confidentiality) and using unauthenticated modes. Use library defaults (for example Go's `crypto/cipher` with `NewGCM`, or a vetted envelope-encryption SDK) and let KMS generate keys.
+GCM is an authenticated mode: it encrypts and also detects tampering. The classic mistakes are reusing a nonce (a number that must be used only once per key) with the same key (which breaks confidentiality) and using unauthenticated modes. Use library defaults (for example Go's `crypto/cipher` with `NewGCM`, or a vetted envelope-encryption SDK) and let KMS generate keys.
 
 ### Deterministic encryption and search
 
 **In plain words:** Normal encryption makes the same email look different every time, so you cannot search it. A keyed fingerprint of the email gives you a searchable column without showing the email.
 
-If you need equality lookup on an encrypted field (find user by email), either store a **keyed hash** (HMAC with a secret) in a separate indexed column, or use deterministic encryption. Both leak equality (two equal values look equal). Do not use plain unsalted hashes of low-entropy values like phone numbers: an attacker can enumerate all numbers.
+If you need equality lookup on an encrypted field (find user by email), either store a **keyed hash** (HMAC: a fingerprint that needs a secret key to compute) in a separate indexed column, or use deterministic encryption. Both leak equality (two equal values look equal). Do not use plain unsalted hashes of low-entropy values like phone numbers: an attacker can enumerate all numbers.
 
 ```mermaid
 flowchart LR
@@ -598,7 +671,27 @@ Say it in 30 seconds: "Trust boundary at the gateway. TLS outside, mTLS inside w
 
 Order to mention in an interview: classify, boundary, TLS, auth, encrypt, tokenize, audit, erase, residency.
 
-## 11. Links 🟢
+## Self-check 🟢🟡
+
+> [!question]- (easy) What do "in transit" and "at rest" mean?
+> Data moving over a network, and data sitting on disk; both should be encrypted.
+
+> [!question]- (easy) What is a token in tokenization?
+> A random stand-in for a sensitive value; the real value stays only in a vault.
+
+> [!question]- (easy) What does zero trust say about calls from inside your network?
+> They prove nothing; every call must show who it is and be allowed.
+
+> [!question]- (medium) Why use envelope encryption instead of encrypting everything with the KMS master key?
+> KMS calls are remote and size-limited; small data keys encrypt data locally, and rotating the master key only re-wraps small keys.
+
+> [!question]- (medium) How can you "delete" a user from an append-only event log?
+> Encrypt their personal fields with a per-user key and delete that key (crypto-shredding).
+
+> [!question]- (medium) Why are passwords hashed and not encrypted?
+> You only need to check them, never read them back; a slow, salted hash cannot be reversed with a stolen key.
+
+## Links 🟢
 
 - Authentication basics: [[Authentication vs Authorization]], [[Access and Refresh Tokens]], [[JWT - Structure, Validation and Pitfalls]], [[OAuth 2.0 and OpenID Connect]]
 - Services and secrets: [[Service-to-Service Auth - API Keys, HMAC, mTLS]], [[Secrets Management]], [[AWS 02 - IAM]]
@@ -606,7 +699,7 @@ Order to mention in an interview: classify, boundary, TLS, auth, encrypt, tokeni
 - Data and resilience: [[Multi-Region Architecture]], [[Event Sourcing]], [[Backup, PITR and Disaster Recovery]], [[TLS and HTTPS]]
 - Framework: [[System Design Interview Framework]], [[Cost-Aware System Design]]
 
-## Links 🟢
+ 🟢
 
 ### Watch on YouTube
 

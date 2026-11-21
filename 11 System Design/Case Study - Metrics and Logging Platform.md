@@ -35,6 +35,13 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+> - [[Observability Fundamentals]]: metrics, logs and traces are the three ways to see inside a running system.
+> - [[Metrics and Prometheus]]: Prometheus scrapes numbers from services every few seconds and graphs them.
+> - [[Structured Logging]]: logs written as key-value fields (like JSON) are easy to filter.
+> - [[Time-Series and Columnar Storage]]: stores built for "(time, value)" points compress them very well.
+
 **From zero, in 60 seconds** 🟢
 
 When a company runs hundreds of services, people need to see what is going on inside them.
@@ -76,6 +83,11 @@ This platform collects both from every service, keeps them for weeks, and wakes 
 | Tenant | One team or customer sharing the platform | The payments team |
 | Alert | A rule that notifies a human when a condition holds | Error rate > 5% for 5 minutes |
 
+| Series | All points for one metric name plus one exact set of labels | `requests{service="checkout", code="500"}` |
+| Cardinality | How many different series exist | 5 million label combinations |
+| Downsampling | Replacing old raw points with per-interval summaries (min, max, sum, count) | one point per hour instead of 240 |
+| Scrape | The collector visiting a service's `/metrics` page to read its numbers | every 15 seconds |
+
 **Picture it**
 
 ```mermaid
@@ -108,8 +120,8 @@ Where it breaks: real meters are few and fixed, but a careless label (like a use
 A company runs 5,000 services on 20,000 pods. Every team ships its own Prometheus and its own log stack, and on-call engineers jump between ten tools during an incident. Disks fill up, a single team's new `user_id` label takes down their Prometheus, and nobody can search logs older than three days. The company wants one platform.
 
 **Functional requirements**
-- Ingest metrics (counters, gauges, histograms) via Prometheus remote write and OTLP; ingest logs from files and stdout.
-- Query metrics with PromQL for dashboards; search and filter logs by service, time range and text.
+- Ingest metrics (counters: only go up; gauges: go up and down; histograms: counts per value range) via Prometheus remote write and OTLP (OpenTelemetry's standard format for sending telemetry); ingest logs from files and stdout.
+- Query metrics with PromQL (Prometheus's query language) for dashboards; search and filter logs by service, time range and text.
 - Evaluate alert rules and route notifications (page, chat, ticket).
 - Multi-tenancy: each team is a tenant with its own limits and access.
 - Retention: metrics raw 15 days, downsampled for 13 months; logs searchable 30 days.
@@ -120,6 +132,13 @@ A company runs 5,000 services on 20,000 pods. Every team ships its own Prometheu
 - Alert evaluation latency: rules evaluated every 1 minute (rule interval), notifications within a minute of a rule firing.
 - Cost per GB stored and per million series is a first-class requirement.
 - Out of scope: traces (see [[Distributed Tracing with OpenTelemetry]]), business analytics.
+
+### Real-life example: a payment outage at night 🟢
+
+Imagine a food app like Zomato at 2 a.m.: payments start failing for some users.
+A graph of "payment errors per second" jumps, a rule notices the error rate is above 5% for 5 minutes, and the on-call engineer's phone rings.
+She opens the dashboard, sees the jump began at 01:58, and searches the logs of the payment service for that minute.
+The log lines say "bank gateway timeout", so she switches traffic to the backup gateway. Metrics found the problem; logs explained it.
 
 **Glossary.** A **sample** is one `(timestamp, value)`. A **series** is all samples with the same metric name and label set, for example `http_requests_total{service="checkout",code="500"}`. **Cardinality** is the number of distinct series. A **block** is an immutable file set covering a time range.
 
@@ -139,7 +158,24 @@ flowchart LR
     LB["Index labels only"] --> L1["Cheap storage,<br/>slower search (scan)"]
 ```
 
+## Common beginner mistakes 🟢
+
+- **Putting a user ID or request ID in a metric label** → millions of new series and the system runs out of memory → put IDs in logs and traces, keep labels to a few fixed values.
+- **Full-text indexing every log line** → the index can be as big as the logs and costs a fortune → index labels only and scan the matching streams at query time.
+- **Storing averages when downsampling** → averaging averages gives wrong answers and hides spikes → keep sum, count, min and max.
+- **Running alerts on the same overloaded cluster as dashboards** → when you most need alerts, they stop → give rule evaluation priority and add a dead-man's switch (an alert that must keep firing; silence means trouble).
+- **Paging a human for every pod** → 40 pages for one problem → group related alerts into one notification.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** what metrics and logs are and that cost follows series count and indexing. **Next we open the box**: the metrics write path, the read path and the logs path, server by server.
+
+**Step by step (plain):**
+1. The checkout service exposes `requests_total{code="500"} = 1,204` on its `/metrics` page.
+2. Every 15 seconds an agent reads that page and sends the numbers in a batch.
+3. A distributor checks the team is under its limits, then sends each series to 3 ingesters (servers holding recent data in memory).
+4. When 2 of the 3 say "saved", the write counts. Every 2 hours each ingester packs its data into a file and uploads it to object storage.
+5. A dashboard query reads the last few hours from ingesters and older data from those files.
 
 ```mermaid
 flowchart LR
@@ -172,7 +208,7 @@ flowchart LR
 1. Agents scrape each pod's `/metrics` every 15 s (pull) or receive OTLP pushes, batch samples, and send them with retries.
 2. The distributor authenticates the tenant, enforces ingest-rate and series limits, validates labels, and hashes each series (tenant + sorted labels) onto a ring of ingesters (see [[Consistent Hashing]]).
 3. Each series goes to 3 ingesters; the write succeeds when 2 acknowledge (a quorum, see [[Quorums and Leaderless Replication]]).
-4. Ingesters append to an in-memory **head** and a write-ahead log; every 2 hours they cut an immutable block (index + compressed chunks) and upload it to object storage.
+4. Ingesters append to an in-memory **head** and a write-ahead log (a file every sample is appended to first, so a crash can replay it); every 2 hours they cut an immutable block (index + compressed chunks) and upload it to object storage.
 5. The compactor merges the 3 replicas' blocks into one (deduplication), merges small blocks into larger ones, writes downsampled copies, and deletes data past retention. (Thanos's compactor downsamples; Grafana Mimir's compactor does not, so on Mimir long ranges rely on query splitting and caching instead.)
 
 **Metrics read path.** The query frontend splits a 7-day query into per-day pieces, serves cached pieces, and queues the rest; queriers fetch the last few hours from ingesters and older data from store gateways, which read block indexes and only the needed chunks from object storage.
@@ -598,6 +634,14 @@ Keeping `sum` and `count` instead of a stored average matters: averaging two 5-m
 | Buffering | Kafka between agents and indexers | durable buffer, replay, many consumers | large scale, multiple sinks (SIEM, archive) | another cluster to run; adds seconds of latency |
 | | Direct agent → backend | agents retry with a disk buffer | smaller scale | backend outages fill agent disks |
 
+### Things people confuse this with 🟡
+
+| Thing | What it records | How it differs |
+| --- | --- | --- |
+| Distributed tracing ([[Distributed Tracing with OpenTelemetry]]) | The path of one request across services | Follows one request end to end; metrics count all requests, logs describe single events |
+| Business analytics | Orders, revenue, funnels | Kept for years, exact, queried by analysts; this platform is for engineers and recent weeks |
+| [[Case Study - Ad Click Aggregation]] | Clicks counted for billing | Must be exact; metrics may be sampled, dropped or rounded |
+
 ## 6. Trade-offs 🟡
 
 - **Index everything vs index labels.** Full-text indexing makes "find this request ID across all services in 30 days" instant, at a cost of index storage and indexing CPU on 69 TB/day.
@@ -617,7 +661,9 @@ flowchart TD
 
 ## 7. In production 🔴
 
-- **Real systems.** Prometheus (single-node TSDB), Grafana Mimir and Cortex (horizontally scaled, multi-tenant Prometheus-compatible), Thanos (sidecar + object storage + compactor), VictoriaMetrics, Grafana Loki, Elasticsearch/OpenSearch, ClickHouse for logs, and the OpenTelemetry Collector as the common agent. Facebook's Gorilla paper introduced the delta-of-delta and XOR scheme that Prometheus and many other TSDBs adapted.
+> 🟡 → 🔴 **You now know** the write, read and log paths, the sizing, the cardinality trap, the alert lifecycle and the Go code. **Next is the advanced part**: real systems and failure stories, how Gorilla squeezes a sample into about 1 byte, the head, WAL and blocks, downsampling tiers, the hash ring and why label-only log indexing scales.
+
+- **Real systems.** Prometheus (single-node TSDB, time-series database), Grafana Mimir and Cortex (horizontally scaled, multi-tenant Prometheus-compatible), Thanos (sidecar + object storage + compactor), VictoriaMetrics, Grafana Loki, Elasticsearch/OpenSearch, ClickHouse for logs, and the OpenTelemetry Collector as the common agent. Facebook's Gorilla paper introduced the delta-of-delta and XOR scheme that Prometheus and many other TSDBs adapted.
 - **Failure: cardinality explosion.** A deploy adds a label with unbounded values; series double in minutes and ingesters run out of memory. Fix: per-tenant and per-metric series limits at the distributor, a "top series by metric" dashboard, and relabelling rules that drop the label at the agent.
 - **Failure: query of death.** Someone runs `rate(...)` over 90 days of a 5 M-series metric. Fix: the query frontend enforces limits on series touched, samples loaded and query length per tenant; long ranges use downsampled blocks.
 - **Failure: alerting depends on the thing that is down.** If the platform is overloaded, alerts must still fire. Fix: rulers with priority over dashboard queries, a separate small "meta-monitoring" stack that watches the platform itself, and dead-man's-switch alerts that page when the alert pipeline goes silent.
@@ -626,9 +672,18 @@ flowchart TD
 
 ## 8. Deep dive 🔴
 
-**Gorilla compression.** Timestamps are stored as the difference of differences. With a fixed 15 s scrape, consecutive deltas are 15, 15, 15, so the delta-of-delta is 0 and costs one bit; the Gorilla paper reports about 96% of timestamps compressed to a single bit.
+**Gorilla compression.**
 
-Values are XORed with the previous value: identical values produce 0 (one bit), and similar floats share sign, exponent and high mantissa bits, so only the middle "meaningful" bits are stored.
+```mermaid
+flowchart LR
+    T["times: 0, 15, 30, 45"] --> D["deltas: 15, 15, 15"]
+    D --> DD["delta of deltas: 0, 0"]
+    DD --> B["each 0 stored as 1 bit"]
+```
+
+Timestamps are stored as the difference of differences. With a fixed 15 s scrape, consecutive deltas are 15, 15, 15, so the delta-of-delta is 0 and costs one bit; the Gorilla paper reports about 96% of timestamps compressed to a single bit.
+
+Values are XORed with the previous value (XOR compares bits; equal bits become 0): identical values produce 0 (one bit), and similar floats share sign, exponent and high mantissa bits, so only the middle "meaningful" bits are stored.
 
 The paper reports an average of about 1.37 bytes per sample instead of 16 bytes for a raw `(int64, float64)` pair, roughly a 12× saving.
 
@@ -674,6 +729,26 @@ That is cheap for "checkout errors in the last hour" and expensive for "this UUI
 
 > [!question]- What happens to alerts if the metrics pipeline itself is broken?
 > Rules see no data and stop firing, which looks like "all healthy". Guard against it with an always-firing watchdog alert that must keep arriving at the pager provider (a dead-man's switch) and a separate meta-monitoring stack for the platform.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is the difference between a metric and a log?
+> A metric is a number over time (errors per second); a log is a text line about one event.
+
+> [!question]- Easy: what is a label?
+> A tag on a metric, like `service="checkout"`, that splits it into separate series.
+
+> [!question]- Easy: why does a user ID make a bad label?
+> Every user creates a new series, so series count explodes and memory runs out.
+
+> [!question]- Medium: 20 million series scraped every 15 s. How many samples per second?
+> About 1.33 million.
+
+> [!question]- Medium: why keep min, max, sum and count when downsampling?
+> So averages, rates and spikes stay correct; an average of averages is wrong and hides peaks.
+
+> [!question]- Medium: why can label-only log indexing handle 69 TB a day?
+> Its index grows with the number of streams, not with bytes logged; searches scan only the matching streams' chunks.
 
 ## 10. Cheat sheet 🟢
 

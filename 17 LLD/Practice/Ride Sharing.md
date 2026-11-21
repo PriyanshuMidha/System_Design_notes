@@ -34,6 +34,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[LLD Interview Method]]: the step order these notes follow: clarify, entities, APIs, storage, code, edge cases.
+> - [[Strategy and Template Method]]: a rule behind an interface you can swap, here matching, fare and surge.
+> - [[State Machines in Go]]: a trip is in one named state at a time, and a table lists the allowed moves.
+> - [[Concurrency for LLD]]: goroutines run at the same time; a mutex makes "check driver is free, then take him" one step.
+
 **From zero, in 60 seconds** 🟢
 
 You open a ride app and ask for a car. The app looks for free drivers near you. To find them fast, it splits the map into small squares, a **grid**, and only checks your square and the ones around it. It ranks the drivers and offers the ride to the best one. Two riders must never get the same driver, so the claim is one safe step. The trip then moves through fixed steps: requested, matched, picked up, completed.
@@ -66,6 +72,11 @@ It also shows a price before the ride, and you should pay that price even if pri
 | Surge multiplier | A price boost when demand is higher than supply | 1.5x during rain |
 | Paise | 1/100 of a rupee, stored as an integer to avoid rounding errors | Rs 120.50 = 12050 paise |
 | Lock | Only one goroutine may run the protected code at a time | Claiming a driver |
+| Haversine distance | Straight-line distance on the Earth's curved surface | 0.01 degree of latitude = about 1.1 km |
+| Claim | Re-check a driver is still free and mark him taken, in one locked step | Driver D1 Available → OnTrip |
+| Compare-and-set | Change a value only if it still has the value you expect | `UPDATE ... WHERE status = 'available'` |
+| Heuristic | A rule of thumb that is usually right but not guaranteed | "Scan one extra ring" |
+| Shard | Split data and load so each part runs on its own | One matcher per city |
 
 **Picture it**
 
@@ -101,7 +112,7 @@ Compute the fare from distance and time, with surge pricing when demand is high.
 Riders and drivers can cancel. Many riders request at the same time.
 ```
 
-- It tests a state machine with real rules, a swappable matching strategy over a spatial index, a race (two riders, one driver) and money arithmetic with a multiplier. Time box: 10 minutes for Steps 1-4, 10 for Steps 5-6, 30-40 for the code, 10 for edge cases and follow-ups.
+- It tests a state machine with real rules, a swappable matching strategy over a spatial index (a structure that finds things by location fast), a race (two riders, one driver) and money arithmetic with a multiplier. Time box: 10 minutes for Steps 1-4, 10 for Steps 5-6, 30-40 for the code, 10 for edge cases and follow-ups.
 
 ### Solving path
 
@@ -110,14 +121,14 @@ Riders and drivers can cancel. Many riders request at the same time.
 3. Name the entities: `Driver`, `Trip`, `Location`, plus the three strategies (match, fare, surge) and the `GridIndex`.
 4. Write `RequestRide` as search, rank and claim, with the claim under one lock.
 5. Add the driver steps (arrive, start, end), the fare and the two cancellation paths.
-6. Test the fare table, the state machine, cancellations, surge, and 50 riders racing for 3 drivers under `-race`. Then discuss sharding by city and the database version.
+6. Test the fare table, the state machine, cancellations, surge, and 50 riders racing for 3 drivers under `-race` (Go's race detector, which flags unsafe shared access). Then discuss sharding by city and the database version.
 
 ## Step 1: Clarify requirements 🟢
 
 ### Questions to ask (with assumed answers)
 
 - One vehicle type or many (bike, auto, sedan)? *Assume: one type in the code; types become a filter in the matcher (Step 10).*
-- What does "nearest" mean? *Assume: straight-line (haversine) distance within a maximum radius. Road ETA is a better strategy and a follow-up.*
+- What does "nearest" mean? *Assume: straight-line (haversine) distance within a maximum radius. Road ETA (estimated time of arrival by road) is a better strategy and a follow-up.*
 - Does the driver accept or reject the offer? *Assume: auto-assign in the code; an offer with a timeout is a follow-up.*
 - How is the fare computed? *Assume: base + per km + per started minute, times the surge multiplier, with a minimum fare. Integer paise.*
 - When is surge decided? *Assume: at request time, from recent requests versus available drivers near the pickup; it is locked on the trip.*
@@ -165,12 +176,12 @@ The hardest use case is **RequestRide** under concurrency: many riders near the 
 | `Driver` | ID, Status (Offline, Available, OnTrip), Loc | The scarce resource riders race for |
 | `Trip` | ID, RiderID, DriverID, Status, SurgePct, timestamps, FarePaise, CancelFee | One ride and its lifecycle |
 | `TripStatus` | Requested, Assigned, Arrived, InProgress, Completed, CancelledByRider, NoDriverFound | The state machine |
-| `GridIndex` | cells map, driver to cell map, own `RWMutex` | Answers "who is near this point" without a full scan |
+| `GridIndex` | cells map, driver to cell map, own `RWMutex` (a lock that lets many readers in at once but one writer) | Answers "who is near this point" without a full scan |
 | `Candidate` | DriverID, Loc, DistM | What the index hands to the matcher |
 | `MatchStrategy` | `Rank(pickup, candidates)` | Nearest first today, ETA or rating tomorrow |
 | `FareStrategy` | `Fare(FareInput)` | The fare formula, including surge |
 | `SurgePolicy` | `SurgePct(demand, supply)` | The surge curve |
-| `Service` | strategies, index, drivers, trips, active riders, demand log, clock | The facade the API calls; owns the claim lock |
+| `Service` | strategies, index, drivers, trips, active riders, demand log, clock | The facade (one front object that hides the parts) the API calls; owns the claim lock |
 
 Modelling insights:
 
@@ -179,6 +190,8 @@ Modelling insights:
 - The surge multiplier belongs to the **trip**, not to the fare strategy. It is a fact recorded at request time.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know the trip states, the grid of cells, and the rule "search without the lock, claim under it". Next we open the box: how the entities link, the API, where locations and trips are stored, and the Go matching code.
 
 ```mermaid
 classDiagram
@@ -283,7 +296,7 @@ Every driver-side method checks that the caller is the assigned driver (`ErrNotY
 
 ## Step 6: Storage and repositories 🟡
 
-Locations do not go to the relational database: they change every few seconds and only the latest one matters. They live in memory (or Redis `GEOADD` / `GEOSEARCH`, see [[Geospatial Indexing]]). Trips and driver status are durable.
+Locations do not go to the relational database: they change every few seconds and only the latest one matters. They live in memory (or Redis `GEOADD` / `GEOSEARCH` (Redis commands that store points and find those near a location), see [[Geospatial Indexing]]). Trips and driver status are durable.
 
 **In plain words:** Tables for drivers and trips. Live locations stay in memory or Redis, not here, because they change every few seconds.
 
@@ -413,7 +426,7 @@ cmd/demo/main.go  -> wiring: index, strategies, time.Now
 > [!tip] Exercise: a rating-weighted matcher
 > Write `ScoredMatch` that ranks by `distanceM - 200*rating` within the radius, before looking at `NearestFirst`. Nothing in `Service` changes. The test only swaps the strategy passed to `NewService`. This is the point of the interface.
 
-Lock order is always `Service.mu` then `GridIndex.mu`; the index never calls back into the service, so there is no deadlock.
+Lock order is always `Service.mu` then `GridIndex.mu`; the index never calls back into the service, so there is no deadlock (two goroutines each waiting forever for the other's lock).
 
 **In plain words:** The full service. Start with the grid index, then `RequestRide`, which matches and claims a driver, then the trip steps.
 
@@ -1249,9 +1262,11 @@ func must(t *testing.T) func(Trip, error) {
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working service and its tests. Next is interview depth: two riders on one driver, the nearest driver in the next cell, cancels during matching, surge rounding, and scaling past one process.
+
 | Edge case | What happens | How the design handles it |
 |---|---|---|
-| Two riders pick the same nearest driver | Check-then-act race | The status check and `OnTrip` set happen under `Service.mu`; the loser tries its next candidate. In SQL, `UPDATE ... WHERE status = 'available'` returns 0 rows for the loser |
+| Two riders pick the same nearest driver | Check-then-act race (both see "free", then both take) | The status check and `OnTrip` set happen under `Service.mu`; the loser tries its next candidate. In SQL, `UPDATE ... WHERE status = 'available'` returns 0 rows for the loser |
 | Nearest driver is in the next cell | Ring 0 has a hit, but it is not the nearest | `Nearby` scans one ring past the first ring that satisfies `want`. This catches most cases but is not exact: an exact search keeps adding rings until the nearest unscanned ring is farther than the `want`-th best distance found |
 | Pickup near a cell corner, few drivers | Empty rings | Rings grow up to `MaxRing`; the radius filter then drops far drivers |
 | Rider cancels while matching runs | Driver claimed for a dead trip | `assign` re-checks `Status == Requested` under the lock before claiming |
@@ -1263,7 +1278,7 @@ func must(t *testing.T) func(Trip, error) {
 | Surge changes between quote and end | Rider pays more than quoted | `SurgePct` is stored on the trip at request time |
 | Trip of 0 to 1 minute | Tiny fare | `MinPaise` floor |
 | Fare rounding with a multiplier | Float drift | Integer `(raw*pct + 50) / 100`, half up, in paise |
-| Drivers near the antimeridian or the poles | Cells distort | Degree cells are fine for city-scale use; use geohash or S2/H3 cells globally (see [[Geospatial Indexing]]) |
+| Drivers near the antimeridian (the 180 degree longitude line) or the poles | Cells distort | Degree cells are fine for city-scale use; use geohash or S2/H3 cells (standard ways to cut the globe into equal-ish cells) globally (see [[Geospatial Indexing]]) |
 
 ### Common mistakes
 
@@ -1291,7 +1306,7 @@ Tradeoffs chosen:
 - **Fixed degree cells versus geohash or H3.** Fixed cells are a few lines and right for one city. At the equator 0.01 degree is about 1.1 km in both directions; at 60 degrees latitude it is about 0.55 km east-west, so cells stop being square away from the equator.
 - **Haversine versus road distance.** Haversine is cheap and good for a shortlist; real dispatch re-ranks the shortlist by ETA.
 - **Auto-assign versus offer.** Auto-assign keeps the code focused on the race; real apps offer and wait, which adds a state and a timer.
-- **One mutex for the service.** Fine for a city in one process. Shard by city first, then by cell block if profiling shows contention.
+- **One mutex for the service.** Fine for a city in one process. Shard by city first, then by cell block if profiling (measuring where time goes) shows contention (goroutines waiting on the lock).
 
 ## Drawing 🟢
 
@@ -1350,7 +1365,7 @@ sequenceDiagram
 > For an exact answer, stop only when the closest edge of the next unscanned ring is farther than the `want`-th best distance so far. In practice the shortlist is re-ranked by ETA anyway.
 
 > [!question]- Why is the surge stored on the trip?
-> The rider agreed to a price at request time. If the fare read the current surge at the end, a trip requested at 1.0x could be charged at 2.0x. Storing `SurgePct` on the trip makes the fare a pure function of the trip's own data, which is also easier to audit and test.
+> The rider agreed to a price at request time. If the fare read the current surge at the end, a trip requested at 1.0x could be charged at 2.0x. Storing `SurgePct` on the trip makes the fare a pure function (same input, same output, no outside state) of the trip's own data, which is also easier to audit and test.
 
 > [!question]- What happens when a driver cancels?
 > The driver goes back to `Available`, is added to the trip's rejected set, and the trip goes back to `Requested` and is rematched. The rider pays nothing. The rejected set stops the same driver from being picked again, and when no candidate is left the trip ends as `NoDriverFound`.
@@ -1378,6 +1393,26 @@ I model a Trip as a state machine with an explicit transition table: Requested, 
 - SQL claim: `UPDATE ... WHERE status = 'available'`; partial unique indexes for one active trip per rider and per driver.
 - Fare = max(min, (base + km x rate + started minutes x rate) x surge%), integer paise, surge locked at request.
 - Rider cancel: free before assignment or within the grace window, flat fee after; no cancel in progress.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 Name the main trip states in order.
+> Requested, Assigned, Arrived, InProgress, Completed (plus CancelledByRider and NoDriverFound).
+
+> [!question]- 🟢 Why are drivers kept in grid cells?
+> So the search looks only at nearby cells instead of every driver in the city.
+
+> [!question]- 🟢 Why is surge stored on the trip at request time?
+> The rider agreed to that price; reading the surge at the end could charge 2.0x for a 1.0x request.
+
+> [!question]- 🟡 Two riders rank the same driver first. How does only one get him?
+> Under the service lock, the claim re-checks the driver is still `Available` and sets `OnTrip`; the loser moves to his next candidate.
+
+> [!question]- 🟡 The pickup cell has a driver. Why scan one more ring?
+> A driver just across the border can be closer than one in the far corner of the pickup cell.
+
+> [!question]- 🟡 Fare 21800 paise at 1.5x surge. How is it rounded without floats?
+> `(21800 x 150 + 50) / 100` = 32700 paise, integer math rounding half up.
 
 ## Links 🟢
 

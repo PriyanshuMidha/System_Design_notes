@@ -31,6 +31,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Interfaces]]: in Go, an interface is a list of method names, and any type that has those methods fits it automatically. That is the trick this whole note leans on.
+> - [[Design Principles - DRY, KISS, YAGNI, Coupling and Cohesion]]: the same coupling and cohesion ideas for single functions and types. Here we zoom out to whole packages and services.
+
 **From zero, in 60 seconds** 🟢
 
 **Architecture** is the set of choices that are hard to change later.
@@ -69,6 +73,12 @@ This note is about drawing lines so one change stays in one place.
 | Interface | A named list of methods, with no code behind it | `type Repo interface { Save(Invoice) error }` |
 | Boundary | A line between parts that change for different reasons | Business rules vs. database code |
 | `internal/` | A Go folder that only its parent tree may import | `svc/internal/domain` |
+| Volatile vs stable | Volatile code changes often; stable code changes rarely | Razorpay client = volatile, "amount > 0" rule = stable |
+| Dependency inversion | The core declares the interface it needs; the database code implements it | `domain.Store`, implemented by `memorystore` |
+| Port | An interface the core owns for one outside need | `Store`, `Notifier` |
+| Adapter | Real code behind a port that talks to the outside world | `memorystore.Store`, a Postgres store |
+| Fake | A tiny pretend adapter written only for tests | `fakeStore` that saves into a map |
+| Composition root | The one place (`main`) that creates real adapters and plugs them in | `domain.NewService(memorystore.New(), ...)` |
 
 **Picture it**
 
@@ -95,7 +105,7 @@ Where it breaks: a socket standard is fixed for decades; your own interfaces wil
 
 A two-person team building InvoiceOps starts with one package: `main.go` calls the Postgres driver directly inside the HTTP handler that creates an invoice. For the first month this is the fastest way to ship.
 
-By month four, three things have happened: a second engineer needs to add Razorpay webhook handling without breaking invoice creation; product wants an integration test that creates an invoice without a running Postgres; and a bug slips through because a handler silently skipped the "amount must be positive" rule that lived only in that one handler's `if` statement, not in a second handler that also creates invoices.
+By month four, three things have happened: a second engineer needs to add Razorpay **webhook** handling (Razorpay, a payment company, calls our server over HTTP to say "this payment happened") without breaking invoice creation; product wants an **integration test** (a test that runs several real parts together) that creates an invoice without a running Postgres; and a bug slips through because a handler silently skipped the "amount must be positive" rule that lived only in that one handler's `if` statement, not in a second handler that also creates invoices.
 
 None of these are bugs in the code that exists — they are costs of *where the boundaries are*. The business rule "an invoice amount must be positive" has no single home, so it can be forgotten in a second handler.
 
@@ -116,12 +126,21 @@ flowchart LR
     end
 ```
 
+### Real-life example 🟢
+
+Picture a food-delivery app like Swiggy. Its "order rules" (a restaurant must be open, the cart must not be empty) change maybe once a quarter.
+Its payment provider, SMS sender and map service can each change every few months, or be swapped for a cheaper one.
+If the order rules import the SMS library directly, switching SMS vendors means editing and re-testing the order code.
+If instead the order code says "I need something that can send a message", only a small SMS adapter changes. The arrow points from the changing part (SMS adapter) to the steady part (order rules).
+
 ## 2. Mental model 🟢
+
+🟢 **Plain version:** Picture each package as a room with a door. Only a few things should pass through the door: plain data, and calls. When you draw an arrow from "who calls" to "who is called", the arrow should point from code that changes a lot (like a payment library) toward code that hardly changes (like "a paid invoice can't be edited"). That way, when the payment library changes, your important rules don't have to. The paragraph below says the same thing with the proper terms.
 
 Think of every package or service as a cell with a wall. The wall decides two things: what can cross it, and which side initiates the crossing.
 
-- **What crosses:** data (DTOs, not ORM rows), calls (function calls, HTTP, events), and *knowledge* (business rules should cross once, as a decision, never as duplicated logic).
-- **Direction:** draw an arrow from the caller to the callee. The rule that makes an architecture "good" is almost always: **make the arrow point from volatile code toward stable code**, never the reverse. A payment provider SDK changes on their schedule; your business rule that "a paid invoice cannot be edited" should not depend on it.
+- **What crosses:** data (**DTOs**, plain structs made only to carry data across a boundary, not **ORM rows**, structs tied to database tables by a mapping library), calls (function calls, HTTP, events), and *knowledge* (business rules should cross once, as a decision, never as duplicated logic).
+- **Direction:** draw an arrow from the caller to the callee. The rule that makes an architecture "good" is almost always: **make the arrow point from volatile code (changes often) toward stable code (changes rarely)**, never the reverse. A payment provider **SDK** (the client library the provider gives you) changes on their schedule; your business rule that "a paid invoice cannot be edited" should not depend on it.
 
 **Analogy:** a restaurant kitchen. The chef (your domain logic) does not know or care which supplier delivered today's tomatoes (a database, an email provider, a payment gateway) — a line cook (an adapter) deals with the delivery truck and hands the chef prepared ingredients in the shape the chef already expects. Swap suppliers and the chef's recipes do not change.
 
@@ -130,11 +149,28 @@ flowchart LR
     LC["Low coupling<br/>few, thin links"] --- HC["High cohesion<br/>related code together"] --> G["Easy to change one part"]
 ```
 
+## Common beginner mistakes 🟢
+
+- **Calling the database straight from the HTTP handler everywhere** → business rules end up scattered and copied, and one copy gets forgotten → put each rule in one `domain` function that every handler calls.
+- **Declaring the interface next to the database code** → the core still has to import the database package to use it → declare the interface in the package that uses it (`domain.Store`).
+- **Making an interface for every type "for testing"** → lots of one-implementation interfaces nobody swaps → start with the concrete type; add an interface when a second implementation or a fake is really needed.
+- **A growing `utils` or `common` package** → it becomes a junk drawer that everything imports → keep a helper next to its one caller; extract a small, well-named package only when a second caller appears.
+- **Thinking separate services means low coupling** → two services sharing one table still have to change together → give each part its own data.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** what coupling and cohesion mean and which way the arrows should point. **Next we open the box**: the kinds of coupling you will meet, how to shape Go packages, and exactly how Go code flips a dependency with an interface. Each subsection starts with a short step-by-step walk.
 
 ### What architecture actually decides
 
 **In plain words: a short list of the big, costly-to-change choices, shown on one example app.**
+
+**Step by step:**
+1. Draw the boxes: invoice rules (`domain`), Postgres code, Razorpay code.
+2. Draw the arrows: Postgres and Razorpay code import `domain`; `domain` imports neither.
+3. Decide how it ships: one program today.
+4. Decide who owns the data: only billing writes to the `invoices` table.
+These four answers are "the architecture". Everything smaller is design.
 
 | Decision | Example for InvoiceOps |
 | --- | --- |
@@ -147,6 +183,21 @@ flowchart LR
 
 **In plain words: four ways one package can be tied to another, from "many depend on me" to "I know your internals".**
 
+**Step by step:**
+1. Count arrows coming **in** to `domain`: say 3 packages import it. That is afferent coupling, 3.
+2. Count arrows going **out** of `domain`: 0. That is efferent coupling, 0. High in, low out: a solid core.
+3. Look for "must happen in this order": service A must deploy before B reads its new field. That is temporal coupling.
+4. Look for shared tables: billing and reports both write `invoices`. That is data coupling; they must change together.
+
+```mermaid
+flowchart LR
+    H["handler"] --> D["domain<br/>in: 3, out: 0"]
+    PG["postgres adapter"] --> D
+    RZ["razorpay adapter"] --> D
+```
+
+Full detail:
+
 - **Afferent coupling** (incoming): how many other packages depend on this one. A `domain` package with high afferent coupling and few dependencies of its own is a stable, trustworthy core.
 - **Efferent coupling** (outgoing): how many other packages this one depends on. High efferent coupling on concrete adapters (a specific SQL driver, a specific HTTP client) means a change to any of them can break you.
 - **Temporal coupling**: two components only work if called in a specific order or at the same time (service A must deploy before service B reads its new field). Invisible in the code, visible only at runtime or deploy time.
@@ -157,6 +208,12 @@ Deployment coupling is a fifth, operational kind: if two packages must always be
 ### Cohesion and Go package shape
 
 **In plain words: keep things that change together in the same package.**
+
+**Step by step:**
+1. You need to add a `due_date` field to invoices.
+2. With package-by-layer you edit `handlers/invoice.go`, `services/invoice.go` and `repositories/invoice.go`: three packages.
+3. With package-by-feature you edit three files, all inside `invoice/`: one package.
+4. One feature change, one package: that is high cohesion.
 
 Cohesion asks: do the things inside this boundary belong together? Two ways to slice the same InvoiceOps handlers:
 
@@ -181,6 +238,15 @@ Package-by-feature is the common Go default once a service has more than a handf
 ### Dependency inversion with a consumer-defined interface
 
 **In plain words: the business code says "I need something that can save an invoice"; the database code provides it.**
+
+**Step by step:**
+1. In `domain`, write `type Store interface { Save(...) error }`. `domain` imports nothing about databases.
+2. In `memorystore` (or a Postgres package), write a `Store` type with a `Save` method. It imports `domain` for the `Invoice` type.
+3. Go sees that `memorystore.Store` has the right methods, so it fits `domain.Store` with no extra code.
+4. In `main`, create `memorystore.New()` and pass it into `domain.NewService(...)`.
+5. At run time the call goes `domain` → store, but the import arrow goes store → `domain`. That flip is "dependency inversion".
+
+Full detail:
 
 The direction that makes testable, swappable architecture possible: the package that *uses* a capability declares the interface, in its own package, in the shape it needs.
 
@@ -210,13 +276,18 @@ flowchart LR
 ```
 
 Three consequences fall out of this one picture:
-- `domain` can be unit-tested with an in-memory fake, with no database, no network, and no test container.
+- `domain` can be unit-tested with an in-memory **fake** (a tiny pretend store written for tests), with no database, no network, and no **test container** (a real database started in Docker just for a test).
 - Swapping Postgres for a different store means writing a new adapter; `domain` does not change.
-- `main` (or a `wire`/`fx` injector) is the only package allowed to know about every concrete type. This is the **composition root**: everywhere else, depend on the interface, not the concrete type.
+- `main` (or a `wire`/`fx` injector, Go libraries that generate or run this wiring for you) is the only package allowed to know about every concrete type. This is the **composition root**: everywhere else, depend on the interface, not the concrete type.
 
 ### Go-specific boundary tools
 
-**In plain words: Go gives you tools to stop the wrong imports: internal folders, small interfaces, and lint rules.**
+**In plain words: Go gives you tools to stop the wrong imports: internal folders, small interfaces, and lint rules** (automatic code checks run before merge).
+
+**Step by step:**
+1. Put `domain` under `svc/internal/domain`. Another team's module tries to import it: the compiler says no.
+2. Someone adds `import "svc/adapters/postgres"` inside `domain`, while `postgres` already imports `domain`. `go build` fails with "import cycle not allowed".
+3. Someone adds `utils/helpers.go` with 40 unrelated functions. Nothing stops this automatically, so review rejects it and the helper moves next to its caller.
 
 - **`internal/`**: any package under a directory named `internal` is importable only by code rooted at its parent. `internal/domain` can be shared across your own `cmd/` binaries but never imported by another module — this is how Go enforces "this is ours, not a public API" at compile time, not by convention.
 - **Import cycles are a compile error.** If `domain` imports `adapters/postgres` and `adapters/postgres` imports `domain`, `go build` refuses to build it. Go turns "we have a circular dependency" from an architecture smell into a build failure, which is why the arrow in the diagram above only ever points one way.
@@ -225,6 +296,11 @@ Three consequences fall out of this one picture:
 ### Quality attributes this buys (and costs)
 
 **In plain words: good boundaries make testing and changing easier, but add files and steps.**
+
+**Step by step:**
+1. You add a `Store` port. Gain: `domain` tests run in milliseconds with a fake. Cost: you write and keep the fake.
+2. Later billing becomes its own service. Gain: its interface already exists. Cost: more packages than a tiny script needs.
+3. Search gets heavy traffic. Gain: an isolated search module can get its own machines. Cost: splitting too early adds network calls you did not need.
 
 | Attribute | What a good boundary buys | What it costs |
 | --- | --- | --- |
@@ -236,6 +312,22 @@ Three consequences fall out of this one picture:
 
 **In plain words: your code ends up shaped like your teams talk to each other.**
 
+**Step by step:**
+1. Team A owns invoices. Team B owns notifications.
+2. They talk only through tickets, a few times a week.
+3. Changing a shared piece of code needs both teams, so people avoid it.
+4. Over months, a clean line appears in the code exactly between "A's stuff" and "B's stuff".
+
+```mermaid
+flowchart LR
+    TA["Team A"] -. "tickets only" .- TB["Team B"]
+    TA --> CA["invoices code"]
+    TB --> CB["notifications code"]
+    CA -. "thin API" .- CB
+```
+
+Full detail:
+
 > [!quote] Melvin Conway, 1968
 > Organizations which design systems are constrained to produce designs which are copies of the communication structures of these organizations.
 
@@ -244,6 +336,12 @@ In practice: if two teams own "invoices" and "notifications" and talk to each ot
 Deliberately choosing module or service boundaries along team boundaries (the "inverse Conway manoeuvre") is often easier than fighting the organization's shape.
 
 ### Choosing a style
+
+**Step by step:**
+1. One or two engineers? Start with simple layers: handler, service, repository.
+2. A second or third outside system appears (payments, email, file storage)? Add a port for each of those.
+3. Several teams with clear areas? Use a modular monolith: one program, firm walls between modules.
+4. One module needs its own scaling, deploys or on-call? Only then split it into its own service.
 
 ```mermaid
 flowchart TD
@@ -258,7 +356,7 @@ flowchart TD
     Scale -- "no" --> StayModular["stay a modular monolith"]
 ```
 
-Domain-driven design is **orthogonal** to this chooser, not a branch on it: bounded contexts and the tactical patterns in [[Domain-Driven Design - Strategic Design]] apply inside a layered service, a hexagonal one, or a microservice, whenever the domain's rules are complex enough to deserve a rich model instead of a thin CRUD layer.
+Domain-driven design is **orthogonal** to this chooser (independent of it: it can be combined with any branch), not a branch on it: **bounded contexts** (areas of the business inside which each word has one exact meaning) and the tactical patterns in [[Domain-Driven Design - Strategic Design]] apply inside a layered service, a hexagonal one, or a microservice, whenever the domain's rules are complex enough to deserve a rich model instead of a thin **CRUD** layer (plain create, read, update, delete with almost no rules).
 
 "Complex business rules" is a reason to add DDD's tactical patterns, not a fork that excludes hexagonal or clean.
 
@@ -271,6 +369,8 @@ The evolutionary path almost every real service takes: start layered, and once a
 ### Whiteboard version
 
 The smallest version of dependency inversion: a function that needs to save something, written against an interface it declares itself.
+
+**What this code does, in plain words:** `CreateInvoice` checks the amount is positive and then asks "some `Saver`" to save it. It has no idea whether the saver is Postgres, a file or a test map.
 
 ```go
 package wb
@@ -298,7 +398,9 @@ func (errBadAmount) Error() string { return "amount must be positive" }
 
 The full version below turns this into InvoiceOps' shape: a `domain` package with two ports, two real adapters, and a composition root, tested without touching either adapter.
 
-A Go package graph (`domain`, `adapters/memorystore`, `adapters/lognotifier`, `main`) that compiles and passes `go vet` and `go test -race` on Go 1.24.
+A Go package graph (`domain`, `adapters/memorystore`, `adapters/lognotifier`, `main`) that compiles and passes `go vet` and `go test -race` (tests run with Go's data-race detector on) on Go 1.24.
+
+**What this code does, in plain words:** `domain` holds the invoice rule and two interfaces. `memorystore` saves invoices in a map, `lognotifier` prints a line, and `main` plugs both into the service and creates invoice `inv-100` for 12,500 cents.
 
 ```go
 // domain/invoice.go
@@ -436,6 +538,8 @@ func main() {
 
 The tests that make the dependency direction a checked fact, not a diagram promise: `domain`'s tests use only fakes defined in its own test file, never an adapter.
 
+**What this code does, in plain words:** three tests. One checks a good invoice is saved and one notice is sent. One checks amount 0 is rejected. One makes the notifier fail and checks the invoice is still saved.
+
 ```go
 // domain/invoice_test.go
 package domain
@@ -572,7 +676,7 @@ ok  	note1/domain	4.635s
 handler -> service -> repository -> database
 ```
 
-is the starting layered shape. As soon as a second external system (Razorpay, an email sender, S3) shows up, the repository-shaped dependency becomes three named ports: `PaymentProvider`, `EmailSender`, `FileStorage`. The webhook path shows why a boundary per integration matters once more than one exists:
+is the starting layered shape. As soon as a second external system (Razorpay, an email sender, S3, which is Amazon's file storage) shows up, the repository-shaped dependency becomes three named ports: `PaymentProvider`, `EmailSender`, `FileStorage`. The webhook path shows why a boundary per integration matters once more than one exists:
 
 ```text
 Webhook handler -> Payment service -> Invoice service -> PaymentProvider verifier -> Repository transaction
@@ -590,6 +694,16 @@ Each arrow here is a boundary with a specific job: the webhook handler only pars
 | `internal/` package | Compiler-enforced "do not import this from outside" | Marking code as intentionally private to a module or repo | None; it is free |
 | Explicit composition root | One package (`main`, or a `cmd/` binary) wires every concrete type | Any service past the one-file stage | Slightly more boilerplate wiring code |
 
+### Coupling vs cohesion vs dependency direction 🟡
+
+People mix these three up. They answer different questions.
+
+| Idea | Question it answers | Good value | InvoiceOps example |
+| --- | --- | --- | --- |
+| Coupling | How much does package A need to know about package B? | Low | `domain` knows nothing about Postgres |
+| Cohesion | Do the things inside one package belong together? | High | Everything about invoices lives in `invoice/` |
+| Dependency direction | Which way does the import arrow point? | Toward stable code | Postgres adapter imports `domain`, not the reverse |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - Introducing ports and a composition root for a 150-line script that will never get a second adapter is pure overhead; a single `main.go` calling the database directly is the right call until a second real need for substitution appears.
@@ -598,6 +712,9 @@ Each arrow here is a boundary with a specific job: the webhook handler only pars
 - Dependency inversion fixes *coupling direction*, not quantity: a `domain` package with forty methods on one interface is just as hard to fake in a test as a direct dependency would have been. Keep ports narrow.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how to point dependencies the right way in Go and when it is not worth it. **Next is the senior view**: what this looks like in real codebases (including Go's own standard library), the four classic ways it goes wrong, and how to measure coupling in your own repo.
+
 
 - **Real systems:** Go's own standard library follows this rule throughout: `database/sql` defines `driver.Driver` as the port, and `lib/pq`, `pgx`'s `stdlib` shim and others are adapters that import `database/sql`'s types, never the reverse. `io.Writer` is the smallest and most reused Go port of all.
 - **Failure modes → fixes:**
@@ -649,6 +766,26 @@ Each arrow here is a boundary with a specific job: the webhook handler only pars
 - Composition root (`main`, or `wire`/`fx`) is the only place allowed to know every concrete type.
 - Chooser: 1-2 engineers and few integrations → layered. Growing integrations → add ports (hexagonal/clean). Multiple teams/domains → modular monolith, split to microservices only when a module needs independent scaling or deploys. DDD is orthogonal, add it when the domain rules are genuinely complex.
 - Big ball of mud, distributed monolith, anemic model and interface pollution are the four anti-patterns to name and avoid.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) In one line, what is coupling and what is cohesion?
+> Coupling is how much one package must know about another (want low); cohesion is how well the things inside one package belong together (want high).
+
+> [!question]- (easy) Should `domain` import the Postgres adapter, or the other way round?
+> The Postgres adapter imports `domain`. Business rules never depend on database code.
+
+> [!question]- (easy) What is the composition root?
+> The one place, usually `main`, that creates the real adapters and plugs them into the service.
+
+> [!question]- (medium) Where should the `Store` interface be declared, and why?
+> In `domain`, the package that uses it. Then `domain` needs no database import, and any adapter or test fake can fit it.
+
+> [!question]- (medium) Two services share the `invoices` table. Are they loosely coupled?
+> No. That is data coupling: a column change forces both to change and deploy together (a distributed monolith).
+
+> [!question]- (medium) A 150-line script talks to one database. Should you add ports and adapters?
+> No. That is overhead with no payoff; add a port when a second real implementation or a test fake is actually needed.
 
 ## Links 🟢
 

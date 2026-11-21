@@ -31,6 +31,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works, with the small whiteboard code), section 4 (the full worked example) and sections 5 and 6 (variants and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Interfaces]]: an interface is a list of methods, and any type with those methods fits it automatically.
+> - [[Error Handling]]: Go functions return an `error`, and `errors.Is` checks whether an error is (or wraps) a known value.
+> - [[Context Package]]: `ctx` carries a deadline and a cancel signal, and well-behaved calls stop when `ctx.Done()` fires.
+
 **From zero, in 60 seconds** 🟢
 
 Your code wants to call things in its own way. Outside code (a payment company's library) has its own way.
@@ -68,6 +73,10 @@ So checkout talks to one shape you design, and a small translator per provider d
 | Context (`ctx`) | Go value carrying a deadline and a cancel signal | `context.WithTimeout(ctx, 3*time.Second)` |
 | Domain error | An error your own code defines and understands | `ErrCardDeclined` |
 | Translate | Convert one format into another | rupees `int64` paise to SDK's `float64` |
+| Goroutine | A light task Go runs alongside others | The adapter runs the slow SDK call in one |
+| Sentinel error | A fixed, named error value callers compare against | `ErrDeclined`, checked with `errors.Is` |
+| Idempotency key | A unique ID sent with a request so a repeat is ignored | The order ID sent with every charge |
+| Compile-time check | A line that makes the build fail if a type stops fitting an interface | `var _ PaymentGateway = (*RazorpayAdapter)(nil)` |
 
 **Picture it**
 
@@ -99,10 +108,14 @@ A checkout service accepts Razorpay, Stripe, an internal wallet and cash on deli
 
 - Every caller learns four APIs, and provider types (`*RzpError`, `map[string]string` notes) spread through business code.
 - Switching or adding a provider touches every caller instead of one file.
-- Error handling diverges: one place retries a declined card, which can never succeed, while another fails a request on a transient `SERVER_ERROR` that one retry would have fixed.
+- Error handling diverges: one place retries a declined card, which can never succeed, while another fails a request on a transient (short-lived, likely gone on the next try) `SERVER_ERROR` that one retry would have fixed.
 - An SDK method without a `context.Context` parameter cannot be cancelled. If the provider hangs for 60 seconds, so does the checkout request, holding a goroutine and a connection the whole time.
 
 The adapter below avoids the last two problems: it honours `ctx` and translates SDK errors into domain errors.
+
+### Real-life example 🟢
+
+Picture paying for a Swiggy order. The checkout screen shows UPI, cards, a wallet and cash on delivery side by side, and the "Pay" button works the same way for all of them. Behind each choice sits a different payment company with its own way of talking. A small translator per company lets the checkout code say one thing, "charge ₹499 for this order", and get back one of three plain answers: paid, declined, or try again. That translator is an adapter.
 
 ## 2. Mental model 🟢
 
@@ -114,9 +127,11 @@ A good travel adapter also has a fuse: it protects your side from whatever the w
 
 The key point is **direction**: you own the target interface, written in your domain's words, and adapt the external thing **to it**. If you shape your interface after one SDK, the next SDK will not fit.
 
+> 🟢 → 🟡 **You now know** what an adapter is: a small translator between your interface and someone else's library. **Next we open the box**: the exact steps to build one in Go, how it adds a timeout to a library that has none, and how it turns provider errors into your own.
+
 ## 3. How it works 🟡
 
-1. **Define the target interface on your side**, in domain terms: `PaymentGateway.Charge(ctx, ChargeRequest)` with amounts in paise and your own error values `ErrDeclined`, `ErrUnavailable`, `ErrUnknownOutcome`.
+1. **Define the target interface on your side**, in domain terms (the words of your own business): `PaymentGateway.Charge(ctx, ChargeRequest)` with amounts in paise and your own error values `ErrDeclined`, `ErrUnavailable`, `ErrUnknownOutcome`.
 2. **Describe the slice of the SDK you use** as a small interface (`RazorpaySDK`). The real SDK client satisfies it implicitly, and tests can supply a fake.
 3. **Write the adapter**: a struct holding the SDK, with methods of the target interface. Each method:
 	- checks `ctx.Err()` first, so a request that is already cancelled never starts a payment;
@@ -187,7 +202,7 @@ sequenceDiagram
 
 Two details make this safe:
 
-- The result channel has a buffer of 1, so the goroutine can always send and exit, even when nobody is waiting any more. With an unbuffered channel it would block forever: a goroutine leak per timeout.
+- The result channel has a buffer of 1 (room to hold one value even if nobody is reading yet), so the goroutine can always send and exit, even when nobody is waiting any more. With an unbuffered channel it would block forever: a goroutine leak (a goroutine that never finishes and keeps its memory) per timeout.
 - A timeout **abandons** the call; it does not cancel it. The provider may still charge the customer. That is why a timeout maps to `ErrUnknownOutcome` ("check the payment status before retrying"), not to "failed".
 
 ### Whiteboard version
@@ -243,6 +258,15 @@ func main() {
 **In plain words:** The full program: our payment interface, a Razorpay adapter that fits it, a fake Razorpay for testing, and a small `main` that shows each case. Read the comments and the printed output; you do not need to follow every line.
 
 One `package main` with `PaymentGateway`, `ChargeRequest` and `RazorpayAdapter`, including context handling, a timeout, error translation, a compile-time check, a function adapter and a fake SDK. `RzpError` codes are modeled on Razorpay's documented error codes; the SDK itself is an in-memory stand-in. Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
+
+**Step by step:**
+
+1. `ChargeRequest` and `PaymentGateway` are our side: one method, `Charge`, with the amount in paise.
+2. `RazorpaySDK` is their side: `CreatePayment` takes no context. `FakeRazorpay` stands in for it and fails on purpose with the errors in `Errs`.
+3. `RazorpayAdapter.Charge` stops early if the caller is gone, adds a timeout, runs `CreatePayment` in a goroutine, and waits for whichever comes first: the result or the timeout.
+4. `translate` turns each `RzpError` code into one of our three errors.
+5. `ChargeFunc` lets a plain function act as a gateway, so `CashOnDelivery` needs no struct.
+6. `PaymentService.Pay` knows only our interface and retries only `ErrUnavailable`; `main` runs each case and prints what happened.
 
 ```go
 package main
@@ -538,8 +562,16 @@ What to notice:
 
 - **retried**: one `SERVER_ERROR` became `ErrUnavailable`, the service retried, and the second SDK call succeeded.
 - **declined**: `BAD_REQUEST_ERROR` became `ErrDeclined`; the service did not retry (1 SDK call). The message keeps the provider detail for logs, but `errors.As(err, &rzpErr)` fails, which the test checks: the provider type does not leak.
-- **slow**: the 50 ms SDK call lost to the 20 ms timeout, and the error wraps both `ErrUnknownOutcome` and `context.DeadlineExceeded` (two `%w` verbs, allowed since Go 1.20).
+- **slow**: the 50 ms SDK call lost to the 20 ms timeout, and the error wraps both `ErrUnknownOutcome` and `context.DeadlineExceeded` (two `%w` verbs, the format code that wraps an error so `errors.Is` can find it inside; allowed since Go 1.20).
 - **cod** and **http.HandlerFunc**: functions turned into interface values by a one-line method.
+
+## Common beginner mistakes 🟢
+
+- **Mistake:** shaping `PaymentGateway` after the first SDK you meet (rupees as `float64`, a `notes` map). → **Why it's wrong:** the second provider will not fit, and the SDK's quirks leak into your checkout code. → **Do this instead:** write `ChargeRequest` in your own words (amount in paise as `int64`, `OrderID`, `UserID`) and adapt every SDK to it.
+- **Mistake:** returning `*RzpError` as it is, or wrapping it with `%w`. → **Why it's wrong:** callers start checking Razorpay error codes, so switching providers breaks them. → **Do this instead:** map codes in one place, as `translate` does, to `ErrDeclined`, `ErrUnavailable` or `ErrUnknownOutcome`.
+- **Mistake:** retrying every error. → **Why it's wrong:** a declined card will never succeed, and blind retries can charge a customer twice. → **Do this instead:** retry only `ErrUnavailable`, like `PaymentService.Pay`.
+- **Mistake:** treating a timeout as "payment failed". → **Why it's wrong:** the SDK call keeps running in the background and may still charge the card. → **Do this instead:** return `ErrUnknownOutcome` and check the payment status before trying again.
+- **Mistake:** an unbuffered `done` channel in `Charge`. → **Why it's wrong:** when the timeout wins, nobody reads the channel, so the goroutine waits forever (a leak). → **Do this instead:** `make(chan result, 1)`, so the late result can be dropped and the goroutine can exit.
 
 ## 5. Variants and comparison 🟡
 
@@ -550,7 +582,7 @@ What to notice:
 | Object adapter | Struct holds the adaptee and implements the target interface | Wrapping SDKs and third-party clients | One type per provider |
 | Function adapter | `type F func(...)` with the interface's one method | One-method interfaces: `http.HandlerFunc`, `ChargeFunc`, `DispenserFunc`, `ValidatorFunc` | Only for single-method interfaces |
 | Adapter function | A function that returns a value of another interface: `io.NopCloser(r)`, `strings.NewReader(s)`, `slog.NewLogLogger(h, level)` | Bridging two standard interfaces | Hidden no-ops (`NopCloser` closes nothing) |
-| Anti-corruption layer | A package of adapters plus translators between your model and an external model | A whole external system (ERP, courier platform, legacy service) | A translation layer to keep in sync |
+| Anti-corruption layer | A package of adapters plus translators between your model and an external model | A whole external system (ERP, the big business software that runs orders, stock and accounts; courier platform; legacy, meaning old, service) | A translation layer to keep in sync |
 
 **Adapter versus its look-alikes:** all four wrap another object; they differ in what the wrapper changes.
 
@@ -568,8 +600,10 @@ See [[Facade (vs Mediator)]], [[Decorator and Middleware]] and [[Proxy]].
 - **One provider, used in one place, with no plan for a second:** calling the SDK directly from a small payment package can be fine. Add the adapter when a second provider or real tests appear. Even then, keep provider types out of your domain packages.
 - **The SDK already accepts `context.Context` and returns usable errors:** the adapter becomes thin (renaming and error mapping only). Do not add a goroutine-and-select timeout; pass the context through.
 - **An adapter that grows business rules** ("if amount > 10,000 rupees, use the other provider") is no longer an adapter. Routing belongs in a service or a strategy (see [[Strategy and Template Method]]).
-- **Leaky adapters** return provider structs or wrap provider errors with `%w`. Callers then type-assert on them, and the adapter stops protecting anything.
+- **Leaky adapters** return provider structs or wrap provider errors with `%w`. Callers then type-assert on them (check at run time which concrete type is inside), and the adapter stops protecting anything.
 - **Cost:** one more type and one translation per call (negligible next to a network call), plus mapping tables to keep up to date when the provider adds error codes.
+
+> 🟡 → 🔴 **You now know** how to build, test and tell apart an adapter from its look-alikes. **Next comes the production view**: real adapters in Go's standard library, the payment bugs a weak adapter causes (double charges, blind retries), and what to watch on a dashboard.
 
 ## 7. In production 🔴
 
@@ -578,7 +612,7 @@ See [[Facade (vs Mediator)]], [[Decorator and Middleware]] and [[Proxy]].
 - `http.HandlerFunc`: the canonical Go function adapter. `type HandlerFunc func(ResponseWriter, *Request)` has a `ServeHTTP` method that calls itself.
 - `io.NopCloser(r)` adapts an `io.Reader` to an `io.ReadCloser` with a no-op `Close`, often used to fill `http.Request.Body` in tests.
 - `slog.NewLogLogger(handler, level)` adapts a `slog.Handler` to a `*log.Logger` for libraries that only accept the old logger type.
-- `database/sql` drivers adapt each database's wire protocol to the `database/sql/driver` interfaces, as described in [[Factory and Abstract Factory]].
+- `database/sql` drivers adapt each database's wire protocol (the exact bytes it sends over the network) to the `database/sql/driver` interfaces, as described in [[Factory and Abstract Factory]].
 
 **Where it shows up in LLD problems:**
 
@@ -590,11 +624,11 @@ See [[Facade (vs Mediator)]], [[Decorator and Middleware]] and [[Proxy]].
 **Failure modes and fixes:**
 
 - The adapter ignores `ctx`, so a slow provider holds requests open. Fix: pass the context if the SDK takes one; otherwise use the goroutine, buffered channel and `select` shown above, and also set the SDK's own HTTP client timeout so abandoned goroutines end.
-- A retry after a timeout charges the customer twice. Fix: map timeouts to "unknown outcome", send an idempotency key (the order ID) with every charge, and reconcile by querying payment status.
+- A retry after a timeout charges the customer twice. Fix: map timeouts to "unknown outcome", send an idempotency key (the order ID) with every charge, and reconcile (compare your records with the provider's) by querying payment status.
 - Provider error codes are retried blindly. Fix: one translation table per provider: permanent (declined, invalid card) versus retryable (gateway or server errors), tested case by case as in `TestErrorTranslation`.
 - A provider adds a new error code. Fix: unknown codes map to the safest category (`ErrUnknownOutcome` here) and are counted, so a new code shows up on a dashboard instead of as silent retries.
 
-**What to monitor:** per provider and per domain error (`declined`, `unavailable`, `unknown_outcome`): call rate, error rate and latency percentiles. Watch the count of timeouts, because every timeout is a payment that needs reconciliation.
+**What to monitor:** per provider and per domain error (`declined`, `unavailable`, `unknown_outcome`): call rate, error rate and latency percentiles (for example p99: the time within which 99 out of 100 calls finish). Watch the count of timeouts, because every timeout is a payment that needs reconciliation.
 
 ## 8. Deep dive 🔴
 
@@ -643,6 +677,26 @@ See [[Facade (vs Mediator)]], [[Decorator and Middleware]] and [[Proxy]].
 - `var _ PaymentGateway = (*RazorpayAdapter)(nil)` for a compile-time check.
 - Test with a fake SDK that scripts errors and latency.
 - Adapter changes the interface; Decorator and Proxy keep it; Facade simplifies many.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 In one line, what does an adapter do?
+> It makes outside code (an SDK) fit an interface that you own, translating calls, data and errors.
+
+> [!question]- 🟢 Who owns the interface: your code or the provider?
+> Your code. You adapt each provider to it, never shape it after one provider.
+
+> [!question]- 🟢 Why should `*RzpError` never reach checkout code?
+> Then checkout depends on Razorpay, and adding or switching a provider means editing checkout.
+
+> [!question]- 🟡 The SDK has no `ctx` parameter. How does the adapter enforce a 3-second timeout?
+> It runs the call in a goroutine that sends to a buffered channel, and `select`s on that channel and `ctx.Done()`.
+
+> [!question]- 🟡 After a timeout, should the service retry the charge?
+> Not blindly: the provider may already have charged. Treat it as "unknown outcome", send an idempotency key, and check the payment status first.
+
+> [!question]- 🟡 Adapter or Decorator: the wrapper keeps the same interface and adds retries. Which is it?
+> Decorator. An adapter changes the interface; a decorator keeps it and adds behaviour.
 
 ## Links 🟢
 

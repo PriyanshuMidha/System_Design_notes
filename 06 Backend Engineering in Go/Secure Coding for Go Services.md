@@ -37,6 +37,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[OWASP API Security Top 10]]: the ten most common ways APIs get attacked, such as reading other users' data or sending huge requests.
+> - [[Request Decoding, Validation and DTOs]]: decode client JSON strictly into a small struct and check every field before trusting it.
+> - [[Building REST Endpoints]]: handlers, status codes, and the allowlist used for list filters.
+
 **From zero, in 60 seconds** 🟢
 
 Attackers do not break the crypto; they use your own features against you. Secure coding means treating every value a client can influence — URL, body, filename, header — as hostile until checked.
@@ -80,6 +85,12 @@ Secure coding means user text is always treated as data, never as instructions.
 | Constant-time compare | Comparing secrets without leaking timing hints | `subtle.ConstantTimeCompare` |
 | Vulnerability scanner | A tool that finds known-bad code or dependencies | `govulncheck`, `gosec` |
 
+| argv | A program's arguments passed as a list, one item each | `["wkhtmltopdf", "in.html", "out.pdf"]` |
+| Symlink | A file that points to another path, possibly outside your folder | `uploads/x` → `/etc/passwd` |
+| Decompression bomb | A small archive that expands to a huge size | 5 KB zip → 5 MB, or far more |
+| AES-GCM | A standard way to encrypt data so it also cannot be changed unnoticed | encrypt a bank account number at rest |
+| Nonce | A random value used once per encryption; must never repeat with the same key | 12 random bytes per message |
+
 **Picture it**
 
 ```mermaid
@@ -110,6 +121,8 @@ Where it breaks: a mailroom checks once at the door; in code each destination (S
 
 ## 1. Why it exists 🟢
 
+🟢 **Plain version:** One InvoiceOps feature, the bulk import, takes a zip file, a sort choice and a file name from an admin, and runs an outside program to make a PDF. That gives an attacker four doors: the sort choice could carry SQL, the PDF command could carry an extra shell command, the file name could climb out of its folder with `../`, and the zip could explode to a huge size. Each door has one specific Go fix, shown in this note.
+
 InvoiceOps ships a bulk-import feature: an admin uploads a `.zip` of CSV invoice batches, picks a column to sort the import summary by, and the system renders that summary to PDF by shelling out to an external renderer.
 
 One feature, four different places untrusted input can reach something dangerous if it is handled the generic way instead of the Go-specific way:
@@ -117,13 +130,17 @@ One feature, four different places untrusted input can reach something dangerous
 1. **The sort column.** `fmt.Sprintf("SELECT * FROM invoices ORDER BY %s", r.URL.Query().Get("sort"))` looks like the same kind of injection risk as an unparameterized `WHERE` clause — but it cannot be fixed the same way.
 
    `database/sql`'s placeholders bind **values**, not **identifiers**; there is no `$1` for a column name. A request for `sort=amount); DROP TABLE invoices;--` reaches the database verbatim if the only defense attempted is string formatting.
-2. **The PDF render step.** A handler that builds `"wkhtmltopdf --quiet " + htmlPath + " " + outPath` and runs it via `sh -c` hands an attacker who controls any part of that string a second command, joined with `;`, `&&`, or a backtick substitution — the same class of bug as the SQL case, one layer lower, in the shell instead of the database.
+2. **The PDF render step.** A handler that builds `"wkhtmltopdf --quiet " + htmlPath + " " + outPath` and runs it via `sh -c` hands an attacker who controls any part of that string a second command, joined with `;`, `&&`, or a backtick substitution (shell symbols that start another command) — the same class of bug as the SQL case, one layer lower, in the shell instead of the database.
 3. **A "download the original CSV" link** built from a client-supplied filename. `../../etc/passwd` or a symlink planted by an earlier upload can walk outside the intended directory if the only check is a passing glance at the string.
 4. **The uploaded `.zip` itself.** A decompression bomb — a small file that expands enormously once decompressed — can exhaust memory or disk during extraction, long before any CSV parsing logic runs.
 
    **Measured** (this note's own test, `archive/zip`, a single repeated-byte entry, Go 1.24, 2026-11-07): 5,242,880 decompressed bytes compressed down to 5,250 bytes on disk — a ~999:1 ratio from the most naive possible payload; a deliberately adversarial stream (structured to maximize DEFLATE's back-reference compression) can do dramatically better than that.
 
 Each of these has a narrow, specific Go fix — not "be more careful," but a specific function or pattern that removes the category of bug entirely.
+
+### A real-life example 🟢
+
+Many food and shopping apps let you sort a list "by price" or "by rating". If the server pasted your choice straight into SQL, a crafted value could run its own database command. A safe server only accepts `price` or `rating` from a short list and rejects anything else with 400. In the same way, when an app turns your order into a PDF invoice with an outside tool, it passes file names as separate arguments, never as one shell string, so a strange file name cannot start a second command.
 
 ## 2. Mental model 🟢
 
@@ -138,9 +155,18 @@ String concatenation, a shell, or an un-capped decoder are never that gate — e
 
 ## 3. How it works 🟡
 
+🟢 → 🟡 You now know the rule: untrusted text passes one typed gate for where it is going and never becomes code. Next we open the box: the checks at the request's front door, why a column name cannot use a SQL placeholder, and why running a program from an argument list is safe while a shell string is not.
+
 ### The request trust boundary, control by control
 
 **In plain words:** a walk along the front door: for each thing a client sends, the one check that makes it safe to touch.
+
+**Step by step:**
+1. TLS decrypts the request; size and time limits stop huge or slow requests.
+2. Authentication finds the caller; authorization checks they may touch this row.
+3. Strict DTO decoding and validation check the fields.
+4. Then each dangerous destination gets its own gate: allowlist for SQL names, argv for commands, `IsLocal` plus `os.Root` for paths, a byte cap for archives.
+5. Output is encoded safely on the way back.
 
 ```mermaid
 flowchart LR
@@ -165,6 +191,12 @@ Everything left of "this note" in the diagram already has its own full treatment
 
 **In plain words:** placeholders protect values, not structure — a column name is structure, so it needs an allowlist instead.
 
+**Step by step:**
+1. `WHERE status = $1` with `status = "paid"` is safe: the database treats `$1` as a value.
+2. `ORDER BY $1` does not work: the database will not accept a column name in a placeholder.
+3. So read `?sort=amount`, look it up in a map like `{"amount": "amount_minor", "date": "created_at"}`.
+4. Found → use the mapped column. Not found → 400. The client's text never enters the SQL.
+
 ```go
 // Both of these run against the same *sql.DB. Only one is safe.
 db.QueryContext(ctx, "SELECT * FROM invoices WHERE status = $1", status) // OK: value
@@ -181,6 +213,12 @@ A column name or `ASC`/`DESC` keyword is part of the grammar itself; there is no
 
 **In plain words:** pass a program and its arguments as separate list items; the moment you build one shell string, attacker text becomes attacker commands.
 
+**Step by step:**
+1. Unsafe: `sh -c "wkhtmltopdf " + htmlPath` with `htmlPath = "a.html; rm -rf ~"` runs two commands.
+2. Safe: `exec.CommandContext(ctx, "wkhtmltopdf", htmlPath, outPath)`.
+3. Go starts the program directly (via `execve`, the OS call that starts a program) with those exact arguments; no shell reads `;`.
+4. `wkhtmltopdf` just fails to find a file named `a.html; rm -rf ~`.
+
 ```mermaid
 flowchart TD
     subgraph shellform["Shell form: sh -c with a concatenated command string"]
@@ -193,7 +231,7 @@ flowchart TD
 
 `exec.Command`/`exec.CommandContext` call `execve` (or the platform equivalent) directly with an argument vector — there is no intermediate shell to hand metacharacters to, ever, regardless of what bytes any argument contains.
 
-The moment code builds a string and passes it to `sh -c` (or shells out via `os/exec` with `"sh", "-c", cmdString"`), every shell metacharacter in that string is live again.
+The moment code builds a string and passes it to `sh -c` (or shells out via `os/exec` with `"sh", "-c", cmdString"`), every shell metacharacter (characters like `;`, `|`, `$` that the shell treats as instructions) in that string is live again.
 
 Two residual risks remain even with argv: a user-controlled value starting with `-` can be read by the child as an option (use the tool's `--` end-of-options marker where it supports one, or only pass server-generated paths), and `exec.Command` resolves a bare name through `PATH`, so call a tool by absolute path in hardened containers (Go refuses to run a binary found via the current directory and returns `exec.ErrDot`).
 
@@ -223,6 +261,8 @@ io.ReadAll(entry) // entry is a *zip.File opened with .Open()
 The full version below fixes each one. It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
 
 ### SQL identifier allowlist
+
+**What this code does, in plain words:** `ValidateSort` checks the client's sort column and direction against an allowlist and returns an error for anything not on it; `BuildOrderByClause` then builds the `ORDER BY` text only from allowed values. The test feeds it injection strings and checks they are all rejected.
 
 ```go
 package securecoding
@@ -298,6 +338,8 @@ func TestValidateSortRejectsInjection(t *testing.T) {
 
 ### Running an external command without a shell
 
+**What this code does, in plain words:** `runArgv` runs a program with `exec.CommandContext` and a timeout, passing every argument as a separate list item; `RenderInvoicePDF` uses it for the renderer. The test runs `echo` with the payload `report.html; rm -rf ~ #` and checks it comes back as plain text, proving no shell read the `;`.
+
 ```go
 package securecoding
 
@@ -365,6 +407,8 @@ func TestRunArgvPassesMetacharactersLiterally(t *testing.T) {
 
 **In plain words:** '../' in a filename is a ladder out of your folder; the first check is pure string math, before the filesystem is ever touched.
 
+**What this code does, in plain words:** `SafeJoin` rejects any name that `filepath.IsLocal` says could leave the base folder (`..`, absolute paths, empty names) before joining it to the base; the test lists good and bad names.
+
 ```go
 package securecoding
 
@@ -420,6 +464,8 @@ func TestSafeJoin(t *testing.T) {
 ### Closing the symlink gap with `os.Root`
 
 **In plain words:** string checks cannot see symlinks; os.Root makes the operating system itself refuse to follow anything out of the folder.
+
+**What this code does, in plain words:** `ReadInRoot` opens the base folder with `os.OpenRoot` and reads the file only through that root (with a size cap), so even a symlink pointing outside is refused by the operating system; the test plants such a symlink and expects an error.
 
 ```go
 package securecoding
@@ -480,6 +526,14 @@ func TestReadInRootBlocksSymlinkEscape(t *testing.T) {
 Do not use a string-prefix check (`strings.HasPrefix(filepath.Clean(p), base)`) as a substitute: `/data/invoiceops-evil` has the prefix `/data/invoiceops`, and the check is lexical, so symlinks defeat it too.
 
 ### A decompression-bomb guard for uploaded archives
+
+**Step by step:**
+1. Open the zip and loop over its entries, stopping after a maximum number of entries.
+2. For each entry, read through `io.LimitReader` capped at, say, 1 MiB plus 1 byte.
+3. If you read more than the cap, stop and reject the upload; do not trust the size the zip header claims.
+4. Keep a running total across all entries too, and never use the entry name as a file path.
+
+**What this code does, in plain words:** `ExtractZipEntry` does step 2 for one entry (the other steps are listed after the code); the test builds a tiny zip that expands to 5 MiB and checks it is rejected.
 
 ```go
 package securecoding
@@ -579,6 +633,8 @@ Two more rules for archives. Cap the **number of entries** and the **total** dec
 Run it through `filepath.IsLocal` (or extract through an `os.Root`), or better, store the bytes under a name the service generates. Since Go 1.20, setting `GODEBUG=zipinsecurepath=0` makes `zip.NewReader` return `zip.ErrInsecurePath` for such names, but it is off by default, so check each name yourself.
 
 ### Modern crypto/rand: one-time codes and encryption at rest
+
+**What this code does, in plain words:** `NewOneTimeCode` makes codes with `crypto/rand`, `NewAESKey` makes a key, and `Encrypt`/`Decrypt` use AES-256-GCM with a fresh random nonce for each message; the test checks that a changed byte fails to decrypt.
 
 ```go
 package securecoding
@@ -687,6 +743,8 @@ func TestDecryptRejectsTamperedCiphertext(t *testing.T) {
 
 ### Constant-time comparison and log redaction
 
+**What this code does, in plain words:** `TokenEqual` and `VerifyHMAC` compare secrets in constant time so timing reveals nothing, and the `Secret` type always logs as `[REDACTED]`.
+
 ```go
 package securecoding
 
@@ -768,7 +826,7 @@ Smaller controls from the same audit, each with a one-line Go answer:
 - **XSS:** use `html/template`, which escapes by context; `text/template` does no escaping and must never render HTML.
 - **Cookie-authenticated browsers:** `SameSite` cookies, plus `http.CrossOriginProtection` (Go 1.25) for CSRF; see [[CSRF, XSS and Security Headers]], which also covers HSTS, `nosniff` and CSP.
 - **TLS:** keep `MinVersion` at `tls.VersionTLS12` or higher and never set `InsecureSkipVerify`; see [[TLS, HTTPS and HTTP2 in Go Servers]].
-- **Supply chain:** commit `go.sum` and keep the default `GOSUMDB` verification on, pin tools with the `go.mod` `tool` directive (Go 1.24), and automate updates with Renovate or Dependabot.
+- **Supply chain:** commit `go.sum` and keep the default `GOSUMDB` verification on, pin tools with the `go.mod` `tool` directive (Go 1.24; it records exact versions of dev tools like linters), and automate updates with Renovate or Dependabot.
 
 > [!warning] Interview trap
 > `govulncheck` passing does not mean the project has zero vulnerable dependencies — it means zero vulnerable *functions the binary's own call graph can reach*.
@@ -785,7 +843,26 @@ Smaller controls from the same audit, each with a one-line Go answer:
 - AES-GCM key management (rotation, where the key itself lives) is a real operational cost on top of the cipher code; [[Secrets Management]] is where that key's own lifecycle belongs, not this note.
 - `gosec` produces real false positives (flagging `#nosec`-worthy patterns like a hardcoded non-secret constant or a deliberately weak hash used for a cache key, not a credential); a blanket "fix every finding" policy trains a team to silence the tool instead of reading it — require a one-line justification on every suppression instead.
 
+### SQL value vs SQL identifier 🟡
+
+| | Value | Identifier |
+| --- | --- | --- |
+| Example | `'paid'` in `WHERE status = ...` | `amount` in `ORDER BY ...` |
+| Safe fix | placeholder `$1` | allowlist map |
+| Can the driver escape it? | yes | no |
+| Bad input result | treated as plain text | rejected with 400 |
+
+### Common beginner mistakes 🟢
+
+- Building SQL with `fmt.Sprintf` for a sort column → SQL injection → map allowed names to fixed column text.
+- Running `sh -c` with a built string → command injection → use `exec.Command(name, args...)`.
+- Checking a path only with string rules → a planted symlink escapes the folder → add `os.Root`.
+- Trusting the zip's declared size → a bomb fills memory or disk → cap the real bytes with `io.LimitReader`.
+- Using `math/rand` for codes or tokens → they can be predicted → use `crypto/rand`.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now close the four doors: SQL names, shell commands, paths and archives, plus safe random codes and encryption. The advanced part covers keeping it closed over time: CI scanners like `govulncheck` (which checks if your code actually calls a known-vulnerable function) and `gosec` (which flags risky code patterns), key rotation, and why some Go packages are safe by design.
 
 - **Real systems:** the Go vulnerability database (`vuln.go.dev`) that powers `govulncheck` is maintained by the Go security team specifically to support this reachability-based workflow; `gosec` is maintained under the `securego` GitHub organization and ships as a `golangci-lint` linter as well as a standalone binary; OWASP's own API Security Top 10 project collects real incident categories (the BOLA, SSRF and mass-assignment entries are each backed by named public breaches in OWASP's own write-up).
 - **Failure modes → fixes:**
@@ -870,6 +947,26 @@ Smaller controls from the same audit, each with a one-line Go answer:
 - Compare secrets with `subtle.ConstantTimeCompare` or `hmac.Equal`, never `==`; wrap secrets in a `slog.LogValuer` so they cannot be logged.
 - `gosec` catches the static shape of these bugs (variable URLs and paths, weak crypto, unchecked errors) as a second, automated layer behind code review.
 - Most of the OWASP API Security Top 10 is already fully covered elsewhere in this vault — check the table in section 5 before writing a new fix for BOLA, mass assignment, SSRF, or XSS.
+
+## Self-check 🟢🟡
+
+> [!question]- Why can a sort column not use a `$1` placeholder?
+> Placeholders hold values; a column name is part of the query's structure, so it needs an allowlist.
+
+> [!question]- What is the safe way to run an outside program in Go?
+> `exec.Command(name, args...)`, which passes arguments as a list with no shell.
+
+> [!question]- What does `filepath.IsLocal("../x")` return?
+> `false`, because the path would leave the base folder.
+
+> [!question]- Why is `IsLocal` alone not enough?
+> It only looks at the string; a symlink inside the folder can still point outside. `os.Root` closes that gap.
+
+> [!question]- Why cap decompressed bytes instead of trusting the zip header?
+> The header's size is written by the attacker; only counting real bytes is reliable.
+
+> [!question]- In AES-GCM, what must never repeat under the same key?
+> The nonce.
 
 ## Links 🟢
 

@@ -26,7 +26,7 @@ updated: 2026-11-13
 > Most SQL bugs come from three places: `NULL`, which makes a condition "unknown" instead of true or false; joins that multiply rows; and forgetting the order in which a query's clauses apply.
 
 > [!abstract] Core idea
-> - You describe the result, not the steps; the planner picks how to fetch it.
+> - You describe the result, not the steps; the planner (the part of the database that decides how to run a query) picks how to fetch it.
 > - Clauses run in a fixed logical order: FROM/JOIN, WHERE, GROUP BY, HAVING, SELECT, ORDER BY, LIMIT. That is why WHERE cannot see a SELECT alias.
 > - `NULL` means unknown: `x = NULL` is never true, so use `IS NULL` and beware `NOT IN` over a column that can be NULL.
 > - Joins multiply rows: joining a one-to-many table before summing double-counts money.
@@ -38,6 +38,9 @@ updated: 2026-11-13
 > - 🟢 **New to this?** Read "From zero" below, then sections 1, 2, the first four parts of section 3 (schema, clause order, joins, grouping) and the cheat sheet (10). Stop there, that is a full first pass.
 > - 🟡 **Know the basics?** Add the rest of section 3 (windows, CTEs, NULL, constraints, upserts), section 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+> [!note] Before this note
+> - Nothing. This note starts from zero.
 
 **From zero, in 60 seconds** 🟢
 
@@ -89,6 +92,11 @@ This note teaches how to ask it correctly.
 | `NULL` | "Unknown or missing value", not zero and not empty | `paid_at IS NULL` |
 | Parameter | A placeholder filled in safely by the driver | `WHERE id = $1` |
 | Transaction | A group of statements that succeed or fail together | `BEGIN; ... COMMIT;` |
+| Primary key | The column that uniquely names each row | `invoices.id` |
+| Foreign key | A column that points at a row in another table | `invoices.client_id → clients.id` |
+| CTE | A named sub-query written with `WITH name AS (...)` | `WITH open_invoices AS (...)` |
+| Window function | A calculation over related rows that keeps every row | running total per client |
+| Upsert | Insert a row, or update it if it already exists | `INSERT ... ON CONFLICT DO UPDATE` |
 
 **Picture it**
 
@@ -138,6 +146,21 @@ flowchart LR
     end
 ```
 
+### Real-life example 🟢
+
+The "Your orders" screen in a food delivery app is one SQL query away.
+It asks: from the orders table, joined to the restaurants table, the rows for this customer, newest first, 20 at a time.
+The app never loads every order on earth; it sends that question and gets 20 rows back.
+The same idea answers "which restaurants did I order from most this year": join, group by restaurant, count, sort.
+
+## Common beginner mistakes 🟢
+
+- **Writing `WHERE email = NULL`** → it is never true, so you get no rows → write `WHERE email IS NULL`.
+- **Using `NOT IN (subquery)` when the subquery can return NULL** → the whole result becomes empty → use `NOT EXISTS`.
+- **Putting a right-table condition of a `LEFT JOIN` in `WHERE`** → rows without a match vanish, so it acts like a plain join → move that condition into `ON`.
+- **Joining items and payments together, then summing** → rows multiply and totals come out doubled → sum each child table separately, then join the sums.
+- **Gluing user input into the SQL string** → a value like `'; DROP TABLE invoices` becomes SQL (SQL injection) → pass values as parameters (`$1`).
+
 ## 2. Mental model 🟢
 
 - A **table** (a *relation* in Codd's 1970 model) holds **rows** that share the same **columns**. Each row is one fact: "invoice INV-102 belongs to client 10 and is overdue".
@@ -148,11 +171,13 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that SQL describes a result and that joins, grouping and `NULL` are the tricky parts. **Next we open the box**: the order the database really applies your clauses, every kind of join, grouping, window functions, CTEs, `NULL` logic, constraints and safe writes. Each subsection starts with a short step-by-step walk on the sample data.
+
 ### The running schema
 
 **In plain words:** four small tables used in every example: clients, their invoices, the lines on each invoice, and payments.
 
-A trimmed InvoiceOps schema with four tables. The full DDL is in [[SQL Essentials - Go]]; the production version with tenant-safe keys is in [[Relational Schema Design]]. Columns ending in `_minor` hold money as integer **minor units** (paise): ₹1,500.00 is `150000`.
+A trimmed InvoiceOps schema with four tables. The full DDL (the `CREATE TABLE` statements) is in [[SQL Essentials - Go]]; the production version with tenant-safe keys is in [[Relational Schema Design]]. Columns ending in `_minor` hold money as integer **minor units** (paise): ₹1,500.00 is `150000`.
 
 | Table | Key columns | Rules it carries |
 | --- | --- | --- |
@@ -197,6 +222,13 @@ INV-102 has two line items (₹1,500 logo and ₹1,000 brand guide) and one paym
 
 **In plain words:** you write SELECT first, but the database reads FROM first. Knowing the real order explains most "why can't I use that name here?" errors.
 
+**Step by step (for `SELECT name AS n FROM clients WHERE ... ORDER BY n`):**
+1. `FROM` picks the `clients` table: 4 rows.
+2. `WHERE` throws away rows that do not match.
+3. `GROUP BY` and `HAVING` run next, if present.
+4. `SELECT` computes the output columns and creates the alias `n`.
+5. `ORDER BY` sorts, and can use `n`; `LIMIT` cuts. `WHERE` ran in step 2, before `n` existed, which is why it cannot use it.
+
 You write `SELECT … FROM … WHERE …`, but PostgreSQL defines the result as if the clauses ran in this order:
 
 ```mermaid
@@ -215,6 +247,12 @@ What follows from it (PostgreSQL 17):
 ### Joins
 
 **In plain words:** a join lines up rows from two tables that share a value, like matching each invoice to its client by client id.
+
+**Step by step:**
+1. Take the 4 clients and the 6 invoices.
+2. `JOIN ... ON i.client_id = c.id` pairs each invoice with its client: 6 rows. Cobalt has no invoices, so it is missing.
+3. `LEFT JOIN` keeps every client: 7 rows, with Cobalt's invoice columns all NULL.
+4. `EXISTS` (a **semi-join**) returns each client once if any matching invoice exists; `NOT EXISTS` (an **anti-join**) returns clients with none.
 
 | Join (clients `c`, invoices `i`)                       | Keeps                                             | Rows on the sample      |
 | ------------------------------------------------------ | ------------------------------------------------- | ----------------------- |
@@ -264,6 +302,12 @@ LEFT JOIN invoices i ON i.client_id = c.id AND i.status = 'overdue';
 
 **In plain words:** sort rows into piles (one per client), then count or add up each pile. Each pile becomes one output row.
 
+**Step by step:**
+1. Join clients to invoices with a `LEFT JOIN`: 7 rows.
+2. `GROUP BY c.id` makes 4 piles: Acme Corp (2 rows), Acme Labs (1), Bolt Foods (3), Cobalt (1 row of NULLs).
+3. `count(*)` counts rows in each pile; `count(i.id)` skips NULLs, so Cobalt gets 0.
+4. `sum(...)` over Cobalt's NULLs gives NULL, not 0; wrap it in `coalesce(..., 0)` if you need 0.
+
 A `LEFT JOIN` from clients to invoices, grouped by client, shows the difference between the two counts. The full query (with `FILTER` columns) and its output table are in [[SQL Essentials - Go]]. The key lines:
 
 ```sql
@@ -291,6 +335,13 @@ With the `FILTER` columns, the representative open balances are 150000 (Acme Cor
 ### Window functions
 
 **In plain words:** like grouping, but you keep every row and add a column such as "running total" or "rank within this client".
+
+**Step by step:**
+1. `PARTITION BY client_id` splits invoices into one group per client, but keeps every row.
+2. `ORDER BY issue_date` orders each group by date.
+3. `row_number()` numbers each client's invoices 1, 2, 3...
+4. `sum(total_minor)` with a frame gives a running total: Acme Corp's two invoices show 120000, then 370000.
+5. To keep only "row 1", wrap the query and filter outside, because windows run after `WHERE`.
 
 A window function computes over a set of rows related to the current row, like `GROUP BY` that keeps every row.
 
@@ -352,6 +403,12 @@ WHERE rn = 1;
 
 **In plain words:** a query inside a query. A CTE (`WITH name AS (...)`) just gives that inner query a name so the big query reads top to bottom.
 
+**Step by step (the recursive CTE for Acme's family):**
+1. The anchor finds client 10, Acme Corp.
+2. The step finds clients whose `parent_id` is 10: Acme Labs (11).
+3. The step runs again for 11 and finds nothing, so it stops.
+4. The family is {10, 11}; summing their open balances gives 150000 + 80000 = 230000.
+
 - **Scalar subquery:** returns one value, e.g. `(SELECT max(paid_at) FROM payments p WHERE p.invoice_id = i.id)`. It is *correlated*: it refers to the outer row.
 - **`IN` / `EXISTS`:** a semi-join. `EXISTS` stops at the first match.
 - **Derived table:** a subquery in `FROM`, as in the latest-invoice query above.
@@ -371,6 +428,13 @@ The anchor yields `{10}`, the first step adds `{11}`, the second step finds noth
 ### NULL and three-valued logic
 
 **In plain words:** NULL means "we don't know". Asking "is unknown equal to 5?" gives "don't know", not yes or no, and "don't know" rows get dropped.
+
+**Step by step:**
+1. Acme Labs has `email = NULL`.
+2. `WHERE email = 'x@y.test'` asks "is unknown equal to x@y.test?" The answer is UNKNOWN, not FALSE.
+3. `WHERE` keeps only TRUE rows, so Acme Labs is dropped, which is fine here.
+4. `WHERE email <> 'x@y.test'` is also UNKNOWN, so Acme Labs is dropped again, which surprises people.
+5. Ask about NULL directly with `IS NULL`, or use `IS DISTINCT FROM`.
 
 A comparison with NULL is neither true nor false but **UNKNOWN**.
 
@@ -413,6 +477,12 @@ WHERE NOT EXISTS (SELECT 1 FROM clients ch WHERE ch.parent_id = c.id);
 
 **In plain words:** rules the database enforces for you, like "this can't be empty" or "no two rows with the same email". Break one and the write is refused.
 
+**Step by step:**
+1. The table says `CHECK (total_minor >= 0)`.
+2. Some code tries `INSERT ... total_minor = -500`.
+3. The database refuses and returns error code `23514` (a SQLSTATE: a five-character error code).
+4. Your Go code turns that code into an API error, for example `400 Bad Request`.
+
 | Constraint             | Rejects                                                       | SQLSTATE on violation         |
 | ---------------------- | ------------------------------------------------------------- | ----------------------------- |
 | `NOT NULL`             | a missing value                                               | 23502 not_null_violation      |
@@ -426,6 +496,12 @@ Your Go code should map these codes to API errors (23505 → 409 Conflict). Whic
 ### Writing: RETURNING, upserts and MERGE
 
 **In plain words:** handy write tricks: get the new id back straight away, and "insert, or update if it already exists" in one safe step.
+
+**Step by step (importing Bolt Foods from a CSV):**
+1. `INSERT` tries to add Bolt Foods with email `ap@bolt.test`.
+2. A client with that email already exists in workspace 1, so the unique rule fires.
+3. `ON CONFLICT ... DO UPDATE` updates the existing row's name instead of failing.
+4. `RETURNING id, name` hands back the row in the same round trip.
 
 ```sql
 -- RETURNING hands back generated values in the same round trip
@@ -455,7 +531,7 @@ flowchart TD
     C -->|"DO UPDATE"| X["lock the existing row, apply SET with EXCLUDED.*"] --> R3["RETURNING: the updated row"]
 ```
 
-- The conflict target must match a unique index or constraint exactly, here `UNIQUE (workspace_id, email)`. `EXCLUDED` is the row you tried to insert.
+- The conflict target (the arbiter index: the unique index used to detect the clash) must match a unique index or constraint exactly, here `UNIQUE (workspace_id, email)`. `EXCLUDED` is the row you tried to insert.
 - `DO NOTHING … RETURNING` returns **no row** on a conflict, which breaks naive "get or create" code. Follow it with a `SELECT`.
 - One statement may not touch the same row twice. A CSV with the same email on two lines fails with "ON CONFLICT DO UPDATE command cannot affect row a second time"; deduplicate the input first.
 - `MERGE` (PostgreSQL 15+) syncs a target from a source with `WHEN MATCHED` / `WHEN NOT MATCHED` branches, and PostgreSQL 17 lets it `RETURNING merge_action()`. When other sessions may insert the same keys concurrently, the docs point to `INSERT … ON CONFLICT`, which can switch to an `UPDATE` if a concurrent `INSERT` wins.
@@ -527,7 +603,7 @@ Two details are worth checking against the trace. INV-104 is not late yet (−18
 
 **In plain words:** never glue user text into SQL. Put `$1` in the SQL and pass the value separately, so it can only ever be a value.
 
-Values must travel as **parameters** (`$1`, `$2`). Drivers such as pgx send the SQL text and the values in separate protocol messages by default, so a value can never become SQL. Column names and `ASC`/`DESC` cannot be parameters, so the builder maps user input to fixed fragments from a whitelist and ends every sort with the unique `id`.
+Values must travel as **parameters** (`$1`, `$2`). Drivers such as pgx (the popular PostgreSQL driver for Go) send the SQL text and the values in separate protocol messages by default, so a value can never become SQL. Column names and `ASC`/`DESC` cannot be parameters, so the builder maps user input to fixed fragments from a whitelist and ends every sort with the unique `id`.
 
 ```mermaid
 sequenceDiagram
@@ -576,7 +652,7 @@ The same question can often be written several ways. They differ in NULL behavio
 
 - **Push work to the database when it shrinks data.** Filtering and aggregating 10 million rows into 3 belongs in SQL. Business rules with many branches belong in Go, where they can be unit tested; a 200-line query nobody can change is a liability.
 - **CTEs are for readability, not speed.** Since PostgreSQL 12 they are usually inlined. `MATERIALIZED` makes the CTE an optimization fence: good for an expensive step used twice, bad when the outer filter could have pushed into it.
-- **`OFFSET` pagination** reads and throws away every skipped row: page 1,000 at 20 rows per page first discards 19,980 rows. Use keyset pagination ([[Pagination, Filtering and Sorting]]).
+- **`OFFSET` pagination** reads and throws away every skipped row: page 1,000 at 20 rows per page first discards 19,980 rows. Use keyset pagination (ask for rows after the last one you saw, like `WHERE id > 5120`) ([[Pagination, Filtering and Sorting]]).
 - **`SELECT *` in application code** breaks when columns are added or reordered and fetches columns you do not need, including large ones.
 - **Dialects differ.** MySQL 8.0 has `ON DUPLICATE KEY UPDATE` instead of `ON CONFLICT` and no `RETURNING`. Portable SQL is a goal only if you really plan to switch engines.
 
@@ -589,6 +665,8 @@ flowchart LR
 ```
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how to write correct joins, groups, windows, CTEs and upserts. **Next is the senior view**: the bugs that reach production (fan-out double counting, casts that disable indexes, time-zone literals), what to monitor, and how the engine handles `NOT IN`, upserts and window frames inside.
 
 - **Real systems:**
 	- PostgreSQL, MySQL, SQL Server, Oracle and SQLite all speak SQL, with different upsert, `RETURNING` and `LIMIT` syntax.
@@ -642,6 +720,9 @@ flowchart LR
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** The database applies `FROM`, then `WHERE`, then `GROUP BY`, then `SELECT`, then `ORDER BY`. NULL means unknown, so compare it with `IS NULL`, and prefer `NOT EXISTS` over `NOT IN`. Joins can copy rows, so sum child tables separately. Always send user values as parameters, never pasted into the SQL text.
+
+
 - Logical order: FROM/JOIN → WHERE → GROUP BY → HAVING → SELECT (windows) → DISTINCT → ORDER BY → LIMIT.
 - NULL makes comparisons UNKNOWN: `WHERE` keeps only TRUE, `CHECK` rejects only FALSE. Use `IS NULL`, `IS DISTINCT FROM`, `coalesce`.
 - Prefer `NOT EXISTS` to `NOT IN`; put right-table conditions of a `LEFT JOIN` in `ON`.
@@ -650,6 +731,30 @@ flowchart LR
 - Upsert with `ON CONFLICT` on a matching unique index; `RETURNING` instead of `LastInsertId`.
 - Parameters for values, a whitelist for identifiers; always end `ORDER BY` with a unique column.
 - Keep the column bare in predicates: no casts or functions on it, no type mismatches.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why can't `WHERE` use an alias defined in `SELECT`?
+> `WHERE` runs before `SELECT`, so the alias does not exist yet.
+
+> [!question]- What does `count(i.id)` give for a client with no invoices after a `LEFT JOIN`?
+> 0, because `count(col)` skips NULLs (while `count(*)` gives 1).
+
+> [!question]- How do you test for a missing email?
+> `email IS NULL`; `email = NULL` is never true.
+
+🟡 Medium
+
+> [!question]- Why does `id NOT IN (SELECT parent_id FROM clients)` return 0 rows on the sample data?
+> The subquery contains NULLs, so every comparison becomes UNKNOWN and `WHERE` drops every row.
+
+> [!question]- A `LEFT JOIN` with `WHERE i.status = 'overdue'` lost the clients without invoices. Fix?
+> Move the condition into `ON ... AND i.status = 'overdue'`.
+
+> [!question]- Why does `INSERT ... ON CONFLICT DO NOTHING RETURNING id` sometimes return no row?
+> On a conflict nothing is inserted, so nothing is returned; follow it with a `SELECT`.
 
 ## Links 🟢
 

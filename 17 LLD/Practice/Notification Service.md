@@ -31,6 +31,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code) and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs) and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Factory and Abstract Factory]]: one function that picks the right type by name, here the sender for a channel.
+> - [[Adapter]]: a thin wrapper that makes a vendor's own API look like our small `Sender` interface.
+> - [[Decorator and Middleware]]: a wrapper with the same interface that adds a step, here the rate limit.
+> - [[Concurrency for LLD]]: goroutines, channels and worker pools; how many workers share one queue safely.
+
 **From zero, in 60 seconds** 🟢
 
 When you place an order, the app sends you an SMS, an email or a push message. A notification service turns one event, like "order placed", into one message per channel. Workers pick messages from a queue and send them through outside providers. Some failures are worth trying again, like a timeout. Others are not, like a wrong phone number. Trying again with growing gaps is called **backoff**. Urgent messages, like a login code, skip ahead of marketing.
@@ -62,6 +68,11 @@ Everything else in this note is just these 3 questions:
 | Retryable error | A failure that may work next time | 503, timeout, 429 |
 | Backoff with jitter | Wait longer after each failure, plus randomness | 1 s, 2 s, 4 s ± random |
 | DLQ (dead-letter queue) | Where messages go after giving up | Invalid number after 5 tries |
+| Rate limit (token bucket) | A cap on sends per second; each send spends a token that refills over time | 100 SMS per second per vendor |
+| Failover | Switch to a backup when the main one fails | SMS vendor A down: use vendor B |
+| At-least-once | Every message is sent, but a crash can cause one repeat | Rare duplicate SMS after a crash |
+| Outbox | A database table where "please send this" is saved in the same transaction as the order | Row stays `queued` until sent |
+| Drain | On shutdown, stop taking new work but finish what is already queued | Deploy waits for 20 queued messages |
 
 **Picture it**
 
@@ -117,14 +128,14 @@ Questions to ask, with the assumptions this design makes:
 - Which channels, transactional or marketing? *Email, SMS, push, WhatsApp; OTPs and order updates are high priority, marketing is low.*
 - Delivery guarantee? *At-least-once from the queue, made effectively once by an idempotency key.*
 - Rate limits? *Per provider account, for example 100 SMS/s (an example figure; each vendor contract differs).*
-- What if the SMS vendor is down? *Fail over to a secondary SMS vendor.*
-- Which errors are worth retrying? *Network timeouts, 408, 429 and 5xx. An invalid number (other 4xx) fails the same way every time.*
-- WhatsApp consent? *Explicit opt-in; no stored WhatsApp number means not opted in.*
+- What if the SMS vendor is down? *Fail over (switch automatically) to a secondary SMS vendor.*
+- Which errors are worth retrying? *Network timeouts, 408, 429 and 5xx (server-side errors such as 500 and 503). An invalid number (other 4xx, the client-side errors such as 400) fails the same way every time.*
+- WhatsApp consent? *Explicit opt-in (the user said yes first); no stored WhatsApp number means not opted in.*
 - Shutdown during a deploy? *Stop intake, finish what is queued, give up after a deadline.*
 
 **Functional:** send on four channels through third-party providers wrapped by adapters; respect per-channel opt-out and contacts; render templates (HTML for email, plain text elsewhere); trigger from order events; retry retryable failures with backoff; per-provider rate limit; primary and secondary SMS provider; OTPs before marketing.
 
-**Non-functional:** the order flow never waits on a provider (async, bounded queue that fails fast); no duplicate sends when an event arrives twice; no message lost on a deploy (drain, plus the outbox in production); a new channel or vendor is one adapter and one factory entry.
+**Non-functional:** the order flow never waits on a provider (async: handed to a background worker, using a bounded queue that fails fast); no duplicate sends when an event arrives twice; no message lost on a deploy (drain, plus the outbox in production); a new channel or vendor is one adapter and one factory entry.
 
 **Out of scope:** template authoring UI, localisation, campaign targeting, in-app inbox, delivery receipts (a follow-up through webhooks).
 
@@ -157,6 +168,8 @@ The use case to code: **process one notification in a worker**, from the idempot
 Modelling insight: **a channel is not a provider.** The channel (SMS) is what the user sees; the provider (vendor A, vendor B) is who sends it. `Service` knows only channels and `Sender`; which vendors sit behind a channel, with what limits and in what failover order, is wiring. That is why failover and rate limiting never touch `Service`.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know channels, providers, the queue, workers and why a key stops duplicate sends. Next we open the box: how the senders nest, the method set, the notifications table as an outbox, and the Go worker code.
 
 ```mermaid
 classDiagram
@@ -304,7 +317,7 @@ CREATE TABLE provider_limits (
 );
 ```
 
-The claim in production is `INSERT INTO notifications (...) ON CONFLICT (idempotency_key) DO NOTHING` (0 rows means duplicate) or Redis `SET key 1 NX EX 86400`. With many worker pods, the provider bucket moves to Redis (a token bucket in a Lua script, keyed by provider), as in [[Rate Limiter]].
+The claim in production is `INSERT INTO notifications (...) ON CONFLICT (idempotency_key) DO NOTHING` (0 rows means duplicate) or Redis `SET key 1 NX EX 86400` (set only if the key does not exist, expire after 1 day). With many worker pods, the provider bucket moves to Redis (a token bucket in a Lua script, keyed by provider), as in [[Rate Limiter]].
 
 The `notifications` table doubles as the outbox when the order service writes it in its own transaction ([[Transactional Outbox and CDC]]), and that is what makes a drain deadline safe: anything not sent is still `queued` in the table.
 
@@ -350,7 +363,7 @@ cmd/demo/main.go    -> wiring: SDK clients -> adapters -> RateLimitedSender per 
 | Pattern | Where | Why here |
 | --- | --- | --- |
 | [[Factory and Abstract Factory]] | `SenderFactory.Get(channel)` | No `switch channel` in the service |
-| [[Adapter]] | `SMSAdapter`, `WhatsAppAdapter` | Each vendor SDK has its own shape and its own status codes; `classify` maps them once |
+| [[Adapter]] | `SMSAdapter`, `WhatsAppAdapter` | Each vendor SDK (the vendor's client library) has its own shape and its own status codes; `classify` maps them once |
 | [[Decorator and Middleware]] | `RateLimitedSender` wraps any `Sender` | Rate limit per provider without touching adapters |
 | [[Chain of Responsibility and Pipelines]] | `FailoverSender` | Primary, then secondary; stops on success or a permanent error |
 | [[Observer and Event Bus]] | `OrderListener.OnOrderEvent` | The order service publishes; notifications react |
@@ -372,7 +385,7 @@ Not used: a Builder for `Notification` (six plain fields, a struct literal is cl
 > - **Backoff has jitter and a cap.** `backoff` returns a full-jitter wait, uniform in `[0, min(maxDelay, base·2^attempt))`, so 1,000 workers that failed together do not retry together.
 > - **HTML email uses `html/template`.** Email templates use `html/template`, which escapes `<b>Tom & Jerry</b>` to `&lt;b&gt;Tom &amp; Jerry&lt;/b&gt;`; SMS stays plain text, where escaping would show `&amp;` to the user.
 > - **Shutdown drains the queue.** Workers that exit on context cancel would drop buffered messages, so `Close` closes both lanes, workers drain them, and only a missed deadline cancels in-flight work.
-> - **Calls with side effects are not chained in one boolean expression.** staticcheck SA4000 flags `!b.Allow() || !b.Allow() || b.Allow()`, so the test stores the three calls in three named variables.
+> - **Calls with side effects are not chained in one boolean expression.** staticcheck (a popular Go code checker) rule SA4000 flags `!b.Allow() || !b.Allow() || b.Allow()`, so the test stores the three calls in three named variables.
 
 Complete package, Go 1.24, standard library only:
 
@@ -1226,6 +1239,8 @@ func TestProcessRetriesAfterRateLimit(t *testing.T) {
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working service and its tests. Next is interview depth: duplicate events, crashes after a send, provider outages and rate limits, queue full, deploys mid-burst and HTML injection.
+
 | Edge case | Risk | Handling |
 | --- | --- | --- |
 | Same event delivered twice | Two SMS | Atomic claim before sending; `UNIQUE (idempotency_key)` |
@@ -1240,7 +1255,7 @@ func TestProcessRetriesAfterRateLimit(t *testing.T) {
 | Marketing burst of 1M messages | OTPs wait minutes | Separate high lane, always read first |
 | Deploy during a burst | Queued messages lost | `Close` drains; the outbox keeps what a missed deadline leaves |
 | `Enqueue` racing `Close` | Panic: send on a closed channel | `RWMutex` around `closed`; `Enqueue` returns `ErrClosed` |
-| User data with `<script>` in an email | HTML injection | `html/template` escapes by context |
+| User data with `<script>` in an email | HTML injection (user text that runs as code in the email) | `html/template` escapes by context |
 | WhatsApp without opt-in | Policy violation, number banned | No contact unless opted in → `ErrNoContact` |
 | `IdemStore` grows forever | Memory leak | TTL in production (`SET NX EX 86400`) |
 
@@ -1251,9 +1266,9 @@ func TestProcessRetriesAfterRateLimit(t *testing.T) {
 | Never lose events | Write the notification row in the order transaction; a relay publishes it ([[Transactional Outbox and CDC]]) |
 | Durable queue | One Kafka topic or SQS queue per priority; workers commit after the send |
 | Poison messages | After max retries, move to a DLQ with the last error; ops replay ([[Dead Letter Queues and Poison Messages]]) |
-| Starvation of the low lane | Weighted reads (for example 9 high : 1 low) instead of strict priority |
+| Starvation (never getting a turn) of the low lane | Weighted reads (for example 9 high : 1 low) instead of strict priority |
 | Per-user limits and quiet hours | Check before sending; reschedule with `next_attempt_at` instead of dropping |
-| Delivery status | Provider webhooks set delivered or bounced; a hard bounce opts the address out |
+| Delivery status | Provider webhooks set delivered or bounced; a hard bounce (the address does not exist) opts the address out |
 | WhatsApp outside the 24 h window | Send a pre-approved template message: the adapter sets `Type: "template"` |
 | New channel | One adapter and one factory entry; `Service` does not change |
 
@@ -1262,7 +1277,7 @@ Tradeoffs chosen:
 - **Async queue instead of a synchronous send:** the order request returns fast however slow the providers are; the cost is eventual delivery and, in production, a durable queue.
 - **Strict priority:** OTPs never wait, but a constant OTP flood could starve marketing; weighted reads fix that if it happens.
 - **Rate limit returns an error instead of blocking:** workers stay free and the existing backoff and failover handle it; blocking is simpler but parks workers.
-- **Full jitter:** in the simulation in the AWS post (many clients contending for one resource), full jitter made the fewest total calls of the variants, while decorrelated jitter finished slightly sooner. A recovering provider therefore sees the fewest calls; the cost is a less predictable delay per message.
+- **Full jitter:** in the simulation in the AWS post (many clients contending for one resource), full jitter made the fewest total calls of the variants, while decorrelated jitter (each wait based on the previous wait, with randomness) finished slightly sooner. A recovering provider therefore sees the fewest calls; the cost is a less predictable delay per message.
 - **Release the key on failure:** allows a replay from the DLQ; a crash between send and store can still double-send (at-least-once).
 - **In-process queue and bucket:** exact for one process; production moves both to Kafka and Redis.
 
@@ -1326,6 +1341,26 @@ Redraw it from memory, then add what it predates: the high and low lanes, the fa
 - Decorators nest: `Failover{RateLimited(A), RateLimited(B)}`.
 - Two lanes, high read first; `Close` = stop intake, drain, deadline.
 - Production: outbox table, Kafka, Redis bucket, DLQ.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What is the difference between a channel and a provider?
+> The channel is what the user sees (SMS); the provider is the company that actually sends it (vendor A or B).
+
+> [!question]- 🟢 Why does the order service not send the SMS itself?
+> Providers are slow and sometimes down; queueing the message lets the order request finish fast.
+
+> [!question]- 🟢 The same "order placed" event arrives twice. How many SMS go out?
+> One. The worker claims the idempotency key first, and the second claim fails with `ErrDuplicate`.
+
+> [!question]- 🟡 A provider returns 400 for an invalid number. Retry?
+> No. Other 4xx errors are marked permanent; retrying only burns quota. Timeouts, 408, 429 and 5xx are retried.
+
+> [!question]- 🟡 Why add jitter to exponential backoff?
+> Without it, 1,000 workers that failed together retry at the same instants and hit the provider in waves.
+
+> [!question]- 🟡 How does an OTP avoid waiting behind 1 million marketing messages?
+> Two lanes; every worker checks the high (OTP) lane first and only then the low one.
 
 ## Links 🟢
 

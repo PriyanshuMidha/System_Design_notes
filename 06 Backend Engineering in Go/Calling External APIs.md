@@ -26,7 +26,7 @@ updated: 2026-11-13
 
 ### Whiteboard version
 
-**In plain words:** the smallest safe outgoing call — one client, one timeout — before the retry and breaker layers.
+**In plain words:** the smallest safe outgoing call — one client, one timeout — before the retry and breaker layers. (A **provider** is the outside company whose API you call; a **circuit breaker** is a switch that stops calling it while it keeps failing.)
 
 The shape every outbound call needs, before any of the hardening below:
 
@@ -57,6 +57,11 @@ Everything below fixes what this whiteboard version gets wrong: no transport poo
 > - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+> [!note] Before this note
+> - [[Building REST Endpoints]]: what a request, a response and a status code are, from the server side.
+> - [[Context Package]]: a `ctx` carries a deadline; when it runs out, every call that was given that `ctx` stops waiting.
+> - [[Timeouts, Retries and Backoff]]: why you give up after a set time, and why retries should wait longer each time with some randomness.
 
 **From zero, in 60 seconds** 🟢
 
@@ -99,6 +104,12 @@ Calling an external API from Go needs the same habits.
 | Idempotent | Safe to repeat; same effect as once | `GET`, or a `POST` with an Idempotency-Key |
 | Circuit breaker | Stops calling a dependency that keeps failing | After many errors, fail fast for 30 s |
 
+| TLS handshake | The setup talk that starts an encrypted HTTPS connection; it costs a few round trips | done once per new connection |
+| `Retry-After` | A response header from the provider saying how long to wait before trying again | `Retry-After: 2` means wait 2 s |
+| Bulkhead | A cap on how many calls to one provider run at the same time | at most 20 payment calls at once |
+| Drain the body | Read the rest of the response and throw it away, so the connection can be reused | `io.Copy(io.Discard, resp.Body)` |
+| SSRF | A trick where a user makes your server fetch an internal URL | a "webhook URL" pointing at `169.254.169.254` |
+
 **Picture it**
 
 ```mermaid
@@ -126,14 +137,22 @@ Where it breaks: a phone call either connects or not; an HTTP call can succeed o
 
 ## 1. Why it exists 🟢
 
-InvoiceOps calls four external providers: a payment gateway to charge a card, an email provider to send a receipt, object storage to persist a generated PDF, and an SMS provider for two-factor codes. Each is a network call to a system you do not control, and each can fail in a way a local function call never does: a TCP connect that hangs for 30 seconds because the provider's load balancer is unhealthy, a response that starts streaming and then stalls at byte 40 of a 2KB body, or a `200 OK` with a body that silently contains an error.
+🟢 **Plain version:** InvoiceOps talks to four outside services: payments, email, file storage and SMS. Any of them can be slow or down, and you cannot fix them. If you wait forever for one slow service, your own server fills up with waiting requests and stops answering everyone, even for unrelated pages. If you blindly retry a payment that actually went through, the customer pays twice. Timeouts and careful retries prevent both.
+
+InvoiceOps calls four external providers: a payment gateway to charge a card, an email provider to send a receipt, object storage to persist a generated PDF, and an SMS provider for two-factor codes. Each is a network call to a system you do not control, and each can fail in a way a local function call never does: a TCP connect (opening the network connection) that hangs for 30 seconds because the provider's load balancer (the front server that spreads traffic over its machines) is unhealthy, a response that starts streaming and then stalls at byte 40 of a 2KB body, or a `200 OK` with a body that silently contains an error.
 
 Two concrete failures show why this needs explicit engineering, not just "call the HTTP client":
 
-- **No timeout, one bad dependency, service-wide outage.** If every `createInvoice` handler calls the payment provider with `http.DefaultClient` and the provider's connect path degrades to a 60-second hang, every concurrent checkout request parks a goroutine for 60 seconds. At even moderate traffic, the server runs out of available goroutines/file descriptors and stops serving *unrelated* requests, like reading an existing invoice — a dependency that is merely slow takes down a service that didn't even need it.
+- **No timeout, one bad dependency, service-wide outage.** If every `createInvoice` handler calls the payment provider with `http.DefaultClient` and the provider's connect path degrades to a 60-second hang, every concurrent checkout request parks a goroutine for 60 seconds. At even moderate traffic, the server runs out of available goroutines/file descriptors (the operating system's limited handles for open files and connections) and stops serving *unrelated* requests, like reading an existing invoice — a dependency that is merely slow takes down a service that didn't even need it.
 - **Blind retries double-charge a customer.** If `createCharge` times out after the provider actually processed the charge (the response was simply lost on the way back), and the client naively retries the same POST, a customer is charged twice. The Idempotency-Key pattern — the client generates a key once and the provider deduplicates by it — is what makes a retry here safe at all; see [[Idempotency and Idempotency Keys]] for the key-generation and storage side.
 
+### A real-life example 🟢
+
+When you pay on Zomato, Zomato's server calls a payment gateway like Razorpay. If Razorpay is slow, Zomato does not let your screen spin forever: the call has a time limit, and you see "payment pending, we will update you". Zomato sends a unique idempotency key with the charge, so if it retries after a timeout, Razorpay knows it is the same payment and does not charge you twice. If the gateway is fully down, Zomato stops calling it for a short while and may offer another payment option.
+
 ## 2. Mental model 🟢
+
+🟢 **Plain version:** Think of the whole call as having a time budget, like a money budget. The user's request gives you, say, 2 seconds in total. Each try at calling the provider has its own smaller limit. Between tries you wait a little. When the 2 seconds are used up, you stop, even if you had more tries left.
 
 Treat every outbound call as a budget with three nested timers, not one:
 
@@ -153,9 +172,20 @@ flowchart LR
 
 - The **outer context deadline** is the absolute budget: if the parent HTTP request has 2 seconds left, no amount of retrying should be allowed to exceed it.
 - **`Client.Timeout`** bounds one entire attempt (connect through reading the full body). It is not the same as a per-attempt context deadline — `Client.Timeout` applies even if you pass a context with no deadline, and a context deadline applies even if `Client.Timeout` is zero. Set both: `Client.Timeout` as the per-attempt ceiling, the context deadline as the overall budget.
-- **Transport-level timeouts** (`DialContext`, `TLSHandshakeTimeout`, `ResponseHeaderTimeout`) catch failures earlier and more precisely than the blunt `Client.Timeout` — a DNS lookup that hangs is a different failure mode from a slow response body, and distinguishing them in logs matters when you're debugging which part of the call actually failed.
+- **Transport-level timeouts** (`DialContext`: time to open the connection; `TLSHandshakeTimeout`: time to set up encryption; `ResponseHeaderTimeout`: time until the first response line arrives) catch failures earlier and more precisely than the blunt `Client.Timeout` — a DNS lookup that hangs is a different failure mode from a slow response body, and distinguishing them in logs matters when you're debugging which part of the call actually failed.
 
 ## 3. How it works 🟡
+
+🟢 → 🟡 You now know the three habits: a time limit on every call, retries only for safe calls, and stop calling a provider that keeps failing. Next we open the box and watch one call go through a rate limiter, a circuit breaker, two failures and a success.
+
+**Step by step:**
+1. The handler asks the rate limiter for permission, so InvoiceOps never sends more than the provider's allowed number of calls per second.
+2. It asks the circuit breaker "may I call?". The breaker is closed (healthy), so yes.
+3. Attempt 1 times out. The handler waits a random short time, staying inside the 2-second total budget.
+4. Attempt 2 gets `429 Too Many Requests` with `Retry-After: 2`. The handler drains and closes the body, then waits exactly 2 seconds.
+5. Attempt 3 gets `200 OK`. The handler tells the breaker "success" and uses the response.
+
+The full detail:
 
 ```mermaid
 sequenceDiagram
@@ -186,11 +216,18 @@ sequenceDiagram
     H->>CB: RecordSuccess()
 ```
 
-The circuit breaker's own state machine (closed → open → half-open) is taught in [[Circuit Breaker]]; here it's one `Allow()`/`RecordSuccess()`/`RecordFailure()` call wrapped around the retry loop above, typically with `sony/gobreaker` in production code.
+The circuit breaker's own state machine (closed: calls flow; open: calls are refused at once; half-open: a few test calls are let through to see if the provider is back) is taught in [[Circuit Breaker]]; here it's one `Allow()`/`RecordSuccess()`/`RecordFailure()` call wrapped around the retry loop above, typically with `sony/gobreaker` in production code.
 
 ### Deciding what to retry
 
 **In plain words:** retry only what is harmless to repeat: reads almost always, writes only when you attach an idempotency key so the provider can spot the duplicate.
+
+**Step by step:**
+1. A call to `GET /v1/charges/ch_9` fails with a network error. A read is safe to repeat, so retry.
+2. A call to `POST /v1/charges` gets a 503. It carries `Idempotency-Key: inv_42-charge`, so the provider will spot a duplicate. Retry.
+3. The same `POST` without an idempotency key gets a 503. Do not retry; return the error, because the charge may already have happened.
+4. A `400 Bad Request` will fail the same way every time. Return it at once.
+5. Before each retry, check tries left and time left; if either is used up, return `ErrAllAttemptsFailed`.
 
 ```mermaid
 flowchart TD
@@ -206,7 +243,9 @@ flowchart TD
 
 ## 4. Worked example 🟡
 
-The pool-tuned client — a shared transport per provider, built once:
+The pool-tuned client — a shared transport per provider, built once.
+
+**What this code does, in plain words:** it builds one HTTP client for the payment provider at startup, with limits for connecting, encryption setup and waiting for the first reply, and keeps more spare connections open for reuse than Go's default of 2.
 
 ```go
 // NewProviderClient builds one shared *http.Client per external provider.
@@ -230,7 +269,9 @@ func NewProviderClient() *http.Client {
 }
 ```
 
-The retry loop: full-jitter backoff, `Retry-After` honoured, non-retryable 4xx returned immediately, and the body always drained:
+The retry loop: full-jitter backoff, `Retry-After` honoured, non-retryable 4xx returned immediately, and the body always drained.
+
+**What this code does, in plain words:** it tries the call up to a fixed number of times. After a retryable failure it waits either the provider's `Retry-After` time or a random backoff, but never past the context deadline. A 4xx error other than 429 stops at once.
 
 ```go
 func CallWithRetry(ctx context.Context, client Doer, newReq func() (*http.Request, error), maxAttempts int, sleep Sleeper) (*http.Response, error) {
@@ -343,7 +384,9 @@ Each outbound call should also log the provider's own request ID (most payment, 
 
 The provider's request ID is what you hand their support team when a charge needs investigating; without logging it, a dispute means grepping raw response bodies in old logs instead of a one-line lookup.
 
-Tests using `httptest.Server` with fault injection — the exact scenarios a real provider produces: a transient 503 that recovers, a 429 with `Retry-After`, and a 400 that must never be retried:
+Tests using `httptest.Server` with fault injection — the exact scenarios a real provider produces: a transient 503 that recovers, a 429 with `Retry-After`, and a 400 that must never be retried.
+
+**What this code does, in plain words:** a fake provider server answers with errors on purpose. Each test checks that the client retried the right number of times, waited the right amount, or did not retry at all.
 
 ```go
 func TestCallWithRetry_HonoursRetryAfter(t *testing.T) {
@@ -413,12 +456,32 @@ func TestCallWithRetry_NonRetryable4xxReturnsImmediately(t *testing.T) {
 
 ## 6. Trade-offs and when not to use 🟡
 
+- **When to use this full setup:** any provider you call often or on a user's request path (payments, email, storage). **When not to:** a call made once a minute by an internal tool needs only a client with a timeout.
 - Retrying a non-idempotent write without an Idempotency-Key is not a tuning choice — it's a correctness bug that can double-charge or double-send. If a provider has no idempotency mechanism, the safe default is zero retries on writes, with the user told to check before retrying manually.
 - A circuit breaker adds state and a failure mode of its own: an incorrectly tuned threshold can pop open on a minor blip and reject traffic a merely-degraded (not actually down) provider could still have served.
 - Transport pool tuning (`MaxIdleConnsPerHost`, etc.) only matters once request volume to one host is high enough to see connection churn in metrics; for a call made once a minute, the default settings are fine and tuning is wasted effort.
 - Hedged requests trade provider load for tail latency — never do this for a payment charge or any write, only for cheap, idempotent reads.
 
+### Timeout vs circuit breaker vs bulkhead 🟡
+
+| Tool | Protects against | Example |
+| --- | --- | --- |
+| Timeout | one call waiting forever | give up on a charge after 2 s |
+| Circuit breaker | calling a provider that is clearly down | after 10 failures, refuse calls for 30 s |
+| Bulkhead | a slow provider using up all your goroutines | at most 20 payment calls at once |
+| Rate limiter | going over the provider's allowed calls per second | at most 100 calls per second |
+
+### Common beginner mistakes 🟢
+
+- Using `http.DefaultClient` → it has no timeout, so one hung provider can hang your handlers → build your own client with `Timeout` set.
+- Building a new `http.Client` for every call → no connection reuse, a new TLS handshake each time → build one per provider at startup.
+- Treating `err == nil` as success → a 500 response still has `err == nil` → check `resp.StatusCode`.
+- Closing the body without reading it → the connection cannot go back to the pool → drain, then close, on every path.
+- Retrying a payment `POST` with no idempotency key → a lost reply turns into a double charge → retry writes only with a key.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now build a safe client: reused connections, deadlines, careful retries, a breaker and a bulkhead. The advanced part covers what goes wrong in real traffic: slowly rising latency, leaked connections, user-supplied URLs that reach internal servers, and reused idempotency keys.
 
 - **Real systems:** AWS SDKs implement exactly this backoff-plus-jitter default (the "full jitter" formula is from AWS's own Builders' Library). Stripe's API requires an `Idempotency-Key` header on every write and documents retry guidance built around it. Netflix popularized the circuit breaker pattern at scale with Hystrix (now largely superseded by resilience4j and language-native breakers like `sony/gobreaker` in Go).
 - **Failure modes → fixes:**
@@ -473,6 +536,26 @@ func TestCallWithRetry_NonRetryable4xxReturnsImmediately(t *testing.T) {
 - Retry only idempotent ops or writes carrying an Idempotency-Key; back off with full jitter; prefer the provider's `Retry-After`.
 - Outbound rate limit with `x/time/rate` to respect provider quotas; a circuit breaker stops calling a provider that's reliably down.
 - SSRF-guard any URL that came from user input, at connect time, not just at input validation time.
+
+## Self-check 🟢🟡
+
+> [!question]- What timeout does `http.DefaultClient` have?
+> None (`Timeout: 0`), so a call can wait forever.
+
+> [!question]- Which calls are safe to retry?
+> Idempotent ones like `GET`, and writes that carry an idempotency key the provider supports.
+
+> [!question]- What does a circuit breaker do when it is open?
+> It refuses calls at once, without contacting the provider, until a short wait passes.
+
+> [!question]- Why set both `Client.Timeout` and a context deadline?
+> `Client.Timeout` caps one attempt; the context deadline caps the whole operation, retries included.
+
+> [!question]- Why add jitter to backoff?
+> Without randomness, many clients retry at the same moment and hit the recovering provider together.
+
+> [!question]- Why must you drain the body before closing it?
+> Only a fully read body lets the connection go back to the pool for reuse.
 
 ## Links 🟢
 - **Before this:** [[Building REST Endpoints]], [[Context Package]], [[Timeouts, Retries and Backoff]]

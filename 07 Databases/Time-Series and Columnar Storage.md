@@ -37,6 +37,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked examples), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7 and the deep dives in 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Storage Engines - B-tree vs LSM and WAL]]: databases read whole pages from disk, and some engines write immutable sorted files and merge them later. Column stores do the same, one column at a time.
+> - [[Partitioning and Sharding]]: a big table can be cut into pieces by a key such as month, and an old piece can be dropped whole.
+> - [[Index Types and Index Design]]: besides normal B-tree indexes there are small summary indexes such as BRIN (min and max per block of pages).
+
 **From zero, in 60 seconds** 🟢
 
 Picture a filing cabinet of invoices, one full form per invoice. Finding one invoice is easy. But "add up the amount on every invoice this year" means pulling out every single form, even though you only care about one box on each.
@@ -84,6 +89,10 @@ Storing data column by column, and by time, makes that question hundreds of time
 | Compression | Storing the same data in fewer bytes | 1000 copies of "paid" stored as "paid ×1000" |
 | Partition | A slice of a table, often one per day or month | `invoices_2025_03` |
 | Rollup | A pre-summarised copy of raw data | Hourly totals instead of every event |
+| Cardinality | How many different values a column has | `event_type`: 5, `invoice_id`: millions |
+| Encoding | A trick for storing one column in fewer bytes | store 15, 15, 15 as "15 × 3" |
+| Vectorized execution | Processing a batch of thousands of values in one tight loop | sum 4,096 amounts at once |
+| Sparse index | An index that keeps one entry per block of rows, not per row | one key per 8,192 rows |
 
 **Picture it**
 
@@ -110,7 +119,7 @@ Where it breaks: changing one person's details is easy on a form but touches man
 > [!tip] Remember
 > Rows for "fetch one thing", columns for "summarise many things"; partition time-series by time and drop old partitions whole.
 
-## 1. Why it exists
+## 1. Why it exists 🟢
 
 InvoiceOps records every invoice event (`created`, `sent`, `viewed`, `paid`, `voided`) in an `invoice_events` table. After three years it holds **1 billion rows** with 20 columns, about **120 bytes per row** on disk (an estimate: 20 mixed columns plus the 24-byte PostgreSQL tuple header). That is roughly **120 GB**.
 
@@ -123,9 +132,9 @@ WHERE event_type = 'paid' AND occurred_at >= now() - interval '365 days'
 GROUP BY 1 ORDER BY 1;
 ```
 
-The query needs **3 columns** (`occurred_at`, `event_type`, `amount_minor`). In PostgreSQL, a heap table is a row store: every 8 KB page holds whole rows, so scanning one year (about a third of the table, 40 GB) reads all 20 columns of every row.
+The query needs **3 columns** (`occurred_at`, `event_type`, `amount_minor`). In PostgreSQL, a heap table (PostgreSQL's normal table storage) is a row store: every 8 KB page holds whole rows, so scanning one year (about a third of the table, 40 GB) reads all 20 columns of every row.
 
-At 500 MB/s of effective sequential read, that is about **80 seconds** (an estimate), and it evicts hot OLTP pages from the cache while it runs.
+At 500 MB/s of effective sequential read, that is about **80 seconds** (an estimate), and it evicts hot OLTP pages from the cache while it runs (pushes the pages the live app needs out of memory).
 
 A column store reads only the 3 columns it needs. Those columns are about 20 bytes of the 120 per row before compression, and a time-sorted timestamp, a 5-value enum and an integer amount compress very well.
 
@@ -134,9 +143,24 @@ A realistic result is a few hundred MB to 2 GB read instead of 40 GB (an estimat
 Two more pressures make it worse over time:
 
 - **Volume.** Metrics and events grow with traffic, not with customers. One service scraped every 15 s with 10,000 series produces 57.6 million samples a day.
-- **Retention.** Deleting "everything older than 90 days" row by row in a row store creates dead tuples, WAL and vacuum work equal to the data being deleted.
+- **Retention.** Deleting "everything older than 90 days" row by row in a row store creates dead tuples (old row copies), WAL (log writes) and vacuum (clean-up) work equal to the data being deleted.
 
-## 2. Mental model
+### Real-life example 🟢
+
+A ride app's internal dashboard shows "trips per city per hour" for the last month.
+That is billions of trip events, but the chart needs only three fields from each: time, city and a count.
+Run on the live trips database, it would read every field of every trip and slow down bookings.
+So the events are copied to a column store, which reads just those three columns, compressed, and draws the chart in about a second.
+
+### Common beginner mistakes 🟢
+
+- **Running big reports on the live (OLTP) database** → long scans fight with real users for disk and cache → use rollups, a read replica, or a column store fed by CDC.
+- **Using a column store as the main app database** → fetching or updating one row touches every column file, and there are no multi-row transactions → keep invoices and payments in the row store.
+- **Inserting one row at a time into ClickHouse** → each insert makes a new part, causing "too many parts" errors → batch thousands of rows per insert.
+- **Deleting old data row by row** → huge clean-up work → partition by time and drop whole old partitions.
+- **Adding labels with millions of values to metrics** (a user ID on a Prometheus metric) → one series per value, and the store runs out of memory → keep labels to small fixed sets.
+
+## 2. Mental model 🟢
 
 Think of a spreadsheet of invoice events printed on paper.
 
@@ -154,9 +178,18 @@ Some terms used throughout:
 - **Cardinality**: the number of distinct values. `event_type` has 5; `invoice_id` has hundreds of millions.
 - **Series** (time-series stores): one unique combination of metric name and labels, such as `http_requests_total{route="/invoices",status="200"}`.
 
-## 3. How it works
+## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the core idea: store values column by column so summary queries read only what they need. **Next we open the box**: how the layout differs on disk, why columns compress so well, how engines process batches, how they skip blocks, and how time-series data is ingested and expired. Each subsection starts with a short step-by-step walk.
 
 ### Row layout vs column layout
+
+**Step by step:**
+1. Take three invoice events: (1, paid, ₹500), (2, sent, ₹900), (3, paid, ₹300).
+2. A row store writes them as three records: `1 paid 500 | 2 sent 900 | 3 paid 300`.
+3. A column store writes three strips: ids `1 2 3`, types `paid sent paid`, amounts `500 900 300`.
+4. "Sum of amounts" reads only the amount strip.
+5. "Show event 2" must read position 2 from every strip, which is why column stores are slow at fetching one row.
 
 ```mermaid
 flowchart TB
@@ -179,6 +212,13 @@ The row number is the glue: value 42 in `amount_minor` belongs to the same row a
 Example with numbers: a heap page of 8 KB holds about 68 rows of 120 bytes. Summing `amount_minor` over those 68 rows touches the whole page. In a column file the same 68 amounts are 68 × 8 bytes = 544 bytes, and after compression often far less, so one 8 KB block holds the amounts of thousands of rows.
 
 ### Why columns compress well
+
+**Step by step:**
+1. `event_type` has only 5 values, so store each as a small code (paid = 1) plus one lookup table: dictionary encoding.
+2. Sorted by workspace, `workspace_id` is 42, 42, 42... so store "42 × 10,000": run-length encoding.
+3. Timestamps every 15 s become differences of 15, 15, 15..., and differences of those are 0, 0, 0: delta-of-delta.
+4. Slowly changing floats like CPU load share most of their bits, so store only the bits that changed: Gorilla XOR.
+5. Finally a general compressor (LZ4 or ZSTD) squeezes the result once more.
 
 All values in a column share a type and usually a narrow range, and if the table is sorted, neighbours are often equal or close. Each column picks an encoding that fits its shape:
 
@@ -209,7 +249,7 @@ Example with numbers: 1,000 raw 8-byte timestamps take 8,000 bytes. With a 15 s 
 
 #### Gorilla XOR on float values
 
-Gauges such as CPU load change slowly, so consecutive values share their sign, exponent and high mantissa bits. XOR of two such values has long runs of zeros at both ends, and only the middle bits need storing.
+Gauges such as CPU load change slowly, so consecutive values share their sign, exponent and high mantissa bits (the parts a float is stored in: the sign, the scale, and the digits). XOR of two such values has long runs of zeros at both ends, and only the middle bits need storing.
 
 ```mermaid
 flowchart TD
@@ -241,6 +281,12 @@ In a table sorted by `(workspace_id, occurred_at)`, the `workspace_id` column be
 
 ### Vectorized execution
 
+**Step by step (sum of paid amounts):**
+1. Load 4,096 values of `event_type` and 4,096 values of `amount_minor` into memory as two arrays.
+2. Compare all 4,096 types with `paid` in one tight loop, producing a yes/no mask.
+3. Add up the amounts where the mask says yes, again in one tight loop.
+4. Move to the next batch. There is no function call per row, so the CPU runs flat out.
+
 A row-at-a-time engine (PostgreSQL's executor, for example) calls a function per row per operator. A **vectorized** engine runs each operator over a batch of thousands of values from one column at once. The inner loop is a plain array walk the CPU can pipeline and turn into SIMD (single instruction, multiple data) instructions, and the per-row overhead of function calls and branching disappears.
 
 ClickHouse, DuckDB, Snowflake and BigQuery all execute this way.
@@ -260,11 +306,17 @@ flowchart LR
 
 ### Skipping data: sparse indexes, min/max and partitions
 
+**Step by step (events of workspace 42 from last week):**
+1. Partitions: only the partitions for last week's days are opened; older months are never touched.
+2. Sparse index: inside a partition, data is sorted by `(workspace_id, occurred_at)`, and the index holds the first key of every block of 8,192 rows. Binary search finds the few blocks that can hold workspace 42.
+3. Min/max: each block also records its smallest and largest time; blocks entirely outside last week are skipped.
+4. Only the surviving blocks are read and decompressed.
+
 Column stores rarely use B-tree indexes on every row. They keep small summaries per block and skip blocks whose summary cannot match:
 
 - **Partition pruning.** The table is split by month or day; a query for last week never opens older partitions.
 - **Sparse primary index.** ClickHouse sorts each data part by the `ORDER BY` key and stores the key of only the first row of every **granule** of 8,192 rows (the default `index_granularity`). A lookup binary-searches these marks and reads only the matching granules.
-- **Min/max (zone map) statistics.** Parquet stores min and max per column chunk and page; PostgreSQL's BRIN index stores min and max per range of 128 heap pages by default. Both work only when the column is correlated with physical order, which time columns usually are.
+- **Min/max (zone map) statistics.** Parquet stores min and max per column chunk and page; PostgreSQL's BRIN index (block range index) stores min and max per range of 128 heap pages by default. Both work only when the column is correlated with physical order, which time columns usually are.
 
 ```mermaid
 flowchart TB
@@ -277,6 +329,12 @@ flowchart TB
 Example with numbers: 1 billion rows with `index_granularity = 8192` give about 122,070 marks (1,000,000,000 / 8,192). The sparse index holds one key per mark, which is small enough to stay in memory, and a lookup reads only the granules whose range can contain workspace 7.
 
 ### Time-series ingestion and retention
+
+**Step by step:**
+1. A new sample (CPU 0.41 at 10:00:15) is appended to a log on disk and to an in-memory buffer.
+2. Every 2 hours (Prometheus) or so, the buffer is written out as one compressed, read-only block for that time window.
+3. In the background, small blocks are merged into bigger ones.
+4. When a block is older than the retention period, say 15 days, the whole block is deleted at once.
 
 ```mermaid
 flowchart LR
@@ -309,11 +367,11 @@ flowchart LR
     a -->|"export"| d
 ```
 
-## 4. Worked example
+## 4. Worked example 🟡
 
 ### 4.1 InvoiceOps analytics store in ClickHouse
 
-The OLTP database stays PostgreSQL. Invoice events flow through CDC (change data capture, reading the database's WAL as a stream of changes) into Kafka and on into ClickHouse:
+The OLTP database stays PostgreSQL. Invoice events flow through CDC (change data capture, reading the database's WAL as a stream of changes) into Kafka (a durable message log that many consumers can read) and on into ClickHouse:
 
 ```mermaid
 flowchart LR
@@ -417,7 +475,7 @@ The last row is the lesson: Gorilla works because real gauges change slowly. Ran
 
 Runnable Go version: [[Time-Series and Columnar Storage - Go]]
 
-## 5. Variants and comparison
+## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
@@ -428,7 +486,7 @@ Runnable Go version: [[Time-Series and Columnar Storage - Go]]
 | Prometheus | In-memory head + WAL, 2-hour compressed blocks, one series per label set | Operational metrics and alerting | Not for events or per-user data; high-cardinality labels break it; local retention 15 days by default |
 | Lakehouse: Parquet + Iceberg or Delta Lake on S3 | Columnar files in object storage plus a table format that adds snapshots and schema evolution | Cheap raw retention, many engines over one copy | Query latency depends on the engine; small files need compaction |
 
-## 6. Trade-offs and when not to use
+## 6. Trade-offs and when not to use 🟡
 
 - **Point lookups and updates are slow.** Fetching one row touches every column file; updating one row in ClickHouse rewrites whole parts (a mutation). Invoices and payments stay in the OLTP database.
 - **No multi-row transactions.** Column stores are fed by pipelines that may deliver twice. Design for idempotent inserts (an `event_id`, ReplacingMergeTree, or upserts in the warehouse).
@@ -437,7 +495,9 @@ Runnable Go version: [[Time-Series and Columnar Storage - Go]]
 - **Another system to run.** A pipeline, schema changes in two places and lag between OLTP and analytics. When the data fits in PostgreSQL with partitions and a replica, that is the simpler answer.
 - **Staleness.** The dashboard is seconds to minutes behind the source. Decide the staleness budget with the product owner ("the revenue chart may lag 5 minutes").
 
-## 7. In production
+## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how column and time-series stores lay out, compress, skip and expire data, and when not to use them. **Next is the senior view**: moving analytics off the primary step by step, warehouse modeling, production failure modes, and the internals of ClickHouse, TimescaleDB, Prometheus and lakehouse files.
 
 **Keeping analytics off the primary.** Grow in steps:
 
@@ -536,7 +596,7 @@ func paidTotal(c EventColumns) (sum int64) {
 }
 ```
 
-## 8. Deep dive
+## 8. Deep dive 🔴
 
 ### ClickHouse MergeTree internals
 
@@ -638,7 +698,7 @@ flowchart TD
     Q -->|no| R["route to a correction path: separate table or batch fix, then re-run affected rollups"]
 ```
 
-## 9. Interview questions
+## 9. Interview questions 🔴
 
 > [!question]- Why is a column store faster for `SUM(amount)` over a year but slower for "get invoice 42"?
 > The sum reads one or two column files out of twenty and those compress 5–20×, so it reads a small fraction of the bytes and runs a tight vectorized loop. Fetching one row means opening every column file and finding the same row position in each, where a row store reads one page.
@@ -666,7 +726,10 @@ flowchart TD
 > [!question]- How would you design the analytics pipeline for InvoiceOps?
 > CDC from PostgreSQL into Kafka, a consumer that batches into a ClickHouse raw table with an `event_id` for dedup, insert-trigger materialized views into AggregatingMergeTree rollups for dashboards, raw TTL of 15 days, and an hourly Parquet export to an Iceberg table on S3 for full history. Monitor consumer lag and reconcile daily totals against OLTP.
 
-## 10. Cheat sheet
+## 10. Cheat sheet 🟢
+
+🟢 **Plain version:** Row stores keep each record together, which suits the live app. Column stores keep each field together, so big summaries read only the fields they need and compress them well. Time-series stores cut data into time blocks and delete old blocks whole. Keep the live app on the row store and copy data to a column store for heavy reports.
+
 
 - Row store: fast single-row reads and writes (OLTP). Column store: fast scans of few columns (OLAP).
 - Column pruning + compression + vectorized execution + block skipping = why OLAP is fast.
@@ -676,6 +739,30 @@ flowchart TD
 - Prometheus: head + WAL, 2-hour blocks, 15-day default retention; cardinality kills it.
 - Retention by dropping partitions, never by row deletes; raw short, rollups long, archive in Parquet on S3.
 - Keep analytics off the primary: rollups, then a replica, then CDC into a column store.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why is a column store fast at "sum of amounts"?
+> It reads only the amount column, which is small and compresses well, instead of every field of every row.
+
+> [!question]- Why is a column store slow at "show invoice 42"?
+> It must read position 42 from every column file to rebuild the row.
+
+> [!question]- What is the cheapest way to delete data older than 90 days in a time-series store?
+> Drop the whole old partitions or blocks.
+
+🟡 Medium
+
+> [!question]- Why does sorting by `(workspace_id, occurred_at)` help compression?
+> Equal `workspace_id` values sit together, so run-length encoding stores each run once.
+
+> [!question]- A 15-second scrape gives timestamps 0, 15000, 30000... What does delta-of-delta store?
+> Mostly zeros, because every difference is the same 15,000 ms.
+
+> [!question]- Why do single-row inserts hurt ClickHouse?
+> Each insert creates a new part; thousands per second cause "too many parts" and heavy merging.
 
 ## Links
 

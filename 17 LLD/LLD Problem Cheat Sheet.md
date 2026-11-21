@@ -21,6 +21,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the whole table, row by row, and open the full note for any row that feels unclear.
 > - 🔴 **Interview / SDE-3 prep?** Use "How to pick your first 5 minutes" and say the "race" column out loud for each problem. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[LLD Interview Method]]: the 10-step order for a round, and the habit of coding the hardest method first.
+> - [[Design Patterns Overview and Chooser]]: what Strategy, State, Observer and the other pattern names in the table mean.
+> - [[Concurrency for LLD]]: two requests at the same moment can both "win" unless check and change happen in one locked step.
+
 **From zero, in 60 seconds** 🟢
 
 This note is one big table, one row per practice problem in this folder.
@@ -51,6 +56,13 @@ Read the table, then open only the notes you feel shaky on.
 | Concurrency hazard | A bug that appears when two requests run at once | Two gates giving away the same spot |
 | Compare-and-set | "Change it only if it still has the value I saw" | `available → busy` only if still `available` |
 | Race test | A test run with `go test -race` to catch unsafe sharing | Many goroutines calling `Park` together |
+| Atomic | Done in one step that nobody can cut into halfway | "Find a free spot and take it" as one locked step |
+| Idempotent | Safe to repeat: the second call changes nothing | A double-tapped "Place order" charges once |
+| TTL (time to live) | How long something stays valid before it expires | A seat hold that lasts 5 minutes |
+| Saga / compensation | A chain of steps where each has an undo step if a later one fails | Payment fails, so the reserved stock is released |
+| Greedy | Always take the biggest or nearest option first | Give change with the largest coin first |
+| O(1) | Takes the same short time however much data there is | A map lookup by key |
+| Escrow | Money held aside until the deal finishes | Inserted coins kept until the item drops |
 
 **Picture it**
 
@@ -74,36 +86,51 @@ Where it breaks: a card cannot teach the topic; if a row makes no sense, open th
 > [!tip] Remember
 > For every problem: name the nouns, what varies, what two callers fight over, and the one method you will code.
 
+## Where you have seen these problems 🟢
+
+Most rows are a small slice of an app you already use. [[Movie Ticket Booking]] is picking seats on BookMyShow. [[Food Ordering System]] and [[Delivery Partner Assignment]] are what happens after you tap "Place order" on Swiggy or Zomato. [[Ride Sharing]] is Uber or Ola finding a nearby driver. [[Digital Wallet and Ledger]] is the balance in a wallet app like Paytm, and [[Splitwise Expense Sharing]] is the Splitwise app itself. Thinking of the real app helps you guess the requirements in the first minute.
+
+## Common beginner mistakes 🟢
+
+- **Using this sheet to learn a problem for the first time** → one line cannot teach a design → read the full note once, then use the row to revise.
+- **Memorising the "Patterns used" column** → interviewers care why a part varies, not the name → say what changes first, then name the pattern.
+- **Skipping the "Concurrency hazard" column** → that is the question you will almost always get → say the race and how you stop it for every row you revise.
+- **Trying to code everything in the last column** → there is not enough time → code the first item well and talk through the rest.
+
+> 🟢 → 🟡 **You now know** what each column means and how to use the sheet. **Next is the table itself**: read one row at a time, say its entities, patterns and race out loud, and open the full note for any row you cannot explain.
+
 ## The table 🟡
 
 | Problem | Core entities | Patterns used | The tricky part | Concurrency hazard | What to code in 60 min |
 |---|---|---|---|---|---|
 | [[Parking Lot]] | ParkingLot, Spot, Vehicle, Ticket | Strategy (spot choice, pricing), Facade | Keeping spot allocation and fee rules swappable; money in `int64` paise with an injected clock | Two gates claiming the same free spot | `Park` and `Unpark` with an atomic find-and-take, one fee strategy, a race test |
-| [[Vending Machine]] | Machine, State, Item, CoinBox, escrow | State, Strategy | Change-making with finite coins (greedy fails); escrow until the item drops | Coin inserts and cancel racing on one machine | State transitions, bounded change search, refund on jam |
-| [[Library Management]] | Book (title), BookCopy, Member, Loan, Hold | Strategy (fines), Observer (hold notifications) | Title versus physical copy; FIFO hold queue with expiry | Two members borrowing the last copy | Borrow, return with hold assignment, fine strategy |
-| [[Meeting Room Scheduler]] | Room, Booking, interval, recurrence | Strategy (room choice) | Half-open overlap rule `start < otherEnd && otherStart < end`; recurrence in the organizer's time zone | Two bookings for one room at once | Per-room lock, overlap check, all-or-nothing recurring booking |
-| [[LRU Cache with TTL]] | Cache, entry, doubly linked list, map | Decorator-friendly interface | O(1) get/put with recency list; expired entries evicted before live ones | Concurrent get/put mutating the list | Map plus list, TTL check on read, sweeper, `-race` test |
-| [[Elevator System]] | Controller, Car, up and down stop sets, Dispatcher | Strategy (dispatch), State | LOOK order: keep going while calls remain ahead, then turn | Hall calls arriving while cars move | Tick-based `Step()`, two stop sets, one dispatch strategy |
+| [[Vending Machine]] | Machine, State, Item, CoinBox, escrow | State, Strategy | Change-making with finite coins (greedy fails when some coins run out); escrow until the item drops | Coin inserts and cancel racing on one machine | State transitions, bounded change search, refund on jam |
+| [[Library Management]] | Book (title), BookCopy, Member, Loan, Hold | Strategy (fines), Observer (hold notifications) | Title versus physical copy; FIFO (first in, first out) hold queue with expiry | Two members borrowing the last copy | Borrow, return with hold assignment, fine strategy |
+| [[Meeting Room Scheduler]] | Room, Booking, interval, recurrence | Strategy (room choice) | Half-open overlap rule (a 10:00-11:00 slot does not clash with 11:00-12:00) `start < otherEnd && otherStart < end`; recurrence in the organizer's time zone | Two bookings for one room at once | Per-room lock, overlap check, all-or-nothing recurring booking |
+| [[LRU Cache with TTL]] | Cache, entry, doubly linked list (a chain you can walk both ways and cut anywhere), map | Decorator-friendly interface | O(1) get/put with recency list; expired entries evicted (thrown out) before live ones | Concurrent get/put mutating the list | Map plus list, TTL check on read, sweeper, `-race` test |
+| [[Elevator System]] | Controller, Car, up and down stop sets, Dispatcher | Strategy (dispatch), State | LOOK order (the classic lift rule): keep going while calls remain ahead, then turn | Hall calls arriving while cars move | Tick-based `Step()`, two stop sets, one dispatch strategy |
 | [[Tic-Tac-Toe and Snake and Ladder]] | Player, Board, Game, Dice | Strategy, injected interfaces | O(1) win check with running sums; scripted dice for tests | Usually none (single-threaded turn loop) | Shared game skeleton, both rule sets, deterministic tests |
-| [[Cart Checkout with Coupons]] | Cart, Coupon, Order, Payment | Strategy, Chain of Responsibility, saga | Compensation after each side effect; rounding rule for discounts | Two checkouts consuming a single-use coupon or the last stock | Price, coupon validate and consume, reserve, charge, undo on failure |
+| [[Cart Checkout with Coupons]] | Cart, Coupon, Order, Payment | Strategy, Chain of Responsibility, saga (see the words table above) | Compensation after each side effect; rounding rule for discounts | Two checkouts consuming a single-use coupon or the last stock | Price, coupon validate and consume, reserve, charge, undo on failure |
 | [[Inventory Order Assignment (Dark Store)]] | Store, StockItem, Order, Reservation | Strategy (store selection), State, Repository | Reserving every item at one store all-or-nothing, falling back to the next store | Losing a stock race mid-reservation | Idempotent assign, nearest-first strategy, compare-and-set status |
-| [[Delivery Partner Assignment]] | Rider, Offer, Order, Dispatcher | State, Adapter (3PL), Strategy | Offer timeouts, widening radius, 3PL fallback | Two orders holding one rider | Compare-and-set `available → busy`, offer timeout, retry next rider |
-| [[Notification Service]] | Event, Message, Channel, Provider, Preference | Factory, Adapter, Decorator, Chain (failover) | Retrying only retryable errors with jittered backoff; priority lane for OTPs | Full queue blocking the caller; drain on shutdown | Worker pool, idempotency claim, retry policy, graceful `Close` |
+| [[Delivery Partner Assignment]] | Rider, Offer, Order, Dispatcher | State, Adapter (3PL: an outside delivery company), Strategy | Offer timeouts, widening radius, 3PL fallback | Two orders holding one rider | Compare-and-set `available → busy`, offer timeout, retry next rider |
+| [[Notification Service]] | Event, Message, Channel, Provider, Preference | Factory, Adapter, Decorator, Chain (failover) | Retrying only retryable errors with jittered backoff (waits that grow and get a little randomness so retries do not all land together); priority lane for OTPs (one-time passwords) | Full queue blocking the caller; drain on shutdown | Worker pool, idempotency claim, retry policy, graceful `Close` |
 | [[Rate Limiter]] | Limiter, bucket per key, Decision | Strategy (algorithm), Decorator (middleware) | Returning when to retry; deleting idle keys | Concurrent `Allow` on one key; distributed state | Token bucket behind `Allow(ctx, key)`, janitor, HTTP middleware |
-| [[Logging Library]] | Logger, Entry, Level, Formatter, Appender | Chain, Strategy, Decorator (async appender) | Never blocking the request on a slow output; flush on shutdown | Async appender buffer and shutdown races | Level filter, JSON formatter, console and async appenders |
-| [[File Search (Unix find)]] | Node (File, Directory, Symlink), Filter | Composite, Strategy, Specification-style filters | Query as a tree of AND, OR and NOT filters; symlink cycles | Optional parallel walk with a worker pool | Tree walk with DFS or BFS, filter tree, visited set |
+| [[Logging Library]] | Logger, Entry, Level, Formatter, Appender | Chain, Strategy, Decorator (async appender) | Never blocking the request on a slow output; flush on shutdown | Async appender (writes logs in the background) buffer and shutdown races | Level filter, JSON formatter, console and async appenders |
+| [[File Search (Unix find)]] | Node (File, Directory, Symlink), Filter | Composite, Strategy, Specification-style filters | Query as a tree of AND, OR and NOT filters; symlink cycles | Optional parallel walk with a worker pool | Tree walk with DFS or BFS (depth-first: go deep first; breadth-first: level by level), filter tree, visited set |
 | [[ATM]] | ATM, Session, Card, Account, CashDispenser | State, Strategy | Bounded change-making with limited notes; debit plus dispense with reversal on hardware failure | Two sessions on one account | Session state machine, dispense algorithm, reversal path |
-| [[In-memory KV Store with TTL and Transactions]] | Store, entry, transaction stack | Command, Memento-style layers | Nested `BEGIN`/`ROLLBACK`/`COMMIT` as a stack of write maps | Sweeper and writers sharing the store | Get, Set with TTL, Delete, nested transactions, lazy plus active expiry |
-| [[Task Scheduler (delayed and recurring jobs)]] | Scheduler, Job, min-heap, worker pool | Command, Strategy | One timer reset to the earliest job; recurring reschedule | Adding a job earlier than the one the timer waits for | Heap dispatcher, bounded workers, injected clock, cancel |
-| [[Circuit Breaker]] | Breaker, window, State | State, Decorator | Sliding failure-rate window and a half-open probe limit | Many callers racing during half-open | Closed, open and half-open transitions with an injected clock |
+| [[In-memory KV Store with TTL and Transactions]] | Store, entry, transaction stack | Command, Memento-style layers | Nested `BEGIN`/`ROLLBACK`/`COMMIT` as a stack of write maps | Sweeper and writers sharing the store | Get, Set with TTL, Delete, nested transactions, lazy (check on read) plus active (background sweeper) expiry |
+| [[Task Scheduler (delayed and recurring jobs)]] | Scheduler, Job, min-heap (a structure that always hands you the earliest job first), worker pool | Command, Strategy | One timer reset to the earliest job; recurring reschedule | Adding a job earlier than the one the timer waits for | Heap dispatcher, bounded workers, injected clock, cancel |
+| [[Circuit Breaker]] | Breaker, window, State | State, Decorator | Sliding failure-rate window and a half-open probe limit (after a pause, let only a few test calls through) | Many callers racing during half-open | Closed, open and half-open transitions with an injected clock |
 | [[Movie Ticket Booking]] | Show, ShowSeat, Hold, Booking | State, Strategy (pricing), Facade | Seat state on ShowSeat, not Seat; late payment after hold expiry | Two users holding the same seats | All-or-nothing `LockSeats`, TTL expiry, idempotent confirm |
 | [[Splitwise Expense Sharing]] | Group, User, Expense, Balance | Strategy (split types), Factory | Integer paise with remainders; delete as negated deltas; debt simplification | Concurrent expenses on one group | Equal, exact and percent splits, net balances, greedy simplify |
 | [[Food Ordering System]] | Restaurant, MenuItem, Cart, Order, OrderLine | State (table with actors), Strategy, Observer | Cart versus order snapshot; actor-checked transitions; refunds | Double-tap checkout charging twice | Idempotent `PlaceOrder`, transition table, auto-reject job |
-| [[Pub-Sub Message Queue]] | Topic, log, Subscription, offset | Observer, Iterator | Per-subscription offsets; redelivery of un-acked messages | Slow subscriber versus bounded buffer | Append-only log, ack and redelivery timeout, back-pressure |
+| [[Pub-Sub Message Queue]] | Topic, log, Subscription, offset | Observer, Iterator | Per-subscription offsets (how far each reader has got in the log); redelivery of un-acked (not yet confirmed as handled) messages | Slow subscriber versus bounded buffer | Append-only log, ack and redelivery timeout, back-pressure (a full buffer makes the sender slow down) |
 | [[Ride Sharing]] | Rider, Driver, Trip, grid index | State, Strategy (matching, fare) | Grid lookup for nearby drivers; surge locked at request time | Two riders claiming one driver | Trip state machine, matcher, atomic driver claim |
 | [[Hotel Booking]] | Hotel, RoomType, night inventory, Hold, Booking | Strategy (cancellation policy), State | Nights, not days; check-out day is not a night | Overbooking the last room for one night | Atomic reserve of every night, hold expiry, refund policy |
 | [[Order Book Matching Engine]] | Order, PriceLevel, Book, Trade | Command, single writer | Price-time priority; trade at the resting price; market remainder cancelled | Concurrent submissions, solved by one owning goroutine | Bid and ask books, match loop, sequenced trade events |
-| [[Digital Wallet and Ledger]] | Account, Transaction, Entry | Command, Repository | Double entry summing to zero; reversals instead of edits | Concurrent transfers overdrawing one account | Atomic transfer with balance check, idempotency key, reconcile |
+| [[Digital Wallet and Ledger]] | Account, Transaction, Entry | Command, Repository | Double entry (every transfer is written as a minus on one account and a plus on another) summing to zero; reversals instead of edits | Concurrent transfers overdrawing one account | Atomic transfer with balance check, idempotency key, reconcile |
+
+> 🟡 → 🔴 **You now know** the shape of all 26 problems. **Next is the opening routine** you can run on any problem, including one that is not in this table.
 
 ## How to pick your first 5 minutes 🔴
 
@@ -112,6 +139,26 @@ Where it breaks: a card cannot teach the topic; if a row makes no sense, open th
 3. **Find what varies.** Pricing, matching, splitting and dispatch rules change often, so each becomes a strategy ([[Strategy and Template Method]]). Anything with a lifecycle becomes a state machine ([[State Machines in Go]]).
 4. **Sketch entities, not classes for everything.** Four to six nouns with their key fields, then the relationships ([[UML for LLD]]).
 5. **Decide the test you will show.** One happy path and one race or edge case, with an injected clock if time matters ([[Testing LLD Code]]).
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What four things should you say for any problem in the table?
+> The main nouns, what varies (patterns), what two callers fight over (the race), and the one method you will code.
+
+> [!question]- 🟢 In [[Parking Lot]], what do two callers fight over?
+> The same free spot, claimed from two gates at once.
+
+> [!question]- 🟢 Should you learn a new problem from this sheet?
+> No. Read the full note once; use the sheet to revise.
+
+> [!question]- 🟡 In [[Delivery Partner Assignment]], how do you stop two orders taking one rider?
+> Compare-and-set: move the rider from `available` to `busy` only if they are still `available`.
+
+> [!question]- 🟡 Why is the meeting room overlap rule written as half-open?
+> So a meeting that ends at 11:00 does not clash with one that starts at 11:00.
+
+> [!question]- 🟡 How does [[Order Book Matching Engine]] handle concurrent submissions without locks?
+> One goroutine owns the book and applies every order in sequence, so there is nothing to race.
 
 ## Links 🟢
 

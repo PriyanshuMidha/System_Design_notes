@@ -34,6 +34,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Distributed Systems Fundamentals]]: machines talk over a network that can lose or delay messages, and silence does not tell you why.
+> - [[Replication]]: the same data is kept as copies on several machines, so one broken machine does not lose it.
+
 **From zero, in 60 seconds** 🟢
 
 Big apps keep the same data on more than one machine, so one broken machine does not lose it.
@@ -76,6 +80,10 @@ The rest of this note is just these 3 questions:
 | Availability (CAP) | Every working node still answers requests | Chennai keeps selling during the outage |
 | Latency | Time to answer one request | 2 ms local vs 30 ms cross-city |
 | Majority (quorum) | More than half of the replicas | 2 of 3 nodes |
+| Stale read | Getting an old value because your copy missed a newer write | Chennai still shows 1 seat left after Mumbai sold it |
+| Linearizability | The formal name for CAP's C: behaves like one single copy | After "seat sold", every read anywhere says 0 seats |
+| CP / AP | A system that picks consistency / availability during a partition | etcd is CP, Cassandra is AP |
+| Last-writer-wins (LWW) | On conflict, keep the write with the latest timestamp and drop the rest | Two edits; the one at 10:00:02 survives |
 
 **Picture it**
 
@@ -126,11 +134,21 @@ sequenceDiagram
 
 ## 2. Mental model 🟢
 
-- **Partition**: some nodes cannot exchange messages with others. It is not only a cut cable. A long GC pause, a full NIC queue, a misconfigured firewall rule or a switch reboot all look the same to the other side: messages are lost or arrive too late.
+🟢 **Plain version:** A partition is any break where copies cannot hear each other in time, not just a cut cable. Consistency means the whole system acts like one copy: once a write is confirmed, nobody reads anything older. Availability means every working copy still answers, even if slowly. During a partition you cannot have both.
+
+- **Partition**: some nodes cannot exchange messages with others. It is not only a cut cable. A long **GC pause** (the program freezing while it cleans up memory), a full NIC queue (the network card's send buffer), a misconfigured firewall rule or a switch reboot all look the same to the other side: messages are lost or arrive too late.
 - **Consistency (C)**: the system behaves like a single copy. Once a write is acknowledged, every later read, on any node, returns it or something newer. The formal name is **linearizability** (see [[Consistency Models]]).
 - **Availability (A)**: every request that reaches a *non-failed* node gets a non-error response. The definition says nothing about speed, so a node that answers in 30 seconds is still "available" in the CAP sense.
 
 **Analogy.** Two bank branches share one ledger by phone. The phone line goes dead. Each branch can either stop serving withdrawals until the line is back (C), or keep serving and sort out overdrafts later (A). Ignoring the dead phone is not an option.
+
+## Common beginner mistakes 🟢
+
+- **"Pick any 2 of 3"** → you cannot choose to have no partitions on a real network → the only real choice is C or A, and only while a partition is happening.
+- **Mixing up CAP's C and ACID's C** → CAP's C means "every read sees the latest write"; ACID's C means "rules like no negative balance hold" → say "linearizable" when you mean CAP's C.
+- **Labelling a whole company or database as CP or AP** → many databases let each request choose, and each feature has different needs → decide per feature: seat booking CP, view counter AP.
+- **Thinking CP means "the whole system goes down"** → only the side that cannot reach a majority stops; the majority side keeps working.
+- **Blaming CAP for lost writes on a normal day** → with no partition, lost writes are a bug, not a CAP trade-off.
 
 ```mermaid
 flowchart LR
@@ -140,7 +158,9 @@ flowchart LR
 
 ## 3. How it works 🟡
 
-The theorem (Brewer's conjecture in 2000, proved by Gilbert and Lynch in 2002) says: in an asynchronous network where messages can be lost, no system can guarantee both linearizability and availability on every node during a partition.
+> 🟢 → 🟡 **You now know** that during a network break each copy must either refuse (stay correct) or answer (maybe stale), and that even on a good day correctness costs speed. **Next we open the box**: why the theorem is true, why "pick 2 of 3" misleads, and how PACELC describes the everyday trade. The proof below is itself a small step-by-step walk.
+
+The theorem (Brewer's conjecture in 2000, proved by Gilbert and Lynch in 2002) says: in an **asynchronous network** (one with no upper limit on how long a message may take) where messages can be lost, no system can guarantee both linearizability and availability on every node during a partition.
 
 The proof sketch is short:
 
@@ -178,7 +198,14 @@ sequenceDiagram
 
 **In plain words:** network breaks are not optional, so the real choice is only between the other two, and only while the network is broken.
 
-- You cannot opt out of P. If your system runs on more than one machine, partitions happen. Bailis and Kingsbury (2014) collect public incident reports of exactly this.
+**Step by step:**
+1. You run a seat database on 3 machines in 2 cities. One day the link between the cities fails. You did not choose this: it just happens.
+2. While the link is down, the Chennai copy must choose: answer (A) or refuse (C).
+3. When the link comes back, both copies can again be correct and answering at once.
+4. So "CA" only exists for a single machine, which never has a link to lose.
+5. You can even choose per action: refuse "book seat" during the break, but keep answering "show movie times".
+
+- You cannot opt out of P. If your system runs on more than one machine, partitions happen. Bailis and Kingsbury (2014) collect public incident reports (write-ups of real outages) of exactly this.
 - So the choice exists **only while a partition is happening**. The rest of the time a system can offer both C and A.
 - "CA" therefore means "one node" (a single PostgreSQL server) or "a cluster that has not had a partition yet". It is not a third design.
 - The choice can be **per operation**, not per product: Brewer's 2012 article points out that a system can refuse some operations during a partition and allow others.
@@ -186,6 +213,13 @@ sequenceDiagram
 ### PACELC
 
 **In plain words:** most of the time the network is fine, and then the trade is speed versus being always correct.
+
+**Step by step:**
+1. No partition today. A user in Mumbai writes "seats = 9".
+2. Fast option (L): the nearest copy saves it and replies in 2 ms. The Chennai copy gets it a moment later, so a Chennai read right now may see the old 10.
+3. Correct option (C): the write waits until a majority (2 of 3) has saved it, about 30 ms across cities, then replies.
+4. Cassandra picks fast by default (EL); Spanner and etcd pick correct (EC).
+5. So PACELC reads as: if Partition, A or C; Else, Latency or Consistency.
 
 Daniel Abadi (2010 blog, 2012 IEEE Computer article) observed that CAP ignores normal operation. To be linearizable, a write must reach other replicas (or a majority) before it is acknowledged, and that costs round trips even when nothing is broken.
 
@@ -410,12 +444,12 @@ Where real systems sit, using their **default** settings. Many are tunable per r
 
 | System | During a partition (PAC) | Normal operation (ELC) | Why |
 | --- | --- | --- | --- |
-| etcd, ZooKeeper, Consul KV | C | C | Raft / ZAB: a minority partition cannot elect a leader or commit writes |
-| Google Spanner | C | C | Paxos groups plus TrueTime commit-wait; pays latency for external consistency |
+| etcd, ZooKeeper, Consul KV | C | C | Raft / ZAB (majority-vote agreement protocols, see [[Consensus - Raft and Paxos]]): a minority partition cannot elect a leader or commit writes |
+| Google Spanner | C | C | Paxos groups plus TrueTime commit-wait (TrueTime is Google's clock API with a known error margin; Spanner waits out that margin before confirming); pays latency for external consistency |
 | HBase | C | C | One RegionServer owns each region; a region is unavailable while it is reassigned |
 | CockroachDB, YugabyteDB | C | C | Raft per range; see [[Distributed SQL]] |
 | Cassandra, ScyllaDB, Riak | A | L | Leaderless; `ONE` or `LOCAL_ONE` answers from one replica. Tunable to `QUORUM` |
-| Amazon Dynamo (2007 paper) | A | L | Sloppy quorums, hinted handoff, vector clocks |
+| Amazon Dynamo (2007 paper) | A | L | Sloppy quorums, hinted handoff, vector clocks (ways to keep writing when the usual replicas are unreachable, and to track which versions are newer; see [[Quorums and Leaderless Replication]]) |
 | Amazon DynamoDB (single Region) | C for strong reads | L by default | Leader per partition with Multi-Paxos; eventually consistent reads may hit any replica, `ConsistentRead=true` goes to the leader |
 | DynamoDB global tables (multi-Region eventual mode) | A | L | Each Region accepts writes; async replication; last-writer-wins on conflict |
 | DynamoDB global tables (multi-Region strong consistency mode, GA 2025) | C | C | A write is acknowledged only after it is durable in a second Region; a Region cut off from the others cannot accept writes. Needs exactly 3 Regions (replicas or a witness) |
@@ -430,16 +464,30 @@ Where real systems sit, using their **default** settings. Many are tunable per r
 
 **In plain words:** many databases let you choose per request: fast and maybe old, or slower and surely fresh.
 
+**Step by step:**
+1. Cassandra keeps 3 copies of each row (N = 3).
+2. A "likes" counter is read with `ONE`: the first copy to answer wins. Fast, but maybe a little old.
+3. A "seats left" value is read and written with `QUORUM`: 2 of 3 copies must answer.
+4. Because 2 + 2 > 3, every quorum read overlaps every quorum write on at least one copy, so it sees the latest value.
+
 | Knob | Weak / fast | Strong / slower |
 | --- | --- | --- |
 | Cassandra consistency level | `ONE`, `LOCAL_ONE` | `QUORUM`, `LOCAL_QUORUM`, `ALL`; strong reads need `R + W > N` (see [[Quorums and Leaderless Replication]]) |
 | DynamoDB `GetItem` / `Query` | default: eventually consistent | `ConsistentRead: true` (twice the read capacity cost) |
 | MongoDB | `readConcern: "local"`, `w: 1` | `readConcern: "majority"` or `"linearizable"`, `w: "majority"` (the default write concern since MongoDB 5.0) |
 
+### CAP terms versus things people confuse them with 🟡
+
+| Term | Means in CAP | Often confused with |
+| --- | --- | --- |
+| Consistency (C) | Every read sees the latest confirmed write (linearizability) | ACID's C: database rules (like "balance ≥ 0") hold after each transaction |
+| Availability (A) | Every working node answers, however slowly | Uptime in an SLO, which also counts slow answers as failures |
+| Partition (P) | Nodes cannot exchange messages in time | A crashed node; in a partition every node may be running fine |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - **CP costs availability on the minority side and latency everywhere.** Every write waits for a majority. Cross-region majorities add one inter-region round trip (tens of milliseconds, an estimate that depends on the regions).
-- **AP costs correctness work.** Someone must merge divergent versions: last-writer-wins (silently loses writes), application merge (shopping cart union), or CRDTs (see [[CRDTs and Conflict Resolution]]).
+- **AP costs correctness work.** Someone must merge divergent versions: last-writer-wins (silently loses writes), application merge (shopping cart union), or CRDTs (data types built to merge automatically; see [[CRDTs and Conflict Resolution]]).
 - **Map by feature, not by company.**
   - Lean CP: payments, inventory and seat booking, auth and permissions, unique usernames, leader election and locks.
   - Lean AP: likes and view counters, feeds, presence ("online now"), recommendations, analytics events.
@@ -448,8 +496,10 @@ Where real systems sit, using their **default** settings. Many are tunable per r
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the proof, why "CA" is not a real option, how PACELC adds the latency trade, and where common databases sit. **Next comes the advanced part**: how Kubernetes, Cassandra and DynamoDB use these choices in production, the failure modes that follow, and the cases where CAP labels stop fitting.
+
 - **Real systems:**
-  - Kubernetes stores cluster state in etcd. If the etcd members lose quorum, the API server cannot write: CP by design.
+  - Kubernetes stores cluster state in etcd. If the etcd members lose **quorum** (a majority), the API server cannot write: CP by design.
   - Cassandra lets each query choose. A common pattern is `LOCAL_QUORUM` for reads and writes in each data centre, which gives strong consistency inside a DC and avoids cross-DC latency.
   - DynamoDB eventually consistent reads cost half of a strongly consistent read, so many read paths deliberately take the "L".
 - **Failure modes → fixes:**
@@ -459,7 +509,7 @@ Where real systems sit, using their **default** settings. Many are tunable per r
   - Clients treat a timeout as failure and retry a non-idempotent write that actually committed → use idempotency keys (see [[Idempotency and Idempotency Keys]]).
 - **What to monitor:**
   - Replica lag and the number of unreachable peers per node.
-  - Rejected requests caused by "no quorum" (CP) and conflict or read-repair counts (AP).
+  - Rejected requests caused by "no quorum" (CP) and conflict or **read-repair** (fixing a stale copy when a read notices it) counts (AP).
   - Hinted-handoff backlog in Cassandra-style stores.
 
 ## 8. Deep dive 🔴
@@ -469,10 +519,10 @@ Where real systems sit, using their **default** settings. Many are tunable per r
   Reads from replicas are not linearizable even with no partition, so they are not "C". If the primary is cut off, writes stop until failover, so writes are not "A". After a failover, writes acknowledged by the old primary but not yet replicated are lost.
 
   CAP was never meant to classify every configuration; describe the actual guarantees instead (see [[Replication]]).
-- **"Available" in CAP is weaker than "available" in an SLO.** CAP-availability has no latency bound and only applies to non-failed nodes. An SLO counts slow responses as failures and counts every user request. A CP system can have a higher SLO availability than an AP system if its partitions are rare and short.
+- **"Available" in CAP is weaker than "available" in an SLO** (a service level objective: a target such as "99.9% of requests succeed within 300 ms"). CAP-availability has no latency bound and only applies to non-failed nodes. An SLO counts slow responses as failures and counts every user request. A CP system can have a higher SLO availability than an AP system if its partitions are rare and short.
 - **Partition detection is a timeout.** A node cannot tell "the other side crashed" from "the other side is slow". Every CP system therefore picks a timeout, and while it waits it is neither consistent-and-answering nor refusing: it is just slow. That is PACELC's latency cost showing up again.
 - **Partition recovery** (Brewer 2012): track which operations ran on each side, then merge, compensate (refund the double-booked seat), or apologise. Designing this recovery path is most of the real work of an AP system.
-- **Stronger than CAP's C, weaker than CAP's C.** Spanner offers strict serializability (external consistency): linearizability extended to multi-key transactions, so it is stronger than CAP's single-register C. Causal consistency is the strongest model that stays available during partitions (Mahajan, Alvisi and Dahlin, 2011). See [[Consistency Models]].
+- **Stronger than CAP's C, weaker than CAP's C.** Spanner offers **strict serializability** (external consistency): linearizability extended to multi-key transactions, so it is stronger than CAP's single-register C. Causal consistency is the strongest model that stays available during partitions (Mahajan, Alvisi and Dahlin, 2011). See [[Consistency Models]].
 
 ## 9. Interview questions 🔴
 
@@ -509,6 +559,30 @@ Where real systems sit, using their **default** settings. Many are tunable per r
 - PA/EL: Cassandra, Riak. PC/EC: Spanner, etcd, ZooKeeper. PA/EC: MongoDB (Abadi 2012, under the old `w: 1` default).
 - DynamoDB is leader-based (Multi-Paxos per partition), not Dynamo.
 - Choose per feature: money and inventory CP; counters and feeds AP.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is a network partition?
+> Machines are running but cannot exchange messages with each other (in time).
+
+> [!question]- During a partition, what does a CP system do on the side without a majority?
+> It refuses (or blocks) requests, so it never returns a wrong answer.
+
+> [!question]- Is "CA" a real design for a multi-machine system?
+> No. Partitions will happen, so a multi-machine system must act as C or A when one does. "CA" really means one node.
+
+🟡 Medium
+
+> [!question]- What does the "ELC" part of PACELC add?
+> With no partition, you still trade latency against consistency: waiting for a majority makes writes slower.
+
+> [!question]- With N = 3 replicas, why do QUORUM reads and writes give fresh reads?
+> Both need 2 of 3 copies, and 2 + 2 > 3, so every read overlaps every write on at least one copy.
+
+> [!question]- An AP store uses last-writer-wins and two users wrote during a partition. What happens on heal?
+> The write with the higher timestamp is kept and the other one is silently lost, even though it was confirmed.
 
 ## Links
 

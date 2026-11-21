@@ -34,6 +34,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how LRU and LFU work), 4 (the code and the measured comparison), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Caching Fundamentals]]: a cache is a small, fast copy of data; a hit is good, a miss goes to the database, and the hit ratio is what counts.
+> - [[Hash Tables and Go Maps]]: a map finds a value by its key in about the same time no matter how many keys it holds.
+
 **From zero, in 60 seconds** 🟢
 
 A cache is a small, fast box of saved answers.
@@ -81,6 +85,10 @@ An eviction policy is the rule that picks which one to throw out.
 | Doubly linked list | Chain where each item links to next and previous | Move a node to the front in O(1) |
 | O(1) | Takes the same time no matter how big | Map lookup |
 | TTL | Expiry time for one item | `EX 60` |
+| Scan | A one-time read of many items that will not be read again | A nightly report reading 5,000 old products |
+| Skewed (Zipf) traffic | A few items get most of the reads | 2% of products get 80% of views |
+| `maxmemory-policy` | The Redis setting that says which keys may be evicted, and how | `allkeys-lru` |
+| OOM | "Out of memory": Redis refuses a write because it is full | `OOM command not allowed ...` |
 
 **Picture it**
 
@@ -108,6 +116,8 @@ Where it breaks: you know your own reading habits; a cache only sees past access
 
 ## 1. Why it exists 🟢
 
+🟢 **Plain version:** Your cache has room for about 7 million products, but the shop has 40 million. So the cache must keep only some of them. If it keeps the popular ones, most reads are hits. If it keeps the wrong ones, the database gets many more reads. And if you never tell Redis what it may throw away, it simply refuses new writes once it is full.
+
 A Redis node with 4 GB for cache data, holding product objects of about 590 bytes each (see the measurement in [[Caching Fundamentals]]), fits roughly 7 million of them. The catalogue has 40 million products. Something has to decide which 7 million stay.
 
 - Keep the wrong ones, and the hit ratio drops from, say, 95% to 70%. The database then sees six times as many reads.
@@ -132,11 +142,35 @@ flowchart TD
     Full --> F4["TTL: items leave when their time is up,<br/>full or not"]
 ```
 
+### Real-life example: thumbnails on a streaming app 🟢
+
+A streaming app like Netflix shows rows of movie posters on your home screen.
+The servers that hand out those images cannot keep every poster of every title in fast memory, so they keep the ones being asked for right now.
+A blockbuster released this week is requested millions of times and stays in the cache; an old documentary that nobody opened today gets evicted to make room.
+If a nightly job reads every poster once (a scan), a plain LRU cache would push out the popular ones, which is why smarter rules count how often each item is used.
+
+## Common beginner mistakes 🟢
+
+- **Leaving Redis on its default `noeviction` for a cache** → once memory is full every `SET` fails with `OOM` → set `allkeys-lru` or `allkeys-lfu` on cache instances.
+- **Using `volatile-lru` but forgetting TTLs on cache keys** → keys without a TTL can never be evicted, so Redis still runs out of memory → put a TTL on every cache key, or use an `allkeys-*` policy.
+- **Putting locks or queues in the same Redis as the cache with `allkeys-lru`** → Redis may evict a lock or a queued job to make room → keep them in a separate Redis instance.
+- **Mixing up eviction and invalidation** → eviction only frees memory and does not remove wrong data on time → delete keys when data changes, and use TTLs.
+- **Expecting a better policy to save a cache that is far too small** → if the hot data is ten times the cache, every policy misses a lot → give the cache more memory or cache less.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a full cache must throw something out, and that LRU, LFU, FIFO and TTL are different rules for picking it. **Next we open the box**: how LRU and LFU find their victim instantly even with millions of items, what smarter rules add, and how Redis does it without keeping a full list.
 
 ### LRU: a hash map plus a doubly linked list
 
 **In plain words:** a lookup table finds any item instantly, and a line of items keeps "most recently used" at the front. Use an item: move it to the front. Need room: drop the one at the back.
+
+**Step by step:**
+1. The cache holds 3 items. The line, front to back, is 7, 3, 9. So 9 is the one used longest ago.
+2. Someone reads key 3. The map finds its spot in the line at once, and 3 moves to the front: 3, 7, 9.
+3. Key 5 arrives and the cache is full. The item at the back, 9, is removed from the line and from the map.
+4. 5 goes in at the front: 5, 3, 7.
+5. Each step touches only a couple of items, so it is just as fast with 3 items or 3 million.
 
 ```mermaid
 flowchart LR
@@ -180,6 +214,20 @@ A full LRU with per-entry TTLs and concurrency is solved step by step in the pra
 
 **In plain words:** keep one line per use count (used once, used twice, ...). To make room, drop from the line with the smallest count.
 
+**Step by step:**
+1. The cache holds 2 items. Keys 1 and 2 arrive. Both sit in the "used once" line, and the smallest count is 1.
+2. Key 1 is read twice. It moves to the "used 2 times" line, then the "used 3 times" line. Key 2 stays in "used once".
+3. Key 3 arrives and the cache is full. Look at the smallest count, 1: that line holds only key 2, so key 2 is evicted.
+4. Key 3 enters the "used once" line, and the smallest count goes back to 1.
+5. If two items tie on count, the one at the back of that line (used longest ago) goes first.
+
+```mermaid
+flowchart LR
+    B1["used once:<br/>3"] --- B3["used 3 times:<br/>1"]
+    N["new key, cache full"] --> V["evict from the<br/>smallest-count line"]
+    V -.-> B1
+```
+
 Keep one list per access count (a **frequency bucket**) and remember the smallest non-empty count, `minFreq`.
 
 - **Get:** move the entry from bucket `f` to bucket `f+1`. If bucket `f` became empty and `f == minFreq`, increment `minFreq`.
@@ -193,20 +241,33 @@ Every step touches a fixed number of nodes, so both operations are `O(1)`. The t
 
 **In plain words:** a quick tour of other rules (random, FIFO, and smarter mixes) and where each one wins or loses.
 
+**Step by step (why the smarter mixes exist):**
+1. Your cache holds 1,000 popular products under LRU.
+2. A report reads 5,000 old products once each. Under LRU each one goes to the front, and all 1,000 popular items are pushed out.
+3. After the report, every popular read is a miss until the cache refills.
+4. 2Q fixes this by putting first-time items in a short waiting line; only a second read lets them into the main cache.
+5. W-TinyLFU fixes it by letting a new item in only if it has been asked for more often than the item it would replace.
+
 | Policy | Evicts | Strength | Weakness |
 | --- | --- | --- | --- |
 | FIFO | Oldest insert | Trivial, reads need no bookkeeping | Ignores popularity |
-| Random | A random key | No metadata, no lock contention | Unpredictable; fine when access is uniform |
+| Random | A random key | No metadata, no **lock contention** (threads waiting on each other for the same lock) | Unpredictable; fine when access is uniform |
 | LRU | Least recently used | Recency-heavy workloads, simple | One sequential scan flushes it |
 | LFU | Least frequently used | Stable popularity, scan-resistant | Needs ageing; new items are fragile |
 | 2Q | Items seen once wait in a FIFO probation queue; a second hit promotes them to the main LRU | Scan-resistant with LRU simplicity | Queue sizes to tune |
 | ARC | Balances a recency list and a frequency list, adapting their sizes from "ghost" lists of recently evicted keys | Self-tuning between recency and frequency | More metadata; was covered by an IBM patent |
-| W-TinyLFU | A small LRU window, then an **admission filter**: a new item enters the main cache only if its approximate frequency (from a compact count-min sketch) beats the eviction victim's | Near-optimal hit ratios in published traces; used by Caffeine (Java) and, in a variant, Ristretto (Go) | More complex; approximate counts |
+| W-TinyLFU | A small LRU window, then an **admission filter**: a new item enters the main cache only if its approximate frequency (from a compact **count-min sketch**, a small table of counters that estimates how often each key was seen) beats the eviction victim's | Near-optimal hit ratios in published traces; used by Caffeine (Java) and, in a variant, Ristretto (Go) | More complex; approximate counts |
 | TTL | Items whose time is up | Bounds staleness, frees memory from dead keys | Not a capacity policy on its own |
 
 ### TTL expiry vs eviction
 
 **In plain words:** expiry is a sell-by date on one item; eviction is clearing shelf space because the shelf is full. They are two separate reasons an item disappears.
+
+**Step by step:**
+1. Key `price:7` is saved with a 60-second TTL. Memory is only half used.
+2. After 60 seconds it expires and is removed, even though there is plenty of room. That is expiry.
+3. Key `product:9` has a 1-hour TTL, but memory hits the `maxmemory` limit.
+4. The eviction policy picks `product:9` as a victim and removes it, even though its timer is far from done. That is eviction.
 
 TTL expiry and eviction are separate mechanisms that both free memory:
 
@@ -229,6 +290,13 @@ flowchart LR
 
 **In plain words:** when Redis runs out of its memory budget, it looks at a setting that says which keys may be removed and how to choose them.
 
+**Step by step:**
+1. A client sends `SET product:9 ...`. Before running it, Redis checks memory.
+2. Memory used is below `maxmemory`: the write runs normally.
+3. Memory is above the limit: Redis reads `maxmemory-policy`.
+4. With `noeviction` (the default), Redis rejects the write with an `OOM` error.
+5. With `allkeys-lru`, Redis picks 5 random keys, removes the one idle longest, and repeats until memory is under the limit. Then the write runs.
+
 Redis checks memory before running a command that may add data. If `used_memory` is above `maxmemory`, it frees memory according to `maxmemory-policy` until it is under the limit, or rejects the command.
 
 | `maxmemory-policy` | Candidates | Picks |
@@ -245,7 +313,7 @@ Redis checks memory before running a command that may add data. If `used_memory`
 Defaults measured on Redis 8.2 with `CONFIG GET`: `maxmemory 0` (no limit on 64-bit builds), `maxmemory-policy noeviction`, `maxmemory-samples 5`, `lfu-log-factor 10`, `lfu-decay-time 1`.
 
 - **Approximate LRU.** Redis keeps a 24-bit "last access" clock in each key, not a linked list. To evict, it samples `maxmemory-samples` keys (5 by default), adds the best candidates to a small pool (16 entries), and evicts the oldest in the pool. Raising the sample count to 10 gets closer to true LRU at more CPU per eviction.
-- **Approximate LFU.** The same 24 bits hold a 16-bit last-decrement time and an 8-bit **logarithmic counter** (maximum 255). A hit increments the counter only with probability `1 / ((counter − 5) × lfu-log-factor + 1)`, so it grows roughly with the logarithm of the hit count. New keys start at 5 so they are not evicted immediately. The counter is decremented by one for each `lfu-decay-time` minutes the key goes unaccessed; the decay is applied lazily, when the key is next accessed or sampled for eviction, not by a background sweep.
+- **Approximate LFU.** The same 24 bits hold a 16-bit last-decrement time and an 8-bit **logarithmic counter** (maximum 255; it grows fast at first and then slower and slower, so one byte can tell 1,000 hits from 100,000). A hit increments the counter only with probability `1 / ((counter − 5) × lfu-log-factor + 1)`, so it grows roughly with the logarithm of the hit count. New keys start at 5 so they are not evicted immediately. The counter is decremented by one for each `lfu-decay-time` minutes the key goes unaccessed; the decay is applied lazily, when the key is next accessed or sampled for eviction, not by a background sweep.
 - **The `volatile-*` trap.** With a `volatile-*` policy, keys without a TTL are never evicted. If none of the keys have a TTL, Redis behaves like `noeviction`. Measured on Redis 8.2: with `volatile-lru` and no TTL keys, a `SET` over the limit returned `OOM`.
 
 ## 4. Worked example 🟡
@@ -634,17 +702,19 @@ flowchart LR
 
 ## 7. In production 🔴
 
-- **Real systems:** Redis (sampled LRU/LFU), Memcached (a segmented LRU per slab class: hot, warm and cold queues), Caffeine (W-TinyLFU, the Java default), Ristretto (TinyLFU admission with sampled LFU eviction, built by Dgraph for Go), and PostgreSQL's buffer pool (a clock-sweep approximation of LRU with usage counts).
+> 🟡 → 🔴 **You now know** how LRU and LFU work inside, what 2Q and TinyLFU add, and how Redis picks victims by sampling. **Next is the advanced part**: which real systems use which rule, what breaks in production, how to make a Go cache fast under many goroutines, and the theoretical best policy you can compare against.
+
+- **Real systems:** Redis (sampled LRU/LFU), Memcached (a segmented LRU per **slab class**, a group of same-sized memory chunks: hot, warm and cold queues), Caffeine (W-TinyLFU, the Java default), Ristretto (TinyLFU admission with sampled LFU eviction, built by Dgraph for Go), and PostgreSQL's buffer pool (a **clock-sweep** approximation of LRU: a pointer circles over the pages and evicts one whose usage count has dropped to zero).
 - **Failure modes → fixes:**
 	- Writes fail with `OOM` → the policy is `noeviction`, or `volatile-*` with no TTL keys. Set `allkeys-lru`/`allkeys-lfu` on cache instances.
 	- Evictions spike and hit ratio drops → working set grew past `maxmemory`; add memory or shard. Check for big keys taking space ([[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]).
 	- Locks or queue entries disappear → they share an instance with an `allkeys-*` policy; separate them.
-	- `maxmemory` set equal to the machine's RAM → replication buffers, fragmentation and fork copy-on-write push the process over and the OS kills it. Leave headroom ([[Redis in Production - Memory, Latency, Security]]).
+	- `maxmemory` set equal to the machine's RAM → replication buffers, fragmentation and fork **copy-on-write** (when Redis forks to save to disk, every page changed meanwhile is copied, using extra memory) push the process over and the OS kills it. Leave headroom ([[Redis in Production - Memory, Latency, Security]]).
 - **What to monitor:** `evicted_keys` rate, `expired_keys` rate, `used_memory` vs `maxmemory`, hit ratio (`keyspace_hits / (keyspace_hits + keyspace_misses)`), and, under LFU, a sample of `OBJECT FREQ` values on hot keys.
 
 ## 8. Deep dive 🔴
 
-- **Concurrency in Go.** A single mutex around an LRU serialises every read, because `Get` mutates the list. Options: **shard** the cache into N independent LRUs by key hash (each with its own lock, 16–256 shards); **buffer** recency updates and apply them in batches (Ristretto and Caffeine do this, accepting slightly stale recency); or accept approximate LRU with per-entry timestamps updated atomically and evict by sampling, as Redis does.
+- **Concurrency in Go.** A single mutex around an LRU serialises every read, because `Get` mutates the list. Options: **shard** (split) the cache into N independent LRUs by key hash (each with its own lock, 16–256 shards); **buffer** recency updates and apply them in batches (Ristretto and Caffeine do this, accepting slightly stale recency); or accept approximate LRU with per-entry timestamps updated atomically and evict by sampling, as Redis does.
 - **Where `sync.Map` fits.** The Go docs recommend it for keys written once and read many times, or for goroutines working on disjoint key sets. It has no size limit and no eviction, so it is a fit for an append-mostly lookup table, not for a bounded cache.
 - **GC cost of big Go caches.** A map of pointers to millions of list nodes makes the garbage collector scan all of them. Caches with millions of entries in Go often store values in large byte slices and keep maps of integer offsets (the approach of `bigcache` and `freecache`) to keep pointers out of the heap.
 - **Belady's optimum.** The best possible policy evicts the item whose next use is furthest in the future. It needs the future, so it cannot be built, but replaying a trace with it gives the ceiling for your workload; if LRU is close to it, a fancier policy will not help.
@@ -684,6 +754,30 @@ flowchart LR
 - Redis LRU/LFU are sampled (`maxmemory-samples 5`); LFU uses an 8-bit log counter starting at 5.
 - `volatile-*` with no TTL keys behaves like `noeviction`.
 - W-TinyLFU (Caffeine, Ristretto) adds admission and resists scans.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does LRU throw out?
+> The item that has gone unused for the longest time.
+
+> [!question]- What is the difference between eviction and expiry?
+> Eviction removes a key because memory is full; expiry removes it because its TTL ran out.
+
+> [!question]- What does Redis do by default when it hits `maxmemory`?
+> It uses `noeviction`, so writes fail with an `OOM` error while reads still work.
+
+🟡 Medium
+
+> [!question]- Why can one big scan hurt LRU but not LFU?
+> Under LRU every scanned item jumps to the front and pushes out the hot set; under LFU scanned items enter with count 1 and evict only each other.
+
+> [!question]- Why does real LFU need its counts to fade over time?
+> Without fading, yesterday's very popular items keep huge counts and never leave, even when nobody reads them now.
+
+> [!question]- With `volatile-lru` and no keys that have a TTL, what happens at the memory limit?
+> Nothing can be evicted, so Redis behaves like `noeviction` and rejects writes with `OOM`.
 
 ## Links 🟢
 

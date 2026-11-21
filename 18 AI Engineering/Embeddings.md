@@ -29,6 +29,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[LLM Fundamentals]]: a model is a big learned math function, text is cut into tokens, and you call it over an API and pay per token.
+
 **From zero, in 60 seconds** 🟢
 
 Computers are good with numbers, not with meaning. "Money back" and "refund" share no letters, but they mean the same thing.
@@ -73,6 +76,11 @@ Keyword search misses it. Embeddings turn both texts into numbers that land clos
 | Cosine similarity | Compares direction of two vectors, ignores length | Same direction = 1.0 |
 | Normalize | Scale a vector to length 1 | Then dot product = cosine |
 | Recall@k | Share of right answers found in the top k results | 9 of 10 found in top 5 = 0.9 |
+| Nearest neighbours | The stored vectors closest to your query vector | The 5 closest help articles |
+| ANN index | A data structure that finds near-nearest vectors fast, without checking every one | HNSW in a vector database |
+| Quantization | Storing each number with fewer bits to save memory | float32 (4 bytes) → int8 (1 byte) |
+| Backfill | A batch job that recomputes old data | Re-embed all 1 million chunks with a new model |
+| Keyword search (BM25) | Search that scores documents by shared words | "refund" finds pages that say "refund" |
 
 **Picture it**
 
@@ -106,9 +114,24 @@ You're building search over 50,000 internal support articles. Keyword search for
 
 Embeddings solve this by representing meaning as geometry instead of as exact tokens.
 
-A sentence encoder maps `"car insurance"` and `"vehicle protection plan"` to vectors that are close together (**measured on a representative sentence-embedding model: cosine similarity ≈ 0.82**, vendor-reported figures on comparable paraphrase pairs typically land in the 0.75–0.90 range), while `"car insurance"` and `"banana bread recipe"` land far apart (cosine similarity ≈ 0.05–0.15, representative range).
+A sentence encoder (an embedding model that turns a whole sentence into one vector) maps `"car insurance"` and `"vehicle protection plan"` to vectors that are close together (**measured on a representative sentence-embedding model: cosine similarity ≈ 0.82**, vendor-reported figures on comparable paraphrase pairs typically land in the 0.75–0.90 range), while `"car insurance"` and `"banana bread recipe"` land far apart (cosine similarity ≈ 0.05–0.15, representative range).
 
 Search becomes "which stored vectors are nearest to the query vector," a well-studied geometric problem instead of a brittle string-matching one.
+
+### Real-life example 🟢
+
+Think of the search box in a food app like Swiggy. A user types "something light for dinner".
+No dish is named "light", so word matching finds little.
+With embeddings, "light dinner" lands near "khichdi", "clear soup" and "salad bowl" on the meaning map, so those come up.
+But when a user types an exact restaurant code or "Paneer 65", plain word matching is better, which is why real apps mix both.
+
+### Common beginner mistakes 🟢
+
+- **Indexing with one model and searching with another** → each model draws its own map, so the numbers do not line up and results quietly go bad → store the model name with the index and use the same one for queries.
+- **Swapping to a "better" model without re-embedding** → old vectors become meaningless next to new queries → re-embed everything, check quality, then switch.
+- **Trusting embeddings for exact codes** → "SKU-4471" and "SKU-4417" can look almost the same in meaning space → add keyword search for IDs and codes.
+- **Forgetting query/document prefixes some models need** → no error appears, recall just drops → read the model card and add the prefixes it asks for.
+- **Judging a model only by a public leaderboard** → your documents differ from the benchmark → test recall@k on 20-100 of your own real queries.
 
 ## 2. Mental model 🟢
 
@@ -129,11 +152,31 @@ flowchart LR
 
 *(Illustrative only — see the representative cosine-similarity ranges above; this diagram does not add new numbers.)*
 
+### Embeddings vs the things people confuse them with 🟡
+
+| Thing | What it gives you | Key difference |
+| --- | --- | --- |
+| Embedding | A list of numbers for one piece of text | Used to compare meaning; it does not write any text |
+| LLM chat reply | New text written by a model | Writes answers; embeddings only measure closeness |
+| Keyword index (BM25) | A word → documents lookup with scores | Matches exact words, misses "money back" vs "refund" |
+| Vector database | A store that holds embeddings and finds the closest ones fast | It stores and searches vectors; the embedding model makes them |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that an embedding turns text into a point on a meaning map, and close points mean similar meaning. **Next we open the box**: how the model learns that map, dense vs sparse vectors, how big the vectors are, how "close" is measured, why questions and passages may need labels, and how to change models safely. Each subsection starts with a plain step-by-step walk.
 
 ### Whiteboard version
 
 **In plain words:** Text goes in, a list of numbers comes out, and "same meaning" becomes "arrows pointing the same way".
+
+**Step by step:**
+1. Send "vehicle protection plan" to the embedding model.
+2. Get back a vector, say 1,536 numbers like `[0.12, -0.55, 0.31, ...]`.
+3. **Normalize** it: scale it so its length is exactly 1 (only the direction is kept).
+4. Do the same for the query "car insurance".
+5. Compare directions with cosine similarity: about 0.82, so they match.
+
+Full detail:
 
 The mechanism end to end: text goes in, a fixed-length vector comes out, and "similar meaning" becomes "small angle between vectors."
 
@@ -147,6 +190,15 @@ flowchart LR
 ### Training: contrastive learning
 
 **In plain words:** The model learns by example: pull matching pairs close together, push unrelated ones apart.
+
+**Step by step:**
+1. Take a pair known to match: "how do I get a refund" and the "Refund policy" article.
+2. Take a pair known not to match: the same question and "Office opening hours".
+3. The model makes vectors for all three texts.
+4. Training nudges the model's numbers so the matching pair moves closer and the other moves away.
+5. Repeat for millions of pairs. The map now groups text by "does this answer that", not by shared letters.
+
+Full detail:
 
 Embedding models are trained with **contrastive learning**: feed the model pairs known to be related (a question and its correct answer, two paraphrases, a document and a search query that should find it) alongside unrelated pairs, and adjust the model so related pairs end up with high cosine similarity and unrelated pairs end up near zero or negative.
 
@@ -162,8 +214,17 @@ flowchart LR
 
 **In plain words:** Dense = a short list where every number carries a bit of meaning. Sparse = a huge list, one slot per word, mostly zeros.
 
+**Step by step:**
+1. Text: "cancel my plan".
+2. Dense: about 1,000 numbers, all filled in. No single number means a word; together they mean "stop a subscription".
+3. Sparse: one slot per word in a 30,000-word list. Only "cancel", "my" and "plan" get a value; the rest are 0.
+4. Dense finds "close my account" (same meaning, other words). Sparse finds the exact code "ERR-504".
+5. Real systems often run both and merge the results.
+
+Full detail:
+
 - **Dense embeddings** (the subject of this note) are what most people mean by "embeddings": every one of the vector's 384–3,072 dimensions (typical current range; always check your model's card) carries some signal, and dimensions aren't individually interpretable.
-- **Sparse embeddings** (BM25's TF-IDF-style weights, or learned sparse models like SPLADE) are vectors with tens of thousands of dimensions where almost all are zero, one per vocabulary term — sparse embeddings are interpretable (each nonzero dimension is a specific token) and excel at exact terms dense embeddings blur over: product codes, IDs, rare proper nouns, negation. See [[Keyword, Semantic and Hybrid Search]] for combining the two.
+- **Sparse embeddings** (BM25's TF-IDF-style weights, which give rare words more weight than common ones, or learned sparse models like SPLADE, which learn which words matter) are vectors with tens of thousands of dimensions where almost all are zero, one per vocabulary term — sparse embeddings are interpretable (each nonzero dimension is a specific token) and excel at exact terms dense embeddings blur over: product codes, IDs, rare proper nouns, negation. See [[Keyword, Semantic and Hybrid Search]] for combining the two.
 
 ```mermaid
 flowchart LR
@@ -177,13 +238,31 @@ flowchart LR
 
 **In plain words:** More numbers per vector = better search but more disk and memory. Some models let you cut the list short and still work well.
 
-Storage for a flat index is simply `N × d × 4 bytes` for `N` vectors of `d` float32 dimensions: one million chunks at 1,536 dimensions is `1,000,000 × 1,536 × 4 = 6.14 GB` just for the raw vectors, before any index overhead (see [[Vector Databases and ANN Indexes]] for graph/index memory on top of this).
+**Step by step:**
+1. Each number is a float32, which takes 4 bytes.
+2. One vector of 1,536 numbers takes about 6 KB.
+3. One million chunks take about 6 GB, before any index on top.
+4. A Matryoshka-trained model (named after Russian nesting dolls) lets you keep only the first 256 numbers and still search, at about 1 GB.
+5. You can search fast with the short version, then re-check the top results with the full one.
 
-**Matryoshka Representation Learning** (Kusupati et al., 2022) trains embeddings so that truncating the vector to a shorter prefix — keeping only the first 256 of 1,536 dimensions, say — still produces a usable (slightly lower-quality) embedding, instead of garbage. This lets you store a short vector for a fast first pass and the full vector for reranking, trading some quality for roughly proportional storage savings; models documented as Matryoshka-trained support this officially, and truncating any other model's output is not guaranteed to work.
+Full detail:
+
+Storage for a flat index (a plain list of vectors with no extra search structure) is simply `N × d × 4 bytes` for `N` vectors of `d` float32 dimensions: one million chunks at 1,536 dimensions is `1,000,000 × 1,536 × 4 = 6.14 GB` just for the raw vectors, before any index overhead (see [[Vector Databases and ANN Indexes]] for graph/index memory on top of this).
+
+**Matryoshka Representation Learning** (Kusupati et al., 2022) trains embeddings so that truncating the vector to a shorter prefix — keeping only the first 256 of 1,536 dimensions, say — still produces a usable (slightly lower-quality) embedding, instead of garbage. This lets you store a short vector for a fast first pass and the full vector for reranking (re-scoring the top few results more carefully), trading some quality for roughly proportional storage savings; models documented as Matryoshka-trained support this officially, and truncating any other model's output is not guaranteed to work.
 
 ### Distance metrics
 
 **In plain words:** These are just different rulers for "how close are two dots". For text, cosine is the default.
+
+**Step by step:**
+1. Two vectors: A = `[3, 4]` and B = `[6, 8]`. B points the same way but is twice as long.
+2. Cosine looks only at direction: A and B score 1.0, a perfect match.
+3. L2 (straight-line distance) says they are 5 apart, because it also counts length.
+4. If you first scale every vector to length 1, A and B become the same point, and all three rulers agree on the order.
+5. So: normalize at write time, then use the fast dot product.
+
+Full detail:
 
 | Metric | Formula (vectors `a`, `b`) | Behavior |
 | --- | --- | --- |
@@ -196,6 +275,15 @@ Normalizing every vector to unit length at write time means dot product and cosi
 ### Symmetric vs asymmetric retrieval
 
 **In plain words:** Symmetric = comparing like with like (sentence vs sentence). Asymmetric = a short question vs a long answer paragraph.
+
+**Step by step:**
+1. Symmetric job: "Is ticket A a duplicate of ticket B?" Both are the same kind of text.
+2. Asymmetric job: the 5-word question "how to reset password" against a 200-word help paragraph.
+3. Asymmetric models want a label on each text, like `"query: how to reset password"` and `"document: To reset your password..."`.
+4. Forget the labels, and nothing errors; the right paragraph just ranks lower.
+5. So read the model card before indexing anything.
+
+Full detail:
 
 A **symmetric** model assumes the query and the thing it's matched against are the same kind of text (paraphrase search: "is this sentence similar to that sentence?").
 
@@ -217,6 +305,15 @@ flowchart LR
 
 **In plain words:** New model = new map. Old dots make no sense on it, so you must redo every vector.
 
+**Step by step:**
+1. Today: 1 million chunks are stored with model A, and queries use model A.
+2. Start a backfill job that re-embeds every chunk with model B into a new, separate index. Queries still use the old index.
+3. The job saves progress by document ID, so it can stop and resume safely.
+4. When it is done, test recall@k on a fixed set of queries against the new index.
+5. If it is good, switch queries to model B and the new index. Delete the old one after a safe waiting period.
+
+Full detail:
+
 Because the index and the query must share a model, changing models means every stored vector is now meaningless relative to new queries — not slightly worse, just incompatible, since different models produce vectors in unrelated spaces (and often different dimensions entirely).
 
 ```mermaid
@@ -234,7 +331,7 @@ sequenceDiagram
     Note over Old: Phase 3 — decommission after a verification window
 ```
 
-Run the backfill as an idempotent, resumable batch job (checkpoint progress by document ID) and verify recall@k on a fixed query set against the new index before flipping query traffic over — never flip mid-backfill, or some queries will silently search a half-populated index.
+Run the backfill as an idempotent (safe to run twice with the same result), resumable batch job (checkpoint progress by document ID) and verify recall@k on a fixed query set against the new index before flipping query traffic over — never flip mid-backfill, or some queries will silently search a half-populated index.
 
 ## 4. Worked example 🟡
 
@@ -580,7 +677,7 @@ ok  	embed	1.51s
 
 | Decision | Options | Use when | Cost |
 | --- | --- | --- | --- |
-| Model source | API-hosted (Voyage, OpenAI, Cohere, Anthropic-ecosystem) vs self-hosted (open-weight, e.g. BGE, E5 families) | API: no infra, best MTEB scores, per-token cost. Self-hosted: data never leaves your network, fixed compute cost at volume | API: ongoing $/token (documented — cite your provider's current pricing page). Self-hosted: GPU/CPU capacity, ops burden |
+| Model source | API-hosted (Voyage, OpenAI, Cohere, Anthropic-ecosystem) vs self-hosted (open-weight, e.g. BGE, E5 families) | API: no infra, best MTEB scores (MTEB is a public leaderboard that ranks embedding models), per-token cost. Self-hosted: data never leaves your network, fixed compute cost at volume | API: ongoing $/token (documented — cite your provider's current pricing page). Self-hosted: GPU/CPU capacity, ops burden |
 | Dimensionality | 384–3,072 typical (verify per model) | Lower: cheaper storage, faster search, somewhat lower recall. Higher: better recall, more storage and compute | Storage scales linearly with `d`; recall gains shrink past a point specific to the model |
 | Dense vs sparse vs hybrid | Pick one, or fuse both | Dense: paraphrase and concept queries. Sparse: exact terms, IDs, rare words. Hybrid: both | Hybrid needs two indexes and a fusion step (see [[Keyword, Semantic and Hybrid Search]]) |
 | Quantization | float32, float16, int8, binary | Full precision: highest recall. Quantized: 2–32× less memory, small recall loss, tune per model | Recall loss grows with aggressiveness; always measure on your own data before shipping |
@@ -595,10 +692,12 @@ ok  	embed	1.51s
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how embeddings are trained, sized, compared and migrated. **Next comes the senior view**: what breaks quietly in production, the one metric that catches it, how to pick a model for your own data, and uses beyond search.
+
 - **Real systems:** semantic search backing documentation and support sites; RAG pipelines retrieving context for an LLM (see [[RAG Pipeline]]); deduplication (near-identical support tickets, catalog listings); clustering unlabeled feedback into themes; recommendation systems embedding both items and user history into the same space.
 - **Failure modes → fixes:**
   - Silent model/version mismatch between indexing and querying → pin the exact model identifier (including a version suffix where the provider offers one) in config, and fail loudly if a query's configured model doesn't match the index's recorded model.
-  - Stale vectors after a source document changes → re-embed and re-upsert on content-hash change, not on a fixed schedule; store the content hash alongside the vector so this is cheap to check.
+  - Stale vectors after a source document changes → re-embed and re-upsert (insert, or update if it already exists) on content-hash change (a short fingerprint of the text that changes when the text changes), not on a fixed schedule; store the content hash alongside the vector so this is cheap to check.
   - Asymmetric model used without query/document prefixes → recall drops without any error; verify by running a small labeled query set through the model's documented usage pattern before launch.
   - Quantization chosen without measurement → recall@k silently degrades; always A/B the quantized index against full precision on your own queries first.
 - **What to monitor:** recall@k against a fixed labeled query set (the only reliable health signal — nothing else tells you retrieval quality is degrading); embedding API latency and error rate; cache hit rate (content-hash cache above); re-embedding backlog size during a migration; storage growth vs corpus growth (a planned, not surprising, number given `N × d × 4 bytes`).
@@ -606,10 +705,10 @@ ok  	embed	1.51s
 ## 8. Deep dive 🔴
 
 - **Choosing a model.** Start from the MTEB retrieval leaderboard, but weight it by what actually matches your workload: filter to your language(s) and domain if the leaderboard offers domain-specific splits, check max input tokens against your chunk size, and weigh API cost or self-hosting compute against the retrieval-quality delta — a model two points higher on a generic benchmark is not automatically worth 3× the latency or cost for your corpus. Re-run your own recall@k evaluation before committing; benchmark rank and your-data rank frequently diverge.
-- **Multilingual and multimodal embeddings.** Multilingual models map semantically equivalent text in different languages close together, letting a query in one language retrieve documents in another — useful, but verify per-language MTEB scores rather than assuming uniform quality across all supported languages. Multimodal models (text-and-image into one space, e.g. CLIP-family architectures) let an image query retrieve text results and vice versa; they generally trade some pure-text retrieval quality for that cross-modal capability.
+- **Multilingual and multimodal embeddings.** Multilingual models map semantically equivalent text in different languages close together, letting a query in one language retrieve documents in another — useful, but verify per-language MTEB scores rather than assuming uniform quality across all supported languages. Multimodal models (text-and-image into one space, e.g. CLIP-family architectures, which were trained on images with their captions) let an image query retrieve text results and vice versa; they generally trade some pure-text retrieval quality for that cross-modal capability.
 - **Batching, rate limits, and caching.** Embedding APIs charge and rate-limit per token, so batch many chunks into one request up to the provider's documented batch-size limit rather than one request per chunk; the content-hash cache above is the single highest-leverage optimization in most pipelines, since re-indexing jobs and repeated user queries both re-embed a lot of identical text.
 - **Evaluating on your own queries.** A public benchmark score is evidence a model is *generally* competent, not evidence it's competent on your documents. Build a small labeled set (20–100 real queries with known correct chunks is enough to start) and measure recall@k — the fraction of queries where a correct chunk appears in the top k results — before and after any model, chunking, or quantization change.
-- **Non-RAG uses are often simpler to ship than RAG itself.** Deduplication (flag pairs above a similarity threshold), clustering (k-means or HDBSCAN over the vectors), and classification (nearest-centroid or a small classifier head on top of frozen embeddings) all reuse the exact same embedding call with none of RAG's retrieval-quality, citation, or context-assembly complexity — a good place to get value from an embeddings investment quickly.
+- **Non-RAG uses are often simpler to ship than RAG itself.** Deduplication (flag pairs above a similarity threshold), clustering (k-means or HDBSCAN, methods that group nearby vectors into themes), and classification (nearest-centroid or a small classifier head on top of frozen embeddings) all reuse the exact same embedding call with none of RAG's retrieval-quality, citation, or context-assembly complexity — a good place to get value from an embeddings investment quickly.
 
 ## 9. Interview questions 🔴
 
@@ -644,6 +743,26 @@ ok  	embed	1.51s
 - Index and query must share the exact model and version; a model change is a backfill-and-cutover migration, never a swap.
 - Cache embeddings by a content hash to cut cost on re-indexing and repeated queries.
 - Measure recall@k on your own labeled queries before and after any model, chunking, or quantization change.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: What is an embedding?
+> A list of numbers for a piece of text, where similar meanings get similar numbers.
+
+> [!question]- Easy: Why does "money back" find "Refund policy" with embeddings but not with keyword search?
+> They share no words, but their meanings land close together on the embedding map.
+
+> [!question]- Easy: What does cosine similarity compare?
+> The direction of two vectors; 1.0 means they point the same way.
+
+> [!question]- Medium: You index with model A and query with model B. What happens?
+> No error, but results are nonsense, because the two models' maps do not line up.
+
+> [!question]- Medium: How much raw space do 1 million vectors of 1,536 float32 numbers take?
+> About 6 GB (1,000,000 × 1,536 × 4 bytes), before any index.
+
+> [!question]- Medium: A user searches an exact part number and gets near misses. What do you add?
+> Keyword (sparse/BM25) search, merged with the dense results as hybrid search.
 
 ## Links 🟢
 

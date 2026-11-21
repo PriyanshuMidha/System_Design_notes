@@ -31,6 +31,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (the nine steps), 4 (worked example) and 5 (what is scored, red flags, follow-ups).
 > - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the round goes requirements → numbers → simple design → deep dives → wrap-up.
+> - [[Back-of-the-Envelope Estimation]]: you can turn "5 million a day" into "about 60 a second" with rounded maths.
+> - [[Scaling Basics]]: you scale by adding stateless servers, then caches and replicas, and split data last.
+
 **From zero, in 60 seconds** 🟢
 
 In a system design round, the interviewer names an app ("design a food delivery app") and gives you about 45 minutes.
@@ -74,6 +79,14 @@ If you follow a fixed set of steps, you ask the right questions, size the system
 | QPS | Queries (requests) per second | 1,750 orders per second at peak |
 | Back-of-envelope estimate | Quick rough math to size the system | 10M orders/day ÷ 86,400 s ≈ 116/s |
 | Deep dive | Zooming into the riskiest part in detail | How to assign riders without double booking |
+| SLA | A promise to customers about uptime or speed, often with penalties | "99.9% a month or we refund" |
+| SLO | Your internal target, usually stricter than the SLA | 99.95% of requests succeed |
+| p99 | 99 out of 100 requests are faster than this | p99 = 200 ms |
+| Partition key | The field that decides which shard stores a row | `customer_id` |
+| Idempotency key | A unique ID sent with a request so a retry does not repeat it | `Idempotency-Key: 7f3a...` on "pay" |
+| Cursor pagination | "Give me 20 items after this one" instead of "page 5" | `?after=order_991` |
+| Replica | A copy of the database that can serve reads | 2 read replicas behind the primary |
+| Circuit breaker | Stops calling a failing service for a while so it can recover | open after 50% errors |
 | Trade-off | What you give up to get something | Faster reads, but data can be seconds stale |
 
 **Picture it**
@@ -130,6 +143,22 @@ Think of the round as **plan, build, stress, defend**.
 
 Where the analogy breaks: a builder is not interrupted every five minutes. An interviewer will steer you; treat each interruption as new information about what they care about, not as an attack.
 
+### Real-life example: "Design Uber" or "Design Swiggy" 🟢
+
+These two prompts are among the most common HLD questions at Indian product companies.
+In both, the hard part is the same: thousands of drivers or riders send their location every few seconds, and a customer must be matched to a nearby one quickly and only once.
+A candidate who follows the steps asks about scale first, finds "about 40,000 location updates a second", and so knows not to write them into the main SQL database.
+The steps exist so that this kind of insight shows up on its own, early, instead of at minute 40.
+
+## Common beginner mistakes 🟢
+
+- **Drawing boxes in the first minute** → wrong scope, and the hardest part is found too late → spend about 5 minutes on requirements and numbers.
+- **Asking 20 questions** → half the round is gone → ask 6-8, write the answers, and state the rest as assumptions.
+- **A number with no consequence** ("1,750 QPS") → the interviewer wonders why you computed it → always add "so we need ...".
+- **A box nobody asked for** → it costs time and invites hard questions → every box must point to a requirement or a number.
+- **No wrap-up** → the interviewer has to guess your main trade-offs → keep 4 minutes to summarise, name the weakest point and the next step.
+
+
 ```mermaid
 flowchart LR
     P["Plan<br/>requirements, numbers"] --> B["Build<br/>API, data, simple HLD"]
@@ -140,6 +169,8 @@ flowchart LR
 ```
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the round is plan, build, stress, defend. **Next we open the box**: the time budget and each of the nine steps, with what to say and what to write. Several steps start with a plain walk-through; the full detail follows.
 
 ### The timebox
 
@@ -176,6 +207,13 @@ gantt
 ### Step 1: Requirements (functional, non-functional, scale, SLA)
 
 **In plain words.** Before drawing, find out what the system must do, how big it is, and how good it must be. The questions below are a script; adapt wording, keep the order.
+
+**Step by step:**
+1. Ask who the users are and their 3 core actions: "customers order, restaurants accept, riders deliver".
+2. Ask how good: "p99 under 300 ms for browsing, never double-charge".
+3. Ask how big: "10 million daily users, peak at lunch and dinner".
+4. Ask what to skip: "may I leave out admin tools and analytics?"
+5. Write all of it in a short list on the board and read it back.
 
 **Picture it.**
 
@@ -219,6 +257,13 @@ The exact questions to ask:
 
 **In plain words.** Turn users into per-second numbers so each design choice has a reason. Estimate only what changes a decision. Method details live in [[Back-of-the-Envelope Estimation]].
 
+**Step by step:**
+1. 5 million orders a day ÷ about 100,000 seconds ≈ 50 a second; peak is about 3 times that.
+2. "So one primary database can take the writes."
+3. 200,000 riders × 1 ping every 5 s = 40,000 writes a second.
+4. "So locations go to an in-memory geo index, not SQL."
+5. Stop there. Two or three numbers that change decisions are enough.
+
 ```mermaid
 flowchart LR
     DAU["DAU"] --> A["actions per user per day"]
@@ -250,6 +295,12 @@ Round aggressively: 86,400 is about 10^5, so a million per day is about 12 per s
 
 **In plain words.** List the calls clients make. Keep to 4 to 8 endpoints covering the functional requirements. Name the identifier, pagination style and idempotency for writes.
 
+**Step by step:**
+1. One call per core action: `POST /orders`, `GET /restaurants?near=...`, `GET /orders/{id}`.
+2. Add an `Idempotency-Key` header to anything that charges money or creates something.
+3. Lists page with a cursor, not page numbers.
+4. Mark live tracking as SSE or WebSocket, not a normal call.
+
 | Concern | What to say |
 | --- | --- |
 | Style | REST for public CRUD, gRPC between services, WebSocket or SSE for live updates (see [[Choosing an API Style]]) |
@@ -270,6 +321,12 @@ WS   /v1/orders/{id}/track                                    -> stream of {lat,
 ### Step 4: Data model
 
 **In plain words.** Name the entities, their keys, and how they are accessed. Choose the store by access pattern, not by habit. The decision guides for choosing databases and brokers sit in [[07 Databases MOC]] and [[09 Messaging & Async MOC]].
+
+**Step by step:**
+1. List the main things: order, menu item, rider location, events.
+2. For each, write its key and how it is read: "order by id, and list by customer".
+3. Pick the store from that access pattern: orders in SQL, rider locations in memory, events in a log.
+4. Say the partition key now, because it decides hot spots later.
 
 ```mermaid
 erDiagram
@@ -346,6 +403,12 @@ The deep-dive recipe, in four sentences you can literally say:
 
 **In plain words.** Walk the request path and ask "what saturates first?" Then name the fix and the trigger for it.
 
+**Step by step:**
+1. Follow one request from the client to the database.
+2. At each layer ask: what fills up first? CPU, database reads, database writes, one hot key, a queue, connections.
+3. Name the fix in order of cost: more servers, then cache, then replicas, then partitioning.
+4. Name the trigger: "I shard when write QPS reaches what one primary handled in our load test".
+
 | Layer | First thing to saturate | Fix | Trigger (state it) |
 | --- | --- | --- | --- |
 | Stateless services | CPU | Add replicas behind the load balancer ([[Load Balancing]]) | CPU above 60 percent at peak |
@@ -377,9 +440,9 @@ flowchart LR
 | Duplicates | Idempotency keys, at-least-once plus dedup ([[Delivery Semantics and Exactly-Once]]) |
 | Overload | Rate limiting, load shedding, graceful degradation ([[Load Shedding and Graceful Degradation]]) |
 | Security | TLS, OAuth or JWT at the gateway, least privilege, secrets in a vault, rate limits for abuse ([[OWASP API Security Top 10]]) |
-| Observability | RED metrics per service (rate, errors, duration), traces across services, SLO alerts ([[SLIs, SLOs, SLAs and Error Budgets]]) |
+| Observability | RED metrics per service (rate, errors, duration: the three numbers to graph for every service), traces across services, SLO alerts ([[SLIs, SLOs, SLAs and Error Budgets]]) |
 
-The four golden signals from the Google SRE book are latency, traffic, errors and saturation. Naming them shows you operate systems.
+The four golden signals from the Google SRE book are latency, traffic, errors and saturation (how full the busiest resource is). Naming them shows you operate systems.
 
 ### Step 9: Wrap-up
 
@@ -492,6 +555,8 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** every step and have seen a whiteboard run. **Next comes the senior view**: how real design reviews mirror this round, ready-made phrases, picking the deep dive by problem type, and the consistency decision in one picture.
+
 - **Real design reviews** follow this order: context, requirements, numbers, options, decision, risks, monitoring. See [[Architecture Decision Records]].
 - **Practice loop that works:** one problem per sitting against a timer; redraw from memory next day; explain one failure end to end; compare one alternative.
 - **Common failures in a real round and the fix:**
@@ -582,6 +647,26 @@ See [[Consistency Models]] and [[CAP and PACELC]] for the theory behind each bra
 - 10x: re-estimate, first bottleneck, scale in order, side effects, load test.
 - Always say failure, security, observability (four golden signals).
 - SDE-3 = drive, quantify, operate, keep it simple.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) Which phase gets the most time in a 45-minute round?
+> The deep dives, about 15 minutes.
+
+> [!question]- (easy) What must every estimate end with?
+> "So we need ...": the decision it drives.
+
+> [!question]- (easy) Why add an `Idempotency-Key` to payment calls?
+> So a retried request does not charge twice.
+
+> [!question]- (medium) 200,000 riders ping every 5 s. Where do the locations go, and why?
+> An in-memory geo index: 40,000 writes a second is too much for the main SQL database.
+
+> [!question]- (medium) In what order do you scale?
+> Stateless servers, then cache, then read replicas, then partitioning.
+
+> [!question]- (medium) What four sentences make a deep dive?
+> The risky part and why; two or three options; the pick and what it costs; when it breaks and the next step.
 
 ## Links 🟢
 

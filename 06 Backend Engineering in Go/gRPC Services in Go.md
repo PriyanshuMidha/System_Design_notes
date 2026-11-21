@@ -31,6 +31,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Service Project Layout and Wiring]]: `main` builds each part and passes it in; the service code lives under `internal/`.
+> - [[gRPC]]: gRPC calls a method on another server with typed binary messages over HTTP/2.
+> - [[Error Handling]]: errors are values you check and wrap.
+> - [[Context Package]]: a `ctx` carries a deadline and cancellation through every call.
+
 **From zero, in 60 seconds** 🟢
 
 **gRPC** is how backend services call each other like functions. You write the contract in a `.proto` file — service names, methods, message shapes — and a generator turns it into Go code for both sides.
@@ -67,6 +73,11 @@ Go code for both sides is generated from it, so a mismatch fails to compile.
 | Context deadline | A time limit that travels with the call | `context.WithTimeout(ctx, 2*time.Second)` |
 | Status code | gRPC's version of HTTP 404/500 | `codes.NotFound` |
 | Interceptor | Middleware that wraps every RPC | Logging, auth, panic recovery |
+
+| Stub | Generated client code that makes a remote call look like a local function | `pb.NewInvoiceServiceClient(conn)` |
+| Metadata | gRPC's version of HTTP headers | `authorization: Bearer ...` |
+| `bufconn` | An in-memory listener for testing gRPC without a real port | server and client in one test |
+| Reflection | A server feature that lets tools list its methods | `grpcurl list` |
 
 **Picture it**
 
@@ -117,6 +128,10 @@ This is why the common InvoiceOps shape is **public REST, internal gRPC**: exter
 
 [[Choosing an API Style]] covers that decision in general; this note is the Go implementation once gRPC has been chosen.
 
+### A real-life example 🟢
+
+Inside Uber or Swiggy, a "place order" request may touch pricing, inventory and payment services. They call each other with gRPC: the pricing team publishes a `.proto` file, and the order team generates a typed Go client from it, so a wrong field name fails at compile time, not in production. Each call carries a deadline, so if pricing is slow, the whole chain gives up together instead of piling up waiting calls.
+
 ## 2. Mental model 🟢
 
 Think of a `.proto` file as a function signature shared by two processes that will never share a compiler. `buf generate` turns it into:
@@ -130,9 +145,17 @@ The `ctx` you pass in doesn't just cancel a goroutine, the way it does for an in
 
 ## 3. How it works 🟡
 
+🟢 → 🟡 You now know gRPC as typed function calls between services, generated from a `.proto` file, with deadlines and status codes. Next we open the box: code generation, building the server and client, errors, deadlines, metadata, interceptors, security, health, load balancing and testing.
+
 ### Code generation
 
 **In plain words:** one buf command reads the contract and writes the boring halves of both sides; you only fill in the method bodies.
+
+**Step by step:**
+1. Write `invoice.proto` with `service InvoiceService { rpc GetInvoice(...) returns (Invoice); }`.
+2. Run `buf generate`.
+3. You get message structs and a `InvoiceServiceServer` interface plus a client stub.
+4. You write only the method bodies on your server type.
 
 A gRPC-in-Go project is driven by [Buf](https://buf.build) rather than invoking `protoc` by hand, so that plugin versions are pinned and import paths don't depend on a developer's local `protoc` install.
 
@@ -229,6 +252,12 @@ client := invoicev1.NewInvoiceServiceClient(conn)
 
 **In plain words:** gRPC has its own small set of error codes instead of HTTP's; the server attaches one to every failure and the client switches on it.
 
+**Step by step:**
+1. The repository says invoice 42 does not exist.
+2. The server returns `status.Error(codes.NotFound, "invoice 42 not found")`.
+3. The client calls `status.Code(err)` and gets `NotFound`.
+4. It shows "not found" instead of retrying; only codes like `Unavailable` are safe to retry.
+
 A gRPC handler returns `(response, error)`, and that `error` should almost always be built with `status.Error` / `status.Errorf`, never a bare `errors.New`. The code is what callers branch on — Go error string matching does not survive a process boundary.
 
 | Code | Means | Typical InvoiceOps source |
@@ -253,6 +282,12 @@ On the client side, `status.FromError(err)` recovers the `*status.Status` (code,
 ### Deadlines
 
 **In plain words:** the caller says 'you have 300 ms' and that budget travels with the call across every hop, cancelling work that can no longer be useful.
+
+**Step by step:**
+1. The client makes `ctx` with a 300 ms timeout and calls `GetInvoice(ctx, req)`.
+2. The deadline travels to the server inside the request.
+3. The server passes the same `ctx` to its database call.
+4. At 300 ms, everything stops and the client gets `DeadlineExceeded`.
 
 ```mermaid
 sequenceDiagram
@@ -291,6 +326,12 @@ Metadata set before the first `Send` becomes **headers**; metadata set after (vi
 ### Interceptors
 
 **In plain words:** middleware by another name — functions wrapped around every RPC for logging, auth and recovery, written once.
+
+**Step by step:**
+1. Register interceptors when building the server: recovery, logging, auth.
+2. Each RPC passes through them in order before reaching your method.
+3. Auth reads the token from metadata and rejects with `Unauthenticated` if it is bad.
+4. Logging records method, status code and time taken after the method returns.
 
 Interceptors are gRPC's middleware: a chain wraps every unary call, in order, each one able to inspect or reject the request before the next link (and the handler) runs.
 
@@ -815,7 +856,26 @@ The structured `errdetails.BadRequest` — not just the status message — is wh
 - A breaking proto change is caught at compile time, which is a strength, but it also means every consumer must regenerate and redeploy together, or you must follow strict additive-only evolution (see [[Protocol Buffers and Schema Evolution]]).
 - For a small system with one client and one server, hand-written REST with a JSON schema is simpler to debug and has no codegen step to maintain — gRPC earns its cost at a handful of services and up, or wherever streaming is a real requirement.
 
+### gRPC vs REST 🟡
+
+| | gRPC | REST + JSON |
+| --- | --- | --- |
+| Contract | `.proto`, code generated | often a spec or docs |
+| Format | binary Protobuf over HTTP/2 | text JSON over HTTP/1.1 or 2 |
+| Errors | status codes like `NotFound` | HTTP codes like 404 |
+| Best for | service-to-service calls | browsers and public APIs |
+
+### Common beginner mistakes 🟢
+
+- Calling without a deadline → a slow server hangs callers forever → always use `context.WithTimeout`.
+- Returning plain `errors.New` → clients see `Unknown` → return `status.Error` with the right code.
+- Retrying every error → duplicate side effects → retry only safe codes like `Unavailable`.
+- Leaving reflection open in production → anyone can list your API → turn it off or protect it.
+- Creating a new connection per call → slow and wasteful → create one `grpc.ClientConn` and reuse it.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now build, call and test a gRPC service. The advanced part covers running it: load balancing long-lived connections, retries, message limits, and the details interviewers ask about.
 
 - **Real systems:** etcd's client/server API is gRPC; Kubernetes uses gRPC for the Container Runtime Interface (CRI) and for device plugins; Envoy and Istio's xDS control-plane protocol runs over gRPC streams.
 - **Failure modes → fixes:**
@@ -870,6 +930,26 @@ The structured `errdetails.BadRequest` — not just the status message — is wh
 - `UnimplementedXServer` embedded by value is what makes new RPCs forward-compatible instead of a compile break.
 - Reflection is a dev/staging convenience (`grpcurl`), not a production default.
 - Test with `bufconn` first: a real server and client, no network, no flakiness.
+
+## Self-check 🟢🟡
+
+> [!question]- What file describes a gRPC service?
+> A `.proto` file.
+
+> [!question]- Which gRPC code means "this resource does not exist"?
+> `NotFound`.
+
+> [!question]- What is an interceptor?
+> Middleware that wraps every RPC, like logging or auth.
+
+> [!question]- How does a deadline reach the server?
+> It travels inside the call from the client's `ctx`, and the server's `ctx` gets the same deadline.
+
+> [!question]- Why is `bufconn` used in tests?
+> It runs server and client in memory with no real port, so tests are fast and not flaky.
+
+> [!question]- Why reuse one `grpc.ClientConn`?
+> It holds an HTTP/2 connection that can carry many calls; making one per call wastes time.
 
 ## Links 🟢
 

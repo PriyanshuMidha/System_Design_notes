@@ -31,6 +31,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Testing in Go]]: `go test ./...` runs your tests, and `-race` also checks for data races between goroutines.
+> - [[Containerizing Go Services]]: a Go service is shipped as a Docker image, built once from a Dockerfile.
+
 **From zero, in 60 seconds** 🟢
 
 Every time someone pushes code, a few things should happen: build it, test it, and if it is good, ship it.
@@ -74,6 +78,13 @@ A CI/CD pipeline makes every change go through the same automatic build, test an
 | Workflow / job | A set of automated steps GitHub Actions runs | "test" job, then "deploy" job |
 | Secret / credential | A password or key that grants access | AWS keys (avoid long-lived ones) |
 | Rollback | Going back to the previous working version | Redeploy yesterday's image |
+| Lint | An automatic check for style mistakes and likely bugs | `golangci-lint run` |
+| Vulnerability scan | Checking code or an image against lists of known security holes (CVEs) | `govulncheck`, Trivy |
+| Staging | A copy of production used for a final check before real users | `staging.example.com` |
+| Smoke test | A quick check, right after a deploy, that the main thing works | `GET /healthz` returns 200 |
+| Approval gate | A pause where a human must click "approve" before production | GitHub environment with required reviewers |
+| OIDC | A way for the pipeline to get short-lived cloud access instead of a stored password | GitHub token → 1-hour AWS credentials |
+| DORA four keys | Four standard numbers for how fast and safely a team ships | Deploys per day, change failure rate |
 
 **Picture it**
 
@@ -102,27 +113,63 @@ Where it breaks: a factory rarely recalls a car within minutes; a good pipeline 
 
 ## 1. Why it exists 🟢
 
-Before CI/CD, a typical release looked like this: an engineer runs the test suite on their laptop (if they remember to), SSHes into a production box, `git pull`s, restarts the process, and watches the logs for a minute. Three things go wrong with this in practice:
+Before CI/CD, a typical release looked like this: an engineer runs the test suite on their laptop (if they remember to), SSHes into (opens a remote terminal on) a production box, `git pull`s, restarts the process, and watches the logs for a minute. Three things go wrong with this in practice:
 
-- **It doesn't scale with team size.** Two engineers deploying by hand to the same fleet will eventually overwrite each other's release, or deploy from a dirty working tree that was never tested.
+- **It doesn't scale with team size.** Two engineers deploying by hand to the same fleet will eventually overwrite each other's release, or deploy from a dirty working tree (local files with uncommitted changes) that was never tested.
 - **It is not repeatable.** "Works on my machine" becomes "works on the machine I happened to SSH into," because the build step ran somewhere different from where the tests ran.
 - **It has no gate.** Nothing stops an engineer from deploying code that fails `go vet` or a unit test; the only test environment is production.
 
-**Documented numbers (DORA 2024 State of DevOps Report):** elite-performing teams deploy to production multiple times a day with change failure rates around 5%, while low performers deploy between once a month and once every six months with change failure rates over 40%.
+**Documented numbers (DORA 2024 State of DevOps Report):** elite-performing teams deploy to production multiple times a day with change failure rates (the share of deploys that cause a problem) around 5%, while low performers deploy between once a month and once every six months with change failure rates over 40%.
 
 A pipeline is what turns "deploy" from a risky, manual ritual into a boring, frequent, low-risk event — which is exactly what lets a team ship fixes fast instead of batching up large, risky releases.
 
+```mermaid
+flowchart LR
+    M["By hand: laptop tests (maybe),<br/>SSH, git pull, restart"] --> R["Different every time"]
+    P["Pipeline: same checks,<br/>same image, every push"] --> S["Same every time"]
+```
+
+### Real-life example: many small releases a day 🟢
+
+A food-delivery app like Swiggy has many teams changing code every day: menus, payments, delivery tracking.
+If each release were done by hand, people would batch changes into big, scary weekly releases.
+With a pipeline, every merge is built, tested and scanned automatically, and the exact image that passed staging is the one that reaches production.
+If the error rate jumps after a deploy, the pipeline rolls back on its own.
+Small, frequent, boring releases are the goal, and the pipeline is what makes them possible.
+
 ## 2. Mental model 🟢
 
-A CI/CD pipeline is an assembly line for one commit. Each station either rejects the commit (test station finds a bug, scan station finds a CVE) or stamps it and passes it to the next station.
+A CI/CD pipeline is an assembly line for one commit. Each station either rejects the commit (test station finds a bug, scan station finds a CVE, a publicly listed security hole) or stamps it and passes it to the next station.
 
 The stamp carries forward: once an artifact is built and tagged with the commit SHA, every later station — staging, production — runs *that exact artifact*, never a fresh rebuild.
 
 That single rule, "build once, promote the same artifact," is what makes "it passed staging" mean something: if production used a different build, staging would have tested nothing.
 
+## Common beginner mistakes 🟢
+
+- **Rebuilding the image for each environment** → production runs a build that staging never tested → build once, then promote the same digest.
+- **Tagging images only as `latest`** → you cannot tell which commit is live or go back to a specific one → tag by commit SHA and deploy by digest.
+- **Storing long-lived AWS keys as pipeline secrets** → a leak works until someone notices → use OIDC to get short-lived credentials per run.
+- **Running database migrations inside the code deploy** → a rollback can leave old code on a new schema → run migrations as their own backward-compatible step.
+- **Re-running flaky tests until they pass** → CI stops meaning anything → quarantine flaky tests and fix them.
+
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that a pipeline builds one image per change, tests it, and promotes that same image to each environment. **Next we open the box**: every station a Go change passes, what each one catches, and how the pipeline gets into AWS safely and backs out if production looks bad.
+
 **In plain words:** the pipeline is a line of stations. Each station either passes the commit on or stops it with a clear reason.
+
+**Step by step (before merge):**
+1. You open a pull request. GitHub Actions starts the CI job.
+2. `gofmt` checks formatting, `go vet` and `golangci-lint` look for likely bugs, `go test -race` runs the tests, and `govulncheck` looks for known security holes in your Go libraries.
+3. Any failure blocks the merge button. All green → you may merge to `main`.
+
+**Step by step (after merge):**
+1. The pipeline builds the Docker image once and tags it with the commit SHA, say `api:3f2a9c`.
+2. Trivy scans the image; a critical CVE fails the job and nothing is pushed.
+3. The image is pushed to ECR (AWS's image registry), using short-lived OIDC credentials.
+4. The same image goes to staging, and a smoke test checks it answers.
+5. A human approves; the same image goes to production. If the error rate jumps, the pipeline redeploys the previous version.
 
 ```mermaid
 flowchart TD
@@ -197,7 +244,7 @@ The full workflow below adds the production concerns: formatting and vulnerabili
 
 **In plain words:** a complete workflow file. Read it top to bottom as "when this happens, run these jobs in this order".
 
-This is a representative GitHub Actions workflow (action versions current as of November 2026). It assumes the repository already has `deploy/task-definition.json` (an ECS task definition template) and a Dockerfile as covered in [[Docker 04 - Writing a Production Dockerfile for Go]].
+This is a representative GitHub Actions workflow (action versions current as of November 2026). It assumes the repository already has `deploy/task-definition.json` (an ECS task definition template: the file that tells AWS ECS which image, CPU, memory and settings to run) and a Dockerfile as covered in [[Docker 04 - Writing a Production Dockerfile for Go]].
 
 ```yaml
 name: ci-cd
@@ -331,7 +378,7 @@ jobs:
 
 **In plain words:** after deploying, a tiny program pings the health URL a few times. If it never answers OK, the pipeline fails.
 
-`cmd/smoketest` in the workflow above is this package. It polls a health endpoint with exponential backoff until it answers `200 OK`, or returns an error once the pipeline's own timeout elapses — the thing that turns "the deploy command returned 0" into "the service is actually serving traffic." It compiles and passes `go vet` and `go test -race` on Go 1.24.
+`cmd/smoketest` in the workflow above is this package. It polls a health endpoint with exponential backoff (waiting longer after each failed try: 1 s, 2 s, 4 s…) until it answers `200 OK`, or returns an error once the pipeline's own timeout elapses — the thing that turns "the deploy command returned 0" into "the service is actually serving traffic." It compiles and passes `go vet` and `go test -race` on Go 1.24.
 
 ```go
 // Package deploy implements the post-deploy smoke-test gate used by a CI/CD
@@ -392,7 +439,9 @@ func probe(ctx context.Context, client *http.Client, url string) error {
 }
 ```
 
-Test, run with `go test -race ./...`: it proves the function both recovers from transient 5xx responses and gives up once the context deadline passes.
+Test, run with `go test -race ./...`: it proves the function both recovers from transient 5xx responses (server errors such as 500 or 503) and gives up once the context deadline passes.
+
+**What this code does, in plain words:** the first test starts a fake server that fails twice and then answers OK, and checks the smoke test keeps trying and succeeds. The second uses a server that always fails, and checks the smoke test gives up with an error once its time limit runs out.
 
 ```go
 package deploy
@@ -454,31 +503,34 @@ func TestWaitForHealthy_TimesOutWhenAlwaysUnhealthy(t *testing.T) {
 | CI only | Tests and lints every commit; deploy stays manual | Small team, infrequent releases, or a regulated manual sign-off is required for every release | Low pipeline complexity, but deploys stay slow and error-prone |
 | Continuous delivery | CI plus an automated build-and-stage pipeline; production deploy is a one-click, human-approved step | Most product teams: want fast iteration but keep a human gate before customer traffic | A protected "production" environment with required reviewers |
 | Continuous deployment | Every commit that passes CI and staging deploys to production automatically, gated only by automated checks (smoke tests, canary analysis) | High-trust teams with strong automated test coverage and automatic rollback, shipping many small changes a day | Needs mature automated rollback (see [[Deployment Strategies - Rolling, Blue-Green, Canary]]) or a bad commit reaches every user |
-| GitOps (Argo CD / Flux) | CI builds and pushes an image; a separate controller watching a Git repo of manifests reconciles the cluster to match, pulling instead of being pushed to | Kubernetes fleets wanting an auditable, declarative source of truth and automatic drift correction | An extra moving part (the GitOps controller) and a second repo to keep in sync with the app repo |
+| GitOps (Argo CD / Flux) (Git holds the wanted state, and a tool keeps the cluster matching it) | CI builds and pushes an image; a separate controller watching a Git repo of manifests reconciles the cluster to match, pulling instead of being pushed to | Kubernetes fleets wanting an auditable, declarative source of truth and automatic drift correction | An extra moving part (the GitOps controller) and a second repo to keep in sync with the app repo |
 
 ## 6. Trade-offs and when not to use 🟡
 
-- A full pipeline (build, scan, staging, smoke test, approval, prod) is more YAML and more infrastructure to maintain than a `Dockerfile` and a `scp`. For a single-developer side project, that overhead can dominate the benefit.
+- A full pipeline (build, scan, staging, smoke test, approval, prod) is more YAML and more infrastructure to maintain than a `Dockerfile` and a `scp` (a command that copies files to a server over SSH). For a single-developer side project, that overhead can dominate the benefit.
 - Continuous deployment trades a human gate for speed; it only pays off once automated tests and rollback are trustworthy enough to replace that human, otherwise it ships bugs faster, not slower.
 - Build-once-promote-everywhere assumes every environment's infrastructure is close enough that the same image runs unmodified; a staging environment that silently differs from production (feature flags off, a smaller database) still means staging never really exercised what production will see — hence [[Feature Flags]] and representative data in [[Test Data Strategy]].
 - Pipelines that run full integration tests on every push become slow and expensive at scale; large orgs split "every PR" checks from a nightly or pre-release "full suite" stage.
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the stations a change passes, a full GitHub Actions workflow to ECS, and a smoke-test gate in Go. **Next is the advanced part**: the pipeline failures real teams hit, and the deeper ideas (build-once guarantees, supply-chain provenance, OIDC trust policies, caching, branch protection, trunk-based development).
+
+
 - **Real systems:** GitHub itself runs its web app's deploys through GitHub Actions; Google and Amazon's internal pipelines are the source of the DORA benchmark data; most Kubernetes-native shops run CI (GitHub Actions, GitLab CI) to build images and a GitOps controller (Argo CD) to apply them, keeping the "what should be running" state in Git rather than in pipeline logs.
 - **Failure modes → fixes:**
-  - Long-lived AWS keys stored as repository secrets get leaked or over-scoped → use GitHub's OIDC provider to mint a short-lived STS token per run, scoped by an IAM trust policy to the exact repo and branch.
+  - Long-lived AWS keys stored as repository secrets get leaked or over-scoped → use GitHub's OIDC provider to mint a short-lived STS token (temporary AWS credentials from the Security Token Service) per run, scoped by an IAM trust policy (the rule saying who may use an AWS role) to the exact repo and branch.
   - A migration ships inside the same deploy as the code that needs it, and a rollback of the code now points at a schema the old code cannot read → split migrations into their own expand/contract job and deploy (see [[Rollback and Safe Migrations]]).
-  - Flaky tests get silenced with retries-until-green, which erodes the one guarantee CI exists to provide → quarantine flaky tests out of the required check instead of looping the whole suite (see [[Testing in CI-CD, Flaky Tests and Testing in Production]]).
+  - Flaky tests get silenced with retries-until-green, which erodes the one guarantee CI exists to provide → quarantine flaky tests (tests that pass or fail at random) out of the required check instead of looping the whole suite (see [[Testing in CI-CD, Flaky Tests and Testing in Production]]).
   - A bad deploy reaches 100% of traffic before anyone notices → use the rollout strategies and automated analysis in [[Deployment Strategies - Rolling, Blue-Green, Canary]] instead of one big switch.
-  - Everyone's PR competes for the same shared staging environment and blocks each other → ephemeral per-PR environments, or at least a "staging is busy" queue instead of a free-for-all.
+  - Everyone's PR competes for the same shared staging environment and blocks each other → ephemeral per-PR environments (a short-lived copy of the app created for one pull request and deleted after), or at least a "staging is busy" queue instead of a free-for-all.
 - **What to monitor:** the DORA four keys (deployment frequency, lead time for changes, change failure rate, mean time to restore), pipeline duration per stage, flaky-test rate, and — once deployed — the same error-rate and latency signals used for the canary analysis in [[Deployment Strategies - Rolling, Blue-Green, Canary]].
 
 ## 8. Deep dive 🔴
 
 - **Build once, promote everywhere.** The image is content-addressed by its digest (`sha256:...`); the human-readable tag (`:<commit-sha>`) is just a pointer to that digest. Re-running `docker build` in a later job, even from the identical Dockerfile and source, is not the same guarantee — reinstalled dependencies, base-image updates or non-deterministic build steps can silently produce a different artifact. The pipeline above passes the `image` output between jobs precisely so that "staging" and "production" always deploy the one digest that was built and scanned once.
-- **Supply-chain provenance.** Beyond scanning for known CVEs, a mature pipeline attaches a Software Bill of Materials (SBOM, via `syft`) and build provenance attestations to the image (SLSA levels), so a consumer can verify which workflow run, which commit, and which build steps produced the artifact, not just trust the registry.
-- **OIDC trust policy.** `aws-actions/configure-aws-credentials` exchanges a GitHub-issued OIDC JWT for temporary AWS credentials. The IAM role's trust policy constrains which token claims it accepts, for example:
+- **Supply-chain provenance.** Beyond scanning for known CVEs, a mature pipeline attaches a Software Bill of Materials (SBOM, via `syft`) and build provenance attestations to the image (SLSA levels, a standard scale for how trustworthy a build's origin is), so a consumer can verify which workflow run, which commit, and which build steps produced the artifact, not just trust the registry.
+- **OIDC trust policy.** `aws-actions/configure-aws-credentials` exchanges a GitHub-issued OIDC JWT (a signed token that says which repo and branch the run came from) for temporary AWS credentials. The IAM role's trust policy constrains which token claims it accepts, for example:
   ```json
   {
     "Effect": "Allow",
@@ -527,6 +579,30 @@ func TestWaitForHealthy_TimesOutWhenAlwaysUnhealthy(t *testing.T) {
 - Smoke-test after every deploy; wire an automated rollback to an error-rate/latency alarm, don't rely on a human noticing.
 - Keep schema migrations in their own backward-compatible job, separate from the code deploy.
 - Watch the DORA four keys plus pipeline duration and flaky-test rate.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is the difference between CI and CD?
+> CI builds and tests every change; CD ships the tested result to environments.
+
+> [!question]- Why tag images with the commit SHA?
+> So you always know exactly which commit is running and can go back to a specific one.
+
+> [!question]- What is a smoke test?
+> A quick check right after a deploy that the service answers, for example `/healthz` returns 200.
+
+🟡 Medium
+
+> [!question]- Why must staging and production run the same image, not two builds?
+> A second build can quietly differ (new base image, new dependency), so staging would have tested something else.
+
+> [!question]- Why use OIDC instead of stored AWS keys in GitHub Actions?
+> OIDC gives short-lived credentials limited to one repo and branch, so there is no long-lived key to leak.
+
+> [!question]- What is the difference between continuous delivery and continuous deployment?
+> Delivery stops for a human approval before production; deployment goes to production automatically when checks pass.
 
 ## Links
 

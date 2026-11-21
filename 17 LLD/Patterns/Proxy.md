@@ -31,6 +31,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Interfaces]]: the proxy and the real client both have the `Catalog` methods, so the caller cannot tell them apart.
+> - [[Design Patterns Overview and Chooser]]: Proxy is the structural pattern for "control access to a slow or remote service"; it sits next to Decorator and Adapter.
+
 **From zero, in 60 seconds** 🟢
 
 A **proxy** is a stand-in that has the same interface as the real object but controls access to it. It might cache answers, check permissions, load the real thing only when first needed, or call a remote server for you. The caller cannot tell the difference. It looks like a decorator, but its goal is controlling access, not adding features. Read the plain-words line above each code block first.
@@ -53,6 +57,9 @@ You asked the same question either way. A proxy is that receptionist in code.
 | singleflight | Merge concurrent identical calls into one | 100 misses -> 1 backend call |
 | Context | Request-scoped values and cancellation in Go | `ctx` carrying the caller's scopes |
 | Composition root | The place in `main` where objects are wired | `cat := NewCachingProxy(realClient)` |
+| Negative caching | Also caching "not found" for a short time | Product 404 remembered for 10 s |
+| Principal | Who is making the call, as set by login code | User `u1` with scope `catalog:read` |
+| Lazy | Create something only on first use | Connect to the catalog on the first `Get` |
 
 **Picture it**
 
@@ -83,11 +90,15 @@ A cart service shows 8 products per cart and calls the catalog service for each 
 
 You want three controls without touching either service's business code:
 
-- **Cache** answers for a minute, so 95% hits (estimate) cut 16,000 calls/s to about 800.
+- **Cache** answers for a minute, so 95% hits (estimate; a hit means the answer was already saved) cut 16,000 calls/s to about 800.
 - **Collapse concurrent misses.** When a popular product's entry expires, 300 requests can miss at the same moment. Without help they make 300 identical backend calls (a cache stampede). The test below starts **100 concurrent misses and measures exactly 1 backend call**.
 - **Check access** before any of that happens.
 
 The cart code depends on a `Catalog` interface. If every control implements that same interface, the cart code never changes: the composition root decides what sits in front of the real client.
+
+### Real-life example 🟢
+
+Picture opening the same product page on Flipkart that a million other people are looking at during a sale. The price and photos rarely change, so asking the product service again for every single visitor would be wasteful. Picture a helper standing in front of that service: it checks you are allowed to see the item, answers from a saved copy when it has a fresh one, and when the copy runs out, lets only one request fetch a new one while everyone else waits for it. To the page, the helper looks exactly like the real service. That stand-in is a Proxy.
 
 ## 2. Mental model 🟢
 
@@ -103,6 +114,8 @@ Two rules define it:
 2. **The proxy controls access to the subject.** It does not add new features to the answer; that is a decorator's job (see section 5).
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a proxy looks exactly like the real object but decides if, when and how the real call happens. **Next we open the box**: how auth, cache and lazy proxies stack, the five steps of a cached lookup, and how 100 misses become one backend call.
 
 **In plain words: a stand-in with the same methods that decides if, when and how the real object is called.**
 
@@ -146,8 +159,8 @@ The auth and caching proxies hold a `next Catalog`, and the lazy proxy builds it
 
 1. Read the map under `RLock`. A fresh entry (positive or negative) is a **hit**: return it.
 2. On a **miss**, call `singleflight.Group.DoChan(id, fn)` (`singleflight` from `golang.org/x/sync` makes concurrent calls for the same key share one execution and its result). If a flight for `id` is already running, this caller joins it instead of starting a new one.
-3. Inside the flight: look again (a flight that just finished may have filled the entry), then call the backend with a detached context and a timeout.
-4. Store the answer with a TTL: found products for 1 minute, "not found" for 10 seconds. Never cache timeouts or 5xx errors.
+3. Inside the flight: look again (a flight that just finished may have filled the entry), then call the backend with a detached context (one that ignores the first caller's cancel, so others are not hurt) and a timeout.
+4. Store the answer with a TTL: found products for 1 minute, "not found" for 10 seconds. Never cache timeouts or 5xx errors (server-side failures such as 500 or 503).
 5. Every waiter receives the same result. A waiter whose own context ends returns early; the flight keeps going for the others.
 
 ```mermaid
@@ -228,6 +241,15 @@ One `package main` with three proxies over one subject: protection (scope check 
 It compiles with Go 1.24 and passes `go vet` and `go test -race`. The only dependency is `golang.org/x/sync`.
 
 On Go 1.24 pin the version you tested with, `go get golang.org/x/sync@v0.19.0`: newer x/sync releases can raise their minimum Go version (as of November 2026 they require Go 1.25+), and then a bare `go get` makes the go command switch to a newer toolchain.
+
+**Step by step:**
+
+1. `Catalog` is the interface everyone uses, and `remoteCatalog` is the real, slow service behind it.
+2. `authCatalog` is the protection proxy: it reads the `Principal` from the context and forwards the call only if the caller has the right scope.
+3. `cachingCatalog.Product` first calls `lookup`. A fresh entry is a hit and returns at once.
+4. On a miss, `singleflight` makes all callers for the same ID share one backend call. The result is saved with `store`: found products for `ttl`, "not found" for `negTTL`, errors never.
+5. `Invalidate` drops an entry and bumps `gen`, so a fetch that started earlier cannot write old data back.
+6. `lazyCatalog` is the virtual proxy: it builds the real catalog only on first use, once. `main` stacks the proxies and prints hits and misses.
 
 ```go
 // Command proxy puts three proxies in front of one product catalog:
@@ -620,6 +642,14 @@ func TestLazyProxyBuildsOnce(t *testing.T) {
 
 `go test -race -count=1 -v` passes all six tests. `TestConcurrentMissesShareOneBackendCall` is the measurement quoted in section 1: 100 goroutines, 1 backend call.
 
+## Common beginner mistakes 🟢
+
+- **Mistake:** letting every cache miss call the backend. → **Why it's wrong:** when a popular product's entry expires, hundreds of requests hit the catalog at once (a cache stampede). → **Do this instead:** share one call per ID with `singleflight`, as `cachingCatalog.Product` does with `c.group.DoChan`.
+- **Mistake:** caching errors such as timeouts. → **Why it's wrong:** one short network blip makes the product look broken for a whole minute. → **Do this instead:** cache only real answers: products for `ttl`, "not found" for the shorter `negTTL`, and never timeouts.
+- **Mistake:** running the shared backend call with the first caller's context. → **Why it's wrong:** if that one user closes the app, the call is cancelled for everyone waiting on it. → **Do this instead:** give the shared call its own time limit that ignores one caller's cancel, as the code does with `context.WithoutCancel` and `c.timeout`.
+- **Mistake:** deleting the entry on update but letting an older fetch write back. → **Why it's wrong:** a fetch that started before the update saves old data after it. → **Do this instead:** bump a counter in `Invalidate` and have `store` skip the write when `gen` changed.
+- **Mistake:** a proxy whose methods differ from the real `Catalog`. → **Why it's wrong:** callers then have to know whether they hold the proxy or the real thing. → **Do this instead:** make every proxy (`authCatalog`, `cachingCatalog`, `lazyCatalog`) satisfy the same `Catalog` interface.
+
 ## 5. Variants and comparison 🟡
 
 **Kinds of proxy:**
@@ -629,8 +659,8 @@ func TestLazyProxyBuildsOnce(t *testing.T) {
 | Caching | Whether the call reaches the subject at all | `RWMutex` + map + TTL, plus `singleflight` for misses | Stale reads up to the TTL; memory; invalidation work |
 | Protection (auth) | Who may call | Read the principal from `ctx`, check scope or ownership, then forward | Must sit outside any shared cache |
 | Remote | Where the subject runs | gRPC client stub, HTTP client wrapper, `httputil.ReverseProxy` | Network failures become your errors; needs timeouts and retries |
-| Virtual (lazy) | When the subject is created | `sync.OnceValues(build)` | First caller pays the latency; a build error is cached forever |
-| Rate or concurrency limited | How fast or how many at once | `rate.Limiter.Wait(ctx)` from `golang.org/x/time/rate`, or a buffered-channel semaphore | Added queueing latency; callers must handle rejection |
+| Virtual (lazy) | When the subject is created | `sync.OnceValues(build)` (runs `build` once and remembers its two results) | First caller pays the latency; a build error is cached forever |
+| Rate or concurrency limited | How fast or how many at once | `rate.Limiter.Wait(ctx)` from `golang.org/x/time/rate`, or a buffered-channel semaphore (a counter of free slots: at most N calls at once) | Added queueing latency; callers must handle rejection |
 
 **Proxy vs Decorator vs Adapter.** In Go all three are "a struct that wraps an interface value", so tell them apart by intent:
 
@@ -650,7 +680,7 @@ The line between Proxy and Decorator is blurry in real code. A logging wrapper i
 - **One call site, no reuse.** A three-line `if cached { return }` inside the only function that needs it is easier to read than a new type.
 - **The data must be fresh.** Account balances, stock that is being reserved, prices at checkout: read from the source of truth, or cache with explicit invalidation and accept the cost.
 - **You need a different API.** That is an [[Adapter]] or a [[Facade (vs Mediator)]], not a proxy.
-- **The concern belongs in the network layer.** TLS, retries and load balancing across hosts often belong in a sidecar or the HTTP transport, not in an application struct.
+- **The concern belongs in the network layer.** TLS, retries and load balancing across hosts often belong in a sidecar (a helper process deployed next to each service) or the HTTP transport, not in an application struct.
 
 **Pitfalls:**
 
@@ -658,18 +688,20 @@ The line between Proxy and Decorator is blurry in real code. A logging wrapper i
 - **Wrong stacking order.** A cache placed **outside** the auth proxy serves a cached product to a caller who would have been refused. Put auth outside, or include the principal in the cache key.
 - **Caching errors.** Caching a timeout turns a 40 ms blip into a minute of failures. Cache only definite answers (found, not found).
 - **First caller's context.** A shared flight that uses the starter's `ctx` fails for everyone when that one caller cancels. Detach with `context.WithoutCancel` and add the proxy's own timeout.
-- **Unbounded cache.** A map that only grows is a memory leak with a hit rate. Bound it with an LRU (see [[LRU Cache with TTL]]).
+- **Unbounded cache.** A map that only grows is a memory leak with a hit rate. Bound it with an LRU (least recently used: throw out the entry nobody has read for longest; see [[LRU Cache with TTL]]).
 - **Hidden latency.** A proxy that looks like a local call but goes over the network surprises callers. Make every method take a `ctx` so deadlines flow through.
+
+> 🟡 → 🔴 **You now know** the kinds of proxy, how to build and stack them, and how they differ from Decorator and Adapter. **Next comes the production view**: proxies in Go's library and gRPC, the cache spikes and stale reads they cause, and the fine print of singleflight and lazy creation.
 
 ## 7. In production 🔴
 
 - **Real systems:**
 	- `net/http/httputil.ReverseProxy` is an `http.Handler` that forwards each request to another server: the network form of a remote proxy. Since Go 1.20 its `Rewrite` hook is the recommended way to change the outbound request; `Director` is the older hook. The network-level picture is in [[Forward and Reverse Proxies - L4 vs L7]].
-	- A **gRPC generated client** (`pb.NewCatalogClient(conn)`) returns an interface whose methods marshal the request and call `conn.Invoke` over HTTP/2. Your code calls it like a local object: a remote proxy. See [[gRPC]].
+	- A **gRPC generated client** (`pb.NewCatalogClient(conn)`) returns an interface whose methods marshal (turn into bytes for the network) the request and call `conn.Invoke` over HTTP/2. Your code calls it like a local object: a remote proxy. See [[gRPC]].
 	- `golang.org/x/sync/singleflight` came from groupcache, which uses it so that concurrent loads of the same key share one fetch.
 	- `sync.OnceValue` and `sync.OnceValues` (Go 1.21+) are the standard building block for virtual proxies and lazily opened clients.
 - **Failure modes → fixes:**
-	- Hot key expires and the backend sees a spike → `singleflight`, plus TTL jitter so many keys do not expire together; see [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
+	- Hot key expires and the backend sees a spike → `singleflight`, plus TTL jitter (a little randomness added to each TTL) so many keys do not expire together; see [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
 	- Many lookups of ids that do not exist (scrapers, bad links) → negative caching with a short TTL.
 	- Stale data after an update → `Invalidate` on the update event; the generation counter stops a fill that started before the update from writing the old value back.
 	- Backend hangs → the proxy's own timeout bounds the flight; callers' deadlines bound their wait.
@@ -717,6 +749,26 @@ The line between Proxy and Decorator is blurry in real code. A logging wrapper i
 - Auth outside the cache, or put the principal in the cache key.
 - Lazy proxy: `sync.OnceValues` (Go 1.21+); it caches the build error too.
 - Proxy controls access, Decorator adds behaviour, Adapter changes the interface.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What two rules make something a proxy?
+> It has the same interface as the real object, and it controls access to it (whether, when or where the call happens).
+
+> [!question]- 🟢 Name three kinds of proxy.
+> Caching, protection (auth), virtual (lazy), plus remote and rate-limited.
+
+> [!question]- 🟢 Why not cache a timeout?
+> A 40 ms network blip would turn into a full minute of failures for every caller.
+
+> [!question]- 🟡 How does the caching proxy turn 100 concurrent misses into one backend call?
+> `singleflight` makes all calls for the same key join one running fetch and share its result.
+
+> [!question]- 🟡 Why must the auth proxy sit outside the cache?
+> Otherwise a cached product can be served to a caller who would have been refused.
+
+> [!question]- 🟡 Proxy or Decorator: the wrapper may skip the real call on a cache hit?
+> Proxy. A decorator always makes the call and adds behaviour around it.
 
 ## Links 🟢
 

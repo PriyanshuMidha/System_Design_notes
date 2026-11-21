@@ -49,6 +49,9 @@ Everything below is what delays entry into, or progress through, this pipeline.
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: the browser asks a server for a file with a request and gets it back in a response, and each request takes a trip over the network.
+
 **From zero, in 60 seconds** 🟢
 
 A web page arrives as three kinds of text files: HTML (what is on the page), CSS (how it looks), JavaScript (what it does). The browser cannot show text files — it has to turn them into pixels.
@@ -89,6 +92,12 @@ If one slow script is in the way, the whole page waits. Knowing the steps tells 
 | Paint | Filling in pixels: text, colours, images | Drawing the blue button |
 | Render-blocking | Something the browser must finish before showing anything | A CSS file in `<head>` |
 | `async` / `defer` | Script attributes that stop a script from pausing the HTML parser | `<script defer src="app.js">` |
+| Render tree | DOM + CSSOM merged: only the things that will be visible, with their final style | a hidden menu is left out |
+| Composite | Stacking the painted layers onto the screen in the right order | a popup layer put over the page |
+| Round trip (RTT) | Time for one message to reach the server and the reply to come back | about 80 ms on a phone network |
+| Critical rendering path | The steps that must finish before the first pixels show | HTML + CSS + any blocking script |
+| Main thread | The one worker in the browser that parses, runs JS and does layout | a long script freezes clicks |
+| Core Web Vitals | Google's three speed scores for real users: LCP, CLS, INP | "page showed its main image in 2 s" |
 
 **Picture it**
 
@@ -118,7 +127,7 @@ Where it breaks: a carpenter can't start before the whole manual arrives; a brow
 
 ## 1. Why it exists 🟢
 
-Say a page's HTML references a 40 KB stylesheet and ends with a `<script src="analytics.js">` tag with no attributes, on a connection with 100 ms round-trip latency.
+Say a page's HTML references a 40 KB stylesheet and ends with a `<script src="analytics.js">` tag with no attributes, on a connection with 100 ms **round-trip latency** (each request takes 100 ms to go to the server and come back).
 
 Without any of the mechanisms below, the browser does this, strictly in order: download and parse enough HTML to discover the stylesheet → download the stylesheet (one round trip) → parse HTML up to the script tag → **stop parsing HTML entirely** → download the script (another round trip, since it is a separate request) → execute it → resume parsing the rest of the HTML.
 
@@ -130,6 +139,14 @@ This is why `<script>` has `async` and `defer` attributes, and why the critical 
 
 > [!tip] Remember
 > A plain `<script>` tag is the one tag in HTML that can stop the parser dead in its tracks — everything else below exists to give you a way around that.
+
+### Real-life example: opening a movie page 🟢
+
+You tap a movie on BookMyShow's website.
+The page title and poster appear first, because the HTML and main CSS arrive and are drawn early.
+The chat widget and tracking scripts load in the background (`async`), so they never hold up the poster.
+The "Book tickets" button's code is `defer`, so it runs right after the page is read, in a fixed order.
+If a big analytics script were a plain `<script>` near the top, you would stare at a white screen until it finished downloading.
 
 ## 2. Mental model 🟢
 
@@ -145,11 +162,37 @@ A plain `<script>` tag is a recipe instruction that says "stop reading, go fetch
 
 This analogy breaks down in one place: a real recipe reader can glance ahead in the binder whenever they like, but the browser genuinely cannot show anything — not even the parts it has already read — until the binder (CSS) is fully checked. The withholding is total, not partial.
 
+## Common beginner mistakes 🟢
+
+- **Putting a plain `<script src>` in the `<head>`** → the browser stops reading the HTML until the script is downloaded and run → add `defer` (or move it to the end of `<body>`).
+- **Moving CSS to the bottom "so the page shows faster"** → the browser still waits for all CSS before painting, so it shows later → keep CSS in `<head>` and make it small.
+- **Adding `async` to every script** → scripts that depend on each other run in the wrong order → use `defer` for your own code, `async` only for independent extras like analytics.
+- **Waiting for `load` to attach click handlers** → buttons stay dead until every image has loaded → use `DOMContentLoaded` (or `defer`).
+- **Animating `width` or `top`** → the browser redoes layout and paint on every frame, which stutters → animate `transform` and `opacity` instead.
+
+## Often confused 🟡
+
+| These two | First one | Second one |
+| --- | --- | --- |
+| DOM vs render tree | Every element, including hidden ones | Only what will be drawn, with final styles |
+| Layout vs paint | Works out sizes and positions | Fills in the pixels (colours, text, images) |
+| `DOMContentLoaded` vs `load` | HTML read and deferred scripts run | Every image, stylesheet and iframe also finished |
+| `preload` vs `prefetch` | Fetch now, this page needs it | Fetch later when idle, the next page may need it |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the pipeline: HTML becomes the DOM, CSS becomes the CSSOM, then layout, paint and composite, and a plain script can stall it. **Next we open the box** and walk each stage, see exactly how `async` and `defer` change script timing, and learn which "ready" event to wait for.
 
 ### Parsing HTML into the DOM
 
 **In plain words:** the browser reads HTML bytes as they arrive over the network, in a single pass, and keeps building a live tree of nodes as it goes — it doesn't wait for the whole file to download first.
+
+**Step by step:**
+1. The server starts sending `index.html`. The first chunk holds `<html><body><h1>Avengers</h1>`.
+2. The browser cuts the text into **tokens** (small pieces: a start tag, some text, an end tag).
+3. Each token becomes a node: an `h1` node with the text "Avengers", hung under `body`.
+4. The next chunk arrives a moment later. Its nodes are added to the same tree.
+5. The top of the page can be shown before the bottom has even arrived.
 
 **Picture it:**
 
@@ -170,6 +213,21 @@ flowchart LR
 
 **In plain words:** the browser refuses to paint anything until it has read ALL the CSS — because the very last rule in the very last file could still change the first element's colour.
 
+**Step by step:**
+1. The HTML head has `<link rel="stylesheet" href="main.css">` and `<link rel="stylesheet" href="theme.css">`.
+2. `main.css` says `h1 { color: black; }`. The browser cannot paint the `h1` yet.
+3. `theme.css` arrives and says `h1 { color: red; }`. That later rule wins.
+4. Only now, with every stylesheet read, is the CSSOM complete and the `h1` known to be red.
+5. Painting starts. Had it painted early, the heading would have flashed black, then red.
+
+```mermaid
+flowchart LR
+    A["main.css read"] --> W["wait: more CSS<br/>could change things"]
+    B["theme.css read"] --> C["CSSOM complete"]
+    W --> C
+    C --> P["first paint allowed"]
+```
+
 Before naming it, here's the problem: the browser needs to know the final, computed style of an element — its color, size, visibility — before it can draw even one pixel of it.
 
 But CSS rules can come from several places (an external file, a `<style>` block, inline `style=""`), and a rule near the *end* of the last stylesheet can still override something that looked settled near the top.
@@ -187,9 +245,16 @@ That is what makes CSS **render-blocking**: first paint never happens before the
 
 **In plain words:** once both trees exist, the browser merges them into one **render tree** — one node per thing that is actually visible, each carrying its final computed style — and then runs three distinct passes to turn that tree into pixels on screen.
 
-- **Layout** (also called reflow) walks the render tree and computes an exact box — x, y, width, height — for every node, given the viewport size.
+**Step by step:**
+1. The DOM has a header, a hidden cookie banner (`display: none`) and a "Book" button. The render tree keeps only the header and the button.
+2. **Layout:** on a 1200px-wide window the header gets 1200×80 at the top; the button gets 120×40 below it.
+3. **Paint:** the browser fills in the header's background, the text, and the red button, onto layers.
+4. **Composite:** the layers are stacked and sent to the screen.
+5. Later you change the button's `background-color`: only paint and composite run again. You change its `width`: layout runs again too.
+
+- **Layout** (also called reflow) walks the render tree and computes an exact box — x, y, width, height — for every node, given the **viewport** (visible window) size.
 - **Paint** fills in each node's pixels: text, colors, borders, shadows, onto one or more layers.
-- **Composite** merges those layers onto the screen in the right stacking order, which the GPU can often do without re-running layout or paint (for example, a `transform` or `opacity` change moves or fades an existing layer in place).
+- **Composite** merges those layers onto the screen in the right stacking order, which the **GPU** (the graphics chip) can often do without re-running layout or paint (for example, a `transform` or `opacity` change moves or fades an existing layer in place).
 
 Nodes with `display: none` are left out of the render tree entirely (they have no box to lay out); `visibility: hidden` nodes stay in the tree and still take up space, they're just not painted.
 
@@ -205,7 +270,7 @@ flowchart TD
 
 **Example:** changing an element's `width` re-runs all three steps (layout, paint, composite) on every frame; changing only its `transform: translateX(...)` skips straight to composite.
 
-On a typical laptop, a layout+paint+composite frame for a moderately complex page can take several milliseconds, while a composite-only frame takes a fraction of a millisecond — the difference between a smooth 60 fps animation and a janky one.
+On a typical laptop, a layout+paint+composite frame for a moderately complex page can take several milliseconds, while a composite-only frame takes a fraction of a millisecond — the difference between a smooth 60 fps (frames, meaning screen redraws, per second) animation and a **janky** (visibly stuttering) one.
 
 **Why it matters:** this is the entire reason "animate `transform`/`opacity`, not `width`/`top`" is standard advice — it is a direct consequence of which of the three steps a property change actually requires.
 
@@ -215,6 +280,13 @@ On a typical laptop, a layout+paint+composite frame for a moderately complex pag
 ### Script loading: normal, async, defer, module
 
 **In plain words:** a `<script>` tag can be told, through an attribute, when it is allowed to run relative to the rest of the page's parsing — and that choice is what actually determines whether it slows down first paint.
+
+**Step by step:**
+1. The browser reads the HTML and reaches `<script src="app.js">`.
+2. **No attribute:** it stops reading, downloads `app.js`, runs it, then carries on reading.
+3. **`async`:** it keeps reading while `app.js` downloads, then pauses briefly to run it the moment it arrives, wherever the reader is.
+4. **`defer`:** it keeps reading while `app.js` downloads, and runs it only after the whole HTML is read, in the order the scripts appear.
+5. **`type="module"`:** behaves like `defer` by default.
 
 **Picture it:**
 
@@ -238,14 +310,14 @@ gantt
     Execute (after parsing)     :c3, 9, 10
 ```
 
-Reading the gantt chart: all three download in parallel with parsing, so the download itself is never the differentiator. The real difference is **when execution is allowed to happen**, and that changes what the parser is doing around it:
+Reading the **gantt chart** (a timeline where each bar shows when a task starts and ends): all three download in parallel with parsing, so the download itself is never the differentiator. The real difference is **when execution is allowed to happen**, and that changes what the parser is doing around it:
 
 | Attribute | Downloads | Executes | Order vs. other scripts | Parser state during execution |
 | --- | --- | --- | --- | --- |
 | (none) | blocks parsing to start | immediately after download | document order (trivially — it's synchronous) | blocked (parser literally paused at that tag) |
 | `async` | parallel with parsing | the instant download finishes | not guaranteed; whichever finishes first runs first | paused only for the duration of that execution, which can land mid-token |
 | `defer` | parallel with parsing | after parsing completes, before `DOMContentLoaded` | document order, always | not blocked at all during download; parsing never pauses for a deferred script |
-| `type="module"` | parallel with parsing | after parsing, like `defer` (this is the default for modules) | document order, respecting static `import` graph | not blocked |
+| `type="module"` | parallel with parsing | after parsing, like `defer` (this is the default for modules) | document order, respecting static `import` graph (the map of which file imports which) | not blocked |
 
 **Example:** a script tag at byte offset 2,000 that takes 3 seconds to download — plain `<script>` stalls the parser for the full 3 seconds; `async` lets parsing continue for those 3 seconds and only pauses for however long the script itself takes to run (often a few milliseconds); `defer` behaves the same as `async` for the download, but waits to execute until the parser has nothing left to parse.
 
@@ -264,6 +336,13 @@ Inline scripts (no `src`) ignore both `async` and `defer`: they always run immed
 
 **In plain words:** the page fires two different "I'm ready" events, and they mean different things — one says the structure is usable, the other says every last resource has shown up.
 
+**Step by step:**
+1. A gallery page with 40 photos starts loading.
+2. At about 300 ms the HTML is fully read and the deferred scripts have run. `DOMContentLoaded` fires; buttons can now get click handlers.
+3. The photos keep downloading in the background.
+4. At about 4 seconds the last photo arrives. `load` fires.
+5. So code that only needs the page structure should wait for the first event, not the second.
+
 **Picture it:**
 
 ```mermaid
@@ -281,7 +360,7 @@ sequenceDiagram
     Doc->>Doc: fire load
 ```
 
-- **`DOMContentLoaded`** fires once the HTML is fully parsed and all deferred (and module) scripts have run — it does **not** wait for images, stylesheets already applied, or iframes.
+- **`DOMContentLoaded`** fires once the HTML is fully parsed and all deferred (and module) scripts have run — it does **not** wait for images, stylesheets already applied, or **iframes** (a page embedded inside another page, like a YouTube player).
 - **`load`** fires once everything the page references, including every image, has finished loading. On an image-heavy page, `load` can fire seconds after `DOMContentLoaded`.
 
 **Example:** a photo gallery page with 40 high-resolution images might fire `DOMContentLoaded` at 300 ms (HTML parsed, no heavy JS) but `load` at 4 seconds (last image finally decoded). Code that only needs to attach click handlers to buttons should listen for `DOMContentLoaded`, not `load` — waiting for `load` there would delay interactivity by 3.7 seconds for no reason.
@@ -318,7 +397,7 @@ This is the actual mechanism behind "defer/async make pages faster" — it's a s
 | Hint | What it tells the browser | Starts | Typical use |
 | --- | --- | --- | --- |
 | `<link rel="preload">` | "This page needs this resource soon, fetch it now, at high priority" | immediately, before the parser would normally discover it | a font or hero image referenced only from CSS, which the parser can't see until CSS is parsed |
-| `<link rel="preconnect">` | "Open the DNS/TLS connection to this origin now, before I ask for anything from it" | immediately, connection setup only, no file transferred yet | a third-party origin (CDN, font host) you know you'll request from soon |
+| `<link rel="preconnect">` | "Open the DNS/TLS connection (DNS finds the server's address; TLS sets up encryption) to this **origin** (a site address: scheme + domain + port) now, before I ask for anything from it" | immediately, connection setup only, no file transferred yet | a third-party origin (CDN, font host) you know you'll request from soon |
 | `<link rel="prefetch">` | "The *next* page will probably need this, fetch it at low priority when idle" | only once the browser is otherwise idle on this page | the first chunk of a route the user is likely to click into next |
 
 **Example — before/after on a page using a Google Font hosted on a different origin**, with a 80 ms round trip and a 150 ms DNS+TLS handshake to the font's origin:
@@ -326,7 +405,7 @@ This is the actual mechanism behind "defer/async make pages faster" — it's a s
 | Step | No hints | `preconnect` only | `preconnect` + `preload` |
 | --- | --- | --- | --- |
 | 1 | Parse HTML, then CSS | same | same |
-| 2 | Discover `@font-face` URL inside the parsed CSS | same discovery point | font fetch starts immediately from the preload tag, before CSS is even parsed |
+| 2 | Discover `@font-face` (the CSS rule that names a font file to download) URL inside the parsed CSS | same discovery point | font fetch starts immediately from the preload tag, before CSS is even parsed |
 | 3 | Open connection to font origin: DNS + TLS (150 ms) | connection already warm — this step ran in parallel with parsing | connection already warm |
 | 4 | Download font (80 ms round trip) | download (80 ms) | download (80 ms), already well underway |
 | 5 | Font paints | font paints | font paints |
@@ -341,7 +420,7 @@ Reading the table: `preconnect` removes step 3's 150 ms by moving it earlier, of
 
 Avoid `@import` in CSS: imported stylesheets download only after the importing one is parsed, serializing requests that `<link>` tags would have run in parallel — the opposite effect of everything above.
 
-This feeds directly into **Core Web Vitals**: **LCP** (Largest Contentful Paint — when the biggest above-the-fold element is painted) is shortened by a shorter critical path; **CLS** (Cumulative Layout Shift) is caused by layout happening again after first paint, for example web fonts swapping in or images without a reserved `width`/`height`; **INP** (Interaction to Next Paint, which replaced FID in 2024) measures how long the main thread is busy — and the main thread is exactly what a synchronous script, or a long script execution during parsing, occupies.
+This feeds directly into **Core Web Vitals**: **LCP** (Largest Contentful Paint — when the biggest **above-the-fold** element, meaning visible without scrolling, is painted) is shortened by a shorter critical path; **CLS** (Cumulative Layout Shift) is caused by layout happening again after first paint, for example web fonts swapping in or images without a reserved `width`/`height`; **INP** (Interaction to Next Paint, which replaced FID, First Input Delay, in 2024) measures how long the main thread is busy — and the main thread is exactly what a synchronous script, or a long script execution during parsing, occupies.
 
 > [!question] What happens if you preload too much?
 > Preloading competes for the same limited early bandwidth and connection slots as the resources the browser would have fetched anyway. Preloading a dozen things "just in case" can push back the download of the one resource that actually blocks first paint — preload only what the *current* page's first paint genuinely needs.
@@ -350,9 +429,9 @@ This feeds directly into **Core Web Vitals**: **LCP** (Largest Contentful Paint 
 
 **In plain words:** none of the browser's work can start before the server sends the first byte — so server speed, compression and caching sit in front of everything in this note.
 
-Nothing above starts until the first HTML bytes exist: TTFB (time to first byte) from the server, response compression, and `Cache-Control`/`ETag` headers for static assets all shift when this whole pipeline gets to begin.
+Nothing above starts until the first HTML bytes exist: TTFB (time to first byte) from the server, response compression, and `Cache-Control`/`ETag` headers (tell the browser how long it may reuse a saved copy, and how to check if it changed) for static assets all shift when this whole pipeline gets to begin.
 
-HTTP/2 server push was an attempt to start sending CSS/JS before the browser asked for it; Chrome disabled it by default in 2022 (Chrome 106) and other Chromium browsers followed, because it over-pushed resources the browser already had cached more often than it helped — `preload` headers achieve the same goal with the browser still in control of what it actually needs.
+HTTP/2 server push (the server sending files the browser has not asked for yet) was an attempt to start sending CSS/JS before the browser asked for it; Chrome disabled it by default in 2022 (Chrome 106) and other Chromium browsers followed, because it over-pushed resources the browser already had cached more often than it helped — `preload` headers achieve the same goal with the browser still in control of what it actually needs.
 
 ## 5. Variants and comparison 🟡
 
@@ -372,9 +451,11 @@ HTTP/2 server push was an attempt to start sending CSS/JS before the browser ask
 
 ## 7. In production 🔴
 
-- **Real systems:** bundlers (Vite, webpack) emit `type="module"` entry points by default, which already behave like `defer`; CDNs commonly load third-party widgets (chat, analytics) with `async` because the page must not depend on them.
+> 🟡 → 🔴 **You now know** every stage of the pipeline, how script attributes change timing, and how hints speed up fetches. **Next is the advanced part**: what real build tools emit, what breaks in production, how to measure real users, and browser internals like the preload scanner.
+
+- **Real systems:** **bundlers** (tools that join and shrink many JS files into a few, like Vite and webpack) (Vite, webpack) emit `type="module"` entry points by default, which already behave like `defer`; CDNs commonly load third-party widgets (chat, analytics) with `async` because the page must not depend on them.
 - **Failure modes → fixes:** a `defer` script that reads `document.currentScript` assuming it runs synchronously breaks — fix: don't rely on execution timing from inside a deferred script. A render-blocking web-font swap causing CLS — fix: `font-display: swap` with a matched fallback, or preload the font.
-- **What to monitor:** LCP, CLS and INP from Real User Monitoring (RUM), not just lab tools, since they vary with real users' devices and networks.
+- **What to monitor:** LCP, CLS and INP from Real User Monitoring (RUM: measurements sent back from real visitors' browsers), not just lab tools, since they vary with real users' devices and networks.
 
 ## 8. Deep dive 🔴
 
@@ -395,7 +476,7 @@ HTTP/2 server push was an attempt to start sending CSS/JS before the browser ask
 
 - **Render-blocking CSS and the "flash of unstyled content":** since the CSSOM must be complete before render-tree construction, a browser never shows unstyled HTML the way old wisdom about "load CSS last" would produce — it holds first paint instead.
 - **Layout thrashing:** reading a layout-dependent property (`offsetHeight`) immediately after writing a style forces a synchronous layout recalculation ("forced reflow") instead of letting the browser batch it; doing this in a loop (read, write, read, write) is "layout thrashing," a common cause of jank that profilers show as repeated purple "Layout" blocks.
-- **Module scripts and the import graph:** a `type="module"` script and everything it statically `import`s are fetched in parallel (the module graph is resolved before execution), then executed in dependency order — a dynamic `import()` is a separate, lazy fetch that runs later, which is how route-based code splitting defers downloading a page nobody has navigated to yet.
+- **Module scripts and the import graph:** a `type="module"` script and everything it statically `import`s are fetched in parallel (the module graph is resolved before execution), then executed in dependency order — a dynamic `import()` is a separate, lazy fetch that runs later, which is how route-based **code splitting** (cutting the app's JS into one chunk per page) defers downloading a page nobody has navigated to yet.
 
 ## 9. Interview questions 🔴
 
@@ -416,7 +497,7 @@ HTTP/2 server push was an attempt to start sending CSS/JS before the browser ask
 > Images don't change layout semantics the same way once their box is sized (unless no width/height was reserved, which is a separate CLS problem), so the browser can paint around a missing image and fill it in when it arrives.
 
 > [!question]- What causes layout (reflow) versus only paint versus only composite?
-> Anything that changes an element's geometry (width, display, font-size, adding/removing nodes) triggers layout, then paint, then composite. Anything that changes only painted appearance (background-color, box-shadow) skips layout but repaints. Changing only `transform` or `opacity` can be handled entirely on the compositor thread, skipping both layout and paint — the reason those two properties are preferred for animation.
+> Anything that changes an element's geometry (width, display, font-size, adding/removing nodes) triggers layout, then paint, then composite. Anything that changes only painted appearance (background-color, box-shadow) skips layout but repaints. Changing only `transform` or `opacity` can be handled entirely on the **compositor thread** (a separate worker that stacks layers, so it keeps going even when the main thread is busy), skipping both layout and paint — the reason those two properties are preferred for animation.
 
 > [!question]- A page has a `<script type="module">` for its entry point. Does it need `defer` too?
 > No. Module scripts are deferred by default per the HTML specification — they download in parallel and execute after parsing, in the order dictated by the static import graph. Adding `defer` explicitly is harmless but redundant; adding `async` to a module script is the one case where you'd opt back into async timing.
@@ -435,6 +516,26 @@ HTTP/2 server push was an attempt to start sending CSS/JS before the browser ask
 - `preconnect` warms up a connection early; `preload` starts the fetch itself early; `prefetch` is both of those, but for the *next* page, at low priority.
 - LCP, CLS, INP are the Core Web Vitals this pipeline directly determines.
 - HTTP/2 push is dead; use `preload`/`preconnect`/`prefetch` instead.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what does the browser build from HTML, and what from CSS?
+> The DOM from HTML, the CSSOM from CSS.
+
+> [!question]- Easy: does a plain `<script src>` stop the browser from reading the rest of the HTML?
+> Yes. It stops, downloads, runs the script, then carries on.
+
+> [!question]- Easy: which fires first, `DOMContentLoaded` or `load`?
+> `DOMContentLoaded`. `load` also waits for every image and iframe.
+
+> [!question]- Medium: two scripts must run in order, `lib.js` then `app.js`. `async` or `defer`?
+> `defer`. It keeps document order; `async` runs whichever finishes downloading first.
+
+> [!question]- Medium: why is animating `transform` cheaper than animating `left`?
+> `left` changes geometry, so layout and paint run every frame; `transform` needs only compositing.
+
+> [!question]- Medium: a font file is named only inside your CSS. Which hint lets the browser start fetching it before the CSS is read?
+> `<link rel="preload">` for the font (add `preconnect` too if it is on another origin).
 
 ## Links 🟢
 - **Before this:** [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]

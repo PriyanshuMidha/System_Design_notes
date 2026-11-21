@@ -22,6 +22,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 2-3, the design decisions and the tests.
 > - 🔴 **Interview / SDE-3 prep?** Add "Running it", the pitfalls and the exercises. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Arrays and Dynamic Arrays (Go Slices)]]: the whole heap lives in one slice, and `append` grows it.
+> - [[Trees, BSTs and Balanced Trees]]: root, parent, child and leaf. Here the tree is only imagined; index math (`2i+1`, `2i+2`, `(i-1)/2`) finds parents and children.
+> - Read [[Heaps and Priority Queues]] first too: sift-up, sift-down and heapify are traced there by hand.
+
 **From zero** 🟢 — This file is the hands-on twin of [[Heaps and Priority Queues]]. It builds four small working heaps in Go: a from-scratch min-heap (to see the mechanics), a task queue using Go's standard `container/heap` (the way real code does it), a "keep the k biggest" helper, and a running-median tracker. Read the theory note first if any word feels new; here, read each code block top to bottom, then the numbered "How it works" list under it.
 
 ## Before the code 🟢
@@ -83,6 +88,8 @@ Four independent, self-contained pieces of code in one package: `MinHeap` is the
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** what the four heaps are for. **Next we read the code:** first a heap built by hand so the index math is visible, then the standard `container/heap` way, then top-K and the running median. Each step starts with one plain-words line.
+
 ### Step 1: a hand-rolled MinHeap
 
 **In plain words:** we build the heap by hand first — one slice, plus two helpers that let values bubble up or sink down — so the index math stops being magic.
@@ -130,6 +137,8 @@ func (h *MinHeap) Peek() (int, bool) {
 2. `Peek` is `O(1)`: the minimum is always `data[0]` by the heap invariant, so no search is needed.
 3. `Len` just reads the slice length — no traversal.
 
+**What this code does, in plain words:** `Push` adds the value at the end and lets it climb; `Pop` saves the top, moves the last value to the top, shrinks the slice, and lets that value sink back down.
+
 ```go
 func (h *MinHeap) Push(v int) {
 	h.data = append(h.data, v)
@@ -157,6 +166,8 @@ func (h *MinHeap) Pop() (int, bool) {
 2. `Pop` first checks for the empty case, returning `(0, false)` rather than panicking on `data[0]`.
 3. Moving `data[n-1]` into `data[0]` before shrinking is what avoids ever leaving a "hole": the array is always valid at every point during the operation.
 4. `siftDown` only runs `if len(h.data) > 0` — popping the last remaining element needs no sift at all.
+
+**What this code does, in plain words:** `siftUp` keeps swapping a value with its parent while the parent is bigger; `siftDown` keeps swapping a value with its smaller child while that child is smaller.
 
 ```go
 func (h *MinHeap) siftUp(i int) {
@@ -246,6 +257,8 @@ func (q TaskQueue) Swap(i, j int) {
 2. `Swap` does the usual element swap, but *also* updates each task's `index` field — this is the detail that makes `heap.Fix` possible later, and it's easy to forget when hand-rolling this interface.
 3. `TaskQueue` is a slice type, not a struct, so it satisfies the interface with value receivers for the read-only methods.
 
+**What this code does, in plain words:** `Push` adds a task and records its position; `Pop` takes the last task off the slice (the heap package has already moved the most urgent one there); `Reprioritize` changes a task's priority and asks `heap.Fix` to move it to its new correct spot.
+
 ```go
 func (q *TaskQueue) Push(x any) {
 	t := x.(*Task)
@@ -300,6 +313,8 @@ sequenceDiagram
 - `TopKLargest` is the size-k pattern from [[Heaps and Priority Queues#Tracing a size-K top-K scan]]: keep a min-heap capped at size `k`, and only replace-and-sift when a new value beats the current weakest kept value.
 - `MedianFinder` is the two-heap pattern: a max-heap for the lower half, a min-heap for the upper half, rebalanced after every `Add` so their sizes never differ by more than one.
 
+**What this code does, in plain words:** the five methods `container/heap` needs, for a plain slice of ints, where smaller numbers come out first.
+
 ```go
 // intMinHeap is the smallest container/heap.Interface implementation that
 // works for a plain []int: compare, swap, and the two slice-resizing
@@ -326,6 +341,8 @@ func (h *intMinHeap) Pop() any {
 3. This type is unexported (`intMinHeap`, lowercase) because it's an implementation detail of `TopKLargest` and `MedianFinder`, not part of this package's public API.
 
 Only `TopKLargest` itself is exported:
+
+**What this code does, in plain words:** keep a min-heap of at most `k` numbers; once it is full, a new number gets in only if it beats the smallest one on top, which is then thrown out; finally sort the survivors.
 
 ```go
 // TopKLargest returns the k largest values in nums, ascending.
@@ -354,6 +371,8 @@ func TopKLargest(nums []int, k int) []int {
 2. While the heap holds fewer than `k` elements, every value is pushed unconditionally — there's nothing yet to compare against.
 3. Once the heap is full, `(*h)[0]` is the current weakest of the `k` kept values (the root of a min-heap); only a value that beats it replaces the root, followed by `heap.Fix(h, 0)` to restore the heap property in `O(log k)`.
 4. The final `sort.Ints` gives a stable, ascending answer — the heap itself only guarantees the *set* of k largest, not their order.
+
+**What this code does, in plain words:** the same int heap with the comparison flipped so the biggest comes out first, and a struct that holds two heaps: one for the smaller half of the numbers, one for the bigger half.
 
 ```go
 // maxIntHeap is intMinHeap with the comparison flipped, used as the "lower
@@ -386,6 +405,8 @@ type MedianFinder struct {
 1. `maxIntHeap.Less` flips the comparison (`h[i] > h[j]`) compared to `intMinHeap` — that single flip is the entire difference between a min-heap and a max-heap in this design.
 2. `MedianFinder.lower` keeps the smaller half of all values seen, with the *largest* of that smaller half on top — so `lower[0]` is "the biggest of the small ones," right at the median boundary.
 3. `upper` keeps the larger half, with the *smallest* of that larger half on top — `upper[0]` is "the smallest of the big ones," the other side of the median boundary.
+
+**What this code does, in plain words:** `Add` drops a new number into the correct half, then moves one number across if one half has become 2 bigger than the other; `Median` reads the top of the bigger half, or averages the two tops when the halves are equal.
 
 ```go
 // Add inserts v and rebalances the two heaps so their sizes never differ
@@ -457,6 +478,8 @@ flowchart LR
 | Push | `5, 3, 8, 1, 9, 2, 7` one at a time | (no direct output; builds the heap) |
 | Pop repeatedly until empty | — | `[1, 2, 3, 5, 7, 8, 9]` |
 
+**What this code does, in plain words:** push seven numbers in a mixed order, pop until empty, and check they come out smallest to largest.
+
 ```go
 func TestMinHeapPushPopIsSorted(t *testing.T) {
 	h := NewMinHeap(nil)
@@ -513,6 +536,8 @@ func TestNewMinHeapHeapifyPutsMinAtRoot(t *testing.T) {
 | Push `low(10)`, `mid(5)`, `high(1)` | — | — |
 | Pop | — | `"high"` (lowest Priority number = most urgent) |
 | `Reprioritize(mid, 0)` then pop | — | `"mid"` (now more urgent than `low`) |
+
+**What this code does, in plain words:** push three tasks, check the most urgent pops first, then make `mid` the most urgent with `Reprioritize` and check it pops next.
 
 ```go
 func TestTaskQueueOrderAndFix(t *testing.T) {
@@ -577,6 +602,8 @@ func TestTopKLargest(t *testing.T) {
 | 3 | `{1, 5, 15}` | 5 |
 | 4 | `{1, 3, 5, 15}` | 4 |
 
+**What this code does, in plain words:** add 5, 15, 1, 3 one at a time and check the median after each add is 5, 10, 5, 4.
+
 ```go
 func TestMedianFinderStream(t *testing.T) {
 	var m MedianFinder
@@ -596,6 +623,8 @@ func TestMedianFinderStream(t *testing.T) {
 **If it fails.** A wrong median at step 2 (`{5, 15}`, equal-size heaps) points at the "average both tops" branch of `Median`. A wrong median at step 3 or 4 (unequal sizes) points at the rebalancing logic in `Add`.
 
 ## Running it 🔴
+
+> 🟡 → 🔴 **You now know** how each heap is coded and how the tests check them against hand-worked answers. **Next comes the advanced part:** reading the test output, the Go-specific traps (index bookkeeping, memory leaks, concurrency), and exercises.
 
 ```text
 go vet ./... && go test -race -v ./...
@@ -642,6 +671,26 @@ ok  	pq	1.473s
 1. In `siftDown`, change `h.data[left] < h.data[smallest]` to always compare against `left` only (drop the `right` check). Predict which test fails first and why, then run the tests to confirm.
 2. Add a `Remove(index int)` method to `TaskQueue` that removes an arbitrary task (not just the root) using `heap.Remove`. Predict what it needs to track to find the task's current index, then implement it using the existing `index` field.
 3. Modify `MedianFinder.Add` to rebalance by more than one element in a single pass (e.g. move all excess elements at once instead of one `if`/`else if`). Predict whether this changes the worst-case time complexity of `Add`, then verify with `TestMedianFinderStream`.
+
+## Self-check 🟢🟡
+
+> [!question]- Where does `NewMinHeap` start sifting down, and why there?
+> At `len(h.data)/2 - 1`, the last non-leaf; every index after it is a leaf with nothing to fix.
+
+> [!question]- What does `Pop` return on an empty `MinHeap`?
+> `(0, false)`, instead of panicking.
+
+> [!question]- Which five methods does `container/heap` need?
+> `Len`, `Less`, `Swap`, `Push`, `Pop`.
+
+> [!question]- Why does `TaskQueue.Swap` also update each task's `index`?
+> So `heap.Fix` can be called with the task's current position in `O(log n)`, without searching.
+
+> [!question]- What is the only difference between `intMinHeap` and `maxIntHeap`?
+> `Less` is flipped: `h[i] < h[j]` versus `h[i] > h[j]`.
+
+> [!question]- After adding 5, 15, 1, 3 to `MedianFinder`, why is the median 4?
+> The halves are {1, 3} and {5, 15}, equal size, so the median is the average of 3 and 5.
 
 ## Links 🟢
 

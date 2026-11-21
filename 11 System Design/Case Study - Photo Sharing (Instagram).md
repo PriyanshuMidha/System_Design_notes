@@ -35,6 +35,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+> - [[Back-of-the-Envelope Estimation]]: turning uploads per day into petabytes and gigabits per second.
+> - [[Case Study - News Feed]]: each user has a ready list of post IDs, filled when people they follow post.
+> - [[CDN and Edge]]: servers near users keep copies of files so they load fast.
+
 **From zero, in 60 seconds** 🟢
 
 A photo app stores two very different kinds of data.
@@ -77,6 +83,10 @@ Behind that, the app stored billions of photos cheaply, survived a half-finished
 | Thumbnail / variant | A smaller copy of the same image | 150 px and 1080 px versions |
 | Async pipeline | Work done in the background after replying | Resize after "upload done" |
 | Fan-out | Copying one item to many followers' feeds | One post to 300 feeds |
+
+| Multipart upload | Sending a big file in parts so a failed part can be retried alone | 5 MB parts, part 3 retried |
+| EXIF | Hidden data a camera stores inside a photo, sometimes including GPS location | the photo's latitude and longitude |
+| Egress | Data sent out of the cloud to users, billed per GB | images downloaded by viewers |
 
 **Picture it**
 
@@ -125,6 +135,13 @@ People want to share photos with friends and see what friends shared. The techni
 - **Eventually consistent feed:** a new photo may take a few seconds to reach followers, but the poster sees their own photo at once.
 - **Mobile friendly:** unreliable networks, resumable uploads, small payloads.
 
+### Real-life example: posting on Instagram from a train 🟢
+
+You take a photo on a Mumbai local train and post it on Instagram. The network keeps dropping, yet the post goes through.
+Your own profile shows it at once, even before the app has finished making the smaller sizes.
+Your friends see it in their feeds a few seconds later, loading instantly from a server near them.
+A small phone downloads a small version; a tablet gets a bigger one. Nobody downloads your full 12-megapixel original.
+
 **Out of scope:** stories, reels and video (see [[Case Study - Video Streaming]]), direct messages, ads, and the machine-learning ranking model itself.
 
 > [!tip] Remember
@@ -153,9 +170,26 @@ flowchart LR
 > [!tip] Remember
 > Bytes go client to storage to CDN to client. Metadata goes through the app. Two separate roads.
 
+## Common beginner mistakes 🟢
+
+- **Storing images in the database** → huge rows bloat backups and replication → keep bytes in object storage and only the key in the database.
+- **Uploading through your app servers** → they carry terabytes a day and slow down → give the phone a presigned URL to upload directly.
+- **Serving images without a CDN** → origin bandwidth explodes and images load slowly far away → serve from a CDN with long cache times.
+- **Reusing a URL for a changed image** → old copies stay cached around the world → name files by content hash so a new image gets a new URL.
+- **Keeping the photo's EXIF data** → it can reveal where the user lives → strip location data in the processing pipeline.
+
 ## 3. How it works - high-level design 🟡
 
+> 🟢 → 🟡 **You now know** the two roads: bytes to object storage and the CDN, small facts to the database. **Next we open the box**: the big picture, then a photo upload step by step, then a feed view step by step.
+
 ### The big picture
+
+**Step by step:**
+1. The phone asks the API for an upload link. The API notes "media m_7Hq2 pending".
+2. The phone sends the photo straight to object storage with that link.
+3. Storage announces "new object". A worker makes four smaller sizes and removes location data.
+4. The phone creates the post. The post service saves it and tells the fan-out workers.
+5. Followers' feeds get the post ID; when they scroll, their phones fetch the right size from the CDN.
 
 ```mermaid
 flowchart TB
@@ -210,7 +244,7 @@ flowchart TB
 4. The client calls `POST /v1/posts` with the media ID and caption. The server marks the media `uploaded` and writes the post row.
 5. Object storage emits an "object created" event. A worker consumes it, validates the file, generates variants, strips private metadata, and marks the media `ready`.
 6. The post service publishes a `post.created` event. Fan-out workers add the post ID to followers' feeds.
-7. The client shows the post from local data immediately (optimistic UI), so the poster does not wait for steps 5-6.
+7. The client shows the post from local data immediately (optimistic UI: show it before the server confirms everything), so the poster does not wait for steps 5-6.
 
 ```mermaid
 sequenceDiagram
@@ -242,7 +276,7 @@ sequenceDiagram
 1. The client calls `GET /v1/feed?cursor=...&limit=20`.
 2. The feed service reads the user's list of post IDs from the feed cache.
 3. It merges recent posts from any celebrities the user follows (pull side).
-4. It fetches post metadata in a batch (`MGET` from cache, misses from the database).
+4. It fetches post metadata in a batch (`MGET`, one call that reads many cache keys, then misses from the database).
 5. It returns post JSON that contains **image URLs**, not images.
 6. The client downloads each image from the CDN at the size that fits the screen.
 
@@ -397,7 +431,7 @@ erDiagram
 - **Feed lists:** Redis lists of post IDs, capped near 800 per user.
 - **Images:** object storage. See [[Choosing Storage for Files, Search and Analytics - Decision Guide]].
 
-**Time-sortable IDs.** Instagram's 2012 engineering post describes 64-bit IDs made from 41 bits of milliseconds since a custom epoch, 13 bits for the logical shard, and 10 bits for a per-shard sequence. The ID sorts by time and tells you which shard holds the row. See [[Unique ID Generation]].
+**Time-sortable IDs.** Instagram's 2012 engineering post describes 64-bit IDs made from 41 bits of milliseconds since a custom epoch (a chosen start date that counts as time zero), 13 bits for the logical shard, and 10 bits for a per-shard sequence. The ID sorts by time and tells you which shard holds the row. See [[Unique ID Generation]].
 
 ### Object keys: content-addressed and immutable
 
@@ -458,7 +492,15 @@ The full treatment is in [[Case Study - News Feed]]; the general push-versus-pul
 | WebP | Smaller than JPEG at similar quality | Wide | Serve when the client supports it |
 | AVIF | Smaller still | Growing | Serve when supported; encoding costs more CPU |
 
-Serve the best format the client advertises in its `Accept` header, and cache each format as its own object.
+Serve the best format the client advertises in its `Accept` header (the list of formats the app says it can show), and cache each format as its own object.
+
+### Things people confuse this with 🟡
+
+| System | What it stores and serves | How it differs from photo sharing |
+| --- | --- | --- |
+| [[Case Study - File Storage and Sync]] | Your private files across your devices | Syncs edits between devices; photos here are write-once and shown to followers |
+| [[Case Study - Video Streaming]] | Long videos in many qualities | Needs transcoding into small segments and adaptive bitrate; far more bytes |
+| [[Case Study - News Feed]] | The list of posts to show | The feed decides what to show; this note adds where the photo bytes live and how they travel |
 
 ## 6. Trade-offs and when not to use 🟡
 
@@ -483,6 +525,8 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the upload and feed paths, the sizing, the API, the tables and the image choices. **Next is the advanced part**: what big companies published, failure stories, resumable uploads, the image pipeline, CDN caching, hot like counters, storage tiers, and privacy and deletion.
+
 - **Instagram (public engineering posts):** the 2012 sharding post describes PostgreSQL with many logical shards mapped to fewer physical servers, and 64-bit IDs that embed a timestamp, a shard ID and a sequence number so IDs are generated inside the database without a central service.
 
   A 2011 post describes using Redis hashes to map hundreds of millions of media IDs to user IDs in far less memory than one key per entry.
@@ -491,9 +535,9 @@ flowchart LR
   The lesson is the same as our tiering in section 8.5.
 - **Object storage (documented):** managed object stores offer multipart upload, presigned URLs, lifecycle rules and storage classes for infrequently accessed data.
 - **Failure modes and fixes:**
-	- *Upload abandoned halfway:* a lifecycle rule aborts incomplete multipart uploads after 1-7 days; a reaper job deletes `pending` media older than 24 hours.
+	- *Upload abandoned halfway:* a lifecycle rule (an automatic storage rule based on age) aborts incomplete multipart uploads after 1-7 days; a reaper job deletes `pending` media older than 24 hours.
 	- *Worker crash during resize:* the queue redelivers the event; the job is idempotent because it writes the same content-hashed keys. See [[Background Jobs and Worker Pools]].
-	- *Poison image (corrupt or decompression bomb):* limit pixel dimensions and decode time; send repeated failures to a dead-letter queue and mark the media `rejected`.
+	- *Poison image (corrupt or decompression bomb: a small file that expands to a gigantic image in memory):* limit pixel dimensions and decode time; send repeated failures to a dead-letter queue and mark the media `rejected`.
 	- *CDN outage or miss storm:* fail over to a second CDN or the origin with rate limits; keep origin capacity for a degraded hit ratio.
 	- *Viral photo:* CDN absorbs views; the like counter is sharded (section 8.4). See [[Hot Keys and Hot Partitions]].
 	- *Inconsistent metadata and storage:* a daily reconciliation job lists objects and rows, flags orphans and deletes them after a grace period.
@@ -604,7 +648,7 @@ flowchart LR
 
 - **Variants** serve almost all views and are small; keep them on the standard tier.
 - **Originals** are rarely read after processing (only for re-encoding or download); move them to colder tiers by lifecycle rule.
-- Facebook's f4 paper reports using erasure coding for warm data to reduce storage overhead compared with full replication.
+- Facebook's f4 paper reports using erasure coding (splitting data into pieces plus a few repair pieces, instead of full copies) for warm data to reduce storage overhead compared with full replication.
 - Always keep at least two independent copies (or erasure-coded fragments across failure domains), so one data center loss does not lose photos. Managed stores do this for you.
 
 ### 8.6 Privacy, deletion and abuse
@@ -647,6 +691,26 @@ flowchart LR
 
 > [!question]- What if traffic grows 10 times?
 > Image bytes scale with the CDN and object store, so add CDN capacity, a shield tier and more regions. Metadata needs more shards (by author ID) and more read replicas or cache. Fan-out needs more workers and a lower celebrity threshold. Image workers scale by queue depth. The first thing to watch is origin egress and fan-out lag.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: where do the photo bytes go, and where do the caption and likes go?
+> Bytes go to object storage; small facts go to the database.
+
+> [!question]- Easy: what is a presigned URL for?
+> It lets the phone upload straight to object storage for a short time, without going through app servers.
+
+> [!question]- Easy: why make several sizes of each photo?
+> So each screen downloads the smallest image that looks sharp.
+
+> [!question]- Medium: 100 million uploads a day. What is the average upload rate?
+> About 1,160 a second, around 3,500 at a 3× peak.
+
+> [!question]- Medium: why name image files by a hash of their content?
+> The bytes behind a URL never change, so the CDN can cache them for a year and never needs a purge.
+
+> [!question]- Medium: a 5 MB upload dies at 90% in a tunnel. How do you avoid restarting from zero?
+> Use a resumable multipart upload; only the failed part is sent again.
 
 ## 10. Cheat sheet 🟢
 

@@ -36,6 +36,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Transactions and ACID]]: a `COMMIT` makes a group of changes permanent; after it the database says "saved".
+> - [[Storage Engines - B-tree vs LSM and WAL]]: before changing its tables, the database writes each change to a log file, the WAL. Replication ships that same log to other servers.
+
 **From zero, in 60 seconds** 🟢
 
 Your app keeps all its data on one database server. If that one server dies, the app is gone, and if too many people read at once, it slows down.
@@ -83,6 +87,10 @@ Database replication works the same way, and that delay is the core thing to des
 | Asynchronous | The primary confirms without waiting | Fast writes, may lose the last few on crash |
 | Failover | Promoting a replica to primary when the primary dies | Replica 1 becomes the new primary |
 | LSN | A position in the WAL, like a page number | `16/B374D848` |
+| Replication slot | A bookmark on the primary that keeps WAL until a replica has received it | `replica_1` slot |
+| Read-your-writes | After you save something, your next read shows it | you pay, then the page says "paid" |
+| Split brain | Two servers both think they are the primary and both accept writes | after a network cut |
+| RPO | How much recent data you can lose in a failure, in time | async replica 2 s behind: up to 2 s |
 
 **Picture it**
 
@@ -118,12 +126,27 @@ InvoiceOps runs on one PostgreSQL server. Four problems appear as it grows:
 | Read load: dashboards and invoice lists are most of the traffic | The primary's CPU is spent on reads, and writes slow down | Send list and dashboard reads to replicas |
 | The server's disk dies | Restore the last backup and replay WAL: tens of minutes to hours | Promote a replica: seconds to a minute |
 | Users in another continent | Every read crosses an ocean (about 150 ms per round trip; estimate) | A replica in their region answers locally |
-| Analysts run month-end reports | Long scans compete with checkout traffic | Point reports at a dedicated replica, or stream changes out (CDC) |
+| Analysts run month-end reports | Long scans compete with checkout traffic | Point reports at a dedicated replica, or stream changes out (CDC: change data capture, reading the change log as a live feed) |
 
 Two things replication does **not** do:
 
 - **It does not scale writes.** Every replica applies every write. To spread writes, see [[Partitioning and Sharding]].
 - **It is not a backup.** A bad `DELETE` reaches every replica within milliseconds. See §6.
+
+### Real-life example 🟢
+
+On a social app like Instagram, you post a comment and the page reloads.
+Your comment went to the main database (the primary), but the reload may be served by a copy in another server (a replica) that is a moment behind.
+If the app is careless, your own comment seems to vanish for a second, then appears.
+Apps avoid this by reading your own recent changes from the primary, or from a copy known to have caught up. Everyone else's view can safely be a second old.
+
+## Common beginner mistakes 🟢
+
+- **Treating a replica as a backup** → a wrong `DELETE` is copied to every replica within milliseconds → keep real backups with point-in-time recovery.
+- **Adding replicas to handle more writes** → every replica must replay every write, so writes do not spread out → use partitioning or sharding for write scale.
+- **Reading from a replica right after a write** → the replica may be behind, so the user does not see their own change → read from the primary for a short while, or track the WAL position (LSN) of the write.
+- **Checking "does this payment exist?" on a replica, then inserting on the primary** → a lagging replica says "no" and you insert a duplicate → enforce it with a unique constraint on the primary.
+- **Leaving an unused replication slot behind** → the primary keeps every WAL file for it until the disk fills → set `max_slot_wal_keep_size` and drop dead slots.
 
 ## 2. Mental model 🟢
 
@@ -140,11 +163,13 @@ Vocabulary:
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the idea: the primary keeps a log of changes and replicas replay it, always a little behind. **Next we open the box**: the processes that ship the log, how long a commit waits in each mode, how to measure lag, and the slots that keep the log around.
+
 ### 3.1 PostgreSQL streaming replication
 
 **In plain words:** the primary writes every change into a diary file, a helper process mails new diary pages to each replica, and the replica copies them into its own books while still answering read questions.
 
-1. A transaction commits on the primary. Its WAL records are written to `pg_wal/` and flushed to disk.
+1. A transaction commits on the primary. Its WAL records are written to `pg_wal/` and flushed to disk (`fsync`: forced out of memory onto the physical disk).
 2. A **walsender** process streams new WAL to each replica over a replication connection.
 3. The replica's **walreceiver** writes the WAL to its own `pg_wal/`, flushes it, and reports three positions back: written, flushed and replayed.
 4. The replica's **startup process** replays the WAL into its data files. With `hot_standby = on` (the default) the replica serves read-only queries meanwhile.
@@ -167,7 +192,7 @@ flowchart LR
     SP -- "remote_apply ack" --> WS
 ```
 
-The three acknowledgements are what `synchronous_commit` can wait for (§3.2). Setting up a replica takes one slot and one base backup:
+The three acknowledgements are what `synchronous_commit` can wait for (§3.2). Setting up a replica takes one slot and one base backup (a full copy of the primary's data files to start from):
 
 ```sql
 -- On the primary (PostgreSQL 17)
@@ -191,6 +216,13 @@ pg_basebackup -h primary.internal -U replicator -D /var/lib/postgresql/17/main -
 | Sync, `synchronous_commit = remote_write` | The standby's OS has the WAL (not yet fsynced) | Only if the standby's OS crashes too | One round trip |
 | Sync, `synchronous_commit = on` | The standby has **flushed** the WAL to disk | None for acknowledged commits | Round trip + standby fsync |
 | Sync, `synchronous_commit = remote_apply` | The standby has **replayed** it, so reads there see it | None | Round trip + replay time |
+
+**Step by step (one ₹5,000 payment commit):**
+1. The app sends `COMMIT` to the primary. The primary writes the change to its own WAL on disk.
+2. **Async:** the primary replies "saved" now. The replica gets the change a moment later.
+3. **Sync (`on`):** the primary first sends the change to a replica and waits until the replica has it on disk, then replies.
+4. **`remote_apply`:** it waits even longer, until the replica has applied it, so reads there already show it.
+5. The longer it waits, the safer the data and the slower each commit.
 
 Which standbys count is set by `synchronous_standby_names`:
 
@@ -253,6 +285,13 @@ With `FIRST 1 (replica_1, replica_2)` instead, the primary waits on `replica_1` 
 
 **In plain words:** lag is how many diary pages a replica still has to copy. Postgres shows it per replica, split into received, written to disk, and actually applied.
 
+**Step by step:**
+1. The primary is at WAL position `16/B374D848`.
+2. `replica_1` has applied up to almost the same position: about 12 KB behind, under 2 ms.
+3. `replica_2` has received the change fast but applied only up to 46 MB earlier: 2.8 s behind.
+4. A read on `replica_2` now shows data as it was 2.8 s ago.
+5. `pg_stat_replication` on the primary shows these numbers per replica.
+
 ```sql
 -- On the primary: one row per connected replica
 SELECT application_name, state, sync_state,
@@ -293,6 +332,13 @@ flowchart LR
 ### 3.4 Replication slots
 
 **In plain words:** a slot is a bookmark that tells the primary "keep every diary page from here, someone still needs them". If that someone never comes back, the pile of kept pages grows until the disk is full.
+
+**Step by step:**
+1. You create slot `replica_1` on the primary.
+2. The primary keeps every WAL file the replica has not yet confirmed.
+3. The replica confirms as it goes, and the primary deletes old files.
+4. The replica is switched off and forgotten. Nothing is confirmed any more, so the primary keeps all new WAL.
+5. Days later the primary's disk is full. `max_slot_wal_keep_size` caps this by giving up on the slot instead.
 
 A slot guarantees that WAL stays until its consumer confirms it. That cuts both ways: a replica or CDC connector that disappears leaves an **inactive slot**, and the primary keeps every WAL file from then on until its disk fills and it stops.
 
@@ -483,8 +529,16 @@ PostgreSQL 17 adds **failover slots** (create the slot with `failover = true` an
 
 ## 6. Trade-offs and when not to use 🟡
 
+**Replica, backup or shard? People mix these up:**
+
+| | Replica | Backup | Shard |
+| --- | --- | --- | --- |
+| Holds | a live copy of all data | a saved copy from the past | one slice of the data |
+| Helps with | reads, fast failover | undoing mistakes, disasters | write volume, data size |
+| A wrong `DELETE` | is copied within milliseconds | is not in older backups | only affects that slice |
+
 - **Replicas multiply reads, not writes.** Each replica replays the full write stream, and a replica that cannot keep up only falls further behind.
-- **Async replication can lose acknowledged commits.** On failover you lose whatever the new primary had not received: the RPO equals the lag at that moment. Sync replication closes that gap but adds a round trip to every commit, and the primary stalls when no synchronous standby is reachable.
+- **Async replication can lose acknowledged commits.** On failover you lose whatever the new primary had not received: the RPO (recovery point objective, how much recent data you may lose) equals the lag at that moment. Sync replication closes that gap but adds a round trip to every commit, and the primary stalls when no synchronous standby is reachable.
 - **Replicas move consistency problems into the application.** Every read path needs a decision: fresh (primary) or fast (replica).
 
 ```mermaid
@@ -499,6 +553,8 @@ flowchart TD
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how replication ships changes, how to measure lag, and how to stop stale reads. **Next is the senior view**: real setups (Patroni, MySQL, RDS, Aurora), safe failover, split brain, replay conflicts and timelines.
+
 - **Real systems:**
 	- PostgreSQL streaming replication managed by **Patroni** (leader key in etcd, Consul or ZooKeeper; `synchronous_mode` for zero-loss failover) or repmgr. `pg_rewind` turns a failed primary back into a replica.
 	- MySQL: binlog replication with GTIDs, semi-sync, and Orchestrator for topology and failover.
@@ -506,8 +562,8 @@ flowchart TD
 - **Failover basics** (depth in [[High Availability and Failover]]):
 	1. Detect: missed heartbeats for longer than a timeout. A timeout cannot tell "dead" from "slow".
 	2. Choose the replica that has received the most WAL (highest LSN) to lose the least data.
-	3. Promote it: `SELECT pg_promote();` (PostgreSQL 12+). It starts a new **timeline**.
-	4. Fence the old primary so it can no longer accept writes: power it off, cut its network, or make it demote itself when it cannot renew its leader lease.
+	3. Promote it: `SELECT pg_promote();` (PostgreSQL 12+). It starts a new **timeline** (a new numbered branch of WAL history).
+	4. Fence the old primary (make sure it cannot act as primary any more) so it can no longer accept writes: power it off, cut its network, or make it demote itself when it cannot renew its leader lease.
 	5. Repoint clients through DNS, a virtual IP or a proxy, then rebuild the old primary as a replica with `pg_rewind`.
 ```mermaid
 sequenceDiagram
@@ -621,6 +677,9 @@ flowchart LR
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** Replication keeps live copies of the database by sending the primary's change log to replicas. It helps reads and lets you switch to a copy if the primary dies, but it does not help writes and it is not a backup. Copies are a little behind, so read your own fresh changes from the primary. Clean up unused slots, or the primary's disk fills.
+
+
 - Replication = the primary streams its WAL; replicas replay it in order. It scales reads and availability, never writes.
 - Async: no latency cost, loses the lag window on failover. Sync (`on`, `remote_apply`, `ANY n`): zero loss, plus a round trip per commit and an availability dependency.
 - Lag = bytes or seconds not yet replayed; watch `pg_stat_replication.replay_lag`.
@@ -629,6 +688,30 @@ flowchart LR
 - Failover: highest LSN wins, promote, fence the old primary, repoint clients, `pg_rewind`.
 - Logical replication: per table, cross-version, feeds CDC, no DDL or sequences.
 - A replica is not a backup: keep PITR.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Which server accepts writes?
+> Only the primary. Replicas copy its changes and serve reads.
+
+> [!question]- Why is a replica not a backup?
+> A mistaken `DELETE` is copied to every replica within milliseconds.
+
+> [!question]- What is replication lag?
+> How far a replica is behind the primary, in bytes of WAL or in seconds.
+
+🟡 Medium
+
+> [!question]- A user pays, then the reloaded page still says "sent". What happened and how do you fix it?
+> The read hit a lagging replica; read from a replica whose replay LSN is at least the write's LSN, else from the primary.
+
+> [!question]- Why use `ANY 1 (replica_1, replica_2)` instead of a single synchronous standby?
+> If the one sync standby dies, commits hang; with `ANY 1` either replica can confirm.
+
+> [!question]- During failover, which replica should you promote?
+> The one that received the most WAL (highest LSN), so the least data is lost.
 
 ## Links
 

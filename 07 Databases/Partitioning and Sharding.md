@@ -35,6 +35,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6 (comparison and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Replication]]: copies of a database (replicas) help with reads, but every write still goes to the one primary.
+> - [[Indexing Fundamentals]]: an index lets the database find rows without reading the whole table.
+> - [[Query Plans and EXPLAIN]]: `EXPLAIN` shows which tables and pieces a query actually touched.
+
 **From zero, in 60 seconds** 🟢
 
 Imagine one notebook where you write every sale your shop ever makes. After a few years the notebook is so thick you cannot flip through it, and only one person can write in it at a time.
@@ -80,6 +85,11 @@ If you pick the key well, each request touches one piece and the load spreads ev
 | Hot shard | One piece that gets far more traffic than the others | All new writes on the newest range |
 | Fan-out | Sending one query to every shard and merging results | "Search all invoices" |
 | Shard map | A table that says which database owns which piece | logical shard 42 → `db-2` |
+| Logical shard | A fixed numbered bucket of keys; many of them sit on one database | 1,024 buckets over 4 databases |
+| Partition pruning | The database skips pieces that cannot hold matching rows | a November query never opens October |
+| Cardinality | How many different values a column has | `status`: 4, `workspace_id`: thousands |
+| Resharding | Moving data between shards while the app keeps running | move shard 906 from db-3 to db-5 |
+| CDC (change data capture) | Reading a database's change log as a live stream of row changes | copy new writes to the new shard |
 
 **Picture it**
 
@@ -110,8 +120,10 @@ Where it breaks: letters to "everyone" must go in every van, just like a query w
 
 InvoiceOps after a few years, with numbers that are estimates for the scenario:
 
-- `audit_logs` has 6 billion rows (about 2 TB). Deleting last year's rows with `DELETE` writes hundreds of GB of WAL, bloats the table, and runs for hours. Vacuuming the table takes most of a day.
+- `audit_logs` has 6 billion rows (about 2 TB). Deleting last year's rows with `DELETE` writes hundreds of GB of WAL (the database's change log, written before every change), bloats the table (leaves it full of dead row space), and runs for hours. Vacuuming the table (PostgreSQL's clean-up of dead rows) takes most of a day.
 - The primary peaks at 15,000 writes per second. Read replicas do not help writes (see [[Replication]]), and the largest instance available is already in use.
+
+🟢 **Plain version:** Two different things hurt. First, one table got so big that cleaning out old rows takes hours and creates a mountain of extra work for the database. Second, the main database server receives more writes than any single machine can take, and copies of it (replicas) only help with reads. The first problem is fixed by cutting the table into pieces inside the same database; the second needs several machines.
 
 These are two different problems with two different fixes:
 
@@ -143,6 +155,22 @@ flowchart TD
     Q4 -- yes --> F4["Scale up"]
     Q4 -- no --> F5["Shard across machines"]
 ```
+
+### 1.2 Real-life example 🟢
+
+Picture a food delivery app with orders from hundreds of cities.
+One database for every order in the country would be swamped at dinner time.
+So orders can be split by city: Bengaluru orders live on one server, Mumbai orders on another.
+Each order, menu and delivery update for one city stays on one server, so most requests touch only one machine.
+The catch: a question like "total orders across India today" must ask every server and add the answers.
+
+### 1.3 Common beginner mistakes 🟢
+
+- **Sharding too early** → you take on cross-shard queries, many backups and hard migrations while one server was still enough → climb the ladder first: indexes, cache, replicas, partitions, bigger machine.
+- **Splitting users by ID ranges (1-1M, 1M-2M...)** → every new signup has the highest ID, so all new writes hit the last shard → hash the ID instead.
+- **Routing with `hash(key) % number_of_servers`** → adding one server changes the answer for most keys, so most data must move → hash into a fixed number of logical shards and keep a map from shard to server.
+- **Picking a shard key your queries do not use** → every request must ask every shard → pick the key that almost every query filters on, like `workspace_id`.
+- **Forgetting to create next month's partition** → inserts fail at midnight with "no partition found" → create partitions weeks ahead and alert when fewer than 2 are ready.
 
 ## 2. Mental model 🟢
 
@@ -178,7 +206,16 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the difference: partitioning cuts one table into pieces inside one database, sharding spreads pieces over machines, and the key decides everything. **Next we open the box**: how PostgreSQL places rows and skips pieces, how a request finds its shard, which strategies exist, and how to choose a key. Each subsection starts with a short step-by-step walk.
+
 ### 3.1 Partitioning inside PostgreSQL
+
+**Step by step:**
+1. You create a parent table `audit_logs` and tell PostgreSQL to split it by `created_at`.
+2. You create one child table per month, for example `audit_logs_2026_11` for 1 Nov to 1 Dec.
+3. An insert with `created_at = 2026-11-17` is stored in the November child, automatically.
+4. Your app still reads and writes `audit_logs`; it never names the children.
+5. An insert for a month with no child fails, so future months must be created ahead of time.
 
 PostgreSQL 17 supports three kinds of declarative partitioning. The parent table holds no rows; each row is stored in exactly one partition.
 
@@ -188,7 +225,7 @@ PostgreSQL 17 supports three kinds of declarative partitioning. The parent table
 | `LIST` | The key is in a listed set | `clients` by `region`: `IN`, `DE`/`FR`/`NL`, everything else | Data residency, known categories |
 | `HASH` | `hash(key) mod MODULUS = REMAINDER` | `invoices` by `workspace_id` over 4 partitions | Even spread when there is no natural range |
 
-The shortest useful example is the monthly range partition. `FROM` is inclusive and `TO` is exclusive, and the primary key must include the partition key (the other two kinds, with their full DDL, are in [[Partitioning and Sharding - Go]]):
+The shortest useful example is the monthly range partition, written as DDL (the SQL that creates or changes tables). `FROM` is inclusive and `TO` is exclusive, and the primary key must include the partition key (the other two kinds, with their full DDL, are in [[Partitioning and Sharding - Go]]):
 
 ```sql
 CREATE TABLE audit_logs (
@@ -211,6 +248,13 @@ flowchart TB
 ```
 
 ### 3.2 Partition pruning
+
+**Step by step:**
+1. A query asks for workspace 7's logs from 1 to 8 November.
+2. The planner (the part of PostgreSQL that decides how to run a query) compares that date range with each month's bounds.
+3. September and October cannot match, so they are dropped from the plan.
+4. Only the November piece is read, which is why the plan below names just one table.
+5. If the date is only known when the query runs (like `now()`), the skipping happens at start-up instead and shows as `Subplans Removed`.
 
 **Partition pruning** is the payoff: the planner skips partitions whose bounds cannot match the `WHERE` clause.
 
@@ -250,7 +294,7 @@ sequenceDiagram
     Note over P10: never touched
 ```
 
-When the bound is only known at run time, such as `now()` or a parameter of a generic prepared plan, pruning happens when the executor starts and shows up as `Subplans Removed`:
+When the bound is only known at run time, such as `now()` or a parameter of a generic prepared plan (a plan made once and reused for any parameter value), pruning happens when the executor starts and shows up as `Subplans Removed`:
 
 ```sql
 EXPLAIN (COSTS OFF)
@@ -271,7 +315,13 @@ Representative output (PostgreSQL 17, 12 monthly partitions, run on 2026-11-02):
 
 ### 3.3 Retention as a metadata operation
 
-**Retention becomes a metadata operation** instead of a giant `DELETE`:
+**Step by step:**
+1. December 2025's logs are past the keep-for-one-year rule.
+2. `DETACH PARTITION` unhooks that month's child table from the parent. Queries stop seeing it.
+3. Optionally copy that table to cheap storage as an archive.
+4. `DROP TABLE` deletes the whole month in one go: no row-by-row work, nothing to clean up.
+
+**Retention becomes a metadata operation** (only the database's catalog, its list of tables, changes) instead of a giant `DELETE`:
 
 ```sql
 ALTER TABLE audit_logs DETACH PARTITION audit_logs_2025_12 CONCURRENTLY;  -- PostgreSQL 14+
@@ -293,9 +343,16 @@ stateDiagram-v2
     Archived --> [*]: DROP TABLE
 ```
 
-`DETACH … CONCURRENTLY` cannot run inside a transaction block or on a table with a `DEFAULT` partition. Create future partitions ahead of time with a scheduled job or `pg_partman`: an insert with no matching partition fails with `no partition of relation "audit_logs" found for row`.
+`DETACH … CONCURRENTLY` cannot run inside a transaction block or on a table with a `DEFAULT` partition. Create future partitions ahead of time with a scheduled job or `pg_partman` (a PostgreSQL extension that creates and drops partitions on a schedule): an insert with no matching partition fails with `no partition of relation "audit_logs" found for row`.
 
 ### 3.4 Sharding across machines
+
+**Step by step:**
+1. A request arrives for workspace 42.
+2. The router hashes 42 into one of 1,024 fixed buckets: bucket 906.
+3. It looks up bucket 906 in the shard map: "db-3".
+4. The query goes only to db-3.
+5. Later, to move bucket 906 to db-5, you copy its rows and change one map entry. The hash never changes.
 
 A sharded system has three parts: a **shard key** on every row, a **shard map** that says which database owns which key, and a **router** that reads the map for every query.
 
@@ -318,9 +375,15 @@ func dbFor(workspaceID string) string {
 }
 ```
 
-The router can be a library inside each service, a proxy (Vitess `vtgate`, MongoDB `mongos`) or a coordinator database (Citus). The map itself is small and lives in a strongly consistent store such as etcd, ZooKeeper or a tiny replicated table; routers cache it and refresh it when its version changes.
+The router can be a library inside each service, a proxy (Vitess `vtgate`, MongoDB `mongos`) or a coordinator database (Citus). The map itself is small and lives in a strongly consistent store (every reader sees the latest value) such as etcd, ZooKeeper or a tiny replicated table; routers cache it and refresh it when its version changes.
 
 ### 3.5 Strategies
+
+**Step by step (where does workspace 42 go?):**
+1. **Range:** IDs 1 to 1,000 on shard 1, 1,001 to 2,000 on shard 2, so 42 goes to shard 1.
+2. **Hash:** hash(42) is a scrambled number; it picks a bucket, so neighbours like 42 and 43 usually land apart.
+3. **Directory:** a lookup table says "42 → db-3"; you can change that row any time.
+4. **Geo / tenant:** the user's region or the tenant ID picks the shard.
 
 | Strategy | How a key finds its shard | Good at | Risk |
 | --- | --- | --- | --- |
@@ -345,13 +408,20 @@ flowchart LR
 
 ### 3.6 The user-ID range example is a hot-shard anti-pattern
 
+**Step by step:**
+1. Shard 3 holds user IDs 2,000,001 to 3,000,000.
+2. IDs come from an auto-increment counter (each new row gets the next number), so the next signup is 2,900,001, then 2,900,002...
+3. Every new signup therefore lands on shard 3, while shards 1 and 2 get none.
+4. New users are also the most active, so shard 3 gets the busy traffic too.
+5. Hashing the ID spreads the same 100,000 signups about 33,000 per shard.
+
 A classic textbook example splits users by ID:
 
 - Shard 1: user ID 1 to 1,000,000
 - Shard 2: user ID 1,000,001 to 2,000,000
 - Shard 3: user ID 2,000,001 to 3,000,000
 
-With auto-increment IDs this is the hot-shard problem in its purest form:
+With auto-increment IDs (always increasing, so they are **monotonic**) this is the hot-shard problem in its purest form:
 
 - **Every insert hits the last shard.** The next signup is always the highest ID. Measured with the router in [[Partitioning and Sharding - Go]]: of the newest 100,000 IDs (2,900,001 to 3,000,000), range sharding puts **all 100,000** on shard 3, while hashing spreads them 33,427 / 33,459 / 33,114.
 - **The newest users are the busiest.** Onboarding, first invoices and first payments all hit shard 3, while shards 1 and 2 hold older, quieter accounts.
@@ -380,7 +450,14 @@ Fixes: hash the ID; or shard by a key that is not monotonic; or keep range shard
 
 ### 3.7 Choosing the shard key for InvoiceOps
 
-A good shard key has high cardinality, spreads load evenly, appears in almost every query, never changes, and keeps data that is used together in one place. Bad keys: `status` or other low-cardinality fields, `created_at` alone for write-heavy tables, `region` alone, and anything most queries do not filter on.
+**Step by step:**
+1. List candidate columns: `status`, `created_at`, `region`, `invoice_id`, `workspace_id`.
+2. Drop columns with few values (`status` has 4), because 4 values can fill at most 4 shards.
+3. Drop columns where all new writes share one value (`created_at` is always "now").
+4. Drop columns that most queries do not filter on (`invoice_id`; list pages are per workspace).
+5. Keep `workspace_id`: thousands of values, in every request, never changes.
+
+A good shard key has high cardinality (many different values), spreads load evenly, appears in almost every query, never changes, and keeps data that is used together in one place. Bad keys: `status` or other low-cardinality fields, `created_at` alone for write-heavy tables, `region` alone, and anything most queries do not filter on.
 
 | Candidate key | Cardinality | Spreads load | In every query | Verdict |
 | --- | --- | --- | --- | --- |
@@ -426,7 +503,7 @@ Joins and transactions inside a workspace stay on one shard. What does not fit, 
 - **Global uniqueness.** `UNIQUE (workspace_id, invoice_number)` is shard-local and cheap. A globally unique `provider_ref` needs the lookup table, because no shard sees the others' rows.
 - **IDs.** A single sequence no longer exists. Use UUIDv7, Snowflake-style or shard-prefixed IDs (see [[Unique ID Generation]]).
 - **A huge enterprise workspace.** Give it a directory override to a dedicated shard.
-- **Cross-workspace reports.** Send them to a warehouse fed by CDC, not to a fan-out over every shard.
+- **Cross-workspace reports.** Send them to a warehouse (a separate database built for big reports) fed by CDC, not to a fan-out over every shard.
 
 ## 4. Worked example 🟡
 
@@ -485,7 +562,7 @@ sequenceDiagram
     O->>S: later, delete shard 906 rows from db-3
 ```
 
-- Taking the snapshot at a known LSN and streaming from that same LSN means no change is missed and none is applied twice.
+- An LSN (log sequence number) is a position in the database's change log, and a logical replication slot is a bookmark that keeps changes from that position for a reader. Taking the snapshot at a known LSN and streaming from that same LSN means no change is missed and none is applied twice.
 - The freeze lasts only as long as the final drain, normally seconds (an estimate that depends on write rate). Clients see `ErrMoving` and retry, or a proxy buffers them.
 - The map version acts as a fence: a router holding version 17 must not write to db-3 after the flip.
 - `Freeze` only stops *new* routing. A write that was routed to db-3 just before the freeze can still be in flight and land after the final drain, and the CDC stream would then miss it. So the source must enforce ownership itself: keep a small `shard_owner(logical_shard, version)` table on each database, have every write transaction check (or `SELECT ... FOR SHARE`) its shard's row and abort when the shard is marked moved, and mark it moved in the same step as the final drain. Late writes then fail with `ErrMoving` and are retried against the new owner instead of being lost.
@@ -555,6 +632,8 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to partition, how to route to shards, and how to move data online. **Next is the senior view**: how real companies (Notion, Instagram, Figma, Slack) shard, the failures they hit, what to monitor, and the deeper maths of logical shards, global indexes and slow fan-out.
+
 - **Real systems:**
 	- Notion shards PostgreSQL by workspace ID into 480 logical shards. 480 divides evenly over 32 hosts (15 each) and over 96 hosts (5 each), which made the re-shard a move of whole logical shards.
 	- Instagram's design keeps thousands of logical shards as PostgreSQL schemas on fewer physical servers, and puts the logical shard ID inside every 64-bit ID.
@@ -566,7 +645,7 @@ flowchart LR
 	- One hot key in a key-value store (a counter, a viral item) → salt it into `key#0 … key#9` and fan reads in.
 	- Routers with a stale map write to the old owner → version the map; the old owner rejects writes for shards it no longer owns; routers refresh on rejection.
 	- Monthly partition not created, so inserts fail at midnight → create partitions weeks ahead and alert on "partitions ahead < 2".
-	- Fan-out queries dominate p99 → add the shard key to the query, or move the report to a warehouse.
+	- Fan-out queries dominate p99 (the time 99 in 100 requests finish within) → add the shard key to the query, or move the report to a warehouse.
 	- A schema migration succeeds on 31 shards and fails on 1 → orchestrated migrations with per-shard status and backward-compatible steps (see [[Zero-Downtime Schema Migrations]]).
 - **What to monitor:**
 	- Per shard: CPU, storage, QPS, p99 latency, connections, replication lag.
@@ -672,6 +751,9 @@ sequenceDiagram
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** Try simpler fixes before sharding. Partitioning cuts a big table into pieces in one database, and lets you delete a whole old month at once. Sharding spreads data over machines by a key, so pick a key that every query uses and that spreads writes evenly. Hash keys into many fixed buckets and keep a map of bucket to machine, so moving data is a map change.
+
+
 - The ladder: indexes → cache → replicas → partitions → bigger machine → shards.
 - PostgreSQL partitioning: `RANGE`, `LIST`, `HASH`; the primary key must include the partition key; pruning shows as missing partitions or `Subplans Removed`.
 - Retention: detach and drop partitions, never `DELETE` billions of rows.
@@ -680,6 +762,30 @@ sequenceDiagram
 - Many logical shards on few servers, plus a versioned map, make moves cheap.
 - Online move: snapshot at an LSN, CDC catch-up, verify, short freeze, flip the map, keep a rollback path.
 - Fan-out to N shards multiplies tail latency (`0.99^32 ≈ 72.5%` within p99).
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is the difference between partitioning and sharding?
+> Partitioning splits a table into pieces inside one database; sharding puts pieces on different machines.
+
+> [!question]- Why is dropping a monthly partition better than `DELETE` for old data?
+> It removes the whole month at once with almost no work or clean-up, instead of touching every row.
+
+> [!question]- Why is `workspace_id` a good shard key for InvoiceOps?
+> It has thousands of values, is in every request, never changes, and keeps a workspace's data together.
+
+🟡 Medium
+
+> [!question]- Why does range sharding by an auto-increment user ID create a hot shard?
+> Every new ID is the highest so far, so all new writes land on the last range's shard.
+
+> [!question]- Why hash into 1,024 logical shards instead of `hash % servers`?
+> Adding a server then moves only whole logical shards (about 1/5 with a fifth server) instead of rehashing most keys.
+
+> [!question]- A query fans out to 32 shards, each with a 1% chance of being slow. How often is the whole query slow?
+> About 1 in 4 times, because 0.99^32 is about 72.5%.
 
 ## Links 🟢
 

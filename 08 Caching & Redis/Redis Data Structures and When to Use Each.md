@@ -34,6 +34,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3.2 and 3.3, section 4 (memory numbers and Go code), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Redis Fundamentals]]: Redis keeps keys in memory, runs one command at a time, and each command is atomic.
+> - [[Redis Hands-on Setup with Go]]: you can start a local Redis, open `redis-cli`, and call Redis from Go with go-redis.
+
 **From zero, in 60 seconds** 🟢
 
 Redis is a very fast store that keeps data in memory, under names called **keys**.
@@ -79,6 +83,10 @@ Picking the right Redis type turns a slow job into one fast command.
 | Sorted set | Unique members each with a score, kept sorted | `ZADD lb 900 p42` |
 | O(log N) | Time grows slowly as data grows | Find rank among 2 M scores |
 | Encoding | How Redis lays the value out in memory | Small hash = compact listpack |
+| Listpack | Redis's compact layout for small collections: all items packed in one block | A 3-field hash |
+| HyperLogLog | A tiny structure that estimates "how many different items?" within about 1% | 12 KB for millions of visitors |
+| Bitmap | A string used as a long row of on/off bits, one bit per numeric ID | Bit 42 = 1: user 42 was active today |
+| Stream | An append-only log of entries that several readers can follow | `XADD events:orders * id 9` |
 
 **Picture it**
 
@@ -120,6 +128,8 @@ If everything is a plain string, each feature fights the storage: you read and r
 
 Redis offers a different structure for each shape of question, with the work done inside the server in O(1) or O(log N).
 
+**Real-life example.** A fantasy-sports app like Dream11 shows millions of players their live rank in a contest: that is a sorted set. A food app like Swiggy finding delivery partners near a restaurant is a geo search. A video app counting "unique viewers today" can use a HyperLogLog instead of storing every viewer ID. Each of these would be slow or huge as plain strings, and is one command with the right type.
+
 **Plain strings vs the right type, as a picture.**
 
 ```mermaid
@@ -144,9 +154,26 @@ Think of Redis types as **the containers in a kitchen**:
 - **Stream** = a receipt roll: append-only entries with IDs, readable by several teams who each remember where they stopped.
 - **Bitmap / HyperLogLog / Geo** = clever ways of using the jar (string) or ordered bag (sorted set) to store huge amounts in little space.
 
+## Common beginner mistakes 🟢
+
+- **Storing a whole user as one JSON string and rewriting it to change one field** → two updates at once can overwrite each other → use a hash and `HSET` the one field.
+- **Storing each field as its own key (`user:1:name`, `user:1:city`)** → every key carries extra bookkeeping, about twice the memory in the measurement below → keep one hash per object.
+- **Letting a list or set grow forever** → it becomes a "big key" that slows Redis → cap it with `LTRIM`, `ZREMRANGEBYRANK` or a TTL.
+- **Calling `HGETALL` or `SMEMBERS` on a huge key** → one command walks millions of items and blocks everyone → use `HSCAN`/`SSCAN` or split the key.
+- **Using a set just to count unique visitors** → 100,000 IDs cost about 5.6 MB per page → use a HyperLogLog (about 12 KB) if you only need the count.
+
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that each Redis type is a different container, and that you choose it by the question you will ask. **Next we open the box**: a decision chart for picking the type, what each type is made of inside and how fast its commands are, and how Redis packs small values tightly.
+
 ### 3.1 Pick by the question
+
+**Step by step:**
+1. Write the exact question your feature asks, for example "what rank is player 42?".
+2. Is it one value or a counter? Use a string. Fields of one object? Use a hash.
+3. "Newest 20 items"? Use a list. "Is X a member?" Use a set, or a HyperLogLog if you only need how many.
+4. Anything with rank, top-K or a time range? Use a sorted set, with the score as the points or the timestamp.
+5. Near a location? Use geo. Events that several readers must not lose? Use a stream.
 
 ```mermaid
 flowchart TD
@@ -167,26 +194,40 @@ flowchart TD
 
 **In plain words:** one row per Redis type: how it is built inside, its main commands and how fast they are, and a typical key name.
 
+**Step by step (reading one row, the sorted set):**
+1. Small sorted sets (up to 128 members) sit in one compact listpack.
+2. Bigger ones switch to a **skip list** (a sorted chain with "express lanes" that skip ahead, so finding a spot takes about log N steps) plus a hash table.
+3. So `ZADD lb 900 p42` and `ZRANK lb p42` take O(log N): with 2 million players, about 21 steps, not 2 million.
+4. `ZRANGE lb 0 9` costs O(log N + M): find the start, then read the M = 10 items you asked for.
+5. A typical key name is `lb:weekly`. Read the other rows the same way: inside layout, then command cost.
+
 | Type | Internals (small → large) | Key commands and cost | Typical key pattern |
 | --- | --- | --- | --- |
 | **String** | `int`, `embstr` (≤ 44 bytes), `raw` | `GET`/`SET`/`INCR`/`APPEND` O(1); `GETRANGE` O(len) | `cache:product:42`, `views:event:9` |
 | **Hash** | listpack → hashtable (above 512 fields or 64-byte values) | `HGET`/`HSET`/`HINCRBY` O(1); `HGETALL` O(N) | `user:42` |
 | **List** | listpack → quicklist (linked list of listpacks) | `LPUSH`/`RPOP` O(1); `LINDEX`/`LRANGE` O(N) toward the middle; `BLPOP` blocks | `recent:user:42` |
-| **Set** | intset (all integers) or listpack → hashtable | `SADD`/`SISMEMBER`/`SREM` O(1); `SINTER` O(N×M) worst case; `SMEMBERS` O(N) | `tags:event:9`, `followers:42` |
+| **Set** | intset (a sorted array of plain integers) or listpack → hashtable | `SADD`/`SISMEMBER`/`SREM` O(1); `SINTER` O(N×M) worst case; `SMEMBERS` O(N) | `tags:event:9`, `followers:42` |
 | **Sorted set** | listpack → skip list + hash table | `ZADD`/`ZINCRBY`/`ZRANK` O(log N); `ZRANGE` O(log N + M) | `lb:weekly`, `delayed:jobs` |
-| **Stream** | radix tree of listpacks | `XADD` O(1); `XRANGE` O(log N + M); consumer groups with `XREADGROUP`/`XACK` | `events:orders` |
+| **Stream** | radix tree (a tree that shares common prefixes of the entry IDs) of listpacks | `XADD` O(1); `XRANGE` O(log N + M); **consumer groups** (a team of readers that split the entries and confirm each one) with `XREADGROUP`/`XACK` | `events:orders` |
 | **Bitmap** | a string; bit *i* = ID *i* | `SETBIT`/`GETBIT` O(1); `BITCOUNT`/`BITOP` O(N) | `dau:2026-11-04` |
 | **HyperLogLog** | a string, sparse → dense (about 12 KB) | `PFADD` O(1); `PFCOUNT` O(1) per key; `PFMERGE` | `uv:event:9:2026-11-04` |
-| **Geo** | a sorted set whose score is a 52-bit geohash | `GEOADD` O(log N); `GEOSEARCH` O(N + log M) for N items in the area | `drivers:pune` |
+| **Geo** | a sorted set whose score is a 52-bit **geohash** (a single number for a location, where nearby places get nearby numbers) | `GEOADD` O(log N); `GEOSEARCH` O(N + log M) for N items in the area | `drivers:pune` |
 | **JSON** (Redis 8) | tree of values | `JSON.SET key $.path`, `JSON.GET`, `JSON.NUMINCRBY` | `doc:order:42` |
 
-Two more that exist but are niche: **bitfield** (`BITFIELD`, many small packed integers in one string) and **vector set** (new in Redis 8, for similarity search on embeddings).
+Two more that exist but are niche: **bitfield** (`BITFIELD`, many small packed integers in one string) and **vector set** (new in Redis 8, for similarity search on **embeddings**, lists of numbers that describe text or images so similar things are close together).
 
 Pub/Sub is not a type: it stores nothing. Lists, streams and Pub/Sub as messaging tools are compared in [[Redis as a Queue - Lists, Streams and Pub-Sub]].
 
 ### 3.3 Small values use compact encodings
 
 **In plain words:** small collections are packed tightly into one block of memory. Past a size limit Redis switches to a roomier layout that uses much more memory.
+
+**Step by step:**
+1. `HSET user:42 name Asha city Pune` creates a small hash. Redis stores it as one packed listpack.
+2. You keep adding fields. Up to 512 fields, each value up to 64 bytes, it stays packed.
+3. Field 513 arrives (or one value longer than 64 bytes). Redis converts the hash to a full hash table, which needs much more memory.
+4. You delete fields back down to 2. It stays a hash table; Redis never converts back.
+5. So keeping objects small and values short is the cheapest memory saving you can make.
 
 Redis stores small collections as one flat **listpack** (a contiguous byte array) and switches to a pointer-based structure once a threshold is crossed. Measured on Redis 8.2:
 
@@ -246,7 +287,7 @@ Measured on Redis 8.2 by `INFO memory` before and after loading 10,000 users wit
 
 `MEMORY USAGE` for a single user gave the same ranking: 112 bytes across three string keys, 80 bytes for the JSON string, 64 bytes for the listpack hash.
 
-Per-key overhead (the keyspace entry, the object header, the allocator) is what makes the first layout expensive. The hash and JSON layouts tie on memory in this test, and the hash wins on partial updates and `HINCRBY`.
+Per-key overhead (the keyspace entry, the object header, the **allocator**'s own bookkeeping for each memory block) is what makes the first layout expensive. The hash and JSON layouts tie on memory in this test, and the hash wins on partial updates and `HINCRBY`.
 
 ### Memory: exact vs approximate uniques
 
@@ -260,7 +301,7 @@ Measured on Redis 8.2 with 100,000 distinct IDs `user:1` … `user:100000`:
 | HyperLogLog (`PFADD`) | 99,471 (0.53% low) | 14,352 bytes |
 | Bitmap, one bit per numeric ID up to 100,000 | exact count with `BITCOUNT`, membership with `GETBIT` | 12,501-byte string (14,352 by `MEMORY USAGE`) |
 
-The documented HyperLogLog standard error is 0.81%, and its size stays about 12 KB whether you add a thousand or a billion items. A bitmap is exact but only fits dense integer IDs: its size depends on the highest ID, not on how many bits are set.
+The documented HyperLogLog **standard error** (the typical size of its mistake) is 0.81%, and its size stays about 12 KB whether you add a thousand or a billion items. A bitmap is exact but only fits dense integer IDs: its size depends on the highest ID, not on how many bits are set.
 
 ### Go code (Go 1.24, go-redis v9)
 
@@ -460,10 +501,12 @@ Strings vs hashes vs JSON for objects:
 - **Sorted sets cost memory.** Beyond 128 members they use a skip list plus a hash table, about 1.7× a plain set for the same members (measured on Redis 8.2: 100,000 members used 9,369,336 bytes as a sorted set vs 5,572,936 as a set). Use them when you need ranking, not just membership.
 - **HyperLogLog cannot list members or remove one.** If you need "who", use a set; if you need deletes, HLL is wrong.
 - **Bitmaps need dense integer IDs.** A single bit at offset 4,000,000,000 allocates a ~500 MB string. Hash sparse IDs into a range or use a set.
-- **Cluster and multi-key commands:** `SINTER`, `PFCOUNT a b`, `BITOP` and `ZUNIONSTORE` need all keys in the same hash slot in Redis Cluster; use hash tags like `uv:{event9}:mon`. See [[Redis Replication, Sentinel and Cluster]].
+- **Cluster and multi-key commands:** `SINTER`, `PFCOUNT a b`, `BITOP` and `ZUNIONSTORE` need all keys in the same **hash slot** (one of 16,384 buckets that decide which cluster node owns a key) in Redis Cluster; use **hash tags** (the part of the key in `{}`, which alone decides the slot) like `uv:{event9}:mon`. See [[Redis Replication, Sentinel and Cluster]].
 - **When a simpler option wins:** if the data needs ad-hoc filters ("users in Pune on the gold plan"), use the database or a search index, not a hand-built set per filter.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** which type answers which question, what each costs in memory, and where each one breaks when it grows. **Next is the advanced part**: failures seen in real systems, and how sorted sets, HyperLogLog and geo actually work inside.
 
 - **Real systems:** leaderboards on sorted sets, capped feeds on lists, HyperLogLog for unique counts in analytics dashboards, geo sets for nearby search; full designs are in [[Redis Use Cases]] and [[Case Study - Leaderboard and Top-K]].
 - **Failure modes and fixes:**
@@ -518,7 +561,7 @@ Before Redis 7.4 only whole keys could expire. Since 7.4, `HEXPIRE`, `HPEXPIRE` 
 > One key per field wastes per-key overhead (measured about 224 vs 105 bytes per user). A JSON string is compact but every field change rewrites the whole value and races unless you use `WATCH` or Lua. A hash is compact while it stays a listpack, updates fields atomically and supports `HINCRBY` and per-field TTL since 7.4.
 
 > [!question]- When do you use a list and when a stream?
-> A list is a simple deque: `LPUSH` + `LTRIM` for capped feeds, `BLMOVE` for a basic work queue. A stream is an append-only log with IDs, range reads, consumer groups, acknowledgements and pending-entry recovery; use it when consumers must not lose messages or must replay.
+> A list is a simple deque (a line you can add to or take from at both ends): `LPUSH` + `LTRIM` for capped feeds, `BLMOVE` for a basic work queue. A stream is an append-only log with IDs, range reads, consumer groups, acknowledgements and pending-entry recovery; use it when consumers must not lose messages or must replay.
 
 > [!question]- What is a listpack and why should you care?
 > A compact contiguous encoding Redis uses for small hashes, lists, sets and sorted sets. It avoids per-element pointers, so small collections use far less memory. Crossing the threshold (for hashes, 512 fields or a value over 64 bytes) converts it to a hash table permanently, and memory per key jumps.
@@ -536,6 +579,30 @@ Before Redis 7.4 only whole keys could expire. Since 7.4, `HEXPIRE`, `HPEXPIRE` 
 - Geo is a sorted set of geohash scores; JSON and vector sets arrived with Redis 8.
 - Small collections use listpack/intset; crossing the threshold is one-way.
 - Keep keys small and bounded; walk big ones with `*SCAN`.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Which type would you use for a game leaderboard?
+> A sorted set: members with scores, kept in order, with rank in O(log N).
+
+> [!question]- Which type fits a user profile where you often change one field?
+> A hash, so `HSET` changes one field without rewriting the rest.
+
+> [!question]- How do you keep only the last 20 items in a list?
+> `LPUSH` the new item, then `LTRIM key 0 19`.
+
+🟡 Medium
+
+> [!question]- You need unique visitors per page but never the list of visitors. Set or HyperLogLog?
+> HyperLogLog: about 12 KB per page with roughly 0.81% error, versus megabytes for a set.
+
+> [!question]- What happens to a hash when it gets its 513th field?
+> It converts from a compact listpack to a full hash table, uses much more memory, and never converts back.
+
+> [!question]- Why is a bitmap a bad fit for user IDs like 4,000,000,000?
+> Its size depends on the highest ID, so one bit that far out makes a string of about 500 MB.
 
 ## Links 🟢
 

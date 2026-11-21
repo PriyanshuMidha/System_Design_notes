@@ -24,6 +24,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 2 to 8 and the Tests.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Time-Series and Columnar Storage]]: the theory half. Column stores keep each field together and compress it with tricks like delta-of-delta, Gorilla XOR and run-length encoding.
+> - [[Storage Engines - B-tree vs LSM and WAL]]: data is written in blocks and old blocks are merged or dropped.
+> - [[Partitioning and Sharding]]: a table can be split by month so old months are dropped whole (Step 7).
+> - [[Index Types and Index Design]]: BRIN is a tiny index that stores only min and max per block of pages (Step 7).
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on twin of [[Time-Series and Columnar Storage]]. Time-series data is just readings with a time stamp, like "CPU was 41% at 10:00:05". There is a lot of it, and it is very repetitive. A **column store** keeps each field in its own list (all times together, all values together), so a sum reads only the list it needs. Because each list is so regular, it shrinks a lot with simple tricks: store only the change between times, store only the bits that changed between values, and store "paid x 500" instead of "paid" 500 times. The Go code builds those three tricks; the SQL at the end shows the same ideas in ClickHouse, Postgres and TimescaleDB. Read it top to bottom: each step is a short Concept, the code, then a walkthrough.
@@ -44,7 +50,7 @@ flowchart LR
 ## Before the code 🟢
 
 - **Slices of numbers** (`[]int64`, `[]float64`): one slice per column is the whole idea of a column store in memory.
-- **Varints** (`binary.AppendVarint`, `binary.Uvarint`): store small numbers in fewer bytes; zigzag makes small negative numbers small too.
+- **Varints** (`binary.AppendVarint`, `binary.Uvarint`, variable-length integers): store small numbers in fewer bytes; zigzag makes small negative numbers small too.
 - **Bit tricks** (`math.Float64bits`, XOR, shifts): view a float as its 64 raw bits so Gorilla encoding can store only the bits that changed.
 - **A small bit writer/reader type**: methods on a struct that append or read single bits, because the encodings are not byte-aligned.
 - **Sentinel errors** (`errors.New`): one `errCorrupt` value returned when encoded input is malformed.
@@ -103,6 +109,8 @@ go vet ./... && go test -race -v ./...
 ```
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** the three tricks the code implements. **Next we open the box**: row versus column layout in Go, then the timestamp encoder, a bit writer, the Gorilla float encoder, run-length encoding, and finally the same ideas in ClickHouse, PostgreSQL and TimescaleDB SQL.
 
 The code implements delta-of-delta timestamps (with zigzag varints, a simpler cousin of Gorilla's bit-bucket scheme), Gorilla XOR floats, and run-length encoding. The size checks in the Tests section measure how well each one compresses.
 
@@ -879,6 +887,8 @@ In a real columnar file each column chunk is encoded separately, and a general-p
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** how each encoder and decoder works. **Next is the senior view**: why each format choice was made, the tests that pin exact sizes, and the traps (zigzag jitter cost, bit-width caps, `-0.0` and `NaN`, RLE on unsorted data).
+
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
 | Zigzag varints for delta-of-delta | Gorilla bit buckets | Byte aligned and simple, about 1 byte per sample instead of about 1 bit |
@@ -900,6 +910,8 @@ In a real columnar file each column chunk is encoded separately, and a general-p
 The tests check round trips and sizes: timestamps compress more than 6x, a constant float series costs exactly one bit per value (137 bytes for 1,001 values), special float values survive, and sorting a column before RLE reduces the number of runs. A round trip proves correctness; a size check proves the compression claim of the theory note.
 
 First the imports and a fixture of regular timestamps.
+
+**What this code does, in plain words:** it makes 1,000 fake scrape times 15 seconds apart, adding a 1-second delay after every 100th one, so the tests have realistic, slightly uneven timestamps to compress.
 
 ```go
 package colenc
@@ -988,6 +1000,8 @@ func TestFloatsRoundTrip(t *testing.T) {
 ```
 
 The check loop, which also logs the compression ratio of each case:
+
+**What this code does, in plain words:** for each test series it encodes, decodes, and checks every value comes back with exactly the same bits, then logs how much smaller the encoded form was.
 
 ```go
 	// TestFloatsRoundTrip, continued: compare every value bit for bit.
@@ -1172,6 +1186,30 @@ The last row is the lesson: Gorilla works because real gauges change slowly. Ran
 Hints. For exercise 1, ten times as many jitters means ten times as many non-zero delta-of-delta entries, each taking 2 bytes instead of 1, so the size grows by roughly 180 B, not 2x. For exercise 2, a counter that steps by exactly `1.0` changes only the same few mantissa bits each time, so the `10` window is reused and the cost per value falls.
 
 For exercise 3, alternating values never repeat next to each other, so there are 1,000 runs and no saving at all; after sorting there are 2.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why does delta-of-delta shrink regular timestamps so much?
+> With a steady 15 s gap, every difference is the same, so the difference of differences is 0 and takes about 1 byte.
+
+> [!question]- How many bits does a repeated float cost in Gorilla?
+> One: the `0` control bit meaning "same as before".
+
+> [!question]- When does run-length encoding help?
+> When equal values sit next to each other, for example after sorting.
+
+🟡 Medium
+
+> [!question]- Why do random floats in [20, 21) barely compress with Gorilla?
+> Noise changes the low mantissa bits every time, so there are few shared bits to drop.
+
+> [!question]- Why does the decoder map a stored significant-bit count of 0 back to 64?
+> The field has only 6 bits, so 64 is stored as 0; forgetting this breaks values that change every bit.
+
+> [!question]- Why is RLE on an unsorted status column a bad idea?
+> Equal values rarely sit together, so there are almost as many runs as values and it can be larger than the raw data.
 
 ## Links 🟢
 

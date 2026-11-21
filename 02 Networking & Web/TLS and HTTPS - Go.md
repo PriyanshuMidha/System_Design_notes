@@ -26,12 +26,17 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code and Tests sections properly, plus Design decisions.
 > - 🔴 **Interview / SDE-3 prep?** Add Pitfalls in the code and do the Exercises. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[TCP - Handshake, Reliability, Flow and Congestion Control]]: the TCP connection opens first; the TLS handshake runs on top of it.
+> - [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]: the TLS hello also picks the HTTP version, and every extra round trip costs time.
+> - [[TLS and HTTPS]] (theory twin): TLS 1.3 vs 1.2, certificates signed by a CA, and mTLS.
+
 **From zero** 🟢: this file is the hands-on twin of the TLS theory note. It runs three real TLS handshakes on your own machine with Go's standard library: one that succeeds with modern TLS 1.3, one that correctly *fails* when the client is too old, and one where the server also demands an ID card from the client (mutual TLS). It even builds its own throwaway certificate authority in memory, so nothing is faked and no files are needed. Read the theory note first; here, read each code block's bold intro line, then the code.
 
 ## Before the code 🟢
 
 - **`crypto/tls`**: Go's built-in TLS; a `tls.Config` sets versions (`MinVersion`, `MaxVersion`), certificates and client-cert rules.
-- **`crypto/x509` + `crypto/ecdsa`**: build and sign certificates in memory, so the tests need no certificate files.
+- **`crypto/x509` + `crypto/ecdsa`**: build and sign certificates in memory (x509 is the standard certificate format; ECDSA is a signing method based on elliptic curves), so the tests need no certificate files.
 - **`net/http/httptest`**: starts a real HTTPS server on a random local port for one test, then `Close()` shuts it down.
 - **`*testing.T` and `t.Helper()`**: test functions; `t.Helper()` makes failures point at the caller's line.
 - **Handler goroutines**: the server runs each request on its own goroutine, which is why the tests run with `-race`.
@@ -92,6 +97,8 @@ go test -race ./...
 ```
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** the three claims: TLS 1.3 really gets used, a too-old client is refused, and mTLS checks the client's certificate. **Next we read the code** that proves each, plus the small in-memory CA that makes real certificates for the tests.
 
 ### Pinning a server to TLS 1.3 for testing
 
@@ -188,7 +195,7 @@ func TestTLS12ClientRejectedByTLS13Server(t *testing.T) {
 }
 ```
 
-**Concept.** This is the direct, working proof behind the theory note's interview question about protocol-version mismatches: a client whose `MaxVersion` excludes a server's `MinVersion` must fail the handshake, not silently downgrade.
+**Concept.** This is the direct, working proof behind the theory note's interview question about protocol-version mismatches (it "fails closed": on doubt it refuses, instead of carrying on unsafely): a client whose `MaxVersion` excludes a server's `MinVersion` must fail the handshake, not silently downgrade.
 
 Cloning the transport (`.Clone()`) rather than mutating the client's shared default transport was chosen so this test can't leak a changed `MaxVersion` into any other test that happens to reuse the same `http.DefaultTransport`.
 
@@ -259,7 +266,7 @@ func newTestCA(t *testing.T) *testCA {
 ```
 
 **How it works.**
-1. `x509.CreateCertificate(rand.Reader, tmpl, tmpl, ...)` passing `tmpl` as both the certificate-to-create and its own signer is what makes this a **self-signed** root — exactly how a real root CA's own certificate is built, the one the theory note says every browser or OS ships pre-trusted.
+1. `x509.CreateCertificate(rand.Reader, tmpl, tmpl, ...)` passing `tmpl` as both the certificate-to-create and its own signer is what makes this a **self-signed** root (a certificate signed by its own key, with no one above it) — exactly how a real root CA's own certificate is built, the one the theory note says every browser or OS ships pre-trusted.
 2. `IsCA: true` plus `KeyUsageCertSign` are the two fields that tell any verifier walking the chain "this certificate is allowed to sign other certificates," not just to present itself as a leaf.
 3. A 1-hour validity window is deliberately short — this is a throwaway authority that exists only for the duration of one test run, unlike a real root CA's typically multi-decade validity.
 
@@ -302,7 +309,7 @@ The alternative of two separate functions was rejected as unnecessary duplicatio
 
 **How it works.**
 1. `x509.CreateCertificate(rand.Reader, tmpl, ca.cert, &key.PublicKey, ca.key)` signs with `ca.key` (the CA's private key) while the certificate's own public key is the leaf's — this asymmetry (signed by one key, identifying another) is the entire mechanism of a certificate chain.
-2. `ExtKeyUsageServerAuth` vs `ExtKeyUsageClientAuth` tells any verifier what this certificate is allowed to be presented *as* — a server cert cannot stand in for a client cert even if both chain to the same trusted root.
+2. `ExtKeyUsageServerAuth` vs `ExtKeyUsageClientAuth` (the "extended key usage" field: what jobs the certificate may do) tells any verifier what this certificate is allowed to be presented *as* — a server cert cannot stand in for a client cert even if both chain to the same trusted root.
 3. `tmpl.DNSNames = []string{"localhost"}` plus the loopback `IPAddresses` entry are the SANs the theory note says are the only thing modern clients actually check, not the legacy `CommonName` field (though `CommonName` is still set here for human readability in log lines).
 
 ### Requiring and verifying a client certificate (mTLS)
@@ -454,7 +461,7 @@ ok  	tlsdemo	1.923s
 
 Reading it: `go vet` printed nothing (no suspicious constructs found).
 
-`version=304` is TLS 1.3's wire-format version number in hex, and `cipher=1301` is `TLS_AES_128_GCM_SHA256`'s suite ID — both confirm the negotiation claimed in the test assertions actually happened at the protocol level, not just that Go's high-level API returned success.
+`version=304` is TLS 1.3's wire-format version number in hex (base 16), and `cipher=1301` is `TLS_AES_128_GCM_SHA256`'s suite ID — both confirm the negotiation claimed in the test assertions actually happened at the protocol level, not just that Go's high-level API returned success.
 
 All three tests ran under `-race`; a pass here specifically rules out any data race in the `httptest` server's concurrent handling of the handshake and the handler goroutine.
 
@@ -463,6 +470,8 @@ The second log line, `handshake failed as expected: remote error: tls: protocol 
 Seeing the real alert text, rather than a generic "connection refused," is the detail that makes a production TLS error log readable the first time it shows up for real: the alert name usually names the mismatched parameter directly.
 
 ## Pitfalls in the code 🔴
+
+> 🟡 → 🔴 **You now know** how each handshake test is built and how to read its output. **Next, the advanced part**: the shortcuts that silently disable the checks you meant to test, and exercises with a wrong CA, an expired certificate and version bounds.
 
 - **Using `InsecureSkipVerify` to make a TLS test "just work"** is the single most common shortcut that quietly defeats the entire point of a certificate-chain test — a server with an expired, wrong-hostname, or entirely self-signed-without-a-trusted-root certificate would still pass.
 - **Forgetting `BasicConstraintsValid: true` and `IsCA: true` on the CA template** would produce a certificate that some strict verifiers reject as a CA even though `KeyUsageCertSign` is set — both fields together are what x509 actually checks.
@@ -480,6 +489,26 @@ Each exercise below is a "change this, predict the result" task rather than a "w
 3. Change `newTLS13Server` to also set `MaxVersion: tls.VersionTLS13` explicitly (instead of relying on it being the implicit ceiling), and add a test asserting the server's advertised supported-version range is exactly one version wide. Predict what `tls.Config` field would tell you this without parsing packets.
 
 Working through all three exercises in order touches every certificate field this note relies on — issuer, validity window, and protocol-version bounds — so by the third one, the full shape of what Go's handshake actually checks (and in what order) should be easy to state from memory rather than by re-reading the code.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 Which `tls.Config` field makes the server refuse anything older than TLS 1.3?
+> `MinVersion: tls.VersionTLS13`.
+
+> [!question]- 🟢 Why do the tests build their own CA instead of using `InsecureSkipVerify`?
+> So the real certificate-chain check runs; skipping verification would let broken certificates pass.
+
+> [!question]- 🟢 What does the server need to require a client certificate?
+> `ClientAuth: tls.RequireAndVerifyClientCert` plus `ClientCAs` holding the trusted CA.
+
+> [!question]- 🟡 Why is the client transport cloned in the version-mismatch test?
+> So the lowered `MaxVersion` can't leak into other tests sharing the default transport.
+
+> [!question]- 🟡 How does the server know the client's name in the mTLS test?
+> It reads `r.TLS.PeerCertificates[0].Subject.CommonName` from the verified client certificate.
+
+> [!question]- 🟡 In the output, what do `version=304` and `cipher=1301` mean?
+> TLS 1.3, and the cipher suite `TLS_AES_128_GCM_SHA256`.
 
 ## Links
 

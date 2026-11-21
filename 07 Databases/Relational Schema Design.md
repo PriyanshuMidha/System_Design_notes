@@ -37,6 +37,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (the eight design steps), 4 (the full worked schema) and 5 (multi-tenancy options).
 > - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[SQL Essentials]]: you can create a table with `CREATE TABLE`, add rows with `INSERT`, and read them with `SELECT ... JOIN`.
+
 **From zero, in 60 seconds** 🟢
 
 A database stores facts in **tables**: grids of rows and columns, like a spreadsheet per kind of thing (one for customers, one for orders).
@@ -82,6 +85,11 @@ Schema design is deciding where each fact lives so this cannot happen.
 | Constraint | A rule the database enforces on every write | `CHECK (amount_minor >= 0)` |
 | Normalize | Store each fact in exactly one place | Client email lives only in `clients` |
 | Denormalize | Copy a fact on purpose, usually for read speed | Store a total on the invoice row |
+| Surrogate key | A made-up ID with no real-world meaning that never changes | `id = 1042` |
+| Natural key | A real-world identifier that may change | an email, an invoice number |
+| Tenant | One customer company in an app that many companies share | workspace 42 |
+| Minor units | Money stored as a whole number of the smallest coin | ₹25.00 stored as `2500` paise |
+| Transaction | A group of writes that all happen or none happen | payment + invoice update together |
 
 **Picture it**
 
@@ -129,6 +137,22 @@ Within a month it had three real bugs:
 
 A designed schema removes all three: the email lives in one row of `clients`, line items are rows you can filter and sum, and money is an integer that cannot drift.
 
+### Real-life example 🟢
+
+Think of a movie ticket app like BookMyShow.
+There is one row per cinema, one per show, one per seat and one per booking.
+A booking does not copy the cinema's address; it stores `show_id`, and the show stores `cinema_id`.
+If the cinema changes its address, one row changes and every booking page shows the new one.
+But the ticket price is copied onto the booking on purpose, because a later price change must not change what you already paid.
+
+## Common beginner mistakes 🟢
+
+- **Storing money as a float** (`double precision`) → binary fractions drift, so ten ₹0.10 payments do not add up to ₹1.00 → store whole paise in a `bigint` with a `currency` column.
+- **Putting a list in one cell** (`items = 'Logo; Brand guide'`) → you cannot filter, sum or constrain it → one row per item in its own table.
+- **Using an email or invoice number as the primary key** → it changes, and every table that points to it must change too → use a surrogate `id` and make the real value `UNIQUE`.
+- **Leaving rules only in app code** → a script or a second service skips them → add `NOT NULL`, `CHECK`, `UNIQUE` and foreign keys.
+- **Forgetting the index on a foreign key column** → PostgreSQL does not create it, so deleting a parent scans the whole child table → add an index on every `*_id` column that references another table.
+
 ## 2. Mental model 🟢
 
 - **One fact, one place.** Each fact ("Acme's billing email is X") is stored once and referenced by key everywhere else. That is what normalization formalizes.
@@ -139,13 +163,15 @@ A designed schema removes all three: the email lives in one row of `clients`, li
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the core rule (one fact, one place) and why the database should enforce your rules. **Next we open the box**: the eight design steps, from asking the right questions through tables, normal forms, keys, constraints, types, naming and soft deletes. Most steps start with a short step-by-step walk.
+
 ### Step 1: ask the questions before drawing tables
 
 1. What are the main objects?
 2. Which queries are most common?
-3. Which writes must happen together, in one transaction?
-4. Which data must be strongly consistent?
-5. What can be eventually consistent?
+3. Which writes must happen together, in one transaction (all or nothing)?
+4. Which data must be strongly consistent (every reader sees the latest value at once)?
+5. What can be eventually consistent (allowed to be a little behind for a while)?
 6. What grows fastest?
 7. What needs indexes?
 8. What must be kept for audit or compliance?
@@ -156,6 +182,12 @@ For InvoiceOps: the objects form the chain `users → workspace_members → work
 ### Step 2: entities and relationships
 
 **In plain words: list the real things your product talks about (users, workspaces, clients, invoices) and draw arrows for how they relate — each thing becomes a table, each arrow a key.**
+
+**Step by step:**
+1. Write the nouns of the product: user, workspace, client, invoice, line item, payment.
+2. Each noun becomes a table: `users`, `workspaces`, `clients`, `invoices`...
+3. For "one client has many invoices", put `client_id` on `invoices` (the "many" side).
+4. For "users belong to many workspaces and workspaces have many users", add a join table `workspace_members (workspace_id, user_id)`.
 
 ```mermaid
 erDiagram
@@ -200,6 +232,12 @@ erDiagram
 
 **In plain words: normalizing is tidying up so each fact lives in exactly one cell — the 'normal forms' (1NF, 2NF, 3NF) are just three passes of that tidy-up, each catching a different kind of duplicate.**
 
+**Step by step (the spreadsheet row from section 1):**
+1. **1NF:** the `items` cell holds two items. Split it so each item is its own row.
+2. **2NF:** now `issue_date` repeats on every item row, but it belongs to the invoice, not the item. Move it to `invoices`.
+3. **3NF:** `client_name` follows from `client_email`, not from the invoice. Move both to `clients` and keep only `client_id` on the invoice.
+4. Result: changing Acme's email is now one row in `clients`.
+
 Normal forms remove the anomalies from section 1, one kind of dependency at a time.
 
 ```mermaid
@@ -213,9 +251,9 @@ flowchart TD
 ```
 
 - **1NF:** every cell holds one atomic value, with no repeating groups. A comma-separated list in a column (Karwin calls it *Jaywalking*) breaks it.
-- **2NF:** no column depends on only *part* of a composite key. `issue_date` depends on `invoice_no`, not on `(invoice_no, line_no)`.
+- **2NF:** no column depends on only *part* of a composite key (a key made of two or more columns together). `issue_date` depends on `invoice_no`, not on `(invoice_no, line_no)`.
 - **3NF:** no column depends on another non-key column. `client_name` follows from `client_email`, so it moves to `clients`.
-- **BCNF:** every determinant (a column set that fixes another column) is a candidate key. 3NF tables usually satisfy it too; the deep dive shows the rare case that does not.
+- **BCNF:** every determinant (a column set that fixes another column) is a candidate key (a column set that could serve as the primary key). 3NF tables usually satisfy it too; the deep dive shows the rare case that does not.
 
 Not every repeated value is a violation. `invoice_items.unit_price_minor` looks like it duplicates a catalogue price, but it records *the price charged on this invoice*. If the catalogue price changes tomorrow, issued invoices must not. The same holds for `invoices.billing_address`, a snapshot taken when the invoice is sent.
 
@@ -223,13 +261,19 @@ Not every repeated value is a violation. `invoice_items.unit_price_minor` looks 
 
 **In plain words: every row needs a name tag that never changes — real-world names (emails, invoice numbers) change, so give rows a made-up id and keep the real name as a uniqueness rule.**
 
+**Step by step:**
+1. A client row gets `id = 10`, created by the database. It never changes.
+2. Invoices point to the client with `client_id = 10`.
+3. The client's email `billing@acme.test` is stored once, with a `UNIQUE` rule so no two live clients share it.
+4. When Acme changes its email, only the `clients` row changes; every invoice still points to 10.
+
 - **Natural key:** a real-world identifier, such as an email or an invoice number. Natural keys change (emails do; draft numbers get corrected), and composite ones bloat every referencing table. Keep them as `UNIQUE` constraints.
 - **Surrogate key:** a meaningless generated id that never changes. Reference rows by it.
 
 | Surrogate           | Size     | Ordered?                    | Generated where     | Watch out for                                                           |
 | ------------------- | -------- | --------------------------- | ------------------- | ----------------------------------------------------------------------- |
 | `bigint` identity   | 8 bytes  | yes, increasing             | the database        | exposes row counts and is guessable; never skip the authorization check |
-| UUIDv4              | 16 bytes | no, random                  | anywhere            | random inserts spread over the whole index: more page splits, larger working set |
+| UUIDv4              | 16 bytes | no, random                  | anywhere            | random inserts spread over the whole index: more page splits (full index pages broken in two), larger working set (more pages that must stay in memory) |
 | UUIDv7 (RFC 9562)   | 16 bytes | by creation millisecond     | anywhere            | reveals creation time; PostgreSQL 17 has no generator, so create it in Go |
 | ULID                | 16 bytes | by creation millisecond     | anywhere            | a text format; store it as `uuid`                                       |
 
@@ -245,7 +289,7 @@ flowchart TD
     V -->|"no, small table"| V4["UUIDv4 is acceptable:<br/>random inserts are cheap on small indexes"]
 ```
 
-**Invoice numbers are not ids.** Accountants expect them gapless and sequential per workspace, and sequences cannot promise that: a `nextval` is never returned after a rollback. Allocate them from a counter row in the same transaction that sends the invoice; the row lock serializes numbering per workspace, which is fine at invoice rates.
+**Invoice numbers are not ids.** Accountants expect them gapless and sequential per workspace, and sequences (PostgreSQL's built-in number generators) cannot promise that: a `nextval` is never returned after a rollback. Allocate them from a counter row in the same transaction that sends the invoice; the row lock serializes numbering per workspace, which is fine at invoice rates.
 
 ```sql
 CREATE TABLE invoice_counters (
@@ -275,6 +319,12 @@ sequenceDiagram
 ### Step 5: constraints are invariants
 
 **In plain words: write your business rules into the schema itself, so the database acts like a strict gatekeeper that rejects impossible data no matter which code wrote it.**
+
+**Step by step:**
+1. Write the business rule in words: "an invoice total is never negative".
+2. Turn it into a constraint: `CHECK (total_minor >= 0)`.
+3. Any `INSERT` or `UPDATE` with `total_minor = -500` is now refused by the database with an error.
+4. Do the same for uniqueness (`UNIQUE`), required values (`NOT NULL`) and links (`FOREIGN KEY`).
 
 | Rule                                         | Constraint                                                          |
 | -------------------------------------------- | ------------------------------------------------------------------- |
@@ -317,6 +367,12 @@ flowchart LR
 
 **In plain words: pick column types that physically cannot lose information — whole-number paise for money (floats drift), and timestamps that keep the time zone.**
 
+**Step by step:**
+1. Money: ₹2,500.50 is stored as `250050` in a `bigint`, with `currency = 'INR'` beside it.
+2. A moment in time ("paid at 10:05 IST") is a `timestamptz`, stored in UTC (the world's reference clock) and shown in your zone.
+3. A calendar date with no time ("due 30 Nov") is a `date`.
+4. Free text is `text`; a fixed set like status is `text` with a `CHECK`.
+
 | Data                | Use                                                         | Avoid                                                                                 |
 | ------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | money               | `bigint` minor units + `currency char(3)`; or `numeric(14,2)` | `real` / `double precision` (binary fractions drift); PostgreSQL's `money` type (format depends on `lc_monetary`, one currency) |
@@ -336,6 +392,12 @@ Minor units differ by currency (ISO 4217): 2 decimals for INR and USD, 0 for JPY
 
 ### Step 8: soft deletes and audit columns
 
+**Step by step:**
+1. A user deletes client Bob. Instead of removing the row, set `deleted_at = now()`.
+2. Every normal query adds `WHERE deleted_at IS NULL`, so Bob disappears from screens.
+3. Later Bob is re-added with the same email. A partial unique index (it only covers rows matching its `WHERE`) ignores the deleted row, so the insert works.
+4. Every change also writes a row to `audit_logs` in the same transaction, so history is kept.
+
 - **Soft delete:** `deleted_at timestamptz` instead of `DELETE`. Uniqueness must then ignore deleted rows, which a **partial unique index** does: `UNIQUE (workspace_id, lower(email)) WHERE deleted_at IS NULL`. The costs: every query must filter `deleted_at IS NULL`, foreign keys still point at "deleted" rows, the table keeps growing, and a legal erasure request still needs a real delete or anonymization. Moving the row to an archive table in the same transaction is often simpler.
 ```mermaid
 flowchart TD
@@ -344,8 +406,8 @@ flowchart TD
     Q -->|"yes"| DUP["error 23505 unique_violation"]
 ```
 
-- **Audit columns:** `created_at` and `updated_at` on every mutable table, with `updated_at` set by a trigger so no code path forgets. `now()` returns the *transaction's* start time, so all rows changed in one transaction share it.
-- **Audit log:** an append-only `audit_logs` table written in the same transaction as the change. Its `(entity_type, entity_id)` pair is a polymorphic reference with no foreign key, on purpose: the log must outlive what it describes. Grant the application only `SELECT, INSERT` on it.
+- **Audit columns:** `created_at` and `updated_at` on every mutable table, with `updated_at` set by a trigger (code the database runs by itself on every update) so no code path forgets. `now()` returns the *transaction's* start time, so all rows changed in one transaction share it.
+- **Audit log:** an append-only `audit_logs` table written in the same transaction as the change. Its `(entity_type, entity_id)` pair is a polymorphic reference (it can point at a row in any table) with no foreign key, on purpose: the log must outlive what it describes. Grant the application only `SELECT, INSERT` on it.
 
 ## 4. Worked example 🟡
 
@@ -405,7 +467,7 @@ GROUP BY i.id
 HAVING i.paid_minor <> coalesce(sum(p.amount_minor), 0);
 ```
 
-**Triggers for `updated_at`**, and tenant isolation with row-level security (RLS). The SQL is in [[Relational Schema Design - Go]]; the two statements that matter are short:
+**Triggers for `updated_at`**, and tenant isolation with row-level security (RLS: a rule inside PostgreSQL that hides rows of other tenants from every query). The SQL is in [[Relational Schema Design - Go]]; the two statements that matter are short:
 
 ```sql
 CREATE TRIGGER invoices_set_updated_at
@@ -484,6 +546,8 @@ Most products start shared and move their largest tenants out later. Including `
 
 ## 6. Trade-offs and when not to use 🔴
 
+> 🟡 → 🔴 **You now know** how to design, key, constrain and type a full schema. **Next is the senior view**: what normalization and constraints cost, how real systems fail (missing FK indexes, tenant leaks, float money), and the corner cases of BCNF, NULLs in composite keys and deferred unique checks.
+
 - **Normalization costs joins.** Fully normalized reads touch more tables. Denormalize only with (1) one owner of the truth, (2) a write path that updates the copy in the same transaction or a rebuild job, and (3) a reconciliation query like the one above. Read models and summary tables are in [[Materialized Views and Denormalization]].
 - **Constraints cost write time,** a little: a foreign key check is one index lookup on the parent. That is cheap insurance; skip constraints only on bulk-loaded analytics tables you can rebuild.
 - **`jsonb` is fine for** data you store and return as a whole or filter by containment: custom fields, provider payloads. It is wrong for data you join, constrain or report on; promote those keys to columns.
@@ -552,6 +616,9 @@ Most products start shared and move their largest tenants out later. Including `
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** Store each fact once and point to it by ID. Give every row a made-up ID, and keep real-world identifiers as `UNIQUE` rules. Write your business rules as constraints so the database refuses bad data. Store money as whole paise in a `bigint`, and times as `timestamptz`. Copy a fact only on purpose, with a plan to keep the copy correct.
+
+
 - Start from the 9 questions: objects, hot queries, transactional writes, consistency, growth, indexes, audit, migrations.
 - Normalize to 3NF; keep snapshots (address, price at issue time) as their own facts.
 - Surrogate keys for references, natural keys as `UNIQUE`; `bigint` identity or UUIDv7, not UUIDv4, for hot tables.
@@ -560,6 +627,30 @@ Most products start shared and move their largest tenants out later. Including `
 - `workspace_id` on every tenant table and in every key; RLS with a transaction-local setting as a backstop.
 - Soft delete needs a partial unique index; audit logs are append-only and written in the same transaction.
 - Every denormalized copy needs an owner, a same-transaction write path and a reconciliation query.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is a foreign key?
+> A column that must match the primary key of a row in another table, such as `invoices.client_id → clients.id`.
+
+> [!question]- Why is money stored as `bigint` paise instead of a float?
+> Floats cannot hold most decimal fractions exactly, so sums drift; whole paise never do.
+
+> [!question]- Why is a client email a bad primary key?
+> Emails change, and every table pointing to it would need updating; use a surrogate ID and make the email `UNIQUE`.
+
+🟡 Medium
+
+> [!question]- Why does InvoiceOps use a composite foreign key `(workspace_id, client_id)`?
+> So an invoice can only point to a client in the same workspace; the database refuses cross-tenant links.
+
+> [!question]- A sent invoice stores the unit price, even though the catalogue has it too. Is that a normalization bug?
+> No. It records the price charged on that invoice, a separate fact that must not change when the catalogue does.
+
+> [!question]- Why are invoice numbers taken from a counter row and not a sequence?
+> A sequence skips numbers after a rollback; a counter row updated in the same transaction gives gapless numbers.
 
 ## Links 🟢
 

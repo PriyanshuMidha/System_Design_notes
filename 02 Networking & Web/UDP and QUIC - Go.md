@@ -24,6 +24,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code and Tests sections top to bottom; each block has a plain-words opener first.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[TCP - Handshake, Reliability, Flow and Congestion Control]]: TCP connects with a handshake, says "refused" when nothing listens, and delivers one ordered stream; this code shows what changes without those.
+> - [[UDP and QUIC]] (theory twin): UDP is send-and-hope; QUIC adds reliable, encrypted, independent streams on top.
+
 **From zero** 🟢 — This file is the hands-on twin of [[UDP and QUIC]]. It shows, in runnable Go, the two ideas from the theory note: first a plain UDP client that sends a packet and only learns about failure by waiting and giving up (no error ever comes back), then a QUIC server where two downloads share one connection but a big slow one never delays a tiny fast one. Read each "In plain words" line before its code block, and you can follow along without knowing Go deeply.
 
 ## Before the code 🟢
@@ -61,6 +65,8 @@ go test -race ./...
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** the two claims: UDP only tells you about a lost reply by timing out, and QUIC streams don't wait on each other. **Next we read the code**: the UDP echo and client, a homemade certificate (QUIC always encrypts), the per-stream QUIC server, and the glue that connects them.
+
 ### UDP: echo and a timing-out client
 
 **In plain words:** two tiny functions — a server that bounces back whatever one packet it gets, and a client that sends one packet and waits. If no reply comes, the client's only clue is its own stopwatch running out.
@@ -93,7 +99,7 @@ func EchoUDP(conn *net.UDPConn) error {
 The alternative design — a connected `UDPConn` per client, the way TCP servers work — doesn't exist for UDP at the protocol level; `ReadFromUDP` returning the sender's address on every call *is* the mechanism UDP servers use instead.
 
 **How it works.**
-1. `buf` is sized to 1500 bytes, a conservative bound that fits inside a standard Ethernet frame's MTU without IP fragmentation — a UDP datagram bigger than the path MTU risks being silently fragmented or dropped.
+1. `buf` is sized to 1500 bytes, a conservative bound that fits inside a standard Ethernet frame's MTU (the largest packet one link carries) without IP fragmentation (splitting a packet into pieces) — a UDP datagram bigger than the path MTU risks being silently fragmented or dropped.
 2. `ReadFromUDP` blocks until a datagram arrives, and hands back both the payload and the sender's address in one call — there is no prior "connection" that already knows who's talking.
 3. `WriteToUDP` replies directly to that address. If this call fails, the caller only learns about it as a local error; the original sender gets no signal at all if the reply is lost in the network.
 
@@ -193,7 +199,7 @@ func selfSignedTLSConfig() (*tls.Config, error) {
 
 **Concept.** This builds the certificate [[UDP and QUIC#QUICs handshake TLS 13 isnt bolted on its structural]] refers to: QUIC's spec has no cleartext mode, so even a loopback demo needs a real (if self-signed) TLS 1.3 certificate to exist before a connection can be dialed.
 
-The alternative — writing cert/key files to disk — was rejected for a test module, since generating them in memory keeps the test hermetic and avoids leaving artifacts around.
+The alternative — writing cert/key files to disk — was rejected for a test module, since generating them in memory keeps the test hermetic (fully self-contained) and avoids leaving artifacts around.
 
 **How it works.**
 1. A fresh 2048-bit RSA key and a minimal self-signed certificate template are generated purely in memory; no certificate authority is involved, which is why the client side below must explicitly opt out of chain verification.
@@ -256,7 +262,7 @@ func OpenStreamAndEcho(ctx context.Context, conn quic.Connection, msg []byte) ([
 
 **How it works.**
 
-`stream.Close()` half-closes only the write direction — "I'm done sending" — which is what lets `io.Copy` on the server see EOF and finish, without needing to close the whole connection.
+`stream.Close()` half-closes only the write direction — "I'm done sending" — which is what lets `io.Copy` on the server see EOF (end of file: no more data coming) and finish, without needing to close the whole connection.
 
 `io.ReadFull` then blocks until exactly `len(msg)` bytes have come back, which is safe here because the server always echoes exactly what it received.
 
@@ -439,6 +445,8 @@ func Dial(ctx context.Context, addr string) (quic.Connection, error) {
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** how both halves work and what the tests prove. **Next, the advanced part**: why each design choice was made, the timeout, buffer and close mistakes to avoid, and exercises that add delays and idle timeouts.
+
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
 | One goroutine per accepted stream | A single loop reading streams round-robin | Round-robin would reintroduce head-of-line blocking in application code, defeating the point of the demo |
@@ -457,6 +465,8 @@ func Dial(ctx context.Context, addr string) (quic.Connection, error) {
 | `SendAndWaitUDP` to a freshly closed port, 300 ms timeout | an error, specifically a deadline-exceeded read error |
 
 A failure here (no error returned) would mean the test's assumption is wrong somewhere — for instance if something else were still listening on that address — and would silently undermine the theory note's central claim that UDP gives no synchronous failure signal.
+
+**What this code does, in plain words:** it finds a free UDP port, closes it so nothing listens there, sends one packet to it, and checks the client gets a timeout error after 300 ms instead of any "refused" message.
 
 ```go
 func TestUDPNoReplyTimesOut(t *testing.T) {
@@ -484,6 +494,8 @@ func TestUDPNoReplyTimesOut(t *testing.T) {
 | Stream A: 64 KB payload; Stream B: `"small, independent stream"` (25 bytes), opened concurrently on one connection | Stream A echoes back exactly 65536 bytes; Stream B echoes back the exact original string |
 
 A failure here (wrong byte count, or a hang) would mean either the server's per-stream goroutines aren't actually independent, or the half-close/EOF signaling between client and server is broken — either way, the core claim "one stream's size never affects another's delivery" would be false.
+
+**What this code does, in plain words:** it starts the QUIC echo server, connects once, then opens two streams at the same time: one sending 64 KB, one sending a 25-byte message.
 
 ```go
 func TestQUICStreamsAreIndependent(t *testing.T) {
@@ -559,6 +571,26 @@ ok  	udpquic	1.950s
 1. Modify `TestQUICStreamsAreIndependent` to introduce an artificial delay in the server's handling of stream A only (for example, `time.Sleep` before the `io.Copy` for the first stream accepted). Predict whether stream B's goroutine still completes quickly, then run it and confirm.
 2. Change `EchoUDP` so it returns an error when `conn.ReadFromUDP` succeeds but the datagram is empty (`n == 0`), and write a test that sends a zero-length UDP datagram to prove the new error path is reached. Predict first whether a zero-length UDP datagram is even distinguishable from "no datagram at all" at this layer.
 3. Lower `quic.Config{MaxIdleTimeout}` to 500ms and add a test that opens a connection, waits 1 second without sending anything, and then tries `OpenStreamSync` again. Predict what error you'll get, and connect it back to [[UDP and QUIC#Connection migration surviving a change of address mid-connection]]'s discussion of path validation failing — are these the same failure mode or different ones?
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 How does the UDP client learn the server never answered?
+> Only by its read deadline running out; UDP sends no error back.
+
+> [!question]- 🟢 Why does the QUIC demo build a certificate first?
+> QUIC always encrypts with TLS 1.3, so even a local test needs a certificate.
+
+> [!question]- 🟢 How many goroutines does the QUIC server start per stream?
+> One, so no stream waits behind another.
+
+> [!question]- 🟡 Does `net.DialUDP` send anything to the server?
+> No. It only remembers the address and filters replies to come from it.
+
+> [!question]- 🟡 What is the difference between `stream.Close()` and closing the whole connection?
+> `stream.Close()` ends only that stream's sending side; closing the connection kills every stream.
+
+> [!question]- 🟡 Why is `InsecureSkipVerify` acceptable here but never in production?
+> The demo's certificate is self-made with no CA; in real code it would let anyone impersonate the server.
 
 ## Links
 

@@ -50,6 +50,10 @@ The second response carries no body at all — just a status line and a couple o
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: a request gets a response with a status code (200, 304, ...), headers, and usually a body.
+> - [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]: each request costs at least one trip to the server and back, which is exactly what caching tries to skip.
+
 **From zero, in 60 seconds** 🟢
 
 You visit the same website every day. The logo never changes. Downloading it again every day is a waste.
@@ -95,6 +99,11 @@ HTTP caching lets your browser (and servers in between) keep a copy and reuse it
 | Cache | A stored copy of a response, reused later | Your browser's copy of the logo |
 | CDN | A network of servers near users that keep cached copies | An edge server in Mumbai serving a US site |
 | Fingerprint (hash) | A short string that changes whenever the content changes | `"0f26d0f1409cfc3c"` |
+| Fresh / stale | Copy is still inside its allowed time / its time has run out | `max-age=60`: fresh for 60 s, stale after |
+| ETag | The server's fingerprint for one version of a response | `ETag: "0f26d0f1409cfc3c"` |
+| Conditional request | A request that says "only send the body if it changed" | `If-None-Match: "0f26d0f1409cfc3c"` |
+| 304 Not Modified | The server's tiny "nothing changed, keep your copy" reply, with no body | Sent when the ETag still matches |
+| Shared cache | One cache used by many people, unlike your own browser's | A CDN or an office proxy |
 
 **Picture it**
 
@@ -125,9 +134,9 @@ Where it breaks: milk can go bad before its date, but an HTTP copy is treated as
 
 Imagine a product page whose price rarely changes, but a thousand people load that page every minute. Without caching, every single one of those thousand loads re-fetches the same CSS, the same images, the same font, and the same price JSON from the origin server — even when nothing has changed since the visit a few seconds earlier.
 
-That is wasted bandwidth, wasted origin CPU and database load, and real latency the user feels on every navigation.
+That is wasted bandwidth (the amount of data the network must carry), wasted origin CPU and database load, and real latency the user feels on every navigation.
 
-**HTTP caching** is the general name for the set of rules (defined mainly in RFC 9111) that let a client, proxy or CDN store a copy of a response and reuse it later instead of asking the origin again. It solves the problem with two separate mechanisms that work at different times:
+**HTTP caching** is the general name for the set of rules (defined mainly in RFC 9111, the official HTTP caching spec) that let a client, proxy or CDN store a copy of a response and reuse it later instead of asking the origin again. It solves the problem with two separate mechanisms that work at different times:
 
 - **Freshness** avoids the network round trip entirely, for a window of time the server names up front (`max-age`).
 - **Validation** avoids re-sending the body once that window has passed, by letting the server answer "still the same" cheaply.
@@ -139,6 +148,19 @@ A concrete example: an e-commerce product page's price JSON is 14 bytes.
 
 > [!tip] Remember
 > Caching exists to avoid paying for the same answer twice: once by skipping the trip entirely, and once by skipping the resend when the trip is unavoidable.
+
+### Real-life example: the Netflix home screen 🟢
+
+When you open Netflix or Hotstar, the app loads hundreds of poster images.
+A poster image rarely changes, so an app like this can serve it with a long `max-age` and a versioned file name, and your phone can reuse it for days.
+The "Continue watching" row is different: it is yours alone and changes all the time, so it should be `private` and checked again on every open.
+This is one reason the second launch of the app feels much faster than the first: most of the screen comes from the phone's own cache.
+
+```mermaid
+flowchart LR
+    A["Open app"] --> P["Posters: cached for days<br/>no network"]
+    A --> C["Continue watching: private<br/>asked fresh each time"]
+```
 
 ## 2. Mental model 🟢
 
@@ -161,11 +183,36 @@ flowchart LR
 > [!tip] Remember
 > A cache always asks "can I skip the trip?" before it ever asks "can I skip the resend?" — freshness and validation are two separate gates, not one setting.
 
+## Common beginner mistakes 🟢
+
+- **Thinking `no-cache` means "do not cache"** → it means "store it, but check with the server before every use" → use `no-store` when nothing may be kept.
+- **Worrying that 304s mean caching is broken** → a 304 is caching working: the body was not sent again → look for repeat 200s on unchanged data instead.
+- **Putting a timestamp inside the content you hash for the ETag** → the ETag changes on every request, so you never get a 304 → hash only the real content.
+- **Marking a logged-in page `public`** → a CDN may show one user's page to another → mark it `private` (or `no-store`).
+- **Using `immutable` on a URL whose content can change (like `/app.js`)** → users keep the old file even on reload → only use it on versioned names like `app.3f8a21.js`.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the two questions every cache asks: "is my copy still fresh?" and, if not, "has it changed?". **Next we open the box**: the exact header words that answer each question, how the fingerprint check works, and how one URL can need several saved copies. Each subsection starts with a plain step-by-step walk; the full detail follows it.
 
 ### Cache-Control directives
 
 **In plain words:** `Cache-Control` is a response header the origin sends that tells every cache along the way — the browser, a corporate proxy, a CDN edge — how long it may treat this exact response as current, and who is allowed to keep a copy at all.
+
+**Step by step:**
+1. The server answers `/price.json` with `Cache-Control: public, max-age=60`.
+2. `public`: any cache may keep it, including a CDN. `max-age=60`: it is fresh for 60 seconds.
+3. You reload at 30 s: the browser uses its copy, no network at all.
+4. You reload at 70 s: the copy is stale, so the browser must ask the server (with its ETag, next subsection).
+5. With `stale-while-revalidate=30` added, the browser would show the old copy at once and check in the background instead.
+
+```mermaid
+flowchart LR
+    T0["0 s: saved"] --> T30["30 s: fresh, use copy"]
+    T30 --> T70["70 s: stale"]
+    T70 -- "plain max-age" --> W["wait for server check"]
+    T70 -- "+ stale-while-revalidate" --> I["show old copy now,<br/>check in background"]
+```
 
 **Picture it:**
 
@@ -210,7 +257,14 @@ Here is what each directive actually promises:
 
 **In plain words:** once a cached copy goes stale, the cache does not have to re-download the whole thing blind. It can send back a short fingerprint of what it already has and ask the server "is this still current?"
 
-An **ETag** is that fingerprint: an opaque string the server chooses (a content hash, a version number, a database row's `updated_at` serialized). `Last-Modified` is the same idea using a timestamp instead of a fingerprint.
+**Step by step:**
+1. First visit: server sends the price JSON with `ETag: "0f26d0f1409cfc3c"`. The browser keeps both.
+2. 60 seconds pass. The copy is stale.
+3. The browser sends `GET /price.json` with `If-None-Match: "0f26d0f1409cfc3c"`.
+4. The server works out the current fingerprint. Same? It replies `304`, no body. The browser keeps using its copy.
+5. Price changed? The fingerprint differs, so the server sends `200` with the new body and a new ETag.
+
+An **ETag** is that fingerprint: an opaque string (the client never reads meaning into it, only compares it) the server chooses (a content hash, a version number, a database row's `updated_at` serialized, meaning written out as text). `Last-Modified` is the same idea using a timestamp instead of a fingerprint.
 
 **Picture it:**
 
@@ -245,6 +299,12 @@ sequenceDiagram
 
 **In plain words:** some responses are not one single thing — the same URL might return gzip-compressed bytes to one client and plain bytes to another, depending on what the client asked for. `Vary` tells a shared cache which request header splits those into separate cache entries.
 
+**Step by step:**
+1. Chrome asks for `/app.js` with `Accept-Encoding: gzip` (it can unpack compressed files).
+2. An old tool asks for the same URL with no compression support.
+3. The server answers with `Vary: Accept-Encoding`, so the CDN keeps two copies: one compressed, one plain.
+4. Each later request gets the copy that matches its own `Accept-Encoding`. Only a few values exist, so caching still works well.
+
 **Example:** `Vary: Accept-Encoding` tells a CDN "store a separate copy per distinct value of the client's `Accept-Encoding` header" — a gzip-compressed response and an uncompressed one are not interchangeable, even for the identical URL, so the cache must keep both.
 
 ```mermaid
@@ -254,7 +314,7 @@ flowchart LR
 ```
 
 > [!warning] Common mistake
-> `Vary: Cookie` looks harmless but is a well-known anti-pattern: since cookies are often unique per user, it effectively creates one cache entry per visitor — a near-infinite number of possible cache keys — while still being technically "correct." The practical effect is that caching stops helping at all for that response.
+> `Vary: Cookie` looks harmless but is a well-known anti-pattern (a common habit that looks fine but causes harm): since cookies are often unique per user, it effectively creates one cache entry per visitor — a near-infinite number of possible cache keys — while still being technically "correct." The practical effect is that caching stops helping at all for that response.
 
 > [!tip] Remember
 > `Vary` is a correctness tool, not a performance one by itself — it only pays off when the header it names actually has few distinct values in practice.
@@ -292,7 +352,16 @@ Runnable Go version: [[HTTP Caching - Cache-Control, ETag, Conditional Requests 
 | `ETag` + `If-None-Match` | "Did it change?" (exact) | Response body on a `304` | A weak/unstable ETag (e.g. includes a timestamp that changes without content changing) defeats caching by never matching |
 | `Last-Modified` + `If-Modified-Since` | "Did it change?" (one-second resolution) | Response body on a `304` | Can't detect two changes within the same second; some servers get the date formatting wrong and break the comparison |
 | `stale-while-revalidate` | "Can I answer instantly and check in the background?" | User-facing latency on revalidation | Serves data up to `N` seconds out of date by design — know that trade-off is intentional |
-| `Vary` | "Which request header splits the cache key?" | Nothing by itself — it's a correctness constraint | `Vary: Cookie` (or any high-cardinality header) silently defeats shared caching |
+| `Vary` | "Which request header splits the cache key?" | Nothing by itself — it's a correctness constraint | `Vary: Cookie` (or any high-cardinality header, one with many different values) silently defeats shared caching |
+
+### HTTP caching vs the things people mix it up with 🟡
+
+| Thing | Who keeps the copy | Who controls it | Note |
+| --- | --- | --- | --- |
+| HTTP caching (this note) | Browser, proxy, CDN | Response headers from the server | Works for any HTTP client automatically |
+| App cache (Redis, in-memory) | Your own servers | Your code | Saves database work; the client never sees it |
+| CDN | Servers near users | Headers plus CDN settings and purges | One kind of shared HTTP cache |
+| Service worker cache | The browser, under your page's own script | Your JavaScript | Can ignore HTTP rules; used for offline apps |
 
 ## 6. Trade-offs and when not to use 🟡
 
@@ -312,21 +381,23 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the directives, ETags, conditional requests and `Vary`. **Next comes the advanced part**: how real pipelines set these headers, the failures that leak or stale data, and finer points like strong vs weak ETags and `must-revalidate`.
+
 - **Real systems:** browsers, forward and reverse proxies, and CDNs (see [[CDN and Edge]]) all implement this same `Cache-Control`/validator contract; static-asset pipelines commonly pair content-hashed filenames (`app.3f8a21.js`) with `Cache-Control: public, max-age=31536000, immutable` so a changed file gets a new URL instead of ever needing revalidation, while HTML itself usually ships `no-cache` so navigation always revalidates.
 - **Failure modes → fixes:**
   - **Serving stale data silently** because `max-age` was set far too long for data that actually changes often → shorten `max-age` or switch to `no-cache` with strong ETags so every request still revalidates cheaply.
   - **Caching a per-user response at a shared cache** (a CDN or corporate proxy serving user A's account page to user B) → mark it `private`, and double-check anything containing a `Set-Cookie` or auth-scoped data is never marked `public`.
   - **`Vary: Cookie` silently disabling shared caching** → split the cacheable, cookie-independent parts of a response from the personalized parts, or drop the dependency on cookies for the cacheable path entirely.
   - **ETag changes on every request even though content didn't** (a timestamp embedded in the hashed bytes, or per-process randomness) → hash only the stable, meaningful content fields, not metadata that changes incidentally.
-- **What to monitor:** cache hit ratio (requests served without reaching origin) and `304` ratio (requests that reached origin but needed no body resent) — both reduce origin load, but a persistently low `304` ratio on content that should be stable usually means an unstable ETag.
+- **What to monitor:** cache hit ratio (share of requests served without reaching origin) and `304` ratio (requests that reached origin but needed no body resent) — both reduce origin load, but a persistently low `304` ratio on content that should be stable usually means an unstable ETag.
 
 ## 8. Deep dive 🔴
 
 - **Strong vs weak validators.** An ETag without a `W/` prefix is a *strong* validator: byte-identical content guaranteed. `W/"..."` marks a *weak* validator: semantically equivalent but not necessarily byte-identical (e.g. same JSON data re-serialized with different key order).
-  Range requests (`Range:`/`If-Range:`, resuming a partial download) require a strong validator, because combining two differently-ordered byte ranges from a "weakly equivalent" response would be silently wrong.
+  Range requests (`Range:`/`If-Range:`, asking for only part of a file, such as resuming a partial download) require a strong validator, because combining two differently-ordered byte ranges from a "weakly equivalent" response would be silently wrong.
 - **`must-revalidate` vs plain staleness.** Without `must-revalidate`, RFC 9111 permits a cache to serve a *stale* response anyway under certain conditions (e.g. the origin is unreachable) unless told not to. `must-revalidate` forbids serving a stale copy without successfully checking with the origin first — the right choice whenever stale-but-available is worse than failing the request.
 - **Why `304` responses still carry headers.** A `304` must repeat any headers that would have been sent with the full `200` and that the cache needs to update its stored copy's metadata (a fresh `Cache-Control`, a possibly-changed `ETag` if the server supports multiple valid representations) — the body is what's elided, not the header contract.
-- **Request collapsing** (mentioned here because it interacts directly with conditional requests): when many concurrent requests for the same stale URL arrive at a cache simultaneously, a well-built cache sends only *one* revalidation request upstream and lets the rest wait on its result, instead of a thundering herd of identical revalidations hitting the origin at once.
+- **Request collapsing** (mentioned here because it interacts directly with conditional requests): when many concurrent requests for the same stale URL arrive at a cache simultaneously, a well-built cache sends only *one* revalidation request upstream and lets the rest wait on its result, instead of a thundering herd (a crowd of identical requests all arriving at once) of identical revalidations hitting the origin at once.
   This is a CDN/reverse-proxy implementation detail, not an HTTP header — see [[CDN and Edge]].
 
 ## 9. Interview questions 🔴
@@ -348,7 +419,7 @@ flowchart LR
 > So the *next* request (not this one) gets the fresh data — a shorter `max-age` alone would make some requests pay the full round-trip latency instead.
 
 > [!question]- Why is `Vary: Cookie` almost always a mistake on a cacheable response?
-> `Vary` tells a shared cache it needs a separate stored entry per distinct value of the named header. Cookies are typically unique per user (session IDs, CSRF tokens), so `Vary: Cookie` effectively creates one cache entry per visitor — technically correct, but it means the shared cache almost never gets a hit.
+> `Vary` tells a shared cache it needs a separate stored entry per distinct value of the named header. Cookies are typically unique per user (session IDs, CSRF tokens, random values that guard forms against forged submissions), so `Vary: Cookie` effectively creates one cache entry per visitor — technically correct, but it means the shared cache almost never gets a hit.
 >
 > If the response really differs per user, mark it `private` instead and don't rely on a shared cache for it at all.
 
@@ -357,6 +428,8 @@ flowchart LR
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** A cache keeps a copy and asks two questions. Is it still fresh (`max-age`)? Then use it with no network. Stale? Ask the server with the fingerprint (ETag); a `304` means "keep yours". `no-store` means never keep a copy; `private` means only the user's own browser may. The dense list below is for revision.
+
 - Freshness (`max-age`/`s-maxage`) skips the network call entirely; validation (`ETag`/`Last-Modified`) skips resending the body once stale.
 - `no-cache` = "store it, but always revalidate first"; `no-store` = "never keep a copy anywhere" — not two ends of one scale.
 - `public`/`private` controls who may cache (shared vs single-user); `immutable` skips revalidation forever for content-hashed URLs only.
@@ -364,6 +437,26 @@ flowchart LR
 - A matching validator gets a `304` with **no body** — that's caching working, not caching failing.
 - `Vary: Accept-Encoding` is normal; `Vary: Cookie` (or any high-cardinality header) usually kills shared cacheability.
 - `stale-while-revalidate` and `stale-if-error` are deliberate staleness trade-offs for latency and resilience, never for data where staleness is a correctness bug.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What does `max-age=60` tell a cache?
+> The copy is fresh for 60 seconds, so it can be reused with no network call until then.
+
+> [!question]- 🟢 What does a `304 Not Modified` reply contain?
+> Headers only, no body: it says "your saved copy is still right".
+
+> [!question]- 🟢 What is an ETag?
+> A short fingerprint the server gives to one version of a response.
+
+> [!question]- 🟡 `no-cache` vs `no-store`: which still keeps a copy?
+> `no-cache` keeps it but checks with the server before each use; `no-store` keeps nothing.
+
+> [!question]- 🟡 A client sends both `If-None-Match` and `If-Modified-Since`. Which does the server use?
+> `If-None-Match`, because ETags are exact while dates only have one-second precision.
+
+> [!question]- 🟡 Why is `immutable` safe on `app.3f8a21.js` but not on `app.js`?
+> A hashed name gets a new URL when content changes; `app.js` keeps its name, so users would be stuck with the old file.
 
 ## Links
 

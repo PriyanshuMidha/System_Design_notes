@@ -29,6 +29,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (one click traced step by step).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[JavaScript Objects, Arrays and Iteration]]: objects hold named fields, `arr.map(...)` turns a list into a new list, and making a new array is different from changing the old one.
+> - [[DOM, Events and Timers]]: the page is a live tree (the DOM) and a click runs an event handler function.
+
 **From zero, in 60 seconds** 🟢
 
 A web page is made of elements: buttons, text, images. Without React, when your data changes you must find each element and update it yourself, by hand, everywhere.
@@ -71,6 +75,12 @@ React lets you say "the badge shows `count`" once, and it keeps the page in sync
 | State | A component's own memory that survives re-renders | `const [n, setN] = useState(0)` |
 | Render | React calling your component to get its UI description | clicking re-runs `Badge()` |
 | Event handler | A function run when the user does something | `onClick={() => setN(n + 1)}` |
+| Re-render | React running your component function again to get fresh UI | after `setN(1)`, `Badge()` runs again |
+| Setter | The function `useState` gives you to change state | `setN` in `[n, setN]` |
+| Hook | A built-in React function starting with `use` that adds a feature to a component | `useState`, `useEffect` |
+| `key` | A unique label on each list item so React can tell items apart | `<li key={order.id}>` |
+| Batching | React grouping several state changes into one re-render | two setters in one click, one repaint |
+| Controlled input | A text box whose value comes from React state | `<input value={q} onChange={...}>` |
 
 **Picture it**
 
@@ -102,12 +112,37 @@ Before component frameworks, updating a page meant hand-written `document.getEle
 
 A shopping cart badge that should update after three different actions — add, remove, checkout — needed three separate manual DOM-update call sites. Each one was a chance to forget, and leave the badge showing a stale count.
 
-React's answer: describe the UI as a pure function of data, `UI = f(props, state)`, and let React figure out which DOM nodes actually need to change. You write what the page should look like for the *current* data.
+React's answer: describe the UI as a **pure function** (same input always gives the same output, with no side effects) of data, `UI = f(props, state)`, and let React figure out which DOM nodes actually need to change. You write what the page should look like for the *current* data.
 
-React re-runs the function on every relevant change and reconciles the difference (see [[React Rendering - Virtual DOM, Reconciliation, Lifecycle]] for how that diffing works).
+React re-runs the function on every relevant change and **reconciles** (compares the new UI description with the old one and changes only what differs) the difference (see [[React Rendering - Virtual DOM, Reconciliation, Lifecycle]] for how that diffing works).
 
 > [!tip] Remember
 > You describe the end result for the current data, not the sequence of DOM edits to get there — React works out the edits.
+
+### Real-life example: the "ADD" button on a food app 🟢
+
+On Swiggy or Zomato, each dish has an "ADD" button that turns into "− 1 +" once you tap it.
+Each dish card is a component that gets the dish name and price as props.
+The count on the card is state; tapping "+" calls the setter, and React re-runs the card to show 2.
+The "View cart: 3 items" bar at the bottom needs the same counts, so that state is lifted up to a parent that holds the whole cart.
+The menu list uses each dish's id as its `key`, so filtering to "Veg only" never mixes up the counts.
+
+## Common beginner mistakes 🟢
+
+- **Changing state directly** (`items.push(x)`) → React sees the same array and does not re-render → make a new array: `setItems([...items, x])`.
+- **Reading state right after setting it** → `setCount(5); console.log(count)` still prints the old value → the new value shows up on the next render.
+- **Using the array index as `key`** → after removing or reordering, inputs keep the wrong row's text → use a real id like `item.id`.
+- **Writing `class` and `onclick` like HTML** → JSX wants `className` and `onClick` → use the camelCase JavaScript names.
+- **Trying to change a prop inside the child** → props are read-only → ask the parent to change it by calling a function prop.
+
+## Often confused 🟡
+
+| These two | Props | State |
+| --- | --- | --- |
+| Who owns it | The parent | The component itself |
+| Can the component change it? | No, read-only | Yes, only through its setter |
+| Changing it causes a re-render? | Yes, when the parent passes a new value | Yes, when the setter is called |
+| Example | `<Badge count={3} />` | `const [count, setCount] = useState(0)` |
 
 ## 2. Mental model 🟢
 
@@ -125,12 +160,14 @@ flowchart LR
 - **JSX** is syntax that compiles to plain function calls (`React.createElement(...)` historically, the `jsx()` runtime import today) — it is not HTML, and the browser never sees it directly.
 
 > [!warning] Common mistake
-> Thinking of a component as something you "update" in place, the way you'd mutate a DOM element. A component re-*runs*, from scratch, every time — any value it needs across runs must live in state, a ref, or a prop, never in a plain local variable that resets every call.
+> Thinking of a component as something you "update" in place, the way you'd mutate a DOM element. A component re-*runs*, from scratch, every time — any value it needs across runs must live in state, a **ref** (a box from `useRef` that survives re-renders without causing one), or a prop, never in a plain local variable that resets every call.
 
 > [!tip] Remember
 > Component = pure function of `(props, state)`. If two renders get the same props and state, they produce the same JSX.
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a component is a function that turns props and state into UI, and React re-runs it when they change. **Next we open the box**: what JSX turns into, how props travel, how lists and missing data are handled, and how code is loaded only when needed.
 
 ```mermaid
 flowchart LR
@@ -147,11 +184,17 @@ flowchart LR
 
 **In plain words:** the angle-bracket syntax you write (`<h1>Hello</h1>`) is not HTML the browser understands directly. A build step translates it into an ordinary JavaScript function call before any of it ships to the browser.
 
+**Step by step:**
+1. You write `<h1 className="title">Hello, {name}</h1>` in a `.jsx` file.
+2. A build tool (like Vite) rewrites it to `_jsx("h1", { className: "title", children: "Hello, " + name })`.
+3. When the component runs, that call returns a small plain object: "an `h1` with these props".
+4. React reads that object and creates or updates a real `<h1>` in the DOM.
+
 ```jsx
 const greeting = <h1 className="title">Hello, {name}</h1>;
 ```
 
-compiles to (the modern automatic JSX runtime, since React 17):
+compiles to (the modern automatic JSX runtime, the helper React 17+ imports for you, since React 17):
 
 ```js
 import { jsx as _jsx } from "react/jsx-runtime";
@@ -160,14 +203,21 @@ const greeting = _jsx("h1", { className: "title", children: `Hello, ${name}` });
 
 **Example:** `<h1 className="title">` becomes a call `_jsx("h1", { className: "title", ... })` — a plain function call with a string tag name and a plain object of attributes. Nothing about this is HTML; it's just syntax sugar that's easier to read than nested function calls.
 
-**Why it matters:** this is why `class` becomes `className` (`class` is a reserved word in JavaScript, so it can't be an object key the normal way without conflicting with the language) and why you can put any JavaScript expression inside `{}` — it's just an argument to a function call, evaluated immediately when the component function runs.
+**Why it matters:** this is why `class` becomes `className` (`class` is a **reserved word** (a word the language keeps for itself) in JavaScript, so it can't be an object key the normal way without conflicting with the language) and why you can put any JavaScript expression inside `{}` — it's just an argument to a function call, evaluated immediately when the component function runs.
 
 > [!warning] Common mistake
-> Writing `<div class="box">` out of HTML habit. JSX attributes are JavaScript identifiers, not HTML attribute names — `class` → `className`, `for` → `htmlFor`, and event handlers are camelCase (`onclick` → `onClick`).
+> Writing `<div class="box">` out of HTML habit. JSX attributes are JavaScript **identifiers** (names), not HTML attribute names — `class` → `className`, `for` → `htmlFor`, and event handlers are **camelCase** (joined words, each new word capitalised) (`onclick` → `onClick`).
 
 ### Components as functions of props and state
 
 **In plain words:** a component receives one argument, an object of props, and returns JSX. The parent decides what goes in; the component can read it but never change it.
+
+**Step by step:**
+1. `Cart` holds the list of items in its state.
+2. `Cart` renders `<ProductList items={items} onAdd={addItem} />`. Both are props.
+3. `ProductList` shows the items. It cannot assign `items = ...`.
+4. When the user taps "Add", `ProductList` calls `onAdd(item)`, a function `Cart` gave it.
+5. `Cart` updates its own state, re-renders, and passes the new `items` down.
 
 ```jsx
 function Greeting({ name }) {       // props arrive as a single object, usually destructured
@@ -197,7 +247,13 @@ This one-way flow is what makes a large component tree's data predictable: you c
 
 ### Conditional and list rendering
 
-**In plain words:** JSX is just JavaScript, so showing or hiding something is a plain `if`/ternary, and rendering a list is just calling `.map()` and returning an array of elements.
+**In plain words:** JSX is just JavaScript, so showing or hiding something is a plain `if`/**ternary** (`cond ? a : b`), and rendering a list is just calling `.map()` and returning an array of elements.
+
+**Step by step:**
+1. `{isLoggedIn ? <Logout /> : <Login />}` shows one button or the other.
+2. `{cart.length > 0 && <Checkout />}` shows the checkout only when the cart has items.
+3. `orders.map(o => <li key={o.id}>{o.name}</li>)` turns 3 orders into 3 list items.
+4. Next render, React matches each `li` with last time's by its `key`, so it can tell which item was removed or moved.
 
 ```jsx
 function Status({ isLoggedIn }) {
@@ -245,6 +301,12 @@ If the key were the array *index* instead (`0, 1, 2`), after removing `B` the it
 
 **In plain words:** `?.` means "only keep going if this exists". It saves you from a crash when data has not loaded yet, like checking a door is there before walking through it.
 
+**Step by step:**
+1. First render: the profile has not loaded, so `user` is `null`.
+2. `user?.address?.city` stops at `user`, gives `undefined`, and does not crash.
+3. `?? "Unknown city"` swaps that `undefined` for a readable fallback.
+4. Data arrives, the component re-renders, and the real city shows.
+
 A common pattern when a prop might not have loaded yet:
 
 ```jsx
@@ -254,11 +316,18 @@ function Profile({ user }) {
 }
 ```
 
-**What happens if** you write `user.address.city` without the `?.` guards, and `user` arrives as `null` on the first render before data loads? JavaScript throws immediately and the whole component crashes, which in React takes down the nearest error boundary — not just that one line. The `?.`/`??` combination is the cheapest guard against exactly this "data hasn't arrived yet" render.
+**What happens if** you write `user.address.city` without the `?.` guards, and `user` arrives as `null` on the first render before data loads? JavaScript throws immediately and the whole component crashes, which in React takes down the nearest **error boundary** (a wrapper component that catches crashes below it and shows a fallback) — not just that one line. The `?.`/`??` combination is the cheapest guard against exactly this "data hasn't arrived yet" render.
 
 ### Code splitting with `lazy` and `Suspense`
 
 **In plain words:** `React.lazy` defers downloading a component's code until the moment it's first rendered. `<Suspense fallback>` shows a placeholder while that code (or any promise the component reads with `use`) is still loading.
+
+**Step by step:**
+1. You write `const Settings = lazy(() => import("./Settings"));`.
+2. The app loads without the Settings code at all, so the first download is smaller.
+3. The user opens Settings. React starts downloading that code.
+4. While it downloads, `<Suspense fallback={<Spinner />}>` shows the spinner.
+5. The code arrives and the real Settings page replaces the spinner.
 
 ```jsx
 import { lazy, Suspense } from "react";
@@ -274,7 +343,7 @@ function App() {
 }
 ```
 
-**Why it matters:** this is what lets a bundler split a route's code into its own chunk (see "Tooling, briefly" below) instead of shipping the whole app up front. Only `lazy` components and promises read via `use` can trigger a `Suspense` fallback — passing an ordinary Promise down as a prop does not suspend anything by itself.
+**Why it matters:** this is what lets a **bundler** (a build tool that packs your files for the browser) split a **route's** (one page's) code into its own **chunk** (a separate JS file) (see "Tooling, briefly" below) instead of shipping the whole app up front. Only `lazy` components and promises read via `use` can trigger a `Suspense` fallback — passing an ordinary Promise down as a prop does not suspend anything by itself.
 
 ## 4. Worked example 🟡
 
@@ -296,7 +365,7 @@ Clicking the button calls `setCount`, which schedules a re-render; React re-runs
 ### Tracing one click, step by step
 
 1. The page shows the button with text `0` — this is the result of the first render, where `count` was `0`.
-2. The user clicks the button. The browser fires a native click event.
+2. The user clicks the button. The browser fires a **native** (the browser's own, not React's) click event.
 3. React's `onClick` handler runs: `() => setCount(count + 1)`, which calls `setCount(1)` (`count` was `0` in *this* render's closure).
 4. React does **not** update the DOM yet. It marks `Counter` as needing a re-render and schedules that work.
 5. React calls `Counter()` again. This time, `useState(0)` returns the *stored* value, `1`, not the initial `0` — the initial argument to `useState` is only used on the very first render.
@@ -347,7 +416,7 @@ sequenceDiagram
     DOM-->>U: input shows the typed character
 ```
 
-**Why it matters:** because `value` is always set from state, React — not the browser — is the single source of truth for what the input shows. This is what makes it possible to validate, transform, or reject a keystroke before it ever appears (e.g. stripping non-digit characters from a phone number field).
+**Why it matters:** because `value` is always set from state, React — not the browser — is the **single source of truth** (the one place the real value lives) for what the input shows. This is what makes it possible to validate, transform, or reject a keystroke before it ever appears (e.g. stripping non-digit characters from a phone number field).
 
 ### Lifting state up
 
@@ -376,12 +445,27 @@ The analogy breaks down because in React the "manager" (the parent component) is
 
 `ProductList` and `CartBadge` never talk to each other directly; both are driven by `Cart`'s state.
 
+```mermaid
+flowchart TD
+    C["Cart: holds items state"] -->|"items, onAdd"| PL["ProductList"]
+    C -->|"count = items.length"| CB["CartBadge"]
+    PL -->|"onAdd(item)"| C
+```
+
 > [!tip] Remember
 > Two components need the same data → move it to their nearest common ancestor, then pass it down. Don't try to sync two separate pieces of state.
 
 ### Batched updates (React 18+)
 
 **In plain words:** if you change state twice in one click, React is smart enough to repaint the page once, not twice. That bundling is called batching.
+
+```mermaid
+flowchart LR
+    Click["one click"] --> A["setName('Asha')"]
+    Click --> B["setAge(25)"]
+    A --> R["ONE re-render<br/>with both changes"]
+    B --> R
+```
 
 ```jsx
 function handleClick() {
@@ -400,7 +484,7 @@ Use the **functional updater** form (`setCount((c) => c + 1)`) rather than `setC
 
 A component typically renders a loading state immediately, fetches inside a `useEffect`, and re-renders once the data arrives; see [[React Hooks]] for the full pattern including the race-condition fix.
 
-In new code, a data-fetching library (TanStack Query, RTK Query) or a framework's built-in data layer (Next.js Server Components, React Router loaders) usually replaces this pattern — see [[React Routing and Rendering Strategies - CSR, SSR, SSG]].
+In new code, a data-fetching library (TanStack Query, RTK Query: libraries that fetch, cache and refresh server data for you) or a framework's built-in data layer (Next.js Server Components, React Router loaders) usually replaces this pattern — see [[React Routing and Rendering Strategies - CSR, SSR, SSG]].
 
 ## 5. Variants and comparison 🟡
 
@@ -414,19 +498,21 @@ In new code, a data-fetching library (TanStack Query, RTK Query) or a framework'
 ## 6. Trade-offs and when not to use 🟡
 
 - A component re-renders every time its state or props change, even if the resulting JSX would be identical; for most UI this is fast enough that optimizing it is premature (see [[React Hooks]] for when `useMemo`/`React.memo` actually pay off).
-- Prop drilling (passing a prop through several layers that don't use it themselves) is fine for 2–3 levels; past that, consider Context or a store — covered in [[React State Management - Props, Context, Redux]].
+- Prop drilling (passing a prop through several layers that don't use it themselves) is fine for 2–3 levels; past that, consider **Context** (React's way to share a value with all components below without passing props) or a **store** (one shared place for app-wide state, like Redux) — covered in [[React State Management - Props, Context, Redux]].
 - Controlled inputs cost a re-render per keystroke; for very large forms or a high-frequency input (e.g. a canvas drag), an uncontrolled input with a ref can be cheaper.
 - This vault is backend-focused: treat this note as "enough to read and lightly modify a React codebase", not as full frontend-engineer depth — state management, styling systems and build tooling go only as deep as a backend engineer needs.
 
 ## 7. In production 🔴
 
-- **Real systems:** React 19 is the current stable release (2024) and powers most large single-page apps and, via Next.js's App Router, server-rendered and hybrid apps with Server Components.
+> 🟡 → 🔴 **You now know** components, JSX, props, state, keys, controlled inputs, lifting state and batching. **Next is the advanced part**: the bugs real React apps hit, how teams watch for them, and finer points like `children`, React 19 features and build tooling.
+
+- **Real systems:** React 19 is the current stable release (2024) and powers most large **single-page apps** (sites that load once and then swap content with JS instead of loading new pages) and, via Next.js's App Router, server-rendered and hybrid apps with **Server Components** (components that run only on the server and send finished UI).
 - **Failure modes → fixes:**
   - List reorders or filters and items lose their input focus/state → the `key` was the array index instead of a stable id; switch to a stable id.
   - A form field "won't update" on typing → the input has a `value` prop but no `onChange`, making it a read-only controlled input by accident.
   - A child mutates a prop object directly and the parent doesn't notice → props (and state) must be treated as immutable; update via the setter with a new object/array (`{...prev, field: x}`, `[...prev, item]`).
   - A fetch inside `useEffect` sets state after the component has moved on to a different id → use the `ignore` flag or `AbortController` pattern shown above.
-- **What to monitor:** render count per component in dev tools (React DevTools Profiler) if a screen feels slow; client-side error rate from a boundary (error boundaries, covered in [[React Rendering - Virtual DOM, Reconciliation, Lifecycle]]).
+- **What to monitor:** render count per component in dev tools (React DevTools Profiler, a browser add-on that records which components rendered and how long they took) if a screen feels slow; client-side error rate from a boundary (error boundaries, covered in [[React Rendering - Virtual DOM, Reconciliation, Lifecycle]]).
 
 ## 8. Deep dive 🔴
 
@@ -434,7 +520,7 @@ In new code, a data-fetching library (TanStack Query, RTK Query) or a framework'
 - **`children` is just a prop.** `<Parent><Child /></Parent>` is sugar for passing `<Child />` as `props.children`; this is how generic wrapper components (layouts, modals) work without hardcoding what goes inside them.
 - **State updates are not synchronous.** Reading `count` immediately after calling `setCount(count + 1)` in the same function body still shows the *old* value — the update is scheduled for the next render, not applied in place.
 - **React 19 additions relevant here:** the `use` API (reads a Promise or Context inside render, conditionally), Actions and `useActionState` for form submissions with built-in pending/error state, and `ref` can now be passed as a plain prop to function components without `forwardRef`. These are extensions of the same props/state model, not a replacement for it.
-- **Tooling, briefly:** `package.json` declares `dependencies` (shipped to the browser) vs `devDependencies` (build-time only, e.g. the bundler itself); a lockfile pins exact versions for reproducible installs. A bundler (Vite, webpack) turns your JSX/TS modules into the handful of files the browser actually loads, tree-shaking unused exports and splitting code at `React.lazy()` boundaries so a route's code only downloads when that route is visited.
+- **Tooling, briefly:** `package.json` declares `dependencies` (shipped to the browser) vs `devDependencies` (build-time only, e.g. the bundler itself); a lockfile pins exact versions for reproducible installs. A bundler (Vite, webpack) turns your JSX/TS modules into the handful of files the browser actually loads, **tree-shaking** (dropping code nobody imports) unused exports and splitting code at `React.lazy()` boundaries so a route's code only downloads when that route is visited.
 
 ## 9. Interview questions 🔴
 
@@ -466,6 +552,26 @@ In new code, a data-fetching library (TanStack Query, RTK Query) or a framework'
 - Since React 18, state updates are batched everywhere, not just inside React event handlers.
 - Lift state to the nearest common ancestor when siblings need to share data.
 - `children` is just a prop — composition, not a special syntax.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what does a React component return?
+> JSX: a description of what the UI should look like.
+
+> [!question]- Easy: can a child component change the props it receives?
+> No. Props are read-only; the child calls a function prop to ask the parent.
+
+> [!question]- Easy: what do you call to change state from `const [n, setN] = useState(0)`?
+> `setN`, for example `setN(1)` or `setN(old => old + 1)`.
+
+> [!question]- Medium: `setCount(count + 1)` twice in one click. Count goes from 0 to?
+> 1. Both calls use the same old `count`. Use `setCount(c => c + 1)` twice to get 2.
+
+> [!question]- Medium: why is the array index a bad `key` for a list you can filter?
+> After filtering, items shift positions, so React matches the wrong old item to each index and state lands on the wrong row.
+
+> [!question]- Medium: two sibling components need the same cart count. Where should the state live?
+> In their nearest common parent, which passes it down to both as props.
 
 ## Links
 

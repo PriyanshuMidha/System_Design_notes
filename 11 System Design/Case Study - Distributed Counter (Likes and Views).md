@@ -35,6 +35,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+> - [[Back-of-the-Envelope Estimation]]: turning "500 million likes a day" into likes per second.
+> - [[Redis Data Structures and When to Use Each]]: Redis keeps numbers, sets and sketches in memory, with commands like `INCR`.
+> - [[Hot Keys and Hot Partitions]]: when one key gets most of the traffic, the one machine holding it becomes the limit.
+
 **From zero, in 60 seconds** 🟢
 
 A like count looks like one simple number under a post.
@@ -72,6 +78,11 @@ A distributed counter lets many places count at once and adds them up later.
 | Event / delta | A small message saying what changed | `{post:7, +1}` |
 | Idempotent | Doing it twice has the same effect as once | Retrying a like does not count it twice |
 | Eventual consistency | All copies agree after a short delay | Count shows 1,200 now, 1,204 a second later |
+
+| Kafka offset | The position of an event in a Kafka partition, used to resume reading | "applied up to event 1,999" |
+| Aggregator | A worker that adds up many small changes and writes one total | 3,100 likes in one second → one `+3,100` |
+| Reconciler | A background job that recounts from the facts and fixes the counter | recount says 1,204,311, counter says 1,205,102 |
+| HyperLogLog | A tiny sketch that estimates "how many different people" | 12 KB counts millions of viewers, about 1% off |
 
 **Picture it**
 
@@ -127,6 +138,13 @@ It breaks on the day a celebrity posts and 50,000 people tap the heart in one se
 - Handle one post receiving 50,000 likes per second (hot key) without hurting other posts.
 - Survive retries, duplicate events and node loss without double counting.
 
+### Real-life example: a cricket highlight on YouTube 🟢
+
+A big cricket highlight goes up on YouTube and millions watch it in the first hour.
+The view count under it climbs in jumps, not one by one, and it may even pause for a while; that is batching and checking at work.
+Your own like shows up the moment you tap it, even before the big total catches up.
+Nobody minds if the views say 4.8 million instead of 4,812,337, which is why views can be counted roughly.
+
 **Out of scope for now:** comments, notifications on like, and ranking by likes (see [[Case Study - Leaderboard and Top-K]] for ranking).
 
 ```mermaid
@@ -173,9 +191,26 @@ flowchart LR
     OP --> SB["Big scoreboard"]
 ```
 
+## Common beginner mistakes 🟢
+
+- **`UPDATE posts SET likes = likes + 1` for every tap** → on a viral post every update waits for the same row lock → write the like fact, then add up deltas in batches.
+- **Counting raw taps** → a double tap or retry adds two likes → count only real state changes (a new row in the likes table).
+- **Trusting "exactly once" from the queue alone** → a crash between "add to counter" and "save offset" re-applies a batch → save the delta and the offset in one transaction.
+- **Sharding every counter** → a post with 40 likes would need 16 reads to show its count → shard only posts measured as hot.
+- **Counting unique viewers with a full set per post** → 5 million IDs is about 40 MB for one post → use a HyperLogLog (12 KB, about 1% error).
+
 ## 3. How it works - high-level design 🟡
 
+> 🟢 → 🟡 **You now know** why one shared number breaks on a viral post and that the count is a summary of stored facts. **Next we open the box**: why the database row is the bottleneck, and how likes flow through a queue and an adder into sharded counters.
+
 ### Why not just `count + 1` in the database
+
+**Step by step:**
+1. Post 7 has a `likes` column. Tap 1 runs `likes = likes + 1` and locks the row for about 1 ms.
+2. Tap 2 arrives in that same millisecond. It must wait for tap 1 to finish.
+3. So one row handles roughly 1,000 taps a second, one after another.
+4. A celebrity post gets 20,000 taps a second. 19,000 a second join the queue.
+5. Waiting taps hold database connections, so other posts' queries wait too, and the whole app slows.
 
 **In plain words.** A relational row is protected by a lock while it is being changed. Two updates to the same row run one after another. If each takes 1 ms, one row can take at most about 1,000 updates per second, and in practice less because of commit and replication cost.
 
@@ -289,7 +324,7 @@ Notes:
 - Counts are a **batch** endpoint: one call per feed page, not 20 calls.
 - Views are posted in a batch by the client and acknowledged with 202. The server must not make the user wait for counting.
 - `liked_by_me` is read from the likes store (or a per-user cache), never derived from the count.
-- The `likers` list is a scatter-gather across likes shards, because `likes` is sharded by `hash(post_id, user_id)` to spread a viral post. That is acceptable for a rarely used call; if it matters, keep a separate `post_likers` table keyed by `post_id` (bucketed for hot posts).
+- The `likers` list is a scatter-gather (ask every shard, then merge the answers) across likes shards, because `likes` is sharded by `hash(post_id, user_id)` to spread a viral post. That is acceptable for a rarely used call; if it matters, keep a separate `post_likers` table keyed by `post_id` (bucketed for hot posts).
 
 ### Data model
 
@@ -338,13 +373,13 @@ Redis keys:
 | `shards:{post}` | small integer | how many shards this post currently uses (default 1) |
 | `seen:{post}:{user}` | string with short TTL | "this user already viewed in this window" dedupe marker |
 
-The `{post}` hash tag keeps all shards of a post in the same Redis Cluster slot for easy `MGET`; the trade-off is that a hot post then lives on one node, so for very hot posts omit the tag and let shards spread across nodes (see deep dive 8.1).
+The `{post}` hash tag (Redis hashes only the part inside `{}`, so these keys land together) keeps all shards of a post in the same Redis Cluster slot for easy `MGET`; the trade-off is that a hot post then lives on one node, so for very hot posts omit the tag and let shards spread across nodes (see deep dive 8.1).
 
 ### One like traced
 
 **In plain words:** follow a single tap from the phone, through the queue and the adder, to the number everyone sees.
 
-1. User 42 taps the heart on post 7. The app updates the heart immediately (optimistic UI) and sends `PUT /v1/posts/7/like`.
+1. User 42 taps the heart on post 7. The app updates the heart immediately (optimistic UI: show the result before the server confirms it) and sends `PUT /v1/posts/7/like`.
 2. The like service runs `INSERT INTO likes ... ON CONFLICT DO NOTHING` and checks the affected row count.
 3. Row count 1 means a new like: emit `{post:7, delta:+1, event_id}` to Kafka. Row count 0 means a duplicate tap: emit nothing.
 4. An aggregator collects deltas for post 7 for one second: `+3,100`. It runs `INCRBY cnt:7:likes:5 3100` on a random shard.
@@ -397,10 +432,10 @@ flowchart TD
 | Sharded counter | `N` sub-keys; random shard per write; sum on read | Hot keys; the standard fix | Read cost grows with `N`; shard count must be tuned |
 | In-memory batching in the app | Add locally, flush every 100 ms to 1 s | Reduces write rate by 100x or more | Lose the unflushed batch on crash (bounded loss, then reconcile) |
 | Stream aggregation (Kafka + aggregator) | Durable event log; windowed sums | High volume plus replay and audit | Seconds of lag; more moving parts |
-| Cassandra counter column | Native `UPDATE ... SET c = c + 1` | Wide-column stack, tolerates drift | Not idempotent; a retried update can over-count (documented) |
+| Cassandra counter column (a special column type Cassandra can add to without reading first) | Native `UPDATE ... SET c = c + 1` | Wide-column stack, tolerates drift | Not idempotent; a retried update can over-count (documented) |
 | DynamoDB atomic counter / write sharding | `ADD` on an item; shard the key | AWS-native; sharding by suffix | Per-partition limit; a retried `ADD` also double-counts |
 | Firestore distributed counter | Many shard documents; sum on read | Firestore app | Documented as the standard pattern because one document sustains only about 1 write/s |
-| PN-Counter CRDT | Each replica keeps its own `P` and `N` vectors; merge = per-replica max | Multi-region writes with no coordination | Memory per replica; no "bounded" counters |
+| PN-Counter CRDT (a counter type that many copies can update separately and merge without conflicts) | Each replica keeps its own `P` and `N` vectors; merge = per-replica max | Multi-region writes with no coordination | Memory per replica; no "bounded" counters |
 | HyperLogLog | Hash, bucket by prefix, keep max leading zeros | Unique viewers | About 0.81% error; cannot remove an item; cannot list members |
 | Count-Min Sketch | Grid of counters, min of rows | Frequencies for millions of keys | Over-counts; not for a single known post |
 
@@ -413,6 +448,14 @@ Real systems:
 These are public, documented patterns, not guesses about private designs.
 
 See [[Choosing a Database - Decision Guide]] for where to keep the likes fact, [[Choosing a Caching Strategy - Decision Guide]] for the count cache, [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]] for the event pipe, and [[Choosing Consistency, Replication and Partitioning - Decision Guide]] for the convergence promise.
+
+### Things people confuse this with 🟡
+
+| System | What it counts | How it differs |
+| --- | --- | --- |
+| [[Case Study - Ad Click Aggregation]] | Clicks that someone pays for | Must be exact for billing, so it adds a nightly batch recount and stricter dedupe |
+| [[Case Study - Leaderboard and Top-K]] | Scores, then ranks them | Needs ordering ("who is in the top 10?"), not just a total per item |
+| Inventory or seat count | Items left to sell | A cap must never be crossed, so it needs locks or transactions, not lagging sums |
 
 ## 6. Trade-offs and when not to use 🟡
 
@@ -432,13 +475,15 @@ flowchart TD
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the pipeline, the API, the tables and one like traced end to end. **Next is the advanced part**: what breaks in production, sharded counters that grow on demand, exactly-once effect, approximate views, reconciliation, and counting across regions.
+
 - **Failure modes and fixes:**
 	- Hot post saturates one Redis node. Fix: automatic shard promotion (section 8.1) and salted Kafka keys.
 	- Aggregator crashes after incrementing Redis but before committing the Kafka offset. On restart the batch is re-applied and the count drifts up. Fix: durable totals and offsets in one transaction (section 8.2), plus nightly reconciliation.
 	- Redis node lost. Fix: counters are rebuilt from the durable totals table plus replay from the last saved offset; until then, serve the last cached value.
 	- Count appears to go backwards on refresh because two cache nodes hold different sums. Fix: clients keep the larger of the old and new count for a post for that session; server returns a `version` or `as_of` stamp.
 	- Unlike arrives before like (events reordered). Fix: deltas are derived from real state changes in the likes store, so the sequence is consistent per `(post,user)`; clamp the displayed total at zero.
-	- Bot farms inflate views. Fix: filter by session, dwell time, rate per account and IP reputation before counting; count only after validation.
+	- Bot farms inflate views. Fix: filter by session, dwell time (how long the post stayed on screen), rate per account and IP reputation (whether an address is known for abuse) before counting; count only after validation.
 	- Backlog after an outage: aggregators fall minutes behind. Fix: autoscale consumers per partition, keep the pipeline idempotent, and show slightly stale counts.
 - **What to monitor:**
 	- Consumer lag of the counter topic (seconds behind).
@@ -554,10 +599,10 @@ sequenceDiagram
 **Numbered rules.**
 1. The aggregator's source of "where am I" is the DB row, not Kafka's committed offset.
 2. A batch's counter updates and its offset update commit together, or not at all.
-3. The aggregator is single-writer per partition (consumer group guarantees one owner at a time; use fencing if a zombie consumer can wake up, see [[Idempotency and Idempotency Keys]]).
+3. The aggregator is single-writer per partition (a Kafka consumer group gives each partition to one reader at a time; use fencing if a zombie consumer can wake up, see [[Idempotency and Idempotency Keys]]).
 4. Redis is updated *after* the commit from the same batch result. If Redis is lost, rebuild it from `post_counters`.
 
-If the counter store is Redis only (no DB), keep the last applied offset in Redis and update both with one Lua script or `MULTI/EXEC` so they stay together.
+If the counter store is Redis only (no DB), keep the last applied offset in Redis and update both with one Lua script or `MULTI/EXEC` (Redis's way to run several commands as one unit) so they stay together.
 
 > [!warning] Common mistake
 > Calling the Kafka offset commit and the counter write "exactly once" because both usually succeed. Two separate systems cannot be updated atomically; one of them must record the other's progress.
@@ -593,7 +638,7 @@ flowchart LR
 
 Facts to quote: Redis HLL uses up to 12 KB per key, has a standard error of 0.81 percent, and cannot delete an item or list members.
 
-**Dedupe window.** Counting every beacon would count a refresh as a new view. Keep a short-lived marker `seen:{post}:{user}` with `SET NX EX 3600`. If the set succeeds, count it; if not, drop it. This marker is per viewer per post, which is large; for non-hot posts use a Bloom filter per hour instead (see [[Bloom Filters and Probabilistic Data Structures]]), accepting a small false-positive rate (a few real views dropped).
+**Dedupe window.** Counting every beacon (a small "I was shown" message the app sends) would count a refresh as a new view. Keep a short-lived marker `seen:{post}:{user}` with `SET NX EX 3600`. If the set succeeds, count it; if not, drop it. This marker is per viewer per post, which is large; for non-hot posts use a Bloom filter per hour instead (see [[Bloom Filters and Probabilistic Data Structures]]), accepting a small false-positive rate (a few real views dropped).
 
 **What happens if** a deploy bug sends every beacon twice? Views double for an hour. This is why views come from a stream: replay the corrected pipeline from Kafka for that window and overwrite.
 
@@ -684,6 +729,26 @@ flowchart LR
 
 > [!question]- What changes if you must support active-active writes in two regions?
 > Use a conflict-free counter (PN-Counter): each region increments its own slot, replicas merge by taking the max per slot, so no cross-region coordination is needed. The per-user like fact must also converge (last-writer-wins on `(post,user)` with a timestamp, or a CRDT set), and the count is eventually consistent across regions.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is the source of truth for likes, the counter or the likes table?
+> The likes table (one row per user and post); the counter is a rebuildable summary.
+
+> [!question]- Easy: what is a hot key?
+> One key getting far more traffic than others, like a celebrity's post.
+
+> [!question]- Easy: why can view counts be approximate?
+> Nobody pays or acts on the exact number, and exact unique counts would cost far more memory.
+
+> [!question]- Medium: a post gets 50,000 likes a second. How do you spread the writes?
+> Batch deltas in aggregators for about a second, and split the counter into 16 or more shard keys; sum them on read.
+
+> [!question]- Medium: the aggregator crashes after updating counters but before committing its Kafka offset. How do you avoid double counting?
+> Store the counter update and the next offset in the same database transaction, and resume from that stored offset.
+
+> [!question]- Medium: a user double-taps like. Why is the count still right?
+> The insert into `likes` hits the existing row and changes nothing, so no `+1` delta is emitted.
 
 ## 10. Cheat sheet 🟢
 

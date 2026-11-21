@@ -32,7 +32,7 @@ flowchart LR
     C --> ADR[("ADR-0007\nstatus: accepted")]
 ```
 
-InvoiceOps needed a way to run invoice reminders reliably without losing one or sending it twice. The team considered a Kafka consumer group and a Postgres job table polled with `SELECT ... FOR UPDATE SKIP LOCKED`, picked the second, and wrote that choice down as ADR-0007 before building it.
+InvoiceOps needed a way to run invoice reminders reliably without losing one or sending it twice. The team considered a **Kafka** consumer group (Kafka is a separate system that stores messages so a group of workers can read them) and a Postgres job table **polled** (asked again and again, "any work for me?") with `SELECT ... FOR UPDATE SKIP LOCKED` (a Postgres query where each worker grabs some rows and skips rows another worker already holds), picked the second, and wrote that choice down as ADR-0007 before building it.
 
 Everything below is what goes inside that one document, and what the decision implies for the code.
 
@@ -42,6 +42,9 @@ Everything below is what goes inside that one document, and what the decision im
 > - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+> [!note] Before this note
+> - [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]: "coupling" means how much one part of the code breaks when another part changes, and "dependency direction" means which package imports which. Section 4 uses one idea from it: the core code depends only on an interface it owns, never on the database package.
 
 **From zero, in 60 seconds** 🟢
 
@@ -80,6 +83,13 @@ A one-page note from the day of the decision would have saved a week of arguing.
 | Immutable | Never edited after it is final | ADR-0007 stays as written |
 | Supersede | Replace an old decision with a newer one | ADR-0012 supersedes ADR-0007 |
 | Pull request (PR) | A proposed change that teammates review before merge | The ADR file gets reviewed like code |
+| One-way door | A choice that is very costly or impossible to undo later | Picking the main database |
+| Two-way door | A choice you can cheaply undo next week | Adding a small cache |
+| Polling | A worker asks the database every few seconds "any jobs for me?" | Reminder worker checks every 1 second |
+| Fan-out | One message delivered to many different readers | One "invoice paid" event read by 3 services |
+| MADR | A popular fill-in-the-blanks template for ADRs (Markdown ADR) | Status, Context, Decision, Alternatives, Consequences |
+| Interface (port) | A list of methods the core code needs, with no "how" inside | `Store` with `Claim` and `Release` |
+| Adapter | The code that does the real "how" behind an interface | `storepg`, which talks to Postgres |
 
 **Picture it**
 
@@ -126,18 +136,46 @@ Think of an ADR as a **lab notebook entry for the architecture**, not a design d
 
 It is deliberately short — a page, not a spec — and deliberately permanent: once accepted, nobody edits an ADR to match a later change of mind. If the decision is reversed, a new ADR is written that supersedes the old one, so the history of *why* stays intact.
 
-This is the same instinct as a database migration: you don't edit migration 0003 after 0007 has shipped, you write 0008. ADRs apply that discipline to decisions instead of schemas.
+This is the same instinct as a **database migration** (a numbered script that changes the database's tables, run once, in order): you don't edit migration 0003 after 0007 has shipped, you write 0008. ADRs apply that discipline to decisions instead of schemas.
 
 ```mermaid
 flowchart LR
     A1["ADR 0003: use Redis sessions<br/>Superseded"] -.-> A2["ADR 0011: use Postgres sessions<br/>Accepted"]
 ```
 
+### Real-life example 🟢
+
+Picture the backend team of a food-delivery app like Swiggy deciding how restaurant payouts are sent each night.
+They choose a simple database job table over a new message queue, because the team is small and payouts happen once a day.
+They write ADR-0021 saying exactly that, plus the cost: "this will not scale to per-minute payouts".
+Two years later the business wants payouts every 10 minutes. The new tech lead reads ADR-0021, sees the old reason no longer holds, and writes ADR-0045 that supersedes it.
+Nobody wastes a week guessing whether the old choice was a mistake or a deliberate trade-off.
+
+## Common beginner mistakes 🟢
+
+- **Editing an old ADR when the decision changes** → the history of why is lost, and readers can't tell what was true at the time → write a new ADR and mark the old one "Superseded by ADR-00NN".
+- **Writing only the decision, no alternatives** → the next engineer re-proposes the same rejected option → list each option you looked at and one line on why you passed it over.
+- **Writing no downside in Consequences** → the ADR reads like an advert, and the cost surprises someone later → name at least one real cost, like "max a few hundred jobs per second".
+- **Writing an ADR for tiny choices** → nobody reads a folder of 300 trivial ADRs → keep them for one-way doors: database, queue, API style, tenancy model.
+- **Keeping ADRs in a wiki far from the code** → they drift out of sight → put them in `docs/adr/` in the repo and link them from the code they govern.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** what an ADR is and why it is never edited. **Next we open the box**: the exact headings inside one, how its status moves over time, and where the file lives and gets reviewed. Each subsection starts with a short step-by-step walk; the full detail follows.
 
 ### 3.1 The template (MADR-style)
 
 **In plain words: a fixed set of headings, so every ADR reads the same way.**
+
+**Step by step:**
+1. Copy the template into a new file, `docs/adr/0007-use-postgres-skip-locked.md`. The number is simply the next free one.
+2. **Context**: write the facts as they are today. "Reminders must go out exactly once. We run Postgres. We do not run Kafka."
+3. **Decision**: one sentence someone can act on. "Store reminders as rows in a `reminder_jobs` table."
+4. **Alternatives**: each option you did not pick, with one line on why. "Kafka: one more system to run for one queue."
+5. **Consequences**: the good and the bad. "No new system to run, but not built for millions of jobs a second."
+6. Set **Status** to Proposed and open a pull request.
+
+Full detail:
 
 ```text
 # ADR-0007: Use Postgres SKIP LOCKED for reminder jobs
@@ -176,6 +214,15 @@ Each field has one job: **Context** is the problem as it looked at decision time
 
 ### 3.2 Lifecycle
 
+**In plain words:** an ADR's status changes over time, but its text does not.
+
+**Step by step:**
+1. You open ADR-0007 as a pull request. Status: **Proposed**.
+2. The team agrees in review and merges it. Status: **Accepted**.
+3. If the team disagrees instead, it is closed. Status: **Rejected** (keep it, so the idea is not proposed blind again).
+4. A year later the team moves to a queue and writes ADR-0012. ADR-0007 gets one new line: "Superseded by ADR-0012". Nothing else in it changes.
+5. If the team just stops following a rule and nothing replaces it, the status becomes **Deprecated**.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Proposed: opened as a PR
@@ -194,6 +241,22 @@ An ADR's text is never rewritten once `Accepted`. "Superseded by ADR-0012" is ad
 
 **In plain words: ADRs are plain files in the repo, reviewed in a pull request like code.**
 
+**Step by step:**
+1. Save the file under `docs/adr/` in the same repo as the code.
+2. Open a pull request. Teammates comment on it like any code change.
+3. Merge it when the team agrees. The review thread stays as a record of how you got there.
+4. Add a comment in the `reminder` package pointing to `docs/adr/0007-*.md`, and link it from the on-call runbook.
+
+```mermaid
+flowchart LR
+    W["Write 0007.md"] --> PR["Open PR"]
+    PR --> R["Team reviews"]
+    R --> M["Merge: Accepted"]
+    M --> L["Link from code + runbook"]
+```
+
+Full detail:
+
 - Files: `docs/adr/0001-use-postgres-for-sessions.md`, `0002-...`, numbered sequentially and never renumbered.
 - Reviewed exactly like a code change: opened as a pull request, discussed in review comments, merged once the team agrees — the PR thread itself becomes part of the record of *how* the decision was reached.
 - Linked from the code it governs (a comment pointing at `docs/adr/0007-*.md` in the `reminder` package) and from runbooks, so an on-call engineer debugging the job table at 2 a.m. can find the reasoning, not just the mechanism.
@@ -201,7 +264,7 @@ An ADR's text is never rewritten once `Accepted`. "Superseded by ADR-0012" is ad
 
 ## 4. Worked example 🟡
 
-The dependency-direction consequence of ADR-0007 is testable, not just stated. The core scheduler never imports a database package — it depends on a `Store` interface the ADR's chosen adapter implements, so the decision can be swapped later (Kafka, SQS) by writing a new adapter, never by touching the scheduler.
+The dependency-direction consequence of ADR-0007 is testable, not just stated. The core scheduler never imports a database package — it depends on a `Store` interface (a list of methods: "claim some jobs", "release a job") that the ADR's chosen **adapter** (the code that actually talks to Postgres) implements, so the decision can be swapped later (Kafka, SQS) by writing a new adapter, never by touching the scheduler.
 
 ```mermaid
 flowchart TD
@@ -218,6 +281,10 @@ flowchart TD
     Main --> Scheduler
     Main --> PG
 ```
+
+In the diagram, `cmd/worker` is the **composition root**: the one `main` place that creates the real Postgres store and hands it to the scheduler.
+
+**What this code does, in plain words:** `Scheduler` asks the store for up to `n` jobs, runs each one, and then tells the store "done" or "failed". It only knows the `Store` interface, so it never sees Postgres.
 
 ```go
 // package reminder — the core. It never imports database/sql or pgx.
@@ -260,6 +327,8 @@ func (s *Scheduler) RunBatch(n int, handle func(Job) error) (int, error) {
 	return done, nil
 }
 ```
+
+**What this code does, in plain words:** this is a pretend Postgres store kept in memory. `Claim` hands out jobs no other worker holds and marks them taken; `Release` deletes a finished job or frees a failed one so it can be tried again.
 
 ```go
 // package storepg — the adapter the ADR picked. It implements
@@ -328,7 +397,9 @@ func (s *Store) Release(id int64, err error) error {
 }
 ```
 
-The test that matters is the one the ADR is really making a promise about: two or more workers can poll at the same instant and never claim the same job. This runs under `go test -race`:
+The test that matters is the one the ADR is really making a promise about: two or more workers can poll at the same instant and never claim the same job. This runs under `go test -race` (Go's test runner with its data-race detector switched on, which flags two goroutines touching the same memory unsafely).
+
+**What this code does, in plain words:** it starts 10 **goroutines** (lightweight Go threads) as 10 workers, lets them claim 100 jobs in batches of 3 at the same time, and then checks that every job was claimed exactly once.
 
 ```go
 func TestClaimNeverDoubleClaims(t *testing.T) {
@@ -427,6 +498,9 @@ func (f *fakeStore) Release(id int64, err error) error {
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to write, review and test an ADR. **Next is the senior view**: which real teams use them, how they go wrong over years, and how to judge which decisions deserve one at all. This is the part interviewers probe.
+
+
 - **Real systems:** AWS, Spotify, GitHub, and most teams that publish engineering blogs describe using lightweight ADRs stored alongside code; the `adr-tools` CLI and `log4brains` (a static site generator for ADR logs) are the common tooling. ThoughtWorks has recommended ADRs on its Technology Radar since 2017.
 - **Failure modes → fixes:**
   - Written long after the decision, from memory → the context section is reconstructed and often wrong; fix by writing the ADR *during* the PR that implements the decision, not after.
@@ -474,6 +548,26 @@ func (f *fakeStore) Release(id int64, err error) error {
 - RFC/design doc = the proposal, written before the decision; ADR = the record, written once it's made.
 - A good ADR states the downside, not just the choice — "Consequences" should include at least one real cost.
 - The decision an ADR records should map to a real code boundary (an interface the core owns), so the choice stays swappable later.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What four parts does every ADR have?
+> Context, Decision, Alternatives considered, and Consequences (plus a Status line).
+
+> [!question]- (easy) You changed your mind about ADR-0007. Do you edit it?
+> No. You write a new ADR (say 0012) and add one line to 0007: "Superseded by ADR-0012".
+
+> [!question]- (easy) Where should ADR files live?
+> In the repo next to the code, under `docs/adr/`, reviewed through a pull request.
+
+> [!question]- (medium) How is an RFC different from an ADR?
+> An RFC is a proposal written before the decision to invite debate; an ADR is the record written once the decision is made.
+
+> [!question]- (medium) Which needs an ADR: choosing Postgres over Kafka for jobs, or using a map inside one function?
+> Postgres over Kafka. It is a one-way door that shapes the whole `reminder` package; the map is cheap to change.
+
+> [!question]- (medium) Why does the worked example put the decision behind a `Store` interface?
+> So the core scheduler never imports Postgres; a later ADR can swap in a queue by writing a new adapter without touching the core.
 
 ## Links 🟢
 

@@ -29,6 +29,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works, with the small whiteboard code), section 4 (the full worked example) and sections 5 and 6 (variants and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Interfaces]]: a one-method interface lets many small types (or functions) be treated the same way.
+> - [[Error Handling]]: a step reports failure by returning an `error`, and `errors.Is` / `errors.As` look inside wrapped errors.
+> - [[Design Patterns Overview and Chooser]]: a pattern is a named answer to "what varies here?"; here, the list of rules varies.
+
 **From zero, in 60 seconds** 🟢
 
 Sometimes a request must pass through a line of small steps, one after another.
@@ -67,6 +72,11 @@ Both are a line of small steps; they differ in when the line stops.
 | Short-circuit | Stop early without running the rest | first failed rule ends the check |
 | Middleware | A step that wraps an HTTP handler | auth check before the real handler |
 | Irreversible work | Something you cannot undo | dispensing cash |
+| Pipeline | A line where every step must say OK | Cart total, first order, city check |
+| Fail-fast | Stop at the first failed step | A ₹300 cart is rejected by rule 1 alone |
+| Collect-all | Run every step and report all failures together | A form showing three field errors at once |
+| Fail open / fail closed | When a check itself breaks: let the request through (open) or block it (closed) | The coupon store times out; block the coupon |
+| Greedy | Take as much as you can at each step | The ATM gives the biggest notes first |
 
 **Picture it**
 
@@ -109,6 +119,10 @@ Support desks have the mirror-image problem. A refund ticket must go to the **ch
 
 The chain turns each rule or approver into its own small unit and turns the order into data: a slice you can read, reorder and test.
 
+### Real-life example 🟢
+
+Picture applying the coupon WELCOME50 at Swiggy checkout. In a blink the app checks a few things in turn: is the cart big enough, is this your first order, have you used the coupon before. The first check that fails gives you the message you see, such as "add ₹120 more to use this coupon". Or picture a refund request in a shopping app's help chat: a bot tries first, then an agent, then a supervisor, and the first one allowed to approve it does. Both are a chain: a line of small checkers, each passing the request on or stopping it.
+
 ## 2. Mental model 🟢
 
 Every link in a chain answers one question about the request, and has exactly three possible answers:
@@ -126,6 +140,8 @@ The two flavours differ in which answers a link may give:
 
 > [!tip] Say which one you mean
 > If no link can stop the chain with a success, you have a pipeline, not classic Chain of Responsibility. Both are useful; they just answer different questions ("who handles this?" vs "is this allowed?").
+
+> 🟢 → 🟡 **You now know** the two kinds of line: a chain where the first step that can handle it wins, and a pipeline where every step must pass. **Next we open the box**: the shape every step shares, how a runner walks the list, and how the coupon pipeline is ordered so cheap checks run first.
 
 ## 3. How it works 🟡
 
@@ -160,7 +176,7 @@ classDiagram
 
 There are two ways to connect the links:
 
-- **A slice of handlers plus a runner** (`Escalate`, `Validate`). The runner owns the loop, so it can log which link decided, time each link, check `ctx.Err()` between links, and no link can forget to call the next one. This is the default in Go.
+- **A slice of handlers plus a runner** (the loop that calls each link in turn: `Escalate`, `Validate`). The runner owns the loop, so it can log which link decided, time each link, check `ctx.Err()` between links, and no link can forget to call the next one. This is the default in Go.
 - **Linked handlers**, where each link holds a `Next` field and calls it itself (`Cassette`, and every HTTP middleware). Each link controls whether and when the next one runs, and can do work after it returns. The price is that a link can forget to call `Next`, and the order is spread across constructors.
 
 **Func-typed handlers.** A one-method interface plus a function type that implements it (`HandlerFunc`, like `http.HandlerFunc`) lets a closure be a link. Most links are a few lines, so most links are functions, and a struct is used only when a link carries configuration or dependencies.
@@ -261,6 +277,15 @@ func main() {
 **In plain words:** One program with four kinds of chain: a helpline-style chain, a coupon pipeline, an ATM dispenser, and HTTP-style steps. Read one form at a time.
 
 One package with all four forms: a classic escalation chain, a coupon pipeline (three of the five rules from section 1) with fail-fast and collect-all, the ATM dispenser as linked handlers, and HTTP middleware.
+
+**Step by step:**
+
+1. `Ticket` is the request, and each link answers with a `Decision`: `Pass`, `Accept` or `Reject`. `HandlerFunc` turns a plain function into a link.
+2. `Escalate` offers a ticket to each link in `supportChain` in order (`fraudGate`, then `approveUpTo(0)`, `approveUpTo(2_000)`, `approveUpTo(20_000)`) and stops at the first `Accept` or `Reject`.
+3. `Validate` runs the `couponRules` on an `Order`. With `failFast` it stops at the first error; without it, it runs all rules and joins the errors.
+4. `WithTimeout` gives the slow `usage_limit` rule its own 50 ms limit.
+5. `Cassette.Plan` works out which notes to pay without touching the counts, and `Withdraw` subtracts them only if the plan worked.
+6. `Chain`, `Health` and `RequireKey` show the same idea as HTTP middleware; `main` runs all four forms.
 
 ```go
 // main.go
@@ -700,6 +725,14 @@ sequenceDiagram
 
 The plan stops as soon as the amount reaches zero: that is the **short-circuit on success**. Withdrawing while walking the chain would be a bug: on the second request the ₹100 cassette would hand out three notes before the chain discovered it could not pay the rest.
 
+## Common beginner mistakes 🟢
+
+- **Mistake:** putting the slow remote check (`usage_limit`) first. → **Why it's wrong:** every cart that a simple field check would reject still pays for a network call of about 20 ms. → **Do this instead:** order the rules cheapest first, as `couponRules` does: `min_cart`, `first_order`, then `usage_limit`.
+- **Mistake:** taking notes out of each `Cassette` while still walking the chain. → **Why it's wrong:** if the amount cannot be paid in full, the machine is left half emptied. → **Do this instead:** work out the whole plan with `Plan` first, and only then subtract counts, as `Withdraw` does.
+- **Mistake:** reporting a failed usage lookup as a broken rule. → **Why it's wrong:** the user is told "coupon already used" when the store was simply down. → **Do this instead:** wrap lookup failures with `%w` and keep `RuleError` for real rule failures.
+- **Mistake:** letting a request fall off the end of the chain with no answer. → **Why it's wrong:** the ticket is silently lost. → **Do this instead:** return a clear error when nobody accepts, like `ErrUnhandled` from `Escalate`.
+- **Mistake:** wrapping middleware in a forward loop. → **Why it's wrong:** the first middleware in the list ends up running last. → **Do this instead:** wrap from the end backwards, as `Chain` does, so `mws[0]` runs first.
+
 ## 5. Variants and comparison 🟡
 
 | Variant | How it works | Stops when | Use when | Cost |
@@ -708,7 +741,7 @@ The plan stops as soon as the amount reaches zero: that is the **short-circuit o
 | Partial handling | Each link handles a share and passes the rest | Nothing left, or end of chain | Splitting work: ATM notes, tiered discounts | Must plan before committing; greedy by nature |
 | Pipeline, fail-fast | Every link must pass | First reject | Dependent checks, expensive later steps | User sees one error at a time |
 | Pipeline, collect-all | Every link runs; errors joined with `errors.Join` | End of chain | Independent checks (form fields) | Runs every rule, including slow ones |
-| HTTP middleware | Linked: each wraps `next` and decides to call it | A link writes a response without calling `next` | Cross-cutting request concerns | Order bugs; a link can forget `next` |
+| HTTP middleware | Linked: each wraps `next` and decides to call it | A link writes a response without calling `next` | Cross-cutting request concerns (needed by every request, such as logging and auth) | Order bugs; a link can forget `next` |
 | Map dispatch (not a chain) | Look up the one handler by key | Always one step | Exactly one handler per known key | Not a chain: no fallbacks or ordering |
 
 **Slice vs linked, in one line:** use a slice and a runner when links are independent checks; use linked handlers when a link must run code both before and after the rest of the chain (timing, recovery, transactions).
@@ -716,26 +749,28 @@ The plan stops as soon as the amount reaches zero: that is the **short-circuit o
 ## 6. Trade-offs and when not to use 🟡
 
 - **Three fixed checks do not need a chain.** A function with three `if` statements is easier to read than a slice of rules and a runner. Reach for the chain when rules are added often, reused across flows, or reordered per configuration.
-- **Exactly one handler per key is a map, not a chain.** Routing an event by its type to one handler is `handlers[event.Type]`: O(1), and no ordering bugs. A chain earns its place when several handlers could match and order decides.
+- **Exactly one handler per key is a map, not a chain.** Routing an event by its type to one handler is `handlers[event.Type]`: O(1) (one quick lookup however many handlers exist), and no ordering bugs. A chain earns its place when several handlers could match and order decides.
 - **Hidden order dependencies.** If rule 3 silently relies on rule 1 having run (for example, it assumes the coupon exists), reordering breaks it. Make such dependencies explicit, or keep those rules in fail-fast mode.
 - **"Who handled this?" is harder to answer.** The decision is spread over links. Return or log the deciding link's name and index, as `Escalate` does.
 - **Business-editable rules want data, not code.** When marketing defines coupon conditions, a rule expression evaluated by an interpreter fits better than compiled links (see [[Rare GoF Patterns in Go]]).
+
+> 🟡 → 🔴 **You now know** how to build both kinds of line in Go, test them, and plan before acting in the ATM case. **Next comes the production view**: where chains live in real Go servers (middleware, interceptors, logging), the bugs they cause, and the finer points such as greedy limits and `errors.Join`.
 
 ## 7. In production 🔴
 
 - **Real systems:**
 	- `net/http` middleware is Go's everyday chain: `func(http.Handler) http.Handler`. A recovery, logging, auth or rate-limit link either calls `next.ServeHTTP` or writes a response and returns. See [[Middleware]] for the backend view and [[Decorator and Middleware]] for the wrapping structure.
-	- gRPC-Go chains unary interceptors with `grpc.ChainUnaryInterceptor`; each interceptor calls `handler` to continue or returns an error to stop.
+	- gRPC-Go chains unary interceptors (functions that run around every single remote call) with `grpc.ChainUnaryInterceptor`; each interceptor calls `handler` to continue or returns an error to stop.
 	- `log/slog`: a `Handler.Enabled` check runs before the record is built and formatted, which is the level filter in the [[Logging Library]] practice problem (LevelFilter → FormatHandler).
 	- The coupon chain in [[Cart Checkout with Coupons]] and the note dispenser in [[ATM]] are the interview versions of this note.
 - **Failure modes → fixes:**
 	- A middleware forgets `next.ServeHTTP` and writes nothing → `net/http` sends `200 OK` with an empty body. Fix: a test per middleware for its pass path, like the `k1` case above.
-	- Recovery middleware placed inside other middleware → a panic in an outer link is not recovered. Fix: put recovery first in `Chain`.
+	- Recovery middleware placed inside other middleware → a panic (Go's crash-style error) in an outer link is not recovered. Fix: put recovery first in `Chain`.
 	- A remote rule with no deadline stalls checkout → wrap it with a per-step timeout (`WithTimeout`) and make the rule honour `ctx`. A rule that ignores `ctx` keeps running past the deadline.
 	- "Could not check" reported as "coupon invalid" → keep validation results (`RuleError`) separate from infrastructure errors (`%w`), and decide fail-open or fail-closed per rule.
 	- A partial-handling chain commits as it walks → plan first, commit after the plan succeeds.
 	- A link mutates the shared request (for example, it upper-cases the coupon code in place) → later links, logs and retries see a request the caller never sent. Fix: pass the request by value, as `Escalate` and `Validate` do, and make any normalisation an explicit first step of the chain.
-- **What to monitor:** decisions per link (accept, reject, pass) as counters labelled with the link name, latency per link as a histogram, the `ErrUnhandled` rate, and timeouts per step.
+- **What to monitor:** decisions per link (accept, reject, pass) as counters labelled with the link name, latency per link as a histogram (a count of calls in time buckets such as under 1 ms, under 10 ms), the `ErrUnhandled` rate, and timeouts per step.
 
 ## 8. Deep dive 🔴
 
@@ -744,8 +779,8 @@ The plan stops as soon as the amount reaches zero: that is the **short-circuit o
 - **Middleware is an onion.** `Chain(h, A, B)` runs A's before-code, then B's, then `h`, then B's after-code, then A's. Code after `next.ServeHTTP` sees the response being written, which is why timing and logging links wrap the whole chain. The ordering rules and the status-capturing wrapper belong to [[Decorator and Middleware]].
 - **A nil receiver ends the linked chain.** `(*Cassette)(nil).Plan(...)` is a legal call because `Plan` checks `c == nil` before touching any field. It removes the "is there a next link?" check from every link.
 - **Cancellation between links.** The runners check `ctx.Err()` before each link, so a client that hung up stops the chain at the next boundary. A link that blocks still needs to honour `ctx` itself (see [[Context Package]]).
-- **Concurrency.** A chain built at startup is shared by every request goroutine. Keep links stateless or guard their state; `Cassette` counts are mutable, so a real ATM serialises withdrawals (one customer at a time per machine, or a mutex). Read-only chains need no locking.
-- **Depth.** A linked chain adds one stack frame per link. Goroutine stacks grow on demand, so tens or hundreds of links are fine; a slice runner has constant depth.
+- **Concurrency.** A chain built at startup is shared by every request goroutine. Keep links stateless or guard their state; `Cassette` counts are mutable, so a real ATM serialises (runs one after another) withdrawals (one customer at a time per machine, or a mutex). Read-only chains need no locking.
+- **Depth.** A linked chain adds one stack frame (one entry in the list of function calls in progress) per link. Goroutine stacks grow on demand, so tens or hundreds of links are fine; a slice runner has constant depth.
 
 ## 9. Interview questions 🔴
 
@@ -777,6 +812,26 @@ The plan stops as soon as the amount reaches zero: that is the **short-circuit o
 - Fail-fast for dependent checks, collect-all with `errors.Join` for independent ones.
 - Keep validation errors (`RuleError`) apart from infrastructure errors (`%w`).
 - Partial handling (ATM): plan, then commit.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What three answers can a link give?
+> Accept (stop with success), reject (stop with failure) or pass (hand it to the next link).
+
+> [!question]- 🟢 In a pipeline, what does reaching the end of the list mean?
+> Success: every step passed. In a classic chain it means nobody handled the request.
+
+> [!question]- 🟢 Why put cheap checks before the remote usage check?
+> So carts that fail a cheap rule never pay for the slow network call.
+
+> [!question]- 🟡 When do you use collect-all instead of fail-fast?
+> When the checks are independent, like form fields, so the user can fix everything in one go.
+
+> [!question]- 🟡 Why must the ATM plan the whole withdrawal before giving out notes?
+> If it hands out notes while walking and later finds it cannot pay the rest, the notes are already gone.
+
+> [!question]- 🟡 The coupon store times out. Should that be reported as "coupon invalid"?
+> No. It is an infrastructure error, kept apart from `RuleError`, and each rule decides to fail open or closed.
 
 ## Links 🟢
 

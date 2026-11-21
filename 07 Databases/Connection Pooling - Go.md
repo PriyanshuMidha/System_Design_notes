@@ -29,10 +29,16 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read all Code steps, Design decisions and Running it.
 > - 🔴 **Interview / SDE-3 prep?** Add the Tests, Pitfalls and Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Transactions and ACID]]: a transaction keeps one connection from `BEGIN` until `COMMIT` or `ROLLBACK`, so it holds a pool slot the whole time.
+> - [[Processes, Threads and Context Switching]]: each PostgreSQL connection is a whole server process, which is why the number of connections must stay small.
+> - The theory twin [[Connection Pooling]] explains borrowing, waiting, Little's Law and leaks in plain words; read its sections 1-3 first.
+
 **From zero** 🟢 — This file is the hands-on twin of [[Connection Pooling]]. It builds a pool out of one Go channel, then uses a fake database driver (every query just sleeps 20 ms) to measure the real Go pool: how a small pool caps speed, how a forgotten `rows.Close()` drains it, and how the fix works. Read the theory note first, then walk the steps top to bottom; the tests prove each claim.
 
 ## Before the code 🟢
 
+- **Goroutines**: Go's lightweight threads; the tests start 40 of them at once to act like 40 users.
 - **Buffered channels** (`chan *Conn`): a queue with a fixed capacity; receiving borrows a connection and sending returns it.
 - **`select`**: waits on several channel operations at once, here "a free connection" or "the deadline passed".
 - **`context.Context`**: carries a deadline or cancellation, so a waiting request can give up cleanly.
@@ -65,7 +71,7 @@ flowchart LR
 
 - Go 1.24. The only dependency is `github.com/jackc/pgx/v5` v5.8.0, used by `config.go`; everything else is the standard library.
 - Layout: a module `pool` with `pool.go`, `config.go`, `fakedb.go`, `overdue.go` and their tests (`pool_test.go`, `overdue_test.go`).
-- Run it with `go vet ./... && go test -race -v ./...`. No database is needed: the tests use the fake driver. `NewPool` needs a real PostgreSQL DSN and is verified to compile only.
+- Run it with `go vet ./... && go test -race -v ./...`. No database is needed: the tests use the fake driver. `NewPool` needs a real PostgreSQL DSN (the connection string: host, port, user, password and database name in one line) and is verified to compile only.
 
 ## How to read this note 🟢
 
@@ -75,6 +81,8 @@ Blocks that belong to one file continue each other, so a function may be cut in 
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** the plan: build a tiny pool, then measure the real Go pool with a fake database. **Next we open the code**: the channel pool, the fake driver, the leaky and fixed query, and the production settings, each with a line-by-line walk.
+
 ### Step 1: the channel pool
 
 **In plain words:** a pool in 30 lines — a channel pre-filled with connections; taking one is borrowing, sending it back is returning, and `select` adds the "give up after a while" rule.
@@ -83,7 +91,7 @@ Blocks that belong to one file continue each other, so a function may be cut in 
 
 A buffered Go channel is that queue: its capacity is the pool size, receiving takes a connection out, and sending puts one back. Using `select` on the channel and `ctx.Done()` gives the "wait with a deadline" behaviour in four lines.
 
-The alternatives are a mutex with a slice and a `sync.Cond`, which cannot wait on a context, or a semaphore from `golang.org/x/sync`, which limits concurrency but does not hold the connection objects.
+The alternatives are a mutex (a lock that lets one goroutine at a time touch shared data) with a slice and a `sync.Cond` (a way to make goroutines sleep until another one signals them), which cannot wait on a context, or a semaphore (a counter that lets at most N goroutines in at once) from `golang.org/x/sync`, which limits concurrency but does not hold the connection objects.
 
 The channel was chosen because it is the smallest correct model; the real `database/sql` pool is much larger because it also opens connections lazily and ages them out.
 
@@ -682,6 +690,8 @@ The earlier measurements with other pool sizes show the same law, time = 40 / po
 
 ## Pitfalls in the code 🔴
 
+> 🟡 → 🔴 **You now know** how the pool, the fake driver and the tests fit together. **Next come the sharp edges**: defaults that quietly hurt, early returns that leak, and the limits of a fake database that never gets tired.
+
 - **`SetMaxIdleConns` defaults to 2.** `newDB` raises it to `maxOpen`; without that, bursts close and reopen connections and the timing numbers mean nothing.
 - **`rows.Next()` returning false closes the rows,** but returning early after a successful `Next` does not. Always `defer rows.Close()` right after the error check.
 - **`NewPool` pings on purpose.** `pgxpool.NewWithConfig` does not connect, so a wrong DSN would otherwise show up on the first request.
@@ -694,6 +704,30 @@ The earlier measurements with other pool sizes show the same law, time = 40 / po
 1. In `TestPoolCapsThroughput`, change the pool size from 4 to 8. Predict the minimum elapsed time and the `WaitCount`, then adjust the assertion and run it.
 2. Remove `db.SetMaxIdleConns(maxOpen)` from `newDB` and run with `maxOpen = 4`. Predict which `DBStats` counter starts to climb, and print it.
 3. In `TestLeakedRowsExhaustThePool`, pass a cancellable context to `FirstOverdueLeaky` and cancel it. Predict what `InUse` becomes and how long it takes.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- In the channel pool, what does receiving from `free` mean?
+> Borrowing a connection; sending it back to `free` is returning it.
+
+> [!question]- Why does the fake driver sleep 20 ms per query?
+> So every query takes the same time, and the measured numbers come only from the pool, not from disk or network noise.
+
+> [!question]- Which single line is the whole difference between `FirstOverdueLeaky` and `FirstOverdue`?
+> `defer rows.Close()`.
+
+🟡 Medium
+
+> [!question]- Pool of 8, 40 queries of 20 ms each, all at once. What is the minimum time?
+> 40 / 8 = 5 rounds x 20 ms = 100 ms.
+
+> [!question]- Why does `newDB` call `SetMaxIdleConns(maxOpen)`?
+> The default keeps only 2 idle, so a burst would close and reopen connections, and the test would measure reconnects instead of queueing.
+
+> [!question]- Why does a leak under a cancellable context heal, but not under `context.Background()`?
+> `database/sql` closes the rows when the query's context ends; `context.Background()` never ends.
 
 ## Links
 

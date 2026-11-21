@@ -26,12 +26,16 @@ type: implementation
 > - 🟡 **Know the basics?** Read each Code section's Concept + How it works, then the Tests.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]]: an IPv4 address is just a number that names one machine.
+> - [[IP Addressing, Subnets, NAT and VPC Basics]] (theory twin): `/N` fixes the first N bits, and a `/16` splits into 16 `/20`s.
+
 **From zero** 🟢 — This file is the runnable version of the IP addressing theory note. It is one small Go package that does subnet math: how many devices fit in a block, where a block starts and ends, how to split a big block into smaller ones (the AWS VPC example), and whether an address is private. Read the theory note first; here, read each "Concept" line, then the code, then "How it works".
 
-- **`net` package:** `net.ParseCIDR` parses `"10.0.0.0/16"` into an address and a `*net.IPNet` (address + mask).
+- **`net` package:** `net.ParseCIDR` parses `"10.0.0.0/16"` into an address and a `*net.IPNet` (address + mask; the mask is the `/16` written as bits: 16 ones, then zeros).
 - **`net.IP`:** a byte slice holding an address; `To4()` gives its 4-byte IPv4 form.
 - **Bit shifts on `uint32`:** `toUint32`/`fromUint32` pack 4 bytes into one integer so address math is plain addition.
-- **Errors as values:** functions return `(result, error)` instead of panicking on bad input.
+- **Errors as values:** functions return `(result, error)` instead of panicking (crashing the program) on bad input.
 - **Table-driven tests:** tests loop over a `map` of input to expected output and report each mismatch with `t.Errorf`.
 - **What to run:** `go vet ./... && go test -race ./...` in the module folder.
 
@@ -77,6 +81,8 @@ go test -race -v ./...
 ```
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** the four jobs: count usable hosts, find a block's first and last address, split a block, and spot private addresses. **Next we read the code** for each, plus two helpers that turn an address into one plain number so the math is simple addition.
 
 ### Counting usable hosts
 
@@ -164,7 +170,7 @@ func Bounds(cidr string) (network, broadcast net.IP, err error) {
 
 1. `net.ParseCIDR` already normalizes the address down to the block's network address inside `ipNet.IP` — that's why `network` can be read straight off it rather than computed separately.
 2. `ipNet.Mask.Size()` returns `(ones, bits)`: the prefix length and the total address width (32 for IPv4). `hostBits := bits - ones` is exactly the number of bits free to vary within the block.
-3. The broadcast address starts as a copy of the network address, then flips every host bit to `1` — one bit at a time, from the least significant bit upward — which is the bit-level version of "set the host portion to all ones."
+3. The broadcast address starts as a copy of the network address, then flips every host bit to `1` — one bit at a time, from the least significant bit (the rightmost, smallest-value bit) upward — which is the bit-level version of "set the host portion to all ones."
 4. `byteIdx := 3 - i/8` walks from the last byte backward as `i` grows, since IPv4 addresses are stored most-significant-byte-first but host bits are the *least* significant ones.
 
 ### Splitting a block into equal subnets
@@ -173,7 +179,7 @@ func Bounds(cidr string) (network, broadcast net.IP, err error) {
 
 **Concept.** This is the function behind the theory note's `/16 → /20` VPC worked example: given a parent CIDR block and a longer (more specific) prefix, it returns every equal-sized child subnet, in address order.
 
-The alternative of returning an iterator instead of a fully materialized slice was rejected because the counts involved in a VPC's typical subnet split (tens, not millions) are small enough that a slice is simpler to test and to consume.
+The alternative of returning an iterator (something that hands out one result at a time) instead of a fully materialized slice (all results built up front) was rejected because the counts involved in a VPC's typical subnet split (tens, not millions) are small enough that a slice is simpler to test and to consume.
 
 ```go
 // Subnets splits a CIDR block into n equal subnets of the given new prefix
@@ -237,7 +243,7 @@ func fromUint32(v uint32) net.IP {
 
 It is deliberately a membership check against exactly three hardcoded CIDR blocks, rather than a general "is this address globally routable" classifier, because those are the only ranges the theory note's table claims to cover.
 
-Scope creep here (handling loopback, link-local, multicast, and so on) would test claims the theory note does not make.
+Scope creep here (handling loopback, link-local, multicast — one address that reaches a group of machines — and so on) would test claims the theory note does not make.
 
 ```go
 // IsPrivate reports whether ip falls in an RFC 1918 private range.
@@ -281,6 +287,8 @@ func IsPrivate(ipStr string) (bool, error) {
 | /32 | 1 |
 | /30 | 2 |
 
+**What this code does, in plain words:** it loops over a few prefixes (`/24`, `/20`, `/16`, `/31`, `/32`, `/30`) and checks `UsableHosts` returns the expected count for each.
+
 ```go
 func TestUsableHosts(t *testing.T) {
 	cases := map[int]int{24: 254, 20: 4094, 16: 65534, 31: 2, 32: 1, 30: 2}
@@ -306,6 +314,8 @@ A failure here would mean the function miscounted a prefix's block size, which w
 | --- | --- | --- |
 | `10.0.1.17/24` | `10.0.1.0` | `10.0.1.255` |
 
+**What this code does, in plain words:** it asks for the bounds of `10.0.1.17/24` and checks the answer is `10.0.1.0` to `10.0.1.255`.
+
 ```go
 func TestBounds(t *testing.T) {
 	network, broadcast, err := Bounds("10.0.1.17/24")
@@ -330,6 +340,8 @@ A failure here would mean the host-bit-flipping loop in `Bounds` has an off-by-o
 | Input | Expected count | First subnet | Second subnet | Last subnet |
 | --- | --- | --- | --- | --- |
 | `10.0.0.0/16` split to `/20` | 16 | `10.0.0.0/20` | `10.0.16.0/20` | `10.0.240.0/20` |
+
+**What this code does, in plain words:** it splits `10.0.0.0/16` into `/20`s and checks there are 16 pieces, starting at `10.0.0.0/20`, then `10.0.16.0/20`, ending at `10.0.240.0/20`.
 
 ```go
 func TestSubnetsSplitsAVPCBlock(t *testing.T) {
@@ -362,6 +374,8 @@ A failure here would mean the step-size or base-address arithmetic in `Subnets` 
 | `192.168.1.1` | private |
 | `8.8.8.8` | not private |
 | `1.1.1.1` | not private |
+
+**What this code does, in plain words:** it checks a list of addresses, including `172.32.0.1` just past a private range, and makes sure each is marked private or not as expected.
 
 ```go
 func TestIsPrivate(t *testing.T) {
@@ -405,6 +419,8 @@ ok  	net02	1.530s
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** how each function works and what the tests check. **Next, the advanced part**: why each design was picked, the byte-order and special-case traps, and exercises such as building `Supernet`.
+
 | Decision | Alternative considered | Trade-off |
 | --- | --- | --- |
 | Compute `UsableHosts` from the prefix length | Hardcode a lookup table for common prefixes | Generalizes to any `/0`–`/32`; a table would need an entry per prefix used |
@@ -435,13 +451,33 @@ Reading it: each `RUN`/`PASS` pair is one top-level test function; the overall `
 
 - **`Bounds` and `Subnets` both call `.To4()` and treat a `nil` result as an error** — forgetting this check anywhere that accepts a `net.IP` would silently panic or misbehave on an IPv6 address, since none of the bit arithmetic here is written to handle 16-byte addresses.
 - **`UsableHosts` must special-case `/31` and `/32` *before* the general formula**, not after: the general formula's `total - 2` would return `-1` for a `/32` (block size 1) if the special cases were missing, which is a classic reserved-address off-by-one.
-- **`toUint32`/`fromUint32` assume a 4-byte big-endian `net.IP`** — passing a `net.IP` that hasn't been normalized with `.To4()` first (which can be either 4 or 16 bytes depending on how it was constructed) would read the wrong bytes.
+- **`toUint32`/`fromUint32` assume a 4-byte big-endian (most important byte first) `net.IP`** — passing a `net.IP` that hasn't been normalized with `.To4()` first (which can be either 4 or 16 bytes depending on how it was constructed) would read the wrong bytes.
 
 ## Exercises 🔴
 
 1. Add an `IsPrivate` case for `127.0.0.1` (loopback). Predict whether the current three-block check classifies it as private, and explain why RFC 1918 and loopback are different reservations even though both are "never publicly routable."
 2. Change `Subnets("10.0.0.0/16", 20)` to request `newPrefix: 15` (shorter than the parent's `/16`) instead. Predict what the function returns, and check it against the explicit error the code already raises for this case.
 3. Add a function `Supernet(childCIDR string) (string, error)` that computes the `/N-1` block a given child subnet belongs to — the inverse operation of `Subnets`. Predict which existing helper function (`toUint32`, `fromUint32`, or neither) you'll reuse, before writing it.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What does `UsableHosts(24)` return?
+> 254: 256 addresses minus the network and broadcast addresses.
+
+> [!question]- 🟢 What are the bounds of `10.0.1.17/24`?
+> Network `10.0.1.0`, broadcast `10.0.1.255`.
+
+> [!question]- 🟢 Is `172.32.0.1` private?
+> No. The private range `172.16.0.0/12` ends at `172.31.255.255`.
+
+> [!question]- 🟡 Why convert addresses to `uint32` before splitting?
+> Adding a step to one integer is simpler and safer than carrying between 4 separate bytes.
+
+> [!question]- 🟡 Why must `/31` and `/32` be handled before the "minus 2" rule?
+> For `/32` the rule would give 1 − 2 = −1; these two sizes reserve nothing.
+
+> [!question]- 🟡 What `step` does `Subnets` use when splitting into `/20`s?
+> `1 << (32 − 20)` = 4,096 addresses per subnet.
 
 ## Links 🟢
 

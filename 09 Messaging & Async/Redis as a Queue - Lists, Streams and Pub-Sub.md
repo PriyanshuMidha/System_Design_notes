@@ -33,6 +33,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (lists, streams, pub/sub, delayed jobs), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Queues vs Streams and Broker Comparison]]: a queue gives each message to one worker; a log keeps messages and lets groups of readers keep bookmarks.
+> - [[Redis Data Structures and When to Use Each]]: Redis lists, sorted sets and streams, and what each command does.
+> - [[Background Jobs and Worker Pools]]: slow work becomes jobs that a pool of workers takes from a queue, with retries and dead letters.
+
 **From zero, in 60 seconds** 🟢
 
 Redis is a very fast store that keeps data in memory.
@@ -78,6 +83,10 @@ You can, but only if you pick the right Redis structure, or jobs quietly get los
 | Ack | Worker saying "this job is done" | `XACK` after the email is sent |
 | Consumer group | Team of workers sharing one stream | Group `mailers` with c1 and c2 |
 | Idempotent | Running twice has the same effect as once | Skip email if already marked sent |
+| PEL (pending entries list) | A stream group's list of entries handed out but not yet acked | Entry 43 with worker c1, 1 delivery |
+| Processing list | A worker's own "in progress" list in the list-queue pattern | `jobs:email:processing:w1` |
+| AOF | Redis's append-only file: a log of writes on disk so data survives a restart | `appendfsync everysec` |
+| Failover | A replica taking over when the main Redis dies | Sentinel promotes a replica |
 
 **Picture it**
 
@@ -112,6 +121,8 @@ Adding RabbitMQ or Kafka means another cluster to run, monitor and secure.
 Redis can do the job: on a laptop (Apple M4, Redis 8.2.1, `redis-benchmark` with its default 50 clients and no pipelining), `LPUSH` measured about 183,000 ops/s, `RPOP` about 188,000 ops/s and `XADD` about 171,000 ops/s, each with a p50 latency near 0.2 ms.
 That is two orders of magnitude more than this team needs.
 
+**Real-life example.** A food app sends "your order is out for delivery" push notifications. Many teams build that with Redis because it is already running for caching. If they use a plain list and a worker crashes right after popping a job, that customer never gets the notification. With a stream and a consumer group, the unfinished job stays on record and another worker picks it up. And if they use Pub/Sub, any notification sent while the worker is restarting is simply lost.
+
 The catch is that the obvious Redis queue is not reliable, and the most obvious "messaging" command, `PUBLISH`, is not a queue at all. This note shows which structure to use and how to close the gaps. Data-structure basics are in [[Redis Data Structures and When to Use Each]].
 
 **Which Redis tool for which need:**
@@ -130,6 +141,14 @@ flowchart TD
 - **Stream:** a numbered logbook. Entries stay in the book. Each team (consumer group) has a bookmark and a list of entries handed out but not signed off (the PEL). A supervisor can reassign unsigned entries from an absent member.
 - **Pub/Sub:** a radio broadcast. Whoever is tuned in hears it; nobody can rewind.
 
+## Common beginner mistakes 🟢
+
+- **Using `BRPOP` for jobs that must not be lost** → the job leaves Redis the moment it is popped, so a crash loses it → use `BLMOVE` into a processing list, or a stream with a consumer group.
+- **Using Pub/Sub as a job queue** → it stores nothing, so messages sent during a restart vanish → use Streams for anything that must be done.
+- **Never trimming a stream** → `XACK` does not delete entries, so memory grows until Redis runs out → add `MAXLEN ~` or `MINID` to every `XADD`.
+- **Not reclaiming stuck entries** → entries held by a dead consumer sit in the PEL forever → run an `XAUTOCLAIM` loop and dead-letter after a few deliveries.
+- **Running the queue Redis with an evicting memory policy** → Redis may delete queue keys to free memory → use `noeviction` on a Redis that holds queues.
+
 **The three mental models, drawn:**
 
 ```mermaid
@@ -141,9 +160,18 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that Redis offers three tools that look alike but behave very differently: lists (a pile), streams (a kept logbook) and Pub/Sub (live radio). **Next we open the box**: how to make a list safe against crashes, how stream groups track who has what, why Pub/Sub keeps nothing, and how to delay a job.
+
 ### List queue and the lost-job problem
 
 **In plain words:** popping a job removes it from Redis, so a crash right after loses it. The fix is to move the job to your own "in progress" list instead.
+
+**Step by step:**
+1. The web app pushes "email user 42" onto `jobs:email`.
+2. Unsafe way: worker w1 runs `BRPOP`. The job leaves Redis. If w1 crashes now, the job is gone.
+3. Safe way: w1 runs `BLMOVE`, which moves the job into `jobs:email:processing:w1` in one step.
+4. w1 sends the email, then removes the job from its processing list with `LREM`. That is the ack.
+5. If w1 crashes before that, the job is still in its processing list, and w1 (or a reaper) puts it back on `jobs:email`.
 
 ```text
 producer:  LPUSH jobs:email '{"id":"j1"}'
@@ -176,13 +204,20 @@ Measured on Redis 8.2.1:
 ```
 
 - `BLMOVE` (since Redis 6.2) replaces the deprecated `BRPOPLPUSH`. It pops from `jobs:email` and pushes onto the processing list in one atomic step, so the job is always in exactly one of the two lists.
-- With a **processing list per worker**, a restarting worker moves its own leftovers back. With a **shared processing list**, you need a **reaper**: a process that requeues jobs whose owner's heartbeat key has expired, or that have been in the list longer than a timeout (store a claim timestamp in a hash, since a list holds no metadata).
+- With a **processing list per worker**, a restarting worker moves its own leftovers back. With a **shared processing list**, you need a **reaper**: a process that requeues jobs whose owner's heartbeat key (a key the worker keeps refreshing to say "I am alive") has expired, or that have been in the list longer than a timeout (store a claim timestamp in a hash, since a list holds no metadata).
 - `LREM` scans the list, so keep processing lists short (one or a few jobs per worker).
 - Lists have no retry counter, no delay and no dead-letter. You build them: a retry count inside the payload, a sorted set for delays, a `jobs:email:dead` list.
 
 ### Streams with consumer groups
 
 **In plain words:** a stream keeps every entry; each group hands entries to workers, remembers who has which, and lets someone else take over an entry left too long.
+
+**Step by step:**
+1. The app adds "order 42" to the stream `orders` with `XADD`. The entry stays in the stream.
+2. Group `billing` hands it to worker c1. It goes on the group's PEL: "with c1, 1 delivery".
+3. c1 crashes before `XACK`. The entry stays on the PEL, idle and growing older.
+4. After it has been idle more than 1 second, c2 runs `XAUTOCLAIM`, takes it over, and its delivery count becomes 2.
+5. c2 finishes and runs `XACK`. The entry leaves the PEL but is still in the stream until trimming removes it.
 
 ```mermaid
 sequenceDiagram
@@ -266,6 +301,12 @@ Read it line by line: c1 got both entries and acked only the first.
 
 **In plain words:** Pub/Sub is live only: it sends to whoever is connected right now and keeps nothing, so it is not a queue.
 
+**Step by step:**
+1. Two dashboard servers subscribe to channel `prices`.
+2. The app runs `PUBLISH prices "ABC 101"`. Redis sends it to both servers right away and keeps no copy.
+3. One server is restarting at that moment. It never sees "ABC 101", and there is no way to get it back.
+4. A third server is connected but slow. Its unread messages pile up on Redis; past the buffer limit, Redis disconnects it.
+
 ```text
 127.0.0.1:6394> PUBLISH news hello
 (integer) 0          <- number of subscribers that received it: nobody was listening, so it is gone
@@ -281,6 +322,12 @@ Read it line by line: c1 got both entries and acked only the first.
 ### Delayed jobs with a sorted set
 
 **In plain words:** store each job with its run time as the score; a poller moves jobs whose time has come into the real queue.
+
+**Step by step:**
+1. "Send reminder to user 42 at 10:30" is added to a sorted set with score = the 10:30 timestamp.
+2. A poller wakes every second and asks for jobs with a score up to "now".
+3. At 10:30 it finds the reminder and tries to remove it with `ZREM`.
+4. Only the poller whose `ZREM` returns 1 pushes the job onto the ready queue, so two pollers never both enqueue it.
 
 ```text
 127.0.0.1:6394> ZADD jobs:delayed 1762250700 job-7 1762250460 job-8      (score = run_at, unix seconds)
@@ -636,6 +683,8 @@ Both still deliver at least once.
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the safe list pattern, how stream groups ack and reclaim, why Pub/Sub is lossy, how to delay jobs, and tested Go code for both safe patterns. **Next is the advanced part**: real systems built on Redis queues, the failures they hit, and how streams are stored and ordered inside.
+
 - **Real systems:** Sidekiq (Ruby), BullMQ (Node) and asynq (Go) all run job queues on Redis at large scale. Redis Streams are common as a lightweight event bus inside one product, and for activity feeds and IoT ingestion where retention is hours.
 - **Failure modes → fixes:**
 	- Worker crash after `BRPOP` → job lost; switch to `BLMOVE` or Streams.
@@ -651,7 +700,7 @@ Both still deliver at least once.
 
 **How streams are stored.** A stream is a radix tree whose nodes are listpacks holding many entries (`stream-node-max-entries`, default 100, measured on this server).
 
-Entries with the same fields are delta-encoded against the node's first entry, which is why streams with stable field names are compact.
+Entries with the same fields are **delta-encoded** (stored as just the differences) against the node's first entry, which is why streams with stable field names are compact.
 
 Trimming with `~` drops whole nodes, which is why it is cheap; exact `MAXLEN` may have to split a node.
 
@@ -667,7 +716,7 @@ For per-entity order, shard streams by entity key and give each shard one consum
 
 **Delivery count semantics.** The delivery counter is incremented by `XREADGROUP` with `>`, by `XCLAIM` and by `XAUTOCLAIM` (the measured run above shows 1 → 2 after a claim). Re-reading your own pending entries with ID `0` increments it too (measured on 8.2.1: 1 → 2); do not depend on exact counts for correctness, only as a poison-message threshold.
 
-**Atomic dead-lettering.** Copy-to-DLQ then ack must not leave an entry in both or neither. A `MULTI`/`EXEC` block (as in the Go code) or a Lua script makes the two writes atomic on the server. Because both keys must be on the same shard in Cluster, name them with a hash tag: `{orders}` and `{orders}:dlq`.
+**Atomic dead-lettering.** Copy-to-DLQ then ack must not leave an entry in both or neither. A `MULTI`/`EXEC` block (as in the Go code) or a Lua script makes the two writes atomic on the server. Because both keys must be on the same shard in Cluster, name them with a **hash tag** (the part of a key in `{}`, which alone decides the shard): `{orders}` and `{orders}:dlq`.
 
 **Exactly-once is still not available.** Between "handler finished" and "`XACK` reached Redis" a crash leads to redelivery. Redis transactions cannot include your database write. Store the processed entry ID in your database in the same transaction as the effect, and skip IDs already seen.
 
@@ -711,6 +760,30 @@ flowchart LR
 - Durability: AOF `everysec` ≈ 1 s loss window; async replication loses writes on failover. Idempotent handlers.
 - Go: go-redis for raw commands, asynq for a job system.
 - Long retention, replay, more data than RAM → Kafka; zero-ops AWS → SQS.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What happens to a job popped with `BRPOP` if the worker crashes right after?
+> It is lost; it already left Redis.
+
+> [!question]- Does Redis Pub/Sub keep messages for subscribers who are offline?
+> No. It keeps nothing; offline subscribers miss them.
+
+> [!question]- Does `XACK` delete an entry from the stream?
+> No. It only removes it from the group's pending list; trimming deletes entries.
+
+🟡 Medium
+
+> [!question]- How does a stream group recover an entry from a dead consumer?
+> Another consumer runs `XAUTOCLAIM` to take entries idle longer than a set time.
+
+> [!question]- How do you dead-letter a stream entry that keeps failing?
+> When its delivery count passes a limit, copy it to a DLQ stream and `XACK` it, both in one `MULTI`/`EXEC`.
+
+> [!question]- Why can a Redis queue lose jobs on failover even with AOF?
+> Replication is asynchronous, so a promoted replica may not have the newest entries.
 
 ## Links
 

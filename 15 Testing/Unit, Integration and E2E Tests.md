@@ -29,6 +29,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Testing Strategy and the Test Pyramid]]: tests come in three sizes (many small unit tests, some integration tests, a few end-to-end tests), and each size runs at a different stage of CI.
+
 **From zero, in 60 seconds** 🟢
 
 Your code talks to other things: a database, another service, a browser.
@@ -66,6 +69,12 @@ This note explains the three test levels and how to write each one in Go.
 | Table-driven test | One test looping over many input/output rows | `[]struct{in, want int}` |
 | `t.Run` | Runs a named sub-test | `t.Run("negative", ...)` |
 | Testcontainers | A library that starts real services in Docker for tests | A throwaway Postgres |
+| Goroutine | A lightweight thread in Go; many can run at once | `go svc.Pay(ctx, "inv-1")` |
+| Race detector | Go's `-race` flag that catches two goroutines touching the same memory unsafely | `go test -race ./...` |
+| `httptest` | Go's package for fake requests, fake response writers and throwaway local servers | `httptest.NewServer(handler)` |
+| sqlmock | A fake SQL driver that matches queries by pattern and returns canned rows | Pretends `UPDATE` worked |
+| Build tag | A comment at the top of a Go file that includes it only when asked | `//go:build integration` |
+| docker-compose | A tool that starts several containers together from one file | API + Postgres + payment stub |
 
 **Picture it**
 
@@ -102,6 +111,10 @@ Only a test that runs this exact query against a real (or real-enough) Postgres 
 
 E2E tests close a further gap: that the HTTP handler, the service, and the database are wired together correctly as one deployed binary, which no amount of testing any one piece in isolation proves.
 
+### Real-life example: placing a BookMyShow booking 🟢
+
+Picture the "book seats" feature of a ticket app like BookMyShow. A unit test checks the price rule: 3 seats at ₹250 plus a ₹30 fee is ₹780, with no database involved. An integration test saves a booking into a real Postgres and checks that the "one booking per seat" rule really rejects a second booking for seat D7. An end-to-end test starts the whole app, calls the real "book" API, and checks that the booking appears in "My bookings". Each catches a bug the others cannot see.
+
 ```mermaid
 flowchart LR
     B1["Bug in a math rule"] --> U["Caught by unit test"]
@@ -130,7 +143,17 @@ flowchart TB
     end
 ```
 
+## Common beginner mistakes 🟢
+
+- **Calling a test with a mocked database an "integration test"** → no real SQL ever runs, so a wrong column passes → use a real Postgres (testcontainers) for repository tests.
+- **Writing E2E tests for every edge case** → the suite gets slow and flaky → test edge cases in unit tests; keep E2E for a few key journeys.
+- **Unit tests that secretly call the network** → slow and flaky → replace the dependency with a fake.
+- **One container per test case** → the suite takes ages → start one container per package and give each test its own data.
+- **Using `time.Sleep` to wait for a goroutine** → passes on your laptop, fails in CI → wait on a signal (channel, condition) or use `testing/synctest`.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that the three kinds differ only in how much is real. **Next we open the box**: how each kind is written in Go, which tools draw each boundary (`t.Run`, `httptest`, testcontainers, sqlmock), and the Go flags that keep tests honest (`-race`, `-short`, coverage).
 
 ```mermaid
 flowchart TB
@@ -167,6 +190,13 @@ sequenceDiagram
 
 **In plain words: one test function, a list of cases, and a loop that checks each case.**
 
+**Step by step:**
+1. Write one test function, `TestInvoiceService_Pay`.
+2. Inside it, list the cases as rows: name, input, expected error ("unknown invoice", "nothing owing").
+3. Loop over the rows; for each, call `t.Run(name, ...)` so it gets its own pass/fail line.
+4. Mark cases `t.Parallel()` so they run at the same time, which also exposes hidden shared state.
+5. Put repeated checks in a helper marked `t.Helper()`, and teardown in `t.Cleanup()`.
+
 Go's idiom is one test function per behaviour, driving a table of cases through `t.Run` subtests:
 
 ```go
@@ -193,14 +223,21 @@ func TestInvoiceService_Pay(t *testing.T) {
 - `t.Run(name, fn)` gives each case its own pass/fail line and its own failure isolation — one case failing doesn't stop the others from reporting.
 - `t.Parallel()` inside both the outer test and each subtest runs independent cases concurrently, which also *surfaces* hidden shared-state bugs (a flaky-test smell) instead of hiding them.
 - `t.Helper()` inside a shared assertion function makes failure line numbers point at the caller, not the helper.
-- `t.Cleanup(fn)` registers teardown that runs even if the test fails, in LIFO order — the modern replacement for a manual `defer` block when the cleanup is set up inside a helper the test itself didn't write.
-- **Golden files**: for tests whose expected output is large (a rendered template, a JSON payload), write the expected output to a `testdata/*.golden` file and compare against it, regenerating with a `-update` flag rather than hand-editing a giant string literal in the test.
+- `t.Cleanup(fn)` registers teardown that runs even if the test fails, in LIFO order (last registered, first run) — the modern replacement for a manual `defer` block when the cleanup is set up inside a helper the test itself didn't write.
+- **Golden files** (saved files holding the expected output): for tests whose expected output is large (a rendered template, a JSON payload), write the expected output to a `testdata/*.golden` file and compare against it, regenerating with a `-update` flag rather than hand-editing a giant string literal in the test.
 
 The full table-driven suite for `InvoiceService.Pay`, exercising five cases through `fakeStore`/`stubProvider`/`dummyNotifier`, is built out in [[Test Doubles and Mocking in Go]] — this note focuses on the layer boundary, that one on the doubles themselves.
 
 ### Integration: `net/http/httptest` for the HTTP boundary
 
 **In plain words: httptest gives you a fake web server or a fake request, so you can test HTTP code without a real network.**
+
+**Step by step:**
+1. To test your own handler: build a request with `httptest.NewRequest`, a recorder with `httptest.NewRecorder()`, call `handler.ServeHTTP(rec, req)`, then read `rec.Code` and `rec.Body`.
+2. To test your own HTTP client: start `httptest.NewServer` with a tiny handler that returns `{"reference":"ext-ref","status":"succeeded"}`.
+3. Point the client at `server.URL` and call `Charge(ctx, "inv-1", 500)`.
+4. The request really travels over a local socket (a network connection on your own machine), so header and body bugs show up.
+5. `defer server.Close()` shuts it down.
 
 `httptest` gives two different things real, for two different directions:
 
@@ -223,9 +260,16 @@ result, err := provider.Charge(ctx, "inv-1", 500)
 
 **In plain words: start a real database in a throwaway container, or fake the database driver. Each answers a different question.**
 
+**Step by step:**
+1. sqlmock: you say "expect a query matching `UPDATE invoices` and return 1 row affected". Fast, but it never checks the SQL is valid.
+2. testcontainers: the test starts `postgres:17-alpine` in Docker and loads `testdata/schema.sql`.
+3. Your real `SQLInvoiceStore.MarkPaid` runs its real `UPDATE` against that real database.
+4. A renamed column or broken `WHERE` now fails the test, as it would in production.
+5. Share one container per test package and stop it at the end, so the suite stays fast.
+
 Two different tools answer two different questions about `SQLInvoiceStore`:
 
-- **sqlmock** (`github.com/DATA-DOG/go-sqlmock`) replaces the `*sql.DB` with a driver that matches queries against a regex and returns canned rows. It never parses or plans SQL, so it proves "my code sends roughly this query and handles these rows back correctly," but a column that doesn't exist, or a constraint violation, still passes.
+- **sqlmock** (`github.com/DATA-DOG/go-sqlmock`) replaces the `*sql.DB` with a driver that matches queries against a regex (a text pattern) and returns canned rows. It never parses or plans SQL, so it proves "my code sends roughly this query and handles these rows back correctly," but a column that doesn't exist, or a constraint violation, still passes.
 - **testcontainers-go** starts an actual Postgres in a Docker container for the test, so the real query runs against the real schema: a renamed column, a `NOT NULL` violation, or a `WHERE` clause matching zero rows are all caught for real.
 
   This is slower (hundreds of milliseconds to seconds to start a container, usually shared per test *package* rather than per test case) but it's the only one of the two that's a true integration test.
@@ -254,6 +298,13 @@ Use sqlmock for a fast smoke test of simple, stable queries; use testcontainers-
 
 **In plain words: run the real app and real database together, but only for the few journeys that matter most.**
 
+**Step by step:**
+1. docker-compose starts Postgres and a stub payment service.
+2. The test starts the real InvoiceOps binary pointed at them.
+3. It sends a real `POST /invoices/inv-1/pay` over HTTP.
+4. It checks the reply, then checks the invoice row is `paid` and a receipt event was published.
+5. It runs nightly or before release, not on every pull request.
+
 An E2E test for InvoiceOps starts the real API binary against a docker-compose stack (Postgres + a stubbed payment sandbox), sends a real `POST /invoices/{id}/pay` over HTTP, and asserts the invoice ends up paid and a receipt event was published.
 
 It is the only layer that proves the handler, service, repository, and database are wired together correctly as deployed — and the slowest and most failure-ambiguous layer (a failure could be the business logic, the wiring, or the environment), so it's reserved for the handful of journeys that matter most (see [[Testing Strategy and the Test Pyramid]] for the risk-based selection).
@@ -261,6 +312,12 @@ It is the only layer that proves the handler, service, repository, and database 
 ### `go test -race` and `testing/synctest`
 
 **In plain words: the race flag catches two goroutines touching the same data; synctest lets you test timing code without real waiting.**
+
+**Step by step:**
+1. A test starts two goroutines that both call `Pay` on `inv-1`.
+2. Run it with `go test -race`. If both write the same field without a lock, the race detector prints both stack traces and fails the test, even if the result looked right.
+3. For code that waits on timers (`time.After`, timeouts), run it inside `testing/synctest`, where a fake clock jumps forward instantly.
+4. The test finishes in milliseconds instead of waiting real seconds.
 
 `go test -race ./...` instruments every test with the race detector, catching concurrent unsynchronized access to shared memory — exactly the class of bug in "two goroutines call `Pay` on the same invoice concurrently." It should run at the unit layer, on every PR, because it's cheap and catches bugs that are otherwise nearly impossible to reproduce reliably.
 
@@ -327,9 +384,12 @@ If the unit suite creeps past a minute, the fix is almost always "something that
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to write each kind of test in Go and which tool draws each boundary. **Next we look at real practice**: how teams run container-based suites in CI without collisions, what to monitor about each layer, and the deeper rules for parallel database tests and where to put fakes.
+
+
 - **Real systems**: testcontainers is widely used at companies running Go microservices against Postgres/Kafka/Redis in CI (the project's own adopter list includes many fintech-adjacent companies, consistent with InvoiceOps's domain); `httptest.NewServer` is the standard way the Go standard library itself tests `net/http` client code.
 - **Failure modes → fixes**:
-  - *Integration suite flakes because containers from different test packages collide on a port or share state* → one container per package (`TestMain`), not per test case; namespace data per test (see [[Test Data Strategy]]).
+  - *Integration suite flakes because containers from different test packages collide on a port or share state* → one container per package (`TestMain`, a special function that runs once before all tests in a package), not per test case; namespace data per test (see [[Test Data Strategy]]).
   - *E2E suite is the only thing that catches a class of bug repeatedly* → that's a signal the bug belongs at a lower layer; add an integration or unit test for it so the fast suite catches the next regression.
 - **What to monitor**: per-layer suite duration over time (catches a slow test sneaking into the wrong layer), and which layer actually caught each production incident retroactively (if integration never catches anything, either it's redundant or it's testing the wrong things).
 
@@ -384,6 +444,26 @@ The rule: in a test at layer N, only fake the things layer N doesn't own — Inv
 - Table-driven tests + `t.Run`/`t.Parallel`/`t.Helper`/`t.Cleanup` are the Go-idiomatic backbone at every level.
 - Never mock the thing an integration test exists to verify — mock only at your own ports.
 - `go test -race` belongs in the unit-layer PR gate; it's cheap and catches a whole class of bug other layers can't reliably reproduce.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is the one thing that differs between unit, integration and E2E tests?
+> How much of the system is real.
+
+> [!question]- (easy) Which level catches a wrong column name in an SQL query?
+> Integration, with a real database.
+
+> [!question]- (easy) What does `t.Run` give each case?
+> Its own name and its own pass/fail result.
+
+> [!question]- (medium) When do you use `httptest.NewServer` instead of `httptest.NewRecorder`?
+> `NewServer` to test an HTTP client you own over a real local socket; `NewRecorder` to test a handler you own in-process.
+
+> [!question]- (medium) Why is sqlmock weaker than testcontainers?
+> It only matches query text by pattern; it never runs SQL against a real schema, so schema and constraint bugs pass.
+
+> [!question]- (medium) How do you keep Docker-based tests out of a plain `go test ./...` run?
+> Put them behind a build tag like `//go:build integration`, or skip them when `testing.Short()` is true.
 
 ## Links 🟢
 - **Before this:** [[Testing Strategy and the Test Pyramid]]

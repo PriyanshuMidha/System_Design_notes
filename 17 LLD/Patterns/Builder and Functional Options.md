@@ -34,6 +34,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works, with the small whiteboard code), section 4 (the full worked example) and sections 5 and 6 (variants and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Structs, Methods and Embedding]]: a struct groups named fields, and a method can change it through a pointer receiver (`func (c *Client) ...`).
+> - [[Error Handling]]: a constructor returns `(*T, error)`, and the caller checks `err != nil` before using the value.
+> - [[Factory and Abstract Factory]]: a `NewX` function hides how a value is built and hands back a ready one.
+
 **From zero, in 60 seconds** 🟢
 
 Some objects have many settings, like an HTTP client with a timeout, retries and a base URL.
@@ -73,6 +78,9 @@ This note is about letting callers set only what they care about, with safe defa
 | Variadic parameter | A function argument that takes any number of values | `func New(opts ...Option)` |
 | Closure | A function that remembers variables from where it was made | `func(c *Client){ c.timeout = d }` |
 | Validation | Checking the final settings make sense | reject a negative timeout |
+| Functional option | A small function that changes one setting on the object being built | `WithTimeout(3*time.Second)` |
+| Chained builder | An object whose methods each add one part and return itself, ending in `Build()` | `Select("id").From("shows").Build()` |
+| Placeholder | A slot in SQL text that the database driver fills safely | `$1` in `WHERE city = $1` |
 
 **Picture it**
 
@@ -108,6 +116,10 @@ An HTTP client for a payment provider needs a base URL, a timeout, a retry count
 
 Functional options and builders let a caller name only what differs from the defaults, and let the constructor reject bad values and bad combinations before the object exists.
 
+### Real-life example 🟢
+
+Picture customizing a burger on Swiggy. The app starts from the regular burger, and you only touch what you want changed: extra cheese, no onion, a bigger size. Everything you did not touch stays at the default. If you pick a combination the restaurant cannot make, the app tells you before the order is placed, not after the food arrives. Functional options work the same way: start from defaults, name only the changes, and get any "cannot do that" error before the object exists.
+
 ## 2. Mental model 🟢
 
 Ordering a pizza: the menu pizza comes with defaults (medium, regular crust, cheese). You state only your changes ("large", "extra olives"). Before baking, the kitchen checks the combination ("a thin crust cannot be stuffed") and refuses the order instead of baking something broken.
@@ -116,6 +128,8 @@ Ordering a pizza: the menu pizza comes with defaults (medium, regular crust, che
 - **Validate** is the kitchen's final check across all changes.
 - **A chained builder** is a sandwich counter: you add one thing at a time, and you get the product only at the till (`Build`), which is also where any problem is reported.
 - **A config struct** is a printed order form: every field is visible at once, and blank boxes mean "default".
+
+> 🟢 → 🟡 **You now know** the problem (too many settings, most of them optional) and the four steps: defaults, apply changes, check once, return. **Next we open the box**: how functional options, option interfaces and chained builders each do those four steps in Go, and how to pick one.
 
 ## 3. How it works 🟡
 
@@ -154,14 +168,14 @@ sequenceDiagram
 The order of the steps is the design:
 
 - **Defaults first**, so every option overrides them. Setting defaults after the loop would silently undo the caller's choices.
-- **Options in order**, so for a scalar setting the last option wins (`WithTimeout(2s), WithTimeout(3s)` gives 3s), while accumulating options such as `WithHeader` add to a collection.
+- **Options in order**, so for a scalar setting (one single value, such as a timeout) the last option wins (`WithTimeout(2s), WithTimeout(3s)` gives 3s), while accumulating options such as `WithHeader` add to a collection.
 - **Validation last**, because a rule like "timeout × attempts ≤ 30s" involves two options that can arrive in any order. An option can check only its own value.
 
 ### Option as an interface
 
 **In plain words:** Same idea as above, but the option is a small type instead of a bare function. Big libraries do this so only they can define new options.
 
-grpc-go, zap and the OpenTelemetry SDK define the option as an **interface with an unexported method** instead of a bare function, as `ServerOption` does in the example:
+grpc-go, zap and the OpenTelemetry SDK (popular Go libraries for remote calls, logging and tracing) define the option as an **interface with an unexported method** (a lower-case method only that package can write) instead of a bare function, as `ServerOption` does in the example:
 
 - Only the defining package can implement an unexported method, so the set of options is closed.
 - An option can be a plain value with extra methods, such as `String()` for debug output (`MaxConns(500)` prints as `MaxConns(500)`).
@@ -237,6 +251,15 @@ func main() {
 **In plain words:** One full program with all three shapes (options, option interface, chained builder). Skim for the `With...` functions and the single `validate` step; that is the core.
 
 One `package main` with an `APIClient` (`WithBaseURL`, `WithTimeout`, `WithRetries`, defaults in the constructor), options that can fail, a final `validate`, options for test injection, an interface-style option set and a small PostgreSQL query builder. Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
+
+**Step by step:**
+
+1. `APIClient` holds the settings, and `Option` is a small function that changes one setting and may return an error.
+2. Each `With...` function (`WithBaseURL`, `WithTimeout`, `WithRetries`, `WithHeader`, `WithClock`, `WithLogger`) builds one such option; `WithBaseURL` and `WithTimeout` refuse bad values right away.
+3. `NewAPIClient` fills in defaults, applies the options in order (the last one wins) and stops at the first error.
+4. `validate` then checks rules across fields: retries must be 0 to 5, and timeout times attempts must stay under 30 seconds.
+5. `ServerOption`, `MaxConns` and `Name` show the same idea with an interface instead of a function.
+6. The `Query` builder chains `Select(...).From(...).Where(...).Limit(...)` and reports the first mistake only in `Build`; `main` prints each result.
 
 ```go
 package main
@@ -602,16 +625,24 @@ What to notice:
 
 - The second `WithTimeout` wins (`3s`), and the trailing `/` of the base URL was normalized by the option.
 - `ftp://` is rejected by the option itself; the constructor returns `nil` and the error.
-- `validate` reports **both** problems at once (`errors.Join`, since Go 1.20), so the caller fixes the config in one round.
+- `validate` reports **both** problems at once (`errors.Join`, which bundles several errors into one, since Go 1.20), so the caller fixes the config in one round.
 - `WithRetries(0)` in the test gives 0 retries, not the default 2: an explicit zero survives because defaults are set before options.
 - The query builder emits `$1` and `$2` placeholders, the PostgreSQL style, and returns the values separately for the driver.
+
+## Common beginner mistakes 🟢
+
+- **Mistake:** setting defaults after applying the options. → **Why it's wrong:** the defaults overwrite what the caller asked for, so `WithTimeout(2*time.Second)` silently becomes 5 seconds. → **Do this instead:** fill defaults first, then apply options in order, as `NewAPIClient` does.
+- **Mistake:** an option with no error return that quietly accepts a bad value, such as a negative timeout. → **Why it's wrong:** the client is built in a broken state and fails much later, far from the cause. → **Do this instead:** use `type Option func(*APIClient) error` and return an error, as `WithTimeout` and `WithBaseURL` do.
+- **Mistake:** checking rules that involve two fields inside one option (for example, timeout times retries inside `WithRetries`). → **Why it's wrong:** the answer depends on the order the caller wrote the options in. → **Do this instead:** check such rules once, after all options, in `validate`.
+- **Mistake:** pointing every client at one shared package-level headers map. → **Why it's wrong:** `WithHeader` on one client adds the header to all of them. → **Do this instead:** create a fresh map inside the constructor (`headers: map[string]string{}`).
+- **Mistake:** reusing one `Query` builder for a second query after `Build`. → **Why it's wrong:** the old `where`, `args` and `err` values carry into the new query. → **Do this instead:** start each query with a fresh `Select(...)`.
 
 ## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
 | Plain parameters | `NewLimiter(rate, burst)` | Up to 2 or 3 settings, all required | Breaks callers when a parameter is added |
-| Config struct | `http.Server{Addr: ":8080", ReadHeaderTimeout: 5 * time.Second}` | Values loaded from YAML, JSON or env; many settings shown at once | Zero value is ambiguous: "unset" and "0" look the same |
+| Config struct | `http.Server{Addr: ":8080", ReadHeaderTimeout: 5 * time.Second}` | Values loaded from YAML, JSON or env (environment variables); many settings shown at once | Zero value is ambiguous: "unset" and "0" look the same |
 | Functional options (func) | `New(opts ...Option)`, each option a closure | Libraries and clients with sensible defaults and few overrides | Options are scattered in docs; cannot be loaded from a file |
 | Functional options (interface) | `Option` interface with an unexported `apply` | Public libraries that want a closed option set and printable options (grpc-go, zap, OpenTelemetry) | More types per option |
 | Chained builder | Methods return the builder; `Build()` returns the product and an error | Step-by-step products: SQL text, documents, test fixtures | Mutable builder; misuse if reused after `Build` |
@@ -623,10 +654,12 @@ What to notice:
 
 - **Two or three fields:** use parameters. `NewAPIClient(WithBaseURL(u), WithTimeout(t))` is longer and less checked than `NewAPIClient(u, t)` when both values are always needed.
 - **Required values never go into options.** If the client cannot work without a base URL, make it a positional parameter (`New(baseURL, opts...)`), so the compiler enforces it.
-- **Values from a config file** fit a struct better: you can decode YAML or JSON into it, print it and diff it. Closures cannot be serialized.
+- **Values from a config file** fit a struct better: you can decode YAML or JSON into it, print it and diff it. Closures cannot be serialized (saved as text and read back).
 - **Discoverability:** a reader finds options by scanning for `With...` functions in the docs. Keep them next to the constructor and document each default.
-- **Allocation:** each option is a closure, usually allocated once at construction. This matters only for per-call options in hot paths, such as per-RPC call options (an estimate; measure before optimizing).
+- **Allocation:** each option is a closure, usually allocated once at construction. This matters only for per-call options in hot paths (code that runs very often), such as per-RPC (per remote call) call options (an estimate; measure before optimizing).
 - **A builder is mutable.** Sharing one between goroutines, or reusing it after `Build`, carries state into the next product.
+
+> 🟡 → 🔴 **You now know** the three shapes, how to write and test them, and when each one fits. **Next comes the production view**: how big Go libraries use options, the bugs that come from bad defaults and shared maps, and design details such as option order and closed option sets.
 
 ## 7. In production 🔴
 
@@ -651,13 +684,13 @@ What to notice:
 - Cross-field rules checked inside options pass or fail depending on option order. Fix: check them in one `validate` after the loop.
 - Defaults are written after the options. Fix: defaults first, always; a test such as `TestOrderAndOverride` pins it.
 - Every client shares one default `map` or slice from a package variable, so `WithHeader` on one client changes all of them. Fix: allocate collections per client inside the constructor, and copy slices that callers pass in.
-- A builder interpolates identifiers or values into SQL text. Fix: values always go through placeholders; identifiers come from an allowlist or are quoted with `pgx.Identifier{...}.Sanitize()`.
+- A builder interpolates (pastes directly) identifiers or values into SQL text, which opens the door to SQL injection. Fix: values always go through placeholders; identifiers come from an allowlist (a fixed list of permitted names) or are quoted with `pgx.Identifier{...}.Sanitize()`.
 
-**What to monitor:** log the effective configuration once at startup, as the example does with `api client ready`, and redact secrets such as API keys. When a production incident turns out to be "the timeout was zero", that log line is the evidence.
+**What to monitor:** log the effective configuration once at startup, as the example does with `api client ready`, and redact (hide, for example as `****`) secrets such as API keys. When a production incident turns out to be "the timeout was zero", that log line is the evidence.
 
 ## 8. Deep dive 🔴
 
-**Option order is part of the API.** Document, per option, whether it overrides (scalars: timeout, base URL) or accumulates (headers, interceptors, middleware). grpc-go, for example, chains interceptors passed with `grpc.ChainUnaryInterceptor`, so their order becomes call order. If two options conflict (say your own `WithPlaintext()` and `WithTLSConfig(cfg)`), reject the combination in `validate` instead of letting the later one win silently.
+**Option order is part of the API.** Document, per option, whether it overrides (scalars: timeout, base URL) or accumulates (headers, interceptors, middleware). grpc-go, for example, chains interceptors (functions that run before and after every call) passed with `grpc.ChainUnaryInterceptor`, so their order becomes call order. If two options conflict (say your own `WithPlaintext()` and `WithTLSConfig(cfg)`), reject the combination in `validate` instead of letting the later one win silently.
 
 **Fail at the first option, or collect everything?** The example stops at the first failing option, because a later option may depend on an earlier value, then collects every cross-field problem in `validate` with `errors.Join`. That gives callers precise errors without cascades.
 
@@ -665,7 +698,7 @@ What to notice:
 
 **Self-referential options.** Rob Pike's 2014 design lets an option return the option that restores the previous value, so a test can apply `prev := c.Option(Verbosity(3))` and later `c.Option(prev)`. It is rare in application code but explains why some libraries return a value from applying an option.
 
-**Generic options.** With generics a package can share one helper, `type Option[T any] func(*T) error` plus `Apply[T any](t *T, opts ...Option[T]) error`. It saves a few lines per type but makes godoc less readable; most libraries keep a concrete `Option` type per constructor. [[Generics and Iterators]] covers the syntax.
+**Generic options.** With generics a package can share one helper, `type Option[T any] func(*T) error` plus `Apply[T any](t *T, opts ...Option[T]) error`. It saves a few lines per type but makes godoc (the generated Go documentation pages) less readable; most libraries keep a concrete `Option` type per constructor. [[Generics and Iterators]] covers the syntax.
 
 **Copying a `strings.Builder` panics.** A `strings.Builder` records its own address on first use. Copying it by value and writing to the copy panics with `strings: illegal use of non-zero Builder copied by value`. Pass builders by pointer, as `Query.Build` does with `&b`.
 
@@ -704,6 +737,26 @@ What to notice:
 - Config struct for file or env config; remember that zero often means "none" (`http.Client.Timeout`).
 - Interface options with an unexported method (grpc-go, zap, OpenTelemetry) keep the set closed.
 - Builder: sticky first error, `Build` validates; never copy a used `strings.Builder`.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What are the four steps every option or builder constructor follows?
+> Set defaults, apply the caller's changes in order, validate once, return the object or an error.
+
+> [!question]- 🟢 Why not just write `NewAPIClient("", 0, 3, nil, nil, nil)`?
+> Nobody can tell which `0` or `nil` means "default", and adding a setting breaks every call.
+
+> [!question]- 🟢 Should a required value such as the base URL be an option?
+> No. Make it a normal parameter so the compiler forces callers to pass it.
+
+> [!question]- 🟡 Why must defaults be set before the options run?
+> Otherwise the defaults overwrite the caller's choices, and `WithRetries(0)` would turn back into 2.
+
+> [!question]- 🟡 Where does the rule "timeout × attempts ≤ 30s" belong?
+> In one `validate` step after all options, because the two options can arrive in any order.
+
+> [!question]- 🟡 What is a sticky error in a chained builder?
+> The first bad input is stored and the chain carries on; `Build` returns that error at the end.
 
 ## Links 🟢
 

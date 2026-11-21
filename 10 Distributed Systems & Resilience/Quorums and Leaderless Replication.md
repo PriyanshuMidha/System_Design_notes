@@ -33,6 +33,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Replication]]: the same data is copied to several machines; usually one leader takes the writes.
+> - [[CAP and PACELC]]: during a network break a copy must choose between refusing and answering with maybe-old data.
+> - [[Consistency Models]]: the promise about which value a read may return, from "always latest" to "eventually the same".
+> - [[Consistent Hashing]]: keys are placed on a ring of servers, so each key has a fixed set of "home" servers.
+
 **From zero, in 60 seconds** 🟢
 
 Many databases keep each piece of data on 3 machines, called **replicas**.
@@ -81,6 +87,10 @@ To read, ask 2 servers and trust the newest answer: one of them must have the la
 | Version | A tag telling which value is newer | Timestamp or version number |
 | Stale | Old, out-of-date data | A replica that missed the last write |
 | Consistency | Whether every reader sees the latest value | Read right after write sees it |
+| Coordinator | The node that receives a client request and talks to the replicas for it | Node 4 forwards `cart:42` to A, B and C |
+| Read repair | Fixing a stale replica when a read notices it is behind | Write v2 back to C after reading v1 there |
+| Hinted handoff | Holding a write for a down replica and passing it on later | D keeps B's write until B is back |
+| Last-writer-wins (LWW) | The version with the highest timestamp wins; others are dropped | `x=7 @10:00:02` beats `x=5 @10:00:01` |
 
 **Picture it**
 
@@ -130,15 +140,32 @@ flowchart LR
 - **R**: replies needed before a read returns.
 - **Quorum**: a set of replicas large enough that any two such sets share a member.
 
-Two groups of size `W` and `R` drawn from `N` must overlap if `W + R > N`, by the pigeonhole principle. The replica in the overlap has the latest completed write, and the reader picks the newest version among its `R` replies.
+Two groups of size `W` and `R` drawn from `N` must overlap if `W + R > N`, by the **pigeonhole principle** (if you put more than N items into N boxes, some box gets two). The replica in the overlap has the latest completed write, and the reader picks the newest version among its `R` replies.
 
 **Analogy.** A club records each decision in the notebooks of any 2 of its 3 secretaries. To learn the latest decision you ask any 2 secretaries and believe the newest entry. At least one of the two you ask wrote the last decision down.
 
+## Common beginner mistakes 🟢
+
+- **Calling DynamoDB leaderless** → DynamoDB has a leader per partition, chosen by Multi-Paxos → name Cassandra, Riak or ScyllaDB as the leaderless examples.
+- **Thinking `R + W > N` makes it act like one perfect copy** → reads during an in-flight write can still see new, then old → use consensus when you need strict order.
+- **Using `ONE`/`ONE` and expecting fresh reads** → 1 + 1 is not more than 3, so read and write sets may not overlap → use `QUORUM` (or `LOCAL_QUORUM`) on both sides.
+- **Storing money or stock counts with last-writer-wins** → two concurrent updates and one silently disappears → use a leader-based or consensus store for these.
+- **Never running repair** → a replica that missed writes, or deletes, stays wrong, and deleted data can come back → schedule anti-entropy repair regularly.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that with no leader, a write waits for W replicas, a read asks R replicas, and `R + W > N` makes them overlap. **Next we open the box**: the overlap argument in detail, the write and read paths, how the "newest" value is chosen, and what happens when home replicas are down. Each subsection starts with a short walk-through.
 
 ### The overlap argument
 
 **In plain words:** any group of W replicas and any group of R replicas must share one replica when R + W is bigger than N.
+
+**Step by step:**
+1. Key `cart:7` lives on 3 replicas: R1, R2, R3 (N = 3).
+2. A write of v2 must reach 2 of them (W = 2). It lands on R1 and R2.
+3. A read must hear from 2 (R = 2). It happens to ask R2 and R3.
+4. 2 + 2 = 4 is more than 3, so the two pairs must share one replica: here R2.
+5. R2 returns v2, R3 returns old v1. The reader keeps the newer v2.
 
 ```mermaid
 flowchart LR
@@ -167,6 +194,13 @@ Common settings with `N = 3`:
 
 **In plain words:** send the write to all replicas and wait for W to say ok; ask R replicas on read, keep the newest answer, and fix stale ones.
 
+**Step by step (plain version):**
+1. The client sends "set cart = 3 items" to a coordinator node, which stamps it "time 200".
+2. The coordinator sends it to all 3 replicas and says "OK" as soon as 2 reply.
+3. Later a read asks 2 replicas. One says "3 items @200", the other (which was down) says "2 items @100".
+4. The coordinator returns "3 items" and quietly sends "3 items @200" to the stale replica.
+5. In the background, a repair job compares all replicas, so even keys nobody reads get fixed.
+
 1. **Write**: the coordinator stamps the value with a version (Cassandra: a timestamp per cell; Riak: a causal context), sends it to all `N` replicas, and replies "OK" after `W` acks. The remaining replicas still receive it unless they are down.
 2. **Read**: the coordinator asks replicas, waits for `R` replies, and returns the newest version.
 3. **Read repair**: if some of those replies were older, the coordinator writes the newest version back to them.
@@ -194,8 +228,14 @@ sequenceDiagram
 
 **In plain words:** either the biggest timestamp wins (simple, can lose writes) or you keep both versions and let the app merge.
 
+**Step by step:**
+1. Two phones edit the same cart at nearly the same time: phone A sets `x=5` at 10:00:01, phone B sets `x=7` at 10:00:02.
+2. With last-writer-wins, the store keeps `x=7` and throws `x=5` away, even though both were "OK".
+3. With version vectors, each version carries a small counter per replica, so the store can see neither one came after the other.
+4. It keeps both as siblings. The next read gets both, and the app merges them (for a cart, by joining the item lists).
+
 - **Last-writer-wins (LWW)**: keep the version with the highest timestamp. Cassandra does this per cell. Simple, but concurrent writes lose silently, and a node with a fast clock wins wrongly (see [[Clocks and Ordering]]).
-- **Version vectors and siblings**: each version carries a vector of per-replica counters. If neither version's vector dominates, they are concurrent and both are kept as **siblings** for the application (or a CRDT) to merge. Dynamo and Riak do this; the Dynamo cart merged siblings by union, which is why deleted items occasionally reappeared.
+- **Version vectors and siblings**: each version carries a vector (a short list) of per-replica counters. If neither version's vector dominates, they are concurrent and both are kept as **siblings** for the application (or a CRDT, a data type built to merge automatically) to merge. Dynamo and Riak do this; the Dynamo cart merged siblings by union, which is why deleted items occasionally reappeared.
 
 ```mermaid
 flowchart LR
@@ -208,6 +248,13 @@ flowchart LR
 ### Sloppy quorum and hinted handoff
 
 **In plain words:** if home replicas are down, another machine holds the write for a while and hands it back later.
+
+**Step by step:**
+1. Key k's home replicas are A, B and C. B and C are down; only A is reachable.
+2. A strict quorum (W = 2) would fail. A sloppy quorum also writes to D, the next healthy node on the ring.
+3. D stores the write with a note: "this belongs to B".
+4. B comes back within 3 hours. D sends B the write and deletes its note.
+5. Until then, a read that asks only B and C misses the write. That is the price of staying writable.
 
 When some of a key's `N` home replicas are unreachable, a **sloppy quorum** accepts the write on other healthy nodes outside the home set, which store it with a **hint** naming the intended owner. When the owner comes back, the hint is handed off.
 
@@ -427,8 +474,8 @@ The toy contacts replicas in a fixed order to stay deterministic; a real coordin
 
 | Consistency level | Replicas that must answer | Use |
 | --- | --- | --- |
-| `ONE` / `LOCAL_ONE` | 1 (in the local DC for `LOCAL_ONE`) | metrics, logs, anything that tolerates stale reads |
-| `QUORUM` | `floor(total RF / 2) + 1` across all DCs | single-DC strong reads with writes also at `QUORUM` |
+| `ONE` / `LOCAL_ONE` | 1 (in the local DC, or data centre, for `LOCAL_ONE`) | metrics, logs, anything that tolerates stale reads |
+| `QUORUM` | `floor(total RF / 2) + 1` across all DCs (RF = replication factor, the N above) | single-DC strong reads with writes also at `QUORUM` |
 | `LOCAL_QUORUM` | a majority of replicas in the coordinator's DC | the usual multi-DC choice: strong inside a DC, no cross-DC wait |
 | `EACH_QUORUM` (writes) | a majority in every DC | writes that must be durable in every region before acking |
 | `ALL` | every replica | rarely; one dead replica fails the request |
@@ -441,30 +488,32 @@ The toy contacts replicas in a fixed order to stay deterministic; a real coordin
 | --- | --- | --- | --- | --- |
 | Leaderless quorum | nobody; versions compared on read | no (see deep dive) | no failover; slow replicas ignored | Cassandra, ScyllaDB, Riak, Dynamo (2007 paper) |
 | Single leader, async followers | the leader | on the leader only | failover needed, may lose writes | PostgreSQL, MySQL (see [[Replication]]) |
-| Consensus (Raft, Multi-Paxos) | an elected leader, log committed by a majority | yes (with leader reads or read-index) | automatic leader election | etcd, Spanner, CockroachDB, DynamoDB (Multi-Paxos per partition) |
+| Consensus (Raft, Multi-Paxos) | an elected leader, log committed by a majority | yes (with leader reads or read-index, where the leader confirms it is still leader before answering) | automatic leader election | etcd, Spanner, CockroachDB, DynamoDB (Multi-Paxos per partition) |
 
 Quorum replicas only **acknowledge**: each one independently stores whatever arrives. Consensus makes replicas **agree on one order** of operations. A majority is used in both, which is why they get confused (see [[Consensus - Raft and Paxos]]).
 
 > [!warning] Trap: DynamoDB is not Dynamo-style
-> DynamoDB keeps 3 replicas per partition in different AZs, and one is the leader elected with Multi-Paxos. Writes go to the leader and are acknowledged after a majority persist them; strongly consistent reads go to the leader. It shares a name with the 2007 Dynamo paper, not its replication design.
+> DynamoDB keeps 3 replicas per partition in different AZs (Availability Zones: separate data-centre sites in one region), and one is the leader elected with Multi-Paxos. Writes go to the leader and are acknowledged after a majority persist them; strongly consistent reads go to the leader. It shares a name with the 2007 Dynamo paper, not its replication design.
 
 ## 6. Trade-offs and when not to use 🟡
 
-- **Latency is set by the slowest replica you wait for.** With `W = 2` of 3, a write's latency is the second-fastest replica's. Coordinators reduce tail latency with **speculative retries**: if a replica has not answered by about its usual p99, ask another one (Cassandra's per-table `speculative_retry` option, default `99p`, written `99PERCENTILE` before 4.0).
+- **Latency is set by the slowest replica you wait for.** With `W = 2` of 3, a write's latency is the second-fastest replica's. Coordinators reduce tail latency with **speculative retries**: if a replica has not answered by about its usual p99 (the time 99 of 100 requests beat), ask another one (Cassandra's per-table `speculative_retry` option, default `99p`, written `99PERCENTILE` before 4.0).
 - **Conflict handling moves to the application.** LWW loses concurrent writes; siblings need merge code.
-- **No conditional updates for free.** "Increment if balance ≥ 10" needs consensus; Cassandra's lightweight transactions (`IF` clauses) run Paxos and cost several round trips.
+- **No conditional updates for free.** "Increment if balance ≥ 10" needs consensus; Cassandra's lightweight transactions (`IF` clauses) run Paxos (a consensus protocol) and cost several round trips.
 - **When not to use:** money, inventory counts, uniqueness constraints, and anything that needs read-modify-write correctness. Use a leader-based or consensus store, or a CRDT if the operation merges naturally (see [[CRDTs and Conflict Resolution]]).
 - **When it shines:** high write throughput, multi-DC writes, time-series, carts, sessions, and feeds where "always writable" beats "always exact".
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the overlap rule, the read and write paths, read repair, anti-entropy, siblings and sloppy quorums. **Next comes the advanced part**: how Cassandra and Riak run this in production, the failure modes (zombie data, clock skew, hint storms), and exactly why quorums are still not linearizable.
+
 - **Real systems:** Cassandra and ScyllaDB (LWW per cell, tunable consistency, hinted handoff, Merkle-tree repair); Riak KV (siblings with dotted version vectors). Voldemort, LinkedIn's Dynamo-style store, is no longer actively developed.
 - **Failure modes → fixes:**
-  - A node down longer than the hint window misses writes forever → run `nodetool repair` (or incremental repair) on a schedule shorter than `gc_grace_seconds` (10 days by default), or deleted data can come back as "zombies" when a replica that missed the tombstone repairs others.
-  - Clock skew on clients or coordinators makes LWW keep the wrong write → use server-side timestamps, NTP monitoring, or lightweight transactions for contended keys.
-  - Read latency spikes from one slow replica → speculative retry, and dynamic snitching to prefer faster replicas.
+  - A node down longer than the hint window misses writes forever → run `nodetool repair` (or incremental repair) on a schedule shorter than `gc_grace_seconds` (10 days by default), or deleted data can come back as "zombies" when a replica that missed the **tombstone** (a marker saying "this was deleted") repairs others.
+  - Clock skew on clients or coordinators makes LWW keep the wrong write → use server-side timestamps, NTP (the protocol that syncs machine clocks) monitoring, or lightweight transactions for contended keys.
+  - Read latency spikes from one slow replica → speculative retry, and dynamic snitching (Cassandra tracking which replicas are currently fast) to prefer faster replicas.
   - Coordinator overload during a hint replay storm → throttle hinted handoff (`hinted_handoff_throttle` in Cassandra 4.1+, `hinted_handoff_throttle_in_kb` in older versions; it limits how fast each node replays its stored hints).
-- **What to monitor:** hints stored and replayed, read-repair rate, repair progress and age of last successful repair per table, digest mismatch rate, per-replica p99 latency, and unavailable or timeout exceptions per consistency level.
+- **What to monitor:** hints stored and replayed, read-repair rate, repair progress and age of last successful repair per table, digest mismatch rate (how often replicas' short fingerprints of the same data differ), per-replica p99 latency, and unavailable or timeout exceptions per consistency level.
 
 ## 8. Deep dive 🔴
 
@@ -478,7 +527,7 @@ Why `R + W > N` is still **not linearizable**:
 
 At scale:
 
-- **Merkle tree granularity.** A tree over a large range with few leaves flags whole big ranges as different and streams much more data than needed; more leaves cost memory. Cassandra builds these trees during validation compaction, which is CPU and I/O heavy, so repairs are scheduled per range.
+- **Merkle tree granularity.** A tree over a large range with few leaves flags whole big ranges as different and streams much more data than needed; more leaves cost memory. Cassandra builds these trees during validation compaction (a background pass that reads the data files), which is CPU and I/O heavy, so repairs are scheduled per range.
 - **Choosing N.** `N = 3` with `R = W = 2` tolerates one unavailable replica per operation. `N = 5` with `R = W = 3` tolerates two but costs more storage and writes.
 
 ## 9. Interview questions 🔴
@@ -514,6 +563,30 @@ At scale:
 - Not linearizable: in-flight writes, partial failures, clock skew, sloppy quorums.
 - Cassandra: `ONE`, `QUORUM`, `LOCAL_QUORUM`, `EACH_QUORUM`, `ALL`; speculative retry for tails.
 - DynamoDB is leader-based (Multi-Paxos per partition), not leaderless.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- With N = 3, W = 2, R = 2, do reads overlap writes?
+> Yes. 2 + 2 = 4 > 3, so every read set shares at least one replica with every completed write set.
+
+> [!question]- What does read repair do?
+> When a read sees an older version on some replica, it writes the newest version back to that replica.
+
+> [!question]- Name two leaderless databases.
+> Cassandra and Riak (also ScyllaDB). Not DynamoDB.
+
+🟡 Medium
+
+> [!question]- N = 3, W = 1, R = 1. What can go wrong?
+> 1 + 1 is not more than 3, so a read can hit a replica that never got the write and return stale data.
+
+> [!question]- Why does a sloppy quorum break the overlap guarantee?
+> The write may sit on nodes outside the home set, so a read from the home replicas can miss it entirely.
+
+> [!question]- Why can last-writer-wins drop a write that was acknowledged?
+> It keeps only the highest timestamp; a concurrent write with a lower timestamp (or a slower clock) is thrown away.
 
 ## Links
 

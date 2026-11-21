@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Sessions and Cookies]]: after login your browser holds a session cookie and sends it with every request to that site, which is exactly what CSRF abuses.
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: GET should only read, POST/PUT/DELETE change things, and responses carry headers the browser obeys.
+
 **From zero, in 60 seconds** 🟢
 
 Your browser sends your login cookie to a site every time you talk to that site, even if another page started the request.
@@ -74,6 +78,12 @@ This note shows how to block both and how browser security headers limit the dam
 | Encoding (escaping) | Turning special characters into safe text | `<` becomes `&lt;` |
 | `SameSite` | Cookie flag limiting when cookies go on cross-site requests | `SameSite=Lax` |
 | CSP | A header listing which scripts the page may run | `script-src 'self'` |
+| Same-origin policy | Browser rule: one site's script cannot read another site's pages or cookies | evil.com cannot read your bank page |
+| Synchronizer token (CSRF token) | A secret value placed in your own forms and checked on submit | Hidden field `csrf_token=t1` |
+| DOM | The browser's live model of the page that JavaScript can change | `element.innerHTML = ...` |
+| Clickjacking | Hiding your real page under a fake one so a click lands on a button the user did not see | Invisible "Delete account" under "Win a prize" |
+| HSTS | A header telling the browser "only ever use HTTPS for this site" | `Strict-Transport-Security: max-age=63072000` |
+| Nonce | A random one-time value; in CSP it marks the few inline scripts you trust | `<script nonce="r4nd0m">` |
 
 **Picture it**
 
@@ -125,16 +135,46 @@ If the victim is logged into the bank in another tab and visits that page, their
 
 **Cross-Site Scripting (XSS)** is the other direction: instead of forging a request, the attacker gets *their own JavaScript* to run inside your page, in the victim's authenticated session. If a comment box echoes `<script>fetch('/transfer?to=mallory&amount=5000',{method:'POST'})</script>` back into the page without encoding it, every visitor who views that comment runs the attacker's script with their own cookies and permissions. The output above is itself a CSRF-less transfer, launched by XSS instead of a forged form.
 
+### Real-life example: a review box on a shopping site 🟢
+
+Think of the review section under a product on an app like Flipkart or Amazon. If the site showed reviews as raw HTML, someone could post a "review" containing a script, and every shopper who opened that product page would run it while logged in, maybe changing their delivery address (stored XSS). Separately, if the "change address" button only checked the cookie, any random web page could quietly submit that form for a logged-in shopper (CSRF). Real shops encode every review as plain text, put a secret token in every form, and send security headers as a safety net.
+
+### CSRF vs XSS 🟡
+
+| | CSRF | XSS |
+| --- | --- | --- |
+| Where the attacker's code runs | On the attacker's own site | Inside your real page |
+| What it can do | Send one forged request with your cookie | Anything you can do on that page |
+| Main fix | CSRF token + `SameSite` cookie | Encode output + CSP |
+| Does a CSRF token help against the other? | — | No: a script on your page can read the token |
+
 ## 2. Mental model 🟢
 
 - **CSRF**: the browser is a courier that stamps every envelope to your bank with your signature (the cookie), regardless of who hands it the envelope. The fix is to also require a one-time password written only on the bank's own paperwork (the CSRF token) or to tell the courier not to deliver on behalf of other senders at all (`SameSite`).
 - **XSS**: your page is a whiteboard; untrusted input is a marker someone else hands you. If you write their text onto the board as *marker strokes you draw* (HTML), they can draw a `<script>` tag. If you write it as *quoted text in a sealed envelope* (HTML-encoded), their input can never become new markup.
 
+## Common beginner mistakes 🟢
+
+- **Changing data with a GET link (`/delete?id=5`)** → any image tag or link on another site can trigger it → use POST/DELETE for changes, with a CSRF token.
+- **Building HTML by gluing strings** → a `<script>` in user text becomes real code → use `html/template` (Go) or the framework's default escaping.
+- **Escaping on save instead of on display** → the stored text is mangled and other contexts (URLs, JS) are still open → encode when you render, for that exact spot.
+- **Adding `'unsafe-inline'` to make CSP errors go away** → injected scripts run again → move scripts to files or use nonces.
+- **Relying on `SameSite` alone** → a GET with side effects or a same-site attacker still gets through → use `SameSite` and CSRF tokens together.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the two attacks: CSRF fakes a request using your cookie, XSS runs a stranger's script inside your page. **Next we open the box**: how CSRF tokens and `SameSite` block the first, where XSS sneaks in and how encoding blocks it, and which headers act as a safety net.
 
 ### CSRF: tokens and SameSite together
 
 **In plain words:** give each real page a secret ticket, and also tell the browser not to send the cookie on cross-site requests. Two locks are better than one.
+
+**Step by step:**
+1. Priya opens the bank's transfer page. The bank puts a hidden field `csrf_token=t1` in the form, tied to her session.
+2. She submits; the browser sends her cookie and `t1`. The bank checks `t1` matches her session → allowed.
+3. In another tab, evil.example auto-submits a transfer form to the bank. Its script cannot read the bank page, so it has no `t1`.
+4. With `SameSite=Lax`, the browser also leaves the cookie off this cross-site POST.
+5. The bank sees no valid token (and no cookie) → 403.
 
 ```mermaid
 sequenceDiagram
@@ -157,7 +197,7 @@ sequenceDiagram
     Bank-->>Browser: 403 Forbidden
 ```
 
-The synchronizer-token pattern works because of the **same-origin policy**: `evil.example`'s JavaScript cannot read a token embedded in `bank.example.com`'s page or in a non-HttpOnly cookie set by the bank, so it cannot forge a matching value, even though it can still *send* a request with the ambient cookie.
+The synchronizer-token pattern works because of the **same-origin policy**: `evil.example`'s JavaScript cannot read a token embedded in `bank.example.com`'s page or in a non-HttpOnly cookie set by the bank, so it cannot forge a matching value, even though it can still *send* a request with the ambient cookie (the cookie the browser attaches by itself).
 
 `SameSite` is a second, independent control set on the cookie itself: `Strict` withholds the cookie on every cross-site request, `Lax` sends it only on top-level `GET` navigation, and `None` always sends it (the full attribute table lives in [[Sessions and Cookies]]).
 
@@ -169,11 +209,17 @@ Use CSRF tokens and `SameSite=Lax`/`Strict` together, not one instead of the oth
 
 **In plain words:** the bad script can be saved in your database, bounced back from the URL, or added by your own front-end code. Same harm, different entry door.
 
+**Step by step:**
+1. Stored: Mallory posts a comment with `<script>`. It is saved and shown to every later visitor.
+2. Reflected: Mallory sends Priya a link like `/search?q=<script>...`. The server copies `q` into the results page, so only Priya, who clicked, is hit.
+3. DOM: Mallory sends a link ending `#name=<img onerror=...>`. The page's own JavaScript reads that part and writes it with `innerHTML`; the server never saw it.
+4. In all three, the browser treats attacker text as code, and it runs with the victim's login.
+
 | Variant | Where the payload is stored | Who gets hit |
 | --- | --- | --- |
 | **Stored XSS** | Saved server-side (a comment, a profile bio, a support ticket) and rendered to other users later | Every user who later views that page |
 | **Reflected XSS** | Bounced straight back in the response from a request parameter (a search box echoing `?q=` into "No results for …") | Only the victim who clicks a crafted link |
-| **DOM XSS** | Never touches the server at all; client-side JS reads something attacker-controlled (`location.hash`, `document.referrer`) and writes it into the DOM with `innerHTML` or `document.write` | Only the victim who loads the crafted URL |
+| **DOM XSS** | Never touches the server at all; client-side JS reads something attacker-controlled (`location.hash`, the part of the URL after `#`; `document.referrer`, the page you came from) and writes it into the DOM with `innerHTML` or `document.write` | Only the victim who loads the crafted URL |
 
 ```mermaid
 flowchart LR
@@ -193,6 +239,13 @@ All three share one root cause: untrusted data crossed from "data" to "markup/co
 ### Output encoding: the actual fix
 
 **In plain words:** turn special characters like < into harmless text before showing them. The right way to encode depends on where the text lands (HTML, attribute, URL, JS).
+
+**Step by step:**
+1. A user saves the comment `<script>alert(1)</script>`. Store it exactly as typed.
+2. When showing it inside a `<div>`, turn `<` into `&lt;` and `>` into `&gt;` (HTML entities, the "show this symbol as text" codes).
+3. The browser now draws the characters `<script>` on screen instead of running them.
+4. If the same text goes into a link or a JavaScript string instead, use that spot's own escaping rules.
+5. In Go, `html/template` does steps 2-4 for you based on where the value sits.
 
 Encoding must match the **context** the data lands in — HTML body, HTML attribute, URL, or JavaScript string — because each context has different special characters:
 
@@ -233,6 +286,12 @@ func Render(body string) (string, error) {
 
 **In plain words:** these are rules you send to the browser, like "only run scripts from my own site". If an encoding bug slips through, the browser still blocks the attack.
 
+**Step by step:**
+1. Your server adds four headers to every response, once, in middleware.
+2. A new page forgets to encode a comment, and an injected `<script>` lands in the HTML.
+3. The browser reads `Content-Security-Policy: script-src 'self'`, sees the script is inline and not from your own files, and refuses to run it.
+4. Meanwhile HSTS keeps the connection on HTTPS, `nosniff` stops uploaded text being run as HTML, and `frame-ancestors 'none'` stops other sites from framing your page.
+
 Encoding bugs still happen — a new template, a `v-html`, a third-party widget. Security headers assume one will, and cap the damage:
 
 ```mermaid
@@ -250,7 +309,7 @@ flowchart TB
 
 - **Content-Security-Policy (CSP)**: an allowlist for where scripts, styles and resources may load from. `script-src 'self'` means an injected `<script>` tag or `onerror="..."` attribute simply does not execute, because inline script isn't on the allowlist — this is what actually contains most real-world stored XSS, on top of encoding.
 - **frame-ancestors**: part of CSP (`frame-ancestors 'none'` or a list of trusted origins); it tells the browser which origins may embed this page in an `<iframe>`. It replaces the older `X-Frame-Options: DENY`/`SAMEORIGIN` header and stops clickjacking — an attacker overlaying your page in a transparent iframe to trick a click into, say, approving a transfer.
-- **HSTS (`Strict-Transport-Security`)**: once a browser has seen this header over HTTPS, it refuses to connect over plain HTTP to that host for `max-age` seconds, even if the user types `http://` or clicks an old link. This closes the window for a network attacker to downgrade the connection and steal the session cookie; see [[TLS and HTTPS]] for the handshake it protects. `preload` submits the host to browsers' built-in HSTS list, so even the very first request is HTTPS-only.
+- **HSTS (`Strict-Transport-Security`)**: once a browser has seen this header over HTTPS, it refuses to connect over plain HTTP to that host for `max-age` seconds, even if the user types `http://` or clicks an old link. This closes the window for a network attacker to downgrade the connection (force it back to plain, readable HTTP) and steal the session cookie; see [[TLS and HTTPS]] for the handshake it protects. `preload` submits the host to browsers' built-in HSTS list, so even the very first request is HTTPS-only.
 - **X-Content-Type-Options: nosniff**: stops the browser from guessing a response's type from its content instead of trusting `Content-Type`. Without it, a file uploaded as `Content-Type: text/plain` but containing HTML can be sniffed and rendered as HTML, reviving an XSS path through a file-upload feature.
 
 ## 4. Worked example 🟡
@@ -468,10 +527,13 @@ In `06 Backend Engineering in Go`, [[Secure Coding for Go Services]] shows where
 
 ## 7. In production 🔴
 
-- **Real systems:** Django, Rails and Spring ship CSRF middleware on by default; GitHub and most banks pair CSRF tokens with `SameSite=Lax`; Gmail and most SPA-heavy sites run a strict CSP with nonces for the handful of scripts they must allow inline.
+> 🟡 → 🔴 **You now know** how tokens and `SameSite` stop CSRF, how encoding stops XSS, and what each security header adds. **Next we look at real systems**: how frameworks ship these defenses, what breaks in production (AJAX tokens, rich text, CSP vs widgets), and the finer points such as nonces, double-submit cookies and Trusted Types.
+
+
+- **Real systems:** Django, Rails and Spring ship CSRF middleware on by default; GitHub and most banks pair CSRF tokens with `SameSite=Lax`; Gmail and most SPA-heavy (single-page app: mostly JavaScript in the browser) sites run a strict CSP with nonces for the handful of scripts they must allow inline.
 - **Failure modes → fixes:**
-  - CSRF token not sent on an AJAX request because it isn't in the form body → read it from a cookie-readable, non-`HttpOnly` copy and attach it as a custom header (`X-CSRF-Token`), which also happens to be blocked by CORS for cross-origin callers.
-  - A new feature uses `v-html`/`dangerouslySetInnerHTML` to render "rich" user bios → sanitize with an allowlist library (DOMPurify) or drop the feature; CSP `script-src` is the backstop, not the primary control.
+  - CSRF token not sent on an AJAX request (a background request made by page JavaScript) because it isn't in the form body → read it from a cookie-readable, non-`HttpOnly` copy and attach it as a custom header (`X-CSRF-Token`), which also happens to be blocked by CORS for cross-origin callers.
+  - A new feature uses `v-html`/`dangerouslySetInnerHTML` to render "rich" user bios → sanitize with an allowlist library (DOMPurify, which strips everything except a safe list of tags) or drop the feature; CSP `script-src` is the backstop, not the primary control.
   - CSP breaks a third-party widget → add its exact origin to the allowlist, never fall back to `'unsafe-inline'`.
   - A reverse proxy or CDN strips security headers → set them at the edge too, and test with the real public hostname, not `localhost`.
 - **What to monitor:** CSP violation reports (`report-uri`/`report-to`), rate of 403s from CSRF validation (spikes mean a client bug, not just attacks), and any response missing the security headers (a header-set regression test in CI catches this before production).
@@ -490,7 +552,7 @@ In `06 Backend Engineering in Go`, [[Secure Coding for Go Services]] shows where
 > No. `Lax` blocks cross-site `POST`/fetch requests from carrying the cookie, which stops the classic auto-submitting form attack, but it still sends the cookie on a top-level cross-site `GET` navigation. Keep CSRF tokens for state-changing endpoints and never let `GET` have side effects; use both controls together.
 
 > [!question]- A teammate says "we use JWTs in an `Authorization` header, so we don't need CSRF protection." Are they right?
-> Mostly yes, for that specific endpoint: a browser does not attach a custom header automatically the way it does a cookie, so a forged cross-site form or fetch can't make the request look authenticated. But if any token is also mirrored into a cookie (for SSR, for example), that endpoint is exposed again and needs the same defenses as a cookie-based session.
+> Mostly yes, for that specific endpoint: a browser does not attach a custom header automatically the way it does a cookie, so a forged cross-site form or fetch can't make the request look authenticated. But if any token is also mirrored into a cookie (for SSR, server-side rendering, for example), that endpoint is exposed again and needs the same defenses as a cookie-based session.
 
 > [!question]- Trap: "We escape everything before storing it in the database, so we're safe from XSS." What's wrong with this?
 > Encoding belongs at the **output** boundary, matched to the context it renders into (HTML body vs attribute vs URL vs JS string), not at the input/storage boundary. Encoding on input corrupts the stored data (search, exports, APIs all see mangled text) and still doesn't protect a different rendering context, like inserting the same stored value into a `<script>` block or an `href`.
@@ -516,6 +578,26 @@ In `06 Backend Engineering in Go`, [[Secure Coding for Go Services]] shows where
 - CSP `script-src 'self'` is the backstop that blocks injected inline scripts even when encoding is missed.
 - `frame-ancestors 'none'` stops clickjacking; HSTS stops protocol downgrade; `X-Content-Type-Options: nosniff` stops MIME sniffing turning an upload into HTML.
 - Pure bearer-token APIs (no cookie) are largely CSRF-immune by construction, but still need XSS defenses wherever they render content in a browser.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) In CSRF, whose browser sends the forged request?
+> The victim's own browser, with their cookie attached.
+
+> [!question]- (easy) In XSS, where does the attacker's code run?
+> Inside your real page, in the victim's browser.
+
+> [!question]- (easy) What does encoding turn `<` into in HTML?
+> `&lt;`, so it shows as text and never becomes a tag.
+
+> [!question]- (medium) Why can't evil.example just copy the CSRF token?
+> The same-origin policy stops its script from reading the bank's page or cookies, so it never sees the token.
+
+> [!question]- (medium) Your API uses only a bearer token in the `Authorization` header, no cookies. Is it open to classic CSRF?
+> Mostly no; browsers do not attach that header by themselves. It still needs XSS defenses.
+
+> [!question]- (medium) What does `Content-Security-Policy: script-src 'self'` stop?
+> Inline and outside scripts, so an injected `<script>` does not run even if encoding was missed.
 
 ## Links
 

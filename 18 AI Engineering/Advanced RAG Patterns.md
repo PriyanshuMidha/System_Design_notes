@@ -33,6 +33,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[RAG Pipeline]]: the basic flow is embed the question, fetch the top chunks, paste them into the prompt, and answer with sources.
+> - [[Keyword, Semantic and Hybrid Search]]: word search and meaning search catch different things, and RRF merges ranked lists by position.
+
 **From zero, in 60 seconds** 🟢
 
 Basic RAG takes your question, searches once, and answers from what it found. That breaks when the question is worded oddly, or needs facts from several places.
@@ -74,6 +78,11 @@ Advanced RAG adds one small extra step to fix each kind of miss like this.
 | Metadata filter | A hard rule on stored fields, not on meaning | `year > 2024` |
 | Corpus | The full set of documents you search | All HR policy docs |
 | Multi-hop | An answer needing facts from two or more documents | "Who manages the author of doc X?" |
+| Query rewriting | Asking an LLM to say the question in other words before searching | "cancel subscription" → "close account" |
+| RRF | Merging several ranked lists by position, not score | A doc high in 3 lists wins |
+| Router | A cheap step that decides where (or whether) to search | Billing question → billing FAQ only |
+| Knowledge graph | Facts stored as things and the links between them | Vendor A —uses→ Service X |
+| LLM judge | An LLM call that grades something, like "are these chunks relevant?" | Returns correct / ambiguous / incorrect |
 
 **Picture it**
 
@@ -111,6 +120,21 @@ The single-pass query pipeline in [[RAG Pipeline]] has a specific failure mode b
 
 Each of these is a different, specific failure, and a different pattern below is the fix for it — not a bigger single pipeline, but a bigger toolbox.
 
+### Real-life example 🟢
+
+Think of an HR help bot at a big company using a tool like Darwinbox or Keka. An employee asks "how many leaves can I carry over after the 2025 policy change?".
+Plain RAG searches once and returns the 2022 leave policy, because it uses the same words.
+A self-query step turns "after the 2025 policy change" into a filter `year >= 2025`, and a rewrite step also searches "leave carry forward rules".
+The merged results surface the 2025 policy page, and the bot answers from it.
+
+### Common beginner mistakes 🟢
+
+- **Adding every pattern at once** → each one adds a model call, delay and cost, and you cannot tell which helped → measure the failure first, then add the one pattern that fixes it.
+- **Using HyDE as the only search** → the fake answer can be confidently wrong and pull in the wrong documents → merge HyDE results with a normal search using RRF.
+- **Trusting the filter the LLM wrote** → it may invent a field name like `publish_year` that does not exist, and you get zero results → check field names against the real schema and fall back to plain search.
+- **Letting agentic RAG run without limits** → the model can keep searching forever → cap the number of searches and the token budget per question.
+- **Hoping fancy query tricks fix bad chunks** → no rewrite can find text that was never parsed or chunked well → fix ingestion first.
+
 ## 2. Mental model 🟢
 
 A single-pass retriever is a person who hears a question once, searches for it once, and reads back whatever came up — brittle if the question was oddly phrased, needed a different shelf of the library, or needed two books combined.
@@ -125,11 +149,31 @@ An advanced-RAG pipeline is the same person given permission to:
 - follow citations between books (GraphRAG),
 - and glance at what they found before answering — going back for another search if it looks thin (agentic/corrective RAG).
 
+### Patterns people mix up 🟡
+
+| These two | How they differ |
+| --- | --- |
+| Query rewriting vs HyDE | Rewriting searches with other wordings of the question; HyDE searches with a made-up answer |
+| Parent-child vs contextual retrieval | Parent-child sends a bigger section to the model after a match; contextual retrieval adds a context note to each chunk before embedding, so it matches better |
+| Agentic vs corrective RAG | Agentic lets the model decide freely how many times to search; corrective grades one search and takes one of a few fixed actions |
+| Routing vs self-query | Routing picks which index to search; self-query adds hard filters (date, price) to the search |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that each advanced pattern fixes one kind of retrieval miss, and that each costs extra time and money. **Next we open the box** and walk through each pattern: rewriting and HyDE, routing, self-query filters, parent-child and contextual retrieval, multi-hop and GraphRAG, and agentic and corrective RAG. Each subsection starts with a plain step-by-step walk.
 
 ### Whiteboard version
 
 **In plain words:** Ask the same question several ways, search for each, then merge the lists. A doc that shows up near the top in many lists wins.
+
+**Step by step:**
+1. User asks "cancel my subscription".
+2. A cheap LLM call writes 2 more versions: "close my account" and "stop being charged".
+3. Run a search for each of the 3 versions, giving 3 ranked lists.
+4. "How to Close Your Account" is rank 4, rank 1 and rank 2 in the three lists.
+5. RRF adds up `1/(60 + rank)` from each list, so this doc beats one that was rank 1 in only one list.
+
+Full detail:
 
 Query rewriting in its smallest form: generate several versions of the question, retrieve for each, and fuse the ranked lists with **Reciprocal Rank Fusion** so a document that shows up (even at different ranks) across multiple phrasings outranks one that only one phrasing happened to find.
 
@@ -152,6 +196,15 @@ flowchart LR
 
 **In plain words:** Rewriting = say the question in other words. HyDE = have the AI write a fake answer, then search for docs that look like it.
 
+**Step by step (HyDE):**
+1. Question: "why is my invoice total higher than the plan price?"
+2. Ask an LLM to write a short, made-up answer: "Invoice totals can include tax, add-on seats and prorated charges..."
+3. Embed that made-up answer, not the question.
+4. Search with it. Real help pages are written as statements like this, so they sit closer to it than to the question.
+5. Use the real pages found; never show the made-up answer to the user.
+
+Full detail:
+
 **Query rewriting** asks an LLM to produce one or more alternative phrasings of the user's question before retrieving. **Multi-query retrieval** (diagram above) runs several rewrites in parallel and fuses their ranked chunk lists with Reciprocal Rank Fusion: `score(doc) = Σ 1 / (k + rank)` over every list the document appears in, `k ≈ 60` by convention (the value from the original RRF paper, which keeps one list's top pick from dominating a fused result by a huge margin). A document that ranks modestly across three rewrites can outscore one that ranks first in only one — exactly the robustness you want when you don't know in advance which phrasing will embed closest to the right chunk.
 
 **HyDE** (Hypothetical Document Embeddings) is a different move: instead of rewriting the question, ask the LLM to *write a plausible-looking answer* to the question — even though it might be factually wrong, it will typically be written in the *style and vocabulary* of a real matching document — then embed that hypothetical answer, not the question, and retrieve with it. A question and its answer are often far apart in embedding space (a question reads like a question; an answer reads like a statement of fact), but the hypothetical answer and the real matching document are usually written the same way, so this closes that gap. The hypothetical text is never shown to the user and never generated from retrieved context — it exists only to produce a better search vector.
@@ -164,6 +217,15 @@ flowchart LR
 ### Routing
 
 **In plain words:** Like a receptionist: decide which department (data source) to send the question to, or whether to search at all.
+
+**Step by step:**
+1. Three indexes exist: product manual, billing FAQ, internal runbook.
+2. A message arrives: "why was I charged twice?".
+3. A small, cheap classifier (an LLM call with a short list of choices, or simple rules) picks `billing-faq`.
+4. Search only the billing FAQ.
+5. If the message were "thanks!", the router would pick "no search" and answer directly.
+
+Full detail:
 
 **Routing** decides, before retrieving, *where* to retrieve from or *whether* to retrieve at all. A router can be a small, cheap classifier (an LLM call with a short list of options, or a traditional text classifier) that looks at the incoming query and picks a target corpus (`product-manual`, `billing-faq`, `internal-runbook`), a retrieval strategy (`semantic`, `keyword`, `skip retrieval entirely for small talk`), or both. Routing matters for both quality (sending a billing question to the product-manual index wastes the whole retrieval budget on irrelevant chunks) and cost (skipping retrieval for `thanks!` avoids an unnecessary vector search and a padded prompt).
 
@@ -182,6 +244,15 @@ flowchart TD
 ### Self-query filters
 
 **In plain words:** The AI splits a question into "what it's about" (search) and hard rules like dates or prices (filters).
+
+**Step by step:**
+1. Question: "tickets about login errors from last week priced under $50".
+2. An LLM splits it into a meaning part, "login errors", and a filter part.
+3. The filter becomes `created_at > now() - 7d AND price < 50`.
+4. Check the field names exist in the stored metadata.
+5. Run one vector search for "login errors" with that filter applied inside the store.
+
+Full detail:
 
 A **self-query** retriever asks the LLM to split a natural-language question into a semantic part and a structured metadata filter:
 
@@ -202,6 +273,15 @@ flowchart LR
 
 **In plain words:** Search with small, sharp pieces, but read the bigger section around them. Or add a short "where this came from" note to each piece.
 
+**Step by step:**
+1. Parent-child: cut the "Refund rules" section into small child chunks; each child stores its parent section's id.
+2. A question matches one child sharply.
+3. Fetch the parent section and give that whole section to the model.
+4. Contextual retrieval, instead: before embedding, an LLM adds one line to each chunk, like "From the 2024 annual report, North America revenue section".
+5. Now the chunk itself carries its context, so it is matched correctly even when read alone.
+
+Full detail:
+
 Small chunks (a paragraph or two) embed well: they're focused, so their vector is a precise summary of one idea, which is exactly what you want when the embedding is doing the matching.
 
 But a small chunk, read alone at generation time, is often too little context for the LLM to answer from in full — it's answering from a paragraph with no idea what document, section, or surrounding argument it came from.
@@ -219,17 +299,26 @@ flowchart LR
     P1 --> LLM[LLM reads the full parent section]
 ```
 
-**Contextual retrieval** (Anthropic, 2024) tackles the same out-of-context problem from the other direction: before embedding, prepend each chunk with a short, LLM-generated summary of where it sits in the document (`"This chunk is from the Q2 2024 10-K's revenue breakdown for the North America segment"`), so the *embedded chunk itself* — not just a parent lookup — carries enough context to be found and understood on its own. Anthropic's published evaluation reported this cut retrieval failure rates meaningfully when combined with hybrid search and reranking — **documented, not reproduced here; verify current figures and methodology against the source before quoting a number**, since published benchmarks on a specific corpus don't automatically transfer to yours.
+**Contextual retrieval** (Anthropic, 2024) tackles the same out-of-context problem from the other direction: before embedding, prepend each chunk with a short, LLM-generated summary of where it sits in the document (`"This chunk is from the Q2 2024 10-K's (a US company's yearly financial report) revenue breakdown for the North America segment"`), so the *embedded chunk itself* — not just a parent lookup — carries enough context to be found and understood on its own. Anthropic's published evaluation reported this cut retrieval failure rates meaningfully when combined with hybrid search and reranking — **documented, not reproduced here; verify current figures and methodology against the source before quoting a number**, since published benchmarks on a specific corpus don't automatically transfer to yours.
 
 ### Multi-hop retrieval and GraphRAG
 
 **In plain words:** Some answers need a chain: find fact A, use it to find fact B. GraphRAG stores links between things to follow that chain.
 
+**Step by step:**
+1. Question: "Which vendors are hit by the outage?"
+2. Search 1 finds "the outage affects service X".
+3. Pull out the fact "service X" and build a new query from it.
+4. Search 2 finds "vendors A and B use service X".
+5. Answer: vendors A and B. GraphRAG does step 3 ahead of time by storing "vendor → uses → service" links in a knowledge graph.
+
+Full detail:
+
 Some questions can't be answered by any single retrieved chunk, because the answer is a combination of facts that live in different documents (`which vendors are affected by both the EU and California privacy changes?`).
 
 **Multi-hop retrieval** answers these iteratively: retrieve, extract an intermediate fact or entity from what came back, then retrieve again using that fact as part of the next query, repeating until enough has been gathered to answer.
 
-**GraphRAG** (Microsoft Research, 2024) builds this capability into the index itself instead of improvising it per query: an indexing-time LLM pass extracts entities and relationships from the corpus into a knowledge graph, and (in the original design) clusters that graph into communities with LLM-written summaries at each level. At query time, retrieval can then walk graph edges between entities (answering "how is X connected to Y") or pull a community summary (answering a broad, corpus-wide question a single chunk could never cover, like "what are the main themes across all these documents?"). This is a meaningfully heavier indexing pipeline — extraction and summarization passes over the whole corpus, re-run as it changes — so it earns its cost mainly for a smaller, relationship-dense corpus (an investigation, a knowledge base explicitly about how things relate) rather than as a default upgrade to plain chunk-and-embed indexing.
+**GraphRAG** (Microsoft Research, 2024) builds this capability into the index itself instead of improvising it per query: an indexing-time LLM pass extracts entities (named things: people, vendors, products) and relationships from the corpus into a knowledge graph, and (in the original design) clusters that graph into communities with LLM-written summaries at each level. At query time, retrieval can then walk graph edges between entities (answering "how is X connected to Y") or pull a community summary (answering a broad, corpus-wide question a single chunk could never cover, like "what are the main themes across all these documents?"). This is a meaningfully heavier indexing pipeline — extraction and summarization passes over the whole corpus, re-run as it changes — so it earns its cost mainly for a smaller, relationship-dense corpus (an investigation, a knowledge base explicitly about how things relate) rather than as a default upgrade to plain chunk-and-embed indexing.
 
 ```mermaid
 flowchart LR
@@ -239,6 +328,15 @@ flowchart LR
 ### Agentic and corrective RAG
 
 **In plain words:** Let the AI decide when and what to search, and check if the results are good enough before answering.
+
+**Step by step (corrective RAG):**
+1. Search once for the question.
+2. A grader (a small classifier or an LLM judge) labels the results: correct, ambiguous or incorrect.
+3. Correct: answer from them as usual.
+4. Ambiguous: keep the good chunks and add a second source, such as a broader search.
+5. Incorrect: try a different search, or say "I don't know" instead of answering from bad chunks.
+
+Full detail:
 
 Every pattern so far still runs a fixed, pre-decided sequence of steps.
 
@@ -578,6 +676,8 @@ ok  	ragpatterns	1.56s
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how each pattern works and which miss it fixes. **Next comes the senior view**: how these patterns fail in real systems, what to monitor so you know a pattern is paying off, and how to combine several without wasting time and money.
+
 - **Real systems:** Anthropic's documented contextual retrieval approach (prepend chunk context before embedding, combine with hybrid search and reranking); Microsoft's GraphRAG for query-focused summarization over document collections; corrective-RAG-style grading steps in support and research assistants that can't tolerate confidently answering from irrelevant context.
 - **Failure modes → fixes:**
   - Query rewriting producing near-duplicate paraphrases that all miss the same way → prompt for *diverse* rewrites (different vocabulary, different angle), not just syntactic variants.
@@ -629,6 +729,26 @@ ok  	ragpatterns	1.56s
 - GraphRAG: extract a knowledge graph at indexing time for relationship and corpus-wide questions; heavy indexing cost.
 - Agentic/corrective RAG: let the model (or a grading step) decide whether one retrieval pass was enough.
 - Every pattern costs an extra call and adds latency — justify it with [[RAG Evaluation]], not intuition.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: What is the main rule for adding an advanced RAG pattern?
+> Measure the retrieval failure first, then add the one pattern that fixes it.
+
+> [!question]- Easy: What does a router do?
+> It picks which index to search, or decides no search is needed.
+
+> [!question]- Easy: What is multi-hop retrieval?
+> Searching, using a fact from the result to search again, until the answer is complete.
+
+> [!question]- Medium: When does HyDE help more than rewriting the question?
+> When questions and answers are written very differently, so even a reworded question does not look like the answer.
+
+> [!question]- Medium: "Invoices over $500 from Q3": which pattern, and why not plain vector search?
+> Self-query: it turns "over $500" and "Q3" into real filters; vector search cannot do number or date conditions.
+
+> [!question]- Medium: Corrective RAG vs agentic RAG: which is more predictable?
+> Corrective: one grading step with a few fixed actions, instead of open-ended searching.
 
 ## Links 🟢
 

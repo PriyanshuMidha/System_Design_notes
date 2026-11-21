@@ -34,6 +34,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (the five steps), 4 (worked example), 5, 6 and the scenario drills.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 9 and "How to say it in the interview". Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Caching Fundamentals]]: a cache is a fast copy of data that really lives somewhere slower, and it can be out of date.
+> - [[Caching Patterns]]: there are a few standard ways to fill and update a cache, such as "check the cache, on a miss read the database and fill it".
+
 **From zero, in 60 seconds** 🟢
 
 Reading from a database is slow-ish, and many users ask for the same thing again and again.
@@ -80,6 +84,12 @@ But if IT changes the password, your note is wrong until you update it. That is 
 | Cache-aside | App checks cache, on miss reads DB and fills cache | Default pattern in most services |
 | CDN | A cache spread across cities, near users | Product images served from an edge |
 | Stampede | Many requests miss at once and all hit the database | A hot key expires at peak traffic |
+| Hit ratio | Share of reads answered by the cache | 95% hit = 5 in 100 reach the DB |
+| Invalidation | Deleting or updating a cached copy when the real data changes | delete `menu:42` after an edit |
+| Write-through | Every write goes to the cache and the database together | cache always warm after a write |
+| Write-behind | Write to the cache now, the database a bit later | counters flushed once a second |
+| Jitter | A small random extra added to a time | TTL 60 s plus 0-10 s |
+| Cache-Control / ETag | HTTP headers that tell browsers and CDNs how long to keep a response and whether it changed | `max-age=300` |
 
 **Picture it**
 
@@ -146,11 +156,35 @@ Each hop is a chance to stop early. The earlier you stop, the cheaper the reques
 > [!tip] Remember
 > The best cache hit is the one that never leaves the user's device.
 
+### Real-life example: menus, photos and seats 🟢
+
+When you open a restaurant on Zomato, the photos come from a CDN near you and the menu comes from a cache like Redis, because thousands of people view the same menu and it rarely changes.
+When the restaurant edits a price, the app deletes the cached menu so the next viewer loads the new one.
+On BookMyShow, "312 seats left" on the listing can come from a cache that is a second old, but the final "book seat D7" step always checks the real database.
+Caching is about choosing which answers may be a little old and which must be exact.
+
+## Common beginner mistakes 🟢
+
+- **No TTL on cached keys** → if a delete is lost, the wrong value stays forever → always set a TTL, even when you also delete on write.
+- **Every key with the same TTL** → thousands expire in the same second and flood the database → add random jitter to TTLs.
+- **Selling from the cache** (seats, stock, balance) → two people can buy the last item from a stale copy → show cached counts, but check the database in the transaction.
+- **Updating the cache on write instead of deleting it** → two writers racing can leave the older value in the cache → write the database, then delete the key.
+- **Assuming the cache is always there** → when it dies, the full load lands on a database sized for 5% of it → plan timeouts, a circuit breaker, and database capacity for a cold cache.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** a cache is a counter shelf in front of the walk-in fridge. **Next we open the box** in five steps: where to put the shelf, who restocks it, when to throw things out, which store to use, and what goes wrong. Each step starts with a plain walk-through; the full detail follows.
 
 ### Step 1: where to cache (the layers)
 
 **In plain words:** you can keep a copy at six places on the path from user to disk. Each place trades reach (how many users share it) against control (how fast you can invalidate).
+
+**Step by step:**
+1. The browser checks its own cache: the product image is already there, so no request is sent at all.
+2. If not, the nearest CDN server may have it and answers in a few milliseconds.
+3. An API call for the menu reaches your app; a small in-memory copy inside the app may answer.
+4. If not, the app asks Redis, shared by all app copies.
+5. Only if every layer misses does the database do the work, and its own memory may still hold the page.
 
 ```mermaid
 flowchart TD
@@ -166,12 +200,12 @@ flowchart TD
 
 | Layer | What it caches | Who shares it | Invalidate how | Typical use |
 | --- | --- | --- | --- | --- |
-| Client (browser, app) | Responses, images, local DB | One user | `Cache-Control`, ETag, versioned URLs | Static assets, offline data |
+| Client (browser, app) | Responses, images, local DB | One user | `Cache-Control`, ETag, versioned URLs (a version or hash in the file name) | Static assets, offline data |
 | CDN edge | Whole HTTP responses | Everyone near that edge | Purge API, short TTL, versioned URLs | Images, JS, public catalogue pages |
 | API gateway | Responses by URL and headers | All callers of the gateway | TTL, purge | Public GET endpoints, rate-limit counters |
 | App process (local) | Objects in memory | One instance | TTL, pub/sub broadcast | Config, feature flags, small lookup tables |
 | Distributed (Redis, Memcached) | Objects, query results, sessions | All instances | Delete on write, TTL | Hot rows, sessions, counters, leaderboards |
-| Database | Pages in buffer pool, materialized views | The database | Automatic, refresh jobs | Hot index pages, heavy aggregates |
+| Database | Pages in buffer pool (the database's own memory cache of disk pages), materialized views (stored results of a query) | The database | Automatic, refresh jobs | Hot index pages, heavy aggregates |
 
 **Example with numbers:** a 200 KB product image fetched 1 million times a day is 200 GB of origin traffic. With a CDN hit ratio of 95 percent (an estimate), origin serves 10 GB.
 
@@ -182,6 +216,13 @@ See [[CDN and Edge]] and [[HTTP Caching - Cache-Control, ETag, Conditional Reque
 ### Step 2: who fills the cache (the patterns)
 
 **In plain words:** when a request misses, someone has to load the value. When data is written, someone has to update or remove the cached copy. The four patterns differ in who does that work.
+
+**Step by step (cache-aside, the usual default):**
+1. A request for restaurant 42's menu checks Redis. Miss.
+2. The app reads the menu from the database and stores it in Redis with a 60 s TTL.
+3. The next 1,000 requests read it from Redis. Hits.
+4. The restaurant edits a price. The app writes the database, then deletes `menu:42` from Redis.
+5. The next request misses, loads the new menu, and fills the cache again.
 
 ```mermaid
 sequenceDiagram
@@ -226,6 +267,12 @@ flowchart TD
 
 **In plain words:** a **TTL** (time to live) is an expiry clock on each key. **Invalidation** means you delete or update the key when the source changes. TTL is simple and always works eventually. Invalidation is precise but you can forget a code path.
 
+**Step by step:**
+1. The menu is cached with a 60 s TTL.
+2. The price changes. The app deletes the key right away, so readers see the change in under a second.
+3. Suppose that delete is lost (a network blip). The TTL still expires the old copy within 60 s.
+4. So the worst case is 60 s of staleness, and the usual case is almost none.
+
 ```mermaid
 flowchart TD
     F{"How wrong can the data be, and for how long?"}
@@ -250,6 +297,12 @@ See [[Cache Invalidation, TTL and Consistency]].
 
 **In plain words:** A cache inside your app's own memory is fastest but each copy of the app has its own. A shared cache like Redis is one copy for everyone, one network hop away.
 
+**Step by step:**
+1. Feature flags change rarely and are read on every request: keep a copy in each app's memory.
+2. A user's profile must look the same on every server: keep it in Redis, shared by all.
+3. You only need plain blobs at huge scale with no extra features: Memcached is enough.
+4. You need sorted sets, counters, locks or persistence: Redis.
+
 ```mermaid
 flowchart TD
     S{"What do I need to store?"}
@@ -265,7 +318,7 @@ flowchart TD
 | Latency (estimate) | tens of nanoseconds to microseconds | sub-millisecond on a good network | sub-millisecond on a good network |
 | Data model | Any Go type | Strings, hashes, lists, sets, sorted sets, streams | Strings (opaque blobs) |
 | Shared across instances | No | Yes | Yes |
-| Persistence | No | Optional (RDB, AOF) | No |
+| Persistence | No | Optional (RDB snapshots, AOF append-only log) | No |
 | Replication and failover | None | Built in (replicas, Sentinel, Cluster) | Not in the server; clients shard, tools replicate |
 | Threading | Your code | Command execution is mostly single-threaded per shard (I/O threads help) | Multi-threaded |
 | Memory overhead | Inside your heap, adds GC pressure | Separate process | Separate process |
@@ -279,6 +332,12 @@ See [[Redis Fundamentals]], [[Redis Data Structures and When to Use Each]] and [
 ### Step 5: stampede and the other failure modes
 
 **In plain words:** when a hot key expires, every request misses at the same moment and all of them hit the database together. That is a **cache stampede** (also called a thundering herd).
+
+**Step by step:**
+1. The homepage key is read 5,000 times a second. Its TTL runs out at 20:00:00.
+2. Without protection, all 5,000 requests that second miss and hit the database together.
+3. With request coalescing (`singleflight`), the first miss loads the value; the others wait for that one result.
+4. Better still, refresh the key a little before it expires, or serve the old value while one request reloads it.
 
 ```mermaid
 sequenceDiagram
@@ -303,7 +362,7 @@ sequenceDiagram
 | Avalanche | Many keys expire at the same time | Add random jitter to TTLs (for example 60 s plus 0 to 10 s) |
 | Penetration | Requests for keys that do not exist skip the cache every time | Cache the "not found" result with a short TTL, or a Bloom filter in front |
 | Hot key | One key gets far more traffic than one node can serve | Local copy in front, replicate the key under several names |
-| Cache down | All traffic falls onto the database | Timeouts, circuit breaker, load shedding, keep the database sized for degraded mode |
+| Cache down | All traffic falls onto the database | Timeouts, circuit breaker (stop calling a failing dependency for a while), load shedding (reject some requests on purpose), keep the database sized for degraded mode |
 
 Facebook's memcache paper describes **leases** as its fix: a miss hands one client a token to refill the key and tells the others to wait briefly, which stops both stampedes and stale refills.
 
@@ -407,6 +466,8 @@ flowchart TD
 > Adding a cache to hide a slow query. Fix the index first ([[Query Plans and EXPLAIN]]), then cache what is still hot.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** where to cache, how to fill and expire it, which store to use and how caches fail. **Next comes the senior view**: production habits and metrics, then two-level caches, multi-region caching, negative caching with Bloom filters, and why deleting beats updating on write.
 
 Real systems, with what is publicly documented:
 
@@ -541,6 +602,26 @@ Updating the cache on write has a race: two writers can set the cache in the opp
 - "To handle a stampede I coalesce misses, add TTL jitter, and cache not-found results."
 - "If Redis fails, the app falls back to the database behind a circuit breaker, and the database is sized for that."
 - Trade-off line: "The cost of this cache is staleness and one more thing to operate, which I think is worth it at 20k reads per second."
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is a cache hit and a cache miss?
+> A hit is found in the cache; a miss is not there, so the database is read.
+
+> [!question]- (easy) What does a TTL do?
+> It makes a cached copy expire after a set time, so stale data cannot live forever.
+
+> [!question]- (easy) Why is a CDN the cheapest cache for images?
+> It answers near the user, so the request never reaches your servers.
+
+> [!question]- (medium) Why set a TTL even when you delete keys on write?
+> If a delete is lost, the TTL still limits how long the wrong value lives.
+
+> [!question]- (medium) What is a stampede and one fix?
+> A hot key expires and all requests hit the database at once; coalesce misses so one request reloads it.
+
+> [!question]- (medium) Why delete the key on write instead of updating it?
+> Two writers racing can leave the older value in the cache; a delete lets the next read load the truth.
 
 ## Links 🟢
 

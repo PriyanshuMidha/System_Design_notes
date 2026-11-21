@@ -36,6 +36,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6 (variants and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Storage Engines - B-tree vs LSM and WAL]]: the database writes every change into a log file (the WAL) before it changes the real tables, so the log can be replayed later.
+> - [[Replication]]: a replica is a second live server that copies every write from the main one a few milliseconds later.
+
 **From zero, in 60 seconds** 🟢
 
 Your database holds all your invoices. One day someone runs a delete by mistake, and the rows are gone everywhere, even on the live copies.
@@ -77,6 +81,12 @@ A backup lets you go back to "one second before the mistake" and get them back.
 | RPO | How much recent data you can afford to lose | RPO 1 min = lose at most the last minute |
 | RTO | How long you can afford to be down while restoring | RTO 1 h = service back within an hour |
 | Restore drill | A practice restore to prove backups work | Every Monday, restore to a test server and check row counts |
+| Base backup | A full copy of the database files, taken while it runs; the starting point for PITR | The 01:00 copy of all 2 TB |
+| WAL segment | One 16 MB file of the WAL; the archive is a long chain of them | Segment 42 holds the changes from 14:00 to 14:05 |
+| LSN | Log sequence number: the byte position inside the WAL, like a page number in the diary | "backup starts at LSN 1/0" |
+| Failover | Switching traffic to a replica when the main server dies | Replica in zone B becomes the new main |
+| Object storage | Cheap cloud storage for files (Amazon S3 and similar) | WAL segments uploaded to an S3 bucket |
+| Immutable copy | A backup that nobody, not even an admin, can delete until a set date | S3 Object Lock for 35 days |
 
 **Picture it**
 
@@ -110,12 +120,27 @@ At 14:42 on a Tuesday an InvoiceOps engineer runs a data-fix script. A missing `
 UPDATE invoices SET status = 'void', amount_due_minor = 0;  -- all 10 M rows
 ```
 
-InvoiceOps runs a primary with two streaming replicas (see [[Replication]]). Both replicas apply the update within 40 ms. Failover does not help: every copy of the data is now wrong. What helps is a copy of the database **as it was at 14:41:59**, and that needs:
+InvoiceOps (the running example in these notes: an invoicing app where many customer companies share one database) runs a **primary** (the main server that accepts writes) with two **streaming replicas** (servers that receive each change as a live stream and apply it; see [[Replication]]). Both replicas apply the update within 40 ms. Failover does not help: every copy of the data is now wrong. What helps is a copy of the database **as it was at 14:41:59**, and that needs:
 
 1. a full copy taken earlier (last night's base backup), and
 2. every change made since then, in order, so the database can replay them and stop just before the bad statement.
 
-The cost of not having it is concrete. The newest copy without PITR might be last night's 01:00 `pg_dump`; restoring it loses 13 hours and 42 minutes of invoices, payments and webhooks, which then have to be rebuilt from payment-provider exports and emails.
+The cost of not having it is concrete. The newest copy without PITR might be last night's 01:00 `pg_dump` (PostgreSQL's tool that writes the whole database out as one SQL file); restoring it loses 13 hours and 42 minutes of invoices, payments and webhooks, which then have to be rebuilt from payment-provider exports and emails.
+
+### Real-life example: a food-delivery order history 🟢
+
+Think of an app like Swiggy, which keeps every order in a database.
+Say a late-night script meant to clear test orders deletes real orders from yesterday instead.
+The replicas copy the delete within a second, so switching servers does not help.
+With PITR the team restores a side copy to one second before the script ran and copies yesterday's orders back.
+Customers still see their past orders and refunds still work, and the team loses only a few hours of cleanup time, not the data.
+
+```mermaid
+flowchart LR
+    S["Script deletes yesterday's orders at 02:00"] --> R["Replicas delete them too"]
+    B["Backup + WAL"] --> SIDE["Side copy at 01:59:59"]
+    SIDE --> BACK["Copy the orders back to the live database"]
+```
 
 ## 2. Mental model 🟢
 
@@ -143,11 +168,34 @@ Two numbers frame every decision:
 - **RPO (Recovery Point Objective):** the most data, measured in time, you accept losing. "RPO 5 minutes" means after a disaster at 14:42 you must recover everything up to at least 14:37.
 - **RTO (Recovery Time Objective):** the most time you accept being down. "RTO 1 hour" means service is back by 15:42.
 
+```mermaid
+flowchart LR
+    L["last safe copy 14:37"] -- "RPO: data lost" --> D["disaster 14:42"]
+    D -- "RTO: time down" --> B["service back 15:42"]
+```
+
+## Common beginner mistakes 🟢
+
+- **Treating replicas as backups** → a replica copies a bad `DELETE` within milliseconds, so every copy is wrong → keep PITR backups as well as replicas.
+- **Never testing a restore** → backups can fail quietly for months (GitLab in 2017 found out on the bad day) → run an automated restore drill every week and check row counts.
+- **Keeping backups in the same account and region as the database** → one leaked admin key or one region outage takes both → copy backups to another account and another region.
+- **Restoring on top of production** → you wipe out everyone's good work since the mistake → restore to a new side server, then copy only the damaged rows back.
+- **Ignoring the WAL archive** → one missing WAL file breaks PITR for every second after it → alert when archiving fails or falls behind.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** why replicas cannot undo a mistake and that a backup plus the change diary can rewind time. **Next we open the box**: the two kinds of backup, how the diary gets shipped, how a restore actually runs, and what decides RPO. Each subsection starts with a short step-by-step walk.
 
 ### 3.1 Logical vs physical backups
 
 **In plain words:** there are two ways to copy a database — write out the data as SQL you can replay anywhere (logical, like re-typing a book), or copy the raw files byte for byte (physical, like photocopying it). Photocopying is faster but only works on the same kind of machine.
+
+**Step by step:**
+1. Logical: `pg_dump` reads every row of `invoices` and writes it out as text, such as `COPY invoices ... 10 M rows`.
+2. To restore it, a fresh server re-inserts all 10 M rows and then rebuilds every index, which is slow.
+3. Physical: `pg_basebackup` copies the raw data files of the whole server, all 2 TB, as they are.
+4. To restore it, you copy those files back and start PostgreSQL. No rows are re-inserted, so it is much faster.
+5. Only the physical copy can be combined with the WAL to reach an exact second.
 
 | | Logical (`pg_dump`, `mysqldump`) | Physical (`pg_basebackup`, volume snapshot) |
 | --- | --- | --- |
@@ -175,11 +223,18 @@ flowchart TD
 
 **In plain words:** the base backup is the nightly photo; the WAL archive is the change diary shipped off-site every minute. Together they let you rebuild to any second.
 
+**Step by step:**
+1. PostgreSQL writes every change into the WAL, one 16 MB file (a segment) at a time.
+2. When a segment is full, PostgreSQL runs your `archive_command`, which uploads it to S3.
+3. At 01:00 a backup tool copies all the data files while the server keeps running.
+4. Those copied files are a bit messy on their own, because writes kept happening during the copy.
+5. Replaying the WAL from the backup's start to its end tidies them into one clean state. From there, more WAL takes you forward to any second you choose.
+
 Every change PostgreSQL makes is first written to the **WAL** (write-ahead log; see [[Storage Engines - B-tree vs LSM and WAL]]) in 16 MB files called segments.
 
-With `archive_mode = on`, each completed segment is handed to `archive_command` (or an `archive_library` since PostgreSQL 15), which copies it to object storage.
+With `archive_mode = on`, each completed segment is handed to `archive_command` (a shell command you configure; or an `archive_library`, a plug-in, since PostgreSQL 15), which copies it to object storage.
 
-A **base backup** is a copy of the data directory taken while the server runs; the files are inconsistent on their own, but together with the WAL from the backup's start to its end they become consistent.
+A **base backup** is a copy of the **data directory** (the folder on disk where PostgreSQL keeps all its table and index files) taken while the server runs; the files are inconsistent on their own, but together with the WAL from the backup's start to its end they become consistent.
 
 ```mermaid
 flowchart LR
@@ -227,6 +282,13 @@ The restore:
 
 **In plain words:** RPO is simply "how much of the diary could I lose?" — whatever sits in the page that has not been shipped off-site yet.
 
+**Step by step:**
+1. Segments 41 and 42 are full and already sit in S3. They are safe.
+2. Segment 43 is still being filled. It lives only on the database server's disk.
+3. If the server dies now, whatever is in segment 43 is lost. That gap is your real RPO.
+4. On a quiet night segment 43 might take 3 hours to fill, so you could lose 3 hours.
+5. `archive_timeout = 60s` closes the segment every minute even if it is not full, so you lose about 1 minute at most.
+
 ```mermaid
 flowchart LR
     subgraph arch["archived, safe off-host"]
@@ -248,6 +310,13 @@ Tools such as `pg_receivewal`, pgBackRest and Barman can also stream WAL continu
 ### 3.4 Disaster recovery tiers
 
 **In plain words:** DR tiers are how much of a spare kitchen you keep in another city — from just the recipes (cheap, slow) to a fully staffed duplicate restaurant (fast, expensive).
+
+**Step by step:**
+1. Say the Mumbai region of your cloud goes down. DR (disaster recovery) asks: how do we run from Hyderabad?
+2. Cheapest: Hyderabad holds only backup files. You build everything from them, which takes hours.
+3. Next: a database replica already runs in Hyderabad, but app servers are off. You switch them on in tens of minutes.
+4. Next: a small copy of the whole app already runs there. You scale it up in minutes.
+5. Most expensive: both regions serve users all the time, so losing one is barely noticed.
 
 | Tier | What runs in the DR region | Typical RPO | Typical RTO | Relative cost |
 | --- | --- | --- | --- | --- |
@@ -301,7 +370,7 @@ The business agrees on **RPO 5 minutes** and **RTO 1 hour** for the invoices dat
 | Requirement | Design choice |
 | --- | --- |
 | RPO 5 min for logical errors | WAL archiving with `archive_timeout = 60s`; alert if the newest archived segment is older than 3 minutes |
-| RPO near 0 for a lost server | Synchronous or quick-async replica in another availability zone, see [[High Availability and Failover]] |
+| RPO near 0 for a lost server | Synchronous or quick-async replica in another **availability zone** (a separate data centre in the same cloud region), see [[High Availability and Failover]] |
 | RTO 1 hour including PITR | Nightly full + 6-hourly incremental base backups, so WAL replay never spans more than 6 hours |
 | Region loss | Backups and WAL copied to a second region and a second account |
 | Ransomware or insider deletes | S3 Object Lock in compliance mode on the backup bucket, 35-day retention |
@@ -314,9 +383,15 @@ The database is 2 TB. The numbers below are **estimates** for one restore host; 
 - Replaying WAL: the database writes about 8 GB of WAL per hour at peak. From a 01:00 backup to 14:42 is about 14 hours, around 110 GB. At an estimated replay rate of 20 MB/s that is 5,500 s ≈ 1 h 32 min.
 - Total ≈ 4 h 20 min, before DNS changes, app restarts and verification. **RTO 1 hour is impossible with this design.**
 
+```mermaid
+flowchart LR
+    C["Copy 2 TB<br/>about 2 h 50 min"] --> W["Replay 110 GB WAL<br/>about 1 h 30 min"]
+    W --> T["Total about 4 h 20 min<br/>target was 1 h"]
+```
+
 What fixes it:
 1. Incremental backups every 6 hours cut the worst-case WAL to 6 × 8 GB = 48 GB ≈ 40 min of replay.
-2. A volume snapshot (EBS) restores in minutes because blocks load lazily, at the cost of slow first reads.
+2. A volume snapshot (EBS, Amazon's network disks, can save a copy of a whole disk) restores in minutes because blocks load lazily, at the cost of slow first reads.
 3. For a bad `UPDATE` on one table, you do not need to replace production at all: restore to a side server, then copy back only the affected rows (section 4.4).
 4. A **delayed replica** (section 8) already sits one hour in the past.
 
@@ -400,9 +475,20 @@ sequenceDiagram
     Cron->>RH: destroy host
 ```
 
+`amcheck` and `pg_checksums` are PostgreSQL tools that scan the restored indexes and pages for damage.
+
 The drill produces measured RTO and RPO each week. If the measured restore time grows past the target, you learn it from a dashboard instead of during an incident.
 
 ## 5. Variants and comparison 🟡
+
+**Do not confuse these** 🟡
+
+| Thing | What it protects you from | What it cannot do |
+| --- | --- | --- |
+| Replica | A server or disk dying | Undo a bad `DELETE`: it copies the mistake |
+| Backup with PITR | Bad changes, lost servers | Bring you back in seconds; a restore takes time |
+| High availability (HA) | Downtime from one machine failing | Protect data; it is about staying up, not about history |
+| Disaster recovery (DR) | Losing a whole region | Replace backups; DR copies mistakes too |
 
 | Method | RPO | RTO for 2 TB (estimate) | Protects against | Misses |
 | --- | --- | --- | --- | --- |
@@ -417,7 +503,7 @@ The drill produces measured RTO and RPO each week. If the measured restore time 
 
 The latest restorable time is typically within the last 5 minutes. A restore always creates a **new** DB instance with a new endpoint. Manual snapshots are kept until you delete them, even after the instance is deleted.
 
-RDS can replicate automated backups to another Region, and manual snapshots can be copied cross-Region and shared with another account (an encrypted snapshot needs a customer-managed KMS key to be shared).
+RDS can replicate automated backups to another Region, and manual snapshots can be copied cross-Region and shared with another account (an encrypted snapshot needs a customer-managed KMS key, a key you create in AWS's key service, to be shared).
 
 Aurora works differently: storage is continuously backed up, and its backtrack feature (Aurora MySQL) rewinds in place.
 
@@ -435,6 +521,8 @@ Aurora works differently: storage is continuously backed up, and its backtrack f
 - **When simpler wins:** a small internal tool with a 24-hour RPO is well served by managed automated backups and a monthly restore test. Do not build pilot light for it.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how a restore works, how to size RPO and RTO, and which tools exist. **Next comes the senior view**: keeping backups safe from attackers, learning from a real outage, the alerts to set, and tricks like delayed replicas and timelines that interviewers like to probe.
 
 **The 3-2-1 rule:** at least **3** copies of the data, on **2** different kinds of storage, **1** of them off-site. A modern extension is 3-2-1-1-0: one copy immutable or offline, and zero errors in restore verification.
 
@@ -514,6 +602,8 @@ flowchart LR
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** A live copy of the database copies your mistakes, so you also need backups. A backup is a full copy plus a diary of every change, and together they can rebuild the data at any second. Decide two numbers with the business: how much data you may lose, and how long you may be down. Keep copies in another place that nobody can delete. Practise restoring every week, because an untested backup may not work.
+
 - Replica ≠ backup. Replicas fix hardware loss; PITR backups fix bad data.
 - PITR = base backup + unbroken WAL archive + `recovery_target_time`. One missing segment breaks the window.
 - RPO ≈ `archive_timeout` + upload delay; RTO ≈ copy time + WAL replay + cut-over. Do the math, then measure it.
@@ -522,6 +612,30 @@ flowchart LR
 - 3-2-1 (+1 immutable, +0 errors). Object Lock compliance mode, separate account.
 - Delayed replica = fast undo for mistakes caught within the delay.
 - Automate restore drills; report measured RTO and RPO every week.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why is a replica not a backup?
+> It copies every change within milliseconds, including a bad `DELETE`, so it holds the mistake too.
+
+> [!question]- What two things does PITR combine?
+> A base backup (the full copy) and the archived WAL (every change since), replayed up to a chosen second.
+
+> [!question]- What do RPO 5 minutes and RTO 1 hour mean?
+> You may lose at most the last 5 minutes of data, and the service must be back within 1 hour.
+
+🟡 Medium
+
+> [!question]- Why does `archive_timeout = 60s` matter on a quiet database?
+> Without it a 16 MB WAL segment may take hours to fill and stays on the server unarchived; the timeout ships it every minute, so RPO stays near one minute.
+
+> [!question]- One WAL segment from 05:00 is missing. What breaks?
+> Any restore that must replay through 05:00 fails, so every target after that point is unreachable from backups taken before it.
+
+> [!question]- One tenant deleted 300 rows. Why not restore the whole database?
+> That would erase every other tenant's work since the mistake; restore a side server and copy back only that tenant's rows.
 
 ## Links
 

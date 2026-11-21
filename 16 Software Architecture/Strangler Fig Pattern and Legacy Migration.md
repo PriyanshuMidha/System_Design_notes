@@ -43,6 +43,10 @@ Everything in this note is this one diagram made precise: what the rule can look
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Monolith vs Microservices]]: a monolith is one big app; pulling a module out into its own service only helps if it also gets its own data. This note is how you do that pull-out safely.
+> - [[Hexagonal Architecture (Ports and Adapters)]]: code depends on an interface, and any adapter that fits can be plugged in. The routing facade here is built the same way: old and new systems are two adapters behind one `Backend` interface.
+
 **From zero, in 60 seconds** 🟢
 
 You have an old system that works but is hard to change. Rewriting it all at once is very risky.
@@ -83,6 +87,12 @@ If something breaks, you send that feature's traffic back to the old app in seco
 | Rollback | Switching back if the new side misbehaves | Flip the rule back |
 | Shadow traffic | Sending a copy of requests to the new system, ignoring its answer | Compare old vs new responses |
 | CDC (change data capture) | Streaming every DB change to another store | Debezium copying rows to the new DB |
+| Seam | A spot where you can cut in and send a request elsewhere | The `/invoices/*` URL prefix |
+| Canary | Sending a small share of real traffic to the new side first | 5% of tenants |
+| Blast radius | How many users are hurt if this step goes wrong | One test tenant vs everyone |
+| Branch by abstraction | Same idea inside one codebase: interface, two versions, a flag | `InvoiceStore` old vs new |
+| Dual write | The app writes to the old and the new database itself | Risky: one write can fail |
+| Backfill | Copying existing old rows into the new store | One-time job over 2 years of invoices |
 
 **Picture it**
 
@@ -108,6 +118,8 @@ Where it breaks: rooms in a house are separate, but old and new systems often sh
 > Move one small, reversible slice at a time until the old system has no traffic left, then delete it.
 
 ## 1. Why it exists 🟢
+
+🟢 **Plain version:** Rewriting a big old system and switching everyone over in one night usually goes wrong. The rewrite takes longer than planned, because the old system keeps changing meanwhile. On switch-over day, one serious bug means rolling back everything. The strangler fig way moves one small piece at a time, so a bad step hurts a few users for an hour, and you undo it by flipping one rule.
 
 A five-year-old monolith has one module — say, invoicing — that a team wants to extract into its own service, written in Go with a cleaner schema. The tempting plan is a **big-bang rewrite**: freeze the old invoicing code, write the new service over two months, cut every client over on release day.
 
@@ -135,9 +147,31 @@ The **facade is the fig's growing lattice**: it occupies the position every clie
 
 The host tree (the old system) never had to be demolished for the fig to take root — it keeps serving requests the facade hasn't routed away yet, right up until the facade routes nothing to it and it can be switched off.
 
+### Real-life example 🟢
+
+Imagine a bank moving its old net-banking app to a new one. It does not switch all customers on one Sunday.
+First, only the "download statement" page goes to the new app, because it only reads data and is easy to check.
+Next, bank staff accounts use the whole new app. Then 5% of customers, then 30%, then everyone.
+If the new "fund transfer" page misbehaves for the 5%, the bank flips that page back to the old app in seconds. Only when no customer uses the old app does the bank switch it off.
+
+## Common beginner mistakes 🟢
+
+- **Moving a write-heavy, money-moving feature first** → a bug costs real money and is hard to undo → start with a low-traffic, read-only page.
+- **Picking which side a tenant goes to at random on every request** → a user's data seems to appear and vanish → hash the tenant ID so each tenant always lands on the same side.
+- **Having the app write to both databases** → one write can fail and the two quietly disagree → use CDC to copy committed changes from the old database.
+- **Trusting the new system because the code "looks right"** → hidden differences show up for real users → run shadow traffic and compare answers first.
+- **Never switching the old system off** → you now run two systems forever → set a retirement date and delete the old branch when traffic reaches zero.
+
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the idea: a router in front, small slices moved one at a time. **Next we open the box**: the three phases, how to choose a slice, how to check the new side before trusting it, how the data moves, and how to keep old ideas from leaking into the new code.
+
 ### 3.1 The three phases
+
+**Step by step:**
+1. Phase 1: a router sits in front. 100% of requests still go to the old system.
+2. Phase 2: the router sends `/invoices/:id/pdf` to the new service. Later, more routes and more tenants. This can last months.
+3. Phase 3: the old system gets 0% of traffic. Switch it off and delete the router's "old" branch from the code.
 
 ```mermaid
 flowchart TB
@@ -169,6 +203,25 @@ Phase 3 is the only truly final step: the old system is decommissioned, and the 
 
 **In plain words: a seam is a spot where you can cut in and send a request somewhere else.**
 
+**Step by step:**
+1. Find a seam: the URL path `/invoices/:id/pdf`.
+2. First rule: send just that path to the new service.
+3. Second rule: send every request from tenant `t-test` (your own test account) to the new service.
+4. Third rule: hash each tenant ID into a number from 0 to 99; numbers below 30 go to the new service. Tenant `t-42` always gets the same number, so it never flips sides.
+
+```mermaid
+flowchart LR
+    R["Request"] --> P{"Path on allowlist?"}
+    P -- "yes" --> N["New service"]
+    P -- "no" --> T{"Tenant on allowlist?"}
+    T -- "yes" --> N
+    T -- "no" --> H{"hash(tenant) < 30?"}
+    H -- "yes" --> N
+    H -- "no" --> O["Old system"]
+```
+
+Full detail:
+
 A **seam** is a boundary in the old system where a request can be intercepted without understanding the whole monolith: a URL prefix (`/invoices/*`), a tenant ID, a message type on a queue, or a function call behind an interface the old code already has.
 
 The facade routes by whichever seam the old system exposes most cleanly — usually the URL path, because most monoliths already have a URL-routing layer to hook into.
@@ -176,10 +229,17 @@ The facade routes by whichever seam the old system exposes most cleanly — usua
 Three concrete routing rules, each real and each used at a different point in the migration:
 
 - **Path allowlist.** Route `/invoices/:id/pdf` to the new service, everything else to the old one. This is the first slice: a single read-only endpoint, chosen because it has no write side effects to reconcile if the new service is wrong.
-- **Tenant allowlist.** Route specific tenant IDs (an internal test tenant, then a handful of consenting beta customers) to the new service regardless of which route they call. This slice tests the new system against real, varied traffic from a small blast radius.
-- **Percentage canary.** Route a stable percentage of *all* tenants to the new service, where "stable" means the same tenant always lands on the same side for the length of the migration wave — a tenant whose data looks half-migrated and half-not because it flip-flopped between requests is worse than either side alone. The Go code below makes this stickiness a hashed, deterministic decision instead of a coin flip per request.
+- **Tenant allowlist.** Route specific tenant IDs (an internal test tenant, then a handful of consenting beta customers) to the new service regardless of which route they call. This slice tests the new system against real, varied traffic from a small **blast radius** (the number of users hurt if it goes wrong).
+- **Percentage canary** (named after the canary miners carried as an early warning). Route a stable percentage of *all* tenants to the new service, where "stable" means the same tenant always lands on the same side for the length of the migration wave — a tenant whose data looks half-migrated and half-not because it flip-flopped between requests is worse than either side alone. The Go code below makes this stickiness a hashed, deterministic decision instead of a coin flip per request.
 
 ### 3.3 Verifying before trusting: shadow traffic
+
+**Step by step:**
+1. A request for invoice `inv-9` arrives.
+2. The facade sends it to the old system **and** to the new one at the same time.
+3. The customer gets the old system's answer, always.
+4. The two answers are compared. Same? Log "match". Different? Log the difference.
+5. Only after many days of matches does a rule let the new system answer for real.
 
 Before any routing rule sends a tenant's *live* traffic to the new service, **shadow traffic** proves the new service would have answered the same way, without the new service's answer ever reaching the caller:
 
@@ -210,20 +270,35 @@ This is the same idea as a **dark launch** (running new code in production witho
 
 **In plain words: the same idea inside one codebase: put an interface in front of old code, then swap in the new code.**
 
+**Step by step:**
+1. Old code calls `legacyInvoiceStore` directly. Put an `InvoiceStore` interface in front of it.
+2. Write `newInvoiceStore` that fits the same interface.
+3. Add a flag: tenant `t-test` uses the new one, everyone else the old one.
+4. Widen the flag over time. When everyone is on the new one, delete the old code.
+
 When the seam is inside one codebase rather than between two deployed services — the invoicing *module* needs replacing but will stay in the same binary for now — **branch by abstraction** is the strangler fig's in-code twin: introduce an interface the old implementation already satisfies, write the new implementation behind the same interface, flip a flag per call site (or per tenant, same as 3.2) to choose which implementation runs, and delete the old implementation once every call site has flipped.
 
-It avoids a long-lived feature branch that drifts from `main`; both implementations ship on every commit, selected at runtime instead of at merge time.
+It avoids a long-lived **feature branch** (a separate copy of the code in git, merged back later) that drifts from `main`; both implementations ship on every commit, selected at runtime instead of at merge time.
 
 ### 3.5 Data migration, the part that outlasts the code
 
 **In plain words: code can move one route at a time; data needs copying, syncing and a careful switch.**
 
+**Step by step:**
+1. At first the new service reads and writes the old tables directly.
+2. Then it gets its own tables. A CDC tool copies every saved change from the old tables into the new ones, a moment later.
+3. A job copies over the old history (backfill) and compares old vs new, again and again.
+4. When several comparisons in a row find zero differences, writes switch to the new tables first.
+5. A reverse copy (new → old) runs until nothing reads the old tables any more.
+
+Full detail:
+
 Code can be migrated route by route; data cannot be migrated row by row without a window where both systems might touch the same row. Three stages, in order:
 
-1. **Shared database.** The new service reads and writes the old system's existing tables directly (through its own repository layer, never the old monolith's ORM models — see [[Hexagonal Architecture (Ports and Adapters)]] for why the port stays stable while the implementation underneath it changes). This is the fastest way to get a second code path running, and the most coupled: a schema change for one system is a schema change for both.
-2. **Change data capture (CDC) sync.** The new service gets its own schema; a CDC tool (Debezium reading Postgres's write-ahead log is the common choice) streams every committed change from the old tables into the new schema, keeping it current without the old system's code knowing a second consumer exists. See [[Transactional Outbox and CDC]] for the mechanics CDC shares with the outbox pattern.
+1. **Shared database.** The new service reads and writes the old system's existing tables directly (through its own repository layer, never the old monolith's **ORM** models, i.e. the structs a database-mapping library built for those tables — see [[Hexagonal Architecture (Ports and Adapters)]] for why the port stays stable while the implementation underneath it changes). This is the fastest way to get a second code path running, and the most coupled: a schema change for one system is a schema change for both.
+2. **Change data capture (CDC) sync.** The new service gets its own schema; a CDC tool (Debezium reading Postgres's **write-ahead log**, the change diary the database writes before changing tables, is the common choice) streams every committed change from the old tables into the new schema, keeping it current without the old system's code knowing a second consumer exists. See [[Transactional Outbox and CDC]] for the mechanics CDC shares with the outbox pattern.
 3. **Dual-write danger, and why CDC beats it.** The tempting shortcut — have the *application* write to both databases in the request path — creates a window where one write succeeds and the other fails, with no transaction spanning two different database engines to make that atomic. CDC avoids this because it reads what already committed to the old database's WAL; there is nothing to partially fail. Dual-writes are acceptable only as a short bridge with reconciliation, never as the steady state.
-4. **Ownership switch.** Once CDC has run long enough that a backfill-and-diff job finds zero discrepancies between old and new for several consecutive runs, the new schema becomes authoritative: writes flip to the new service first, and a reverse sync (new → old) runs only until every remaining old-system caller has moved — one more slice in 3.2's sense, applied to the write path itself.
+4. **Ownership switch.** Once CDC has run long enough that a **backfill**-and-diff job (copy old rows across, then compare both sides) finds zero discrepancies between old and new for several consecutive runs, the new schema becomes authoritative: writes flip to the new service first, and a reverse sync (new → old) runs only until every remaining old-system caller has moved — one more slice in 3.2's sense, applied to the write path itself.
 
 ```mermaid
 flowchart LR
@@ -235,6 +310,12 @@ flowchart LR
 ### 3.6 Anti-corruption layer
 
 **In plain words: a translator so the old system's messy words do not leak into the new one.**
+
+**Step by step:**
+1. The old system has one `Invoice` row with a negative amount meaning "refund".
+2. The new system has two types: `Invoice` and `CreditNote`.
+3. A small translator at the seam turns "old invoice with amount below 0" into a `CreditNote`, and back.
+4. The new code never has to know the old trick.
 
 While the old and new systems coexist, they often disagree on what a word means — the old monolith's `Invoice` row might represent what the new system splits into `Invoice` and `CreditNote`.
 
@@ -290,6 +371,8 @@ flowchart TB
 ```
 
 `facade` imports nothing from either adapter: it declares `Backend`, `RoutingRule` and `DiffRecorder` as interfaces and depends only on those.
+
+**What the code below does, in plain words:** `Facade` asks a rule "old or new?" and calls that backend. `PercentCanary` hashes the tenant ID to decide, so a tenant always gets the same answer. `ShadowFacade` calls both backends, always returns the old answer, and records whether the two matched.
 
 Both the old-monolith adapter and the new-service adapter import `facade` to implement `Backend`, never the reverse — the same inward-pointing dependency direction [[Hexagonal Architecture (Ports and Adapters)]] and [[Clean Architecture]] both require, applied here to a migration seam instead of a layered application.
 
@@ -619,6 +702,9 @@ func TestShadowFacadeIsSafeForConcurrentRequests(t *testing.T) {
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to route by slice, shadow-test, move the data and translate between models, with working Go code. **Next is the senior view**: real tools (gateways, GitHub's Scientist), how migrations fail in production, and the finer points like why CDC beats dual writes.
+
+
 - **Real systems:**
 	- Fowler's original 2004 post takes its name from strangler figs he saw on a trip to Queensland's rain forests, used as a metaphor for colleagues' work modernising legacy systems; the post itself names no specific client, but its further-reading links to Ferri and Coggrave's writing on introducing seams into a mainframe system.
 	- API gateways and reverse proxies (Envoy, Nginx, an internal [[API Gateway and BFF]]) are the usual facade implementation at the HTTP layer; a message broker's routing rules serve the same role for event-driven seams.
@@ -634,7 +720,7 @@ func TestShadowFacadeIsSafeForConcurrentRequests(t *testing.T) {
 
 - **Why CDC instead of dual writes, precisely.** A dual write from the application is two separate commits to two separate storage engines with no shared transaction coordinator between them; the window between the two commits is a window where a crash, a timeout, or a retry can leave the systems permanently disagreeing, and nothing detects that disagreement until a customer notices. CDC reads a single source of truth's write-ahead log after it has already committed, so there is exactly one commit to reason about, and the sync is naturally eventually consistent rather than silently inconsistent.
 - **Sizing the first slice.** The first migrated slice should have three properties at once: low traffic (a small blast radius if wrong), no destructive side effects (prefer a read endpoint over a write), and high observability (good existing logs/metrics on the old path to diff against). A read-only PDF export or a dashboard summary endpoint usually satisfies all three; a payment-capture endpoint satisfies none of them and should migrate last, not first.
-- **Percentage canary bucket stability under tenant churn.** Hashing the tenant ID (as the Go code above does with FNV-1a) rather than assigning buckets in a lookup table means a new tenant signing up mid-migration gets a stable bucket automatically, with no table row to maintain — at the cost of not being able to force a *specific* tenant onto a side without a path- or tenant-allowlist override layered in front of the percentage rule.
+- **Percentage canary bucket stability under tenant churn.** Hashing the tenant ID (as the Go code above does with FNV-1a, a simple, fast hash function) rather than assigning buckets in a lookup table means a new tenant signing up mid-migration gets a stable bucket automatically, with no table row to maintain — at the cost of not being able to force a *specific* tenant onto a side without a path- or tenant-allowlist override layered in front of the percentage rule.
 - **When the "old" system in the diagram is itself a vendor product**, the facade pattern is identical, but the anticorruption layer (3.6) usually has to carry much more translation weight, because a vendor's data model cannot be changed to meet the new system halfway the way an in-house monolith's model sometimes can.
 
 ## 9. Interview questions 🔴
@@ -669,6 +755,26 @@ func TestShadowFacadeIsSafeForConcurrentRequests(t *testing.T) {
 - Data migration order: shared database → CDC sync (never dual-write from the app) → backfill-and-diff → ownership switch.
 - Anticorruption layer translates between the old and new domain models while both exist, so neither has to compromise to understand the other.
 - A migration without a retirement step (old system decommissioned, old branch of the facade deleted) is a permanent two-system architecture, not a migration in progress.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What does the routing facade do?
+> For each request it decides whether the old or the new system answers.
+
+> [!question]- (easy) Which feature should you move first?
+> A low-traffic, read-only, well-logged one, like a PDF export.
+
+> [!question]- (easy) How do you undo a bad slice?
+> Flip that slice's routing rule back to the old system.
+
+> [!question]- (medium) Why hash the tenant ID for the percentage canary?
+> So each tenant always lands on the same side and never sees its data flip between systems.
+
+> [!question]- (medium) Why is CDC safer than dual writes?
+> CDC copies changes that already committed in one database; dual writes are two separate commits that can half-fail.
+
+> [!question]- (medium) Shadow traffic matched 100% for a week. Go to 100% at once?
+> No. Shadow traffic doesn't test the new side as the real critical path; widen with a canary and watch latency and errors.
 
 ## Links 🟢
 

@@ -49,6 +49,9 @@ This is the entire cascade in miniature: compare the left-most number first, and
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[How Browsers Load and Render a Page]]: the browser reads your HTML into a tree of elements, reads your CSS, and then works out how each element looks and where it sits. That rough picture is enough.
+
 **From zero, in 60 seconds** 🟢
 
 A web page is built from boxes: every heading, button and paragraph is a box. CSS is the list of rules that says how each box looks. A rule has two parts: a **selector** ("which boxes?") and some settings ("make them blue").
@@ -94,6 +97,12 @@ CSS has a fixed rulebook for that choice, plus a fixed recipe for how big each b
 | Specificity | A score of how precise a selector is | `#main` beats `.card` beats `p` |
 | Inherit | A child takes a value from its parent | Text colour flows into nested `<span>` |
 | Padding / border / margin | Space inside the edge / the edge / space outside it | `padding: 8px` |
+| `!important` | A flag that makes one setting beat normal settings | `color: red !important;` |
+| Pseudo-class | A selector for an element in a certain state | `a:hover` (mouse is over the link) |
+| Pseudo-element | A selector for a made-up part of an element | `p::first-line` |
+| `box-sizing` | Decides whether `width` counts padding and border | `box-sizing: border-box` |
+| Viewport | The visible area of the browser window | a phone screen is about 400px wide |
+| Inline style | CSS written straight on one tag | `<p style="color:red">` |
 
 **Picture it**
 
@@ -130,6 +139,14 @@ The cascade is the fixed, documented procedure that makes the outcome the same i
 > [!tip] Remember
 > The cascade exists so three conflicting rules on one element always resolve the same way, in every browser, without you reading the whole stylesheet to find out which one wins.
 
+### Real-life example: the "Book" button 🟢
+
+Think of the red "Book tickets" button on BookMyShow.
+The site-wide stylesheet says every button is grey with small padding.
+The movie page's stylesheet says buttons on that page are red.
+On a sold-out show, one more rule says the button is faded and not clickable.
+All three rules hit the same button, and the cascade decides, every time and in every browser, that the sold-out rule wins because it is the most precise (more classes) or comes last.
+
 ## 2. Mental model 🟢
 
 > [!quote] Analogy: a four-round tournament
@@ -151,23 +168,55 @@ flowchart TD
 > [!tip] Remember
 > Each round of the tournament only runs when the previous round was an exact tie — a rule never gets a second chance to win on a later round once it has already lost an earlier one.
 
+## Common beginner mistakes 🟢
+
+- **Selecting an ID with a dot** (`.hero` for `<div id="hero">`) → a dot means class, so the rule matches nothing → use `#hero` for an ID and `.hero` for a class.
+- **Adding more and more classes to beat an ID** → specificity compares IDs first, so 10 classes still lose to 1 ID → remove the ID from the old rule, or use `@layer`.
+- **Using `!important` to fix every clash** → the next person can only win with another `!important`, and the cascade stops being useful → make the selector simpler or reorder the rules.
+- **Forgetting that padding and border add to `width`** → `width: 200px` plus `padding: 20px` shows a 240px box and breaks the row → set `box-sizing: border-box` once for all elements.
+- **Expecting two vertical margins to add up** → 10px and 15px give a 15px gap, not 25px (margin collapsing) → use padding, or a `gap` in flex or grid, when you need an exact gap.
+
+## Often confused 🟡
+
+| These two | First one | Second one |
+| --- | --- | --- |
+| Class vs ID | `.card`: can repeat on many elements, weight (0,1,0) | `#main`: one per page, weight (1,0,0), hard to override |
+| Padding vs margin | Space **inside** the border, shows the box's background | Space **outside** the border, always see-through |
+| Pseudo-class vs pseudo-element | One colon, a **state** of a real element (`:hover`) | Two colons, a made-up **part** (`::before`) |
+| `display: none` vs `visibility: hidden` | Box is gone, takes no space | Box is invisible but still takes its space |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that rules can clash and that a fixed tie-breaker (the cascade) picks one winner. **Next we open the box**: where CSS can live, the exact order of the tie-breaker, how selectors aim, which settings flow down to children, and how big each box really is. Each subsection starts with a short step-by-step walk, then the full detail.
 
 ### Adding CSS and why the method matters
 
 **In plain words:** there are three places to put CSS — a separate file, a block inside the page, or right on one tag — like keeping recipes in a cookbook, on the fridge, or scribbled on the plate itself.
 
+**Step by step:**
+1. You write `button { color: white; }` in a file `style.css` and add `<link rel="stylesheet" href="style.css">` in the page head. Every page that links it gets the rule.
+2. Or you put the same rule inside `<style>…</style>` in one page. Only that page gets it.
+3. Or you write `style="color: white"` right on one `<button>`. Only that one button gets it, and it beats the other two.
+4. The browser saves (caches) `style.css` after the first page, so the next page loads faster. Rules inside one page cannot be reused like that.
+
 | Method | Syntax | Scope | Notes |
 | --- | --- | --- | --- |
-| External | `<link rel="stylesheet" href="style.css">` in `<head>` | whole site | cached by the browser and by CDNs across pages; the one that scales |
+| External | `<link rel="stylesheet" href="style.css">` in `<head>` | whole site | cached by the browser and by CDNs (content delivery networks: servers near the user that keep copies of files) across pages; the one that scales |
 | Internal | `<style>…</style>` in `<head>` | one page | no caching across pages; fine for a single-page demo |
 | Inline | `style="…"` on one element | one element | highest precedence of the three; no reuse, hard to maintain |
 
-External CSS is render-blocking (see [[How Browsers Load and Render a Page]]): the browser cannot paint until the CSSOM from every linked stylesheet is built, so a large unnecessary stylesheet delays first paint even though it never touches JavaScript.
+External CSS is **render-blocking** (the browser shows nothing until it has it; see [[How Browsers Load and Render a Page]]): the browser cannot paint until the **CSSOM** (the browser's in-memory tree of all CSS rules) from every linked stylesheet is built, so a large unnecessary stylesheet delays first paint even though it never touches JavaScript.
 
 ### The cascade, in order
 
 **In plain words:** this is the full tie-breaker, as a flowchart. Read it top to bottom: the first question with a clear answer ends the fight.
+
+**Step by step:**
+1. Two rules both set `color` on the same `<a>`: one says blue, one says red.
+2. Where did each come from? Your stylesheet beats the browser's built-in default. If they come from different places, done.
+3. Same place? Is exactly one of them marked `!important`? That one wins.
+4. Still tied? Count specificity: `#nav a` is (1,0,1), `.menu a` is (0,1,1). The ID wins, so the link is whatever `#nav a` says.
+5. Exact tie on everything? The rule written later in the file wins.
 
 ```mermaid
 flowchart TD
@@ -182,7 +231,7 @@ flowchart TD
 
 **Origin and `!important`.** Normally author (your) styles beat the browser's default stylesheet.
 
-`!important` flips the fight within its own origin: an `!important` author rule beats a normal author rule regardless of specificity, and a user stylesheet's `!important` (accessibility overrides a user sets) beats even an `!important` author rule.
+`!important` flips the fight within its own **origin** (who wrote the rule: the browser, the website author, or the person using the browser): an `!important` author rule beats a normal author rule regardless of specificity, and a user stylesheet's `!important` (accessibility overrides a user sets, such as "always use big text") beats even an `!important` author rule.
 
 In practice, treat `!important` as an escape hatch for utility classes or overriding a third-party widget you don't control, not a habit — a page where every rule is `!important` has no cascade left to reason about.
 
@@ -191,7 +240,7 @@ In practice, treat `!important` as an escape hatch for utility classes or overri
 - `b` = number of class, attribute, and pseudo-class selectors (`.card`, `[type="text"]`, `:hover`)
 - `c` = number of type selectors and pseudo-elements (`div`, `a`, `::before`)
 
-Compare `a` first; only if tied, compare `b`; only if tied, compare `c`. The universal selector `*` and combinators (`>`, `+`, `~`, space) contribute nothing.
+Compare `a` first; only if tied, compare `b`; only if tied, compare `c`. The universal selector `*` (matches every element) and **combinators** (the symbols that join selectors into a family relation: `>`, `+`, `~`, space) contribute nothing.
 
 **In plain words:** specificity is three separate counters, not one combined score. You never add them together; you compare the ID counter first, and only look at the class counter if the ID counters are exactly equal.
 
@@ -231,11 +280,11 @@ Styling by ID is discouraged in practice precisely because of this table: an ID 
 
 **Source order.** Only reached when origin, `!important`, and specificity all tie. The rule that appears later — later in the same file, or in a file linked later — wins.
 
-This is why `@import` at the top of a file is placed exactly where its rules sit in the cascade, and why your overrides must come after a third-party stylesheet's `<link>` tag, not before it.
+This is why `@import` (a line that pulls another CSS file into this one) at the top of a file is placed exactly where its rules sit in the cascade, and why your overrides must come after a third-party stylesheet's `<link>` tag, not before it.
 
-**Cascade layers (`@layer`, since 2022 across evergreen browsers).** `@layer reset, base, components, utilities;` declares layer order up front; rules inside an earlier-named layer always lose to a later-named layer regardless of specificity, and only within the same layer does the normal specificity battle happen.
+**Cascade layers (`@layer`, since 2022 across evergreen browsers, meaning browsers that update themselves, like Chrome, Firefox, Safari and Edge).** `@layer reset, base, components, utilities;` declares layer order up front; rules inside an earlier-named layer always lose to a later-named layer regardless of specificity, and only within the same layer does the normal specificity battle happen.
 
-This is how design systems let a one-class utility override a highly specific component rule without an `!important` war.
+This is how **design systems** (a company's shared kit of buttons, colours and spacing rules) let a one-class **utility** (a tiny class that does one thing, like `.text-blue`) override a highly specific component rule without an `!important` war.
 
 **In plain words:** layers add a fifth, earlier judge to the tournament — one that runs before specificity is even looked at. **Picture it:**
 
@@ -253,6 +302,13 @@ flowchart LR
 ### Selectors and combinators
 
 **In plain words:** selectors are the "which boxes?" aiming tools. Some aim at a tag name, some at a label (class or ID), and combinators aim at family relations like "child of" or "right after".
+
+**Step by step:**
+1. `p` aims at every paragraph on the page.
+2. `.price` aims at every element that has `class="price"`, on any tag.
+3. `#cart` aims at the one element with `id="cart"`.
+4. `.card p` aims at paragraphs anywhere inside a `.card`. `.card > p` aims only at paragraphs that are direct children of it.
+5. `h2 + p` aims at the one paragraph that comes right after an `h2`.
 
 | Selector | Matches | Example |
 | --- | --- | --- |
@@ -272,13 +328,26 @@ flowchart LR
 
 An ID must be unique on the page; a class can repeat on as many elements as you like. In JavaScript, the ID maps to `document.getElementById('hero')` or `document.querySelector('#hero')`; the class maps to `document.getElementsByClassName('btn')` or `document.querySelectorAll('.btn')`.
 
-**Selector matching direction (performance myth).** Browsers match compound selectors right-to-left (starting from the rightmost, most specific part, then walking up ancestors only if needed), which used to make very long descendant selectors a measurable cost.
+**Selector matching direction (performance myth).** Browsers match **compound selectors** (several selectors chained together, like `.card p span`) right-to-left (starting from the rightmost, most specific part, then walking up ancestors only if needed), which used to make very long descendant selectors a measurable cost.
 
-On modern rendering engines this is rarely the actual bottleneck for typical stylesheets; layout and paint cost dominate far more often, so writing readable, class-based selectors is the right default rather than hand-optimizing selector shape.
+On modern **rendering engines** (the part of the browser that turns HTML and CSS into pixels) this is rarely the actual bottleneck for typical stylesheets; **layout** (working out sizes and positions) and **paint** (filling in the pixels) cost dominate far more often, so writing readable, class-based selectors is the right default rather than hand-optimizing selector shape.
 
 ### Inheritance
 
 **In plain words:** some settings flow from a parent box into its children (mostly text settings, like a family surname), and some never do (like a parent's border — you do not want one on every child).
+
+**Step by step:**
+1. You set `body { color: #333; font-family: Arial; }` once.
+2. A `<p>` inside the body has no colour rule of its own, so it takes `#333` and Arial from its parent.
+3. A `<span>` inside that `<p>` takes them from the `<p>`, and so on down.
+4. You also set `body { border: 1px solid red; }`. The `<p>` does **not** get a border, because border does not inherit.
+5. If a rule targets the `<span>` directly (`span { color: green; }`), that rule wins over the inherited colour.
+
+```mermaid
+flowchart TD
+    B["body: color #333, border red"] --> P["p: gets color #333<br/>no border"]
+    P --> S["span: gets color #333<br/>unless a span rule says otherwise"]
+```
 
 Some properties inherit from parent to child by default; others don't:
 
@@ -291,6 +360,13 @@ The rule of thumb: text-related properties inherit (so you can set a font once o
 ### The box model
 
 **In plain words:** every box is wrapped like a parcel — the item (content), bubble wrap (padding), the cardboard (border), and the empty space you leave around the parcel (margin).
+
+**Step by step:**
+1. A card has `width: 200px`. That is the content area: 200px.
+2. Add `padding: 20px`. That adds 20px on the left and 20px on the right: 240px.
+3. Add `border: 5px solid`. Another 5px each side: 250px on screen.
+4. Add `margin: 10px`. The card still looks 250px wide, but it keeps 10px of empty space from its neighbours.
+5. Set `box-sizing: border-box` and the card is 200px on screen again; the content area shrinks to 150px to make room.
 
 ```mermaid
 flowchart TD
@@ -317,15 +393,27 @@ flowchart LR
 - `content-box` (the CSS default): `width` is the content box only; padding and border are added on top, so a `width: 200px; padding: 20px; border: 5px solid` box actually renders 250px wide.
 - `border-box`: `width` includes padding and border, so that same box renders exactly 200px wide, with the content area shrinking to fit. Nearly every CSS reset sets `*, *::before, *::after { box-sizing: border-box; }` because it makes widths predictable when you add padding or a border later without needing to recompute anything.
 
-**Margin collapsing:** two vertical margins touching between block-level siblings (or between a parent and its first/last child, if nothing separates them) collapse into a single margin equal to the larger of the two, not their sum.
+```mermaid
+flowchart TD
+    A["Box A: margin-bottom 10px"] --> G["Gap between them = 15px<br/>(the bigger one, not 10 + 15)"]
+    G --> B2["Box B: margin-top 15px"]
+```
+
+**Margin collapsing:** two vertical margins touching between **block-level** (boxes that take a full row, like `<div>` and `<p>`) siblings (or between a parent and its first/last child, if nothing separates them) collapse into a single margin equal to the larger of the two, not their sum.
 
 A `10px` bottom margin followed by a `15px` top margin produces `15px` of gap, not `25px`. This only applies to vertical margins in normal flow, not horizontal margins, and not to flex or grid children.
 
-**Units:** `px` is an absolute pixel; `%` is relative to the parent's size for that property; `em` is relative to the current element's font size (and compounds through nested elements); `rem` is relative to the root (`html`) font size, which is why most codebases default to `rem` for spacing and font sizes — it doesn't compound unpredictably as you nest; `vw`/`vh` are 1% of the viewport width/height; `ch` is the width of the `0` character in the current font, useful for capping line length for readability.
+**Units:** `px` is an absolute pixel (a fixed screen dot size); `%` is relative to the parent's size for that property; `em` is relative to the current element's font size (and compounds through nested elements); `rem` is relative to the root (`html`) font size, which is why most codebases default to `rem` for spacing and font sizes — it doesn't compound unpredictably as you nest; `vw`/`vh` are 1% of the viewport (the visible window area) width/height; `ch` is the width of the `0` character in the current font, useful for capping line length for readability.
 
 ### Typography, colors and backgrounds
 
 **In plain words:** these are the "make text and surfaces look right" settings — fonts with backups, colours written a few ways, and backgrounds that can be gradients or images.
+
+**Step by step:**
+1. You write `font-family: "Inter", Arial, sans-serif;`. The browser tries Inter, then Arial, then any plain sans-serif font it has.
+2. You write a colour as `#1a1a1a` (hex), `rgb(26, 26, 26)` or `hsl(0, 0%, 10%)`. All three are the same dark grey.
+3. You store a brand colour once: `:root { --brand: #e23744; }`, then use `color: var(--brand)` everywhere.
+4. You add `@media (min-width: 768px) { … }`. Those rules only apply when the window is at least 768px wide, like a tablet or laptop.
 
 ```css
 body {
@@ -348,13 +436,13 @@ A font stack lists specific fonts first and a generic family (`sans-serif`, `ser
 
 Colors can be hex (`#1a1a1a`), `rgb()`/`rgba()`, `hsl()` (often easier to tweak lightness on), or `currentColor` (reuses the element's own computed `color`, handy for an SVG icon that should match surrounding text).
 
-Loading a custom web font causes either FOIT (flash of invisible text, if the browser hides text until the font arrives) or FOUT (flash of unstyled text, if it shows a fallback font first); `font-display: swap` opts into FOUT, which is usually the better user experience.
+Loading a custom **web font** (a font file the page downloads, instead of one already on the device) causes either FOIT (flash of invisible text, if the browser hides text until the font arrives) or FOUT (flash of unstyled text, if it shows a fallback font first); `font-display: swap` opts into FOUT, which is usually the better user experience.
 
 `overflow: hidden` combined with `text-overflow: ellipsis` and `white-space: nowrap` truncates long text with `…` instead of letting it break the layout.
 
-`float: left` pulls an element out of normal flow to one side and lets inline content (typically text) wrap around it — this is the old way to wrap text around an image, mostly replaced today by flexbox or grid (see [[CSS Layout - Position, Flexbox, Grid]]), though floats still need an explicit "clearfix" (or a parent with `display: flow-root`) so the parent doesn't collapse to zero height around only-floated children.
+`float: left` pulls an element out of normal flow to one side and lets inline content (typically text) wrap around it — this is the old way to wrap text around an image, mostly replaced today by flexbox or grid (see [[CSS Layout - Position, Flexbox, Grid]]), though floats still need an explicit "clearfix" (a small CSS trick that makes the parent grow to wrap its floated children) (or a parent with `display: flow-root`) so the parent doesn't collapse to zero height around only-floated children.
 
-Custom properties (CSS variables) are declared with `--name: value` and read with `var(--name, fallback)`; they cascade and inherit like any other property, which is what makes them useful for theming (`--brand-color` set once on `:root`, read everywhere).
+Custom properties (CSS variables: named values you set once and reuse) are declared with `--name: value` and read with `var(--name, fallback)`; they cascade and inherit like any other property, which is what makes them useful for theming (`--brand-color` set once on `:root`, read everywhere).
 
 **Responsive basics.** `@media (min-width: 768px) { … }` scopes a block of rules to a viewport condition (width, height, orientation, `prefers-color-scheme`); it's still ordinary cascade rules underneath, just gated by the query.
 
@@ -364,7 +452,13 @@ Custom properties (CSS variables) are declared with `--name: value` and read wit
 
 **In plain words:** one colon means "the element in a mood" (hovered, focused, first child); two colons mean "an invented part of the element" that is not in your HTML at all.
 
-A **pseudo-class** (one colon, `:hover`) selects an element in a particular *state*; a **pseudo-element** (two colons, `::before`) selects a *part* of an element that isn't a real DOM node.
+**Step by step:**
+1. `button:hover { background: red; }` turns a button red only while the mouse is over it.
+2. `li:first-child { font-weight: bold; }` makes only the first item of each list bold.
+3. `input:invalid { border-color: red; }` paints a red edge on an email box that holds "abc".
+4. `.price::before { content: "₹"; }` puts a ₹ sign before every price, even though "₹" is not in your HTML.
+
+A **pseudo-class** (one colon, `:hover`) selects an element in a particular *state*; a **pseudo-element** (two colons, `::before`) selects a *part* of an element that isn't a real **DOM node** (an element in the browser's tree of the page).
 
 | Category | Examples |
 | --- | --- |
@@ -401,7 +495,7 @@ a:hover   { color: #e8710a; }
 a:active  { color: #faa700; }
 ```
 
-`:focus` matches any focused element, including a mouse click on a button; `:focus-visible` matches only when the browser decides focus should be visibly shown — typically keyboard navigation — which is the one to use for a custom focus ring that shouldn't flash on every mouse click but must appear for keyboard users (an accessibility requirement, not a style preference).
+`:focus` matches any focused element, including a mouse click on a button; `:focus-visible` matches only when the browser decides focus should be visibly shown — typically keyboard navigation — which is the one to use for a custom **focus ring** (the outline that shows which element the keyboard is on) that shouldn't flash on every mouse click but must appear for keyboard users (an accessibility requirement, not a style preference).
 
 `:has()` (a "parent selector", widely supported since 2023) lets a rule select a parent based on what's inside it: `.card:has(> img) { padding-top: 0; }` matches a `.card` only when it directly contains an `img`, something no earlier version of CSS could express without JavaScript.
 
@@ -410,6 +504,12 @@ Pseudo-class specificity counts as a class, `(0, 1, 0)`, same weight as `.btn`.
 ### Shadows
 
 **In plain words:** shadows are painted on top of the layout and never push anything around — that is exactly what makes them useful for focus rings.
+
+**Step by step:**
+1. `box-shadow: 0 2px 8px rgba(0,0,0,0.2);` means: no sideways shift, 2px down, 8px of blur, light see-through black.
+2. The card looks lifted off the page, but its size and its neighbours do not move at all.
+3. Add `inset` and the shadow is drawn inside the card instead, like a pressed-in button.
+4. For a keyboard focus ring, `box-shadow: 0 0 0 3px blue;` draws a solid 3px blue edge without moving anything.
 
 ```css
 .card {
@@ -433,11 +533,18 @@ Design systems typically define a small "elevation" scale (shadow presets for `s
 
 `filter: drop-shadow()` is the one to reach for on a transparent PNG or SVG, since `box-shadow` only follows the element's rectangular box, not the shape of transparent pixels inside it.
 
-Animating a shadow's blur/spread directly is expensive (it's a paint-affecting property); animating the `opacity` of a pseudo-element pre-rendered with the target shadow is the cheap equivalent, since opacity can be composited.
+Animating a shadow's blur/spread directly is expensive (it's a paint-affecting property); animating the `opacity` of a pseudo-element pre-rendered with the target shadow is the cheap equivalent, since opacity can be **composited** (the graphics card just blends finished layers, with no repainting).
 
 ### Display and normal flow
 
 **In plain words:** by default boxes stack in two styles — big boxes that take the whole row (block) and small ones that sit inside a line of text (inline). `display` lets you change a box's style.
+
+**Step by step:**
+1. Three `<p>` tags stack on top of each other, each one full width. They are block boxes.
+2. Three `<a>` links inside a sentence sit side by side, only as wide as their text. They are inline boxes.
+3. You set `height: 40px` on a link. Nothing happens, because inline boxes ignore height.
+4. Change the link to `display: inline-block`. It still sits in the line, and now it accepts the 40px height. Good for a nav button.
+5. Change it to `display: none` and the link vanishes and gives up its space.
 
 Block elements (`div`, `p`, `section`, `h1`) take the full available width and start on a new line; inline elements (`span`, `a`, `strong`) take only the width their content needs and sit in the flow of text.
 
@@ -449,9 +556,9 @@ One gotcha: adjacent `inline-block` elements in the HTML source pick up a small 
 
 `img` and `input` are **replaced elements**: the browser renders external content (an image, a form control) inside their box, so unlike a plain inline element, `width` and `height` do apply to them even though their default `display` is inline.
 
-`display: none` removes an element from the render tree entirely — no box, no space reserved, invisible to screen readers. `visibility: hidden` keeps the box's space reserved but paints nothing.
+`display: none` removes an element from the **render tree** (the list of boxes the browser will actually draw) entirely — no box, no space reserved, invisible to **screen readers** (software that reads the page aloud for blind users). `visibility: hidden` keeps the box's space reserved but paints nothing.
 
-`opacity: 0` keeps both the space and the element in the accessibility tree and still receives clicks — it's invisible paint only, not removed from interaction, which is a common accessibility bug source if used where `display: none` was meant.
+`opacity: 0` keeps both the space and the element in the **accessibility tree** (the version of the page that screen readers use) and still receives clicks — it's invisible paint only, not removed from interaction, which is a common accessibility bug source if used where `display: none` was meant.
 
 Setting `display: flex`, `display: grid`, or `display: contents` changes the *outer* display (how the element behaves in its parent's layout) while also establishing a new *inner* layout mode for its own children — this outer/inner split is why `display: inline-flex` exists: flex layout for the children, inline behavior in the parent's flow.
 
@@ -507,9 +614,11 @@ Each token only ever bumps exactly one counter, and the counters are never combi
 
 ## 7. In production 🔴
 
-- **Real systems:** every mainstream CSS reset (`modern-normalize`, Tailwind's preflight) starts with a universal `box-sizing: border-box` rule; component libraries like Material UI and shadcn/ui use cascade layers or CSS Modules specifically to avoid specificity conflicts with consumer apps.
+> 🟡 → 🔴 **You now know** how the cascade, selectors, inheritance and the box model work, and which styling approaches big teams use. **Next is the advanced part**: how real CSS libraries avoid clashes, what breaks in production, and the tricky corners (`:is()`, `:where()`, `:not()`, layers) that interviewers like to ask about.
+
+- **Real systems:** every mainstream **CSS reset** (a small stylesheet that clears browser defaults so every browser starts the same) (`modern-normalize`, Tailwind's preflight) starts with a universal `box-sizing: border-box` rule; component libraries like Material UI and shadcn/ui use cascade layers or CSS Modules specifically to avoid specificity conflicts with consumer apps.
 - **Failure modes → fixes:** a third-party widget's CSS overriding your button styles because its selector happens to be more specific → wrap your overrides in a layer declared after theirs, or raise specificity deliberately (`.my-app .btn`) rather than reaching for `!important`. A `:visited`/`:hover` link color flip-flopping → check LVHA order.
-- **What to monitor:** CLS from web-font swapping or images without a reserved box size; these are the box-model and rendering-path interactions this note and [[How Browsers Load and Render a Page]] both cover.
+- **What to monitor:** CLS (Cumulative Layout Shift: a score for how much the page jumps around while loading) from web-font swapping or images without a reserved box size; these are the box-model and rendering-path interactions this note and [[How Browsers Load and Render a Page]] both cover.
 
 ## 8. Deep dive 🔴
 
@@ -555,6 +664,26 @@ Each token only ever bumps exactly one counter, and the counters are never combi
 - LVHA order for link pseudo-classes: `:link`, `:visited`, `:hover`, `:active`.
 - `:focus-visible` for an accessible focus ring; plain `:focus` fires on mouse clicks too.
 - `box-shadow` has an optional spread value; `text-shadow` does not.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: which selector picks the element with `id="cart"`: `.cart` or `#cart`?
+> `#cart`. A dot selects a class, a hash selects an ID.
+
+> [!question]- Easy: list the four layers of a box, from the inside out.
+> Content, padding, border, margin.
+
+> [!question]- Easy: if `body` has `color: grey`, does a `<p>` inside it turn grey too? Does it get the body's border?
+> Yes to the colour, because text settings inherit. No to the border, because box settings do not.
+
+> [!question]- Medium: `.a.b.c` (0,3,0) vs `#x` (1,0,0). Which wins, and why?
+> `#x`. The ID counter is compared first and 1 beats 0, so the class count is never looked at.
+
+> [!question]- Medium: `width: 300px; padding: 10px; border: 2px solid` with the default `box-sizing`. How wide is the box on screen?
+> 324px: 300 + 10 + 10 + 2 + 2. With `border-box` it would be exactly 300px.
+
+> [!question]- Medium: a hovered link that is also visited stays purple instead of orange. What is the likely cause?
+> The `:hover` rule is written before `:visited`. They tie on specificity, so the later one wins; write them in LVHA order.
 
 ## Links 🟢
 - **Before this:** [[How Browsers Load and Render a Page]]

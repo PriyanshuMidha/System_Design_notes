@@ -26,6 +26,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Backend Roadmap and Tech Landscape]]: backend work splits into about ten layers (language, APIs, data, caching, messaging and so on), each with its own vault folder. This checklist has one line per folder, in that same order.
+
 **From zero, in 60 seconds** 🟢
 
 Feeling "almost ready" for a senior interview is a feeling, not a fact. This note turns it into a list you can tick.
@@ -69,6 +72,13 @@ Every unchecked line tells you exactly what to study next.
 | Vault folder | One topic area of these notes | `07 Databases` |
 | STAR story | Situation, Task, Action, Result answer format | "The DB fell over at 2 a.m.; I..." |
 | Mock interview | A timed practice round | 60-minute LLD rehearsal |
+| Consistent hashing | Placing keys and servers on a ring so adding a server moves few keys | 4 servers, adding a 5th moves about 1/5 of keys |
+| Virtual nodes | Each real server appears at many spots on the ring, to spread load evenly | 1 server = 100 ring points |
+| Thundering herd | Many requests hit the database at once when a cached item expires | 10,000 users miss the cache together |
+| Circuit breaker | Code that stops calling a failing service for a while | Skip the payment API for 30 s after 5 errors |
+| Idempotency key | A unique ID sent with a request so a retry isn't applied twice | `Idempotency-Key: ord-42` |
+| SLO | A target for how well a service behaves | "99.9% of requests under 300 ms" |
+| Canary vs blue-green | Release to a small share first vs switch all traffic between two full copies | 5% on v2 vs flip from blue to green |
 
 **Picture it**
 
@@ -116,7 +126,31 @@ Think of readiness as a row per folder, with four columns:
 
 A folder only counts as "I can" when all four are true, not just the first one — "I can define a circuit breaker" is not the same claim as "I can tell you when one is the wrong fix."
 
+### Real-life example 🟢
+
+Say you have an SDE-3 loop at a company like Swiggy next month. You open the checklist and reach the caching line.
+You can explain cache-aside and draw it. But when you ask yourself "what happens when the menu cache for a popular restaurant expires at 8 pm?", you have no answer.
+That gap is the thundering-herd failure mode, so the line stays unticked, and you know exactly what to read tonight.
+By the end of the week you can say the failure, the fix (one request refills, others wait or get the old copy) and its cost. Now you tick it.
+
+## Common beginner mistakes 🟢
+
+- **Ticking a line because you can define the term** → definitions are where people over-claim → tick only after explain, draw, failure mode and trade-off.
+- **Checking with the note open** → you recognise answers instead of recalling them → close the note and say it out loud.
+- **Using this list to learn a topic for the first time** → it's a self-test, not a course → learn from the folder first, then test here.
+- **Skipping the behavioural round** → senior loops weigh ownership stories heavily → write three STAR stories with one number each.
+- **Never re-checking old ticks** → fluency fades in weeks → re-test items you haven't touched in a month.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the four-question test for one topic. **Next we open the box**: the loop you run for each folder, and how a folder becomes "checkable" at all.
+
+**Step by step:**
+1. Pick a folder, say [[08 Caching & Redis MOC]].
+2. Close the notes. Explain cache-aside out loud in under a minute.
+3. Can't? Read the note, redraw its diagram, try again.
+4. Can? Name a failure mode (thundering herd) and a trade-off (fresh data vs fast reads).
+5. All four done? Tick the line and move to the next folder.
 
 ```mermaid
 flowchart TD
@@ -131,7 +165,7 @@ flowchart TD
     Check --> Next["Move to the next folder"]
 ```
 
-This is the same four-question loop the Writer Brief's quality bar applies to every note in this vault ([[Consistent Hashing]] is the model): read it, redraw it, explain an example aloud, say a failure mode, say a trade-off.
+This is the same four-question loop the Writer Brief's (the vault's own rules for writing notes) quality bar applies to every note in this vault ([[Consistent Hashing]] is the model): read it, redraw it, explain an example aloud, say a failure mode, say a trade-off.
 
 Each folder itself moves through three states as the vault is rebuilt, and an item in this checklist can only be checked once its folder reaches "rebuilt":
 
@@ -157,8 +191,8 @@ A worked pass through one folder, using [[Consistent Hashing]] as the concrete t
 
 1. **Explain unaided:** "keys and servers hash onto the same ring; a key belongs to the first server clockwise; adding a server only moves the arc behind it."
 2. **Redraw:** the ring diagram with 4 servers and 3 keys, without looking.
-3. **Failure mode:** "without virtual nodes, one server can own a disproportionate arc and get overloaded; and consistent hashing does not fix a single hot *key* — one very popular key still lands on one server."
-4. **Trade-off:** "vs. `hash % N`: consistent hashing moves ~1/N of keys instead of ~(N−1)/N on a resize, at the cost of an `O(log P)` ring lookup instead of `O(1)` modulo."
+3. **Failure mode:** "without virtual nodes (each server placed at many spots on the ring), one server can own a disproportionate arc and get overloaded; and consistent hashing does not fix a single hot *key* — one very popular key still lands on one server."
+4. **Trade-off:** "vs. `hash % N`: consistent hashing moves ~1/N of keys instead of ~(N−1)/N on a resize, at the cost of an `O(log P)` ring lookup (a search that grows slowly with the number of ring points P) instead of `O(1)` modulo (one quick division)."
 
 Only once all four are fluent does [[07 Databases MOC]]'s consistent-hashing item get checked below.
 
@@ -176,9 +210,12 @@ Only once all four are fluent does [[07 Databases MOC]]'s consistent-hashing ite
 
 - This checklist assumes you've already read the linked notes at least once; it is a self-test, not a syllabus — use [[Backend Roadmap and Tech Landscape]] for first-pass learning order.
 - Checking every box here does not replace mock interviews: it proves topic fluency, not interview performance under time pressure and follow-ups (see [[LLD Round Playbook]] for the performance side).
-- A folder marked pending below has no note to self-test against yet; treat those as "not yet checkable," not "known to be hard."
+- Every folder now has notes, so every section below can be self-tested.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how to run the loop and what a worked pass looks like. **Next is the real checklist**: how teams use this bar, the full folder-by-folder list, the honest gaps, the final-week plan and the mock-interview plan.
+
 
 - **Real systems:** every "I can" item below is phrased as something you'd actually say in a design review, not a trivia answer — that's deliberate, since the loop this checklist prepares for is testing the same thing a design review tests.
 - **Failure modes → fixes:** the single most common way candidates fail this bar is stopping at "explain unaided" and skipping straight to the next topic — always force yourself through all four questions per item.
@@ -192,13 +229,13 @@ Only once all four are fluent does [[07 Databases MOC]]'s consistent-hashing ite
 
 Each item checks against the four-question bar in section 2. Folders already rebuilt in this vault get real links; folders not yet rebuilt are listed honestly in the gap section below instead of being linked to notes that don't exist.
 
-**[[04 Go Language MOC]]** (pending — see gaps)
+**[[04 Go Language MOC]]**
 - [ ] I can explain goroutines, channels, and the Go memory model, including at least one trap (see [[Go Interview Questions and Traps]]).
 
 **[[05 APIs MOC]]**
 - [ ] I can design and critique a REST, GraphQL, gRPC or WebSocket API: versioning, pagination, idempotency keys, and backward compatibility.
 
-**[[06 Backend Engineering in Go MOC]]** (pending — see gaps)
+**[[06 Backend Engineering in Go MOC]]**
 - [ ] I can lay out a Go service in handler → service → repository layers and justify the boundary.
 
 **[[07 Databases MOC]]**
@@ -216,25 +253,25 @@ Each item checks against the four-question bar in section 2. Folders already reb
 **[[11 System Design MOC]]**
 - [ ] I can run a full design (requirements → scale estimate → API → data model → deep dive → failure modes → observability → trade-offs) end to end on an unfamiliar prompt in 35–40 minutes.
 
-**[[12 Security & Auth MOC]]** (pending — see gaps)
+**[[12 Security & Auth MOC]]**
 - [ ] I can explain authn vs. authz, JWT vs. session trade-offs, and name two OWASP API risks relevant to my last project.
 
-**[[13 DevOps & Cloud MOC]]** (pending — see gaps)
+**[[13 DevOps & Cloud MOC]]**
 - [ ] I can explain blue-green vs. canary rollout and what each needs from observability to be safe.
 
-**[[14 Observability & SRE MOC]]** (pending — see gaps)
+**[[14 Observability & SRE MOC]]**
 - [ ] I can define an SLO, connect it to an alert, and describe one real incident's timeline (detect → mitigate → root-cause → follow-up).
 
-**[[15 Testing MOC]]** (pending — see gaps)
+**[[15 Testing MOC]]**
 - [ ] I can justify fakes vs. mocks for a given test, and explain what `-race` catches that a normal test run does not.
 
-**[[16 Software Architecture MOC]]** (pending — see gaps)
+**[[16 Software Architecture MOC]]**
 - [ ] I can compare layered, hexagonal and event-driven architecture and say which production pressure pushes a system from one to another.
 
 **[[17 LLD MOC]]**
 - [ ] I can design a class model for a practice problem (rate limiter, parking lot, etc.) live, in under 25 minutes, and defend one pattern choice.
 
-**[[18 AI Engineering MOC]]** (pending — see gaps)
+**[[18 AI Engineering MOC]]**
 - [ ] I can describe a production RAG pipeline's failure modes (stale index, retrieval miss, hallucinated citation) and one guardrail for each.
 
 **[[19 Interview & Career MOC]]**
@@ -306,18 +343,32 @@ flowchart LR
 
 - Four questions per item: explain unaided, redraw, name a failure mode, name a trade-off.
 - Checklist order mirrors [[Backend Roadmap and Tech Landscape]]'s folder order.
-- Written and checkable today: 05, 07, 08, 09, 10, 11, 17, 19.
-- Pending, not yet checkable: 01, 02, 03, 04, 06, 12, 13, 14, 15, 16, 18.
+- Every folder (01 to 19) now has notes, so every row is checkable today.
 - Final week: redraw diagrams, run two timed system-design and two timed LLD prompts, write three STAR stories.
 - This checklist tests topic fluency; [[LLD Round Playbook]] tests interview performance — use both.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What are the four checks before you tick a line?
+> Explain it unaided, redraw it, name a failure mode, name a trade-off.
+
+> [!question]- (easy) Can you check a line with the note open?
+> No. The point is to recall it without help.
+
+> [!question]- (easy) How many STAR stories should you prepare, and with what?
+> Three, each with one metric.
+
+> [!question]- (medium) Name a failure mode of consistent hashing that virtual nodes do NOT fix.
+> A single very popular key still lands on one server.
+
+> [!question]- (medium) Why does this checklist list unwritten folders instead of hiding them?
+> So you can tell "not written yet" from "written but not mastered"; the fix differs.
+
+> [!question]- (medium) What does this checklist not prove, and what covers it?
+> Performance under time pressure and follow-ups; timed mock rounds with [[LLD Round Playbook]] cover that.
 
 ## Links 🟢
 
 - **Before this:** [[Backend Roadmap and Tech Landscape]]
 - **Next:** [[Go Interview Questions and Traps]]
 - **Compare with:** [[LLD Round Playbook]]
-
-### Watch on YouTube
-
-- [The Ultimate PLG Readiness Checklist: 27 Steps to Success](https://www.youtube.com/watch?v=w4Gt26RnzpY) · SaaS CMO Pro · 45 min · 2,953 views
-- [Literacy Performance Assessment Planning Readiness Checklist](https://www.youtube.com/watch?v=KeTwp7JvzOE) · TPA Café (CalTPA and LPA Support Channel)   · 10 min · 152 views

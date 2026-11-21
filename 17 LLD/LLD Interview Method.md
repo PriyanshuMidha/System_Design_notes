@@ -30,6 +30,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[OOP in Go - Structs, Interfaces, Embedding]]: in Go you model things as structs with methods, and swap behaviour through small interfaces. That is all the code you need to follow the example.
+
 **From zero, in 60 seconds** 🟢
 
 In a **low-level design** (LLD) round, you get a vague task like "design a parking lot".
@@ -67,6 +70,11 @@ A fixed method tells you what to do in each slice of the hour so the important c
 | Method signature | A method's name, inputs and outputs | `Unpark(t Ticket) (int64, error)` |
 | Invariant | A rule that must always hold | "One spot holds at most one car" |
 | Trade-off | Giving up one good thing to get another | Simpler code but only one instance |
+| NFR (non-functional requirement) | How well it must work, not what it does | "Many users can book at once" |
+| Goroutine | A light task Go runs at the same time as others; each request gets one | Two users booking at once are two goroutines |
+| Mutex | A lock: one goroutine at a time runs the code inside it | `mu.Lock()` around "check seat free, mark held" |
+| Race | A bug where two requests at the same moment both "win" | Two users both book seat A2 |
+| Idempotent | Safe to call twice: the second call changes nothing | A retried `Confirm` returns `nil` again |
 
 **Picture it**
 
@@ -109,13 +117,17 @@ In a 60-minute round you have roughly 45 minutes of design and coding once intro
 | **LLD / object design** | Classes, interfaces, method signatures, one or two methods coded | Clean model plus the hard method written and explained |
 | **Machine coding** | A runnable program in 60–120 minutes, often with a command-line driver | Code that compiles, runs the given commands and has tests |
 
-LLD sits between the two others: one process, in memory, but correct under concurrency. When the interviewer says "now assume 3 instances behind a load balancer", you are being pulled toward HLD; answer with the database-level version (see Step 10).
+LLD sits between the two others: one process, in memory, but correct under concurrency. When the interviewer says "now assume 3 instances behind a load balancer" (a box that spreads requests across several copies of your server), you are being pulled toward HLD; answer with the database-level version (see Step 10).
 
 ```mermaid
 flowchart LR
     N["No method: code at minute 2"] --> X["Miss rules, rewrite at minute 40"]
     Y["10 steps: code at minute 20"] --> OK["Right design, time for edge cases"]
 ```
+
+### Real-life example: "design BookMyShow seat booking" 🟢
+
+A common LLD prompt is "design the seat booking part of an app like BookMyShow". With no method, you might draw cinemas, cities, movies, offers and payments for 30 minutes. With the 10 steps, you ask three quick questions (is a seat held while the user pays? for how long? can two users race for one seat?), name four things (show, seat, hold, booking) and code `HoldSeats` by minute 20. That method is where the real risk sits: two people tapping the same seat at the same second. Section 4 walks through exactly this problem.
 
 ## 2. Mental model 🟢
 
@@ -129,9 +141,26 @@ Think of the 10 steps as **zooming in**. You start with the whole problem in one
 
 **Analogy:** an architect visiting a client. They ask how many people live there and what rooms they need before they draw walls, and they draw walls before they choose the tiles. Patterns are the tiles.
 
+## Common beginner mistakes 🟢
+
+- **Coding at minute 2** → you model the wrong thing (no seat hold) and rewrite at minute 30 → spend 3 minutes writing the requirement list first.
+- **Asking open questions** ("how long should a hold be?") → you often get "what do you think?" back → propose an answer and ask "is that OK?".
+- **Drawing every class you can think of** → half are never used and the clock runs out → cut any entity that no use case touches.
+- **Writing constructors and getters first** → the interviewer never sees the hard part → code the hardest method first and stub the rest.
+- **Saying "I'll add a lock" with no detail** → it sounds like a guess → say what is shared, what the lock covers, and what the loser gets back (`ErrSeatTaken`).
+
+> 🟢 → 🟡 **You now know** why a fixed order of steps saves the round, and that the steps zoom in from the whole problem to one method. **Next we open the box**: each step and its output, how many minutes each gets, how to lead the requirement talk, how to spot the hardest method, and how to lay out the files.
+
 ## 3. How it works 🟡
 
 ### The 10 steps with time boxes
+
+**Step by step** (a 60-minute "design a parking lot" round):
+1. Minutes 0-8: write 5 requirements, for example "2 gates, cars and bikes, one spot per vehicle, pay on exit", plus what is out of scope.
+2. Minutes 8-13: list the actors (driver, gate) and the nouns (`Spot`, `Ticket`, `Vehicle`), and how they link.
+3. Minutes 13-20: write the method signatures, such as `Park(v Vehicle) (Ticket, error)`, and say if any pattern is needed.
+4. Minutes 20-45: code `Park`, the hardest method, and two small tests.
+5. Minutes 45-52: list edge cases (two cars, one spot) and trade-offs (one lock now, the database with many servers).
 
 ```mermaid
 flowchart TD
@@ -162,9 +191,9 @@ Each step has one output you write on the shared doc or whiteboard:
 | 1 | Clarify requirements | 4–8 bullet requirements, NFRs (non-functional requirements such as concurrency or latency), out-of-scope list | Asking nothing, or asking 20 questions |
 | 2 | Actors and use cases | `User: search, hold seats, pay, cancel` | Listing features no one asked for |
 | 3 | Entities | `Show, Seat, Hold, Booking` | Adding entities no use case touches |
-| 4 | Relationships | "Show has many Seats; Booking references a Hold by ID" | Deep object graphs with pointers everywhere |
+| 4 | Relationships | "Show has many Seats; Booking references a Hold by ID" | Deep object graphs (objects pointing to objects pointing to objects) with pointers everywhere |
 | 5 | APIs and methods | Go signatures: `HoldSeats(showID string, seatIDs []string) (Hold, error)` | Signatures without errors or IDs |
-| 6 | Storage | `type BookingRepo interface{...}`, and a SQL table if the round is backend-flavoured | Picking a database brand instead of an access pattern |
+| 6 | Storage | `type BookingRepo interface{...}` (a repository: an interface that hides how data is saved), and a SQL table if the round is backend-flavoured | Picking a database brand instead of an access pattern |
 | 7 | Patterns | "Pricing varies by show → Strategy; seat lifecycle → state enum" | Naming patterns with no varying part |
 | 8 | Core code | The hardest method plus 2–3 tests | Coding constructors and getters first |
 | 9 | Edge cases | A list, each with how the code handles it | Mentioning "concurrency" without saying what is locked |
@@ -173,6 +202,12 @@ Each step has one output you write on the shared doc or whiteboard:
 ### Time boxes by round length
 
 **In plain words: how many minutes each step gets in a 45, 60 or 90 minute round.**
+
+**Step by step:**
+1. Find your round length in the table header, say 45 minutes.
+2. Read down that column: 5 minutes of questions, 4 of entities, 5 of methods.
+3. That puts you at minute 14 when you start the code; you then get 20 minutes for it.
+4. Glance at the clock after each block. If you are 5 minutes behind, shorten the next design block, never the code.
 
 All numbers below are planning targets (estimates), not rules from any company.
 
@@ -189,11 +224,18 @@ Rules of thumb behind the table:
 
 - **Steps 1–4 never take more than about a quarter** of the round. If you are at minute 15 of 45 without method signatures, stop modelling and say "let me move to the API".
 - **The code block is the biggest block.** In a 45-minute round you code one method well; in a 90-minute machine-coding round you code everything, so steps 1–7 compress into a few written lines.
-- **Product-company rounds move APIs and schema earlier.** Backend-heavy interviewers often ask for the REST endpoints and the tables right after the use cases, because overselling and double assignment are solved in the database. Then run steps 5–6 before 3–4 and derive the entities from the tables. The method is the same; only the order of the middle steps moves.
+- **Product-company rounds move APIs and schema earlier.** Backend-heavy interviewers often ask for the REST endpoints (URLs such as `POST /holds`) and the tables right after the use cases, because overselling and double assignment are solved in the database. Then run steps 5–6 before 3–4 and derive the entities from the tables. The method is the same; only the order of the middle steps moves.
 
 ### Driving the requirements
 
 **In plain words: you suggest an answer and ask "is that OK?", instead of asking open questions.**
+
+**Step by step:**
+1. Find the problem type in the table below, for example booking.
+2. Pick 3 to 5 questions that would change the code, such as "hold before payment?".
+3. Turn each into a proposal: "I'll assume a seat is held for 5 minutes. Is that fine?"
+4. Write the answer on the board and move on.
+5. Always add the two big ones: "can two requests touch the same thing?" and "what if a step fails halfway?"
 
 You drive; the interviewer confirms. The pattern is **propose, then ask**: "I'll assume a seat is held for 5 minutes while the user pays. Is that fine?" A proposal gets a yes or a correction in 5 seconds; an open question ("how long should a hold be?") often gets "what do you think?" back.
 
@@ -205,7 +247,7 @@ Question bank by problem type (pick 3–5, not all):
 | Inventory and orders | [[Inventory Order Assignment (Dark Store)]], [[Cart Checkout with Coupons]], [[Food Ordering System]] | Reserve stock at cart or at checkout? What if payment fails after reserving? Coupons stack? Idempotent retries? |
 | State machines | [[Vending Machine]], [[Elevator System]], [[ATM]] | Which states, which events? What happens on an invalid event? Cancel mid-flow? Out-of-service mode? |
 | Matching and assignment | [[Delivery Partner Assignment]], [[Ride Sharing]], [[Parking Lot]] | Selection rule (nearest, least loaded)? Can one partner get two orders? Timeout and reassignment? |
-| Infrastructure components | [[Rate Limiter]], [[LRU Cache with TTL]], [[Logging Library]], [[Pub-Sub Message Queue]] | Single process or shared? Per-key limits? Eviction policy? Blocking or drop when full? |
+| Infrastructure components | [[Rate Limiter]], [[LRU Cache with TTL]], [[Logging Library]], [[Pub-Sub Message Queue]] | Single process or shared? Per-key limits? Eviction policy (which item to throw out when the cache is full)? Blocking or drop when full? |
 | Money | [[Splitwise Expense Sharing]], [[Digital Wallet and Ledger]] | Currency and rounding? Integer minor units? Audit trail? Can balances go negative? |
 
 Always ask the two questions that change the code most: **"Can two requests touch the same thing at the same time?"** and **"What happens if a step fails halfway?"**
@@ -223,9 +265,16 @@ sequenceDiagram
 
 **In plain words: pick the one method where bugs and races live, and code that first.**
 
+**Step by step:**
+1. Look at your method list: `AddShow`, `ListSeats`, `HoldSeats`, `Confirm`.
+2. Ask of each: can two callers want the same thing? `HoldSeats` yes (the same seat).
+3. Is there a rule that must never break? Yes: one seat, one holder.
+4. Does it change several things at once? Yes: hold all 3 seats or none.
+5. Three yeses: `HoldSeats` is the method to code first.
+
 After step 5, point at one signature and say "this is where the correctness lives, I'll code it". The hardest method is the one with:
 
-- **a shared resource** that two callers can want (a seat, a stock unit, a delivery partner, a token bucket),
+- **a shared resource** that two callers can want (a seat, a stock unit, a delivery partner, a token bucket, which is a rate limiter's counter of allowed requests),
 - **an invariant** that must never break (no double booking, stock never negative, total never below zero),
 - **a multi-step change** that must be all-or-nothing (hold 3 seats, reserve then charge).
 
@@ -241,6 +290,13 @@ After step 5, point at one signature and say "this is where the correctness live
 ### Code layout in a round
 
 **In plain words: one package and a handful of files is enough in an interview.**
+
+**Step by step:**
+1. Make one package, for example `booking`.
+2. Put types in `model.go` and error values in `errors.go`.
+3. Put the storage interface in `repository.go` and the use cases (`HoldSeats`, `Confirm`) in `service.go`.
+4. Put the tests in `service_test.go`.
+5. Show this list to the interviewer before typing, so they see the boundaries.
 
 For a 45–60 minute round, one package with five files is enough. Put the layout on screen before you code so the interviewer sees the boundaries:
 
@@ -331,7 +387,7 @@ classDiagram
 
 **Step 6, storage:** in memory for the round. Backend version: a `seats(show_id, seat_id, state, hold_id, expires_at)` table where the hold is one `UPDATE seats SET state = 'held', hold_id = $3, expires_at = now() + interval '5 minutes' WHERE show_id = $1 AND seat_id = ANY($2) AND (state = 'free' OR (state = 'held' AND expires_at <= now()))` (note the parentheses: without them the `OR` escapes the `show_id` filter), and the row count must equal the number of seats requested; see [[Locking - Optimistic vs Pessimistic]].
 
-**Step 7, patterns:** seat lifecycle as a small state enum (Free → Held → Booked); the clock as an injected interface so expiry is testable. No Strategy or Factory: nothing varies yet. Full lifecycle patterns are in [[State Machines in Go]].
+**Step 7, patterns:** seat lifecycle as a small state enum (a type with a fixed list of values: Free → Held → Booked); the clock as an injected interface (passed in from outside, so a test can pass a fake clock) so expiry is testable. No Strategy or Factory: nothing varies yet. Full lifecycle patterns are in [[State Machines in Go]].
 
 ```mermaid
 sequenceDiagram
@@ -380,6 +436,8 @@ The two loops run under one lock, so no other caller can sneak in between "check
 ### Step 8, core code (tested)
 
 **In plain words: the core code for the example problem, with tests. Skim the method names first.**
+
+**What this code does, in plain words:** `Service` keeps every seat of every show in a map, guarded by one mutex. `HoldSeats` takes the lock, checks that every asked-for seat is free (or its old hold has expired), and only then marks them all Held under a new hold ID with a 5-minute expiry. `Confirm` checks that the hold still owns its seats and has not expired, then marks them Booked; calling it again just returns `nil`. Time comes from an injected `Clock`, so tests can jump forward.
 
 ```go
 // Package booking is the 45-minute core of a movie-booking round:
@@ -520,9 +578,9 @@ Three tests cover what interviewers ask about most:
 
 - **Winner test:** N goroutines race for the same seat; exactly one wins and N−1 get `ErrSeatTaken`. Run it with `-race`.
 - **All-or-nothing test:** a request that includes one taken seat holds nothing.
-- **Fake-clock test:** move an injected clock past the expiry instead of calling `time.Sleep`, so the test is instant and deterministic.
+- **Fake-clock test:** move an injected clock past the expiry instead of calling `time.Sleep`, so the test is instant and deterministic (gives the same result on every run).
 
-For problems with a payment step, add a **compensation test**: payment fails after a reservation, and the reservation is released (otherwise stock leaks).
+For problems with a payment step, add a **compensation test** (a compensation is the undo step you run when a later step fails): payment fails after a reservation, and the reservation is released (otherwise stock leaks).
 
 ```go
 package booking
@@ -612,9 +670,9 @@ func TestHoldExpiry(t *testing.T) {
 
 Measured: `go vet` is clean and `go test -race -count=1` passes on Go 1.24.4 (darwin/arm64).
 
-**Step 9, edge cases** (say each with the line of code that handles it): two users, one seat → one mutex around check and mark; a seat id that does not exist → `ErrSeatTaken` from the `!ok` branch; hold expires during payment → `Confirm` returns `ErrHoldExpired` and the payment must be refunded; client retries `Confirm` → second call returns `nil`; expired holds are never cleaned up → lazy expiry is enough for correctness, a sweeper only frees memory.
+**Step 9, edge cases** (say each with the line of code that handles it): two users, one seat → one mutex around check and mark; a seat id that does not exist → `ErrSeatTaken` from the `!ok` branch; hold expires during payment → `Confirm` returns `ErrHoldExpired` and the payment must be refunded; client retries `Confirm` → second call returns `nil`; expired holds are never cleaned up → lazy expiry (a hold counts as expired when someone next looks at it, with no timer) is enough for correctness, a sweeper only frees memory.
 
-**Step 10, trade-offs:** one mutex for all shows is simple and correct but serialises every show; a lock per show removes that contention (see [[Concurrency for LLD]]). With 3 service instances the mutex no longer protects anything, so the hold moves into the database as a conditional `UPDATE` or `SELECT ... FOR UPDATE`. A hold is a lease: it trades a little seat availability (abandoned holds block seats for 5 minutes) for never charging two people for one seat.
+**Step 10, trade-offs:** one mutex for all shows is simple and correct but serialises every show; a lock per show removes that contention (callers queueing for the same lock; see [[Concurrency for LLD]]). With 3 service instances the mutex no longer protects anything, so the hold moves into the database as a conditional `UPDATE` or `SELECT ... FOR UPDATE`. A hold is a lease (a claim that expires on its own): it trades a little seat availability (abandoned holds block seats for 5 minutes) for never charging two people for one seat.
 
 ## 5. Variants and comparison 🟡
 
@@ -633,6 +691,8 @@ Measured: `go vet` is clean and `go test -race -count=1` passes on Go 1.24.4 (da
 - **Step 7 is often "no pattern".** Saying "nothing varies yet, so no Strategy here" is a positive signal; see [[Design Principles - DRY, KISS, YAGNI, Coupling and Cohesion]].
 - **The method can make you slow** if you write long prose at each step. The output of each step is a few lines, not a paragraph.
 - **When the interviewer redirects, follow.** If they say "skip requirements, I'll give them to you", jump to step 3 and keep the order from there.
+
+> 🟡 → 🔴 **You now know** the 10 steps, their time boxes and how a full round looks on the movie-booking problem. **Next comes the senior view**: how the same steps match a real design doc, the failure patterns interviewers see again and again, what they actually score, and what an SDE-3 should raise without being asked.
 
 ## 7. In production 🔴
 
@@ -657,7 +717,7 @@ The same steps map onto real design work, which is why interviewers use them:
 | Signal | Strong | Weak |
 | --- | --- | --- |
 | Requirements | Proposes assumptions, confirms, writes out-of-scope | Asks nothing, or asks without proposing |
-| Modelling | Few entities, clear ownership, IDs between aggregates | Deep pointer graphs, god objects |
+| Modelling | Few entities, clear ownership, IDs between aggregates (groups of objects that change together, such as a show and its seats) | Deep pointer graphs, god objects (one huge type that does everything) |
 | Code correctness | Hard method compiles, handles the invariant, has a test | Pseudocode only, or happy path only |
 | Concurrency and failure | Names what is shared, how it is locked, what happens on retry | "We can add a lock" with no detail |
 | Extensibility | One interface where variation is real | Interfaces everywhere, or none where needed |
@@ -668,12 +728,12 @@ The same steps map onto real design work, which is why interviewers use them:
 **Narrating trade-offs.** A trade-off statement has three parts: the choice, its cost, and the condition to switch. "I hold seats with one mutex; that serialises all shows, which is fine for one process; if contention shows up I'd switch to a lock per show." Practise saying one of these per step 7–10.
 
 **SDE-3 additions.** At senior level the interviewer expects you to raise, without being asked:
-- **Multi-instance correctness:** the in-memory lock becomes a database constraint, a conditional update or a lease with a fencing token.
+- **Multi-instance correctness:** the in-memory lock becomes a database constraint, a conditional update or a lease with a fencing token (a number that grows with each new lease, so storage can reject writes from an old holder).
 - **Idempotency:** every write that a client can retry (`Confirm`, `PlaceOrder`) takes an idempotency key; see [[Idempotency and Idempotency Keys]].
 - **Time:** inject a clock everywhere; never call `time.Now()` inside domain logic you want to test.
 - **Observability:** which counter tells you double bookings are happening (for example, "holds rejected per show per minute").
 
-**Deterministic tests are part of the design.** Injected clocks and ID generators are not test-only hacks; they make the system replayable. If your design cannot be tested without `time.Sleep`, that is a design smell to fix in step 5.
+**Deterministic tests are part of the design.** Injected clocks and ID generators are not test-only hacks; they make the system replayable. If your design cannot be tested without `time.Sleep`, that is a design smell (a sign that something is built wrong) to fix in step 5.
 
 **Machine-coding specifics.** In a runnable round, add a thin driver: a loop that reads commands such as `hold show-1 A1 A2` from standard input and calls the service. Keep it in `main.go` so the service stays testable without it.
 
@@ -710,6 +770,26 @@ The same steps map onto real design work, which is why interviewers use them:
 - Tests: winner test under `-race`, all-or-nothing test, fake-clock test, compensation test.
 - Layout: one package with model, errors, repository, service, test; `internal/<domain>` for bigger rounds.
 - Every trade-off: choice, cost, when to switch.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What are the first four of the 10 steps?
+> Requirements, actors and use cases, entities, relationships.
+
+> [!question]- 🟢 How should you ask about an unclear rule, such as hold length?
+> Propose an answer and ask for a yes: "I'll assume 5 minutes, is that fine?"
+
+> [!question]- 🟢 What gets the biggest block of time in a 60-minute round?
+> The code of the single hardest method, plus a few tests: about 25 minutes.
+
+> [!question]- 🟡 How do you pick the hardest method?
+> It touches a shared resource, protects a rule that must never break, and changes several things at once, like `HoldSeats`.
+
+> [!question]- 🟡 Your design uses one mutex. What changes with 3 server instances?
+> Each instance has its own mutex, so the check-and-mark must move into the database: a conditional `UPDATE` or `SELECT ... FOR UPDATE`.
+
+> [!question]- 🟡 Why inject a `Clock` instead of calling `time.Now()`?
+> So a test can move time forward by 5 minutes at once and check expiry with no `time.Sleep`.
 
 ## Links 🟢
 

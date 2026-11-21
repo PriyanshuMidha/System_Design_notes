@@ -30,6 +30,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Webhooks - Sending and Receiving]]: a provider calls your URL with a POST when something happens, and retries if you do not answer 2xx.
+> - [[Idempotency and Idempotency Keys]]: doing the same action twice must have the same effect as doing it once, usually by remembering a unique key.
+> - [[Error Handling]]: Go errors are values you check, wrap and compare with `errors.Is`.
+
 **From zero, in 60 seconds** 🟢
 
 A **webhook** is a phone call in reverse: instead of you asking the payment provider "anything new?", the provider calls your server when something happens — "invoice 42 just got paid".
@@ -71,6 +76,13 @@ An idempotent webhook handler does the work once, however many copies arrive.
 | Unique constraint | A database rule that rejects a second row with the same key | `UNIQUE (provider, event_id)` |
 | `2xx` / `4xx` / `5xx` | Success / your-request-is-bad / server-failed status codes | `200`, `400`, `500` |
 
+| Raw body | The exact bytes the provider sent, before any JSON decoding | `io.ReadAll(r.Body)` |
+| Constant-time compare | A comparison that takes the same time whether it matches or not | `hmac.Equal(a, b)` |
+| Replay window | How old a signed message may be before it is rejected | 5 minutes |
+| `ON CONFLICT DO NOTHING` | Postgres: if this key already exists, skip the insert without an error | second copy of `evt_42` inserts 0 rows |
+| Outbox | A table row written in the same transaction, picked up later by a worker | "mark invoice 42 paid" |
+| State machine | Fixed states and the allowed moves between them | `pending → paid`, never `paid → pending` |
+
 **Picture it**
 
 ```mermaid
@@ -110,6 +122,10 @@ The handler has to tell "an event I have not seen" from "a retry of an event I h
 
 A second, unrelated failure mode: anyone who finds the endpoint URL can `POST` a forged "invoice.paid" body to it. Without a signature check, that forged request marks a real invoice paid. The fix for both problems is the same shape of code: verify first, then deduplicate, then process once.
 
+### A real-life example 🟢
+
+When you pay a Swiggy order by UPI, the payment gateway tells Swiggy's server "payment captured" with a webhook. On a bad network moment, the gateway does not get Swiggy's reply in time and sends the same message again a minute later. Swiggy's server checks the signature, sees it already stored that event ID, answers "OK" and does nothing more. So your order is confirmed once, and you are charged and notified once.
+
 ## 2. Mental model 🟢
 
 Treat the handler as two phases that must not share a transaction or a timeout budget:
@@ -136,9 +152,18 @@ The provider only ever sees the fast phase's outcome. Everything in the slow pha
 
 ## 3. How it works 🟡
 
+🟢 → 🟡 You now know the four steps: check the signature, remember the event ID, answer fast, do the slow work later. Next we open the box: how to check the signature safely, how to read the body, how the database makes the "seen it?" check race-free, why the hand-off needs an outbox, and what to do with events that arrive out of order.
+
 ### Signature verification: raw bytes, constant time, a replay window
 
 **In plain words:** check the secret stamp on the exact bytes that arrived, using a comparison that takes the same time whether it matches or not, and reject stamps that are too old.
+
+**Step by step:**
+1. Stripe sends header `Stripe-Signature: t=1732150000,v1=ab12...` and a body.
+2. Rebuild the signed text: `"1732150000" + "." + <raw body bytes>`.
+3. Compute HMAC-SHA256 of it with the shared secret.
+4. Compare with `v1` using `hmac.Equal`. No match → 400.
+5. If `t` is more than 5 minutes away from now → reject as a replay.
 
 ```go
 func verifySignatureWB(secret []byte, timestamp string, body []byte, sigHex string) bool {
@@ -160,7 +185,7 @@ Two details separate this from most tutorial code:
 - **`hmac.Equal`, never `==` or `bytes.Equal`.** Both of those compare byte-by-byte and return at the first mismatch, so the time taken to reject a guess leaks how many leading bytes it got right. `hmac.Equal` always compares the full length in constant time.
 - **The signature covers `timestamp + "." + body`, not just `body`.** Binding the timestamp into the MAC is what makes the next check meaningful: without it, an attacker who captures one valid, old request can replay it with a forged fresh timestamp and the signature would still check out.
 
-The replay window rejects anything too old (a captured request replayed later) or implausibly in the future (clock skew gone wrong):
+The replay window rejects anything too old (a captured request replayed later) or implausibly in the future (clock skew: two machines' clocks disagreeing):
 
 ```go
 func VerifyStripeStyle(header string, body []byte, secrets [][]byte, tolerance time.Duration, now time.Time) error {
@@ -216,6 +241,12 @@ The shared rule, regardless of scheme: verify against the **exact bytes** the pr
 
 ### Reading the body safely
 
+**Step by step:**
+1. Wrap the body with a 64 KiB cap.
+2. Read all of it into `body` once.
+3. If it is bigger than 64 KiB, stop with 413 before any other check runs.
+4. Use these same bytes for the signature check, then for JSON decoding.
+
 ```go
 r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes) // e.g. 64 KiB
 body, err := io.ReadAll(r.Body)
@@ -232,6 +263,12 @@ The cap is set once, comfortably above the provider's real payload size, and it 
 ### Deduplicating atomically
 
 **In plain words:** let the database be the memory — a uniqueness rule on (provider, event ID) means the second insert of the same event simply fails, no race possible.
+
+**Step by step:**
+1. Two copies of `evt_42` arrive within 1 ms and run at the same time.
+2. Both run `INSERT INTO webhook_events (provider, event_id) VALUES ('stripe','evt_42') ON CONFLICT DO NOTHING`.
+3. The unique index lets only one insert write a row; it reports 1 row, the other reports 0.
+4. The one with 1 row goes on to queue the business update. The one with 0 rows answers 200 and stops.
 
 ```sql
 CREATE UNIQUE INDEX webhook_events_provider_event_id_key
@@ -270,6 +307,12 @@ sequenceDiagram
 
 **In plain words:** answer 'got it' within seconds and do the real work in the background — a slow answer makes the provider re-send, which creates the very duplicates you are defending against.
 
+**Step by step:**
+1. The event is new, so the insert wrote a row.
+2. Hand the work ("mark invoice 42 paid, send receipt") to a worker.
+3. Answer 200 right away, in a few milliseconds.
+4. The worker does the slow work afterwards; a slow email service can no longer make the provider retry.
+
 The handler writes the `200` the instant the insert tells it this is a new event, and hands the actual business effect to a worker instead of running it inline:
 
 ```go
@@ -294,6 +337,12 @@ Response-code policy follows directly from what each outcome means to the *provi
 
 ### Why the hand-off to the worker needs an outbox, not just a channel
 
+**Step by step:**
+1. In one transaction: insert `evt_42` into `webhook_events` and insert an outbox row "set invoice 42 to paid".
+2. Commit, answer 200.
+3. A relay claims undispatched outbox rows with `FOR UPDATE SKIP LOCKED` and applies them.
+4. If the process crashes after step 2, the outbox row is still there, so the payment update is not lost.
+
 The `h.jobs <- job{...}` send shown above is the simplest version of "hand off to a worker," and it has a real gap: `job` only lives in process memory.
 
 If the process is killed between the `INSERT ... ON CONFLICT` commit (which already marked this event as seen) and a worker actually draining that job off the channel, the business effect — marking the invoice paid — never happens, and nothing will ever retry it.
@@ -313,6 +362,12 @@ An in-memory channel is an acceptable simplification for a demo or a single-inst
 ### Out-of-order events
 
 **In plain words:** 'paid' can arrive before 'sent'; trust the state machine and the event's own timestamps, not the arrival order.
+
+**Step by step:**
+1. `payment.paid` arrives first; the invoice moves `pending → paid`.
+2. A delayed `payment.pending` arrives second.
+3. The guard asks: is `paid → pending` an allowed move? No, `paid` is final.
+4. The event is logged and dropped, and the provider still gets 200, because it was received fine; it is just stale.
 
 At-least-once, unordered delivery means a late "payment.pending" can arrive *after* "payment.paid" already landed, if the pending notification was merely delayed in transit rather than actually happening later.
 
@@ -374,6 +429,8 @@ func ValidateAmount(invoiceTotalMinor, eventAmountMinor int64) error {
 The shape without any of the hardening: decode the body, extract a signature header, compare it, apply the event. It has no size cap, no constant-time compare, no replay window and no dedupe — every one of those gaps is a real, separately exploitable bug, not a simplification. The sections above exist because this version is not safe to ship.
 
 ### Production version
+
+**What this code does, in plain words:** the handler caps and reads the body, checks the signature against each allowed secret, inserts the event ID into the store, and answers 200 for new and duplicate events alike; only new events are passed to the worker, which applies the amount check and the status guard.
 
 The full handler, with an in-memory `EventStore` standing in for the Postgres table above (Postgres is not available in this environment; the fake enforces the same "first insert for a key wins" rule a unique index does, under a mutex, so the concurrency test below exercises the real race):
 
@@ -452,6 +509,8 @@ func (h *Handler) process(j job) {
 }
 ```
 
+**What this code does, in plain words:** the tests sign events with a test secret and check that a tampered body fails verification, a duplicate delivery is acknowledged without reprocessing, a late `pending` cannot undo `paid`, and 10 goroutines sending the same event cause exactly one update.
+
 Tests, run with `go test -race`, each proving one claim from the sections above:
 
 ```go
@@ -522,7 +581,27 @@ All of the above pass, including a full concurrent-delivery test (`TestHandler_C
 - A replay-window check adds a hard requirement that the server's clock be reasonably correct (NTP-synced); a server with multi-minute clock drift will reject genuinely fresh events.
 - For an internal, trusted caller (not a public internet-facing webhook), full HMAC verification can be overkill compared to mTLS or a network-level allowlist — see [[Secure Coding for Go Services]] for the broader menu of service-to-service auth options.
 
+### Duplicate vs invalid vs failed 🟡
+
+These three are often answered with the same status code, which is wrong:
+
+| Case | What it means | Answer |
+| --- | --- | --- |
+| Duplicate | We already stored this event ID | 200, do nothing |
+| Invalid | Bad signature, too old, or broken JSON | 400, provider should not retry |
+| Our failure | We could not even store the event | 500, provider should retry |
+
+### Common beginner mistakes 🟢
+
+- Decoding the JSON, then re-encoding it to check the signature → whitespace and key order change and the check fails → verify the raw bytes.
+- Comparing signatures with `==` → timing leaks how much of a guess is right → use `hmac.Equal`.
+- Checking "seen it?" with a `SELECT` and then `INSERT` → two retries both pass → use a unique index with `ON CONFLICT DO NOTHING`.
+- Doing the slow work before answering → the provider times out and retries → answer 200 first, process on a worker.
+- Returning 500 for a duplicate → the provider keeps retrying forever → treat a duplicate as success.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now receive webhooks safely and process each event exactly once. The advanced part covers what happens in live systems: secret rotations, backed-up workers, replayed old requests, and why you still need a reconciliation job for events that never arrive.
 
 - **Real systems:** Stripe, GitHub, Razorpay and the Standard Webhooks spec all converge on "HMAC over the raw body, event id for dedupe, ack fast" as the shape, differing mainly in header names and whether a timestamp is bound into the signature.
 - **Failure modes → fixes:**
@@ -572,6 +651,26 @@ All of the above pass, including a full concurrent-delivery test (`TestHandler_C
 - `2xx` = processed or duplicate; `4xx` = bad signature/malformed; `5xx` = only your own failure to store the event.
 - Guard status transitions with a state machine, not with timestamps; make terminal states (`paid`, `failed`) reject any further transition.
 - Pair webhooks with a reconciliation job: a provider that never sends an event is a gap no amount of correct handling closes.
+
+## Self-check 🟢🟡
+
+> [!question]- Why must the signature be checked on the raw body?
+> The provider signed those exact bytes; decoding and re-encoding changes them.
+
+> [!question]- What status do you return for a duplicate event?
+> 200, because it was already handled and the provider should stop retrying.
+
+> [!question]- Which Go function compares signatures safely?
+> `hmac.Equal`.
+
+> [!question]- Why is `SELECT` then `INSERT` not safe for dedupe?
+> Two concurrent retries can both see "not found" before either inserts.
+
+> [!question]- Why is a timestamp inside the signed data important?
+> It lets you reject old captured requests, because the attacker cannot change the timestamp without breaking the signature.
+
+> [!question]- Why hand off to the worker through an outbox and not a channel?
+> A crash after commit would lose the channel job, while the event is already marked as seen; the outbox row survives.
 
 ## Links 🟢
 

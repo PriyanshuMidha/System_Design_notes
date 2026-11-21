@@ -37,6 +37,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[gRPC Services in Go]]: how a gRPC service is defined in a `.proto` file, generated into Go, and served by `grpc.NewServer`.
+> - [[Building REST Endpoints]]: what a JSON REST endpoint looks like and how errors become HTTP status codes.
+> - [[gRPC]]: gRPC sends typed binary messages over HTTP/2 and has its own error codes like `NotFound`.
+
 **From zero, in 60 seconds** 🟢
 
 Inside your company, services talk **gRPC**: a fast, typed protocol generated from `.proto` contract files. But browsers and third parties want plain JSON over REST.
@@ -76,6 +81,12 @@ So you describe the API once, and let a tool serve it both ways.
 | HTTP/2 | Newer HTTP that sends many requests on one connection | gRPC needs it |
 | Port | A numbered door on a server for network traffic | `:8080` for REST, `:9090` for gRPC |
 
+| grpc-gateway | A generated translator that turns REST+JSON calls into gRPC calls | `GET /v1/invoices/42` → `GetInvoice(id=42)` |
+| ConnectRPC | A library whose one handler speaks gRPC, gRPC-Web and plain JSON | `curl -d '{"id":42}' .../GetInvoice` |
+| gRPC-Web | A browser-friendly variant of gRPC | a web page calling the service with a JS client |
+| Metadata | gRPC's version of HTTP headers | `authorization`, `x-tenant-id` |
+| `cmux` | A library that lets two protocols share one port by peeking at each new connection | gRPC and REST both on `:8080` |
+
 **Picture it**
 
 ```mermaid
@@ -102,7 +113,7 @@ Where it breaks: a translator can relay a long conversation easily, but streamin
 
 ## 1. Why it exists 🟢
 
-InvoiceOps' internal services call each other over gRPC: compact binary encoding, generated client stubs, deadlines and streaming built in (see [[gRPC Services in Go]]).
+InvoiceOps' internal services call each other over gRPC: compact binary encoding, generated client stubs (ready-made Go functions that call the remote service), deadlines and streaming built in (see [[gRPC Services in Go]]).
 
 But the billing dashboard is a browser, and browsers cannot easily speak gRPC — it's framed over HTTP/2 in a way `fetch` doesn't expose, and gRPC-Web needs a client library and a translating proxy of its own.
 
@@ -113,6 +124,10 @@ The naive fix is to hand-write a second REST API that calls the same business lo
 Now every new field, every new error case, and every new endpoint is written and tested twice, and the two APIs drift: the REST handler forgets a validation the gRPC handler has, or returns a different error shape for the same failure.
 
 grpc-gateway and ConnectRPC remove the duplication by generating the REST (or Connect-JSON) layer from the same `.proto` that defines the gRPC service. One implementation of `InvoiceService`, two protocols on the wire.
+
+### A real-life example 🟢
+
+A payments company like Razorpay may run dozens of internal services that talk to each other over gRPC because it is fast and typed. Its merchants, though, call public REST endpoints with `curl` or any language. Instead of writing every endpoint twice, the team describes each call once in a `.proto` file, marks which REST path it should answer to, and generates the REST layer. A new field added to the proto shows up in both the gRPC API and the JSON API at the same time.
 
 ## 2. Mental model 🟢
 
@@ -143,9 +158,17 @@ Both sides generate code from the same `invoice.proto`. The difference is whethe
 
 ## 3. How it works 🟡
 
+🟢 → 🟡 You now know the idea: describe the API once in `.proto`, then either generate a REST translator (grpc-gateway) or use a handler that speaks both (ConnectRPC). Next we open the box: the code generation steps, the gateway settings, two ways to connect it, error mapping, ConnectRPC, ports, and streaming limits.
+
 ### Codegen pipeline
 
 **In plain words:** one buf command reads the .proto file and writes three things: the types, the gRPC service, and the REST translator.
+
+**Step by step:**
+1. Write `rpc GetInvoice(...)` in `invoice.proto` and add `option (google.api.http) = { get: "/v1/invoices/{id}" }`.
+2. Run the generator with four plugins.
+3. You get `invoice.pb.go` (message types), `invoice_grpc.pb.go` (gRPC server and client), `invoice.pb.gw.go` (the REST translator) and an OpenAPI file.
+4. You write only `InvoiceService`'s methods; everything else is generated.
 
 A `.proto` file with an `option (google.api.http)` on each RPC:
 
@@ -187,6 +210,8 @@ protoc -I. -Igoogleapis \
 
 ### What the generated gateway file contains
 
+**In plain words:** for each RPC the generator writes small functions that read the URL, query and body into the request message, then call the service.
+
 `invoice.pb.gw.go` defines, per RPC, a `request_InvoiceService_GetInvoice_0` function (used over the network hop) and a `local_request_InvoiceService_GetInvoice_0` function (used in-process), plus a `RegisterInvoiceServiceHandler*` family:
 
 ```go
@@ -208,6 +233,12 @@ This is why a path parameter that doesn't type-check (a non-numeric `{id}` bound
 
 ### `runtime.NewServeMux` options
 
+**Step by step:**
+1. Create the gateway mux with `runtime.NewServeMux(...)`.
+2. Set the JSON options: keep proto field names (`amount_cents`) and include empty fields.
+3. Say which HTTP headers pass through to the service as gRPC metadata.
+4. Install your own error handler so errors match the rest of your REST API.
+
 ```mermaid
 flowchart LR
     REQ["HTTP request"] --> MUX["runtime.ServeMux"]
@@ -226,6 +257,11 @@ flowchart LR
 
 **In plain words:** the translator can call the service through memory (same process) or over the network (separate pods) — one line decides, with different failure behavior.
 
+**Step by step:**
+1. In-process: `RegisterInvoiceServiceHandlerServer(ctx, mux, srv)` calls your Go service value directly. No network, but no streaming.
+2. Network hop: `RegisterInvoiceServiceHandlerFromEndpoint(ctx, mux, "localhost:9090", opts)` dials the real gRPC server.
+3. A REST call now becomes a real gRPC call, so streaming works (as JSON lines), at the cost of one extra hop.
+
 | | `RegisterXHandlerServer` (in-process) | `RegisterXHandlerFromEndpoint` (network hop) |
 |---|---|---|
 | How it reaches the service | Calls the Go `InvoiceServiceServer` value directly | Dials the gRPC server as a real `grpc.ClientConn` |
@@ -238,11 +274,23 @@ flowchart LR
 
 **In plain words:** gRPC's error codes and HTTP's status codes are different alphabets; a fixed table translates one to the other so clients see sensible errors.
 
+**Step by step:**
+1. The service returns `status.Error(codes.NotFound, "invoice 42 not found")`.
+2. The gateway's error handler reads the code.
+3. `NotFound` becomes HTTP 404, `InvalidArgument` 400, `Unauthenticated` 401.
+4. The body is written as JSON, in your own shape if you set `WithErrorHandler`.
+
 A gRPC `status.Error` crosses the gateway and becomes an HTTP status via `runtime.HTTPStatusFromCode` (`NotFound` → 404, `InvalidArgument` → 400, `Unauthenticated` → 401, …) and a default JSON error body.
 
 Override both with `runtime.WithErrorHandler` when the API needs its own error shape or a status mapping the defaults get wrong for your domain — for example, treating `codes.AlreadyExists` as 200 for an idempotent create instead of the default 409.
 
 ### ConnectRPC
+
+**Step by step:**
+1. Generate with `protoc-gen-connect-go` from the same proto; no HTTP annotations needed.
+2. `NewInvoiceServiceHandler(server)` returns a path and one `http.Handler`.
+3. Mount it on a normal `http.ServeMux`.
+4. A gRPC client, a gRPC-Web browser client, and a plain `curl` with JSON all reach the same method; the handler picks the protocol from `Content-Type`.
 
 `protoc-gen-connect-go` generates a handler and a client from the same `.proto`, no HTTP annotations required:
 
@@ -253,7 +301,7 @@ mux.Handle(path, handler) // mounted at /invoiceops.v1.InvoiceService/
 ```
 
 One `http.Handler` now serves:
-- gRPC (binary protobuf, `Content-Type: application/grpc`) — compatible with any gRPC client, including grpc-go's. gRPC requires HTTP/2, so a plain `http.Server` needs TLS or h2c (`h2c.NewHandler`) for native gRPC clients and for bidirectional streaming; the Connect protocol also works over HTTP/1.1.
+- gRPC (binary protobuf, `Content-Type: application/grpc`) — compatible with any gRPC client, including grpc-go's. gRPC requires HTTP/2, so a plain `http.Server` needs TLS or h2c (`h2c.NewHandler`; h2c means HTTP/2 without encryption) for native gRPC clients and for bidirectional streaming; the Connect protocol also works over HTTP/1.1.
 - gRPC-Web — so a browser can talk to it with a gRPC-Web JS client, no separate Envoy proxy.
 - Connect's own protocol — JSON or protobuf over plain HTTP/1.1 or HTTP/2, callable from `curl` or `fetch` with no client library at all.
 
@@ -262,6 +310,12 @@ There is no second serialization pass and no annotation to keep in sync with the
 ### Serving on one port vs two
 
 **In plain words:** both protocols can share one port by sniffing each connection, or keep two ports and stay simple — the trade is ops convenience vs moving parts.
+
+**Step by step:**
+1. Default: gRPC on `:9090`, REST on `:8080`, two simple servers.
+2. If the platform allows only one port, `cmux` listens on `:8080`.
+3. For each new connection it peeks at the first bytes: HTTP/2 with `application/grpc` goes to the gRPC server.
+4. Everything else goes to the REST gateway.
 
 Two ports — gRPC on `:9090`, the gateway's REST handler on `:8080` — is the simpler default: each is a plain `http.Server` or `grpc.Server`, independently health-checked, independently scaled in front of its own load-balancer listener.
 
@@ -273,7 +327,13 @@ A cmux-free alternative is to put one `http.Handler` behind h2c (or TLS) that ch
 
 ### Limits of streaming over the gateway
 
-A gRPC server-streaming RPC routed through the network-hop gateway becomes a stream of newline-delimited JSON objects on one long-lived HTTP response — there is no HTTP/2 push or WebSocket involved, just one response body that never ends until the stream does.
+**Step by step:**
+1. A server-streaming RPC sends invoice updates one by one.
+2. Through the network-hop gateway, each update becomes one JSON object on its own line in a single long HTTP response.
+3. Client-streaming and two-way streams barely work over this path, and browsers cannot reliably stream a request body.
+4. So for live browser updates, use WebSockets or SSE instead.
+
+A gRPC server-streaming RPC routed through the network-hop gateway becomes a stream of newline-delimited JSON objects on one long-lived HTTP response — there is no HTTP/2 push (server-initiated sends) or WebSocket involved, just one response body that never ends until the stream does.
 
 grpc-gateway v2 can also accept a client-streaming request as a stream of JSON objects in the request body (and bidirectional streams in a limited form), but browsers' `fetch` cannot reliably stream a request body and nothing reconnects or resumes for you, so treat those as awkward.
 
@@ -305,7 +365,9 @@ http.ListenAndServe(":8080", mux)
 
 The full version below adds custom error mapping, header forwarding, the two registration paths, one-port serving with `cmux`, and a ConnectRPC handler on the same service — tested on Go 1.24 with `grpc-gateway v2.22.0`, `grpc-go v1.68.1` and `connectrpc.com/connect v1.18.1`.
 
-**The service implementation**, satisfying `invoicepb.InvoiceServiceServer`:
+**The service implementation**, satisfying `invoicepb.InvoiceServiceServer`.
+
+**What this code does, in plain words:** `invoiceServer` stores invoices in memory; `CreateInvoice` checks `customer_id` and returns `InvalidArgument` if it is missing, and `GetInvoice` returns `NotFound` for an unknown ID.
 
 ```go
 // invoiceStore is the in-memory backend. gRPC and the gateway serve requests
@@ -386,6 +448,8 @@ func newGRPCServer(store *invoiceStore) *grpc.Server {
 
 **Custom error mapping and marshaling options:**
 
+**What this code does, in plain words:** `newGatewayMux` builds the gateway mux with proto field names, empty fields included, a header matcher, and `customErrorHandler`, which turns gRPC codes into HTTP statuses and your own JSON error body.
+
 ```go
 // httpStatus maps a gRPC code to the HTTP status grpc-gateway should send.
 // The default mapping (codes.NotFound -> 404, codes.InvalidArgument -> 400, ...)
@@ -453,6 +517,8 @@ func headerMatcher(key string) (string, bool) {
 
 **Both registration paths:**
 
+**What this code does, in plain words:** `inProcessGatewayHandler` wires the gateway straight to the Go service value; `networkHopGatewayHandler` dials the gRPC server and wires the gateway to that connection.
+
 ```go
 // inProcessGatewayHandler wires the REST gateway directly to the Go server
 // value with RegisterInvoiceServiceHandlerServer: no network hop, no second
@@ -486,6 +552,8 @@ func networkHopGatewayHandler(ctx context.Context, grpcAddr string) (http.Handle
 
 **Serving both on one port with cmux:**
 
+**What this code does, in plain words:** `ServeOnePort` opens one listener, lets `cmux` send gRPC connections to the gRPC server and everything else to the HTTP gateway, and runs both.
+
 ```go
 // ServeOnePort runs the gRPC server and the REST gateway behind a single
 // listener, splitting connections by content type with cmux: a gRPC call
@@ -515,6 +583,8 @@ func ServeOnePort(lis net.Listener, grpcServer *grpc.Server, gatewayHandler http
 ```
 
 **Tests** (`go test -race`, real listeners, no mocked transport):
+
+**What this code does, in plain words:** the tests create then fetch an invoice through the in-process gateway, check a missing invoice gives 404, call through the network-hop gateway, and send both REST and gRPC traffic to one `cmux` port.
 
 ```go
 func TestInProcessGateway_CreateThenGet(t *testing.T) {
@@ -639,6 +709,8 @@ func TestServeOnePort(t *testing.T) {
 
 **ConnectRPC serving the same proto, no HTTP annotations:**
 
+**What this code does, in plain words:** `connectInvoiceServer` implements the same two methods with Connect's request and response wrappers; the test calls it with plain JSON and with the Connect protocol on one handler.
+
 ```go
 // connectInvoiceServer implements invoicepbconnect.InvoiceServiceHandler. A real
 // service would share one implementation with invoiceServer instead of
@@ -714,7 +786,26 @@ func TestConnectHandler_ServesJSONAndConnectProtocol(t *testing.T) {
 - Streaming RPCs translate poorly to REST (server streaming becomes JSON lines; client and bidirectional streams are awkward); don't try to force a server-streaming method through grpc-gateway for a browser that actually wants a WebSocket or SSE connection (see [[WebSockets and SSE in Go]]).
 - One more moving part (the gateway, or `cmux`) is one more thing to operate, monitor and keep version-pinned alongside the gRPC server.
 
+### grpc-gateway vs ConnectRPC 🟡
+
+| | grpc-gateway | ConnectRPC |
+| --- | --- | --- |
+| How it works | translates REST+JSON into a gRPC call | one handler speaks gRPC, gRPC-Web and Connect JSON |
+| REST paths | you choose them with `google.api.http` | fixed form `/package.Service/Method` |
+| Extra layer | yes, a translation step | no |
+| Good for | a hand-shaped public REST API | browsers and gRPC clients on one handler |
+
+### Common beginner mistakes 🟢
+
+- Hand-writing a second REST API next to the gRPC one → the two drift apart → generate the REST layer from the same proto.
+- Registering a streaming service in-process → every streaming call returns `Unimplemented` at runtime → use the network-hop registration.
+- Keeping the default error handler → REST errors look different from the rest of your API → set `WithErrorHandler` early.
+- Assuming every HTTP header reaches the gRPC handler → the default allowlist drops most → configure `IncomingHeaderMatcher`.
+- Sharing one port with `cmux` when two would do → one more moving part to debug → use two ports unless the platform forces one.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now serve one service as both gRPC and REST. The advanced part covers running it: error shapes, streaming surprises after a deploy, missing headers, `cmux` edge cases, and why in-process registration cannot stream.
 
 - **Real systems:** Google's own APIs are the origin of `google.api.http` annotations and grpc-gateway's design. Many Kubernetes-adjacent and cloud-native projects (etcd's gRPC gateway) ship a REST surface this way. ConnectRPC is built by Buf and is aimed at APIs that must be callable from both `curl`/browsers and native gRPC clients.
 - **Failure modes → fixes:**
@@ -775,6 +866,26 @@ func TestConnectHandler_ServesJSONAndConnectProtocol(t *testing.T) {
 - ConnectRPC = one handler, three protocols (gRPC, gRPC-Web, Connect-JSON), no translation layer.
 - Two ports is the default; one port needs `cmux` plus h2c and buys you a single exposed port.
 - Streaming RPCs only translate to awkward JSON-lines over the network-hop path (client and bidi streams barely) — don't force them through the gateway for browsers.
+
+## Self-check 🟢🟡
+
+> [!question]- What does grpc-gateway do?
+> It turns a REST+JSON request into the matching gRPC call and turns the answer back into JSON.
+
+> [!question]- Where do you say which REST path maps to an RPC?
+> In the `.proto` file, with `option (google.api.http)`.
+
+> [!question]- What does gRPC `NotFound` become at the gateway?
+> HTTP 404.
+
+> [!question]- Why can the in-process gateway not stream?
+> It calls the Go service as a plain function; there is no stream object to read from, so streaming methods return `Unimplemented`.
+
+> [!question]- How is ConnectRPC different from grpc-gateway?
+> One handler speaks gRPC, gRPC-Web and JSON directly, with no translation step.
+
+> [!question]- Why are two ports the default instead of one?
+> Two plain servers are simpler to run and check; one port needs `cmux` and extra care.
 
 ## Links 🟢
 

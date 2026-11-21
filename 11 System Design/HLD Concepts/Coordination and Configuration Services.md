@@ -36,6 +36,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (the five jobs) and 5 (variants).
 > - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Consensus - Raft and Paxos]]: a few machines can agree on one value by majority vote, even if one or two of them die.
+> - [[Service Discovery]]: services find each other through a live list that machines join with heartbeats and fall out of when they stop.
+
 **From zero, in 60 seconds** 🟢
 
 You run 40 copies of the same service. They need to agree on small things.
@@ -84,6 +88,12 @@ Agreeing like this across machines is hard, so one small trusted service does it
 | Watch | A push notification when a value changes | Service reloads config on change |
 | Compare-and-set | Write only if the value is still what you expect | Set leader only if no leader key exists |
 | Fencing token | A number that grows with each new lock holder | Storage rejects writes with an old token |
+| Linearizable | Every read sees the latest finished write, as if there were one copy | read the leader key and always get the newest |
+| Revision / version | A counter that goes up on every change | `/config/retry_limit` is at version 12 |
+| Compaction | Throwing away old versions to save space | etcd keeps only recent revisions |
+| GC pause | The program freezes for a moment while it frees memory | a 12 s Java pause |
+| Canary | Trying a change on a small slice first | new config on 1% of hosts |
+| CP | Stays correct during a network split, even if some requests fail | the minority side refuses writes |
 
 **Picture it**
 
@@ -140,6 +150,29 @@ Where the analogy breaks: a real notice board is one piece of wood. This board i
 
 The price is that every write waits for a majority round trip, so the board is slow compared with a cache and small compared with a database.
 
+### Real-life example: Kubernetes and Kafka 🟢
+
+Every Kubernetes cluster, including the ones running apps like Swiggy or Zomato, keeps all its state in etcd: which pods exist, which node runs them, which config they use. When you change a setting, the change goes into etcd, and the parts of Kubernetes watching that key react within moments.
+Kafka, used by most large apps to move events, used ZooKeeper for years to decide which broker is the boss and to track which brokers are alive.
+In both cases the coordination store holds only small facts; the real data (your orders, your messages) lives elsewhere.
+
+## Common beginner mistakes 🟢
+
+- **Using it as a database or cache** → it is small (etcd defaults to 2 GiB) and every write needs a vote → keep only small facts there: leader, members, config.
+- **Trusting a lock just because the lease has not expired yet** → after a long pause another worker may already hold it → pass a fencing token and let storage reject old ones.
+- **Running 4 or 6 nodes "for extra safety"** → 4 survives no more failures than 3 → use 3 or 5.
+- **Having every waiter watch the same lock key** → when it frees, hundreds wake up at once → each waiter watches only the one just ahead of it.
+- **Pushing a config change to every machine at once** → one typo breaks the whole fleet → validate, canary on 1%, then widen, with one-step rollback.
+
+### Coordination service vs things people confuse it with 🟡
+
+| Thing | What it holds | Example |
+| --- | --- | --- |
+| Coordination service | A few small facts everyone must agree on | leader key, live members, `retry_limit` |
+| Database | Your real business data, lots of it | orders, users, payments |
+| Cache (Redis) | Fast copies; fine if briefly wrong | profile JSON, session |
+| Feature-flag service | On/off switches for features, with targeting | "new checkout for 10% of users" |
+
 ```mermaid
 flowchart LR
     subgraph C["Coordination cluster (3 or 5 nodes, Raft or ZAB)"]
@@ -156,9 +189,18 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** a coordination service is a tiny, voting cluster that holds the few facts a whole fleet must agree on. **Next we open the box**: how it stores values with versions, how it decides who is alive, how it pushes changes, and the voting underneath. Each subsection starts with a plain walk-through; the full detail follows.
+
 ### One data model: a small tree or key space with versions
 
 **In plain words.** Both systems store small values under names. ZooKeeper arranges the names like a file system tree of **znodes** (`/services/payments/p-7`). etcd uses a flat key space where `/services/payments/p-7` is just a string, and prefix reads give you the same effect. Every change bumps a version number that the server assigns.
+
+**Step by step:**
+1. The key `/config/retry_limit` holds `3`, at version 12.
+2. Worker A reads it: value 3, version 12.
+3. Worker A writes `5` with the rule "only if the version is still 12". It works; the version becomes 13.
+4. Worker B, which also read version 12, tries to write `4` with the same rule. It fails, because the version is now 13.
+5. Worker B re-reads, sees `5`, and decides again. No silent overwrite happened.
 
 **Picture it.**
 
@@ -184,6 +226,13 @@ flowchart TD
 ### Sessions and leases: how "alive" is defined
 
 **In plain words.** A client that cannot be trusted to clean up after itself (it can crash) gets a **session** (ZooKeeper) or a **lease** (etcd, Consul sessions). The session has a time to live (TTL). The client must keep renewing it. Entries attached to the session vanish when it expires.
+
+**Step by step:**
+1. Worker w1 asks etcd for a lease that lives 10 seconds.
+2. It writes `/workers/w1` attached to that lease. The dashboard, watching `/workers/`, sees w1 appear.
+3. Every 3 seconds w1 renews the lease.
+4. At 40 s w1 crashes. Renewals stop.
+5. At about 50 s the lease expires, `/workers/w1` is deleted, and the dashboard sees w1 disappear.
 
 **Picture it.**
 
@@ -215,6 +264,13 @@ sequenceDiagram
 
 **In plain words.** Polling 4,000 clients every second against one cluster is wasteful. A **watch** lets a client say "tell me when this changes" and receive a push.
 
+**Step by step:**
+1. A worker reads `/config/retry_limit` and says "tell me when it changes".
+2. Nothing happens for hours, and the worker sends no requests.
+3. An operator writes `5`. The cluster pushes a "changed" event to every watching worker.
+4. Each worker re-reads the current value (it does not trust the event alone).
+5. In ZooKeeper the worker then sets a fresh watch; in etcd the stream simply continues from the last revision.
+
 **Picture it.**
 
 ```mermaid
@@ -238,7 +294,14 @@ flowchart LR
 
 ### The consensus underneath
 
-**In plain words.** Each write goes to the leader, which replicates it to followers and commits it once a **majority (quorum)** has stored it. Reads can be served by the leader linearizably, or by followers if you accept slightly stale data.
+**In plain words.** Each write goes to the leader, which replicates it to followers and commits it once a **majority (quorum)** has stored it. Reads can be served by the leader linearizably (always the newest value), or by followers if you accept slightly stale data.
+
+**Step by step:**
+1. The cluster has 3 nodes. One is the leader.
+2. A client writes `retry_limit = 5`. The leader adds it to its log.
+3. The leader sends it to both followers. One follower saves it and says "ok".
+4. Leader + 1 follower = 2 of 3, a majority. The write is committed, the client gets "ok", and watches fire.
+5. If a network cut leaves a node alone, that lone node cannot reach a majority, so it refuses writes instead of going its own way.
 
 **Picture it.**
 
@@ -353,7 +416,7 @@ Say it in 60 seconds, drawing one box:
 
 | System | Data model | Consensus | Liveness primitive | Watch style | Notes |
 | --- | --- | --- | --- | --- | --- |
-| ZooKeeper | Tree of znodes, small values | ZAB | Session with ephemeral znodes | One-time triggers | JVM, mature; used for Kafka metadata until KRaft |
+| ZooKeeper | Tree of znodes, small values | ZAB (ZooKeeper's own Raft-like protocol) | Session with ephemeral znodes | One-time triggers | JVM, mature; used for Kafka metadata until KRaft |
 | etcd | Flat key space, MVCC revisions | Raft | Lease with keepalive | Streaming watch from a revision | Go; Kubernetes API server's store |
 | Consul | KV store plus catalog | Raft (servers), gossip (Serf) agents | Session, health checks | Blocking queries (long poll) | Strong on discovery and health |
 | Chubby (Google, internal) | Small files with locks | Paxos | Sessions and leases | Event notifications | The design that inspired the others |
@@ -366,8 +429,8 @@ Say it in 60 seconds, drawing one box:
 | Option | Safety | Speed | Use when | Avoid when |
 | --- | --- | --- | --- | --- |
 | etcd or ZooKeeper lock with fencing token | Strong (consensus) | Milliseconds, limited write rate | Correctness matters: leader for a scheduler, singleton job | You need tens of thousands of lock ops per second |
-| Redis lock (`SET key value NX PX ttl`) | Best effort on a single node; Redlock across nodes is debated (see Kleppmann's critique) | Sub-millisecond | Efficiency only: avoid duplicate work, double-sending is harmless | A duplicate holder would corrupt money or data |
-| Database row lock or Postgres advisory lock (`pg_advisory_lock`) | Strong inside that one database, and released if the session dies | Fast, no new infrastructure | The protected data lives in that same database | The lock must span systems, or the DB is already your bottleneck |
+| Redis lock (`SET key value NX PX ttl`) | Best effort on a single node; Redlock (a recipe that takes the lock on a majority of several Redis nodes) across nodes is debated (see Kleppmann's critique) | Sub-millisecond | Efficiency only: avoid duplicate work, double-sending is harmless | A duplicate holder would corrupt money or data |
+| Database row lock or Postgres advisory lock (`pg_advisory_lock`, a named lock that is not tied to any row) | Strong inside that one database, and released if the session dies | Fast, no new infrastructure | The protected data lives in that same database | The lock must span systems, or the DB is already your bottleneck |
 
 ```mermaid
 flowchart TD
@@ -395,9 +458,11 @@ flowchart TD
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the primitives and the five jobs (config, membership, leader, locks, safe rollout). **Next comes the senior view**: who runs this in the real world, how these clusters fail, and the details behind odd cluster sizes, fresh vs fast reads, lock recipes and clocks.
+
 - **Real systems.**
   - Kubernetes keeps all objects in etcd, and controllers read them through the API server's list-and-watch.
-  - Kafka used ZooKeeper for controller election and metadata until KRaft mode (production ready from 3.3) moved this into Kafka itself, which shows teams do remove the extra dependency when they can.
+  - Kafka used ZooKeeper for controller election and metadata until KRaft mode (Kafka's built-in Raft) (production ready from 3.3) moved this into Kafka itself, which shows teams do remove the extra dependency when they can.
   - Chubby underpins Google's infrastructure per the 2006 paper, and ZooKeeper was built at Yahoo for the same purpose.
   - Facebook's configuration system (SOSP 2015) distributes config changes to its fleet with validation and canaries.
 - **Failure modes and fixes.**
@@ -504,6 +569,26 @@ Treat each config as an immutable version with an id. Servers report the version
 - Keep it small: etcd default 2 GiB quota and 1.5 MiB request. Never a cache, queue or database.
 - Roll config out like code: validate, canary, widen, rollback, keep last known good.
 - Clients cache so they survive a coordination outage.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What kind of data belongs in a coordination service?
+> A few small facts the whole fleet must agree on: leader, live members, config, locks.
+
+> [!question]- (easy) What is a watch?
+> A request to be told when a value changes, instead of asking again and again.
+
+> [!question]- (easy) Why do entries tied to a lease vanish when a worker dies?
+> The worker stops renewing, the lease expires, and everything attached to it is deleted.
+
+> [!question]- (medium) Why use 3 or 5 nodes and not 4?
+> 4 needs 3 votes and still survives only 1 failure, the same as 3, at more cost.
+
+> [!question]- (medium) Why is a lease alone not enough for a safe lock?
+> A paused holder can wake after the lease expired and act anyway; a fencing token lets storage reject it.
+
+> [!question]- (medium) How does the lowest-sequence-number recipe avoid a herd effect?
+> Each candidate watches only the node just ahead of it, so one release wakes one waiter.
 
 ## Links 🟢
 

@@ -37,6 +37,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[State Machines in Go]]: an order is in one named status at a time, and a table lists the allowed moves (here also who may make each move).
+> - [[Concurrency for LLD]]: goroutines run at the same time; a mutex makes "check, then change" one step, and slow network calls happen outside it.
+
 **From zero, in 60 seconds** 🟢
 
 You open a food app, pick a restaurant and add dishes to your cart. The cart is a draft: you can change it freely, and it belongs to one restaurant only. When you check out, the app makes an **order** and freezes the prices at that moment. The order then moves through fixed steps: placed, accepted, cooking, picked up, delivered. Only certain moves are allowed, like you cannot deliver before cooking. That set of allowed moves is a **state machine**.
@@ -70,6 +74,10 @@ This note designs the cart, the order and its life from "placed" to "delivered".
 | Actor | Who makes a change | Customer, restaurant, system |
 | Outbox | A "to do later" row saved with the change, sent by a background job | Refund task |
 | Port (interface) | A Go interface that hides an outside service | `PaymentGateway` |
+| SLA | A promised time limit | Restaurant must accept within 5 minutes |
+| Transition table | A list of allowed moves: from, to, and who may do it | PLACED → ACCEPTED by the restaurant only |
+| Atomic | Done as one step nobody can cut into | Status change and refund row saved together |
+| Exponential backoff | Wait longer after each failure (2 s, 4 s, 8 s) before retrying | Refund retry after a gateway timeout |
 
 **Picture it**
 
@@ -157,16 +165,18 @@ The hardest use cases: `PlaceOrder` (validate, snapshot, charge once under concu
 | Entity | Key fields | Why it exists |
 | --- | --- | --- |
 | `Restaurant` | ID, Name, Open | Owns the menu; `Open` is checked again at checkout |
-| `MenuItem` | ID, RestaurantID, PricePaise, Available | The live, mutable price and availability |
+| `MenuItem` | ID, RestaurantID, PricePaise, Available | The live, mutable (can change any time) price and availability |
 | `Cart` | UserID, RestaurantID, Qty, CheckingOut | A draft pinned to one restaurant, frozen during payment |
-| `Order` | ID, Lines, TotalPaise, Status, PaymentID, PartnerID, IdempotencyKey, CreatedAt | The source of truth after checkout |
+| `Order` | ID, Lines, TotalPaise, Status, PaymentID, PartnerID, IdempotencyKey, CreatedAt | The source of truth (the record that wins if data disagrees) after checkout |
 | `OrderLine` | ItemID, Name, UnitPricePaise, Qty | **A snapshot** of a menu item at order time |
 | `RefundTask` | OrderID, PaymentID, AmountPaise, Attempts, NextTryAt, Done | The refund outbox row |
-| `PaymentGateway`, `DeliveryAssigner`, `StatusListener` | interfaces | Adapter, Strategy and Observer ports |
+| `PaymentGateway`, `DeliveryAssigner`, `StatusListener` | interfaces | Adapter, Strategy and Observer ports (interfaces that hide outside services) |
 
 The modeling insight is **MenuItem versus OrderLine**. The menu item is live; the order line is a frozen copy of name and price. Computing an order total from the live menu would rewrite history and make refunds wrong. Likewise, **a cart is not an order**: the cart is a disposable draft, and the order is created once, atomically, at checkout.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know cart versus order, the price snapshot, the idempotency key and the order statuses. Next we open the box: how entities and ports link, the API, the tables, and the Go code for `PlaceOrder` and status changes.
 
 ```mermaid
 classDiagram
@@ -379,14 +389,14 @@ type MenuRepository interface {
 }
 ```
 
-The Step 8 code keeps these as maps inside `Service` behind one mutex, so the mutex plays the role of the unique key and the guarded update. The `WHERE status = $from` guard is optimistic concurrency control, compared in [[Locking - Optimistic vs Pessimistic]].
+The Step 8 code keeps these as maps inside `Service` behind one mutex, so the mutex plays the role of the unique key and the guarded update. The `WHERE status = $from` guard is optimistic concurrency control (no lock up front; the update only succeeds if nobody changed the row first), compared in [[Locking - Optimistic vs Pessimistic]].
 
 ## Step 7: Patterns 🟡
 
 | Pattern | Where | Why here |
 | --- | --- | --- |
 | [[State Machines in Go]] (table-driven) | `transitions map[edge][]Actor` | All legal moves and who may make them in one place |
-| [[Adapter]] | `PaymentGateway` over each vendor SDK | The domain never imports a vendor SDK |
+| [[Adapter]] | `PaymentGateway` over each vendor SDK (the payment company's client library) | The domain never imports a vendor SDK |
 | [[Strategy and Template Method]] | `DeliveryAssigner` | Nearest rider, least loaded, or a third-party fallback |
 | [[Observer and Event Bus]] | `StatusListener`, `notify` | Push, SMS, tablet and analytics react without the order code knowing them |
 | [[Command, Undo and Memento]] | `ProcessRefunds`, `ExpireUnaccepted` | Scheduled, retryable jobs that are safe to run twice |
@@ -413,7 +423,7 @@ adapters/
 cmd/demo/main.go   -> wiring: repositories, adapter, assigner, listeners, HTTP handlers, jobs
 ```
 
-- `model.go` and `state.go` are pure, with no I/O, so the transition table is tested alone.
+- `model.go` and `state.go` are pure, with no I/O (no network, disk or database calls), so the transition table is tested alone.
 - `ports.go` holds everything external, as interfaces.
 - `service.go` and `jobs.go` are the only files that take locks, and neither calls a port while holding one.
 
@@ -452,14 +462,14 @@ sequenceDiagram
 
 How it works:
 
-1. **Idempotency.** `PlaceOrder` builds `userID|idemKey` and locks. If the key is known, this is a retry or a concurrent double tap: it waits for that call's result (or `ctx`) and returns the same order or error. Only one caller does the work, like `singleflight`.
+1. **Idempotency.** `PlaceOrder` builds `userID|idemKey` and locks. If the key is known, this is a retry or a concurrent double tap: it waits for that call's result (or `ctx`) and returns the same order or error. Only one caller does the work, like `singleflight` (Go's helper that merges duplicate calls in flight into one).
 2. **Freeze, not take.** It validates the cart (not empty, restaurant open, items available), snapshots names and prices into `OrderLine`s and sets `CheckingOut`.
 
    Taking the cart out of the map instead would lose it: if the user started a new cart while the payment was in flight and the payment then failed, the old cart could only go back when no new cart existed, so it could vanish silently.
 
    With the freeze, `AddToCart` and a second checkout with another key get `ErrCheckoutInProgress`, and a failure simply unfreezes the same cart.
 3. **Charge without the lock.** The gateway call is a network call, and it carries the idempotency key so a crash-and-retry is deduped there too. Success saves the order as PLACED and deletes the cart; failure releases the key so the client can retry.
-4. **Transitions.** `transitionLocked` checks `canMove(from, to, by)`: the edge must exist and list the actor. For REJECTED or CANCELLED it writes the `RefundTask` in the same critical section, so the status and the promise to refund can never disagree.
+4. **Transitions.** `transitionLocked` checks `canMove(from, to, by)`: the edge must exist and list the actor. For REJECTED or CANCELLED it writes the `RefundTask` in the same critical section (code run while holding the lock), so the status and the promise to refund can never disagree.
 
    A best-effort `_ = s.pay.Refund(...)` after unlocking would drop the error, and the refund with it.
 
@@ -943,7 +953,7 @@ func (s *Service) notify(ctx context.Context, o Order, from OrderStatus) {
 | `TestPlaceOrderSnapshotsPriceAndIsIdempotent` | Total 2 × 25000 + 4000 = 54000; a later price change does not touch the order; same key, same ID, one charge; cart cleared; listener sees `->PLACED` |
 | `TestPlaceOrderFailures` | Restaurant closed after add; item unavailable; payment fails, then the same key succeeds |
 | `TestCartFrozenDuringCheckoutIsNeverLost` | An add during payment gets `ErrCheckoutInProgress`; after the failed payment the original cart (50000 paise) checks out |
-| `TestStateMachine` (8 rows) | Happy path; reject and cancel queue refunds the relay sends; no cancel after PREPARING; customer and SYSTEM cannot accept; no skipping; DELIVERED is terminal |
+| `TestStateMachine` (8 rows) | Happy path; reject and cancel queue refunds the relay sends; no cancel after PREPARING; customer and SYSTEM cannot accept; no skipping; DELIVERED is terminal (no moves out of it) |
 | `TestRefundOutboxRetriesWithBackoff` | A gateway timeout keeps the row pending; no retry before the 2-second backoff; then exactly one refund, 2 attempts |
 | `TestRestaurantSLAAutoRejectsAndRefunds` | Nothing expires at 4 minutes; at 5 the order is REJECTED by SYSTEM; a late accept fails; one refund; listener sees `PLACED->REJECTED` |
 | `TestAcceptAssignsRiderAndNotifies` | ACCEPTED calls the assigner and notifies `PLACED->ACCEPTED` |
@@ -1351,23 +1361,25 @@ func TestConcurrentDifferentKeysOneCartOneWinner(t *testing.T) {
 }
 ```
 
-Run in a scratch module with Go 1.24.4: `go vet` clean and `go test -race -count=3` passes all eleven tests.
+Run in a scratch module with Go 1.24.4: `go vet` clean and `go test -race -count=3` (`-race` is Go's race detector, which flags unsafe shared access) passes all eleven tests.
 
 ## Step 9: Edge cases 🔴
+
+🟡 → 🔴 You now know the working service and its tests. Next is interview depth: double taps, crashes after a charge, accept racing cancel, restaurants that never answer, failed refunds and the trade-offs behind each choice.
 
 | Edge case | What happens | How the design handles it |
 | --- | --- | --- |
 | Double tap, same key | Two orders, two charges | One `pending` per key; the others wait for its result. SQL: `UNIQUE (user_id, idempotency_key)` |
 | Double tap, different keys | Two orders from one cart | The cart is frozen; the loser gets `ErrCheckoutInProgress` or, later, `ErrEmptyCart` |
 | Retry after a client timeout | The client does not know if the order exists | The same key returns the stored order; the gateway dedups on the key |
-| Process crashes after the charge, before the order is saved | Money taken, no order | A client retry with the same key gets the same payment ID back and saves the order. If no retry comes, production writes the order as PAYMENT_PENDING with the key before charging, and a reconciler asks the gateway by key and then completes or refunds it |
+| Process crashes after the charge, before the order is saved | Money taken, no order | A client retry with the same key gets the same payment ID back and saves the order. If no retry comes, production writes the order as PAYMENT_PENDING with the key before charging, and a reconciler (a background job that compares records and fixes gaps) asks the gateway by key and then completes or refunds it |
 | Payment fails | No order should exist | `ErrPaymentFailed` (wrapping the gateway error); key released; the same cart unfrozen |
 | Add an item from another restaurant | Mixed cart | `ErrDifferentRestaurant`; the client offers "clear cart?" |
 | User edits the cart during payment | The cart could be replaced and lost | `ErrCheckoutInProgress` until checkout ends |
 | Restaurant closed or item unavailable after add | Stale cart | Checked again at checkout |
 | Menu price changes | The total could drift | `OrderLine` snapshot |
 | Cancel after preparing starts | The restaurant loses money | No customer edge out of PREPARING |
-| Accept versus cancel, or accept versus SLA expiry | Lost update | One lock here; the `WHERE status = $from` guard in SQL |
+| Accept versus cancel, or accept versus SLA expiry | Lost update (one change silently overwrites the other) | One lock here; the `WHERE status = $from` guard in SQL |
 | Restaurant never answers | Order stuck, money held | `ExpireUnaccepted` rejects as SYSTEM and queues the refund |
 | Refund call fails | Money stuck with the platform | Outbox row, retries with backoff, `last_error` for alerting |
 | Relay crashes after the gateway refunded | A second refund attempt | At-least-once relay, so the gateway call must be idempotent per payment |
@@ -1390,7 +1402,7 @@ Run in a scratch module with Go 1.24.4: `go vet` clean and `go test -race -count
 Choices made:
 
 - A process mutex for the interview, `UNIQUE` plus a guarded `UPDATE` in production
-- Prepaid at checkout (stops fake orders, costs refunds; authorize-then-capture is the alternative)
+- Prepaid at checkout (stops fake orders, costs refunds; authorize-then-capture, reserving the money first and taking it later, is the alternative)
 - A transition table over state classes
 - An outbox for refunds instead of a best-effort call
 - A sweeper for the SLA instead of per-order timers
@@ -1441,6 +1453,26 @@ I split the design into a cart, a mutable draft pinned to one restaurant, and an
 - REJECTED or CANCELLED writes the refund outbox row in the same step; a relay retries with backoff.
 - Side effects (assign, notify) run after unlock; production adds the outbox for events too.
 - SQL: `UNIQUE (user_id, idempotency_key)`, `UPDATE ... WHERE status = $from`, `refund_outbox`.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What is the difference between a cart and an order?
+> The cart is a draft you can still change; the order is the fixed record created once at checkout.
+
+> [!question]- 🟢 The menu price changes after you ordered. Does your order total change?
+> No. `OrderLine` saved a copy of the name and price at checkout.
+
+> [!question]- 🟢 Until which status can the customer cancel?
+> PLACED or ACCEPTED, before the kitchen starts PREPARING.
+
+> [!question]- 🟡 The user double-taps "Place order" with the same key. What happens?
+> The second call waits for the first and returns the same order; the card is charged once.
+
+> [!question]- 🟡 Why is the payment charged outside the lock?
+> It is a slow network call; holding the lock would block every other cart and order meanwhile.
+
+> [!question]- 🟡 Why write a refund row instead of calling `Refund` right after REJECTED?
+> If the gateway times out or the process crashes, the refund is lost; the row is saved with the status change and a relay retries until it succeeds.
 
 ## Links 🟢
 

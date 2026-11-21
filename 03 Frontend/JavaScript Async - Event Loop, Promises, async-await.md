@@ -32,6 +32,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[DOM, Events and Timers]]: `setTimeout` hands a function to the browser to run later, and that "later" only comes once your current code has finished.
+
 **From zero, in 60 seconds** 🟢
 
 JavaScript can only do one thing at a time — one worker, one to-do list. But some jobs are mostly waiting: a network reply takes 300 ms, a timer takes a second. If the worker just stood there waiting, the whole page would freeze.
@@ -75,6 +78,12 @@ Promises and `async`/`await` are tidy ways to write that "call me back".
 | Promise | An object standing for a value that arrives later | `fetch(url)` returns one |
 | Resolve / reject | The promise finished OK / failed | `.then(ok)` / `.catch(err)` |
 | `await` | Pause this async function until the promise settles | `const r = await fetch(url)` |
+| Event loop | The rule for when queued callbacks get to run | "stack empty? then run the next one" |
+| Microtask | An urgent queued job; promise callbacks are microtasks | `.then(fn)` |
+| Macrotask | A normal queued job, one per loop turn | a `setTimeout` callback |
+| Settle | A promise finishing, either OK or with an error; it happens once | pending → fulfilled |
+| Concurrent | Several jobs in progress at once, even on one thread, by taking turns while waiting | three fetches waiting together |
+| Unhandled rejection | A failed promise that no code catches | `fetch` fails and there is no `.catch` |
 
 **Picture it**
 
@@ -103,14 +112,39 @@ Where it breaks: a real waiter can be interrupted mid-task; JavaScript always fi
 
 Say a page needs to fetch a user's profile and render it. A network call can take anywhere from 20 ms to several seconds. If JavaScript blocked the single thread while waiting, the whole page would freeze: no scrolling, no clicking, no other code running.
 
-So the runtime (the browser, or Node's libuv) does the actual waiting outside of JavaScript. Your JavaScript function returns immediately, and a callback runs later, when the result is ready. Everything in this note is about **how "later" is scheduled**, and how `Promise` and `async`/`await` make that schedule easier to read and reason about than raw callbacks.
+So the **runtime** (the program that runs your JS: the browser, or Node with its **libuv** library, which does waiting and file work for Node) does the actual waiting outside of JavaScript. Your JavaScript function returns immediately, and a callback runs later, when the result is ready. Everything in this note is about **how "later" is scheduled**, and how `Promise` and `async`/`await` make that schedule easier to read and reason about than raw callbacks.
+
+### Real-life example: opening the Swiggy app home screen 🟢
+
+When the Swiggy home screen opens, it needs your address, the offers banner and the list of nearby restaurants.
+These are three separate requests to the server, each taking maybe 200 ms.
+The app starts all three at once (`Promise.all`) instead of one after another, so the screen fills in about 200 ms, not 600 ms.
+While it waits, you can still scroll and tap, because JavaScript is not stuck waiting; it just handles each answer when it lands.
+If the offers request fails, a `.catch` shows the page without the banner instead of a blank screen.
+
+## Common beginner mistakes 🟢
+
+- **Expecting `setTimeout(fn, 0)` to run before a `.then`** → promise callbacks (microtasks) always go first → never rely on that order; if order matters, chain the steps.
+- **Writing `await` inside a `for` loop for independent calls** → they run one at a time, 3 × 100 ms = 300 ms → start them all, then `await Promise.all(...)`.
+- **Forgetting `.catch` or `try/catch`** → a failed promise becomes an unhandled rejection and can crash a Node server → always handle errors where you await.
+- **Thinking `fetch` fails on a 404** → a 404 or 500 is still a "successful" fetch → check `res.ok` and throw yourself.
+- **Thinking `async` makes code run in parallel** → it still runs on one thread → use `Promise.all` for waiting together, and a worker for heavy CPU work.
+
+## Often confused 🟡
+
+| These two | First one | Second one |
+| --- | --- | --- |
+| Microtask vs macrotask | Promise callbacks; all of them run before the next macrotask | `setTimeout`, clicks, network events; one per loop turn |
+| `.then` chain vs `async`/`await` | Callbacks chained on a promise | Same thing, written to look like normal top-to-bottom code |
+| `Promise.all` vs `Promise.allSettled` | Fails as soon as one fails | Waits for all and tells you each result |
+| Concurrent vs parallel | Many jobs waiting at once, on one thread | Many jobs truly computing at once, on many cores |
 
 ## 2. Mental model 🟢
 
 Four pieces work together:
 
-- **Call stack:** the frames of functions currently running. JavaScript can only run one frame at a time.
-- **Web APIs / libuv:** where the runtime actually does the waiting — DOM timers, `fetch`, file reads. These live outside the single JS thread.
+- **Call stack:** the **frames** (one entry per function call, holding its local variables) of functions currently running. JavaScript can only run one frame at a time.
+- **Web APIs / libuv:** (the browser's or Node's built-in helpers, written outside JavaScript) where the runtime actually does the waiting — DOM timers, `fetch`, file reads. These live outside the single JS thread.
 - **Callback queue (macrotask queue):** holds callbacks that are ready to run: a fired `setTimeout`, a finished `fetch`, a UI event.
 - **Microtask queue:** holds `Promise` callbacks (`.then`, `.catch`, `.finally`) and `queueMicrotask` callbacks.
 
@@ -119,6 +153,16 @@ The **event loop** is a simple rule, repeated forever: *if the call stack is emp
 Analogy: the call stack is a single cashier. The macrotask queue is customers in the main line; the microtask queue is "quick questions" the cashier always finishes answering completely before calling the next customer in the main line, even if a new quick question arrives while answering one.
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that JavaScript has one worker, hands slow jobs to helpers, and runs callbacks later. **Next we open the box**: the exact order the event loop picks callbacks in, and how a promise moves through its states.
+
+**Step by step:**
+1. Your script runs `console.log("1")`, then `setTimeout(cb2, 0)`, then `Promise.resolve().then(cb3)`, then `console.log("5")`.
+2. `setTimeout` gives `cb2` to the browser timer; it lands in the macrotask queue almost at once.
+3. `.then(cb3)` puts `cb3` in the microtask queue.
+4. The script prints 1 and 5 and ends. The call stack is now empty.
+5. The event loop runs **every** microtask first: `cb3`. Then it runs **one** macrotask: `cb2`.
+6. So the output is 1, 5, 3, 2, every time.
 
 ```mermaid
 flowchart LR
@@ -191,6 +235,13 @@ sequenceDiagram
 
 **In plain words:** a promise is like a package tracking page — it starts as "on the way" (pending) and ends exactly once as "delivered" (fulfilled) or "lost" (rejected). It never flips back.
 
+**Step by step:**
+1. `const p = fetch("/api/user")` gives you a promise right away. It is **pending**.
+2. You attach `p.then(showUser).catch(showError)`. Nothing runs yet.
+3. 300 ms later the reply arrives. The promise becomes **fulfilled** with the response, and `showUser` is queued as a microtask.
+4. If the network had dropped, it would become **rejected** instead, and `showError` would be queued.
+5. Once settled, it never changes again. Calling `.then` later still gets the same answer.
+
 ```mermaid
 stateDiagram-v2
     [*] --> pending: new Promise(executor)
@@ -200,7 +251,7 @@ stateDiagram-v2
     rejected --> [*]: settled, reason fixed
 ```
 
-A Promise starts `pending` and **settles exactly once**, to `fulfilled` with a value or `rejected` with a reason — never both, never again after that. `.then(onFulfilled, onRejected)` registers callbacks for either outcome; `.catch(fn)` is `.then(undefined, fn)`; `.finally(fn)` runs on either outcome and doesn't receive the value or reason.
+A Promise starts `pending` and **settles exactly once**, to `fulfilled` with a value or `rejected` with a reason (the error) — never both, never again after that. `.then(onFulfilled, onRejected)` registers callbacks for either outcome; `.catch(fn)` is `.then(undefined, fn)`; `.finally(fn)` runs on either outcome and doesn't receive the value or reason.
 
 Whatever a `.then` callback returns becomes the value the *next* `.then` in the chain receives — if it returns another Promise, the chain waits for that Promise too, which is how chaining composes async steps:
 
@@ -317,6 +368,13 @@ Use the sequential form only when each step genuinely depends on the previous on
 
 **In plain words:** a rejected promise that nobody is listening to is an error with no catcher — in Node it can take the whole process down.
 
+```mermaid
+flowchart LR
+    R["promise rejects"] --> Q{"any .catch or try/catch?"}
+    Q -- "yes" --> H["error handled, app keeps going"]
+    Q -- "no" --> U["unhandled rejection:<br/>Node may exit, browser logs an error"]
+```
+
 ```js
 function risky() {
   return Promise.reject(new Error("boom"));
@@ -325,44 +383,46 @@ function risky() {
 risky(); // no .catch and no await: this becomes an unhandled rejection
 ```
 
-**Measured (Node.js v20.20.2):** Node prints `UnhandledPromiseRejection` and, depending on configuration, can exit the process. A browser logs an `Unhandled promise rejection` console error. Fix it by adding `.catch(...)`, wrapping the `await` in `try/catch`, or (for triage only) a global `unhandledrejection` / `process.on('unhandledRejection', ...)` listener — the latter should log and alert, not silently swallow the error.
+**Measured (Node.js v20.20.2):** Node prints `UnhandledPromiseRejection` and, depending on configuration, can exit the process. A browser logs an `Unhandled promise rejection` console error. Fix it by adding `.catch(...)`, wrapping the `await` in `try/catch`, or (for **triage**, meaning first-aid logging while you find the real bug, only) a global `unhandledrejection` / `process.on('unhandledRejection', ...)` listener — the latter should log and alert, not silently swallow the error.
 
 ## 5. Variants and comparison 🟡
 
 | Mechanism | How it works | Use when | Cost |
 | --- | --- | --- | --- |
-| Raw callback | Function passed in, called later by the runtime | Legacy APIs, very simple one-shot timers | Callback hell; no built-in error channel; easy to call twice or never |
+| Raw callback | Function passed in, called later by the runtime | Legacy APIs, very simple one-shot timers | Callback hell (callbacks nested inside callbacks, many levels deep);  no built-in error channel; easy to call twice or never |
 | `Promise` + `.then` chain | An object that settles once; `.then` composes steps | Library code, conditional branching across async steps | Verbose nesting if overused; manageable with flat chains |
 | `async`/`await` | Sugar over Promises; looks synchronous | Most application code | Easy to write that pitfall of sequential awaits by accident |
-| `Promise.all` / `allSettled` / `race` / `any` | Combinators over multiple Promises | Running independent work concurrently | `all` rejects fast on the first failure; `allSettled` never rejects |
-| Go goroutine + channel (compare) | OS-scheduled, truly parallel on multiple cores | Backend concurrency, not relevant in the browser | Needs explicit synchronization (channels, mutexes) |
+| `Promise.all` / `allSettled` / `race` / `any` | Combinators (helpers that join many promises into one) over multiple Promises | Running independent work concurrently | `all` rejects fast on the first failure; `allSettled` never rejects |
+| Go goroutine + channel (compare) | OS-scheduled, truly parallel on multiple cores | Backend concurrency, not relevant in the browser | Needs explicit synchronization (channels, mutexes: locks that let one goroutine at a time touch shared data) |
 
 > [!warning] Interview trap
-> `fetch` only rejects on a network failure (DNS, offline, CORS). A `404` or `500` response is still a **fulfilled** Promise — you must check `res.ok` or `res.status` yourself and throw if it's not what you expect.
+> `fetch` only rejects on a network failure (DNS, offline, CORS: the browser blocking a call to another site that has not allowed it). A `404` or `500` response is still a **fulfilled** Promise — you must check `res.ok` or `res.status` yourself and throw if it's not what you expect.
 
 ## 6. Trade-offs and when not to use 🟡
 
 - `async`/`await` reads like sequential code, which makes it easy to forget that `await` inside a loop serializes work that could run concurrently — always ask "do these depend on each other?" before choosing a loop over `Promise.all`.
 - `Promise.all` rejects as soon as any one input rejects, discarding the others' results; use `Promise.allSettled` when you need every outcome regardless of individual failures.
-- None of this adds real parallelism on a single tab: JavaScript still runs on one thread. True parallel CPU work needs Web Workers (browser) or `worker_threads` (Node), not `async`/`await`.
+- None of this adds real parallelism on a single tab: JavaScript still runs on one thread. True parallel CPU work needs Web Workers (browser) or `worker_threads` (Node) (both run JS on a separate thread), not `async`/`await`.
 - For a single, already-resolved value with no real waiting, a Promise is unnecessary overhead; just use the value directly.
 
 ## 7. In production 🔴
 
-- **Real systems:** every browser fetch call, every Node HTTP handler using `async` route handlers (Express, Fastify), React's `useEffect` data-fetching pattern, and React Query / TanStack Query, which wrap this exact Promise lifecycle with caching and retries.
+> 🟡 → 🔴 **You now know** the event loop order, promise states, `async`/`await`, and how to run calls together. **Next is the advanced part**: where this shows up in real frameworks, the race and crash bugs it causes, and fine details like `process.nextTick`, top-level await and cancellation.
+
+- **Real systems:** every browser fetch call, every Node HTTP handler using `async` route handlers (Express, Fastify), React's `useEffect` data-fetching pattern, and React Query / TanStack Query (libraries that fetch, cache and refresh server data for React), which wrap this exact Promise lifecycle with caching and retries.
 - **Failure modes → fixes:**
   - Unhandled rejection crashes a Node process → always `.catch` or `try/catch` around `await`; add a top-level handler as a safety net, not a substitute.
   - A stale response from an earlier request overwrites a newer one (race condition) → use `AbortController` to cancel the outdated `fetch`, or an "ignore flag" that drops late responses.
   - A `setTimeout`-based polling loop drifts or overlaps if the callback itself takes longer than the interval → use a recursive `setTimeout` that re-schedules only after the previous call finishes, instead of `setInterval`.
   - Sequential awaits in a loop silently slow down a page → batch with `Promise.all` where requests are independent.
-- **What to monitor:** unhandled rejection counts (both window and Node process events), fetch error rates and status-code breakdown, p95 time-to-data for a page's critical fetch.
+- **What to monitor:** unhandled rejection counts (both window and Node process events), fetch error rates and status-code breakdown, **p95** (the time that 95 out of 100 requests beat) time-to-data for a page's critical fetch.
 
 ## 8. Deep dive 🔴
 
-- **Macrotask vs microtask, precisely.** `setTimeout`, `setInterval`, UI events, and `fetch`'s network completion are macrotasks (one per event-loop turn). `Promise` callbacks, `queueMicrotask`, and (in Node) `process.nextTick` (which runs even before other microtasks) are microtasks, and the queue is drained completely — including any new microtasks a microtask callback itself queues — before the next macrotask runs. This is why a chain of ten `.then()` calls all run before a single `setTimeout(fn, 0)` scheduled before any of them.
+- **Macrotask vs microtask, precisely.** `setTimeout`, `setInterval`, UI events, and `fetch`'s network completion are macrotasks (one per event-loop turn). `Promise` callbacks, `queueMicrotask`, and (in Node) `process.nextTick` (Node's "run this right after the current function" queue, which runs even before other microtasks) are microtasks, and the queue is drained completely — including any new microtasks a microtask callback itself queues — before the next macrotask runs. This is why a chain of ten `.then()` calls all run before a single `setTimeout(fn, 0)` scheduled before any of them.
 - **Why `setTimeout(fn, 0)` isn't actually 0ms.** Browsers clamp nested timeouts to a minimum (historically 4ms after a few levels of nesting); Node applies its own minimum. "0" means "as soon as the event loop gets to it", after the stack and all microtasks.
 - **Top-level await.** Since ES2022 (Node 14.8+ with ES modules, and natively in module `<script type="module">`), `await` is legal at the top level of a module, not only inside an `async function`. This lets a module block its own evaluation until a dependency resolves, which also means importers wait for it.
-- **`for await...of`** iterates an async iterable (e.g. a streaming response body or `ReadableStream`), awaiting each chunk in turn — appropriate here because each chunk genuinely depends on the stream's current position.
+- **`for await...of`** iterates an **async iterable** (something that hands out values one at a time, each arriving later) (e.g. a streaming response body or `ReadableStream`), awaiting each chunk in turn — appropriate here because each chunk genuinely depends on the stream's current position.
 - **Cancellation.** Promises have no built-in cancel; `AbortController`/`AbortSignal` is the standard pattern — pass `signal` to `fetch`, call `controller.abort()`, and the fetch's Promise rejects with an `AbortError`.
 
   **Picture it:**
@@ -384,7 +444,7 @@ risky(); // no .catch and no await: this becomes an unhandled rejection
   ```
 
   A stale-response race (an older request's result overwriting a newer one) is exactly the failure mode this prevents: abort the old controller right before starting a new request for the same data, and the old Promise's `.catch` discards the result instead of racing it against the new one.
-- **Compare with Go.** A goroutine is pre-emptible and can run on a different OS thread; the event loop model here is cooperative and single-threaded — a long synchronous loop (e.g. sorting a huge array) blocks everything, including timer callbacks, until it returns control to the stack. There's no event-loop equivalent of Go's scheduler moving work across cores.
+- **Compare with Go.** A goroutine is **pre-emptible** (the scheduler can pause it at any time to let another run) and can run on a different OS thread; the event loop model here is **cooperative** (each callback runs until it chooses to finish) and single-threaded — a long synchronous loop (e.g. sorting a huge array) blocks everything, including timer callbacks, until it returns control to the stack. There's no event-loop equivalent of Go's scheduler moving work across cores.
 
 ## 9. Interview questions 🔴
 
@@ -392,7 +452,7 @@ risky(); // no .catch and no await: this becomes an unhandled rejection
 > Because `.then` callbacks are microtasks and `setTimeout` callbacks are macrotasks. The event loop always drains the entire microtask queue before it takes the next macrotask, regardless of scheduling order or the timeout value.
 
 > [!question]- What's wrong with calling an async function inside `useEffect` like `useEffect(async () => {...}, [])`?
-> `useEffect`'s callback must return either `undefined` or a cleanup function. An `async` function always returns a Promise, which React can't call as a cleanup function. Define the async logic as an inner function and call it, or use an IIFE, instead of making the effect callback itself `async`.
+> `useEffect`'s callback must return either `undefined` or a cleanup function. An `async` function always returns a Promise, which React can't call as a cleanup function. Define the async logic as an inner function and call it, or use an IIFE (a function you define and call in one go: `(async () => {...})()`), instead of making the effect callback itself `async`.
 
 > [!question]- Does `fetch` reject when the server returns a 404 or 500?
 > No. `fetch`'s Promise only rejects on a network-level failure (DNS failure, no connectivity, CORS). A 404 or 500 is a normal, fulfilled response — check `res.ok` (or `res.status`) and throw yourself if the status isn't acceptable.
@@ -419,6 +479,26 @@ risky(); // no .catch and no await: this becomes an unhandled rejection
 - `fetch` doesn't reject on 4xx/5xx — check `res.ok` yourself.
 - Independent awaits: start them together and `Promise.all`, don't `await` one at a time in a loop.
 - Always attach `.catch`/`try-catch`; an unhandled rejection can crash a Node process.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: how many things can JavaScript's call stack run at the same moment?
+> One. Slow waiting is handed to the browser or Node, not done on the stack.
+
+> [!question]- Easy: what are the three states of a promise?
+> Pending, fulfilled, rejected. It moves out of pending only once.
+
+> [!question]- Easy: what does an `async` function return when you write `return 5`?
+> A promise that fulfills with 5.
+
+> [!question]- Medium: in what order do these print: `log(1); setTimeout(()=>log(2)); Promise.resolve().then(()=>log(3)); log(4)`?
+> 1, 4, 3, 2. Sync code first, then microtasks, then one macrotask.
+
+> [!question]- Medium: three independent 100 ms calls with `await` in a loop take about how long, and how do you fix it?
+> About 300 ms. Start all three and `await Promise.all(...)` to get about 100 ms.
+
+> [!question]- Medium: a user types fast and an old search result overwrites the new one. What tool fixes it?
+> An `AbortController`: abort the old `fetch` before starting the new one, so the old result is dropped.
 
 ## Links 🟢
 

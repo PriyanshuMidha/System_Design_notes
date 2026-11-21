@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Arrays and Dynamic Arrays (Go Slices)]]: reading box number `i` of an array is instant, one math step. A hash table is built on exactly this.
+> - [[Complexity Analysis - Big-O and Amortized Cost]]: `O(1)` means "same cost at any size", and "amortized" means "cheap on average, even if one call now and then is slow".
+
 **From zero, in 60 seconds** 🟢
 
 You have a big pile of data, say a million users. You want to find one user fast. Checking them one by one is way too slow.
@@ -73,6 +77,11 @@ A hash table is that rule, done by a computer in nanoseconds.
 | Collision | Two keys landing on the same slot | `"alice"` and `"bob"` both → slot 1 |
 | Load factor | How full the table is: entries ÷ slots | 6 entries / 8 slots = 0.75 |
 | Big-O `O(1)` | Cost stays the same no matter how big the data gets | one lookup in 10 or 10M keys |
+| Bucket | One slot of the table; it may hold one entry or a small group | bucket 2 holds Alice and Bob |
+| Chaining | On a collision, keep a small list in that slot | slot 2: Alice → Bob |
+| Open addressing / probing | On a collision, look in the next slots for an empty one | Bob goes to slot 3 |
+| Resize / rehash | Build a bigger table and recompute every key's slot | 4 slots → 8 slots, all keys moved |
+| Seed | A random number mixed into the hash so outsiders cannot predict slots | each Go map gets its own |
 
 **Picture it**
 
@@ -99,9 +108,9 @@ Where it breaks: hooks never move, but a hash table sometimes rebuilds itself bi
 
 ## 1. Why it exists 🟢
 
-Say you need to look up a user by ID among 10 million users. An array keyed by position only works if IDs are small, dense integers — real IDs are sparse (`user:482913`), so most array slots would sit empty.
+Say you need to look up a user by ID among 10 million users. An array keyed by position only works if IDs are small, dense (no big gaps) integers — real IDs are sparse (`user:482913`), so most array slots would sit empty.
 
-A sorted array with binary search works for any key, giving `O(log n)` — about 24 comparisons for 10 million rows — but every insert has to shift, on average, half the array to keep it sorted.
+A sorted array with binary search (check the middle, throw away the half that cannot hold the key, repeat) works for any key, giving `O(log n)` — about 24 comparisons for 10 million rows — but every insert has to shift, on average, half the array to keep it sorted.
 
 ### 1.1 The idea in one line
 
@@ -117,10 +126,18 @@ flowchart LR
 
 **Example:** looking up `user:482913` in a hash table is one hash computation (a few nanoseconds) and one array access, regardless of whether the table holds 100 users or 100 million.
 
-**Why it matters:** this is the only reason dictionaries, caches, and database indexes on equality predicates (`WHERE id = ?`) can stay fast as data grows — without it, every one of those would slow down as your dataset grows, not just at launch.
+**Why it matters:** this is the only reason dictionaries, caches, and database indexes on equality predicates ("find rows where this column equals this value", like `WHERE id = ?`) can stay fast as data grows — without it, every one of those would slow down as your dataset grows, not just at launch.
 
 > [!tip] Remember
 > A hash table trades "fully sorted" for "O(1) average lookup" by computing a slot instead of searching for one.
+
+### Real-life example: "Is this username taken?" on Instagram 🟢
+
+When you sign up for Instagram and type `priya_cooks`, the app tells you almost instantly whether the name is free.
+Behind it there are hundreds of crores of usernames; checking them one by one would take far too long.
+Instead, the server keeps usernames in a hash-based lookup: `priya_cooks` is hashed to a slot, and only that slot is checked.
+The same trick powers a UPI app finding your saved contact by phone number, and Swiggy finding an order by order ID.
+It is fast because the cost is "hash once, look in one place", no matter how many users exist.
 
 ## 2. Mental model 🟢
 
@@ -146,18 +163,34 @@ flowchart TD
 > [!tip] Remember
 > The hash function's whole job is to turn "search for it" into "go directly to it" — collisions are the cost of that shortcut.
 
+## Common beginner mistakes 🟢
+
+- **Writing to a map you never made** (`var m map[string]int; m["a"] = 1`) → writing to a nil map panics → create it first with `make(map[string]int)`.
+- **Treating `m[key]` returning 0 as "not there"** → a missing key also returns the zero value → use `v, ok := m[key]` and check `ok`.
+- **Expecting `range` over a map to come out in the same order** → Go shuffles it on purpose → sort the keys first if order matters.
+- **Writing to one map from many goroutines** → the program crashes with `concurrent map writes` → guard it with a mutex, or use `sync.Map` for read-mostly data.
+- **Using a map when you need "keys between X and Y"** → a hash table has no order → use a sorted slice or tree.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the core trick: turn a key into a slot number and go straight there. **Next we open the box:** what makes a good hash function, what happens when two keys want the same slot, when the table grows, and how attackers can abuse it. Each subsection starts with a plain walk-through.
 
 ### 3.1 Hash functions
 
-**In plain words:** a **hash function** is a small program that takes any key — a string, a number, anything — and deterministically produces a fixed-size number (commonly 64 bits). That number is what the table uses to pick a slot.
+**In plain words:** a **hash function** is a small program that takes any key — a string, a number, anything — and deterministically (same input, same output, every time) produces a fixed-size number (commonly 64 bits). That number is what the table uses to pick a slot.
+
+**Step by step:**
+1. Key `"user:19"` goes into the hash function and comes out as a big number, say `9,138`.
+2. The table has 4 buckets, so take the remainder: `9,138 mod 4 = 2`. The key lives in bucket 2.
+3. Next time you look up `"user:19"`, the same number comes out, so you land in bucket 2 again.
+4. A different key, `"user:77"`, might also give remainder 2. That is a collision, handled in 3.2.
 
 A hash function must be:
 - **Deterministic** — the same key always produces the same hash, every time, within one program run.
 - **Uniform** — keys spread evenly across buckets, so no slot gets overloaded.
 - **Fast** — it runs on every lookup, so it must be cheaper than the lookup it enables.
 
-It does **not** need to be cryptographically secure. A cryptographic hash (SHA-256) is deterministic and reasonably uniform, but it is slower than necessary — hash tables use fast, non-cryptographic hashes such as FNV, Murmur3, or (what Go uses internally) AES-based hashing on hardware with AES-NI.
+It does **not** need to be cryptographically secure (built so nobody can work backwards from the output or forge a match). A cryptographic hash (SHA-256) is deterministic and reasonably uniform, but it is slower than necessary — hash tables use fast, non-cryptographic hashes such as FNV, Murmur3, or (what Go uses internally) AES-based hashing on hardware with AES-NI (built-in CPU instructions for the AES cipher, which make this mixing very fast).
 
 **Picture it:**
 
@@ -182,6 +215,13 @@ flowchart LR
 **Why it matters:** a slow or poorly-mixed hash function (one that clusters similar keys into the same few buckets) silently turns an `O(1)` structure into something closer to a linked list.
 
 ### 3.2 Collisions: chaining vs. open addressing
+
+**Step by step (5 slots; Alice and Bob both hash to slot 2):**
+1. Insert Alice: slot 2 is empty, so she goes there.
+2. Insert Bob: slot 2 is taken. That is a collision.
+3. Chaining: hang Bob in a small list on slot 2, so slot 2 now holds Alice → Bob.
+4. Open addressing: look at slot 3; it is empty, so Bob goes there.
+5. Lookup for Bob: chaining walks slot 2's list; open addressing checks slot 2 (Alice, not him), then slot 3 (found).
 
 **In plain words:** once two keys land in the same slot, the table needs a rule for where the second one actually goes. The two families of rules are **chaining** (keep a small list per slot) and **open addressing** (find a different empty slot nearby).
 
@@ -218,6 +258,13 @@ flowchart TB
 
 ### 3.3 Load factor and resizing
 
+**Step by step:**
+1. A table has 8 buckets and holds 4 keys: load factor 4 ÷ 8 = 0.5. Lookups are quick.
+2. Keep inserting. At 7 keys, load factor is 0.875; collisions become common and lookups slow down.
+3. The table passes its limit, so it builds a new table with 16 buckets.
+4. Every key is hashed again with `mod 16` and moved, because its old slot number was for `mod 8`.
+5. Load factor drops back to about 0.44. This one insert was slow; the next many are fast again.
+
 **In plain words:** **load factor** is how full the table is: `(number of keys) / (number of buckets)`. A low load factor wastes memory; a high one turns O(1) lookups into long chains or long probe sequences.
 
 **Example:** a table with 1,000 keys and 2,000 buckets has load factor 0.5 — comfortably sparse. The same 1,000 keys in 1,100 buckets (load factor 0.91) means almost every bucket is touched, and chains or probe sequences get noticeably longer.
@@ -247,9 +294,16 @@ This is the identical argument used for slice growth in [[Arrays and Dynamic Arr
 
 ### 3.4 Worst case and hash flooding
 
+**Step by step:**
+1. A server stores the names of incoming form fields in a hash table with a fixed, publicly known hash.
+2. An attacker works out, offline, 10,000 field names that all land in bucket 7.
+3. The attacker sends one request with those 10,000 names.
+4. Every insert has to walk bucket 7's growing list, so one request takes seconds of CPU.
+5. Fix: mix a random seed into the hash, so the attacker cannot know which names collide.
+
 **In plain words:** the O(1) average assumes a well-mixed hash and a reasonable load factor. If every key collides into one bucket, lookup degrades to `O(n)` — and an attacker who knows your hash function can make that happen on purpose.
 
-This is called **hash flooding**: an attacker who controls input that becomes hash-table keys (HTTP form field names, JSON object keys, URL query parameters) crafts many keys that all hash to the same bucket, and your `O(1)` structure becomes an `O(n)`-per-lookup bottleneck under their chosen traffic — a real denial-of-service vector against naive hash tables.
+This is called **hash flooding**: an attacker who controls input that becomes hash-table keys (HTTP form field names, JSON object keys, URL query parameters) crafts many keys that all hash to the same bucket, and your `O(1)` structure becomes an `O(n)`-per-lookup bottleneck under their chosen traffic — a real denial-of-service (making a service too slow or busy to answer real users) vector against naive hash tables.
 
 ```mermaid
 sequenceDiagram
@@ -339,7 +393,7 @@ Same contract, average `O(1)` operations, but compiler- and runtime-supported in
 
 `Get` was close either way, 7.8 ns/op versus 7.6 ns/op.
 
-At this scale (10,000 keys, update-heavy workload) the simple chaining table is not slower — Swiss Tables' real advantage shows up at larger scale and higher load factor, where its SIMD-scanned metadata bytes avoid touching most keys' memory at all (see the deep dive), not necessarily on a small, mostly-updates microbenchmark like this one.
+At this scale (10,000 keys, update-heavy workload) the simple chaining table is not slower — Swiss Tables' real advantage shows up at larger scale and higher load factor, where its SIMD-scanned (SIMD: one CPU instruction that checks many bytes at once) metadata bytes avoid touching most keys' memory at all (see the deep dive), not necessarily on a small, mostly-updates microbenchmark like this one.
 
 Runnable Go version: [[Hash Tables and Go Maps - Go]]
 
@@ -352,7 +406,7 @@ Runnable Go version: [[Hash Tables and Go Maps - Go]]
 |---|---|---|---|
 | Separate chaining | Each bucket is a list of colliding entries | Default choice; simple, degrades gracefully | O(1) average, O(n) worst case per bucket |
 | Open addressing (linear/quadratic probing) | Probe forward in the same array on collision | Cache-friendly, no pointer chasing | Clustering under high load factor |
-| Robin Hood hashing | Open addressing with bounded probe-length variance | You want predictable tail latency | More work per insert/delete |
+| Robin Hood hashing | Open addressing with bounded probe-length variance | You want predictable tail latency (the time of the slowest few requests) | More work per insert/delete |
 | **Swiss Tables** (Go 1.24+ maps, Abseil `flat_hash_map`) | Open addressing + SIMD-scanned 1-byte control metadata per group of slots | Default for a modern general-purpose map | O(1) average; very low constant factor from SIMD |
 | Sorted slice + binary search | No hashing; keys kept sorted | Small, rarely-mutated sets; range queries | O(log n) lookup, O(n) insert |
 | [[Tries, Suffix Trees and Suffix Arrays|Trie]] | Tree keyed by key prefix | Keys share prefixes (strings, IP ranges) | O(key length) lookup, naturally sorted iteration |
@@ -372,7 +426,7 @@ flowchart TD
 
 - **No ordering.** A hash table cannot answer "give me keys between X and Y" or "the smallest key" efficiently — use a sorted structure ([[Trees, BSTs and Balanced Trees]], or a sorted slice) instead.
 - **Memory overhead.** Buckets reserve capacity ahead of need; a hash table of `n` small entries typically uses more memory than a sorted array of the same entries.
-- **Hashing cost.** For very small, fixed key sets known at compile time, a `switch` statement or a perfect hash can beat a general hash table.
+- **Hashing cost.** For very small, fixed key sets known at compile time, a `switch` statement or a perfect hash (a hash function built for one fixed key set so that no two keys ever collide) can beat a general hash table.
 - **Iteration order.** If you need stable, reproducible iteration (snapshots, tests, deterministic serialization), a hash table alone won't give it — pair it with a slice of keys in the order you want, or use an ordered-map library.
 
 ```mermaid
@@ -387,9 +441,11 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** hash functions, collisions, load factor, resizing and hash flooding, and you have traced a resize by hand. **Next comes the advanced part:** how real systems use hash tables, how Go's map is built inside (old buckets vs Swiss Tables), the Go map rules that bite, and interview questions.
+
 - **Real systems:**
 	- Go's `map[K]V`, Python's `dict`, Java's `HashMap`, Redis's main keyspace (itself a hash table, separate from the "hash" data type it also offers).
-	- Java's `HashMap` **treeifies** a bucket (converts its linked list to a red-black tree) once it holds 8+ entries, turning a worst-case `O(n)` bucket scan into `O(log n)` — a defense against hash-flooding and bad luck that Go's map does not need because Go caps the load factor more aggressively and randomizes bucket iteration order and the hash seed.
+	- Java's `HashMap` **treeifies** a bucket (converts its linked list to a red-black tree, a self-balancing sorted tree) once it holds 8+ entries, turning a worst-case `O(n)` bucket scan into `O(log n)` — a defense against hash-flooding and bad luck that Go's map does not need because Go caps the load factor more aggressively and randomizes bucket iteration order and the hash seed.
 	- Database hash indexes (PostgreSQL's `hash` index type) for equality lookups, though B-tree indexes ([[Storage Engines - B-tree vs LSM and WAL]]) remain the default because they also support range scans.
 - **Failure modes → fixes:**
 	- Hash flooding from attacker-controlled keys → random per-process hash seed (Go does this automatically for every map).
@@ -500,6 +556,26 @@ These are the hash-table patterns that show up most often in interviews:
 - `sync.Map` is for read-mostly or disjoint-key concurrent access, not a general mutex replacement.
 - Sets: `map[T]struct{}`. Bloom filters trade a small false-positive rate for O(1) space-efficient set membership at scale — see [[Bloom Filters and Probabilistic Data Structures]].
 - `hash(key) mod N` is also how naive partitioning works, and why it breaks when N changes — see [[Consistent Hashing]].
+
+## Self-check 🟢🟡
+
+> [!question]- What does a hash function do, in one line?
+> Turns any key into a number, which picks the slot where the key lives.
+
+> [!question]- What is a collision?
+> Two different keys landing in the same slot.
+
+> [!question]- What does `m["missing"]` return in Go, and how do you tell it apart from a stored zero?
+> The zero value; use `v, ok := m["missing"]` and check `ok`.
+
+> [!question]- A table has 4 buckets, max load factor 0.75, and holds 3 keys. What happens on the 4th insert?
+> Load factor becomes 1.0, over the limit, so it grows to 8 buckets and rehashes all 4 keys.
+
+> [!question]- Why does Go give every map a random hash seed?
+> So attackers cannot pick keys that all collide (hash flooding).
+
+> [!question]- When should you use a sorted structure instead of a hash table?
+> When you need order: ranges, min/max, or "the next key after X".
 
 ## Links 🟢
 

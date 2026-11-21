@@ -32,6 +32,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - Nothing. This note starts from zero.
+
 **From zero, in 60 seconds** 🟢
 
 The internet does not send your message in one piece. It chops it into small chunks called **packets**, each about the size of a text page.
@@ -78,6 +81,11 @@ Somehow your bytes hop through a dozen machines and still reach the right progra
 | Header | Label bytes stuck in front of data | "from X, to Y, port 443" |
 | Protocol | Agreed rules for how two machines talk | TCP, UDP, HTTP |
 | ISP | Company that connects you to the internet | Your broadband provider |
+| MAC address | A hardware ID built into each network card, used only for the next hop | `a4:83:e7:12:34:56` |
+| Switch | A box that passes frames between machines on the same local network | The ports on your office network box |
+| Encapsulation | Wrapping data in one header per layer, like envelopes inside envelopes | HTTP inside TCP inside IP inside Ethernet |
+| Socket | The operating system's handle for one end of a connection | Your browser's connection to `example.com:443` |
+| MTU | The biggest packet one link can carry | 1500 bytes on Ethernet |
 
 **Picture it**
 
@@ -131,7 +139,21 @@ flowchart LR
     D --> E(("onto the wire"))
 ```
 
-Each layer wraps the one above it in its own header. A router only ever opens the IP header; a switch only ever opens the Ethernet header. Neither one looks any deeper than it has to.
+Each layer wraps the one above it in its own header (`seq#` is TCP's sequence number, which counts bytes so they can be put back in order). A router only ever opens the IP header; a switch only ever opens the Ethernet header. Neither one looks any deeper than it has to.
+
+### Real-life example: a WhatsApp photo 🟢
+
+You send a 3 MB photo on WhatsApp from Delhi to a friend in Bengaluru.
+Your phone cuts it into about 2,000 packets of up to 1500 bytes each, every one labelled with WhatsApp's server IP and port.
+The packets go from your phone to the mobile tower, through your carrier's network, across other networks, to the server. Different packets may take slightly different roads.
+The server's operating system uses the port and the connection's 5-tuple to hand every packet to the right program, which puts the photo back together in order.
+
+```mermaid
+flowchart LR
+    P["Photo, 3 MB"] --> C["~2,000 packets"]
+    C --> N["many routers,<br/>hop by hop"]
+    N --> S["server rebuilds<br/>the photo"]
+```
 
 ## 2. Mental model 🟢
 
@@ -145,11 +167,28 @@ A router, in this picture, is a post office that reads only the IP envelope's ad
 
 Where the analogy breaks down: a real post office reads a letter once and is done; a router repeats this "read IP address, repackage, forward" cycle for millions of packets per second, and it discards and rebuilds the outer envelope at *every single hop* — nothing like paper mail.
 
+## Common beginner mistakes 🟢
+
+- **Thinking a router "sees the website you visit"** → a router reads only the IP header, never the URL inside → the endpoints (and anything that unlocks TLS) see the request.
+- **Treating OSI's 7 layers as 7 real protocols** → real systems run the 4-layer TCP/IP model → use OSI numbers only as shorthand, like "L4" and "L7".
+- **Thinking one port = one connection** → each connection is the full 5-tuple, so port 443 can serve thousands of clients → look at source port and IP too.
+- **Mixing up IP address and MAC address** → the IP address names the final destination for the whole trip; the MAC only names the next box → both are needed, for different jobs.
+- **Ignoring MTU when adding a VPN or tunnel** → the extra header pushes packets over 1500 bytes and big replies vanish → lower the MTU or clamp the MSS.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that data travels as labelled packets, hop by hop, with an IP address for the machine and a port for the program. **Next we open the box**: how the labels are stacked, which layer model is real, how networks owned by different companies share routes, how big a packet may be, and how one machine keeps thousands of connections apart. Each subsection starts with a plain step-by-step walk; the full detail follows it.
 
 ### Encapsulation and decapsulation
 
 **In plain words:** sending data down the stack means stacking a new header on top at each layer, like nesting dolls. Receiving it means popping dolls off one at a time, in the exact reverse order they were added.
+
+**Step by step:**
+1. Your browser writes `GET /` (application data).
+2. TCP puts a header in front: source port 51001, destination port 443, sequence number.
+3. IP puts its header in front of that: from `192.168.1.42` to `93.184.216.34`.
+4. Ethernet puts its header in front: from your laptop's MAC to your home router's MAC. Now it goes on the wire.
+5. The server peels them off in reverse: Ethernet, then IP, then TCP, and the web server program finally reads `GET /`.
 
 **Picture it:**
 
@@ -173,7 +212,7 @@ flowchart TB
 
 **Example:** an HTTP GET request leaves your browser as plain bytes. TCP wraps it with a header naming port 443 and a sequence number. IP wraps that with a header naming your address and the server's address. Ethernet wraps that again with the MAC address of the very next device — your home router, not the server.
 
-**Why it matters:** each header carries a field that names what comes next — the Ethernet frame's EtherType (IPv4 vs IPv6 vs ARP), the IP header's protocol field (TCP=6, UDP=17, ICMP=1), and the destination port.
+**Why it matters:** each header carries a field that names what comes next — the Ethernet frame's EtherType (IPv4 vs IPv6 vs ARP, the protocol that finds a MAC address for an IP on the local network), the IP header's protocol field (TCP=6, UDP=17, ICMP=1; ICMP carries network error and test messages like ping), and the destination port.
 
 Without those fields, decapsulation would have no way to know which header to strip next, and the receiving machine could not hand the data to the right program.
 
@@ -185,7 +224,14 @@ Without those fields, decapsulation would have no way to know which header to st
 
 ### OSI's 7 layers vs the internet's 4
 
-**In plain words:** you'll often hear networking explained with "the 7 layers of OSI." That model is a *teaching reference* from the 1980s — no mainstream network stack actually implements all seven as separate, distinct protocols. What ships inside every real operating system is the simpler **TCP/IP (Internet) model**, standardized by the IETF in RFC 1122, with 4 layers.
+**In plain words:** you'll often hear networking explained with "the 7 layers of OSI." That model is a *teaching reference* from the 1980s — no mainstream network stack actually implements all seven as separate, distinct protocols. What ships inside every real operating system is the simpler **TCP/IP (Internet) model**, standardized by the IETF (the group that writes internet standards) in RFC 1122, with 4 layers.
+
+**Step by step:**
+1. **Link** layer: gets bits across one cable or Wi-Fi hop (Ethernet, MAC addresses).
+2. **Internet** layer: gets a packet from the first machine to the last across many hops (IP).
+3. **Transport** layer: gets data to the right program, reliably (TCP) or quickly (UDP).
+4. **Application** layer: what the program actually says (HTTP, DNS, SSH).
+5. OSI splits these into 7 boxes. When people say "L4" or "L7", they mean OSI's Transport (4) and Application (7).
 
 **Picture it:**
 
@@ -213,14 +259,14 @@ Knowing which model is real and which is a teaching aid keeps you from drawing a
 
 ### Routing and BGP, briefly
 
-**In plain words:** a **router** is a machine holding a forwarding table: for a given destination IP, which outgoing interface (and next-hop router) should this packet go to. Inside one organization's network — one **Autonomous System (AS)**, such as one ISP — routers exchange routes with an **interior** protocol (OSPF, IS-IS) that finds shortest paths by link cost.
+**In plain words:** a **router** is a machine holding a forwarding table: for a given destination IP, which outgoing interface (one physical or virtual network port on the router), and which next-hop router, should this packet go to. Inside one organization's network — one **Autonomous System (AS)**, such as one ISP — routers exchange routes with an **interior** protocol (OSPF, IS-IS: route-sharing protocols used inside one network) that finds shortest paths by link cost.
 
 Between *different* organizations' networks, routers speak **BGP** (Border Gateway Protocol, RFC 4271). Think of BGP as a chain of word-of-mouth announcements: each AS tells its neighbors "I can reach this address block," and its neighbors repeat that announcement onward, each adding their own name to a running list called the **AS-path**.
 
 **Step-by-step — how one route propagates:**
 
-1. The server's own ISP (AS 3) announces to its neighbor: "I can reach `93.184.216.0/24`. AS-path: [3]."
-2. A transit provider (AS 2) hears this, adds itself to the path, and re-announces: "reachable via me. AS-path: [2, 3]."
+1. The server's own ISP (AS 3) announces to its neighbor: "I can reach `93.184.216.0/24` (a prefix: a block of addresses, here the 256 addresses `93.184.216.0` to `.255`). AS-path: [3]."
+2. A transit provider (AS 2, a large network paid to carry other networks' traffic) hears this, adds itself to the path, and re-announces: "reachable via me. AS-path: [2, 3]."
 3. Your ISP (AS 1) hears the transit provider's announcement and picks it — among any other candidate routes — by shortest AS-path (plus other policy rules), then installs it in its own forwarding table.
 4. From then on, your ISP forwards any packet addressed to that block toward the transit provider, one hop at a time, with no single router ever knowing the whole path.
 
@@ -238,7 +284,7 @@ sequenceDiagram
     Transit->>Server-ISP: forwards it (one hop closer)
 ```
 
-**Why it matters:** this word-of-mouth design is exactly why losing one undersea cable or one ISP peering point reroutes traffic instead of cutting the internet in half — neighbors simply stop hearing a route and switch to the next-best one they know.
+**Why it matters:** this word-of-mouth design is exactly why losing one undersea cable or one ISP peering point (a place where two networks connect directly) reroutes traffic instead of cutting the internet in half — neighbors simply stop hearing a route and switch to the next-best one they know.
 
 It is also why a *bad* BGP announcement (a misconfigured AS claiming a prefix it has no business serving) can hijack and misdirect traffic: there is no central authority checking who is allowed to announce what.
 
@@ -251,6 +297,20 @@ It is also why a *bad* BGP announcement (a misconfigured AS claiming a prefix it
 ### MTU and fragmentation
 
 **In plain words:** Ethernet frames carry at most **1500 bytes of payload** by default — this ceiling is called the **Maximum Transmission Unit (MTU)**. A packet larger than the MTU of any link it crosses must either be split up (fragmented) or, better, never be created oversized in the first place.
+
+**Step by step:**
+1. A link can carry at most 1500 bytes per packet (its MTU).
+2. When a TCP connection opens, both sides agree on a segment size (MSS) of about 1460 bytes, leaving room for the 40 bytes of IP and TCP headers.
+3. So every TCP packet fits, and nothing needs splitting.
+4. A VPN adds its own header, say 60 bytes. Now a full packet is too big for some link on the path.
+5. Path MTU Discovery: the sender marks packets "don't split me"; a router that can't fit one replies "too big", and the sender uses a smaller size.
+
+```mermaid
+flowchart LR
+    S["Sender: 1500-byte packet,<br/>don't fragment"] --> R["Router on a 1400 link"]
+    R -- "ICMP: too big, use 1400" --> S
+    S -- "resend at 1400" --> D["Destination"]
+```
 
 **Picture it — what TCP does instead of fragmenting:**
 
@@ -270,7 +330,7 @@ UDP and ICMP traffic has no such negotiation, so it can still get fragmented; if
 
 **Why it matters:** **Path MTU Discovery** sends packets with the "don't fragment" bit set and shrinks its guess of the usable MTU whenever a router replies "too big."
 
-This is why MTU-related outages — commonly a VPN or tunnel header pushing an otherwise-fine packet over 1500 bytes — show up as "everything works except big responses," a confusing symptom that traces straight back to this one header field.
+This is why MTU-related outages — commonly a VPN (an encrypted tunnel that wraps your packets inside other packets) or tunnel header pushing an otherwise-fine packet over 1500 bytes — show up as "everything works except big responses," a confusing symptom that traces straight back to this one header field.
 
 > [!tip] Remember
 > TCP avoids fragmentation by negotiating segment size up front; UDP/ICMP can still be fragmented, and losing one fragment means resending the whole packet.
@@ -279,7 +339,13 @@ This is why MTU-related outages — commonly a VPN or tunnel header pushing an o
 
 **In plain words:** an IP address identifies a *host* (one machine). A **port** — a number from 0 to 65535 — identifies a *program* running on that host. It lives in the TCP or UDP header, not the IP header, which is exactly why a router forwarding on the IP header alone never sees it.
 
-Ports below 1024 are "well-known" by convention (80 = HTTP, 443 = HTTPS, 53 = DNS) and on Linux require root privileges to bind.
+**Step by step:**
+1. The web server opens a socket and listens on port 443.
+2. You open two tabs to `example.com`. The OS gives tab 1 the free source port 51001 and tab 2 the port 51002.
+3. Both connections go to `93.184.216.34:443`, but their 5-tuples differ by one number, the source port.
+4. Replies come back addressed to port 51001 or 51002, so the OS hands each one to the right tab.
+
+Ports below 1024 are "well-known" by convention (80 = HTTP, 443 = HTTPS, 53 = DNS) and on Linux require root privileges (administrator rights) to bind (claim the port for listening).
 
 A **socket** is the operating system's handle for one end of a connection. The OS and the network together identify a single TCP connection by its **5-tuple**:
 
@@ -368,9 +434,11 @@ Runnable Go version: [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-I
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** encapsulation, the real 4-layer model, BGP, MTU and the 5-tuple. **Next comes the advanced part**: failures that hit real systems (MTU black holes, route hijacks, port exhaustion), what to monitor, and the deeper "why" behind packets, TTL and anycast.
+
 - **Real systems:** every TCP/IP stack (Linux, macOS, Windows) implements the 4-layer model directly; BGP runs between every pair of ISPs and cloud providers on the internet; AWS/GCP/Azure VPC routing tables are, internally, a constrained BGP-like forwarding problem (see [[IP Addressing, Subnets, NAT and VPC Basics]]).
 - **Failure modes → fixes:**
-	- **MTU black hole**: large packets vanish silently (a middlebox drops them instead of sending back "too big") → lower the interface MTU or clamp MSS on the path.
+	- **MTU black hole**: large packets vanish silently (a middlebox, a network device in the path such as a firewall, drops them instead of sending back "too big") → lower the interface MTU or clamp MSS on the path.
 	- **BGP route leak/hijack**: traffic for a prefix suddenly routes somewhere wrong → RPKI route-origin validation, and monitoring services that alert on unexpected AS-path changes for your own prefixes.
 	- **Port exhaustion**: a host opening huge numbers of outbound connections to the same destination runs out of ephemeral source ports (the ~28,000 available on Linux by default) → connection pooling/reuse, or widen the ephemeral port range.
 - **What to monitor:** interface MTU mismatches (via Path MTU Discovery failures), BGP session flaps and unexpected AS-path changes for your own prefixes, and ephemeral port usage on high-connection-count hosts.
@@ -379,11 +447,11 @@ Runnable Go version: [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-I
 
 - **Why packet switching over circuit switching:** a phone network reserves a fixed-capacity circuit for a call's whole duration, wasting it during silence.
 
-  Packet switching statistically multiplexes many flows over the same link, trading guaranteed bandwidth for better average utilization — the core bet the early ARPANET made and the internet inherited.
+  Packet switching statistically multiplexes (shares the link among whoever is sending at that moment) many flows over the same link, trading guaranteed bandwidth for better average utilization — the core bet the early ARPANET (the 1969 US research network that grew into the internet) made and the internet inherited.
 - **TTL as a loop-breaker, not a timer:** the IP header's **TTL** (Time To Live) field is a hop count, decremented by one at every router; when it hits zero the packet is dropped and an ICMP "Time Exceeded" is sent back.
 
   This is what `traceroute` abuses: it sends packets with TTL=1, 2, 3, … and records which router replies "exceeded" at each hop, reconstructing the path one router at a time.
-- **Why the 5-tuple, not just the port:** a server listening on port 443 can be reached by millions of distinct clients simultaneously. The OS demultiplexes incoming segments to the right in-memory socket using the full 5-tuple as the lookup key, not just the destination port — otherwise it couldn't tell two clients' traffic apart.
+- **Why the 5-tuple, not just the port:** a server listening on port 443 can be reached by millions of distinct clients simultaneously. The OS demultiplexes (sorts out and delivers) incoming segments to the right in-memory socket using the full 5-tuple as the lookup key, not just the destination port — otherwise it couldn't tell two clients' traffic apart.
 - **EtherType and the IP protocol field** are what make decapsulation deterministic: EtherType `0x0800` says "the next header is IPv4," and the IP header's protocol field (6=TCP, 17=UDP, 1=ICMP) says what follows it.
 
   Get either field wrong (common in hand-rolled raw-socket code) and the receiving stack silently drops the packet.
@@ -413,6 +481,8 @@ Runnable Go version: [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-I
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** Data is cut into packets of up to about 1500 bytes. Each packet carries an IP address (which machine) and a port (which program). Routers pass packets one hop at a time without knowing the whole path. Headers are stacked layer by layer on the way out and removed in reverse on the way in. The real model has 4 layers; OSI's 7 is a teaching aid. The dense list follows.
+
 - Packets are independently routed; no end-to-end circuit is reserved.
 - Encapsulation adds a header per layer going out; decapsulation strips them in reverse coming in.
 - OSI's 7 layers are a teaching model; the internet runs TCP/IP's 4 layers (Link, Internet, Transport, Application).
@@ -420,6 +490,26 @@ Runnable Go version: [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-I
 - MTU is usually 1500 bytes; TCP negotiates MSS to avoid fragmentation, UDP doesn't.
 - Routers forward hop by hop using a forwarding table; BGP builds that table between organizations by announcing reachable prefixes.
 - TTL is a hop counter that stops routing loops, and `traceroute` exploits it to map a path.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What does an IP address identify, and what does a port identify?
+> The IP address identifies a machine; the port identifies a program on that machine.
+
+> [!question]- 🟢 Does any single router know the whole path to the server?
+> No. Each router only picks the next hop.
+
+> [!question]- 🟢 About how big is one packet on normal Ethernet?
+> At most about 1500 bytes (the MTU).
+
+> [!question]- 🟡 Two tabs connect to the same server on port 443. How does the OS keep them apart?
+> Each gets a different source port, so the full 5-tuple of each connection is unique.
+
+> [!question]- 🟡 Which header does a router read, and which does it never open?
+> It reads the IP header; it never opens the TCP header or the HTTP data inside.
+
+> [!question]- 🟡 How does TCP avoid IP fragmentation?
+> It agrees on a maximum segment size at connection setup so every packet fits the link's MTU.
 
 ## Links
 

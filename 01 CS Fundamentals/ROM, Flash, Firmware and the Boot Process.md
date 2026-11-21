@@ -30,6 +30,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[How a Computer Runs a Program]]: the CPU fetches instructions from memory one by one and runs them. This note answers where the very first instruction comes from.
+
 **From zero, in 60 seconds** 🟢
 
 RAM forgets everything when power goes off. So every computer needs some memory that survives power-off — that family is **ROM** and its modern cousin **flash** (the stuff inside SSDs and USB sticks).
@@ -71,6 +74,12 @@ That "how to wake up" code lives in memory that survives power loss: ROM and fla
 | Bootloader | Tiny program whose only job is to load the OS | GRUB on Linux |
 | Kernel | The core of the operating system | Linux itself |
 | POST | Power-On Self-Test: firmware checking the hardware | The beep codes on an old PC |
+| Reset vector | The fixed address the CPU reads its first instruction from at power-on | points into the firmware chip |
+| UEFI | The modern PC/server firmware that replaced the old BIOS | the setup screen you get with F2 |
+| Secure Boot | Firmware checking a digital signature before running the bootloader and kernel | blocks an unsigned kernel |
+| initramfs | A tiny temporary file system in RAM with just enough drivers to find the real disk | thrown away after boot |
+| NOR / NAND flash | NOR: CPU can run code straight from it. NAND: denser, cheaper, read in pages | BIOS chip / SSD |
+| PID 1 (`systemd`) | The first user process the kernel starts; it starts everything else | starts your Go service |
 
 **Picture it**
 
@@ -109,6 +118,13 @@ Everything this note describes — POST, the bootloader, the kernel handoff — 
 > [!tip] Remember
 > ROM exists for one reason: something must be readable, correct, and already there the instant power returns, before an operating system exists to load anything else.
 
+### Real-life example 🟢
+
+When your Android phone installs a system update overnight and restarts, it is rewriting flash and then walking through this exact relay: boot firmware, then a bootloader, then the kernel, then the apps.
+Phones keep two copies of the system ("A/B slots") so that if the new one fails to boot, the bootloader falls back to the old one instead of leaving you with a dead phone.
+Smart TVs, Wi-Fi routers and even your SSD get firmware updates the same way.
+On the server side, every AWS or GCP virtual machine you launch for a backend runs the same stages, just with the firmware part handled by the cloud's own hardware.
+
 ## 2. Mental model 🟢
 
 Think of ROM/flash as a sealed instruction card taped to a vending machine, readable even if the machine's internal lights (RAM, which needs constant power) are off.
@@ -117,7 +133,17 @@ The boot process is reading that card step by step: first a short self-test ("ar
 
 This analogy breaks down in one place: a vending machine's card never changes. A motherboard's flash chip can be rewritten in place (a firmware update), something a sealed card can never do.
 
+## Common beginner mistakes 🟢
+
+- **Thinking "ROM" means "can never change"** → the BIOS chip is rewritable flash; that is what a firmware update does → read "ROM" as "survives power-off".
+- **Thinking the OS is the first thing that runs** → firmware runs first, then a bootloader, then the kernel → when a machine won't start, check how far it got, from the top.
+- **Assuming Secure Boot protects everything** → it only checks what boots; it does not protect the firmware itself or a running system → pair it with firmware write-protection and normal OS security.
+- **Mixing up NOR and NAND flash** → NOR holds firmware (CPU runs from it directly); NAND holds bulk data (SSDs) → match the type to the job.
+- **Expecting a container to "boot"** → a container starts inside an already-running kernel, so it skips firmware and the bootloader → that is why containers start in milliseconds and VMs in seconds.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that RAM forgets, flash remembers, and firmware in flash starts a relay that ends with your program. **Next we open the box:** the ROM family, what firmware is, every boot stage, BIOS vs UEFI, why `initramfs` exists, why firmware sits on NOR flash, and how cloud VMs boot.
 
 ### In plain words: what makes memory "ROM" at all
 
@@ -126,6 +152,13 @@ A chip is only "ROM" in the sense that matters for booting if it does one thing:
 **Read-Only Memory (ROM):** non-volatile memory, readable at power-on, that may or may not also be rewritable depending on the specific technology.
 
 ### Picture it: the ROM family, from unchangeable to rewritable
+
+**Step by step:**
+1. **Mask ROM**: the bits are part of the chip's wiring from the factory. Never changes.
+2. **PROM**: blank when bought; you burn tiny fuses once to write it. Then fixed.
+3. **EPROM**: write electrically; erase by shining UV light through a little window on the chip.
+4. **EEPROM**: write and erase electrically, one byte at a time, but slowly.
+5. **Flash (NOR and NAND)**: write electrically, erase in big blocks, fast and cheap. This is what ships today.
 
 ```mermaid
 flowchart LR
@@ -145,7 +178,7 @@ flowchart LR
 | NOR flash | Electrically | Electrically, in blocks | Supports **execute-in-place** (the CPU can run code directly from it); used for firmware |
 | NAND flash | Electrically | Electrically, in larger blocks | Denser and cheaper per bit than NOR, but not directly executable — used for bulk storage (SSDs; see [[Storage Devices - HDD, SSD, NVMe]]) |
 
-**Example:** a 2025-era motherboard's "BIOS chip" is, physically, a small SPI NOR flash chip of a few megabytes. It holds firmware that is rewritable (that's what a "BIOS/firmware update" actually does) but, like true ROM, keeps its contents with no power, and unlike NAND flash, can be read directly by the CPU as executable code without first loading it into RAM.
+**Example:** a 2025-era motherboard's "BIOS chip" is, physically, a small SPI (a simple serial wiring standard) NOR flash chip of a few megabytes. It holds firmware that is rewritable (that's what a "BIOS/firmware update" actually does) but, like true ROM, keeps its contents with no power, and unlike NAND flash, can be read directly by the CPU as executable code without first loading it into RAM.
 
 > [!warning] Common mistake
 > Calling the BIOS chip "ROM" makes people assume it can never be changed. It is rewritable NOR flash. The "ROM" label describes how it behaves at power-on (intact, non-volatile), not whether a firmware update can rewrite it.
@@ -157,9 +190,15 @@ flowchart LR
 
 Firmware is software, just like an application — written in C or assembly, compiled, and stored as a binary image.
 
-Two things set it apart from an ordinary application: it lives in the device's own flash chip rather than on a general-purpose file system, and it runs on the device's own microcontroller (or, for the main system BIOS/UEFI, directly on the CPU) rather than waiting for an operating system to schedule it.
+Two things set it apart from an ordinary application: it lives in the device's own flash chip rather than on a general-purpose file system, and it runs on the device's own microcontroller (a small, simple processor built into the device) (or, for the main system BIOS/UEFI, directly on the CPU) rather than waiting for an operating system to schedule it.
 
-**Example:** every SSD runs firmware that manages its flash translation layer (see [[Storage Devices - HDD, SSD, NVMe]]); every network interface card runs firmware; a server's baseboard management controller (BMC) runs its own independent firmware and OS for out-of-band management (IPMI), entirely separate from whatever OS the main CPU boots.
+**Step by step:**
+1. An engineer writes the firmware in C, compiles it, and gets one binary file (an "image").
+2. The image is written into the device's flash chip at the factory.
+3. At power-on, the device's own small processor runs that image directly. No OS loads it.
+4. Later, a firmware update writes a newer image into the same flash chip.
+
+**Example:** every SSD runs firmware that manages its flash translation layer (the SSD's map from the block numbers the OS asks for to where the data really sits in flash; see [[Storage Devices - HDD, SSD, NVMe]]); every network interface card runs firmware; a server's baseboard management controller (BMC) runs its own independent firmware and OS for out-of-band management (IPMI: a way to control the server over a separate network port even when the main OS is down), entirely separate from whatever OS the main CPU boots.
 
 ### Picture it: the boot sequence, stage by stage
 
@@ -189,7 +228,14 @@ Walking through it step by step:
 
 ### In plain words: BIOS vs UEFI
 
-**Legacy BIOS** boots in 16-bit real mode, reads the first sector of the boot disk (the Master Boot Record, limited to 2 TB disks and 4 primary partitions), and hands off with almost no structure beyond "jump here." **UEFI** (Unified Extensible Firmware Interface) replaced it on essentially all 2025-era hardware: it runs in native CPU mode from the start, understands the GPT partition table (no 2 TB/4-partition limits), has its own small FAT filesystem (the EFI System Partition) holding bootloader files directly as regular files rather than one raw sector, and supports **Secure Boot** — the firmware verifies a cryptographic signature on the bootloader and kernel before running them, so a chain of trust can be established starting from the firmware itself.
+**Step by step (a UEFI boot):**
+1. Power on. UEFI firmware starts in the CPU's normal mode and runs POST.
+2. It reads the disk's GPT partition table (the modern list of partitions on a disk) and finds a small FAT-formatted partition called the EFI System Partition.
+3. It opens a regular file there, such as `grubx64.efi`, the bootloader.
+4. With Secure Boot on, it checks the file's digital signature. Bad or missing signature: stop.
+5. Good signature: it runs the bootloader, which loads the signed kernel the same way.
+
+**Legacy BIOS** boots in 16-bit real mode (the CPU's simple 1980s start-up mode, which can only see 1 MB of memory), reads the first sector of the boot disk (the Master Boot Record, limited to 2 TB disks and 4 primary partitions), and hands off with almost no structure beyond "jump here." **UEFI** (Unified Extensible Firmware Interface) replaced it on essentially all 2025-era hardware: it runs in native CPU mode from the start, understands the GPT partition table (no 2 TB/4-partition limits), has its own small FAT filesystem (the EFI System Partition) holding bootloader files directly as regular files rather than one raw sector, and supports **Secure Boot** — the firmware verifies a cryptographic signature on the bootloader and kernel before running them, so a chain of trust can be established starting from the firmware itself.
 
 Servers moved to UEFI specifically for GPT's capacity/partition limits and Secure Boot's protection against boot-level malware (bootkits) that legacy BIOS had no mechanism to prevent.
 
@@ -243,6 +289,12 @@ Step by step:
 
 ### Picture it: why firmware runs from NOR flash, not NAND
 
+**Step by step:**
+1. At power-on, RAM is not set up yet, so the CPU must run its first instructions straight from the flash chip.
+2. NOR flash lets the CPU read any single byte at any address, like memory. So the CPU can run code from it in place.
+3. NAND flash only reads whole pages (several KB) into a buffer first. The CPU cannot run code from it directly.
+4. So firmware lives on a small NOR chip, and the big OS and your files live on NAND (the SSD).
+
 ```mermaid
 flowchart TD
     subgraph NOR["NOR flash: execute-in-place"]
@@ -261,6 +313,13 @@ NOR flash supports random-access reads at the bit/byte level directly, so a CPU 
 ### In plain words: cloud instances boot through the same stages, one layer down
 
 An AWS EC2 instance, a GCP Compute Engine VM, or any cloud VM boots through this exact sequence from the guest OS's point of view — but the "firmware" the guest sees is itself emulated or passed through by the hypervisor.
+
+**Step by step:**
+1. You click "launch instance". The cloud picks a physical host that is already running.
+2. The hypervisor (the software that runs many virtual machines on one physical computer) creates a new VM and gives it virtual firmware.
+3. That virtual firmware does a quick, mostly skipped POST and loads the bootloader from the VM's disk image.
+4. The kernel and `systemd` start inside the VM, then your Go service.
+5. A container skips all of this: it is just a new process on a kernel that is already running.
 
 AWS's Nitro System, for example, handles instance boot largely in dedicated hardware/firmware outside the main host CPU, which is part of why modern cloud instances can report very fast boot times: much of the traditional POST and hardware-discovery work is short-circuited or parallelized by the virtualization layer, rather than every instance repeating a full physical-machine POST from scratch.
 
@@ -319,9 +378,11 @@ Runnable Go version: [[ROM, Flash, Firmware and the Boot Process - Go]]
 
 ## 6. Trade-offs and when not to use 🟡
 
-- Rewritable flash firmware is convenient (bugs and vulnerabilities can be patched without replacing hardware) but is itself an attack surface: a firmware rootkit that survives an OS reinstall is a documented, real threat class, which is exactly what Secure Boot and signed firmware updates (UEFI capsule updates, `fwupd` on Linux) exist to close off.
-- A botched firmware update can brick a device with no working fallback, which is why production fleets stage firmware updates carefully and why some hardware keeps a redundant, read-only fallback firmware image specifically for recovery.
+- Rewritable flash firmware is convenient (bugs and vulnerabilities can be patched without replacing hardware) but is itself an attack surface: a firmware rootkit (hidden malicious code) that survives an OS reinstall is a documented, real threat class, which is exactly what Secure Boot and signed firmware updates (UEFI capsule updates, `fwupd` on Linux) exist to close off.
+- A botched firmware update can brick a device (leave it as useful as a brick: it will not start at all) with no working fallback, which is why production fleets stage firmware updates carefully and why some hardware keeps a redundant, read-only fallback firmware image specifically for recovery.
 - None of this is something a backend engineer manages directly on cloud infrastructure — the cloud provider owns and secures firmware for the underlying physical hosts (e.g. AWS's Nitro System). It matters here because understanding why a VM boots the way it does, and why boot time is nonzero, explains real operational numbers (VM cold-start latency, why some instance types report faster boots than others).
+
+> 🟡 → 🔴 **You now know** the ROM family, what firmware is, the boot stages, BIOS vs UEFI, `initramfs` and why cloud VMs boot faster. **Next comes the advanced part:** firmware in real server fleets, boot failures and how to diagnose them, and the deep details: measured boot with a TPM, network (PXE) boot, and the BMC.
 
 ## 7. In production 🔴
 
@@ -335,8 +396,8 @@ Runnable Go version: [[ROM, Flash, Firmware and the Boot Process - Go]]
 ## 8. Deep dive 🔴
 
 - **Execute-in-place and why firmware uses NOR, not NAND.** Covered visually in section 3; the short version is that NOR's random-access reads let the CPU execute straight out of flash, which is mandatory for the first instructions after power-on, before any RAM initialization has happened.
-- **The trusted boot chain, precisely.** Secure Boot's guarantee is only as strong as its root of trust: the firmware itself must be protected (write-protected, or itself measured by a Trusted Platform Module) or an attacker who can rewrite firmware defeats every later signature check. Measured boot extends this further: each stage (firmware → bootloader → kernel) records a cryptographic hash of the next stage into the TPM before running it, producing an auditable, tamper-evident record of exactly what booted, which remote-attestation systems can check without trusting the booted OS itself to self-report honestly.
-- **PXE and network boot.** Servers often boot over the network instead of local storage: the firmware's NIC implements enough of DHCP and TFTP to fetch a bootloader and kernel image from the network before any local disk is touched — standard for provisioning bare-metal fleets and diskless nodes, and conceptually identical to the local-disk sequence above with the boot device replaced by a network target.
+- **The trusted boot chain, precisely.** Secure Boot's guarantee is only as strong as its root of trust: the firmware itself must be protected (write-protected, or itself measured by a Trusted Platform Module, a small security chip that stores keys and hashes) or an attacker who can rewrite firmware defeats every later signature check. Measured boot extends this further: each stage (firmware → bootloader → kernel) records a cryptographic hash of the next stage into the TPM before running it, producing an auditable, tamper-evident record of exactly what booted, which remote-attestation systems can check without trusting the booted OS itself to self-report honestly.
+- **PXE and network boot.** Servers often boot over the network instead of local storage: the firmware's NIC implements enough of DHCP (the protocol that hands out IP addresses) and TFTP (a very simple file-download protocol) to fetch a bootloader and kernel image from the network before any local disk is touched — standard for provisioning bare-metal fleets and diskless nodes, and conceptually identical to the local-disk sequence above with the boot device replaced by a network target.
 - **BMC/IPMI, a boot sequence of its own.** A server's baseboard management controller runs its own firmware and its own lightweight OS, independent of and before the main CPU's boot sequence — it can power-cycle the main system, read POST codes, and provide remote console access even if the main OS has never successfully booted at all, which is precisely why it's the tool used to diagnose a host that won't POST.
 
 ## 9. Interview questions 🔴
@@ -372,6 +433,30 @@ Runnable Go version: [[ROM, Flash, Firmware and the Boot Process - Go]]
 - `initramfs` is a temporary RAM-loaded root filesystem holding just enough drivers to mount the real one, then discarded via `switch_root`.
 - A server's BMC/IPMI boots and runs independently of the main CPU, specifically so it can diagnose a host that never POSTs.
 - Cloud VMs boot through the same sequence conceptually, with firmware/POST handled or short-circuited by the hypervisor layer.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why must the first boot code live in ROM or flash, not RAM?
+> RAM is empty at power-on; only non-volatile memory still holds code at that moment.
+
+> [!question]- Put these in order: kernel, firmware, bootloader, `systemd`.
+> Firmware → bootloader → kernel → `systemd`.
+
+> [!question]- Is the BIOS chip truly read-only?
+> No. It is rewritable NOR flash; firmware updates rewrite it.
+
+🟡 Medium
+
+> [!question]- Why does firmware sit on NOR flash and not NAND?
+> NOR allows byte-level reads, so the CPU can run code straight from it before RAM is ready; NAND reads only whole pages.
+
+> [!question]- What is `initramfs` for?
+> A tiny RAM file system with the drivers needed to reach the real disk; it is discarded after `switch_root`.
+
+> [!question]- What does Secure Boot check, and what does it not cover?
+> It checks signatures on the bootloader and kernel; it does not protect the firmware itself or the system after boot.
 
 ## Links
 

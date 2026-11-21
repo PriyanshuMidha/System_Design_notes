@@ -30,6 +30,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add the lists for APIs, databases, cloud, AI engineering and LLD.
 > - 🔴 **Interview / SDE-3 prep?** Add the backend course syllabus map at the end. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - Nothing. This note starts from zero. It is a reading list, so you only need to know which topic you are studying right now.
+
 **From zero, in 60 seconds** 🟢
 
 There is too much to learn from. Search for any topic and you get dozens of videos, courses and books.
@@ -72,6 +75,14 @@ You read the vault note first, then only the slice of the source you need.
 | Scratch module | A throwaway Go project for trying code | `go mod init scratch` |
 | LLD | Low-level design: classes, methods and their rules | Designing a parking lot |
 | MOC | "Map of content", an index note for a folder | [[19 Interview & Career MOC]] |
+| HLD | High-level design: services, databases and how they connect | Designing all of WhatsApp's backend |
+| Goroutine | A lightweight Go thread | `go send(msg)` |
+| Data race | Two goroutines touch the same memory at once, one writing | Two requests updating one map |
+| gRPC | A fast way for services to call each other over the network | `payments.Charge(...)` from another service |
+| Protocol Buffers | The compact message format gRPC uses, defined in a `.proto` file | `message Invoice { int64 id = 1; }` |
+| Cache eviction / TTL | Which old cache entries get thrown out / how long an entry lives | LRU drops the least recently used; TTL 60 s |
+| OpenTelemetry | A standard toolkit for traces and metrics | One trace across 3 services |
+| Vector DB | A database that finds items by "closeness of meaning" | Search notes similar to a question |
 
 **Picture it**
 
@@ -101,7 +112,33 @@ Where it breaks: a librarian checks the book is still there, but these links wer
 3. Rebuild the example in a scratch module and add one test.
 4. Write one interview answer in your own words in the note's question callouts.
 
+### Real-life example 🟢
+
+Say next week's interview asks you to design seat booking for an app like BookMyShow, and you are unsure how to stop two people grabbing the same seat.
+Step 1: read the vault note on locking until the end of its worked example.
+Step 2: open only the PostgreSQL docs section on row locks (`SELECT ... FOR UPDATE`), not the whole manual.
+Step 3: write a 30-line Go program where two goroutines try to book seat D7, and a test that proves only one wins.
+Step 4: write your three-sentence interview answer in the note. That is one evening, not a 12-hour course.
+
+## Common beginner mistakes 🟢
+
+- **Starting a long course from video 1** → you tire out before reaching the part you need → read the vault note, then jump to the one matching section.
+- **Trusting a random blog over the official docs** → blogs go out of date or are simply wrong → check the official docs for anything you will say in an interview.
+- **Watching without coding** → it feels like learning but doesn't stick → rebuild the example in a scratch module and add one test.
+- **Copying Java course code straight into Go** → you get class-like code Go reviewers dislike → use the "Translating a Java course to Go" list below.
+- **Giving up when a link is dead** → these links were not re-checked → search the title on the same site.
+
+### Official docs vs books vs videos 🟡
+
+| Source type | Best for | Watch out for | Example |
+| --- | --- | --- | --- |
+| Official docs | Exact, current facts you can quote | Dry; not a tutorial | The Go Memory Model |
+| Books | Deep, connected understanding | Can lag behind new versions | *Designing Data-Intensive Applications* |
+| Videos and courses | Intuition and a first walk-through | Long, may skip edge cases, may be outdated | Rob Pike's concurrency talk |
+
 ## Go language 🟢
+
+🟢 **Plain version:** If you are new to Go, open just two links from this table: A Tour of Go (short browser lessons) and How to Write Go Code (how to set up a project). Come back to the rest later, one at a time, when a vault note points you here. Words like "memory model" and "race detector" are about goroutines (lightweight threads) safely sharing data; you can skip them until you study concurrency.
 
 **Official (start here):**
 
@@ -153,6 +190,8 @@ The owner followed the Udemy course *Go Bootcamp: With gRPC and Protocol Buffers
 
 ## APIs, gRPC and Protocol Buffers 🟡
 
+> 🟢 → 🟡 **You now know** the four-step way to use a source and where to start for Go. **Next** come the lists for specific backend areas: APIs, databases, cloud, AI and LLD. Open them only when you are studying that area.
+
 **In plain words:** Each table row is one source, what it is good for, and which note it backs up.
 
 | Resource | Use it for | Backs up |
@@ -170,8 +209,8 @@ The owner followed the Udemy course *Go Bootcamp: With gRPC and Protocol Buffers
 | Resource | Use it for | Backs up |
 | --- | --- | --- |
 | [PostgreSQL 17 documentation](https://www.postgresql.org/docs/17/) | The SQL dialect used everywhere in this vault | [[07 Databases MOC]] |
-| [Redis docs: key eviction](https://redis.io/docs/latest/reference/eviction/) | `maxmemory` policies, approximate LRU and LFU | [[Cache Eviction Policies - LRU, LFU, TTL]] |
-| [AWS: caching best practices](https://aws.amazon.com/caching/best-practices/) | Cache-aside, write-through, TTL choices | [[Caching Patterns]] |
+| [Redis docs: key eviction](https://redis.io/docs/latest/reference/eviction/) | `maxmemory` policies, approximate LRU (drop least recently used) and LFU (drop least frequently used) | [[Cache Eviction Policies - LRU, LFU, TTL]] |
+| [AWS: caching best practices](https://aws.amazon.com/caching/best-practices/) | Cache-aside (app checks cache, then DB), write-through (write cache and DB together), TTL choices | [[Caching Patterns]] |
 | [AWS whitepaper: database caching strategies using Redis, caching patterns](https://docs.aws.amazon.com/whitepapers/latest/database-caching-strategies-using-redis/caching-patterns.html) | The same patterns with Redis specifics | [[Caching Patterns]] |
 
 **Book:** *Designing Data-Intensive Applications* (Martin Kleppmann) for replication, partitioning, transactions and stream processing; read it alongside [[07 Databases MOC]] and [[10 Distributed Systems & Resilience MOC]].
@@ -200,7 +239,7 @@ The owner followed the Udemy course *Go Bootcamp: With gRPC and Protocol Buffers
 | [CodeWithAryan: how to approach LLD problems](https://codewitharyan.com/tech-blogs/how-to-approach-lld-problems) | A step order for solving a problem | [[LLD Interview Method]] |
 | [CodeWithAryan: structural design patterns](https://codewitharyan.com/tech-blogs/structural-design-patterns) | Adapter, Decorator, Proxy, Facade, Composite in Java | [[Design Patterns Overview and Chooser]] |
 | [CodeWithAryan: design a logging system](https://codewitharyan.com/tech-blogs/design-logging-system) | A pattern-combination model problem | [[Logging Library]] |
-| [Refactoring Guru: design patterns](https://refactoring.guru/design-patterns) | Intent, structure and pitfalls of each GoF pattern, with a Go example per pattern | [[Design Patterns Overview and Chooser]] |
+| [Refactoring Guru: design patterns](https://refactoring.guru/design-patterns) | Intent, structure and pitfalls of each GoF ("Gang of Four", the classic 1994 design patterns book) pattern, with a Go example per pattern | [[Design Patterns Overview and Chooser]] |
 | [Mermaid: class diagrams](https://mermaid.js.org/syntax/classDiagram.html) | Syntax for the class diagrams in 17 | [[UML for LLD]] |
 | [Mermaid: sequence diagrams](https://mermaid.js.org/syntax/sequenceDiagram.html) | Syntax for request flows | [[UML for LLD]] |
 | [Mermaid: state diagrams](https://mermaid.js.org/syntax/stateDiagram.html) | Syntax for lifecycles | [[State Machines in Go]] |
@@ -233,6 +272,8 @@ The course is taught in Java. Each module maps to one vault note:
 
 ## Backend course syllabus (Advanced Backend + AI) 🔴
 
+> 🟡 → 🔴 **You now know** the best source per topic. **Last comes the big picture**: how an older end-to-end backend course maps onto this vault's folders, useful for planning a long study run.
+
 The owner's earlier study plan followed a two-part backend course. Its syllabus, mapped to the vault:
 
 | Level | Course topics | Vault area |
@@ -244,13 +285,28 @@ The owner's earlier study plan followed a two-part backend course. Its syllabus,
 | 4. AI | LLM fundamentals, LangChain, LangGraph, agents, prompt engineering, RAG, embeddings, vector DBs, semantic search, document processing, chat with PDFs and websites | [[18 AI Engineering MOC]] |
 | 5. Cloud | AWS deployment, CI/CD, ECR and ECS, production best practices | [[AWS 05 - ECS, Fargate and ECR]], [[CI-CD Pipelines (GitHub Actions for Go)]], [[Deploying a Go API on AWS (Reference Architecture)]] |
 
+## Self-check 🟢🟡
+
+> [!question]- (easy) What are the four steps for using any resource?
+> Read the vault note, open one matching section of the source, rebuild the example with a test, write your own interview answer.
+
+> [!question]- (easy) Which source wins if a blog and the official docs disagree?
+> The official docs.
+
+> [!question]- (easy) Where should a total Go beginner start?
+> A Tour of Go, then How to Write Go Code.
+
+> [!question]- (medium) A Java LLD course uses `synchronized`. What is the Go version?
+> A `sync.Mutex` inside one process, or an atomic database update across instances.
+
+> [!question]- (medium) Name three things Java LLD courses usually skip that you should study here.
+> Concurrency and race tests, invariants enforced in the database, and idempotent retries.
+
+> [!question]- (medium) Which book backs up replication, partitioning and transactions?
+> *Designing Data-Intensive Applications* by Martin Kleppmann.
+
 ## Links 🟢
 
 - **Before this:** [[19 Interview & Career MOC]], [[Backend Roadmap and Tech Landscape]]
 - **Next:** [[SDE-3 Readiness Checklist]], [[LLD Round Playbook]]
 - **Compare with:** each area's MOC, which lists the vault notes in learning order
-
-### Watch on YouTube
-
-- [Learning Resources : Meaning, Types and Function /BEd 3rd Semester Notes/ Teaching of Life Sciences](https://www.youtube.com/watch?v=h4Mnuw0SEns) · The Vani Classes · 12 min · 112,010 views
-- [Meaning, Significance and Types of Learning Resources in EVS](https://www.youtube.com/watch?v=yrE6Tzgx-5E) · NIOS Senior Secondary Courses · 28 min · 17,868 views

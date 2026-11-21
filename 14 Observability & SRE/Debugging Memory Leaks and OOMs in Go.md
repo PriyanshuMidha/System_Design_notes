@@ -32,6 +32,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Goroutines and Channels]]: `go f()` starts a goroutine, and sending on an unbuffered channel waits until someone receives.
+> - [[Benchmarks, Profiling and Tracing]]: `pprof` records where a Go program spends CPU or memory, and `go tool pprof` lets you read it.
+
 **From zero, in 60 seconds** 🟢
 
 Go cleans up memory you no longer use, by itself. That cleaner is the **garbage collector**.
@@ -75,6 +79,13 @@ Something in the code is holding on to memory it no longer needs.
 | RSS | Memory the OS sees your process holding | `ps` shows 450 MB |
 | OOMKilled | The kernel killed the process for using too much memory | Kubernetes exit code 137 |
 | pprof | Go's built-in profiler for heap, CPU and goroutines | `go tool pprof heap.out` |
+| Container memory limit | The most memory Kubernetes lets one container use | 512 MB |
+| Heap profile | A pprof snapshot of which code lines hold live memory | `SessionCache.Set` holds 398 MB |
+| `GOGC` | Setting for how much the heap may grow before the next clean-up | 100 = let it double |
+| `GOMEMLIMIT` | A soft memory ceiling that makes the GC clean harder as you get near it | `GOMEMLIMIT=460MiB` |
+| LRU cache | A cache with a size limit that throws out the least recently used item when full | keep 10,000 sessions max |
+| `context.Context` | A Go value that tells goroutines "the caller gave up, stop now" | `ctx.Done()` closes on cancel |
+| Closure | A function that keeps using variables from where it was created, keeping them alive | `go func() { use(buf) }()` |
 
 **Picture it**
 
@@ -103,11 +114,22 @@ Where it breaks: Go's GC is fully automatic; you never "free" memory by hand, yo
 
 ## 1. Why it exists 🟢
 
-A pod restarts every six hours with `OOMKilled` (Kubernetes exit code 137). Restarts hide the problem rather than reveal it: the service appears "fine" because the automatic restart resets memory to zero before anyone notices the climb, and the sawtooth RSS graph looks almost like normal GC behavior if you don't look closely at the baseline between sawteeth.
+🟢 **Plain version:** A service is killed for using too much memory every six hours, then restarts and looks fine, so the problem hides. Its memory graph climbs, drops to the bottom at each restart, and climbs again, like saw teeth. The number of goroutines climbs in the same pattern, and both rise with traffic, not with time. That one clue already says "each request leaves a goroutine behind", before any deeper tool is used.
 
-**Representative numbers:** `container_memory_working_set_bytes` for the pod climbs from 180MB after a fresh start to the 512MB container limit over roughly 6 hours, at a rate that tracks requests served, not time elapsed — meaning it's proportional to traffic, not a slow constant drip (which would point at something time-based like an unbounded ticker, rather than something per-request like a per-request goroutine or map entry).
+
+A pod (one running copy of the service in Kubernetes) restarts every six hours with `OOMKilled` (Kubernetes exit code 137). Restarts hide the problem rather than reveal it: the service appears "fine" because the automatic restart resets memory to zero before anyone notices the climb, and the sawtooth RSS graph looks almost like normal GC behavior if you don't look closely at the baseline between sawteeth.
+
+**Representative numbers:** `container_memory_working_set_bytes` (the memory Kubernetes counts against the limit) for the pod climbs from 180MB after a fresh start to the 512MB container limit over roughly 6 hours, at a rate that tracks requests served, not time elapsed — meaning it's proportional to traffic, not a slow constant drip (which would point at something time-based like an unbounded ticker, a timer that fires again and again, rather than something per-request like a per-request goroutine or map entry).
 
 `go_goroutines` climbs in lockstep with the same curve: from ~40 at steady state to several thousand just before the restart. That single correlated pair of metrics (`container_memory_working_set_bytes` and `go_goroutines` both rising with traffic, never falling) already points at a per-request goroutine leak before a single profile is taken.
+
+### Real-life example: a live order-tracking service 🟢
+
+Imagine a Go service that pushes live order updates in an app like Zomato.
+For each open app screen it starts a goroutine to send updates.
+When a user closes the app, a bug means that goroutine is left waiting forever on a channel nobody reads.
+At dinner time, with many users, memory climbs fast; at 4 a.m. it barely moves, because the leak follows traffic.
+A goroutine profile shows thousands of goroutines stuck on the same line, and adding a `context` that is cancelled on disconnect fixes it.
 
 ## 2. Mental model 🟢
 
@@ -128,11 +150,35 @@ stateDiagram-v2
     Reachable --> Reachable: leak — a reference is never dropped (blocked goroutine, unbounded map, live timer)
 ```
 
+## Common beginner mistakes 🟢
+
+- **Starting a goroutine with no way to stop** → if the caller gives up, it waits forever and keeps its memory → pass a `context.Context` and `select` on `ctx.Done()`.
+- **Using a plain map as a cache** → it grows with every new key, forever → use a cache with a size limit (LRU) or an expiry time (TTL).
+- **Reading code to guess the leak** → leaks hide in harmless-looking lines → take two heap profiles 10+ minutes apart and diff them with `-base`.
+- **Panicking when RSS stays high after load drops** → Go returns freed memory to the OS slowly, so this is often normal → compare with the Go heap metric before calling it a leak.
+- **Thinking `GOMEMLIMIT` fixes leaks** → it only makes the GC try harder, so a real leak still crashes, just later → find and fix the reference that should have been dropped.
+
+### Leak vs big but healthy memory vs slow return to the OS 🟡
+
+| | Real leak | Big but healthy | Slow return to OS |
+| --- | --- | --- | --- |
+| Go heap over hours | Keeps climbing, never falls | High but flat | Falls |
+| RSS (what the OS sees) | Keeps climbing | High but flat | Stays high for a while |
+| Fix | Drop the stuck reference | Set `GOMEMLIMIT` or raise the limit | Usually nothing |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a Go leak is memory still pointed to by mistake, and the three usual causes. **Next we open the box**: what each leak looks like in code, how to pick the right branch from metrics, how to diff heap snapshots with pprof, and how `GOMEMLIMIT` keeps the container alive.
 
 ### The three everyday leaks
 
 **In plain words:** a goroutine waiting forever, a cache or map with no size limit, and timers or tickers never stopped.
+
+**Step by step:**
+1. A handler starts a goroutine to do slow work and waits up to 1 second for the result.
+2. The work takes 2 seconds, so the handler times out and returns. Nobody reads the channel any more.
+3. The goroutine finishes and tries to send on the unbuffered channel. It waits forever, holding its memory.
+4. 1,000 slow requests later, 1,000 goroutines are stuck. The same idea applies to a map that is only ever added to.
 
 **1. A goroutine with no way out.** The classic shape: a goroutine sends a result on an unbuffered channel, and if the receiver has already given up (timed out, moved on), the send blocks forever. That goroutine, its stack, and everything it closed over are reachable for the lifetime of the process.
 
@@ -150,7 +196,7 @@ sequenceDiagram
 
 The fix is always to give the goroutine a way to notice the caller gave up: a `context.Context`, a `select` with a `done` channel, or a buffered channel sized so the send never blocks.
 
-**2. An unbounded map used as a cache.** Any `map[K]V` that is only ever written to, never evicted from, grows for as long as the key space does. A per-session or per-user cache without a TTL or an LRU eviction policy is the most common real-world version: it looks fine in testing (a handful of keys) and grows without bound in production (a new key for every session, forever).
+**2. An unbounded map used as a cache.** Any `map[K]V` that is only ever written to, never evicted from, grows for as long as the key space does. A per-session or per-user cache without a TTL (time to live: each entry expires after a set time) or an LRU eviction policy is the most common real-world version: it looks fine in testing (a handful of keys) and grows without bound in production (a new key for every session, forever).
 
 **3. `time.After` inside a loop (fixed in Go 1.23).** Before Go 1.23, every call to `time.After` allocated a new runtime timer, and that timer was only cleaned up when it *fired* — if the surrounding code finished before the timeout (the common case for a `select` used as a deadline guard), the unfired timer and the small struct it closed over stayed reachable until the full duration elapsed.
 
@@ -159,6 +205,12 @@ In a hot loop running faster than the timeout, timers piled up faster than they 
 ### Diagnosis flowchart
 
 **In plain words:** look at which number is climbing (goroutines, heap, or total memory) and follow that branch.
+
+**Step by step:**
+1. Is total memory (RSS) climbing? If not, there is no leak to chase.
+2. Is the goroutine count climbing too? Take a goroutine profile and look for one stack repeated thousands of times.
+3. Goroutines flat but Go heap climbing? Take two heap profiles and diff them.
+4. RSS climbing but Go heap flat? Look outside the Go heap: cgo (C code called from Go) or memory the runtime has not handed back yet.
 
 ```mermaid
 flowchart TD
@@ -173,13 +225,24 @@ flowchart TD
 
 **In plain words:** goroutine count rising means goroutine leak; heap rising means objects kept alive; total rising but heap flat means something outside the Go heap.
 
+**Step by step:**
+1. Plot `go_goroutines`: 40 at rest, 4,000 by evening and still rising = goroutine leak.
+2. Plot `go_memstats_heap_inuse_bytes`: the Go heap's live memory. Rising with it = objects kept alive.
+3. Plot `container_memory_working_set_bytes`: what Kubernetes compares to the limit. It includes the heap plus stacks, cgo and not-yet-returned memory.
+
 - `go_goroutines` (from the Prometheus Go collector): a steady climb that tracks traffic, not time, is the goroutine-leak signature.
 - `go_memstats_heap_inuse_bytes`: the Go heap's own view of live memory — this is what a heap profile diff explains.
-- `process_resident_memory_bytes` / `container_memory_working_set_bytes`: the OS/cgroup view, which includes the Go heap plus goroutine stacks, cgo allocations, and memory the runtime hasn't yet returned to the OS.
+- `process_resident_memory_bytes` / `container_memory_working_set_bytes`: the OS/cgroup view, which includes the Go heap plus goroutine stacks, cgo allocations, and memory the runtime hasn't yet returned to the OS. (The diagram's `mmap` is a way of asking the OS for memory directly, outside the Go heap.)
 
 ### pprof: taking and diffing two heap snapshots
 
 **In plain words:** grab a memory profile now, grab another later, and ask pprof to show only the difference.
+
+**Step by step:**
+1. While real traffic flows, save heap profile 1 from `/debug/pprof/heap`.
+2. Wait 10 minutes and save heap profile 2.
+3. Run `go tool pprof -top -base heap.1.pprof heap.2.pprof`. It shows only what grew.
+4. The top line, `SessionCache.Set` with +398 MB, is where the leak lives.
 
 ```bash
 # capture two heap profiles under live traffic, 10+ minutes apart
@@ -206,7 +269,13 @@ Showing nodes accounting for 412.08MB, 98.4% of 418.70MB total
 
 **In plain words:** tell Go how much memory the container allows, so the cleaner works harder before the container gets killed.
 
-By default, Go's GC paces itself using `GOGC` (default 100: grow the heap to roughly double the live set before the next collection), with no awareness of a container's cgroup memory limit. A service with a genuinely large but legitimate working set can get killed by the kernel before `GOGC`'s pacing would have triggered a collection.
+**Step by step:**
+1. The container limit is 512 MB. By default Go does not know that.
+2. With `GOGC=100`, Go lets the heap double before cleaning, so 300 MB live could try to grow to 600 MB and get killed.
+3. Set `GOMEMLIMIT=460MiB` (about 90% of the limit).
+4. As the heap nears 460 MB, the GC cleans more often, spending a bit more CPU instead of being killed.
+
+By default, Go's GC paces itself using `GOGC` (default 100: grow the heap to roughly double the live set before the next collection), with no awareness of a container's cgroup memory limit (cgroup is the Linux feature that enforces the container's limit). A service with a genuinely large but legitimate working set can get killed by the kernel before `GOGC`'s pacing would have triggered a collection.
 
 `GOMEMLIMIT` (a soft memory limit, Go 1.19+) tells the runtime "collect more aggressively as you approach this ceiling," which trades some extra CPU for avoiding an OOM kill:
 
@@ -236,6 +305,8 @@ func leaky(out chan<- int) {
 ```
 
 The full version below adds the context-based fix, a bounded LRU cache, and both the pre-1.23-unsafe and the always-safe `time.After` patterns, each with a test. It compiles and passes `go vet` and `go test -race` on Go 1.24.
+
+**What this code does, in plain words:** `LeakyWorker` shows the bug: its goroutine can wait forever on a send. `FixedWorker` adds a `select` with `ctx.Done()`, so the goroutine leaves when the caller gives up. `BoundedCache` holds at most `capacity` keys and drops the oldest-used one when full. `FixedTimeoutLoop` reuses one timer for 1,000 loop turns instead of creating 1,000 timers.
 
 ```go
 package leaks
@@ -378,8 +449,8 @@ func TestBoundedCacheEvictsLeastRecentlyUsed(t *testing.T) {
 | Blocked goroutine (no ctx cancel, unbuffered send with no receiver) | `go_goroutines` climbs with traffic, heap climbs proportionally | Goroutine profile (`/debug/pprof/goroutine?debug=2`): many goroutines with the identical blocked stack | `context.Context` + `select` with `ctx.Done()`, or a buffered/non-blocking send |
 | Unbounded map/cache | `go_memstats_heap_inuse_bytes` climbs with distinct keys seen, not with time | Heap profile `-base` diff: one allocation site dominating growth | Bounded LRU/TTL cache with a hard capacity |
 | `time.After` in a hot loop (pre-Go 1.23) | Slow, steady heap growth independent of traffic shape, worse under high iteration rates | Heap profile (allocations attributed to `time.After`/`time.NewTimer`) | Reuse one `time.Timer` with `Reset`; safe on every Go version |
-| Sub-slice pinning a large backing array | Heap stays large even though "most" of the data looks freed | Heap profile shows a small struct retaining a surprisingly large `cap` | Copy the needed slice (`append([]T(nil), big[lo:hi]...)`) instead of re-slicing |
-| Unclosed `resp.Body` | Goroutine and file-descriptor counts both climb (connections never returned to the pool) | Goroutine profile; `lsof`/open FD count on the process | Always `defer resp.Body.Close()`, even on a non-2xx status |
+| Sub-slice pinning a large backing array (the big block of memory a slice points into) | Heap stays large even though "most" of the data looks freed | Heap profile shows a small struct retaining a surprisingly large `cap` | Copy the needed slice (`append([]T(nil), big[lo:hi]...)`) instead of re-slicing |
+| Unclosed `resp.Body` | Goroutine and file-descriptor (the OS's handle for an open file or network connection) counts both climb (connections never returned to the pool) | Goroutine profile; `lsof`/open FD count on the process | Always `defer resp.Body.Close()`, even on a non-2xx status |
 | RSS high, Go heap flat | `process_resident_memory_bytes` high but `go_memstats_heap_inuse_bytes` stable | Compare the two metrics directly | Often not a leak: fragmentation or lazy return-to-OS (see Deep dive); check cgo if either metric diverges further |
 
 ## 6. Trade-offs and when not to use 🟡
@@ -387,11 +458,14 @@ func TestBoundedCacheEvictsLeastRecentlyUsed(t *testing.T) {
 - `GOMEMLIMIT` trades CPU for safety: a service running close to its soft limit garbage-collects more often, which costs CPU it wouldn't otherwise spend. Set it with headroom (≈90% of the container limit), not at 100%.
 - An LRU cache isn't free: the `touch` operation here is O(n) in the simple doubly-linked-list-via-slice version; a production cache under heavy contention wants a real doubly linked list or `container/list`, or a sharded cache to reduce lock contention.
 - Continuous profiling (Pyroscope, Parca) adds constant background overhead (typically low single-digit percent CPU) in exchange for always having historical profiles when an incident happens — worth it for anything where "reproduce it live" is hard, not necessarily for every service.
-- Restarting on `OOMKilled` is a legitimate mitigation during an incident (it buys time), but a pod's liveness probe restarting it before an actual OOM, as a workaround for a real leak, only hides the bug and still costs users dropped requests during each restart.
+- Restarting on `OOMKilled` is a legitimate mitigation during an incident (it buys time), but a pod's liveness probe (Kubernetes's regular "are you alive?" check) restarting it before an actual OOM, as a workaround for a real leak, only hides the bug and still costs users dropped requests during each restart.
 
 ## 7. In production 🔴
 
-- **Real systems:** Kubernetes sets a container's memory limit as a cgroup v2 limit; crossing it invokes the kernel OOM killer against that cgroup, which sends `SIGKILL` (no graceful shutdown, no chance to flush logs) and the container reports exit code 137.
+> 🟡 → 🔴 **You now know** the three leak shapes, which metric points to which branch, how to diff heap profiles, and how `GOMEMLIMIT` works. **Next is the advanced part**: what Kubernetes actually does on an OOM, the failure patterns seen in real services, and the GC internals (escape analysis, mark-sweep, RSS vs heap) interviewers ask about.
+
+
+- **Real systems:** Kubernetes sets a container's memory limit as a cgroup v2 limit; crossing it invokes the kernel OOM killer against that cgroup, which sends `SIGKILL` (an instant, unblockable kill signal: no graceful shutdown, no chance to flush logs) and the container reports exit code 137.
 
   Continuous-profiling tools (Pyroscope, Grafana's Parca) exist specifically so a profile from the exact moment of a leak is available after the fact, without having to reproduce it live.
 - **Failure modes → fixes:**
@@ -409,11 +483,11 @@ func TestBoundedCacheEvictsLeastRecentlyUsed(t *testing.T) {
 - **Concurrent mark-sweep, `GOGC`, `GOMEMLIMIT` together.** Go's GC is concurrent (it runs alongside your goroutines, with short stop-the-world pauses only at the very start and end of a cycle) and uses a mark-sweep algorithm: starting from roots, mark everything reachable, then sweep (free) everything unmarked.
 
   `GOGC=100` (the default) triggers the next cycle when live heap has doubled since the last one — a ratio-based trigger with no idea what a container's actual memory ceiling is. `GOMEMLIMIT` adds an absolute ceiling on top: the runtime will collect more aggressively (even running concurrent GC more often, and in extreme cases forcing non-concurrent collections) as live heap approaches the limit, trading CPU to avoid crossing it.
-- **RSS vs. heap: why they diverge.** Go's runtime returns freed memory pages to the OS lazily (a background "scavenger" goroutine, and more eagerly since Go 1.16's madvise-based changes) — so RSS can stay elevated for a while after the Go heap itself has shrunk, which is not a leak, just delayed reclamation.
+- **RSS vs. heap: why they diverge.** Go's runtime returns freed memory pages to the OS lazily (a background "scavenger" goroutine, and more eagerly since Go 1.16's madvise-based changes; madvise is the system call that tells the OS "you can take these pages back") — so RSS can stay elevated for a while after the Go heap itself has shrunk, which is not a leak, just delayed reclamation.
 
   True divergence (RSS far above anything the Go heap or goroutine stacks can account for) more often points at cgo allocations (memory the Go GC doesn't scan or manage at all) or fragmentation from an allocation pattern with many different object sizes.
 - **Goroutine profile, `debug=2`.** `/debug/pprof/goroutine?debug=2` dumps every goroutine's full stack trace in human-readable text — the single fastest way to find a leak's *shape*: thousands of goroutines all blocked at the identical line of code is the leak; a handful of genuinely different stacks are probably just normal concurrent work.
-- **Reproducing under load.** A leak that only shows up after hours of real traffic is hard to catch in a unit test; the practical approach is periodic heap snapshots under a sustained load test (k6, a soak test — see [[Latency, Percentiles and Bottleneck Analysis]] for load-generation correctness) with `-base` diffs taken every 10–15 minutes, which turns "wait six hours for a restart" into "see the growing allocation site in twenty minutes."
+- **Reproducing under load.** A leak that only shows up after hours of real traffic is hard to catch in a unit test; the practical approach is periodic heap snapshots under a sustained load test (k6, a soak test, meaning steady load for hours — see [[Latency, Percentiles and Bottleneck Analysis]] for load-generation correctness) with `-base` diffs taken every 10–15 minutes, which turns "wait six hours for a restart" into "see the growing allocation site in twenty minutes."
 
 ## 9. Interview questions 🔴
 
@@ -444,6 +518,30 @@ func TestBoundedCacheEvictsLeastRecentlyUsed(t *testing.T) {
 - RSS and the Go heap are different numbers; RSS staying elevated briefly after the heap shrinks is normal lazy reclamation, not a leak.
 - `GOMEMLIMIT` (Go 1.19+) lets the GC react to a container's memory ceiling before the kernel's OOM killer does — set it to ~90% of the limit.
 - Never expose `net/http/pprof` on a public listener; bind it internally only.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is a memory leak in Go?
+> Memory the program still points to by mistake, so the GC is not allowed to free it.
+
+> [!question]- Name the three everyday Go leaks.
+> A goroutine stuck forever, a map or cache that only grows, and (before Go 1.23) `time.After` in a hot loop.
+
+> [!question]- What does OOMKilled (exit code 137) mean?
+> The container used more memory than its limit and the kernel killed it.
+
+🟡 Medium
+
+> [!question]- Memory and `go_goroutines` both climb with traffic. What do you check first?
+> A goroutine profile with `debug=2`, looking for thousands of goroutines on the same blocked line.
+
+> [!question]- How do you find which code is growing the heap?
+> Take two heap profiles 10+ minutes apart and run `go tool pprof -base old new`.
+
+> [!question]- Container limit 1 GB. What `GOMEMLIMIT` would you start with?
+> About 90%, roughly 900 MiB, leaving room for stacks and memory not yet returned to the OS.
 
 ## Links
 

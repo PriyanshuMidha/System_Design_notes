@@ -31,6 +31,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (commands vs events, choreography, event styles), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Queues vs Streams and Broker Comparison]]: a broker holds messages between a sender and its receivers, so they do not have to be online at the same time.
+> - [[Monolith vs Microservices]]: a system can be split into separate services, each deployed on its own and owning one job.
+
 **From zero, in 60 seconds** 🟢
 
 Normally one service calls the others directly: "charge the card", "send the email".
@@ -80,6 +84,10 @@ That shout is an event, and building systems around such shouts is event-driven 
 | Publish / subscribe | Sender posts a message; anyone interested receives a copy | Email and loyalty both get `order.placed` |
 | Coupling | How much one service must know or change because of another | Orders must redeploy when email changes |
 | Eventually consistent | All copies agree, but only after a short delay | Points show up 2 seconds after checkout |
+| Event vs command | "This happened" for anyone / "do this" for one receiver | `order.placed` vs `ChargeCard` |
+| Outbox | A table where a service saves the event in the same transaction as its data change; a relay publishes it later | `outbox` row next to the new order |
+| Choreography / orchestration | Services react to each other's events / one coordinator tells each service what to do | Saga without or with a boss |
+| Idempotent | Safe to run twice: the second run changes nothing | Points added once even if the event arrives twice |
 
 **Picture it**
 
@@ -107,7 +115,7 @@ Where it breaks: a paper notice is read once and in order; real events can arriv
 
 ## 1. Why it exists 🟢
 
-An orders service in a monolith-turned-microservices system calls, on every checkout: payments, inventory, email, loyalty, analytics and fraud. That is 6 synchronous calls.
+An orders service in a **monolith**-turned-microservices system (a monolith is one big program that does everything) calls, on every checkout: payments, inventory, email, loyalty, analytics and fraud. That is 6 synchronous calls.
 
 If each is 99.9% available, the chain is about 0.999^6 ≈ 99.4% available, so roughly 6 in 1,000 checkouts hit some failure (an estimate that assumes independent failures).
 
@@ -116,6 +124,8 @@ Each new team that wants to "know about orders" needs a code change and a deploy
 With events, the orders service commits the order and publishes `order.placed`. Payments, email, loyalty, analytics and fraud subscribe.
 
 The orders service no longer changes when the 7th consumer arrives, and an email outage does not fail checkouts.
+
+**Real-life example.** When you order food on Zomato, one "order placed" moment sets off many things: the restaurant's tablet rings, a delivery partner is searched for, you get a notification, and analytics counts the order. None of these should be able to break your checkout if they are slow. That is the event-driven idea: the order service announces the fact once, and each of those parts listens and does its own job.
 
 The cost: the business process "place order" now lives in six codebases, and its state is **eventually consistent** (the loyalty balance is updated a few hundred milliseconds or minutes later, not inside the checkout transaction).
 
@@ -150,11 +160,28 @@ flowchart LR
     end
 ```
 
+## Common beginner mistakes 🟢
+
+- **Naming an event after the reaction you want (`SendWelcomeEmail`)** → that is a command in disguise, and the publisher is now tied to one consumer → publish the fact, `user.registered`, and let the email service decide.
+- **Publishing the event right after `COMMIT`** → if the process dies in between, the order exists but the event is lost forever → save the event in an outbox row in the same transaction.
+- **Assuming each event arrives exactly once, in order** → brokers redeliver and can reorder → make consumers skip duplicates by event id and use version numbers.
+- **Using an event when you need an answer right now** → nobody replies to an event, so the caller cannot continue → use a direct call for things like "is this card valid?".
+- **Letting a long business flow live as a chain of reactions across ten services** → nobody can see where order 42 is stuck → move long flows with refunds into one orchestrator.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that an event is a past-tense fact that anyone may react to, and that a command is a request to one receiver. **Next we open the box**: how the arrows of dependency flip, how a checkout runs as a chain of reactions, and how much data each event should carry.
 
 ### Commands vs events
 
 **In plain words:** a command is "please do X", sent to one service that can say no. An event is "X happened", and anyone may listen.
+
+**Step by step:**
+1. Command style: the orders service sends `ChargeCard` to payments, `SendReceipt` to email and `AddPoints` to loyalty. It must know all three.
+2. The analytics team wants order data. The orders team must change and redeploy their code to send one more command.
+3. Event style: the orders service publishes one event, `order.placed`, to the bus. It does not know who listens.
+4. Payments, email and loyalty each subscribe to `order.placed`.
+5. Analytics simply subscribes too. The orders service does not change at all.
 
 ```mermaid
 flowchart LR
@@ -202,13 +229,20 @@ sequenceDiagram
 Steps:
 
 1. The publisher changes its own state and records the event **in the same database transaction** (an outbox row). A relay publishes it. Publishing directly after commit is a **dual write**: if the process dies between commit and publish, the event is lost forever. See [[Transactional Outbox and CDC]].
-2. The broker delivers the event to each subscriber (each has its own queue or consumer group).
+2. The broker delivers the event to each subscriber (each has its own queue or **consumer group**: a named set of workers that share one copy of the event stream).
 3. Each subscriber does its local work in its own transaction and may publish new events.
 4. No service holds the whole flow. When a later step fails, earlier steps are undone by compensating events. The full pattern, including when to switch to a central **orchestrator**, is in [[Saga Pattern]].
 
 ### Two event styles
 
 **In plain words:** an event can be a short ping ("order 42 changed, ask me for details") or a full copy of the data, so readers never need to call back.
+
+**Step by step:**
+1. Thin style: orders publishes `order.placed {order_id: 42}`.
+2. Billing receives it and calls `GET /orders/42` to learn the total. If the orders service is down, billing is stuck.
+3. Fat style: orders publishes `order.placed {order_id: 42, ship_to_city: Pune, total: 1999}`.
+4. Shipping receives it, saves "order 42 → Pune" in its own table, and never calls back.
+5. The trade: fat events keep consumers working when orders is down, but every field you add is a promise you must keep.
 
 ```mermaid
 sequenceDiagram
@@ -255,7 +289,7 @@ publish(e):
 
 **In plain words:** a tiny event bus in Go that gives each event to every subscriber, so you can watch both event styles work.
 
-The bus below is the in-memory version of what a broker does for a topic: deliver to every subscriber of a type, independently. The envelope follows the CloudEvents core attribute names (`id`, `source`, `type`, `time`) plus a version number.
+The bus below is the in-memory version of what a broker does for a topic: deliver to every subscriber of a type, independently. The envelope follows the **CloudEvents** (an industry standard for the common fields of an event) core attribute names (`id`, `source`, `type`, `time`) plus a version number.
 
 ```go
 // Package eda shows an in-process event bus with a versioned envelope,
@@ -446,10 +480,10 @@ Run with `go test -race ./eda` (Go 1.24): all 4 tests pass. They show:
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
-| Synchronous request/response | Caller waits for the callee | Caller needs the answer now (price, auth, stock check before payment) | Temporal coupling; availability multiplies down the chain |
+| Synchronous request/response | Caller waits for the callee | Caller needs the answer now (price, auth, stock check before payment) | **Temporal coupling** (both must be up at the same moment); availability multiplies down the chain |
 | Command via queue | One named receiver, async | A job must be done by a specific service, with retries | Sender knows the receiver |
 | Event notification | Thin event, consumers call back | Data changes often, consumers need the freshest state, few consumers | Callback load; publisher must be up |
-| Event-carried state transfer | Fat event with the needed data | Many consumers, publisher outages must not spread, consumers keep local read models ([[CQRS]]) | Larger contract, duplicated data, schema evolution matters |
+| Event-carried state transfer | Fat event with the needed data | Many consumers, publisher outages must not spread, consumers keep local **read models** (their own copy of the data, shaped for their queries) ([[CQRS]]) | Larger contract, duplicated data, schema evolution matters |
 | Event sourcing | Events are the system of record | Audit, temporal queries, rebuilding projections | Hard to change past events; snapshots and upcasting |
 | Choreography | Services react to each other's events | Few steps, independent teams, flow rarely changes | Flow is implicit; hard to answer "where is order 42?" |
 | Orchestration | A coordinator sends commands and waits for replies | Many steps, compensation logic, need visibility | Central component to build and run ([[Workflow Engines and Durable Execution]]) |
@@ -459,11 +493,13 @@ Run with `go test -race ./eda` (Go 1.24): all 4 tests pass. They show:
 - **Eventual consistency is user-visible.** After checkout the "My points" page may lag. Design the UI for it ("points arrive within a minute") or keep that read synchronous.
 - **Hidden coupling.** Consumers depend on field names, meanings and timing of events they do not own. Renaming `total` to `amount` silently breaks three teams. Treat events as public APIs with versioning and a registry ([[Event Schemas and Schema Registry]]).
 - **Event spaghetti.** With 40 event types and 15 services reacting to each other, nobody can draw the order flow. Signs: cycles (A reacts to B reacts to A), and incidents that need five teams to trace. Fix: name the business process, move it to an orchestrator, keep choreography for simple fan-out.
-- **Debugging needs tooling.** Without a correlation id in every event and tracing across the broker, "why was order 42 not shipped?" takes hours. Propagate trace context in message headers ([[Distributed Tracing with OpenTelemetry]]).
-- **Duplicates and reordering are normal.** At-least-once delivery means every consumer must be idempotent ([[Delivery Semantics and Exactly-Once]]), and must handle `order.cancelled` arriving before `order.placed` ([[Message Ordering and Partition Keys]]).
+- **Debugging needs tooling.** Without a **correlation id** (one id copied into every event of the same business flow) in every event and tracing across the broker, "why was order 42 not shipped?" takes hours. Propagate trace context in message headers ([[Distributed Tracing with OpenTelemetry]]).
+- **Duplicates and reordering are normal.** **At-least-once** delivery (the broker retries until it is sure, so a message may arrive twice) means every consumer must be idempotent ([[Delivery Semantics and Exactly-Once]]), and must handle `order.cancelled` arriving before `order.placed` ([[Message Ordering and Partition Keys]]).
 - **Do not use events** for a request that needs an answer to continue, inside a single small service, or as a way to avoid deciding which team owns a process.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** commands vs events, how choreography runs a checkout, the two event styles, and how to build a tiny bus in Go. **Next is the advanced part**: real brokers, naming rules that age well, production failures, and where to draw event boundaries so they stay stable for years.
 
 - **Real systems:** event buses are usually Kafka, SNS + SQS, EventBridge, or Pulsar ([[Queues vs Streams and Broker Comparison]]). Debezium turns database changes into events without touching application code. AWS EventBridge routes events by content with rules, and its schema registry can discover event shapes.
 - **Naming conventions that age well:**
@@ -477,11 +513,11 @@ Run with `go test -race ./eda` (Go 1.24): all 4 tests pass. They show:
 	- Breaking schema change → additive changes only; new major version as a new type; consumers ignore unknown fields.
 	- Infinite loop between two services → never react to your own events; add a hop count or a cause id.
 	- Slow consumer backlog → per-consumer queues and lag alerts, so one slow consumer does not slow the others.
-- **What to monitor:** publish rate and errors per event type, consumer lag or oldest-message age per subscriber, DLQ depth, end-to-end latency from `time` in the envelope to processing, and outbox backlog.
+- **What to monitor:** publish rate and errors per event type, consumer lag or oldest-message age per subscriber, DLQ (dead letter queue: where messages that keep failing are parked) depth, end-to-end latency from `time` in the envelope to processing, and outbox backlog.
 
 ## 8. Deep dive 🔴
 
-**Where to draw event boundaries.** Events are most stable when they cross a bounded context boundary ([[Domain-Driven Design - Strategic Design]]). Inside one context, use domain events in-process; at the edge, publish **integration events** with a deliberately smaller, stable schema. Publishing internal domain events directly leaks your model and freezes it.
+**Where to draw event boundaries.** Events are most stable when they cross a **bounded context** boundary (the edge of one team's part of the business, with its own words and model) ([[Domain-Driven Design - Strategic Design]]). Inside one context, use domain events in-process; at the edge, publish **integration events** with a deliberately smaller, stable schema. Publishing internal domain events directly leaks your model and freezes it.
 
 **Fat vs thin is a spectrum, and "delta" events are a trap.**
 
@@ -489,7 +525,7 @@ An event like `order.updated {changed: {status: "paid"}}` forces every consumer 
 
 Prefer either a thin notification or a full snapshot of the fields consumers need. Snapshots make reordering harmless if each carries a version: the consumer applies an event only if `event.version > stored.version`.
 
-**Ordering scope.** A broker orders events per partition, per message group, or per queue. Put all events for one aggregate (one order) under the same key so they stay ordered relative to each other. Across aggregates there is no order, and you should not need one.
+**Ordering scope.** A broker orders events per partition, per message group, or per queue. Put all events for one **aggregate** (one business object that changes as a unit, such as one order) under the same key so they stay ordered relative to each other. Across aggregates there is no order, and you should not need one.
 
 **Time.** `time` in the envelope is the producer's clock, which can be skewed by seconds between hosts. Use it for latency metrics and humans, not for ordering decisions. Use per-aggregate version numbers for ordering.
 
@@ -535,6 +571,30 @@ flowchart LR
 - Consumers are idempotent (dedupe by event id) and tolerate reordering (versions).
 - Choreography for simple fan-out; orchestration (saga coordinator, workflow engine) for long flows with compensation.
 - Envelope: id, source, type, version, time, correlation id, data.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Is `order.placed` an event or a command?
+> An event: a past-tense fact that anyone may react to.
+
+> [!question]- Does the publisher of an event know who is listening?
+> No. It publishes the fact; subscribers decide for themselves.
+
+> [!question]- What is eventual consistency in a checkout?
+> Other parts, like loyalty points, catch up a little later instead of inside the checkout itself.
+
+🟡 Medium
+
+> [!question]- Why is "commit, then publish" unsafe?
+> If the process dies between the two, the data is saved but the event is lost; use an outbox.
+
+> [!question]- When is a thin (id-only) event better than a fat one?
+> When consumers need the freshest data, there are few of them, and the publisher can handle the call-backs.
+
+> [!question]- How do you handle events for one order arriving out of order?
+> Send them with the order id as the key so they stay in order, and skip any event whose version is not newer than the stored one.
 
 ## Links
 

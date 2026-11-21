@@ -32,6 +32,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+> - [[Back-of-the-Envelope Estimation]]: turning 100 million links a day into writes per second and terabytes.
+> - [[Unique ID Generation]]: ways for many servers to hand out numbers that never repeat.
+
 **From zero, in 60 seconds** 🟢
 
 A URL shortener turns a long web address into a short one, like `sho.rt/aZ3k9Qx`.
@@ -75,6 +80,10 @@ Billions of links exist, and two links must never get the same short code.
 | Collision | Two different links getting the same code | Must never happen |
 | Cache | A fast copy of popular answers in memory | Hot codes served from Redis |
 
+| Range allocator | A small service that hands each server a block of unused numbers | server 3 gets 1,000-1,999 |
+| Conditional put | "Save this only if the key does not exist yet" | `PutItem ... IF attribute_not_exists(code)` |
+| CDN | Servers near users that cache responses | a viral link answered from a nearby edge |
+
 **Picture it**
 
 ```mermaid
@@ -116,6 +125,13 @@ Long URLs break in SMS messages, printed posters and tweets with character limit
 - Availability of redirects matters more than availability of creation: a broken printed QR code cannot be reprinted. Target 99.99% for redirects.
 - Codes must never collide and must not be guessable in sequence if links are private (see section 8).
 
+### Real-life example: an SMS from your bank 🟢
+
+Banks and shops in India often send SMS messages with short links, because a full web address with tracking codes would not fit in one message.
+You tap the short link and, a split second later, your browser is on the long page.
+The company also sees how many people tapped, from which cities, and on which days.
+Links in a festive-sale SMS may stop working after the sale ends; that is link expiry.
+
 **Out of scope**: user accounts and billing, link editing after creation, a link-preview page, QR-code rendering.
 
 ## 2. Mental model 🟢
@@ -126,7 +142,24 @@ Two ideas carry the whole design:
 1. **The write path is an ID problem.** Turn a unique number into a short string. Uniqueness is the job of [[Unique ID Generation]]; base62 is just the encoding.
 2. **The read path is a cache problem.** A redirect is a single-key lookup with a 100:1 read ratio, the best case for [[Caching Patterns]] (cache-aside) and [[CDN and Edge]].
 
+## Common beginner mistakes 🟢
+
+- **Hashing the long URL and keeping the first 7 characters** → two URLs can get the same code, so every write needs a check and retry → turn a unique counter into base62.
+- **One database counter for every server** → a single bottleneck and point of failure → give each server a block of 1,000 numbers at a time.
+- **Counting clicks with `UPDATE clicks = clicks + 1` on each redirect** → a viral link becomes a hot row → send click events to Kafka and count in the background.
+- **Using 301 when you need analytics** → browsers cache it and skip your server on repeat clicks → use 302 if every click must be counted.
+- **Checking "is this alias free?" then saving it** → two users can grab the same alias at once → use a conditional put and let the store pick the winner.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the two halves: making a unique short code, and looking it up fast. **Next we open the box**: the write path with blocks of numbers, and the read path through the CDN, Redis and the key-value store.
+
+**Step by step (plain):**
+1. A write server has the block 125,000,000,000 to 125,000,000,999 in memory.
+2. A marketer shortens a long link. The server takes the next number, writes it in base62 as `2CRTGIz`, and saves `2CRTGIz → long URL` only if that code is new.
+3. A customer taps `sho.rt/2CRTGIz`. The CDN and Redis do not have it yet, so the redirect service reads the key-value store and caches the answer.
+4. It replies `302` with the long URL; the browser goes there.
+5. A click event goes to Kafka without slowing the reply; a background job counts it.
 
 ```mermaid
 flowchart LR
@@ -146,7 +179,7 @@ flowchart LR
     OLAP --> DASH[Owner analytics API]
 ```
 
-**Write path.** The write service holds a block of pre-reserved IDs (for example 1,000) in memory. For each create it takes the next ID, encodes it in base62, checks the URL against a malware list, and stores `code → long_url` with a conditional put. It fetches a new block from the range allocator only once per 1,000 creates.
+**Write path.** The write service holds a block of pre-reserved IDs (for example 1,000) in memory. For each create it takes the next ID, encodes it in base62, checks the URL against a malware list, and stores `code → long_url` with a conditional put (save only if the code is not already taken). It fetches a new block from the range allocator only once per 1,000 creates.
 
 ```mermaid
 sequenceDiagram
@@ -293,7 +326,7 @@ erDiagram
     CLICK_EVENTS }o--|| DAILY_CLICKS : "rolled up into"
 ```
 
-`URLS` lives in a KV store partitioned by `code` (DynamoDB or Cassandra); the access pattern is only "get by code" and "put if absent", so there are no joins and partitioning is trivial (see [[Partitioning and Sharding]]). `CLICK_EVENTS` is a Kafka topic; `DAILY_CLICKS` is a table in an OLAP store such as ClickHouse.
+`URLS` lives in a KV (key-value) store partitioned by `code` (DynamoDB or Cassandra); the access pattern is only "get by code" and "put if absent", so there are no joins and partitioning is trivial (see [[Partitioning and Sharding]]). `CLICK_EVENTS` is a Kafka topic; `DAILY_CLICKS` is a table in an OLAP store such as ClickHouse.
 
 ### Code: base62 encoding and block allocation
 
@@ -521,6 +554,14 @@ func TestTwoAllocatorsNeverCollide(t *testing.T) {
 | 307 Temporary Redirect | Temporary, method preserved | Like 302 | Every click | Same as 302 when non-GET requests are possible |
 | 308 Permanent Redirect | Permanent, method preserved | Like 301 | Undercounts | Rare for shorteners |
 
+### Things people confuse this with 🟡
+
+| Thing | What it does | How it differs from a URL shortener |
+| --- | --- | --- |
+| [[Unique ID Generation]] | Makes unique numbers across many servers | Only the first half; the shortener adds base62, lookup, caching and redirects |
+| [[Case Study - Key-Value Store]] | Stores any value by key at huge scale | The shortener is one simple user of such a store |
+| QR code | A picture that encodes a link | Just a way to carry the link; often it carries a short link so the code stays simple |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - **302 over 301 because** analytics are a product feature; the price is every click hitting the CDN or origin. If analytics are not needed, 301 with a long `Cache-Control: max-age` cuts origin traffic sharply.
@@ -537,14 +578,16 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the paths, the sizing, the API, the table and the Go allocator. **Next is the advanced part**: real building blocks, failure stories (allocator down, viral links, scans for random codes, phishing), unguessable codes, the custom alias race and expiry.
+
 - **Real building blocks (documented):**
 	- Flickr's 2010 ticket-server design used MySQL `REPLACE INTO` with `auto_increment` on two servers (odd and even IDs) to hand out unique IDs; the block allocator here is the same idea with larger reservations.
 	- DynamoDB `PutItem` with `attribute_not_exists(code)` gives a race-free "insert if absent" for custom aliases; DynamoDB TTL deletes expired items in the background, typically within a few days, so readers must still check `expires_at`.
-	- Cassandra offers `INSERT ... IF NOT EXISTS` (a lightweight transaction using Paxos), which is slower than a plain write, so use it only for custom aliases.
+	- Cassandra offers `INSERT ... IF NOT EXISTS` (a lightweight transaction using Paxos, a voting protocol between replicas), which is slower than a plain write, so use it only for custom aliases.
 	- Google Safe Browsing offers a lookup API and a local-list update API to check URLs for malware and phishing.
 - **Failure modes → fixes:**
 	- *Range allocator down* → write servers keep serving from their current block; give each server two blocks (current and next) so a 1-minute outage at 1.2k writes/s does not stop creates. Redirects are unaffected.
-	- *Viral link (hot key)* → one Redis shard takes a huge share of traffic. Put the redirect in a short CDN cache (`s-maxage=60`) or a small in-process LRU in the redirect service; see [[Hot Keys and Hot Partitions]] and [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
+	- *Viral link (hot key)* → one Redis shard takes a huge share of traffic. Put the redirect in a short CDN cache (`s-maxage=60`) or a small in-process LRU (a cache that drops the least recently used entries) in the redirect service; see [[Hot Keys and Hot Partitions]] and [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
 	- *Cache penetration by random codes* (a bot scans `/aaaaaaa`, `/aaaaaab`, ...) → every miss hits the KV store. Cache negative results for a short time, rate-limit by IP, and optionally put a Bloom filter of existing codes in front (see [[Bloom Filters and Probabilistic Data Structures]]).
 	- *Abuse: phishing links* → check on create, re-scan periodically, and let the redirect service return a warning page for flagged codes. Rate-limit creates per user and per IP ([[Rate Limiting - Algorithms and Distributed Design]]).
 	- *Kafka down* → buffer click events in memory with a bounded queue and drop when full; redirects must never block on analytics.
@@ -557,8 +600,15 @@ flowchart LR
 **In plain words:** counting 1, 2, 3 makes codes easy to guess; scramble the number before encoding it.
 
 Counter IDs produce codes such as `...0001`, `...0002`. Anyone can enumerate everyone's links. Two fixes keep the "no collision" property:
-- **Bijective scrambling.** Apply a reversible permutation to the ID before encoding, for example `code_id = (id × m) mod 62^7`. Multiplication by any `m` coprime to `62^7` (any number not divisible by 2 or 31) is a bijection on `[0, 62^7)`. Unique IDs in give unique codes out, but neighbouring IDs give unrelated codes. A small Feistel cipher over the 42-bit space is stronger.
-- **Random codes from a KGS.** A pre-generated pool of random codes; servers claim a batch with `UPDATE ... SET used = true ... RETURNING` (or delete-on-claim). The hard part moves to keeping the pool full.
+```mermaid
+flowchart LR
+    ID["next ID: 125,000,000,417"] --> S["scramble: (id × m) mod 62^7"]
+    S --> B["base62 encode"]
+    B --> C["code looks random, never repeats"]
+```
+
+- **Bijective scrambling** (a one-to-one shuffle: every ID maps to a different number and back). Apply a reversible permutation to the ID before encoding, for example `code_id = (id × m) mod 62^7`. Multiplication by any `m` coprime to `62^7` (any number not divisible by 2 or 31) is a bijection on `[0, 62^7)`. Unique IDs in give unique codes out, but neighbouring IDs give unrelated codes. A small Feistel cipher over the 42-bit space is stronger.
+- **Random codes from a KGS** (key generation service, which pre-makes random codes). A pre-generated pool of random codes; servers claim a batch with `UPDATE ... SET used = true ... RETURNING` (or delete-on-claim). The hard part moves to keeping the pool full.
 
 Scrambling hides sequence, not existence: with 182.5B of 3.52T codes used (5.2%), a random 7-character guess hits a real link about 1 time in 19 (an estimate from that ratio). Private links therefore need longer codes (10+ characters) or authentication, not just scrambling.
 
@@ -602,6 +652,26 @@ Expiry has two halves:
 
 > [!question]- Should the same long URL always get the same code?
 > Only if the product wants it. Deduping needs an index on `long_url` (or its hash) per owner, which adds a lookup to every write. Most shorteners give each create its own code because different owners want separate analytics.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is base62?
+> Writing numbers with 62 symbols: 0-9, a-z and A-Z.
+
+> [!question]- Easy: about how many codes do 7 base62 characters give?
+> About 3.5 trillion.
+
+> [!question]- Easy: which status code would you use if you need every click counted?
+> 302, because browsers do not cache it by default.
+
+> [!question]- Medium: 10 billion redirects a day. What is the average rate?
+> About 116,000 a second.
+
+> [!question]- Medium: why hand each server a block of 1,000 IDs?
+> It only talks to the allocator once per 1,000 links, and blocks never overlap, so codes never collide.
+
+> [!question]- Medium: a bot requests `/aaaaaaa`, `/aaaaaab`, ... Every request misses the cache. What do you do?
+> Cache "not found" results briefly and rate-limit by IP.
 
 ## 10. Cheat sheet 🟢
 

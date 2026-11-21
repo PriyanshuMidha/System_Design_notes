@@ -31,6 +31,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (write path, outbox table, relay designs), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Transactions and ACID]]: writes inside one transaction all happen or none do, even if the process crashes.
+> - [[Queues vs Streams and Broker Comparison]]: a broker such as Kafka carries messages from one service to others.
+> - [[Delivery Semantics and Exactly-Once]]: messages can arrive twice, so consumers must skip duplicates by id.
+
 **From zero, in 60 seconds** 🟢
 
 When an order is placed, you must do two things: save it in the database, and tell other services.
@@ -77,6 +82,10 @@ You paid, but no pizza and no email.
 | WAL | The database's append-only log of every change | PostgreSQL's `pg_wal` files |
 | CDC | Change data capture: reading the WAL to see every change | Debezium streaming new rows |
 | Idempotent consumer | A receiver that handles the same message twice safely | Skip event id 1 if already seen |
+| Dual write | Writing to two systems (database and broker) with no shared transaction | Commit order, then publish event |
+| Aggregate | The one business object an event is about | Order `o-1` |
+| Inbox | A consumer-side table of event ids already handled | Insert `event_id`, skip if it exists |
+| Debezium | An open-source tool that reads a database's change log and publishes the changes to Kafka | Streams new outbox rows |
 
 **Picture it**
 
@@ -110,7 +119,7 @@ There are only two naive orders of operations, and both break.
 
 | Order | Crash point | Result |
 | --- | --- | --- |
-| Commit, then publish | Process dies (deploy, OOM kill) after `COMMIT`, before `Publish` | The order exists, nobody hears about it. Billing never charges; the customer never gets an email. |
+| Commit, then publish | Process dies (deploy, OOM kill: the system stopping a process that used too much memory) after `COMMIT`, before `Publish` | The order exists, nobody hears about it. Billing never charges; the customer never gets an email. |
 | Publish, then commit | Publish succeeds, then the `INSERT` fails (constraint violation, deadlock, lost connection) | Consumers act on an order that does not exist. Billing charges a phantom order. |
 
 This is the **dual-write problem**: two systems, no shared transaction. Retrying does not fix it, because the process that would retry is the one that crashed.
@@ -119,7 +128,9 @@ The numbers are not exotic. Suppose a service does 2,000 orders per second, and 
 
 That still loses about 1.7 events a day (2,000 × 86,400 × 10⁻⁸ ≈ 1.7), and each lost event is a support ticket and a manual fix.
 
-Distributed transactions (two-phase commit, XA) across PostgreSQL and Kafka are not an option: Kafka does not take part in XA, and 2PC adds a blocking coordinator anyway.
+**Real-life example.** On BookMyShow, when your seats are booked, the booking row is saved and a "booking confirmed" event must reach the ticket-email service and the theatre's system. If the server restarted between those two steps, you could pay and hold seats but never get a ticket email. Writing the booking and the event into the same database transaction, and letting a relay send the event afterwards, means the email may be sent twice in rare cases but is never silently lost.
+
+Distributed transactions (two-phase commit, XA: protocols where a coordinator makes several systems commit together) across PostgreSQL and Kafka are not an option: Kafka does not take part in XA, and 2PC adds a blocking coordinator anyway.
 
 **The dual-write problem, both ways:**
 
@@ -145,6 +156,14 @@ If the clerk is sick, letters wait in the tray; they are never lost. If the cler
 	- **Log tailing (CDC):** a reader of the database's write-ahead log (WAL, the append-only file the database writes every change to before applying it; see [[Storage Engines - B-tree vs LSM and WAL]]). Debezium is the common tool.
 - **Idempotent consumer:** the recipient who ignores a letter with a reference number it has already handled (owned by [[Delivery Semantics and Exactly-Once]]).
 
+## Common beginner mistakes 🟢
+
+- **Committing, then publishing to the broker directly** → a crash in between loses the event forever → write the event to the outbox in the same transaction.
+- **Assuming the relay sends each event once** → a relay that crashes after publishing but before marking the row sends it again → make every consumer skip duplicates by `event_id`.
+- **Tracking "last published id" and querying `id > last`** → ids are handed out before commit, so a slow transaction's row can be skipped forever → query rows where `published_at IS NULL`, or use CDC.
+- **Never cleaning the outbox** → millions of sent rows slow the relay and vacuum → delete sent rows in batches, or drop old daily partitions.
+- **Leaving a CDC replication slot unwatched** → if the reader stops, the database keeps all its log files and can fill the disk → alert on slot lag and set `max_slot_wal_keep_size`.
+
 **The office out-tray, drawn:**
 
 ```mermaid
@@ -156,9 +175,18 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the dual-write problem and the fix: save the event in an outbox table in the same transaction, and let a relay send it. **Next we open the box**: the exact write path, what the outbox table holds, and the two ways a relay can find new rows.
+
 ### The write path
 
 **In plain words:** one transaction writes the order and its message together; the relay sends the message later, so either both happen or neither does.
+
+**Step by step:**
+1. `POST /orders` arrives. The service runs `BEGIN`.
+2. It inserts the order `o-1` and, in the same transaction, an outbox row `OrderPlaced {order: o-1}`.
+3. `COMMIT`. Now both rows exist, or, after a crash, neither does.
+4. The relay finds the unsent outbox row, publishes it to Kafka, and waits for the broker's "got it".
+5. It marks the row `published_at = now()`. If it crashes before marking, it publishes the row again later.
 
 ```mermaid
 sequenceDiagram
@@ -191,6 +219,12 @@ Crash analysis:
 
 **In plain words:** a plain table with one row per message to send: who it is about, what kind of event, the payload, and when it was sent.
 
+**Step by step (one row's fields):**
+1. `event_id`: a unique id, for example a UUID, that consumers use to spot duplicates.
+2. `aggregate_type` and `aggregate_id`: "order" and `o-1`, which decide the topic and the message key.
+3. `event_type` and `payload`: `OrderPlaced` and its JSON data.
+4. `published_at`: empty until the relay has sent it.
+
 ```sql
 CREATE TABLE outbox (
     id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -213,6 +247,13 @@ CREATE INDEX outbox_unsent ON outbox (id) WHERE published_at IS NULL;
 ### Two relay designs
 
 **In plain words:** the relay either asks the table "anything new?" every second, or reads the database's own change log as it is written.
+
+**Step by step:**
+1. Polling relay: every 100 ms it asks "give me up to 100 unsent rows, oldest first, skipping rows another relay has locked".
+2. It publishes each one, then marks them sent.
+3. CDC relay: Debezium instead reads PostgreSQL's change log through a replication slot, a bookmark the database keeps for it.
+4. Every committed insert into `outbox` shows up in that log, in commit order, and Debezium turns it into a Kafka record.
+5. Polling needs nothing new to run; CDC is faster and keeps commit order, but you must run and watch Debezium.
 
 ```mermaid
 flowchart LR
@@ -248,7 +289,7 @@ COMMIT;
 - The row locks are held while publishing, so a relay that dies mid-batch releases them when its connection drops, and another relay picks the batch up.
 - To cut latency below the polling interval, the writer can `NOTIFY outbox` in the same transaction and the relay can `LISTEN outbox`; the notification is delivered only on commit.
 
-**Log-tailing relay (CDC):** PostgreSQL logical decoding turns WAL records into row changes.
+**Log-tailing relay (CDC):** PostgreSQL **logical decoding** (a feature that reads the WAL and turns it into readable row changes) turns WAL records into row changes.
 
 1. Debezium creates a **logical replication slot** (a server-side bookmark that remembers how far this reader has confirmed) using the built-in `pgoutput` plugin.
 2. It streams every `INSERT` into `outbox`.
@@ -602,7 +643,7 @@ WHERE slot_type = 'logical';
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
 | Outbox + polling relay | Relay queries `published_at IS NULL`, publishes, marks | Default for most teams; no extra infrastructure | Polling load and latency (tens to hundreds of ms); table bloat without cleanup |
-| Outbox + CDC (Debezium) | Relay reads the WAL through a logical slot | High volume, low latency, or a platform team already runs Kafka Connect | Kafka Connect cluster to operate; slot retention risk; schema of WAL events |
+| Outbox + CDC (Debezium) | Relay reads the WAL through a logical slot | High volume, low latency, or a platform team already runs Kafka Connect (the framework that runs connectors like Debezium) | Kafka Connect cluster to operate; slot retention risk; schema of WAL events |
 | CDC on business tables (no outbox) | Debezium streams `orders` row changes directly | Feeding a search index, cache or warehouse with table state | Leaks your internal schema as the public contract; no event intent ("why did it change?") |
 | Listen to yourself | Publish only; the service consumes its own event to update its DB | Writes that can tolerate being asynchronous | The API cannot read its own write immediately; more moving parts |
 | Event sourcing | The event log *is* the state; no separate business row | Domains needing a full audit history | Big model change; see [[Event Sourcing]] |
@@ -624,6 +665,8 @@ WHERE slot_type = 'logical';
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the outbox write path, the table, the polling and CDC relays, and a tested Go relay that keeps order. **Next is the advanced part**: real CDC tools, slot and failover pitfalls, what to monitor, and the subtle identity-gap and ordering traps.
+
 - **Real systems:**
 	- Debezium's PostgreSQL and MySQL connectors with the Outbox Event Router are the common open-source CDC relay.
 	- Managed CDC services exist on the major clouds (for example AWS DMS can stream changes into Kinesis or Kafka).
@@ -632,13 +675,13 @@ WHERE slot_type = 'logical';
 	- *Idle replication slot fills the disk.* A logical slot keeps every WAL segment the reader has not confirmed. If Debezium is down for a weekend, WAL piles up until the primary runs out of disk.
 		- Fix: alert on slot lag, set `max_slot_wal_keep_size` (PostgreSQL 13+) so PostgreSQL invalidates the slot instead of dying, and enable Debezium heartbeats so a slot on a quiet database still advances.
 	- *Failover loses the slot.* Before PostgreSQL 17, logical slots existed only on the primary, so a failover forced a fresh snapshot.
-		- PostgreSQL 17 can synchronise logical slots to a physical standby: the slot must be created with `failover = true`, the standby needs `sync_replication_slots = on` together with `hot_standby_feedback = on` and a `primary_slot_name`, and the primary should list that standby's physical slot in `synchronized_standby_slots` so the logical reader never gets ahead of it.
+		- PostgreSQL 17 can synchronise logical slots to a physical standby (a replica that copies the database's raw log, ready to take over): the slot must be created with `failover = true`, the standby needs `sync_replication_slots = on` together with `hot_standby_feedback = on` and a `primary_slot_name`, and the primary should list that standby's physical slot in `synchronized_standby_slots` so the logical reader never gets ahead of it.
 		- The CDC tool must also create the slot with the failover flag (recent Debezium versions expose this as `slot.failover`).
 	- *Relay stuck on one poison row* (payload the broker rejects, e.g. too large). The whole outbox stalls behind it. Fix: after N failures, move the row to a parked state and alert; see [[Dead Letter Queues and Poison Messages]].
 	- *Outbox table bloat.* Millions of sent rows slow the scan and vacuum. Fix: delete sent rows in small batches, or partition the table by day and drop old partitions.
 	- *Order broken by parallel relays.* Two relays each grab a batch and publish concurrently, so `o-1:Paid` may land before `o-1:Placed`. Fix below in the deep dive.
 - **What to monitor:**
-	- Unsent row count and oldest unsent age (alert at, say, 30 s; pick from your SLO).
+	- Unsent row count and oldest unsent age (alert at, say, 30 s; pick from your SLO, the service-level objective: the target you promise, such as "events out within 30 s").
 	- Relay publish error rate and retries.
 	- For CDC: slot lag in bytes (`pg_wal_lsn_diff`), whether the slot is `active`, and connector status.
 	- Consumer dedupe hits: a sudden rise means the relay is replaying.
@@ -652,7 +695,7 @@ WHERE slot_type = 'logical';
 	4. A commits, and 501 is never seen.
 	- Querying on `published_at IS NULL` (a per-row flag) avoids this. CDC avoids it too, because the WAL is in commit order.
 - **Keeping per-aggregate order with several relays.** `SKIP LOCKED` spreads rows across relays with no regard to the aggregate. Options:
-	- Run one active relay (leader election through a PostgreSQL advisory lock or a lease) and scale it with bigger batches.
+	- Run one active relay (leader election through a PostgreSQL **advisory lock** (an app-chosen lock number the database holds for you) or a lease) and scale it with bigger batches.
 	- Shard the outbox: relay `k` of `n` only takes rows with `hashtext(aggregate_id) % n = k`. Same aggregate, same relay, same order.
 	- Use CDC: one connector reads the WAL sequentially.
 	- In every case, publish with `key = aggregate_id`, so the broker keeps the order within one partition; see [[Message Ordering and Partition Keys]].
@@ -709,6 +752,30 @@ sequenceDiagram
 - Order per aggregate: one relay per aggregate and `key = aggregate_id`.
 - Clean up sent rows (batch delete or drop partitions); monitor unsent count and oldest age.
 - Kafka transactions do not cover your database.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is the dual-write problem?
+> Writing to the database and the broker separately, so a crash between them leaves one done and the other not.
+
+> [!question]- What goes into the outbox, and when?
+> The event row, in the same transaction as the business change.
+
+> [!question]- Can the relay send an event twice?
+> Yes, if it crashes after publishing but before marking the row, so consumers must dedupe.
+
+🟡 Medium
+
+> [!question]- Why is `WHERE id > last_published_id` unsafe for a polling relay?
+> Ids are assigned at insert, but transactions commit in a different order, so a slower row with a lower id can be skipped.
+
+> [!question]- How do you keep per-order event order with several relays?
+> Send all events of one aggregate through one relay (shard by `aggregate_id`) and publish with `key = aggregate_id`.
+
+> [!question]- What can an idle CDC replication slot do to the database?
+> Make it keep all WAL files, until the disk fills; alert on slot lag and set `max_slot_wal_keep_size`.
 
 ## Links
 

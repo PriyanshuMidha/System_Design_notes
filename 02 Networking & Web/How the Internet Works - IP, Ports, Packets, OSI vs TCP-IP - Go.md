@@ -23,6 +23,9 @@ type: implementation
 > - 🟡 **Know the basics?** Read the Code sections in full, then Tests and Running it.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - Nothing. This note starts from zero; reading [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]] first (IP address = machine, port = program) helps.
+
 **From zero** 🟢: this file is a tiny Go program plus one test. It opens a real connection on your own machine and prints the address pair each side sees, to show that every connection gets its own unique source port — which is how one server port can talk to thousands of clients at once. Read the Concept line above each code block first; the code just acts it out.
 
 ## Before the code 🟢
@@ -56,6 +59,8 @@ go test -race -v ./...
 ```
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** the claim: every connection is named by both ends, so each gets its own source port. **Next we read the code**: a helper that prints that name, and a one-connection echo server, both run on loopback (`127.0.0.1`, your own machine talking to itself).
 
 ### Formatting the 5-tuple
 
@@ -96,7 +101,7 @@ func FiveTuple(network string, conn net.Conn) string {
 
 **In plain words:** a mini server that waits for one caller, notes the caller's full address pair, and repeats back anything said to it.
 
-**Concept.** `EchoServer` plays the server side: it accepts exactly one connection (enough for this demo), reports its own view of the 5-tuple over a channel, and then echoes back whatever bytes it reads. A real server would loop on `Accept` forever; stopping after one connection keeps the test deterministic and short-lived.
+**Concept.** `EchoServer` plays the server side: it accepts exactly one connection (enough for this demo), reports its own view of the 5-tuple over a channel, and then echoes back whatever bytes it reads. A real server would loop on `Accept` forever; stopping after one connection keeps the test deterministic (same result every run) and short-lived.
 
 ```go
 // EchoServer accepts one connection on addr, echoes whatever it reads back
@@ -118,7 +123,7 @@ func EchoServer(ln net.Listener, tuples chan<- string) {
 **How it works:**
 
 1. `ln.Accept()` blocks until a client dials in, then returns a `net.Conn` representing that one connection.
-2. `defer conn.Close()` guarantees the connection is cleaned up even if something below panics or returns early — a habit worth keeping even in a demo, since a missing `Close()` is exactly the `CLOSE_WAIT` leak described in [[Network Debugging Toolkit - dig, curl, ss, tcpdump#Sockets ss netstat]].
+2. `defer conn.Close()` guarantees the connection is cleaned up even if something below panics or returns early — a habit worth keeping even in a demo, since a missing `Close()` is exactly the `CLOSE_WAIT` leak (connections the other side closed but this program never closed) described in [[Network Debugging Toolkit - dig, curl, ss, tcpdump#Sockets ss netstat]].
 3. The tuple is sent over `tuples` and the channel is closed immediately after — the test reads exactly one value and then knows no more are coming.
 4. `io.Copy(conn, conn)` reads from the connection and writes whatever it read back to the same connection — a textbook one-line echo loop. The error is intentionally ignored because this is demo code, not production code; a real echo server would check and log it.
 
@@ -206,6 +211,8 @@ The client's line is the exact mirror: local `54665`, peer `54664` — the same 
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** how the server and test work and how to read the measured ports. **Next, the advanced part**: the design trade-offs, the close and port mistakes that leak resources or make tests flaky, and exercises.
+
 | Decision | Alternative considered | Trade-off |
 | --- | --- | --- |
 | Stop the server after one connection | Loop `Accept()` forever | Simpler, deterministic test; not representative of a real long-running server |
@@ -231,8 +238,8 @@ The race detector (`-race`) finding nothing to report means no goroutine touched
 
 ## Pitfalls in the code 🔴
 
-- **Forgetting `defer conn.Close()` on either end** would leak a file descriptor per connection — in a long-running server this is exactly the `CLOSE_WAIT` accumulation a tool like `ss -tan` would surface (see [[Network Debugging Toolkit - dig, curl, ss, tcpdump]]).
-- **`client.(*net.TCPConn).CloseWrite()`** is a half-close: it signals EOF to the server's `io.Copy` without fully closing the connection, so the client can still read the echoed bytes back. Calling `client.Close()` instead at that point would also close the read side and the test would never see the echo.
+- **Forgetting `defer conn.Close()` on either end** would leak a file descriptor (the OS's numbered handle for an open file or socket; each process has a limited number) per connection — in a long-running server this is exactly the `CLOSE_WAIT` accumulation a tool like `ss -tan` would surface (see [[Network Debugging Toolkit - dig, curl, ss, tcpdump]]).
+- **`client.(*net.TCPConn).CloseWrite()`** is a half-close (closing only the sending direction): it signals EOF (end of file: "no more data is coming") to the server's `io.Copy` without fully closing the connection, so the client can still read the echoed bytes back. Calling `client.Close()` instead at that point would also close the read side and the test would never see the echo.
 - **`net.Listen("tcp", "127.0.0.1:0")`** binds to port `0`, which tells the OS "pick any free port." Hardcoding a specific port instead would make the test flaky whenever that port is already in use on the machine running it.
 
 ## Exercises 🔴
@@ -240,6 +247,26 @@ The race detector (`-race`) finding nothing to report means no goroutine touched
 1. Change the server to loop and accept multiple connections instead of stopping after one. Predict: what has to change about `tuples` (currently closed after a single send) to support more than one client, and why would leaving it as-is cause a panic on the second send?
 2. Remove the `defer client.Close()` call and rerun the test with `-race`. Predict whether the race detector flags anything, and explain why a missing client-side close is a resource leak but not necessarily a *data* race.
 3. Change `client.(*net.TCPConn).CloseWrite()` to `client.Close()` instead. Predict what the subsequent `io.ReadFull(client, buf)` call will do, and why.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What does `FiveTuple` print?
+> The protocol plus this end's address and port, and the other end's address and port.
+
+> [!question]- 🟢 What does `127.0.0.1:0` mean in `net.Listen`?
+> Listen on this machine only, on any free port the OS chooses.
+
+> [!question]- 🟢 In the measured output, which port did the OS pick for the client?
+> `54665`, a free ephemeral port; the server's listening port was `54664`.
+
+> [!question]- 🟡 Why does the test use `CloseWrite()` instead of `Close()`?
+> It ends only the sending side, so the server's echo loop stops but the client can still read the reply.
+
+> [!question]- 🟡 Why does the server report its tuple over a channel?
+> The server runs in its own goroutine; the channel passes the result to the test safely.
+
+> [!question]- 🟡 What happens in a long-running server that forgets `conn.Close()`?
+> File descriptors leak and sockets pile up in `CLOSE_WAIT` until the process hits its limit.
 
 ## Links
 

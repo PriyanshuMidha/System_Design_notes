@@ -31,6 +31,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - Nothing. This note starts from zero. If you have ever called a web API from code, that helps, but it is not required.
+
 **From zero, in 60 seconds** 🟢
 
 An LLM (large language model) is a very big autocomplete. It reads your text and guesses the next small piece, again and again.
@@ -79,6 +82,11 @@ Knowing this one fact explains its cost, its speed, its randomness and its mista
 | Stateless | The server keeps no memory between calls | You must resend the chat history each time |
 | Context window | The max tokens the model can see in one call | Input + output must fit in the limit |
 | Hallucination | Confident output that is wrong | Inventing a function that does not exist |
+| Training | The long, costly step where the model learns from example text | Months of reading web pages and books |
+| Prompt | The text you send the model | "Summarise this email in one line" |
+| Temperature | A knob for how random the word choice is | 0 = steady, 1 = more varied |
+| Streaming | Getting the reply piece by piece as it is written | A chat bubble that fills up word by word |
+| Fine-tuning | Training an existing model a bit more on your own examples | Teaching it your company's reply style |
 
 **Picture it**
 
@@ -110,9 +118,25 @@ Where it breaks: autocomplete only suggests and you choose, while the LLM picks 
 
 A classic autocomplete suggests the next word from a small, fixed set of patterns. An LLM does the same job — predict the next piece of text — but trained on a huge amount of text with a huge model, so the "patterns" it has learned include grammar, facts, code, reasoning chains, and conversational structure.
 
-Concretely: you send an API request with a `model` name, a `max_tokens` budget, and a list of `messages`. The API bills you for **input tokens** (everything you sent: history, documents, instructions) and **output tokens** (everything it generated), typically at different per-token prices, and returns the generated message plus a `usage` field reporting both counts.
+Concretely: you send an API request with a `model` name, a `max_tokens` budget (the most tokens you allow it to write back), and a list of `messages`. The API bills you for **input tokens** (everything you sent: history, documents, instructions) and **output tokens** (everything it generated), typically at different per-token prices, and returns the generated message plus a `usage` field reporting both counts.
 
 A backend that ignores this — for example, resending a growing chat transcript every turn without ever trimming it — pays for the whole history on every single call and gets slower as the conversation grows, because the model must process every input token before it emits the first output token.
+
+### Real-life example 🟢
+
+Think of the help chat inside a food delivery app like Swiggy. You type "my order is late, where is it?".
+The app's backend sends the model a short instruction ("you are a polite support helper"), your past messages and the order status it looked up, say "rider 2 km away".
+The model writes a friendly reply word by word, and the app streams it into the chat bubble.
+On your next message, the backend sends the whole chat again, because the model remembers nothing.
+If the app forgot to include the order status, the model might simply guess a delivery time, which is a hallucination.
+
+### Common beginner mistakes 🟢
+
+- **Thinking the model remembers you** → the API keeps nothing between calls, so a follow-up like "and its population?" makes no sense to it → send the chat history again on every call.
+- **Trusting a confident answer** → the model picks likely words, not checked facts, so it can invent a refund rule → give it the real facts (from your database or documents) and check its output.
+- **Counting words or characters for cost** → you are billed per token, and Hindi or code can take 2-3 times more tokens → read the `usage` numbers the API sends back.
+- **Expecting the same answer every time** → replies are picked with some randomness, and even temperature 0 can vary → if you need the same string twice, save the first answer and reuse it.
+- **Using an LLM for a fixed rule** → "is this number above 100?" is one line of code, while an LLM call is slow, paid and can be wrong → keep plain rules in plain code.
 
 ## 2. Mental model 🟢
 
@@ -130,11 +154,31 @@ The analogy that holds up under interview questions: an LLM is a very well-read,
 
 It has no memory between tasks — every time you hand it a new task, you must re-hand it everything it needs to know.
 
+### LLM vs the things people confuse it with 🟡
+
+| Thing | What it really does | Key difference from an LLM |
+| --- | --- | --- |
+| Search engine (Google) | Finds existing pages that match your words | It returns real pages; an LLM writes new text and can make things up |
+| Phone autocomplete | Suggests one next word; you choose | An LLM picks every word itself and writes whole answers |
+| Chat app (ChatGPT, Claude.ai) | A product built around an LLM, with saved chats | The app stores your history; the raw model API does not |
+| Database | Stores facts and returns exactly what was saved | An LLM stores no exact facts, only patterns, so it can be wrong |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that an LLM is a stateless next-token guesser that you pay per token. **Next we open the box**: how it learns, how text becomes tokens, why the window has a size limit, how it picks each word, and why you must resend the chat. Each subsection starts with a plain step-by-step walk; the full detail follows.
 
 ### Training, in three stages
 
 **In plain words:** First it reads the internet to learn language, then it learns to follow instructions, then people teach it which answers are better.
+
+**Step by step:**
+1. **Pretraining:** the model reads a huge pile of text (a **corpus**: web pages, books, code) and practises guessing the next token billions of times. Now it writes fluent text but does not follow orders well.
+2. **Instruction tuning (SFT,** supervised fine-tuning: training on example pairs written by people**):** it sees pairs like "Summarise this" → a good summary, and learns to obey requests.
+3. **Preference tuning (RLHF / DPO,** methods where people rank two answers and the model learns to prefer the better one**):** it learns to be helpful and polite, not just plausible.
+4. The finished model is put behind an API. From now on it learns nothing new from your calls.
+5. So it only knows what was in its training text, up to a date called the **knowledge cutoff**.
+
+Full detail:
 
 ```mermaid
 flowchart LR
@@ -151,7 +195,16 @@ None of these stages give the model a live connection to your data or today's da
 
 **In plain words:** The model chops text into small pieces before reading. Pieces, not letters or words, are what you pay for.
 
-The model does not see characters or whole words; it sees **tokens**, the units produced by its tokeniser (a byte-pair-encoding, BPE, variant in most current frontier models). A rough estimate for English text is **about 4 characters per token** — `"hello world"` is 2 tokens, but `"supercalifragilisticexpialidocious"` might be 8–10.
+**Step by step:**
+1. You send "unbelievable price".
+2. The **tokeniser** (a small program that cuts text into known pieces) splits it into pieces such as "un", "believ", "able", " price".
+3. Each piece becomes a number from the model's fixed list of known pieces (its **vocabulary**, tens of thousands of entries).
+4. The model reads those numbers, not your letters.
+5. The bill counts pieces: about 4 English characters per token, so 1,000 words is roughly 1,300 tokens.
+
+Full detail:
+
+The model does not see characters or whole words; it sees **tokens**, the units produced by its tokeniser (a byte-pair-encoding, BPE, variant in most current **frontier models**, meaning the newest and strongest models from the big providers; BPE builds its piece list by repeatedly merging the most common pairs of letters). A rough estimate for English text is **about 4 characters per token** — `"hello world"` is 2 tokens, but `"supercalifragilisticexpialidocious"` might be 8–10.
 
 Other scripts (Hindi, Chinese, Japanese, Arabic) and code tend to tokenise less efficiently, often 2–3x more tokens for the same apparent amount of content; this is an **estimate**, not a documented constant, and it varies by tokeniser and language.
 
@@ -169,6 +222,15 @@ flowchart LR
 ### Context window and "lost in the middle"
 
 **In plain words:** The window is the model's desk: only so much paper fits. And it reads the top and bottom of the pile better than the middle.
+
+**Step by step:**
+1. Say the window is 200,000 tokens.
+2. You set `max_tokens` to 4,000, the room you keep for the reply.
+3. That leaves about 196,000 tokens for your instructions, chat history and documents.
+4. If you send more than that, the call fails or gets cut, so you must shorten, summarise or pick only the useful parts.
+5. Even when it fits, a fact buried in the middle of a long document is found less often than one at the start or end.
+
+Full detail:
 
 The **context window** is the maximum number of tokens the model can attend to in one call. A common mistake is to think of it as an input-only budget: it is actually **input tokens + output tokens combined**, as of 2026 for essentially all frontier providers — so a large `max_tokens` setting shrinks how much input history actually fits.
 
@@ -188,6 +250,15 @@ flowchart LR
 
 **In plain words:** The model scores every possible next word, then picks one. Temperature is the "how adventurous" knob.
 
+**Step by step:**
+1. Text so far: "The capital of France is".
+2. The model gives every token in its vocabulary a raw score, called a **logit**.
+3. A formula called **softmax** turns those scores into chances that add up to 1, say "Paris" 0.95, "a" 0.03, "Lyon" 0.01.
+4. **Sampling** picks one token using those chances. Low temperature almost always picks "Paris"; high temperature sometimes picks "Lyon".
+5. The chosen token is added to the text, and the loop runs again for the next one.
+
+Full detail:
+
 ```mermaid
 flowchart LR
     T["tokens so far"] --> M["model"] --> L["logits<br/>(one score per vocabulary token)"] --> S["softmax → probability<br/>distribution over tokens"] --> P["sampling<br/>(temperature, top-p, top-k)"] --> N["next token"]
@@ -197,16 +268,25 @@ flowchart LR
 The model does not output one deterministic "best" token; it outputs a probability distribution over its whole vocabulary (tens of thousands of possible tokens), and the API samples from that distribution:
 
 - **Temperature** scales the distribution before sampling. Low temperature sharpens it toward the highest-probability tokens (more stable, more repetitive); high temperature flattens it (more varied, more surprising, more likely to go off the rails).
-- **Top-p** (nucleus sampling) restricts sampling to the smallest set of tokens whose cumulative probability exceeds `p`, cutting off the long unlikely tail.
+- **Top-p** (nucleus sampling, "only consider the top slice of likely words") restricts sampling to the smallest set of tokens whose cumulative probability exceeds `p`, cutting off the long unlikely tail.
 - **Top-k** restricts sampling to the `k` most likely tokens.
 
 **Temperature 0 is not the same as deterministic.**
 
-Even at temperature 0 (always pick the top token), floating-point non-associativity in how GPUs batch requests, provider-side load balancing across replicas, and backend non-determinism can produce different output across two calls with an identical prompt. Reasoning models in particular may ignore or fix some sampling parameters entirely and expose a separate "reasoning effort" control instead (verify per provider and model). If your backend logic depends on getting the literal same string back for the same input, do not rely on sampling settings alone — cache the first response and reuse it, or use structured outputs with strict validation (see [[Structured Outputs and Tool Calling]]).
+Even at temperature 0 (always pick the top token), floating-point non-associativity in how GPUs batch requests (tiny rounding differences when the same numbers are added in a different order), provider-side load balancing across replicas (many copies of the model on different machines), and backend non-determinism can produce different output across two calls with an identical prompt. Reasoning models in particular may ignore or fix some sampling parameters entirely and expose a separate "reasoning effort" control instead (verify per provider and model). If your backend logic depends on getting the literal same string back for the same input, do not rely on sampling settings alone — cache the first response and reuse it, or use structured outputs with strict validation (see [[Structured Outputs and Tool Calling]]).
 
 ### Statelessness and multi-turn conversation
 
 **In plain words:** Like talking to someone with no memory: you repeat the whole chat each time you speak.
+
+**Step by step:**
+1. Turn 1: the user asks "What's the capital of France?". The backend sends that one message and gets "Paris."
+2. The backend saves both messages in its own store, for example a database table.
+3. Turn 2: the user asks "What's its population?". Alone, "its" means nothing to the model.
+4. So the backend sends all 3 messages: question 1, answer "Paris.", question 2.
+5. Every new turn sends the whole growing list again, so each turn costs a bit more than the last.
+
+Full detail:
 
 ```mermaid
 sequenceDiagram
@@ -234,11 +314,27 @@ This is also why every added turn costs more: you are re-billed for the entire v
 
 **In plain words:** Some models "think out loud" before answering (better but slower and pricier). Many can also read images and PDFs.
 
+**Step by step:**
+1. You ask a hard question, such as a tricky date calculation, and set an "effort" level.
+2. The reasoning model first writes hidden working notes, say 2,000 tokens.
+3. Then it writes the short final answer, say 100 tokens.
+4. You pay for all 2,100 output tokens, and you wait for all of them.
+5. A **multimodal** model (one that reads more than text) can also take a photo of a bill or a PDF page inside the same message list.
+
+```mermaid
+flowchart LR
+    Q["Hard question"] --> T["Hidden thinking<br/>(billed tokens)"]
+    T --> A["Final answer"]
+    IMG["Image or PDF"] --> Q
+```
+
+Full detail:
+
 As of 2026, a separate family of **reasoning models** (sometimes exposed as a "thinking" or "extended reasoning" mode on general-purpose models) spend extra generated tokens working through a problem step by step before producing a final answer, controlled by an "effort" or "thinking budget" setting rather than by prompting techniques like "think step by step" (which mattered more for earlier non-reasoning models; see [[Prompt Engineering]]).
 
 This extra reasoning is itself billed as output tokens, so it trades latency and cost for accuracy on harder problems, and is usually unnecessary for simple classification or extraction tasks.
 
-Most frontier models as of 2026 also accept **multimodal input** — images and PDFs alongside text, encoded in the same `messages` structure as a typed content block — which matters for AI engineering because a scanned document or a screenshot can go straight into a prompt instead of through a separate OCR step, though dedicated OCR is still often more accurate and cheaper for high-volume document pipelines (see [[Document Ingestion and Chunking]]).
+Most frontier models as of 2026 also accept **multimodal input** — images and PDFs alongside text, encoded in the same `messages` structure as a typed content block — which matters for AI engineering because a scanned document or a screenshot can go straight into a prompt instead of through a separate OCR step, though dedicated OCR (software that turns a picture of text into real text) is still often more accurate and cheaper for high-volume document pipelines (see [[Document Ingestion and Chunking]]).
 
 ## 4. Worked example 🟡
 
@@ -272,7 +368,7 @@ Three things worth noticing even before writing any code:
 
 1. The `system` field is a separate slot from the conversation, not just the first message (it is handled specially by the model and is a natural place for stable, cacheable instructions).
 2. `usage` is the ground truth for cost, not an estimate.
-3. `stop_reason` tells you *why* generation stopped (`end_turn` for a natural finish, `max_tokens` for a truncated answer, `tool_use` when the model wants to call a tool — see [[Structured Outputs and Tool Calling]]).
+3. `stop_reason` (a field in the reply that says why the model stopped writing) tells you *why* generation stopped (`end_turn` for a natural finish, `max_tokens` for a truncated answer, `tool_use` when the model wants to call a tool — see [[Structured Outputs and Tool Calling]]).
 
 A backend that doesn't check `stop_reason` can silently ship truncated answers as if they were complete.
 
@@ -317,13 +413,15 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how training, tokens, the window, sampling and statelessness work, and how to pick between prompting, RAG, tools and fine-tuning. **Next comes the senior view**: what breaks in real systems, what to watch on dashboards, why hallucination cannot be fully removed, and how pricing and latency are shaped.
+
 - **Real systems:** customer-support copilots that draft replies for a human to approve; code-review and code-generation assistants; semantic search and document Q&A backends (see [[Case Study - Chat with PDFs and Websites]]); structured-extraction pipelines that turn unstructured text (emails, PDFs, support tickets) into typed JSON rows for a database.
 - **Failure modes → fixes:**
   - Hallucinated fact stated confidently → ground with retrieval or tools; ask the model to cite sources and validate the citation exists.
   - Output silently truncated mid-answer → check `stop_reason`, not just that the call returned `200`.
   - Cost spike from an unbounded conversation → cap and summarise history (see [[LLM Cost, Latency and Caching]]).
   - Inconsistent output breaking a downstream parser → use the API's structured-output mode, not prose parsing (see [[Structured Outputs and Tool Calling]]).
-- **What to monitor:** input/output token counts and $ cost per request; p50/p99 latency, split into time-to-first-token and total time; error rate by status code (429 vs 5xx vs 4xx); `stop_reason` distribution (a rising share of `max_tokens` truncations is a budget bug, not a model problem).
+- **What to monitor:** input/output token counts and $ cost per request; p50/p99 latency (the typical wait, and the wait of the slowest 1 in 100 calls), split into time-to-first-token and total time; error rate by status code (429 vs 5xx vs 4xx); `stop_reason` distribution (a rising share of `max_tokens` truncations is a budget bug, not a model problem).
 
 ## 8. Deep dive 🔴
 
@@ -333,7 +431,7 @@ flowchart LR
 - **Pricing shape, not numbers.** As of 2026, providers typically bill input and output tokens at different rates (output usually costs several times more than input, since generation is the expensive step), offer a reduced rate for cached input tokens (an unchanged prompt prefix the provider doesn't have to reprocess), and offer a batch API at a further discount for requests that can tolerate asynchronous, non-urgent processing.
 
   Treat any specific per-token price you see as **documented** only if you cite the provider's current pricing page with a date, since these numbers change often; otherwise label it an estimate or leave it out.
-- **Model tiers, deliberately without hardcoded names.** Providers generally ship a frontier/flagship tier (best quality, slowest, most expensive), a small/fast tier (cheaper, lower latency, weaker at hard reasoning), and increasingly an open-weight tier you can self-host.
+- **Model tiers, deliberately without hardcoded names.** Providers generally ship a frontier/flagship tier (best quality, slowest, most expensive), a small/fast tier (cheaper, lower latency, weaker at hard reasoning), and increasingly an open-weight tier you can self-host (the model files are public, so you run it on your own servers).
 
   Pick by running your own eval set against the candidates (see [[LLM Evals in Production]]), not by assuming the newest or biggest model is best for your task — a well-prompted small model is frequently the better choice for a narrow, high-volume task.
 
@@ -385,6 +483,26 @@ flowchart LR
 - Hallucination is structural (fluent ≠ correct); fix it by grounding, not by better wording alone.
 - Pick the mechanism by the failure mode: prompting (reasoning/format), RAG (missing facts), tool calling (precise live data/actions), fine-tuning (consistent style at volume, rarely first).
 - Reasoning models spend extra output tokens "thinking"; multimodal models accept images/PDFs as typed content blocks.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: What is a token?
+> A small piece of text, about 3/4 of an English word; it is the unit you pay for.
+
+> [!question]- Easy: Does the model remember your last message?
+> No. The API is stateless, so your backend must resend the chat history on every call.
+
+> [!question]- Easy: What is a hallucination?
+> A confident answer that is wrong, because the model predicts likely words, not checked facts.
+
+> [!question]- Medium: Your `max_tokens` is huge and long documents start failing. Why?
+> The context window covers input plus output, so a big reply budget leaves less room for input.
+
+> [!question]- Medium: Temperature is 0 but two identical calls gave different answers. Is that a bug?
+> No. GPU rounding and routing across machines can still change output; cache the first answer if you need the same string.
+
+> [!question]- Medium: The model does not know your company's refund policy. Fine-tune or RAG?
+> RAG first: fetch the policy text and put it in the prompt; fine-tuning is for a steady style, not for facts that change.
 
 ## Links 🟢
 

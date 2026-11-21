@@ -29,6 +29,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs) and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[LLD Interview Method]]: the step order these notes follow: clarify, entities, APIs, storage, code, edge cases.
+> - [[State Machines in Go]]: a thing is in one named mode at a time (Idle, CardInserted), and only allowed actions move it.
+> - [[Concurrency for LLD]]: goroutines run at the same time; a mutex makes them take turns on shared data.
+
 **From zero, in 60 seconds** 🟢
 
 You walk up to a cash machine, put in your card and type your PIN. You ask for ₹600. The machine asks your bank to take ₹600 from your account, then pushes out the notes. The tricky part is the order of these steps. If the notes get stuck after the bank took the money, the machine must give the money back (a **reversal**). And it can only use the notes it actually has inside, so it must plan the exact mix first. The machine is always in one named mode, like "waiting for card" or "card in". That idea is called a **state machine**.
@@ -64,6 +69,10 @@ This note designs that machine as code that cannot lose or invent money.
 | Idempotent | Doing it twice has the same effect as once | Same transaction ID, one debit |
 | Dynamic programming (DP) | Solve a big problem by building up answers to smaller ones | Best notes for ₹100, then ₹200, ... |
 | Paise | 1/100 of a rupee; money kept as whole numbers | ₹6 = 600 paise |
+| Guard | A check at the start of a method: "is this action allowed in the current state?" | `Withdraw` before PIN gets `ErrWrongState` |
+| Greedy | Always take the biggest note first, never look back | ₹600: take ₹500, then stuck |
+| Compensating action | A step that undoes an earlier step that already happened | Reverse the debit after a jam |
+| Reconciliation | Comparing two records at day end to find mismatches | Notes counted vs notes the journal says went out |
 
 **Picture it**
 
@@ -117,8 +126,8 @@ amounts the ATM cannot make with its notes, and a cash jam after the account was
 
 - Which operations? *Assume: withdraw cash; balance enquiry, deposit and PIN change are extensions.*
 - Which denominations? *Assume: ₹500, ₹200 and ₹100, configurable; each has a limited count in the cassette.*
-- Which notes should a withdrawal use? *Assume: any exact combination, preferring the fewest notes. Real ATMs often also want a mix of small notes; that is a different objective function.*
-- Limit per withdrawal? *Assume: ₹20,000 per transaction (an example limit; real limits are set by the issuing bank).*
+- Which notes should a withdrawal use? *Assume: any exact combination, preferring the fewest notes. Real ATMs often also want a mix of small notes; that is a different objective function (the score the planner tries to make best).*
+- Limit per withdrawal? *Assume: ₹20,000 per transaction (an example limit; real limits are set by the issuing bank (the bank that gave the customer the card)).*
 - How many wrong PINs? *Assume: three, then the card is retained.*
 - Session timeout? *Assume: 2 minutes of inactivity ejects the card; the clock is injected.*
 - What if the notes jam after the bank debited the account? *Assume: reverse the debit, put the ATM out of service, and let a technician reconcile the cassette.*
@@ -133,14 +142,14 @@ amounts the ATM cannot make with its notes, and a cash jam after the account was
 
 ### Non-functional
 
-- Never give cash without a debit, and never keep a debit without giving cash: the withdrawal behaves atomically across the bank and the hardware.
+- Never give cash without a debit, and never keep a debit without giving cash: the withdrawal behaves atomically (all or nothing) across the bank and the hardware.
 - A retried debit never charges twice: the transaction ID is the idempotency key.
 - The planner never fails when an exact combination exists.
 - Money is `int64` paise; time comes from an injected clock; state is guarded by one mutex.
 
 ### Out of scope
 
-- The card network protocol (ISO 8583 messages), EMV chip cryptography and PIN block encryption.
+- The card network protocol (ISO 8583 messages, the standard card-network message format), EMV chip cryptography (the security in the card's chip) and PIN block encryption (how the PIN is hidden in transit).
 - The bank's ledger (see [[Digital Wallet and Ledger]]).
 - Physical security, cameras, receipts printing.
 
@@ -160,10 +169,10 @@ The hardest use case is **Withdraw**: it crosses two systems that can each fail,
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
-| `ATM` | state, card, pinTries, lastActive, cassette, limit, timeout, seq | The facade and the state machine; owns the lock |
+| `ATM` | state, card, pinTries, lastActive, cassette, limit, timeout, seq | The facade (one front object hiding the parts behind it) and the state machine; owns the lock |
 | `State` | Idle, CardInserted, Authenticated, OutOfService | Decides which actions are allowed |
 | Cassette | `map[int64]int` denomination to count | The limited resource the planner draws from |
-| `Bank` | `VerifyPIN`, `Debit`, `Reverse` | The external system of record for money |
+| `Bank` | `VerifyPIN`, `Debit`, `Reverse` | The external system of record (the one place whose numbers count) for money |
 | `Dispenser` | `Dispense(notes)` | The hardware; all notes or none |
 | `Receipt` | TxnID, Card, Amount, Notes, At | What a successful withdrawal returns |
 | Transaction ID | `ATM1-000042` | Idempotency key for debit and reversal |
@@ -171,6 +180,8 @@ The hardest use case is **Withdraw**: it crosses two systems that can each fail,
 Modelling insight: the **ATM does not own money**; the bank does. The ATM owns only the physical notes. That is why the debit happens at the bank with an idempotency key and the ATM's own state (the cassette count) changes only after the hardware succeeds.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know the four states, why the bank owns the money and the ATM owns only the notes, and why withdraw is the hard part. Next we open the box: how the parts link, the interfaces, the journal on disk, and the Go code for the safe withdraw order.
 
 ```mermaid
 classDiagram
@@ -287,7 +298,7 @@ WHERE txn_id = $1 AND status = 'debited';
 Patterns not used, and why:
 
 - No State pattern objects (one struct per state): four states and short guards; a `switch` on a field reads better. Use state objects when each state carries a lot of behaviour, as discussed in [[Vending Machine]].
-- No two-phase commit with the hardware: a cash dispenser cannot "prepare" and wait; it can only dispense or fail. A compensating reversal is the realistic choice.
+- No two-phase commit (a protocol where every party first promises "I can commit", then all commit together) with the hardware: a cash dispenser cannot "prepare" and wait; it can only dispense or fail. A compensating reversal is the realistic choice.
 
 ## Folder structure 🟡
 
@@ -328,7 +339,7 @@ For ₹20,000 with ₹100 as the unit that is 201 entries and at most 41 + 101 +
 
 1. Lock. Expire the session if idle too long. Require `Authenticated`. Validate `0 < amount <= limit`.
 2. Plan the notes from the current cassette. No plan: `ErrCannotDispense`, and nothing was debited.
-3. New transaction ID, `Debit`. A decline or error: call `Reverse(txnID)` anyway, because a timeout can hide a debit the bank applied (for a plain decline the reversal is a no-op), then return the error; the cassette is untouched and the session continues. The bank must remember a reversal for a txn ID it has not seen yet, so a debit that arrives late is refused rather than applied.
+3. New transaction ID, `Debit`. A decline or error: call `Reverse(txnID)` anyway, because a timeout can hide a debit the bank applied (for a plain decline the reversal is a no-op (does nothing)), then return the error; the cassette is untouched and the session continues. The bank must remember a reversal for a txn ID it has not seen yet, so a debit that arrives late is refused rather than applied.
 4. `Dispense(notes)`. On failure: `Reverse(txnID)` using `context.WithoutCancel` (Go 1.21+) plus its own timeout, so a cancelled request cannot skip the refund; go `OutOfService` because the cassette count is now uncertain.
 5. On success: subtract the notes from the cassette, return the receipt.
 
@@ -614,7 +625,7 @@ func gcd(a, b int64) int64 {
 
 ## Test cases 🟡
 
-Fakes for the bank, the hardware and the clock make every path deterministic. Run with `go test -race ./...` (Go 1.24.4, all pass).
+Fakes for the bank, the hardware and the clock make every path deterministic (same result every run). Run with `go test -race ./...` (`-race` turns on Go's race detector, which flags unsafe shared access) (Go 1.24.4, all pass).
 
 **In plain words:** Fake versions of the bank, the note box and the clock, so each test can force a failure (wrong PIN, jam, timeout) on purpose.
 
@@ -874,6 +885,8 @@ func TestConcurrentWithdrawals(t *testing.T) {
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working ATM and its tests. Next is interview depth: timeouts that hide a debit, failed reversals, power cuts mid-withdrawal, and why a reversal beats two-phase commit here.
+
 | Edge case | What happens | How the design handles it |
 |---|---|---|
 | Amount the ATM cannot make (₹250, or notes run out) | Exact amount impossible | `ErrCannotDispense` before any debit |
@@ -883,7 +896,7 @@ func TestConcurrentWithdrawals(t *testing.T) {
 | Reversal call fails too | Debit stuck | Error joined into the result; the journal retries the reversal later; the bank's idempotent `Reverse` makes the retry safe |
 | Debit times out but actually succeeded | Unknown outcome | `Withdraw` reverses by txn ID on any debit error, so no cash means no charge; the bank records the reversal even before it sees the debit, so a late debit is refused |
 | Request context cancelled mid-withdrawal | Reversal skipped | `context.WithoutCancel` for the reversal |
-| Three wrong PINs | Brute force | Card retained, session reset |
+| Three wrong PINs | Brute force (guessing PINs one after another) | Card retained, session reset |
 | Customer walks away | Card left in the machine | Timeout via the injected clock ejects and resets |
 | Withdraw before PIN, or a second card | Wrong state | `ErrWrongState` from the guard |
 | Operator refills during a session | Race on the cassette | Same mutex as `Withdraw` |
@@ -912,8 +925,8 @@ func TestConcurrentWithdrawals(t *testing.T) {
 
 Tradeoffs chosen:
 
-- **Hold the mutex across the bank call.** An ATM serves one customer at a time, so this costs only refill latency, and it makes "plan from this cassette" and "subtract from this cassette" one critical section. A server handling many devices would not hold a lock across network calls.
-- **Compensation instead of a distributed transaction.** The hardware cannot prepare; a reversal is how real ATM networks recover, and it needs the idempotent transaction ID.
+- **Hold the mutex across the bank call.** An ATM serves one customer at a time, so this costs only refill latency, and it makes "plan from this cassette" and "subtract from this cassette" one critical section (code that runs while holding the lock). A server handling many devices would not hold a lock across network calls.
+- **Compensation instead of a distributed transaction** (one transaction spread over several systems). The hardware cannot prepare; a reversal is how real ATM networks recover, and it needs the idempotent transaction ID.
 - **Out of service after a jam.** Safer than guessing which notes came out; a person counts the cassette.
 - **Fewest notes.** Simple to state and test; a real bank may weigh note mix and remaining stock.
 
@@ -995,6 +1008,26 @@ Redraw it from memory:
 - Order: plan, debit (idempotent txn ID), dispense, subtract notes. Jam: reverse with `context.WithoutCancel`, go out of service.
 - The bank owns money; the ATM owns notes; a journal plus reconciliation closes crash gaps.
 - One mutex covers session, cassette and refill; `int64` paise.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What happens after three wrong PINs?
+> The card is retained and the session goes back to Idle.
+
+> [!question]- 🟢 Who owns the money, and who owns the notes?
+> The bank owns the account money; the ATM only owns the physical notes in its cassette.
+
+> [!question]- 🟢 Why is money kept as `int64` paise?
+> Whole numbers are exact; floats round amounts like ₹0.10 and drift.
+
+> [!question]- 🟡 What is the safe order inside `Withdraw`?
+> Plan the notes, debit with a transaction ID, dispense, then subtract notes from the cassette.
+
+> [!question]- 🟡 ₹600 from {₹500 x1, ₹200 x3}. What does greedy do, and what does the DP do?
+> Greedy takes ₹500 and is stuck needing ₹100; the DP finds 3 x ₹200.
+
+> [!question]- 🟡 The debit call times out. Why call `Reverse` anyway?
+> The bank may have applied the debit before the reply was lost; reversing by the same transaction ID makes sure no cash means no charge.
 
 ## Links 🟢
 

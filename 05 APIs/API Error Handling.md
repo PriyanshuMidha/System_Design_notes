@@ -36,6 +36,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[REST and HTTP API Design]]: every HTTP response has a 3-digit status code, and `4xx` means the caller's fault while `5xx` means the server's.
+> - [[API Contract Design and OpenAPI]]: the API's fields and error codes are a written promise that clients depend on, so they must not change silently.
+> - [[Error Handling]]: in Go, a function returns an `error`, and you can wrap it with `%w` and check it later with `errors.Is` and `errors.As`.
+
 **From zero, in 60 seconds** 🟢
 
 You tap "Book" in an app and it fails. The server has to answer *something*. That answer is the error response.
@@ -81,6 +86,12 @@ and gives the engineers an ID to find the exact failure in their logs.
 | Retry | Sending the same request again after a failure | Try again after 2 s on `503` |
 | Request ID | A unique ID stamped on every request | `req-7f3a` in the response and the logs |
 | Problem Details | The standard JSON body for HTTP errors (RFC 9457) | `{"type":..., "title":..., "status":409}` |
+| Idempotent | Doing it twice has the same effect as doing it once | `GET`, `PUT`, or a `POST` with an idempotency key |
+| Backoff | Waiting longer after each failed retry | wait 1 s, then 2 s, then 4 s |
+| Middleware | Code that wraps every request, before and after the handler | one error-mapping layer for all routes |
+| Domain error | An error in business words, not HTTP words | `ErrSeatTaken` |
+| Upstream | A service your server calls to do its job | the payment service behind the booking API |
+| Gateway | The front door server that all client requests pass through first | checks tokens, then forwards |
 
 **Picture it**
 
@@ -120,7 +131,7 @@ with status `200`. Three things go wrong at once:
 - **Monitoring is blind.** Every failure is a `200`, so the 5xx dashboard stays green while payments fail.
 - **Support cannot debug.** A user reports "it failed at 8:15". Without a request ID, someone searches millions of log lines for the right one.
 
-The opposite mistake is just as common: returning `pq: relation "payments" does not exist` or a stack trace in the body. That tells attackers your database, table names and library versions, and tells users nothing useful.
+The opposite mistake is just as common: returning `pq: relation "payments" does not exist` or a **stack trace** (the list of functions that were running when the error happened) in the body. That tells attackers your database, table names and library versions, and tells users nothing useful.
 
 ## 2. Mental model 🟢
 
@@ -132,11 +143,45 @@ An API error is a **hospital discharge note**, written for three readers:
 
 The internal record (stack trace, SQL, hostnames) never leaves the hospital.
 
+### Real-life example: a failed UPI payment 🟢
+
+When a UPI payment fails in an app like PhonePe or Google Pay, the screen tells you different things for different failures.
+"Incorrect UPI PIN" means you must fix something; trying the same thing again will not help.
+"Bank server is busy, please try after some time" means waiting may fix it.
+Behind the scenes, the app decides between those screens from a stable error code, not by reading the message text.
+The small transaction ID on the screen is what support asks you for, so they can find the exact failure in their logs.
+
+## Common beginner mistakes 🟢
+
+- **Returning `200` with `{"error": ...}`** → dashboards and retry tools think everything is fine → use the right `4xx` or `5xx` status.
+- **Putting SQL errors or stack traces in the response** → attackers learn your tables and versions → send a generic `500` and keep the details in logs.
+- **Making clients read the message text** → rewording a message breaks their code → give a stable `code` like `SEAT_TAKEN` and let messages change freely.
+- **Reporting only the first invalid field** → users fix one field at a time, round after round → list every invalid field at once.
+- **Retrying every error** → hopeless requests (`422`) loop forever, and retried `POST`s can charge twice → retry only `429`, `503` and, for idempotent calls, `502`/`504`.
+
+## Often confused 🟡
+
+| These two | First one | Second one |
+| --- | --- | --- |
+| `401` vs `403` | "Who are you?" Missing or bad login | "I know you, but you may not do this" |
+| `400` vs `422` | The request cannot be read (broken JSON) | Readable, but the values are not allowed |
+| Error code vs message | Fixed label for programs, never renamed | Text for humans, may change any day |
+| `502` vs `504` | The service behind returned a broken answer | The service behind did not answer in time |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that one error must serve the program, the person and the engineer, without leaking internals. **Next we open the box**: the standard error body, codes vs messages, field-level errors, which status fits which case, which errors are worth retrying, and the one place in the code where errors become HTTP.
 
 ### The Problem Details format (RFC 9457)
 
 **In plain words:** instead of every API inventing its own error JSON, there is one standard shape. Think of it as the standard accident-report form: same boxes every time, so everyone knows where to look.
+
+**Step by step:**
+1. A booking fails because seat A7 is taken.
+2. The server sets the status line to `409 Conflict` and the header `Content-Type: application/problem+json`.
+3. The body says `type` (a link to the docs page for this kind of error), `title` ("Seat already taken"), `status` (409) and `detail` ("A7 was booked a moment ago").
+4. It adds its own extra fields: `code: "SEAT_TAKEN"` and `request_id: "req-7f3a"`.
+5. Every endpoint fails in this same shape, so clients write the error reader once.
 
 ```json
 {
@@ -152,26 +197,39 @@ The internal record (stack trace, SQL, hostnames) never leaves the hospital.
 
 | Member | Meaning | Rule |
 | --- | --- | --- |
-| `type` | A URI that identifies the **kind** of problem; ideally a docs page | Defaults to `about:blank`. Clients may branch on it |
+| `type` | A **URI** (a web address or similar identifier) that identifies the **kind** of problem; ideally a docs page | Defaults to `about:blank`. Clients may branch on it |
 | `title` | Short summary of the kind | Same text for every occurrence of that `type` |
 | `status` | The HTTP status code | Advisory copy; must match the real status line |
 | `detail` | Explanation of **this** occurrence | Helps the client fix it; never debugging data |
-| `instance` | A URI reference for this occurrence | Often the request path, or a URN with the request ID |
+| `instance` | A URI reference for this occurrence | Often the request path, or a **URN** (a name-style identifier like `urn:request:req-7f3a`) with the request ID |
 | extensions | Any extra members | Here: `code`, `request_id` and `errors` |
 
-The media type is `application/problem+json`. RFC 9457 replaced RFC 7807 in 2023 with the same core members; it added a registry of common problem types and an example of reporting several problems at once.
+The **media type** (the value of the `Content-Type` header) is `application/problem+json`. RFC 9457 replaced RFC 7807 in 2023 with the same core members; it added a registry of common problem types and an example of reporting several problems at once.
 
 ### Stable codes and human messages
 
 **In plain words:** the code is for machines and must never change its spelling; the message is for people and may be reworded any day. Keep those two jobs separate.
 
-- **The status code** groups the failure (`409` = conflict with current state). Generic HTTP tools act on it: proxies, retry libraries, dashboards.
+**Step by step:**
+1. The app gets `409` with `code: "SEAT_TAKEN"` and `detail: "Seat A7 is no longer free"`.
+2. The app's code checks `if code == "SEAT_TAKEN"` and reopens the seat map.
+3. Next month the team rewrites the message to "Someone just grabbed A7". The app keeps working, because it never read the message.
+4. If the team renamed the code to `SEAT_UNAVAILABLE`, the app's `if` would silently stop matching. So codes never change.
+
+- **The status code** groups the failure (`409` = conflict with current state). Generic HTTP tools act on it: **proxies** (servers that sit between client and server and forward traffic), retry libraries, dashboards.
 - **The error code** (`SEAT_TAKEN`, `CARD_EXPIRED`) is the precise reason. It is part of the contract: documented, `UPPER_SNAKE`, never renamed (see [[API Contract Design and OpenAPI]]). Clients branch on it.
 - **The message** (`title`, `detail`) is for humans. Clients must never parse it, so you can reword or translate it freely.
 
 ### Field-level validation errors
 
 **In plain words:** if a form has three mistakes, say all three at once. Nobody likes fixing one, resubmitting, and finding the next.
+
+**Step by step:**
+1. The client sends seats `["A7", "77"]` and forgets `show_id`.
+2. The server checks every field and collects every problem, instead of stopping at the first.
+3. It returns one `422` with an `errors` list: the second seat has a bad format, and `show_id` is missing.
+4. Each entry has a `pointer` saying exactly where: `#/seats/1` means "the item at position 1 in `seats`".
+5. The app highlights both fields in red at once.
 
 Report **every** invalid field at once, each with a pointer into the request body, so a form can highlight all of them after one round trip:
 
@@ -188,6 +246,12 @@ The pointer is a JSON Pointer (`#/seats/1` = the second seat), which is the styl
 
 **In plain words:** this table is the dictionary from "what actually happened" to "which 3-digit code to send". You do not memorise it; you keep it next to you.
 
+**Step by step:**
+1. Ask: whose fault is it? The caller's → a `4xx`. Yours or a dependency's → a `5xx`.
+2. Caller's fault: broken JSON → `400`; no valid login → `401`; logged in but not allowed → `403`; no such booking → `404`.
+3. The request is fine but clashes with current data (seat already taken) → `409`. Values not allowed (`quantity: -3`) → `422`. Too many requests → `429`.
+4. Your side: a bug → `500`; the service you called sent garbage → `502`; you are overloaded or a dependency is down → `503`; the service you called was too slow → `504`.
+
 | Status | Domain situation | Example code | Client should retry? |
 | --- | --- | --- | --- |
 | `400` | Body or parameters cannot be parsed | `MALFORMED_REQUEST` | No: fix the request |
@@ -195,7 +259,7 @@ The pointer is a JSON Pointer (`#/seats/1` = the second seat), which is the styl
 | `403` | Authenticated but not allowed | `FORBIDDEN` | No |
 | `404` | Resource does not exist, or the caller may not know it exists | `BOOKING_NOT_FOUND` | No |
 | `409` | Conflicts with current state | `SEAT_TAKEN`, `ALREADY_CANCELLED` | No; re-read state and decide |
-| `412` | `If-Match` precondition failed | `VERSION_MISMATCH` | After re-reading and re-applying the change |
+| `412` | `If-Match` precondition failed (the client said "only update if the version is still 7", and it is not) | `VERSION_MISMATCH` | After re-reading and re-applying the change |
 | `422` | Parsed but invalid values | `VALIDATION_FAILED` | No: fix the fields |
 | `429` | Rate limit or quota exceeded | `RATE_LIMITED` | Yes, after `Retry-After` |
 | `500` | Bug or unexpected failure here | `INTERNAL` | Only if the request is idempotent or carries an `Idempotency-Key` |
@@ -208,6 +272,13 @@ The method-level meaning of each status is in [[REST and HTTP API Design]]; this
 ### Retryable vs non-retryable
 
 **In plain words:** some failures fix themselves if you wait (server busy); some never will (your input is wrong). The response must make clear which one this is, or clients will retry hopeless requests.
+
+**Step by step:**
+1. The client gets `422`. Retrying the same body will fail the same way, so it shows the error.
+2. It gets `429` with `Retry-After: 5`. It waits 5 seconds and tries again.
+3. It gets `504` on a `POST /payments`. The payment may have gone through, so it must not blindly retry.
+4. If that `POST` carried an `Idempotency-Key`, a retry is safe: the server will not charge twice.
+5. Retries wait a bit longer each time (backoff), plus a small random extra (**jitter**) so thousands of clients do not retry at the same instant.
 
 Error handling is half of a retry policy. Clients need a rule they can apply without reading the message:
 
@@ -228,6 +299,13 @@ flowchart TD
 ### One mapping layer
 
 **In plain words:** deep business code says "seat taken" in its own words; exactly one gatekeeper at the door translates that into HTTP. One translator means one consistent accent.
+
+**Step by step:**
+1. PostgreSQL rejects a duplicate seat with error code `23505` (unique violation).
+2. The repository (the database layer) turns that into the domain error `ErrSeatTaken`.
+3. The service adds context ("book show 42: %w") and returns it; the handler returns it too. Nobody logs yet.
+4. The error middleware checks it with `errors.Is(err, ErrSeatTaken)` and writes `409 SEAT_TAKEN`.
+5. It logs the full error chain once, with the request ID. Anything it does not recognise becomes a plain `500`.
 
 Domain code returns **domain errors** and never imports `net/http`. One middleware at the edge maps them to responses and logs each failure once:
 
@@ -291,7 +369,7 @@ func WriteError(w http.ResponseWriter, err error) {
 
 **In plain words:** the real thing: domain errors in one package, one middleware that maps, logs once, and never leaks database text to the client.
 
-Three files in Go 1.24: a domain package with sentinel and typed errors, an `api` package that is the only place errors become HTTP, and its tests. The mapping uses `errors.Is` for sentinels and `errors.As` for typed errors, so wrapping with `%w` at each layer keeps working. It passes `go vet` and `go test -race`.
+Three files in Go 1.24: a domain package with **sentinel** errors (fixed error values like `ErrNotFound` that you compare against) and **typed** errors (error structs that carry data, like a list of bad fields), an `api` package that is the only place errors become HTTP, and its tests. The mapping uses `errors.Is` for sentinels and `errors.As` for typed errors, so wrapping with `%w` at each layer keeps working. It passes `go vet` and `go test -race`.
 
 ```go
 // Package booking is the domain layer. It knows nothing about HTTP or gRPC.
@@ -670,6 +748,8 @@ sequenceDiagram
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the error body, codes, status mapping, retry rules and the single mapping layer. **Next is the advanced part**: how Stripe, Google and Kubernetes shape their errors, keeping the gateway consistent, what to monitor, and Go traps like the typed nil.
+
 - **Real systems:**
 	- **Stripe** returns an error object with `type` (such as `card_error`, `invalid_request_error`, `api_error`), `code`, `decline_code` for card declines, `param` naming the bad field, a `message` and a `doc_url`, and every response carries a `Request-Id` header.
 	- **Google APIs** follow AIP-193: canonical gRPC codes plus `ErrorInfo` with a stable reason, mapped to HTTP for JSON clients.
@@ -684,25 +764,25 @@ sequenceDiagram
 	- An error code renamed in a refactor breaks a client's branch → treat codes as contract; diff them in CI like fields.
 	- A handler writes half a response, then returns an error → the middleware cannot change the status any more; validate and do all fallible work before writing the body.
 - **What to monitor:**
-	- Request rate split into 2xx, 4xx and 5xx per route. 5xx is your fault and counts against the SLO (see [[SLIs, SLOs, SLAs and Error Budgets]]); a 4xx spike right after a deploy often means you broke the contract.
+	- Request rate split into 2xx, 4xx and 5xx per route. 5xx is your fault and counts against the **SLO** (the reliability target you promised, like "99.9% of requests succeed") (see [[SLIs, SLOs, SLAs and Error Budgets]]); a 4xx spike right after a deploy often means you broke the contract.
 	- Top error codes per route and per client version, as a metric label (`code="SEAT_TAKEN"`), not parsed from logs.
 	- `429` and `503` rates with the `Retry-After` values sent, and how many clients retry before it expires.
 
 ## 8. Deep dive 🔴
 
-- **The typed-nil trap.** An `error` is an interface: a type and a value. Returning a nil `*ValidationError` as `error` yields an interface whose type is set, so `err != nil` is true.
+- **The typed-nil trap.** An `error` is an **interface** (a Go value that holds two things inside): a type and a value. Returning a nil `*ValidationError` as `error` yields an interface whose type is set, so `err != nil` is true.
 
   The middleware then treats a valid request as failed, `errors.As` matches and hands back a nil pointer, and calling `Error()` on it panics if `Error()` reads a field. The test above checks the first, the `ve != nil` guard handles the second, and the third is what crashed the first version of the test.
 
   Fix: return a literal `nil` on success, and guard `ve != nil` after `errors.As`. More Go error mechanics (`errors.Join`, several `%w` in one `fmt.Errorf` since Go 1.20, wrapping rules) are in [[Error Handling]].
-- **Translate, do not leak, at layer boundaries.** If the repository returns the raw driver error, every caller must know about PostgreSQL error codes. Translate the ones that have domain meaning (`23505` on the seat index → `ErrSeatTaken`; `40001` serialization failure → retry inside the service) and wrap the rest as opaque internal errors.
+- **Translate, do not leak, at layer boundaries.** If the repository returns the raw driver error, every caller must know about PostgreSQL error codes. Translate the ones that have domain meaning (`23505` on the seat index → `ErrSeatTaken`; `40001` serialization failure, meaning two transactions clashed and one must run again → retry inside the service) and wrap the rest as opaque internal errors.
 - **`errors.Is` vs `errors.As` vs string matching.** `Is` compares against a sentinel through the whole wrap chain; `As` finds the first error of a type and gives you its data. Matching on `err.Error()` text breaks as soon as someone adds context with `fmt.Errorf`, which is exactly what wrapping is for.
 - **Retryable as a property, not a status.** Inside services, attach retryability to the error (a small interface such as `Retryable() bool`, or a `RetryInfo` detail in gRPC) so retry loops do not re-derive it from status codes. Only the edge turns it into `Retry-After`.
 - **Panics are not errors.** A recover middleware turns a panic into a `500` with the same problem shape and logs the stack trace, so the client sees a consistent error and the process survives (see [[Middleware]]).
 - **`instance` and request IDs.** RFC 9457 lets `instance` be any URI reference. Using the request path is common but not unique per occurrence; `urn:request:req-7f3a` makes it unique.
 
   Either way, also return the request ID in a response header such as `X-Request-Id` (some teams return the trace ID taken from the W3C `traceparent` request header instead) so clients can quote it even when the body is lost.
-- **Errors in streaming responses.** Once a `200` and part of an SSE stream or a chunked body have been sent, the status cannot change. Send an error event in the stream's own format; gRPC can do better because its status travels in trailers after the messages.
+- **Errors in streaming responses.** Once a `200` and part of an SSE stream (Server-Sent Events: a long response the server keeps adding messages to) or a chunked body have been sent, the status cannot change. Send an error event in the stream's own format; gRPC can do better because its status travels in **trailers** (headers sent at the very end of a response) after the messages.
 
 ## 9. Interview questions 🔴
 
@@ -725,7 +805,7 @@ sequenceDiagram
 > Clients parse `application/problem+json` and crash or show garbage on HTML. Every error a client can receive is part of the contract, including the gateway's own `401`, `429`, `502` and `504`. Configure the gateway to emit the same problem format with a request ID, and pass service errors through untouched.
 
 > [!question]- How do gRPC errors carry the same information?
-> A gRPC status has a canonical code (`NOT_FOUND`, `INVALID_ARGUMENT`, `UNAVAILABLE`) and a message, plus typed details in `google.rpc.Status`: `BadRequest` for field violations, `ErrorInfo` for a stable reason, `RetryInfo` for when to retry. Transcoding gateways map the codes to HTTP statuses (`UNAVAILABLE` → `503`, `DEADLINE_EXCEEDED` → `504`).
+> A gRPC status has a canonical code (`NOT_FOUND`, `INVALID_ARGUMENT`, `UNAVAILABLE`) and a message, plus typed details in `google.rpc.Status`: `BadRequest` for field violations, `ErrorInfo` for a stable reason, `RetryInfo` for when to retry. **Transcoding** gateways (which translate between JSON/HTTP and gRPC) map the codes to HTTP statuses (`UNAVAILABLE` → `503`, `DEADLINE_EXCEEDED` → `504`).
 
 ## 10. Cheat sheet 🟢
 
@@ -737,6 +817,26 @@ sequenceDiagram
 - Domain returns errors; one edge middleware maps them with `errors.Is` and `errors.As`.
 - gRPC: canonical codes + `ErrorInfo`, `BadRequest`, `RetryInfo`; keep HTTP and gRPC mappings aligned.
 - Monitor 4xx vs 5xx per route and the top error codes; a 4xx spike after a deploy is a contract break.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what three things should every error response give?
+> A status plus stable error code (for programs), a readable message (for people), and a request ID (for engineers).
+
+> [!question]- Easy: does a `5xx` mean the caller or the server is at fault?
+> The server (or something it depends on).
+
+> [!question]- Easy: should a client ever parse the error message text?
+> No. It should branch on the stable error code.
+
+> [!question]- Medium: which status for "logged in, but not allowed to cancel someone else's booking"?
+> `403 Forbidden`.
+
+> [!question]- Medium: a `POST /payments` gets a `504`. Should the client retry?
+> Only if the request carries an `Idempotency-Key` (or it first checks whether the payment happened); the first attempt may have succeeded.
+
+> [!question]- Medium: where in a Go service should domain errors become HTTP statuses?
+> In one middleware at the edge, using `errors.Is` and `errors.As`; the domain code never imports `net/http`.
 
 ## Links 🟢
 

@@ -27,6 +27,8 @@ updated: 2026-11-13
 
 The smallest version of the idea: an aggregate that refuses to be invalid, because the only way to create or change one is through a function that checks first.
 
+**What this code does, in plain words:** the invoice's fields are lowercase, so no other package can set them. The only way to make one is a constructor that checks the input, and the only way to change one is a method that checks the rule first.
+
 ```go
 package wb
 
@@ -65,6 +67,10 @@ The full version below adds the rest of the pattern: a Money and a Recipient val
 > - 🟢 **New to this?** Read "From zero" below, then 1 (why it exists), 2 (mental model) and 10 (cheat sheet). Stop there, that is a full first pass.
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+> [!note] Before this note
+> - [[Domain-Driven Design - Strategic Design]]: a big business is split into **bounded contexts**, areas where each word (like "invoice") has one exact meaning. This note works inside one of them.
+> - [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]: the core declares the interface it needs and the database code implements it. Here that interface is the `Repository`.
 
 **From zero, in 60 seconds** 🟢
 
@@ -105,6 +111,12 @@ Tactical DDD puts the rule inside the invoice, so nobody can forget it.
 | Repository | Code that loads and saves one aggregate | `InvoiceRepo.FindByID` |
 | Domain event | A record that something happened | `InvoicePaid` |
 | Unexported field | A lowercase Go field only its package can touch | `amountDue int64` |
+| Bounded context | One area of the business where every word has one exact meaning | "Billing" |
+| Application service | Code that runs the steps (load, call, save) but holds no rules | `RecordPayment` |
+| Optimistic locking | Save only if nobody else saved since you loaded; otherwise retry | `WHERE version = 3` |
+| Outbox | A table where events wait to be sent, written in the same save as the data | `outbox` row for `InvoicePaid` |
+| Rehydrate | Rebuild an object from saved data, instead of creating a new one | `invoice.Rehydrate(snapshot)` |
+| Eventual consistency | A second object catches up a moment later, not in the same save | Client's total updates after `InvoicePaid` |
 
 **Picture it**
 
@@ -133,7 +145,7 @@ Where it breaks: a teller can serve many accounts at once; an aggregate guards o
 
 ## 1. Why it exists 🟢
 
-A `CreateInvoice` handler, a `MarkInvoicePaid` handler and a reminder job each hold a piece of "what makes an invoice valid" if `Invoice` is a plain struct with exported fields: nothing stops one of them from setting `AmountPaid` higher than `AmountDue` and forgetting to flip `Status`, or from building an `Invoice{}` literal with a line item whose currency does not match the invoice's own.
+A `CreateInvoice` handler, a `MarkInvoicePaid` handler and a reminder job each hold a piece of "what makes an invoice valid" if `Invoice` is a plain struct with exported fields: nothing stops one of them from setting `AmountPaid` higher than `AmountDue` and forgetting to flip `Status`, or from building an `Invoice{}` **literal** (a struct typed out directly with its fields filled in) with a line item whose currency does not match the invoice's own.
 
 Three call sites agreeing to follow the same unwritten rule is how real systems end up with a partially-paid invoice silently marked `paid`, discovered only when a customer disputes a charge.
 
@@ -143,9 +155,11 @@ Tactical DDD's answer is to give the rule exactly one owner. `Invoice` becomes a
 
 Think of an aggregate as a small object with a lock on it that only its own methods have the key to. `NewInvoice` builds the first valid one. Every `Add*`, `Apply*`, `Send` method is the only door in, and each one checks the invariant before it lets a change through.
 
-A repository is the only thing allowed to carry the whole object across a transaction boundary — load it whole, save it whole — and it is declared by the domain itself, not by whatever package happens to hold a database connection (see [[Hexagonal Architecture (Ports and Adapters)]] for why the domain never imports its own infrastructure).
+A repository is the only thing allowed to carry the whole object across a **transaction boundary** (the edge of one all-or-nothing database save) — load it whole, save it whole — and it is declared by the domain itself, not by whatever package happens to hold a database connection (see [[Hexagonal Architecture (Ports and Adapters)]] for why the domain never imports its own infrastructure).
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the words: entity, value object, aggregate, root. **Next we open the box**: how each one looks in Go, why there is one repository per root, and why events are only sent after the save succeeds.
 
 ### 3.1 Value objects: no identity, interchangeable by value
 
@@ -253,9 +267,9 @@ sequenceDiagram
 
 **In plain words: the invoice writes down "I was sent"; someone else reads that note after the save succeeds.**
 
-`Send` and `ApplyPayment` append to `Invoice`'s own `events` slice; nothing is sent anywhere yet. Only after `Repository.Save` has committed does the application service call `PullEvents` and hand the result to the outbox — the ordering that `Transactional Outbox and CDC` builds the delivery guarantee on top of.
+`Send` and `ApplyPayment` append to `Invoice`'s own `events` slice; nothing is sent anywhere yet. Only after `Repository.Save` has committed does the application service call `PullEvents` and hand the result to the **outbox** (a table where events wait to be sent, written in the same transaction as the data) — the ordering that `Transactional Outbox and CDC` builds the delivery guarantee on top of.
 
-Publishing before the commit (or on a goroutine racing the commit) risks an event for a write that then rolls back.
+Publishing before the commit (or on a **goroutine**, a lightweight Go thread, racing the commit) risks an event for a write that then rolls back.
 
 ```mermaid
 sequenceDiagram
@@ -285,6 +299,8 @@ The code below is the InvoiceOps billing domain, split across two Go packages to
 It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
 
 **`invoice/invoice.go`** — value objects, the entity, the aggregate root, and its own factory:
+
+**What this code does, in plain words:** it defines `Money` and `Recipient` (plain values), `LineItem` (a line with its own ID), and `Invoice`, which can only be created by `NewInvoice` and only changed by methods like `AddLineItem`, `Send` and `ApplyPayment`. Each method checks the rules and records an event such as "invoice paid".
 
 ```go
 // Package invoice is the InvoiceOps billing domain: one aggregate (Invoice),
@@ -674,6 +690,8 @@ func Rehydrate(s State) (*Invoice, error) {
 
 **`invoice/repository.go`** — the port the domain declares for itself, plus the application service that is the only thing allowed to call it:
 
+**What this code does, in plain words:** `Repository` has just two methods, find an invoice and save it. `RecordPayment` loads the invoice, asks it to apply the payment, saves it, and only then pulls out the events to send.
+
 ```go
 package invoice
 
@@ -755,6 +773,8 @@ func (s *ApplicationService) RecordPayment(ctx context.Context, invoiceID string
 
 **`memstore/memstore.go`** — the adapter. It imports `invoice`; `invoice` never imports it back:
 
+**What this code does, in plain words:** a pretend database kept in a map. `Save` refuses to save if someone else saved a newer version since you loaded it, and returns `ErrConcurrentUpdate` instead.
+
 ```go
 // Package memstore is a repository adapter: it imports invoice to
 // implement invoice.Repository, and invoice never imports memstore back.
@@ -813,6 +833,8 @@ func (r *Repository) Save(_ context.Context, inv *invoice.Invoice, matchVersion 
 ```
 
 Tests (`go test -race -v ./...`):
+
+**What this code does, in plain words:** the first file checks the rules (bad amounts and overpayments are refused, events are recorded, save-then-load gives the same invoice). The second file checks that two writers racing on one invoice cannot both win, and that events are pulled only after a successful save.
 
 ```go
 package invoice
@@ -972,6 +994,9 @@ func TestApplicationServiceRecordPaymentPullsEvents(t *testing.T) {
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how a rich aggregate, its repository and its events look in compiling Go. **Next is the senior view**: how this breaks in production, how big an aggregate should be, how version-based locking works exactly, and why two aggregates are only "eventually" in sync.
+
+
 - **Real systems:** this is the shape most Go DDD ports/adapters repositories on GitHub converge on (an aggregate package with no infrastructure imports, a separate package per adapter); it is also exactly the split [[Hexagonal Architecture (Ports and Adapters)]] draws for ports in general, applied specifically to persistence.
 - **Failure modes → fixes:**
   - A field added to `Invoice` but not to `Snapshot`/`Rehydrate` silently drops data on the next save-then-load round trip → a repository conformance test (like `TestSnapshotRehydrateRoundTrip` above) run against every field catches this in CI, not in production.
@@ -989,7 +1014,7 @@ Vernon's rule of thumb (*Effective Aggregate Design*, 2011) is "model true invar
 
 `Invoice` holds its `LineItem`s because "amount due must equal the sum of the lines" is a true invariant that must never be observed broken. It references a `Client` by ID only, because "this client's name changed" has no bearing on whether this invoice's total is correct.
 
-A larger aggregate means fewer round trips but more contention: two unrelated updates to the same aggregate now race on the same optimistic-concurrency version, each forcing the other to reload and retry.
+A larger aggregate means fewer round trips but more **contention** (many writers fighting over the same row): two unrelated updates to the same aggregate now race on the same optimistic-concurrency version, each forcing the other to reload and retry.
 
 ### Optimistic locking, exactly
 
@@ -997,9 +1022,9 @@ A larger aggregate means fewer round trips but more contention: two unrelated up
 
 `Invoice.version` is not business data — `AddLineItem` and `ApplyPayment` never read or change it.
 
-Only the repository boundary uses it: `FindByID` returns the version an aggregate was loaded at, `Save` takes `matchVersion` as a separate argument, and a real Postgres adapter would run `UPDATE invoices SET ..., version = version + 1 WHERE id = $1 AND version = $2` and treat zero rows affected as `ErrConcurrentUpdate` — exactly what `memstore.Repository.Save` does with a map lookup under a mutex instead of a `WHERE` clause.
+Only the repository boundary uses it: `FindByID` returns the version an aggregate was loaded at, `Save` takes `matchVersion` as a separate argument, and a real Postgres adapter would run `UPDATE invoices SET ..., version = version + 1 WHERE id = $1 AND version = $2` and treat zero rows affected as `ErrConcurrentUpdate` — exactly what `memstore.Repository.Save` does with a map lookup under a **mutex** (a lock that lets only one goroutine in at a time) instead of a `WHERE` clause.
 
-This is cheaper than a pessimistic `SELECT ... FOR UPDATE` lock held for the whole request, at the cost of making the caller handle a conflict instead of just waiting for one.
+This is cheaper than a **pessimistic** `SELECT ... FOR UPDATE` lock (lock the row first, make everyone else wait) held for the whole request, at the cost of making the caller handle a conflict instead of just waiting for one.
 
 ```mermaid
 flowchart LR
@@ -1014,7 +1039,7 @@ flowchart LR
 
 `ApplyPayment` only ever changes `Invoice`'s own fields. If a `Client`'s lifetime-spend total also needs to move when a payment lands, that update happens in a second transaction, driven by the `InvoicePaid` event, after this one commits — the two aggregates are eventually, not immediately, consistent with each other.
 
-This is a deliberate cost: the alternative (one transaction touching both aggregates) would mean every payment write locks two unrelated rows together, and a `Client` table hotspot would slow down every invoice in the system, not just that client's own.
+This is a deliberate cost: the alternative (one transaction touching both aggregates) would mean every payment write locks two unrelated rows together, and a `Client` table **hotspot** (one row that every request wants to write) would slow down every invoice in the system, not just that client's own.
 
 ### Why `Rehydrate` re-derives `AmountDue` instead of trusting the stored column
 
@@ -1058,6 +1083,26 @@ A stored `amount_due_minor` column could, in principle, be hand-edited by an ope
 - Two factories: `New*` for a fresh, invariant-satisfying instance; `Rehydrate` for reconstructing one that was already valid when saved.
 - Optimistic locking: a `version` field the repository compares, not business data the aggregate itself reads.
 - DDD tactical patterns are overkill wherever there's no real invariant to protect — plain CRUD doesn't need them.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) Is `Money{100, "INR"}` an entity or a value object?
+> A value object: it has no ID, and any two with the same fields are the same.
+
+> [!question]- (easy) Why are `Invoice`'s fields lowercase in Go?
+> So no other package can set them directly; the only way in is the constructor and methods that check the rules.
+
+> [!question]- (easy) Should `LineItem` have its own repository?
+> No. It is only ever loaded and saved as part of its `Invoice` (the aggregate root).
+
+> [!question]- (medium) When are domain events handed to the outbox, and why then?
+> After `Repository.Save` succeeds. Sending earlier could announce a change that then rolls back.
+
+> [!question]- (medium) Two requests load invoice version 3 and both save. What happens?
+> The first save wins and bumps it to version 4; the second gets `ErrConcurrentUpdate` and must reload and retry.
+
+> [!question]- (medium) Why does `Invoice` hold `Client` by ID and not by pointer?
+> They are separate aggregates with separate saves; a pointer could save stale client data and blur two transactions into one.
 
 ## Links 🟢
 

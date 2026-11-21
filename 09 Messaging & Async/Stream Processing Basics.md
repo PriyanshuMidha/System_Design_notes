@@ -33,6 +33,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (pipeline, event time, windows, checkpoints), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9, plus "Joins" in 5. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Kafka and Event Streaming]]: events sit in partitioned logs, and readers keep an offset (bookmark) per partition.
+> - [[Message Ordering and Partition Keys]]: events with the same key go to the same partition and stay in order; there is no order across keys.
+> - [[Delivery Semantics and Exactly-Once]]: after a crash, events can be read again, so counts can double unless state and offsets are saved together.
+
 **From zero, in 60 seconds** 🟢
 
 Some answers are needed right now, not tomorrow: "has this ad spent its budget yet?"
@@ -78,6 +83,10 @@ The screen must still show the right number for each minute, even if the countin
 | State | Data the program remembers between events | A running count per campaign |
 | Key | The field used to group events | `campaign_id` |
 | Window | A time bucket that groups events | All clicks from 10:00 to 10:01 |
+| Event time | When the event actually happened, stamped inside it | Click at 10:00:05 |
+| Watermark | The point in event time up to which you believe all events have arrived | "Everything up to 10:01 is in" |
+| Late event | An event that arrives after its window was already reported | A 10:00 click arriving at 10:05 |
+| Checkpoint | A saved snapshot of all counts plus the input offsets, used to recover after a crash | Saved every 10 s |
 
 **Picture it**
 
@@ -114,6 +123,8 @@ An ad platform charges advertisers per click and must stop a campaign the minute
 	- The consumer crashes and replays from its last committed offset. Clicks get counted twice in an in-memory map that was half-written, or lost if the map was not saved.
 	- One process cannot hold the state for 2 million campaigns and keep up with 200,000 events per second.
 
+**Real-life example.** A food app like Swiggy shows "high demand, delivery fees are higher" when orders in an area spike. That needs "orders per area in the last 5 minutes", updated every minute, from a never-ending flow of orders. Orders sent from phones with bad signal arrive late, and the counting servers sometimes restart. Stream processing is how such numbers stay both fast and correct.
+
 A stream processor partitions the state by key across many workers, buckets events by their own timestamps, decides when a bucket is complete with a watermark, and checkpoints state and offsets together.
 
 **Why naive counting breaks:**
@@ -134,6 +145,14 @@ A **toll plaza with a counting clerk per lane**. Cars (events) carry a ticket st
 - A truck stamped 10:00:20 that turns up at 10:05 is **late**. The clerk notes it in a separate book (the side output) rather than reopening a report that has already been sent.
 - Every few minutes the clerk photocopies all tallies along with "the last car I counted was number 81,233" (a **checkpoint**). After a coffee spill they restore the photocopy and recount from car 81,234.
 
+## Common beginner mistakes 🟢
+
+- **Grouping by arrival time instead of event time** → late events land in the wrong minute, and a replay gives different numbers → window by the timestamp inside the event.
+- **Keeping counts in a plain in-memory map** → a crash loses them or, after replay, counts some events twice → use the engine's checkpointed state, saved together with offsets.
+- **Setting the watermark delay to zero** → every slightly late event is dropped as late → allow a delay that covers your normal lateness, and send the rest to a side output.
+- **Writing results to a database with plain inserts** → after a restart the same window is written twice → upsert by `(key, window_start)`.
+- **Letting state grow without limit** → joins and sessions keep data for every key forever → set state TTLs and window every join.
+
 **The toll clerk, drawn:**
 
 ```mermaid
@@ -145,9 +164,18 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that stream processing counts events as they flow, groups them into time windows, uses a watermark to decide when a window is done, and saves state with checkpoints. **Next we open the box**: the pipeline of operators, the three kinds of time, the window types and their life cycle, and how checkpoints give exactly-once state.
+
 ### The pipeline
 
 **In plain words:** events flow in from Kafka, get grouped by key and time, get counted, and the results flow out; each stage runs on many workers at once.
+
+**Step by step:**
+1. A source operator reads the `clicks` topic, with several parallel copies, one or more partitions each.
+2. `keyBy(campaign_id)` sends every click of campaign `c-7` to the same counting instance.
+3. That instance keeps the running count for `c-7` in its own state.
+4. When a window closes, it emits "c-7: 312 clicks from 10:00 to 10:01".
+5. A sink operator writes that result to a database or another topic.
 
 ```mermaid
 flowchart LR
@@ -161,12 +189,19 @@ flowchart LR
 ```
 
 - **Operators** are the boxes. Each runs as several parallel instances.
-- **keyBy** sends every event for one key to the same instance, so that instance holds all the state for that key. This is a network shuffle; in Kafka Streams it is a repartition topic.
-- **State** lives next to the operator: in memory, or in an embedded RocksDB store for state larger than memory.
+- **keyBy** sends every event for one key to the same instance, so that instance holds all the state for that key. This is a **network shuffle** (events re-sent across machines so each key lands in one place); in Kafka Streams it is a repartition topic.
+- **State** lives next to the operator: in memory, or in an embedded RocksDB store (a fast key-value database stored on local disk) for state larger than memory.
 
 ### Event time, processing time and watermarks
 
 **In plain words:** event time is when it happened, processing time is when you saw it. The watermark is your best guess of "nothing older is still coming".
+
+**Step by step:**
+1. A click happens at 10:00:05 on a phone in a tunnel. That is its event time.
+2. It reaches the processor at 10:03:00. That is its processing time.
+3. The allowed delay is 10 seconds. The latest event time seen so far is 10:01:15, so the watermark is 10:01:05.
+4. The watermark has passed 10:01, so the 10:00-10:01 window has already been reported.
+5. The tunnel click is therefore late: it goes to allowed lateness or a side output, not silently into the wrong minute.
 
 | Time | Meaning | Use for |
 | --- | --- | --- |
@@ -186,6 +221,12 @@ With several input partitions, an operator's watermark is the **minimum** across
 ### Windows
 
 **In plain words:** a window is a time bucket. Fixed buckets don't overlap, sliding buckets do, and session buckets grow while a user stays active.
+
+**Step by step:**
+1. Tumbling, 1 minute: 10:00-10:01, 10:01-10:02, ... Each click lands in exactly one bucket.
+2. Hopping, 5 minutes every 1 minute: 10:00-10:05, 10:01-10:06, ... A click at 10:03 lands in five buckets.
+3. Session, 30-minute gap: a user's clicks keep one bucket open while they come less than 30 minutes apart.
+4. After 30 quiet minutes, that user's session window closes and is reported.
 
 ```mermaid
 flowchart TB
@@ -208,6 +249,13 @@ flowchart TB
 ### Window lifecycle
 
 **In plain words:** a window opens with its first event, fills up, closes when the watermark passes its end, and is then cleaned away.
+
+**Step by step:**
+1. The first click stamped 10:00:02 creates the 10:00-10:01 window for its key.
+2. More clicks for that minute add to its count.
+3. The watermark passes 10:01: the window fires and its result is emitted.
+4. During the allowed lateness, a late click can still update and re-emit the result.
+5. After that, the window's state is deleted to free memory.
 
 ```mermaid
 stateDiagram-v2
@@ -233,7 +281,7 @@ Flink's checkpoint, step by step:
 3. When every operator has acknowledged, the checkpoint (state plus the source offsets at the barrier) is complete.
 4. On failure the job restarts from the last complete checkpoint: offsets rewind, state rewinds to match, and replayed events rebuild exactly the same state.
 
-This is a variant of the Chandy-Lamport snapshot algorithm.
+This is a variant of the Chandy-Lamport snapshot algorithm (a classic method for taking a consistent snapshot of a running distributed system without stopping it).
 
 Kafka Streams keeps each state store in local RocksDB, backed by a compacted **changelog topic**; with `processing.guarantee=exactly_once_v2` it writes state changes, output records and input offsets in one Kafka transaction.
 
@@ -450,6 +498,15 @@ ad-3         2026-11-04 10:00:00   2026-11-04 10:01:00   7
 | Apache Flink | Separate cluster (JobManager, TaskManagers); checkpoints to object storage; DataStream API and Flink SQL | Large state, complex event-time logic, many sources and sinks | A cluster to run (or a managed service); operational expertise |
 | Spark Structured Streaming | Micro-batches (or continuous mode) on Spark | Teams already on Spark; unified batch and stream code | Higher latency in micro-batch mode (often seconds) |
 | Managed (Kinesis Data Analytics / Amazon Managed Service for Apache Flink, Google Dataflow) | Hosted Flink or Beam runners | Avoid running clusters | Cost; provider limits |
+
+### Stream vs batch processing 🟡
+
+| | Batch job | Stream processing |
+| --- | --- | --- |
+| Input | A finished set of data (yesterday's files) | An endless flow of events |
+| Freshness | Minutes to hours old | Seconds old |
+| Late data | Already included when the job runs | Needs watermarks and lateness rules |
+| When to pick | An hour-old answer is fine | You must act within seconds (budgets, fraud) |
 | Streaming databases (Materialize, RisingWave, ksqlDB) | SQL views kept up to date incrementally | Mostly SQL logic, query results directly | Less control over custom logic |
 
 **Lambda vs Kappa architecture:**
@@ -470,7 +527,7 @@ ad-3         2026-11-04 10:00:00   2026-11-04 10:01:00   7
 
 - **Completeness vs latency.** Every watermark delay is a trade: shorter means faster but more late data; longer means more complete but slower. No setting gives both.
 - **State is the cost driver.** Session windows, long hopping windows and stream-stream joins hold state for every key; a misconfigured join can grow without bound. Set state TTLs.
-- **Operational complexity.** Checkpoint tuning, savepoints for upgrades, rebalancing state across instances, and schema changes on stateful jobs.
+- **Operational complexity.** Checkpoint tuning, savepoints (checkpoints you take by hand before an upgrade) for upgrades, rebalancing state across instances, and schema changes on stateful jobs.
 - **Debuggability.** A wrong count may come from a late event, a watermark stall or a replay. You need side outputs and metrics to tell which.
 - **When not to use it:**
 	- Freshness of an hour is acceptable: a scheduled SQL query over a warehouse is simpler and exact.
@@ -487,13 +544,15 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the pipeline, event time and watermarks, the window types, checkpoints, a Go windowing operator and the main tools. **Next is the advanced part**: real uses, the production failures (stuck watermarks, doubled results, growing state), and the deeper ideas of triggers, rescaling and clock skew.
+
 - **Real systems:** fraud scoring on payment streams, real-time ad budget pacing, IoT telemetry aggregation, live leaderboards ([[Case Study - Leaderboard and Top-K]]), metric roll-ups ([[Case Study - Metrics and Logging Platform]]), and keeping read models current for [[CQRS]].
 - **Failure modes → fixes:**
 	- *Watermark stuck.* One Kafka partition gets no data, so the minimum watermark never advances and no window fires. Fix: idle-source detection (Flink `withIdleness`), or fewer source partitions so that every partition keeps receiving data.
 	- *Results double after a restart.* Sink was neither transactional nor idempotent. Fix: transactional sink with the checkpoint, or upsert by `(key, window_start)`.
 	- *State grows until out of memory or disk.* Unbounded keys with no TTL, or a join without a window. Fix: state TTL, windowed joins, RocksDB with incremental checkpoints.
 	- *Checkpoints time out under backpressure.* Barriers queue behind slow records. Fix: find the slow operator, scale it, or use unaligned checkpoints (Flink); see [[Backpressure and Flow Control]].
-	- *Hot key.* One campaign gets most clicks and one instance falls behind. Fix: two-phase aggregation (pre-aggregate on a salted key, then combine); see [[Hot Keys and Hot Partitions]].
+	- *Hot key.* One campaign gets most clicks and one instance falls behind. Fix: two-phase aggregation (pre-aggregate on a salted key, the key plus a random suffix such as `c-7#3` to spread it, then combine); see [[Hot Keys and Hot Partitions]].
 	- *Upgrading a stateful job breaks state.* Changed operator IDs or state schema. Fix: stable operator UIDs, savepoints, and state schema evolution ([[Event Schemas and Schema Registry]]).
 - **What to monitor:** consumer lag of the source, watermark lag (wall-clock time minus current watermark), late events per minute, checkpoint duration and size, backpressure per operator, state size per key group, end-to-end latency from event time to output.
 
@@ -539,6 +598,30 @@ flowchart LR
 - Checkpoint = state + source offsets together; exactly-once state, not exactly-once sinks.
 - Kafka Streams = library + RocksDB + changelog; Flink = cluster + barriers + object storage.
 - Watch watermark lag, late events, checkpoint duration, backpressure.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is the difference between event time and processing time?
+> Event time is when it happened; processing time is when your program saw it.
+
+> [!question]- What is a tumbling window?
+> A fixed-size time bucket with no overlap, such as each minute.
+
+> [!question]- Why save checkpoints?
+> So after a crash the job reloads its counts and input positions together and neither loses nor doubles events.
+
+🟡 Medium
+
+> [!question]- The latest event time seen is 10:05:20 and the allowed delay is 20 s. What is the watermark?
+> 10:05:00.
+
+> [!question]- One Kafka partition gets no data. Why might no window ever fire?
+> The operator's watermark is the minimum across inputs, and the idle partition holds it back.
+
+> [!question]- Exactly-once state is on. Can results still be written twice to a database?
+> Yes, unless the sink is transactional with the checkpoint or idempotent (upsert by key and window).
 
 ## Links
 

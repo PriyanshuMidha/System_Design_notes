@@ -42,6 +42,10 @@ That arithmetic — Little's Law plus a headroom multiplier — is the whole ide
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Latency, Percentiles and Bottleneck Analysis]]: p99 is the time the slowest 1 in 100 requests take, and a trace shows which step ate the time.
+> - [[Back-of-the-Envelope Estimation]]: you can turn "1 million users a day" into "about 230 requests per second" with quick rounded math.
+
 **From zero, in 60 seconds** 🟢
 
 Performance work has one rule: measure first, then fix the slowest part, then measure again.
@@ -84,6 +88,12 @@ This note is about measuring first, then working out how many servers you really
 | Headroom | Spare capacity kept on purpose | Run at 70% so one pod can die |
 | Load test | Sending fake traffic to see where it breaks | Ramp to 3,000 RPS in staging |
 | Little's Law | Concurrency = arrival rate × time each request takes | 2,000 × 0.15 s = 300 |
+| p99 latency | The time the slowest 1 in 100 requests take | p99 = 200 ms |
+| Connection pool | A fixed set of open database connections the app reuses | 50 connections |
+| Lock contention | Many requests waiting for the same locked row or resource | everyone updating one stock counter |
+| Utilization / saturation | How busy a resource is / how much work is queued waiting for it | CPU 60% busy, 40 jobs waiting |
+| Autoscaling | Adding or removing copies automatically based on load | add pods when CPU passes 65% |
+| Peak-to-average ratio | How much bigger the busiest moment is than a normal moment | peak is 10× the daily average |
 
 **Picture it**
 
@@ -112,19 +122,29 @@ Where it breaks: tables don't get slower when the room is full, but servers do; 
 
 ## 1. Why it exists 🟢
 
+🟢 **Plain version:** A sale is coming that will bring 10 times the usual traffic. The team does the math ahead of time and finds a trap: at normal load each database query is quick, but under heavy load many requests fight over the same row, so each query gets about 5 times slower. Slower queries hold database connections longer, and the app runs out of its 50 connections. Doing the math with the "under load" speed, not the quiet-time speed, catches this before the sale instead of during it.
+
+
 A team ships a service that handles today's traffic fine. Six months later, the same code falls over during a marketing push, and nobody saw it coming because nobody asked "how much more can this take, and what breaks first?"
 
 Concretely: a feed service runs comfortably at 200 requests/second (RPS) with p99 latency of 180ms. Marketing announces a sale expected to 10x traffic to 2,000 RPS. Without capacity planning, the team finds out whether the service survives by watching it happen live.
 
-With it, they compute in advance that the database connection pool (configured for 50 connections) looks fine at 450 RPS using idle-time query latency — concurrency = 450 x 0.025s = 11.25 connections in flight — but p99 query time itself degrades under load because of lock contention on a hot row, pushing effective query time to 120ms per query at 450 RPS: concurrency = 450 x 0.12s = 54 connections in flight, past the pool's 50-connection limit.
+With it, they compute in advance that the database connection pool (configured for 50 connections) looks fine at 450 RPS using idle-time query latency — concurrency = 450 x 0.025s = 11.25 connections in flight — but p99 query time itself degrades under load because of lock contention on a hot row (one row that many requests try to update at once), pushing effective query time to 120ms per query at 450 RPS: concurrency = 450 x 0.12s = 54 connections in flight, past the pool's 50-connection limit.
 
 That failure mode (a resource that gets slower as load rises, not just full) is exactly what capacity planning before a load test catches and a server-count spreadsheet alone misses.
 
 Performance engineering is the process that finds this kind of answer: measure, find the one true bottleneck, fix it, measure again. Capacity planning is performance engineering pointed at the future instead of at today's incident.
 
+### Real-life example: Flipkart's Big Billion Days 🟢
+
+Think of Flipkart getting ready for its Big Billion Days sale.
+Weeks earlier, engineers take last year's peak, add the expected growth, and turn it into "requests per second at the busiest minute".
+They multiply by how long each request takes to get "how many requests are in progress at once", then divide by what one server can hold, and add spare room in case servers die.
+Then they run a load test at that traffic. Whatever breaks first, maybe the database or the payment service, is fixed before the real sale.
+
 ## 2. Mental model 🟢
 
-Picture the request path as a chain of stages: load balancer, API handler, cache, database, external payment API, response serialization. Under any fixed load, exactly one stage is the slowest — the **bottleneck** — and the whole request's latency is dominated by it.
+Picture the request path as a chain of stages: load balancer, API handler, cache, database, external payment API, response serialization (turning the result into JSON to send back). Under any fixed load, exactly one stage is the slowest — the **bottleneck** — and the whole request's latency is dominated by it.
 
 Speeding up a stage that is not the bottleneck does nothing to overall latency; it just means that stage now waits more.
 
@@ -137,11 +157,28 @@ L = λ × W
 ```
 `L` is the average number of items in the system (in-flight requests, open connections, items in a queue). `λ` is the arrival rate (RPS). `W` is the average time each item spends in the system (latency). It holds for any stable system, regardless of the arrival pattern or the service-time distribution — that generality is why it is the right tool for the "how many servers" question.
 
+## Common beginner mistakes 🟢
+
+- **Guessing where it is slow** ("must be the network") → you fix the wrong part and nothing improves → look at traces and per-step timings first.
+- **Using average or quiet-time latency in the math** → the plan is too small exactly when traffic is high → use p99 measured under the target load.
+- **Running servers at 95-100% busy to save money** → one server dying or one burst breaks the SLO → keep 20-30% headroom.
+- **Speeding up a step that is not the bottleneck** → total time does not change → fix the slowest step first, then re-measure.
+- **Trusting the plan without a load test** → hidden limits (connection pools, locks) show up during the real event → load test at the planned traffic before the event.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that the slowest step decides the speed, and that Little's Law plus headroom turns traffic into a server count. **Next we open the box**: the loop for finding the real bottleneck, and the full pipeline from a user forecast to a tested resource plan.
 
 ### The bottleneck-finding loop
 
 **In plain words:** measure, find the busiest part, fix it, measure again. Repeat until it is fast enough.
+
+**Step by step:**
+1. Set the goal: p99 under 300 ms at 2,000 RPS.
+2. Measure: a trace shows a 420 ms request spends 365 ms in one database query.
+3. Fix only that: add an index (a lookup table that makes the query fast).
+4. Load test again: p99 drops to 150 ms.
+5. Still short of the goal? Find the new slowest step and repeat. Met the goal? Ship it and add an alert.
 
 ```mermaid
 flowchart TD
@@ -162,6 +199,13 @@ See [[Latency, Percentiles and Bottleneck Analysis]] for how to build that break
 
 **In plain words:** take the expected peak, multiply by what each request costs, add a safety margin, and you get how much to buy.
 
+**Step by step:**
+1. Start from users: 1 million daily active users (DAU) × 20 requests each = 20 million requests a day.
+2. Turn that into traffic: 20 million ÷ 86,400 seconds ≈ 231 RPS on average; with a 10× peak, about 2,315 RPS.
+3. Little's Law: 2,315 RPS × 0.2 s ≈ 463 requests in flight.
+4. Add 30% headroom (463 × 1.3 ≈ 602) and divide by 50 per server: 12.04 → round up to 13 servers.
+5. Load test at 2,300 RPS. If something breaks early, fix it and redo the math.
+
 Capacity planning runs the same "measure, then compute" discipline against a forecast instead of a live incident:
 
 ```mermaid
@@ -180,11 +224,21 @@ Turning a user forecast into RPS (the leftmost arrow above) is the job of [[Back
 **Headroom** is the fraction of capacity kept deliberately unused. Three reasons to keep it, each sizing it differently:
 - **N+1 / N+2 redundancy**: if one node can fail, the survivors must absorb its load without breaching the SLO. For a 4-node fleet at 70% average utilization per node, losing one node pushes the rest to 93% — still under 100%, but with no room for anything else. Losing two needs more slack or fewer average-utilization targets.
 - **Burst absorption**: real traffic is not a flat line; a forecast's "peak RPS" is itself an estimate, and actual peaks can exceed it. 20-30% extra headroom above the forecast peak is a common starting point, tightened or loosened once you have measured how noisy your traffic actually is.
-- **Deploy and scale-up lag**: autoscaling and rolling deploys take minutes, during which the fleet runs below its target size. Headroom covers the gap between "load increased" and "capacity caught up."
+- **Deploy and scale-up lag**: autoscaling and rolling deploys (replacing servers a few at a time) take minutes, during which the fleet runs below its target size. Headroom covers the gap between "load increased" and "capacity caught up."
+
+```mermaid
+flowchart LR
+    A["4 nodes at 70% busy"] --> F["1 node dies"]
+    F --> B["3 nodes at about 93%"]
+    B --> Q{"Still under 100%?"}
+    Q -- "yes" --> OK["SLO holds, barely"]
+```
 
 ## 4. Worked example 🟡
 
 **In plain words:** the capacity math as tested Go code, so the plan can be re-run when the numbers change.
+
+**What this code does, in plain words:** `EstimateTraffic` turns daily users into average and peak requests per second. `ServersNeeded` uses Little's Law (requests per second × time per request) to get how many requests are in flight, adds the headroom share, divides by what one server can hold, and rounds up.
 
 The whiteboard version above gave the shape of the calculation. Here it is as tested Go, because a capacity plan that lives only in a spreadsheet does not get re-run when the forecast changes — a function does.
 
@@ -275,8 +329,8 @@ func TestServersNeededNoHeadroomIsSmaller(t *testing.T) {
 
 The same shape applies to every other resource, not just compute:
 - **Database connection pool:** `L = query RPS x average query time`. If query time rises under load (lock contention, as in the "why it exists" example), re-run the calculation with the *loaded* query time, not the idle one — this is the trap most capacity plans fall into.
-- **Cache memory:** `bytes needed = working-set keys x average value size x replication factor`, not total keys — only the keys actually read in a rolling window matter.
-- **Message queue consumers:** `L = enqueue rate x average processing time`; see [[Queues vs Streams and Broker Comparison]] for how this interacts with partition count.
+- **Cache memory:** `bytes needed = working-set keys x average value size x replication factor` (working set = the keys actually read recently; replication factor = how many copies of each key you keep), not total keys — only the keys actually read in a rolling window matter.
+- **Message queue consumers:** `L = enqueue rate x average processing time`; see [[Queues vs Streams and Broker Comparison]] for how this interacts with partition count (the number of parallel lanes a topic is split into).
 
 ## 5. Variants and comparison 🟡
 
@@ -285,8 +339,16 @@ The same shape applies to every other resource, not just compute:
 | Little's Law sizing | `L = λ × W`, divide by per-node capacity, add headroom | You have a traffic forecast and per-request latency | Needs an accurate latency figure; garbage in, garbage out |
 | Load testing to find the ceiling | Drive real traffic at the service until a metric breaches its threshold | You want an empirical number instead of a model | Needs a prod-like environment; see [[Load and Performance Testing]] |
 | Historical trend extrapolation | Plot RPS or resource use over months, extrapolate the curve | Steady organic growth, no step-function launches | Misses sudden shifts (viral growth, a new feature, a competitor's outage) |
-| Queueing-theory models (M/M/1, M/M/c) | Model arrivals and service time as distributions, solve for wait time | You need the full latency *distribution* under load, not just a mean | Requires arrival/service patterns to roughly fit the model's assumptions |
+| Queueing-theory models (M/M/1, M/M/c: standard math models of a queue with 1 or c servers) | Model arrivals and service time as distributions, solve for wait time | You need the full latency *distribution* under load, not just a mean | Requires arrival/service patterns to roughly fit the model's assumptions |
 | Chaos/game-day exercises | Deliberately remove capacity (kill a node, throttle a dependency) and watch what breaks | Validating that headroom and failover actually work, not just that they're planned | Operationally risky without blast-radius controls; see [[Chaos Engineering]] |
+
+### Performance engineering vs capacity planning vs load testing 🟡
+
+| | Performance engineering | Capacity planning | Load testing |
+| --- | --- | --- | --- |
+| Question | Why is it slow now? | How much will we need later? | Where does it actually break? |
+| Method | Measure, fix the bottleneck, repeat | Forecast × cost per request + headroom | Send fake traffic until a limit is hit |
+| Output | A faster service | A server, connection and memory count | A real, measured ceiling |
 
 ## 6. Trade-offs and when not to use 🟡
 
@@ -297,9 +359,12 @@ The same shape applies to every other resource, not just compute:
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the bottleneck loop, the forecast-to-servers pipeline, the code that does the math, and the other sizing methods. **Next is the advanced part**: how big companies run capacity reviews, the ways plans fail (idle latency, late autoscaling), and the theory behind Little's Law and the USE method.
+
+
 - **Real systems:** Google's SRE workbook describes capacity planning as one of the four pillars of the SRE role, explicitly tied to a mandatory load test before any major capacity decision. AWS's Well-Architected Framework names "stop guessing capacity — monitor demand and automatically add/remove resources" as one of its Reliability pillar design principles (right-sizing itself sits under the separate Cost Optimization pillar). Large-scale retail and ticketing platforms run scheduled game days ahead of known traffic events (product launches, sales) that combine a capacity plan with a chaos exercise to validate it.
 - **Failure modes → fixes:**
-  - Plan based on p50 latency, breaches SLO at p99 under load → replan against p99/p999, and re-measure latency *under load*, not idle.
+  - Plan based on p50 latency, breaches SLO at p99 under load → replan against p99/p999 (p999 = the slowest 1 in 1,000), and re-measure latency *under load*, not idle.
   - A resource that degrades with load (lock contention, GC pauses) was sized using its idle cost → load test at target RPS and read the loaded cost back into the formula.
   - Headroom computed once at launch, never revisited → tie capacity review to the same cadence as the SLO review ([[SLIs, SLOs, SLAs and Error Budgets]]) and to major feature launches.
   - Autoscaler configured to react only after saturation → set scale-out triggers at 60-70% utilization, not 95%, so new capacity is ready before the old capacity runs out.
@@ -307,7 +372,7 @@ The same shape applies to every other resource, not just compute:
 
 ## 8. Deep dive 🔴
 
-- **Why Little's Law holds regardless of distribution.** The proof (Little, 1961) only needs the system to be stable (arrivals equal departures over the long run) — it says nothing about Poisson arrivals or exponential service times, which is why it applies equally to a web server's connection pool, a warehouse's inventory, or a call center's queue. This generality is also its limit: it gives you the *average* number in the system, not the distribution of wait times. For the shape of the tail, you need either a load test or a queueing model with distributional assumptions (M/M/c, or simulation).
+- **Why Little's Law holds regardless of distribution.** The proof (Little, 1961) only needs the system to be stable (arrivals equal departures over the long run) — it says nothing about Poisson arrivals or exponential service times (specific random patterns that queue math often assumes), which is why it applies equally to a web server's connection pool, a warehouse's inventory, or a call center's queue. This generality is also its limit: it gives you the *average* number in the system, not the distribution of wait times. For the shape of the tail, you need either a load test or a queueing model with distributional assumptions (M/M/c, or simulation).
 - **The USE method.** Brendan Gregg's framework for diagnosing a resource bottleneck: for every resource (CPU, memory, disk, network, each queue, each lock), check **U**tilization (percent busy), **S**aturation (work queued because the resource is full), and **E**rrors. A resource at 60% utilization but high saturation (long queue) is still a bottleneck — utilization alone hides queueing delay. This is the systematic version of the "where is time spent" question in the bottleneck loop above.
 - **Why fixing the bottleneck can make things look worse briefly.** Removing stage A's bottleneck shifts load onto stage B, whose utilization rises even though nothing about B changed — it is now serving the throughput A used to hold back. Reviewers unfamiliar with this sometimes revert the fix to A, thinking it "caused" B's regression; the right move is to size B for the new throughput.
 - **Forecasting the peak-to-average ratio itself.** `peakFactor` in the worked example is usually the least certain input. Build it from your own history (max 1-minute RPS over the trailing 90 days, divided by the same period's average RPS) rather than reusing an industry rule of thumb, and widen it for known step-changes (a marketing calendar, a new market launch).
@@ -343,6 +408,30 @@ The same shape applies to every other resource, not just compute:
 - Fixing one bottleneck reveals the next, one stage downstream — this is expected, not a regression.
 - USE method per resource: Utilization, Saturation, Errors — saturation at moderate utilization still means "bottleneck."
 - Revisit the plan on the same cadence as your SLO review, and after every major traffic event (compare forecast peak to observed peak).
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is the bottleneck?
+> The slowest step under current load; it limits the whole request.
+
+> [!question]- What does Little's Law say?
+> Requests in flight = requests per second × time each request takes.
+
+> [!question]- Why keep headroom?
+> To survive a server dying, traffic bursts and the minutes it takes to scale up.
+
+🟡 Medium
+
+> [!question]- 1,000 RPS, 0.2 s per request, 40 per server, 25% headroom. How many servers?
+> 1,000 × 0.2 = 200; × 1.25 = 250; ÷ 40 = 6.25 → 7 servers.
+
+> [!question]- Why plan with latency measured under load, not idle?
+> Things like lock contention make each request slower at high load, so more connections and servers are needed.
+
+> [!question]- A resource is 60% busy but has a long queue. Is it a bottleneck?
+> Yes. High saturation (work waiting) means it is a bottleneck even at moderate utilization.
 
 ## Links
 

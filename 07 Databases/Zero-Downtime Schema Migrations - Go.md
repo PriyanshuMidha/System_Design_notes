@@ -23,6 +23,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 2 to 5 and the Tests.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Zero-Downtime Schema Migrations]]: the theory half. Add the new column, fill old rows in small batches, switch the code, drop the old column last.
+> - [[Relational Schema Design]]: money moves from `total numeric` to `total_minor bigint` (whole paise).
+> - [[Transactions and ACID]]: each batch is its own short transaction, so locks are held only briefly.
+> - [[Locking - Optimistic vs Pessimistic]]: updated rows are locked until their transaction commits, which is why batches stay small.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on twin of [[Zero-Downtime Schema Migrations]]. You added a new column, and now 20 million old rows need a value in it. Doing it in one giant update would lock rows and swamp the copies of the database, so the app would slow down or stall. Instead, a small Go job fills the column a little at a time; this is called a **backfill**. It updates a small slice of rows, takes a short break, checks the copies (the **replicas**) have caught up, then does the next slice. If someone stops it halfway, it remembers where it got to and carries on from there without redoing rows. Read it top to bottom: each step is a short Concept, the code, then a walkthrough.
@@ -42,7 +48,7 @@ flowchart LR
 - **Interfaces** (`Store`): the backfill loop talks to an interface, so tests use an in-memory fake and production uses pgx.
 - **`context.Context`**: lets an operator cancel a long backfill; the loop stops cleanly and returns where to resume.
 - **`time.Duration` and `time.NewTimer`**: express batch pauses and replica-lag limits, and build a sleep that can be cancelled.
-- **`select`**: waits on whichever happens first, the timer firing or the context being cancelled.
+- **`select`** (Go's statement for waiting on several channels at once): waits on whichever happens first, the timer firing or the context being cancelled.
 - **`errors.Is(err, context.Canceled)`**: tells "someone stopped us" apart from a real failure.
 - **What to run**: `go mod init example.com/backfill`, then `go vet ./... && go test -race ./...`.
 
@@ -84,6 +90,8 @@ go test -race ./...
 ```
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** the job: fill 20 million rows without hurting live traffic, and be safe to stop and resume. **Next we open the box**: the one-batch SQL, the store interface and knobs, the resumable loop, the replica-lag wait and a sleep that can be cancelled.
 
 ### Step 1: the SQL behind the interface
 
@@ -310,6 +318,8 @@ flowchart LR
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** how the loop runs, waits and stops. **Next is the senior view**: why it is built this way, the tests that prove resume-without-rewrite and lag waiting, and the traps (starting too early, non-idempotent batches, one giant transaction).
+
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
 | Return `next` as the checkpoint | Store a checkpoint row after every batch | No extra writes or table, but the caller must save the value itself |
@@ -430,6 +440,8 @@ sequenceDiagram
 | 10,000 ids, batch 1,000, cancel after batch 3 | first run returns `next = 3001` and `context.Canceled` |
 | resume from 3001 with a live context | no error; 10,000 rows filled, each with `writes == 1` |
 
+**What this code does, in plain words:** it runs the backfill over 10,000 fake rows and cancels it right after batch 3, then checks the job stopped cleanly and reported 3001 as the place to resume.
+
 ```go
 func TestBackfillResumesWithoutRewritingRows(t *testing.T) {
 	s := newFakeStore(10_000)
@@ -446,6 +458,8 @@ func TestBackfillResumesWithoutRewritingRows(t *testing.T) {
 ```
 
 The second half of the same test resumes from `next` with a live context and then checks every row.
+
+**What this code does, in plain words:** it restarts the job from 3001, lets it finish, then checks all 10,000 rows are filled and none was written twice.
 
 ```go
 
@@ -534,6 +548,8 @@ Reading the output line by line:
 2. In `TestBackfillWaitsForReplicaLag`, change the readings to `{0, 5s, 0}`. Predict the sequence of `events` before the first `batch`.
 3. Set `cfg.BatchSize` to 3,000 with `maxID` 10,000. Predict how many batches run in total and what `Run` returns for `next`.
 
+**What this code does, in plain words:** the whole `backfill.go` in one place: the `Store` interface, the `Config` knobs, `Run` (wait for replicas, fill one batch, pause, repeat, and return the resume point if stopped), and the cancellable `sleep`.
+
 > [!example]- Full file: backfill.go
 > ```go
 > package backfill
@@ -611,6 +627,30 @@ Reading the output line by line:
 > 	}
 > }
 > ```
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why does the backfill `UPDATE` include `AND total_minor IS NULL`?
+> So rerunning a batch skips rows already filled; the step is idempotent.
+
+> [!question]- What does `Run` return when it is cancelled?
+> The id to resume from, plus `context.Canceled`.
+
+> [!question]- Why is each batch its own transaction?
+> So row locks are held only for one short batch and vacuum and replicas can keep up.
+
+🟡 Medium
+
+> [!question]- Why does the loop check replica lag before every batch?
+> Each batch makes WAL; if replicas fall behind, reads from them go stale, so the job waits until lag is under the limit.
+
+> [!question]- Why does `sleep` check the context before the `select`?
+> With a zero pause both channels can be ready, and `select` picks at random; the check makes cancel win every time.
+
+> [!question]- Cancelled during the pause after batch 3 of 1,000-row batches starting at 1, what resume id is correct?
+> 3001, because batch 3 (ids 2001 to 3000) already committed.
 
 ## Links 🟢
 

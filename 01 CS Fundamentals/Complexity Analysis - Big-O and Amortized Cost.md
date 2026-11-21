@@ -29,6 +29,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (the formal bounds and the classes) and 4 (the measured worked example), plus 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 9 and 10. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Number Representation and Text Encoding]]: computers count in powers of 2, so 2¹⁰ = 1,024 (about a thousand) and 2²⁰ is about a million. That makes `log₂` numbers easy: `log₂(1,000,000)` is about 20.
+
 **From zero, in 60 seconds** 🟢
 
 Your code works on a list. Someday that list will be much bigger. Will the code still be fast?
@@ -74,6 +77,11 @@ Complexity analysis is the tool that predicts this before it happens.
 | Worst case | The most steps for any input of size `n` | Searched value is last in the list |
 | Slice / capacity | A Go growable list; capacity is its reserved room | `make([]int, 0, 8)` has room for 8 |
 | Amortized | Average cost per call over many calls | One costly call spread over 100 cheap ones |
+| Bound | A line the cost will not cross (a ceiling or a floor) | "never more than `5n` steps" |
+| Binary search | Find a value in a sorted list by checking the middle and throwing away half each time | 1,000,000 items in about 20 checks |
+| Backing array / reallocation | The real memory under a slice; reallocation means getting a bigger one and copying everything over | 8 slots full, so get 16 and copy 8 |
+| SLA (latency) | A promise about how fast each request must be | "99% of requests under 200 ms" |
+| Hash map | A key → value store that finds a key in about one step | Go `map[string]int` |
 
 ### Picture it
 
@@ -125,6 +133,14 @@ Concretely: at `n = 1,000,000`, an `O(n)` algorithm doing one simple operation p
 > [!tip] Remember
 > Big-O predicts whether an algorithm survives scaling the input, which no amount of faster hardware can substitute for once `n` gets large enough.
 
+### Real-life example: "Find friends on WhatsApp" 🟢
+
+When you install WhatsApp, it checks which of your 500 phone contacts already use the app, against a list of hundreds of crores of users.
+Comparing each contact with every user one by one (a loop inside a loop) would take forever.
+Instead the server looks each contact up in a hash map, which is about one step per contact, so 500 contacts cost about 500 steps.
+That change, from `O(n × m)` to `O(n)`, is the difference between "instant" and "never finishes".
+Big-O is how an engineer sees this before writing a single line.
+
 ## 2. Mental model 🟢
 
 ### The errand-list analogy
@@ -149,7 +165,7 @@ flowchart LR
 
 **Why it matters:** Big-O is the habit of asking "which curve am I on?" before asking "how fast is my computer?"
 
-**Where the analogy breaks down:** a slow errand is merely unpleasant; a slow algorithm in a production system with a latency budget can be an outage.
+**Where the analogy breaks down:** a slow errand is merely unpleasant; a slow algorithm in a production system with a latency budget (the maximum time a request is allowed to take) can be an outage.
 
 ### The gym-membership analogy (amortized cost)
 
@@ -170,11 +186,27 @@ flowchart LR
 > [!warning] Common mistake
 > Confusing "amortized `O(1)`" with "every single call is `O(1)`." They are different claims. A hard per-call latency SLA cares about the worst single call, which amortized analysis explicitly does not bound.
 
+## Common beginner mistakes 🟢
+
+- **Keeping constants, like `O(2n + 5)`** → Big-O only cares about the shape of growth → write `O(n)`.
+- **Adding nested loops instead of multiplying** → a loop of `n` inside a loop of `n` is `n × n`, not `n + n` → nested means multiply (`O(n²)`), one after another means add (`O(n)`).
+- **Forgetting the hidden loop inside a library call** → `slices.Contains` inside a `for` loop is a loop inside a loop → count the cost of every call you make, not just your own `for`.
+- **Thinking `O(log n)` is "a bit faster than `O(n)`"** → at a million items it is 20 steps versus 1,000,000 → treat `log n` as "almost free".
+- **Saying "amortized `O(1)`" means every call is fast** → one call can still be `O(n)` → pre-size with `make([]T, 0, n)` when a single slow call hurts.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that Big-O is about how work grows when the input grows, and that "amortized" means "averaged over many calls". **Next we open the box:** the three exact kinds of bound, the seven common growth classes with real numbers, and why the same code can be fast on one input and slow on another. Each subsection starts with a plain walk-through.
 
 ### Formal definitions, informally
 
 **In plain words:** Big-O, Big-Omega and Big-Theta are three different kinds of bound on a growth curve — upper, lower, and both at once.
+
+**Step by step (linear search on a list of 1,000 names):**
+1. Count the steps: in the worst case you check all 1,000 names; in the best case just 1.
+2. Big-O (ceiling): it never takes more than about `n` steps, so it is `O(n)`.
+3. Big-Omega (floor): it always takes at least 1 step, so it is `Ω(1)`.
+4. Big-Theta needs the ceiling and floor to match. They match for the worst case (always `n` checks when the name is missing), so worst-case linear search is `Θ(n)`.
 
 - **`O(g(n))`** ("Big-O", upper bound): the algorithm's running time grows *no faster than* `g(n)`, for large enough `n`, up to a constant factor. "At most this fast-growing."
 - **`Ω(g(n))`** ("Big-Omega", lower bound): the running time grows *at least as fast* as `g(n)`. "At least this fast-growing."
@@ -206,6 +238,13 @@ flowchart TB
 
 **In plain words:** Seven named classes cover almost every algorithm you'll encounter, ordered from "doesn't care how big `n` gets" to "unusable past a tiny `n`."
 
+**Step by step (how to name the class of your own code):**
+1. Find what grows: here, `n` = number of orders.
+2. One loop over the orders → `O(n)`.
+3. A loop over orders, and inside it a loop over orders again → `O(n²)`.
+4. Halving the problem each step (like binary search) → `O(log n)`.
+5. Sorting first, then one loop → `O(n log n)` + `O(n)` = `O(n log n)`; keep only the biggest term.
+
 ```mermaid
 flowchart LR
     A["O(1)<br/>array index, hash lookup"] --> B["O(log n)<br/>binary search, balanced tree lookup"]
@@ -233,7 +272,7 @@ flowchart LR
 This is why interview questions probing "can you do better than the brute-force nested loop" aren't pedantic: at real production scale (`n` in the millions), an `O(n²)` algorithm is simply not viable, full stop, regardless of hardware.
 
 > [!tip] Remember
-> The seven classes aren't evenly spaced — the gaps between them explode as `n` grows, especially the jump from polynomial (`n`, `n²`) to exponential (`2ⁿ`, `n!`).
+> The seven classes aren't evenly spaced — the gaps between them explode as `n` grows, especially the jump from polynomial (`n`, `n²`: `n` raised to a fixed power) to exponential (`2ⁿ`, `n!`: the work multiplies with every extra item).
 
 ### Best, average, and worst case
 
@@ -244,12 +283,12 @@ This is why interview questions probing "can you do better than the brute-force 
 2. Worst case: the value is last, or absent entirely — `O(n)`, every element checked.
 3. Average case, over random positions: roughly `n/2` checks — still `O(n)`.
 
-**Example:** Quicksort is `Θ(n log n)` on average but `O(n²)` in the worst case (already-sorted input with a naive pivot choice) — which is exactly why production sort implementations use randomized or median-of-three pivot selection, or fall back to a different algorithm (introsort) when recursion depth suggests the worst case is happening.
+**Example:** Quicksort is `Θ(n log n)` on average but `O(n²)` in the worst case (already-sorted input with a naive pivot choice; the pivot is the item quicksort splits the list around) — which is exactly why production sort implementations use randomized or median-of-three pivot selection (pick the middle value of three samples), or fall back to a different algorithm (introsort, a hybrid that switches to heapsort when quicksort goes badly) when recursion depth suggests the worst case is happening.
 
 **Why it matters:** "This algorithm is `O(n log n)`" is an incomplete sentence unless you also say *which case* — a system with a strict latency SLA needs to design for the worst case, not the average.
 
 > [!warning] Common mistake
-> Quoting an algorithm's average-case complexity as if it were a guarantee. Average case assumes a distribution of inputs (often "random"); a production system facing adversarial or pathological input (deliberately or by bad luck) can hit the worst case instead.
+> Quoting an algorithm's average-case complexity as if it were a guarantee. Average case assumes a distribution of inputs (often "random"); a production system facing adversarial (crafted on purpose to be slow) or pathological input (deliberately or by bad luck) can hit the worst case instead.
 
 ## 4. Worked example 🟡
 
@@ -291,7 +330,15 @@ For larger slices Go's runtime tapers the growth factor down toward roughly 1.25
 
 ### A second measured example: Go map insertion
 
-**In plain words:** Slice `append` is not a one-off curiosity — the same "usually cheap, occasionally expensive, bounded on average" shape applies to Go's built-in `map`, which also grows its bucket array (doubling it, then evacuating old buckets into the new array incrementally) whenever its load factor crosses an internal threshold.
+**In plain words:** Slice `append` is not a one-off curiosity — the same "usually cheap, occasionally expensive, bounded on average" shape applies to Go's built-in `map`, which also grows its bucket array (the row of slots where keys are stored; doubling it, then evacuating, meaning moving, old buckets into the new array a few at a time) whenever its load factor (how full the slots are on average) crosses an internal threshold.
+
+```mermaid
+flowchart LR
+    I["insert key"] --> F{"slots too full?<br/>(load factor high)"}
+    F -- "no (most inserts)" --> C["put it in a slot: cheap"]
+    F -- "yes (rare)" --> G["double the slots,<br/>move old keys over bit by bit"]
+    G --> C
+```
 
 **Example, measured** (this code, Go 1.24.4, darwin/arm64, building a fresh map of `n` sequential int keys from empty, timing the whole build):
 
@@ -344,16 +391,18 @@ flowchart LR
     big["large n"] --> win2["O(n log n) code wins<br/>(better curve takes over)"]
 ```
 
-- A better Big-O class is not automatically faster in practice: an `O(n)` algorithm with a large constant (e.g. heavy per-element work, poor cache locality) can lose to an `O(n log n)` algorithm with tiny constants and great cache behavior, for every `n` you'll actually encounter.
+- A better Big-O class is not automatically faster in practice: an `O(n)` algorithm with a large constant (e.g. heavy per-element work, poor cache locality, meaning data scattered in memory so the CPU's fast cache keeps missing) can lose to an `O(n log n)` algorithm with tiny constants and great cache behavior, for every `n` you'll actually encounter.
 	- This is why, for example, insertion sort (`O(n²)`) is often used for small sub-arrays inside production sort implementations (including Go's) — its constant factor is low enough to beat `O(n log n)` algorithms for small `n`.
 - Amortized analysis describes average cost over a sequence; it says nothing about any *individual* operation's worst case.
 	- A system with a hard per-request latency SLA can't rely on "it's amortized `O(1)`" if a single unlucky request happening to trigger the expensive case would violate the SLA — that's a case for pre-allocating capacity, not just trusting amortized bounds.
-- Big-O deliberately ignores constants and lower-order terms, which makes it the wrong tool for comparing two implementations of the *same* asymptotic class (two `O(n log n)` sorts) — that comparison needs real benchmarking, not asymptotic analysis.
+- Big-O deliberately ignores constants and lower-order terms, which makes it the wrong tool for comparing two implementations of the *same* asymptotic class (the same growth shape for very large `n`) (two `O(n log n)` sorts) — that comparison needs real benchmarking, not asymptotic analysis.
 
 > [!tip] Remember
 > Amortized bounds are about averages over sequences; they're the wrong tool for a single request's worst case, and Big-O comparisons within the same class are the wrong tool for picking between two real implementations.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the three bounds, the seven classes, best/average/worst case, and real measurements that show amortized `O(1)`. **Next comes the advanced part:** how this shows up in real systems, why Go tapers its growth factor, the banker's method of proof, and interview traps.
 
 - **Real systems:** Go's `append` uses amortized-`O(1)` growth (shown above).
 	- Dynamic arrays in essentially every language (Python lists, Java `ArrayList`, C++ `std::vector`) use the same doubling-capacity strategy for the same reason.
@@ -429,6 +478,26 @@ That five-step picture, plus the banker's-method explanation in the deep dive be
 - Space complexity is analyzed the same way as time complexity; the two often trade off (memoization trades space for time).
 - Constants matter: a better asymptotic class doesn't guarantee a faster algorithm for realistic input sizes — benchmark when comparing implementations in the same class or in nearby classes at moderate `n`.
 - Amortized bounds don't protect a hard per-request SLA from the occasional expensive operation — eliminate the worst case directly when that matters.
+
+## Self-check 🟢🟡
+
+> [!question]- A loop of `n` runs inside another loop of `n`. What is the Big-O?
+> `O(n²)`: nested loops multiply.
+
+> [!question]- About how many steps does binary search need for 1,000,000 sorted items?
+> About 20, because `log₂(1,000,000)` ≈ 20.
+
+> [!question]- What is `O(3n + 100)` simplified?
+> `O(n)`: drop constants and smaller terms.
+
+> [!question]- Why is Go's `append` amortized `O(1)` if one call can copy the whole slice?
+> Capacity roughly doubles, so copies happen only about `log n` times; total copying is about `n`, so the average per append is constant.
+
+> [!question]- Quicksort is `Θ(n log n)` on average. When can it be `O(n²)`?
+> When the pivot choice keeps splitting badly, like a first-element pivot on already-sorted input.
+
+> [!question]- Your API has a strict 50 ms per-request SLA and appends millions of items to a slice. What should you do?
+> Pre-size it with `make([]T, 0, n)`, so no single request pays for a big copy; amortized `O(1)` does not protect one request.
 
 ## Links
 

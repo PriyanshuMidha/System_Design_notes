@@ -24,11 +24,15 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code and Tests sections properly, plus Design decisions.
 > - 🔴 **Interview / SDE-3 prep?** Add Pitfalls in the code and do the Exercises. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]]: data moves as packets between IP:port pairs, and the network may lose or reorder them.
+> - [[TCP - Handshake, Reliability, Flow and Congestion Control]] (theory twin): the handshake, `rwnd` (receiver's free space) and `cwnd` (sender's guess of network capacity).
+
 **From zero** 🟢: this file is the hands-on twin of the TCP theory note. It builds TCP's two "how fast may I send" limits as tiny Go types you can run on your laptop — one for the receiver's buffer (flow control), one for the network's capacity (congestion control) — and then opens one real connection over loopback to prove the handshake and the byte-stream behavior are real, not just diagrams. Read the theory note first; here, read each code block's bold intro line, then the code.
 
 ## Before the code 🟢
 
-- **Structs with methods:** `Window` and `Sender` are plain structs; methods like `OnACK` change their fields through a pointer receiver.
+- **Structs with methods:** `Window` and `Sender` are plain structs; methods like `OnACK` change their fields through a pointer receiver (the method gets the struct's address, so its changes stick).
 - **Two packages:** `wb` holds pure flow-control math with no networking; `main` holds congestion control and real sockets.
 - **`net.Listener` / `net.Conn`:** Go's interfaces for a listening socket and one open connection; `Accept` and `Dial` hide the 3-way handshake.
 - **Type assertion:** `conn.(*net.TCPConn)` turns the general `net.Conn` into the TCP-specific type that has `SetNoDelay` and `SetKeepAlive`.
@@ -66,6 +70,8 @@ go test -race ./...
 ```
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** the plan: model the two speed limits as small types, then open one real connection. **Next we read the code**: the flow-control calculator, the congestion-control state machine (a small set of states with rules for moving between them), and the echo server and client.
 
 ### The whiteboard model: flow control alone
 
@@ -211,6 +217,8 @@ The alternative of leaving both at their OS defaults was rejected specifically b
 2. The type assertion `conn.(*net.TCPConn)` is needed because `net.Listener.Accept` returns the general `net.Conn` interface — the TCP-specific tuning methods (`SetNoDelay`, `SetKeepAlive`) only exist on the concrete `*net.TCPConn` type.
 3. `io.Copy(conn, conn)` reading and writing the same connection is what makes this an echo server: every byte read is immediately written back, with no buffering or framing logic of its own.
 
+**What this code does, in plain words:** it connects to the echo server (the handshake happens inside `Dial`), sends a message, reads back exactly as many bytes as it sent, and reports how long the whole thing took.
+
 ```go
 // DialAndRoundtrip opens a TCP connection (the 3-way handshake happens
 // inside Dial), writes msg, and returns the echoed bytes plus how long the
@@ -293,7 +301,7 @@ It deliberately doesn't: the goal here is a state machine small enough to assert
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
 | `wb.Window` as its own package, separate from `Sender` | One combined `Connection` type holding both windows | Keeping flow control and congestion control as separate types lets each be tested in isolation, matching the theory note's point that they solve two different problems |
-| `Cwnd`/`Ssthresh` as `float64` | Integer segment counts with manual rounding | Avoids writing custom rounding rules for `Cwnd / 2`; real kernels use fixed-point byte counts instead, which this demo intentionally simplifies away |
+| `Cwnd`/`Ssthresh` as `float64` | Integer segment counts with manual rounding | Avoids writing custom rounding rules for `Cwnd / 2`; real kernels use fixed-point (whole numbers scaled to act like decimals) byte counts instead, which this demo intentionally simplifies away |
 | Reno-style reset only (no CUBIC/BBR model) | Implementing CUBIC's cubic growth function | Keeps the state machine small enough to unit-test exactly against RFC 5681's three rules; CUBIC and BBR are covered conceptually in the theory note instead of re-implemented here |
 | `io.ReadFull` in the client | A single `conn.Read` call | Matches the theory note's warning that TCP has no message boundaries — a single `Read` is not guaranteed to fill the buffer |
 
@@ -308,6 +316,8 @@ It deliberately doesn't: the goal here is a state machine small enough to assert
 | `Ssthresh = 64`, 8 calls to `OnACK()` from `Cwnd = 1` | `Cwnd` trace: `1, 2, 4, 8, 16, 32, 64, 65` |
 
 A failure here would mean the slow-start/congestion-avoidance switch is off by one RTT, or that growth past `Ssthresh` isn't linear — either would misrepresent exactly the mechanism this note exists to teach.
+
+**What this code does, in plain words:** it starts a sender, calls `OnACK` 8 times, and checks `Cwnd` goes 1, 2, 4, 8, 16, 32, 64, then 65.
 
 ```go
 func TestSlowStartThenCongestionAvoidance(t *testing.T) {
@@ -338,6 +348,8 @@ func TestSlowStartThenCongestionAvoidance(t *testing.T) {
 
 A failure here would mean a lost segment doesn't actually shrink the sender's rate — the one behavior that keeps a congested network from collapsing under senders that never back off.
 
+**What this code does, in plain words:** it grows `Cwnd` to 64, reports one loss, and checks `Ssthresh` became 32 and `Cwnd` went back to 1.
+
 ```go
 func TestLossHalvesSsthreshAndResetsCwnd(t *testing.T) {
 	s := NewSender()
@@ -364,6 +376,8 @@ func TestLossHalvesSsthreshAndResetsCwnd(t *testing.T) {
 | Dial a listener on `127.0.0.1`, write `"seq=1 ack=1 SYN,ACK"`, read it back | The echoed bytes equal the sent bytes; no error |
 
 A failure here would mean either the handshake itself didn't complete (a `Dial` error) or the byte stream didn't round-trip correctly (a mismatch), which would undercut every claim this note makes about "it compiles, and it actually works."
+
+**What this code does, in plain words:** it starts the echo server on a free local port, sends one message through a real connection, and checks the same bytes come back.
 
 ```go
 func TestTCPHandshakeAndEcho(t *testing.T) {
@@ -393,6 +407,8 @@ func TestTCPHandshakeAndEcho(t *testing.T) {
 | `RecvWin=100`, send 60 bytes, then ACK with a new `RecvWin=10` | `CanSend()` goes `100 → 40 → 10` |
 
 A failure here would mean the whiteboard model doesn't actually enforce the window — exactly the bug class flow control exists to prevent in the real protocol.
+
+**What this code does, in plain words:** it starts with a 100-byte window, sends 60 bytes (40 left), then simulates an ACK that shrinks the window to 10, and checks `CanSend` each time.
 
 ```go
 func TestWindowCanSendShrinksAsBytesGoInFlight(t *testing.T) {
@@ -454,10 +470,12 @@ That separation is also why a bug in one almost never shows up as a failure in a
 
 ## Pitfalls in the code 🔴
 
+> 🟡 → 🔴 **You now know** how both windows and the real socket code work and what the tests prove. **Next, the advanced part**: the float, floor and `Read` traps, and exercises that add fast recovery and concurrent connections.
+
 - **Comparing `Cwnd` with `==` after repeated multiplication** would be fragile with real floating-point segment sizes; this demo's inputs happen to stay exact powers of two, but production congestion-control code tracks bytes as integers specifically to avoid float drift over millions of RTTs.
 - **Forgetting the `Ssthresh` floor of 2** in `OnLoss` would let a run of consecutive losses drive the threshold toward zero, permanently trapping the sender in a tiny `Cwnd` it can never grow out of.
 - **Calling `conn.Read` once instead of `io.ReadFull`** is the single most common bug in code built on top of TCP: it happens to work on a fast loopback link in testing and then intermittently truncates messages in production once the network between client and server adds any real latency or packet fragmentation.
-- **Skipping the `*net.TCPConn` type assertion's `ok` check** would panic on any `net.Conn` that isn't a TCP connection (for example, if this code were ever reused over a Unix domain socket listener).
+- **Skipping the `*net.TCPConn` type assertion's `ok` check** would panic on any `net.Conn` that isn't a TCP connection (for example, if this code were ever reused over a Unix domain socket listener, a socket that is a file on the same machine instead of a network port).
 
 Each exercise below is deliberately a "change this, predict the result" task, not a "write this from scratch" task: the point is to build intuition for how a small change to the state machine or the socket code ripples through the existing tests, the same intuition that matters when debugging a real connection's `cwnd` trace in production.
 
@@ -466,6 +484,26 @@ Each exercise below is deliberately a "change this, predict the result" task, no
 1. Change `OnLoss` to model "fast recovery" instead of a full reset: on a fast-retransmit-triggered loss (as opposed to a timeout), set `Cwnd = Ssthresh` instead of `Cwnd = 1`. Predict how the `TestSlowStartThenCongestionAvoidance`-style trace changes, then write a test for it.
 2. Change `DialAndRoundtrip` to use a single `conn.Read(buf)` instead of `io.ReadFull(conn, buf)`, then run the existing test in a loop (`go test -race -count=100`). Predict whether it ever fails on loopback, and why relying on that result would still be a mistake for code that has to run over a real network.
 3. Add a second `Serve` instance and a second `DialAndRoundtrip` call racing against the first inside one test, both writing to the same listener's address. Predict what `TestTCPHandshakeAndEcho`-style assertions would need to change to handle two concurrent connections instead of one, and why `Accept` only ever hands back one connection per call.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 Where does the 3-way handshake happen in this code?
+> Inside `net.Dial` on the client and `ln.Accept()` on the server; the kernel does it.
+
+> [!question]- 🟢 What does `wb.Window.CanSend` return?
+> How many more bytes may be sent: the receiver's window minus bytes already in flight, never below 0.
+
+> [!question]- 🟢 What does `OnLoss` do to `Ssthresh` and `Cwnd`?
+> `Ssthresh` becomes half of `Cwnd` (at least 2) and `Cwnd` resets to 1.
+
+> [!question]- 🟡 Why does the client use `io.ReadFull` instead of one `conn.Read`?
+> TCP is a byte stream; one `Read` may return only part of the message.
+
+> [!question]- 🟡 Why are flow control and congestion control separate types?
+> They solve different problems, and separate types let each be tested alone.
+
+> [!question]- 🟡 Why is the `*net.TCPConn` type assertion needed?
+> `SetNoDelay` and `SetKeepAlive` exist only on the TCP-specific type, not on `net.Conn`.
 
 ## Links
 

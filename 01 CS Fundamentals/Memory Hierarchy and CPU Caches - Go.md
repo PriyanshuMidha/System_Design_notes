@@ -23,6 +23,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run the benchmark yourself.
 > - 🔴 **Interview / SDE-3 prep?** Add Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Memory Hierarchy and CPU Caches]]: the theory twin. Know that caches move data in 64-byte lines, and that two cores writing the same line slow each other down (false sharing).
+> - [[How a Computer Runs a Program]]: the CPU runs instructions that read and write memory.
+
 **From zero** 🟢: this file is one small Go experiment. It builds two versions of the same counter array — one where counters sit squeezed together in memory, one where each counter gets its own 64-byte "room" (a cache line). Both give the right answer; the padded one is faster under concurrency because CPU cores stop fighting over the same line. Read it top to bottom: the code first, then the tests that prove it is correct, then the benchmark that shows the speed difference.
 
 ## Before the code 🟢
@@ -30,6 +34,8 @@ updated: 2026-11-13
 - **Structs and blank fields**: `_ [7]int64` reserves memory without a usable name; here it is padding.
 - **Slices**: `make([]T, n)` allocates `n` elements back to back in one block of memory.
 - **Goroutines**: `go func(...)` starts a lightweight concurrent function; each counter gets its own.
+- **Padding**: unused bytes added on purpose so the next value starts on a fresh 64-byte cache line.
+- **False sharing**: two cores slowing each other down because their *different* variables sit in the same cache line.
 - **`sync.WaitGroup`**: `Add`, `Done`, `Wait` let the test block until every goroutine finishes.
 - **`testing` benchmarks**: `func BenchmarkX(b *testing.B)` runs the body `b.N` times and reports time per iteration.
 - **What to run**: `go vet ./... && go test -race -v ./...`, then the benchmark command in Setup.
@@ -72,7 +78,11 @@ Both types expose the same two methods, `Incr` and `Get`, so the only difference
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** the goal: two counter layouts, same answers, different speed. **Next we read the code:** first the packed layout that causes false sharing, then the padded fix.
+
 ### Step 1: the packed layout
+
+**What this code does, in plain words:** it keeps one `int64` counter per worker in a single slice, so eight counters sit side by side in one 64-byte cache line, and each worker adds 1 to its own counter many times.
 
 **Concept.** This implements the "before" side of [[Memory Hierarchy and CPU Caches#4. Worked example 🟡]]: `N` plain `int64` counters packed into one slice.
 
@@ -123,6 +133,8 @@ flowchart LR
 ```
 
 ### Step 2: the padded fix
+
+**What this code does, in plain words:** the same counters, but each one is wrapped with 56 bytes of empty space so every counter fills a whole 64-byte line by itself.
 
 **Concept.** This implements the "after" side of the worked example: each counter is wrapped in a `paddedCounter` struct sized to exactly one 64-byte cache line, so no two counters can ever share a line regardless of how the slice is allocated.
 
@@ -262,7 +274,7 @@ func TestPaddedCounterIsOneCacheLine(t *testing.T) {
 
 1. Each subtest launches `goroutines` (8) goroutines, each incrementing only its own index `i` — this is why `-race` passes: no two goroutines ever write the same memory word, only the same cache line.
 2. `wg.Wait()` ensures every increment has completed before any `Get` call, so the read-after-write ordering is correct.
-3. `go func(i int) { ... }(i)` captures `i` by parameter, not by closing over the loop variable directly — necessary to avoid every goroutine seeing the final value of `i` (a classic Go closure-over-loop-variable bug, fixed here by passing `i` explicitly).
+3. `go func(i int) { ... }(i)` captures `i` by parameter, not by closing over the loop variable directly — necessary to avoid every goroutine seeing the final value of `i` (a classic Go closure-over-loop-variable bug (before Go 1.22, every goroutine started in a loop shared one `i` variable), fixed here by passing `i` explicitly).
 
 **If it fails.** A failure here (`counter %d = %d, want %d`) would mean an increment was lost or double-counted — a real data race, not false sharing.
 
@@ -349,6 +361,8 @@ Apple's performance cores share a large per-cluster L2 with fast core-to-core tr
 
 Treat the ~9% figure as one representative sample, not a precise constant.
 
+> 🟡 → 🔴 **You now know** how the code, tests and benchmark work. **Next comes the advanced part:** the settings and assumptions that can make this benchmark lie, such as too few cores, too few runs, or a different cache-line size.
+
 ## Pitfalls in the code 🔴
 
 - **`-cpu 8` matters.** Running this benchmark with the default `GOMAXPROCS` on a machine with fewer than 8 logical cores will time-slice goroutines onto the same core, hiding the inter-core invalidation cost entirely.
@@ -361,6 +375,30 @@ Treat the ~9% figure as one representative sample, not a precise constant.
 1. Change `goroutines` from 8 to 2 and re-run the benchmark with `-cpu 2`. Predict whether the padded/unpadded gap grows, shrinks, or stays about the same, then measure it.
 2. Change the padding from `[7]int64` to `[3]int64` (32 bytes total per counter, so two counters now share a 64-byte line). Predict what happens to the benchmark gap, then run it.
 3. Add a third layout where all 8 counters share a *single* `int64` behind a `sync/atomic.Int64`, incremented by all 8 goroutines. Predict how its time compares to both `Counters` and `PaddedCounters`, and explain why using the MESI model from the theory note.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Do the padded and unpadded layouts give different counts?
+> No. Both are correct; only the speed differs.
+
+> [!question]- Why is `paddedCounter` exactly 64 bytes?
+> 8 bytes for the counter + 7 × 8 bytes of padding = one 64-byte cache line.
+
+> [!question]- Why does `-race` pass even with non-atomic `++`?
+> Each goroutine writes only its own index, so no memory word is shared, only a cache line.
+
+🟡 Medium
+
+> [!question]- Why run the benchmark with `-cpu 8`?
+> So the 8 goroutines run on 8 different cores; on one core there is no cross-core invalidation to measure.
+
+> [!question]- Why use `-count=5` instead of one run?
+> The gap is noisy (about 5% to 25%); one run can even show padded slower by chance.
+
+> [!question]- Would `sync/atomic` counters without padding fix false sharing?
+> No. Atomics stop races on the same counter, but neighbouring counters still share a line.
 
 ## Links
 

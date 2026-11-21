@@ -34,6 +34,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs) and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[LLD Interview Method]]: the step order these notes follow: clarify, entities, APIs, storage, code, edge cases.
+> - [[Concurrency for LLD]]: goroutines, channels and a mutex; one goroutine can own data while others send it work.
+> - [[Command, Undo and Memento]]: a request turned into a value that can wait in a queue, here a job's function.
+
 **From zero, in 60 seconds** 🟢
 
 A task scheduler runs a piece of code at a set time, once or again and again. Think of a phone alarm app with many alarms. All jobs sit in a list sorted by the next run time; the data structure for this is a **min-heap**. One loop looks at the earliest job and sleeps until it is due. When it wakes, it runs the job, and if the job repeats, it puts it back with the next time.
@@ -66,6 +71,11 @@ Something must wake up at the right moment, run the job, and allow a job to be c
 | Worker pool | A fixed number of goroutines that run jobs | 4 workers share all jobs |
 | Context | A Go value that carries cancellation to running code | Cancel stops an in-flight run |
 | Injected clock | Time comes from an interface, so tests can fake it | Test calls `Advance(10*time.Second)` |
+| O(log n) | Cost that grows very slowly with size | 1,000,000 jobs: about 20 steps to insert |
+| Backpressure | When workers are full, the sender is made to wait instead of piling up work | Dispatcher blocks on a full channel |
+| Lease | A claim on a job that runs out unless renewed | "Instance 2 owns job 7 for 30 s" |
+| At-least-once / idempotent | A job may run twice after a crash, so running it twice must be harmless | Send reminder only if not already sent |
+| Graceful shutdown | Stop taking new work, finish what is running, then exit | Wait up to 10 s on SIGTERM |
 
 **Picture it**
 
@@ -105,12 +115,12 @@ was busy or paused, and a graceful shutdown that lets running jobs finish.
 
 ### Solving path
 
-1. Clarify: one process or many, delayed and fixed-interval jobs (cron expressions are a follow-up), the missed-run policy, overlap, and shutdown.
+1. Clarify: one process or many, delayed and fixed-interval jobs (cron expressions, the classic Unix text format like `0 9 * * *` for "9 a.m. daily", are a follow-up), the missed-run policy, overlap, and shutdown.
 2. Name the entities: `Job`, the heap `entry`, `Scheduler`, `Clock`, `Result`.
 3. Choose the core structure: a min-heap by next run time, plus a map from ID to entry for cancellation.
 4. Write the dispatcher loop: pop everything due, reschedule recurring jobs, arm one timer for the new head, wait on the timer or a wake-up signal.
 5. Add the worker pool, cancellation, the missed-run policy and shutdown.
-6. Test with a fake clock: ordering, both missed-run policies, cancel, no overlap, panic recovery, shutdown, and 50 concurrent schedule/cancel calls under `-race`.
+6. Test with a fake clock: ordering, both missed-run policies, cancel, no overlap, panic recovery (catching a crash inside one job so the worker survives), shutdown, and 50 concurrent schedule/cancel calls under `-race` (Go's race detector, which flags unsafe shared access).
 
 ## Step 1: Clarify requirements 🟢
 
@@ -118,7 +128,7 @@ was busy or paused, and a graceful shutdown that lets running jobs finish.
 
 - One process, or a cluster of instances that must not run a job twice? *Assume: one process; the cluster version is a Step 10 extension.*
 - Which schedules? *Assume: one-shot at a time, and fixed interval (`Every`). Cron expressions are an extension that only changes how the next time is computed.*
-- What if the scheduler wakes up late and several slots of a recurring job were missed? *Assume: a per-job policy, `CatchUp` or `Coalesce`.*
+- What if the scheduler wakes up late and several slots of a recurring job were missed? *Assume: a per-job policy, `CatchUp` (run every missed slot) or `Coalesce` (merge them into one run).*
 - Can two runs of the same recurring job overlap if one run is slower than the interval? *Assume: no for `Coalesce` jobs (the late slot is skipped); `CatchUp` jobs owe every slot, so they may overlap when there is more than one worker.*
 - Are jobs durable across a restart? *Assume: no, in memory; the database version is in Step 6.*
 - Retries on failure? *Assume: the result is reported; retry is the job's own concern or a follow-up.*
@@ -137,7 +147,7 @@ was busy or paused, and a graceful shutdown that lets running jobs finish.
 - Due jobs start within one timer wake-up of their time; no polling interval.
 - `Schedule` and `Cancel` are O(log n) and safe from many goroutines.
 - A full worker pool never blocks `Schedule` or `Cancel`.
-- Time is injected, so tests are deterministic and never sleep for the scheduled duration.
+- Time is injected, so tests are deterministic (same result every run) and never sleep for the scheduled duration.
 
 ### Out of scope
 
@@ -153,7 +163,7 @@ was busy or paused, and a graceful shutdown that lets running jobs finish.
 | Application code | Schedule a recurring job (refresh a cache every 30 seconds) |
 | Application code | Cancel a job (the user cancelled the order, so drop the reminder) |
 | Worker pool | Execute due runs, report results |
-| Process owner (`main`) | Graceful shutdown on SIGTERM |
+| Process owner (`main`) | Graceful shutdown on SIGTERM (the signal an OS or Kubernetes sends to say "please stop") |
 | Operator | Read results and metrics (late starts, failures) |
 
 The hardest use case is the **dispatcher loop**: it must sleep exactly until the next due job, wake early when a sooner job is scheduled, and never hold the lock while it waits for a free worker.
@@ -173,6 +183,8 @@ The hardest use case is the **dispatcher loop**: it must sleep exactly until the
 Modelling insight: the job is the caller's value, the **entry is the scheduler's state** about it. Keeping `index` on the entry is what makes `Cancel` O(log n): `heap.Remove(&pq, e.index)` instead of a linear search. The entry also carries the job's `context`, so cancelling stops a run that has already started.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know delayed and recurring jobs, the heap, the dispatcher and the workers. Next we open the box: how the entry, heap and clock link up, the API, a jobs table for restarts, and the Go code of the dispatcher loop.
 
 ```mermaid
 classDiagram
@@ -255,7 +267,7 @@ GET    /jobs/{id}                                                           -> 2
 GET    /jobs/{id}/runs?limit=20                                             -> 200 [{scheduledAt, startedAt, error}]
 ```
 
-The Go surface is a small interface; `*Scheduler` in Step 8 implements it. `Fn` is a closure, which is the usual Go form of the command pattern ([[Command, Undo and Memento]]).
+The Go surface is a small interface; `*Scheduler` in Step 8 implements it. `Fn` is a closure (a function value that carries the variables it needs), which is the usual Go form of the command pattern ([[Command, Undo and Memento]]).
 
 ```go
 type JobScheduler interface {
@@ -318,7 +330,7 @@ type JobRepo interface {
 }
 ```
 
-- The partial index keeps "what is due" a small index range scan, whatever the size of the history.
+- The partial index keeps "what is due" a small index range scan (reading one short slice of a sorted index), whatever the size of the history.
 - `FOR UPDATE SKIP LOCKED` is the same claim pattern as in [[Parking Lot]]; the general trade-offs are in [[Locking - Optimistic vs Pessimistic]].
 - An instance that crashes mid-run leaves a lease that expires; a sweeper puts the row back to `scheduled`. That makes execution **at-least-once**, so handlers must be idempotent ([[Idempotency and Idempotency Keys]]).
 
@@ -364,7 +376,7 @@ cmd/demo/main.go    -> New(RealClock{}, 4, logResult), signal.NotifyContext, Shu
 
 1. Validate (ID, function, non-negative interval) and reject a duplicate ID.
 2. Create the entry with its own `context.WithCancel` and a sequence number for tie-breaking.
-3. `heap.Push`, then `signal()`: a non-blocking send on `wake` (capacity 1), because the new job may be earlier than the timer the dispatcher sleeps on.
+3. `heap.Push`, then `signal()`: a non-blocking send (try to send; if the channel is full, skip instead of waiting) on `wake` (capacity 1), because the new job may be earlier than the timer the dispatcher sleeps on.
 
 `loop()` (the dispatcher, one goroutine):
 
@@ -1140,11 +1152,13 @@ func TestConcurrentScheduleAndCancel(t *testing.T) {
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working scheduler and its fake-clock tests. Next is interview depth: missed runs after a pause, slow jobs that overlap, clock jumps, and how the design grows into a fleet-wide scheduler.
+
 | Edge case | What happens | How the design handles it |
 |---|---|---|
 | A job sooner than the current timer is scheduled | Dispatcher would oversleep | `signal()` on `wake`; the loop re-reads the heap head and re-arms |
 | Two jobs due at the same instant | Order would be random | `seq` tie-break: submit order |
-| Process paused (GC, laptop sleep, `SIGSTOP`) for several intervals | Several slots missed at once | `MissedRunPolicy`: `CatchUp` runs each, `Coalesce` runs once |
+| Process paused (GC: Go's garbage collector pausing to free memory; laptop sleep; `SIGSTOP`: an OS signal that freezes a process) for several intervals | Several slots missed at once | `MissedRunPolicy`: `CatchUp` runs each, `Coalesce` runs once |
 | Run slower than its interval | Two copies of the same job run together | `Coalesce` skips a slot while `inFlight > 0`; `CatchUp` dispatches anyway (documented) |
 | All workers busy | Due runs pile up | The dispatcher blocks on the bounded `work` channel; `Schedule` and `Cancel` stay fast because the lock is not held |
 | Cancel after dispatch but before start | Run would start anyway | Worker checks `ctx.Err()` before calling `Fn` |
@@ -1152,7 +1166,7 @@ func TestConcurrentScheduleAndCancel(t *testing.T) {
 | Job panics | Worker goroutine would die, pool shrinks | `safeCall` recovers and reports an error |
 | Duplicate ID | Two entries, `Cancel` ambiguous | `ErrDuplicateID` |
 | `Every` tiny with `CatchUp` after a long pause | Thousands of catch-up runs | Cap the catch-up count, or use `Coalesce` for anything that only needs the latest state |
-| Wall clock jumps (NTP step) | A deadline could fire early or late | Times from `time.Now()` carry a monotonic reading that `Sub` uses, so `now.Add(d)` deadlines are safe. A caller-supplied `RunAt` (parsed from a request) has no monotonic reading, so a step moves it; state that wall-time jobs follow the wall clock |
+| Wall clock jumps (NTP step: the time-sync service suddenly corrects the clock) | A deadline could fire early or late | Times from `time.Now()` carry a monotonic reading (a counter that only moves forward) that `Sub` uses, so `now.Add(d)` deadlines are safe. A caller-supplied `RunAt` (parsed from a request) has no monotonic reading, so a step moves it; state that wall-time jobs follow the wall clock |
 | Daylight-saving change for "every day at 02:30" | The slot does not exist or repeats | Out of scope for fixed intervals; a cron strategy must pick a rule (skip or run once) |
 
 ### Common mistakes
@@ -1168,12 +1182,12 @@ func TestConcurrentScheduleAndCancel(t *testing.T) {
 | Follow-up | Design change |
 |---|---|
 | Cron expressions | A `NextAfter(t time.Time) time.Time` strategy per job; the heap and loop do not change |
-| Retries with backoff | The `onResult` observer re-schedules a one-shot copy at `now + backoff(attempt)` with jitter ([[Timeouts, Retries and Backoff]]) |
+| Retries with backoff | The `onResult` observer re-schedules a one-shot copy at `now + backoff(attempt)` with jitter (a small random extra delay so retries do not all fire together) ([[Timeouts, Retries and Backoff]]) |
 | Survive restarts | The `jobs` table from Step 6; the heap becomes a cache of the next few minutes |
 | Several instances | Claim with `FOR UPDATE SKIP LOCKED` and a lease; at-least-once, so idempotent handlers; or a single leader ([[Leader Election]]) |
-| Millions of timers | A hierarchical timing wheel gives O(1) insert and cancel at the cost of tick granularity |
+| Millions of timers | A hierarchical timing wheel (rings of time buckets, like the hands of a clock) gives O(1) insert and cancel at the cost of tick granularity |
 | Priorities | Order the ready queue by priority after the time check, or one work channel per priority |
-| Per-job concurrency limits | A semaphore per job type in the worker ([[Bulkheads and Concurrency Limits]]) |
+| Per-job concurrency limits | A semaphore (a counter that lets at most N goroutines in at once) per job type in the worker ([[Bulkheads and Concurrency Limits]]) |
 
 Tradeoffs chosen:
 
@@ -1226,7 +1240,7 @@ Redraw it from memory:
 > The heap gives the earliest job in O(1) and insert or remove in O(log n), and one goroutine sleeps until the head is due. A timer per job scatters state across many callbacks: you cannot list jobs, shutdown cannot wait for them, and cancelling races with firing. With a heap there is one place that owns all the state.
 
 > [!question]- How does `Cancel` stay O(log n), and what happens to a run that already started?
-> Each entry stores its heap index, kept up to date by `Swap`, so `heap.Remove(&pq, e.index)` needs no search. The entry also owns a `context.CancelFunc`: a queued run checks `ctx.Err()` and is skipped, and a running job sees `ctx.Done()`. Cancellation in Go is cooperative, so a job that ignores its context runs to the end.
+> Each entry stores its heap index, kept up to date by `Swap`, so `heap.Remove(&pq, e.index)` needs no search. The entry also owns a `context.CancelFunc`: a queued run checks `ctx.Err()` and is skipped, and a running job sees `ctx.Done()`. Cancellation in Go is cooperative (the job must check its context itself), so a job that ignores its context runs to the end.
 
 > [!question]- Trap: the process was paused for 25 seconds and a 10-second job missed two slots. What runs?
 > It depends on a policy you must state. `CatchUp` runs every missed slot (10, 20, 30), which suits per-slot work like hourly billing. `Coalesce` runs once and jumps to the first future slot (40), which suits "refresh the cache". Running all missed slots by accident after a long pause causes a burst that can overload a dependency.
@@ -1257,6 +1271,26 @@ Redraw it from memory:
 - Cancel = heap remove + `ctx` cancel; a queued run re-checks `ctx.Err()`.
 - Shutdown = stop, drain, wait, cancel contexts on deadline.
 - Inject the clock with absolute-deadline timers; never sleep in tests.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 Why a min-heap and not a scan of all jobs every second?
+> The heap keeps the job due soonest on top, so the dispatcher sleeps until exactly that time; a scan is slow and up to a second late.
+
+> [!question]- 🟢 Who decides when a job runs, and who runs it?
+> One dispatcher goroutine decides when; a fixed pool of workers does the running.
+
+> [!question]- 🟢 How do the tests check a 10-minute delay without waiting 10 minutes?
+> An injected fake clock: the test calls `Advance` and the fake timer fires at once.
+
+> [!question]- 🟡 Paused 25 s, a 10 s job missed slots 10, 20, 30. What do `CatchUp` and `Coalesce` run?
+> `CatchUp` runs all three slots; `Coalesce` runs once, then both continue at 40.
+
+> [!question]- 🟡 Why must the dispatcher send to the worker channel outside the lock?
+> If all workers are busy the send blocks; under the lock that would freeze `Schedule`, `Cancel` and `Shutdown` too.
+
+> [!question]- 🟡 Why `TimerAt(deadline)` instead of `NewTimer(duration)`?
+> If the fake clock moves between `Now()` and `NewTimer`, a relative timer lands in the future and the test can hang; an absolute deadline cannot drift.
 
 ## Links 🟢
 

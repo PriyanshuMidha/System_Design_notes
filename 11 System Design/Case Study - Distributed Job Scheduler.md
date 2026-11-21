@@ -31,6 +31,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+> - [[Scheduled Jobs - Cron to Durable Schedulers]]: cron runs tasks on a timetable on one machine; a durable scheduler saves jobs in a database instead.
+> - [[Background Jobs and Worker Pools]]: a pool of worker processes picks tasks off a list and runs them away from the user's request.
+
 **From zero, in 60 seconds** 🟢
 
 A job scheduler runs tasks at a set time, like "send this reminder at 9 am".
@@ -70,6 +75,10 @@ A distributed scheduler runs each job on time, once, even when machines fail.
 | Heartbeat | A periodic "I am still alive" signal | Renew the lease every 10 s |
 | Idempotent | Running twice has the same effect as once | Sending reminder #9 checks it was not sent |
 
+| Fencing token | A number that goes up on each new claim; old numbers are refused | attempt 2 can finish, attempt 1 cannot |
+| Tenant | One customer (team or company) sharing the scheduler with others | team "billing" and team "growth" |
+| Dead (dead-letter) | The resting state for a job that failed too many times | job 9 gave up after 5 tries |
+
 **Picture it**
 
 ```mermaid
@@ -106,7 +115,7 @@ The single-service mechanics (cron syntax, Kubernetes CronJob, `SKIP LOCKED` pol
 - Submit a one-off job with a `run_at` time and a payload (HTTP callback, queue message or registered handler).
 - Create recurring schedules from a cron expression with a time zone.
 - Cancel or reschedule a job before it runs; pause a schedule.
-- Retries with backoff, a maximum number of attempts, and a dead-letter state.
+- Retries with backoff (wait longer after each failure), a maximum number of attempts, and a dead-letter state.
 - Query job status and run history.
 
 **Non-functional requirements**
@@ -114,7 +123,14 @@ The single-service mechanics (cron syntax, Kubernetes CronJob, `SKIP LOCKED` pol
 - **Timeliness:** a job starts within 2 s of `run_at` at p99 under normal load.
 - **No concurrent duplicates:** two workers never run the same attempt at once. Execution is at least once, so a crash can cause a re-run.
 - Scale: about 100 M pending jobs and 50 M executions a day, with a burst at the top of every minute and hour.
-- Multi-tenant fairness: one tenant scheduling a million jobs for 09:00 cannot starve others.
+- Multi-tenant (many customer teams share one scheduler) fairness: one tenant scheduling a million jobs for 09:00 cannot starve others.
+
+### Real-life example: a movie-show reminder 🟢
+
+You book a movie on BookMyShow for 7 pm. The app may remind you two hours before the show.
+That reminder is a one-off job with a run time of 5 pm, saved the moment you book.
+At 5 pm a worker picks it up, sends the push or SMS, and marks it done. If that worker crashes mid-way, another one sends it.
+Because a crash can cause a second try, the sending step checks "was reminder #9 already sent?" so you are not reminded twice.
 
 **Glossary.** A **job** is one unit of work with a due time. A **schedule** is a recurring rule that creates a job per fire time. A **lease** is a time-limited claim on a job by one worker. A **heartbeat** extends a lease. A **fencing token** is a number that increases each time a job is re-leased; the store rejects updates carrying an old number. **DLQ / dead** is the state for jobs that exhausted their attempts.
 
@@ -140,7 +156,26 @@ sequenceDiagram
     A->>D: done, attempt 1: refused
 ```
 
+## Common beginner mistakes 🟢
+
+- **Running cron on two servers for safety** → every job now runs twice → keep jobs in a shared table and let workers claim them.
+- **Marking a job "taken" forever** → if that worker dies, the job is stuck → claim with a lease that expires unless renewed.
+- **Letting a late worker mark a job done** → a paused worker can overwrite a newer attempt → check the attempt number (fencing token) on every write.
+- **Assuming each job runs exactly once** → a crash after the work but before "done" repeats it → make the job's effect idempotent with the job ID as a key.
+- **Using each worker's own clock for lease expiry** → clocks drift apart → use the database's `now()`.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the goal: run every job on time, never lose one, and survive dead workers. **Next we open the box** and follow one job from submit, to claim with a lease, to done, and see what happens when a worker dies.
+
+**Step by step (plain):**
+1. The app submits "remind user 42 at 09:00". The row is saved with state `scheduled` before the API says OK.
+2. At 09:00 a poller finds it due and claims it in one statement: state `running`, attempt 1, lease until 09:00:30.
+3. A worker sends the reminder, renewing the lease every 10 seconds if it takes long.
+4. It reports "done for attempt 1". The row still says attempt 1, so the update is accepted.
+5. If the worker had died, the lease would run out at 09:00:30, the job would be due again, and the next claim would make it attempt 2.
+
+**Full detail:**
 
 ```mermaid
 flowchart LR
@@ -159,11 +194,11 @@ flowchart LR
 ```
 
 1. **Submit.** The API validates the request, inserts the job row with `state = 'scheduled'` and an `Idempotency-Key`, and returns 201 only after the commit.
-2. **Find due work.** Each job-store shard has pollers that run the claim query every 200-500 ms: oldest `run_at <= now()`, `FOR UPDATE SKIP LOCKED`, limit 100. `SKIP LOCKED` lets several pollers on one shard work without blocking each other.
+2. **Find due work.** Each job-store shard has pollers that run the claim query every 200-500 ms: oldest `run_at <= now()`, `FOR UPDATE SKIP LOCKED`, limit 100. `SKIP LOCKED` (skip rows another transaction has locked instead of waiting for them) lets several pollers on one shard work without blocking each other.
 3. **Lease.** The same statement sets `state = 'running'`, `attempt = attempt + 1`, `lease_owner`, `lease_until = now() + 30 s`.
 4. **Dispatch fairly.** Leased jobs go to per-tenant queues; workers pull round-robin across tenants, so a tenant's 1 M jobs at 09:00 do not block a small tenant's 10.
 5. **Execute.** The worker calls the target with the job ID and attempt as an idempotency key, heartbeating every 10 s for long jobs.
-6. **Finish.** `complete(job, attempt)` succeeds only if the row still shows that attempt. Failure schedules a retry with exponential backoff and jitter, or moves the job to `dead` after `max_attempts`.
+6. **Finish.** `complete(job, attempt)` succeeds only if the row still shows that attempt. Failure schedules a retry with exponential backoff (1 s, 2 s, 4 s, 8 s...) and jitter (a small random extra wait so retries do not line up), or moves the job to `dead` after `max_attempts`.
 7. **Recover.** A worker that dies stops heartbeating; after `lease_until` the job is due again and the next claim gives it attempt + 1.
 
 ```mermaid
@@ -290,7 +325,7 @@ erDiagram
     }
 ```
 
-The claim, the fenced completion and the indexes, in PostgreSQL 17:
+The claim, the fenced completion and the indexes, in PostgreSQL 17 (`jobs_due` is a partial index: it covers only rows still waiting, so it stays small):
 
 ```sql
 CREATE INDEX jobs_due ON jobs (run_at) WHERE state = 'scheduled';
@@ -328,7 +363,7 @@ VALUES ($1, $2, $3, $4, 'scheduled', $4, 0, $5, $6)
 ON CONFLICT (schedule_id, fire_time) WHERE schedule_id IS NOT NULL DO NOTHING;
 ```
 
-Representative output (PostgreSQL 17) of `EXPLAIN` for the inner claim query on a shard with 25 M scheduled rows, showing the partial index serving the `ORDER BY ... LIMIT` without a sort:
+Representative output (PostgreSQL 17) of `EXPLAIN` (the command that shows how the database plans to run a query) for the inner claim query on a shard with 25 M scheduled rows, showing the partial index serving the `ORDER BY ... LIMIT` without a sort:
 
 ```text
 Limit  (cost=0.56..9.21 rows=100 width=22)
@@ -723,6 +758,14 @@ func TestConcurrentWorkersNeverShareAJob(t *testing.T) {
 | Workflow engine (Temporal timers) | durable timers inside workflows | multi-step processes with waits | heavier platform (see [[Workflow Engines and Durable Execution]]) |
 | Kubernetes CronJob | controller creates a Job per fire time | a handful of infra tasks | not built for millions of user jobs |
 
+### Things people confuse this with 🟡
+
+| Thing | What it does | How it differs from a distributed scheduler |
+| --- | --- | --- |
+| cron on one server | Runs commands on a timetable | No failover, no retries, no record of runs; a reboot skips jobs |
+| Message queue ([[Case Study - Distributed Message Queue]]) | Delivers messages as soon as possible | Not built for "run at 09:00 next Tuesday"; delays are limited |
+| Workflow engine (Temporal, Airflow) | Runs multi-step flows with state between steps | A scheduler fires single jobs; a workflow engine also tracks step 2 waiting on step 1 |
+
 ## 6. Trade-offs 🟡
 
 - **Polling vs push.** Polling every 250 ms adds up to 250 ms of delay and constant queries, but it is simple and self-healing. A timing wheel loaded a few seconds ahead gives precise firing while the database stays the source of truth.
@@ -739,22 +782,35 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the claim query, the lease and fencing rules, the data model and the Go store with tests. **Next is the advanced part**: real systems, failure stories, why the attempt number works as a fence, cron at scale, timing wheels, fairness and exactly-once effects.
+
 - **Real systems.** Postgres-backed queues with periodic jobs (River for Go, GoodJob and Solid Queue for Ruby), Redis-backed schedulers (asynq for Go, Sidekiq Enterprise periodic jobs for Ruby), Quartz in clustered JDBC mode, Kubernetes CronJob, Amazon EventBridge Scheduler, and Temporal for durable timers all implement parts of this design.
-- **Failure: the target is down for an hour.** Retries with exponential backoff and jitter, capped at a few minutes, plus a per-target circuit breaker so 50,000 jobs do not hammer a dead endpoint (see [[Timeouts, Retries and Backoff]]).
-- **Failure: a poison job** crashes the worker every time. The attempt count rises on each lease expiry and the job reaches `dead` after `max_attempts` (see [[Dead Letter Queues and Poison Messages]]).
-- **Failure: clock skew between workers.** Lease expiry is computed with the database's `now()`, never with worker clocks, so skew between workers cannot shorten someone else's lease.
+- **Failure: the target is down for an hour.** Retries with exponential backoff and jitter, capped at a few minutes, plus a per-target circuit breaker (a switch that stops calls to a failing service for a while) so 50,000 jobs do not hammer a dead endpoint (see [[Timeouts, Retries and Backoff]]).
+- **Failure: a poison job** (one whose own data makes it fail every time) crashes the worker every time. The attempt count rises on each lease expiry and the job reaches `dead` after `max_attempts` (see [[Dead Letter Queues and Poison Messages]]).
+- **Failure: clock skew (machines' clocks disagreeing by seconds) between workers.** Lease expiry is computed with the database's `now()`, never with worker clocks, so skew between workers cannot shorten someone else's lease.
 - **Failure: the scheduler was down for 20 minutes.** On restart, all overdue jobs are due at once. Claim in `run_at` order with per-tenant limits; for cron schedules apply each schedule's catch-up policy (`latest_only` skips missed fires instead of running 20 copies).
 - **What to monitor:** due-but-unclaimed count and age of the oldest due job (the key lag signal); start delay (`started_at - run_at`) p99; success, retry and dead rates per tenant; lease expiries (crashing or slow workers); heartbeat failures; table bloat and autovacuum lag on the jobs table; a dead-man's switch alert for critical schedules that did not run.
 
 ## 8. Deep dive 🔴
 
-**Why the attempt number is a fencing token.** A lease is based on time, and a process cannot know it has been paused. After a 40-second GC pause, worker 1 still believes it holds the job. Every write it makes is therefore guarded by `attempt = $token`. When the job is re-leased, the attempt increments, so the old holder's writes match zero rows. This is the fencing pattern from [[Distributed Locks and Fencing Tokens]] applied to jobs. It protects the job store, but it does not stop worker 1's HTTP call to the target that is already in flight. That is why the target also needs an idempotency key.
+**Why the attempt number is a fencing token.** A lease is based on time, and a process cannot know it has been paused. After a 40-second GC pause (the program frozen while the language runtime cleans up memory), worker 1 still believes it holds the job. Every write it makes is therefore guarded by `attempt = $token`. When the job is re-leased, the attempt increments, so the old holder's writes match zero rows. This is the fencing pattern from [[Distributed Locks and Fencing Tokens]] applied to jobs. It protects the job store, but it does not stop worker 1's HTTP call to the target that is already in flight. That is why the target also needs an idempotency key.
 
 **Cron at scale.** Evaluating 1 M cron expressions every minute is wasteful. Store `next_fire_at` per schedule and index it; an expander claims schedules whose `next_fire_at <= now() + lookahead`, inserts the job row for that fire time with `ON CONFLICT DO NOTHING`, and advances `next_fire_at` in the same transaction. If two expanders race, or one crashes after inserting, the unique key `(schedule_id, fire_time)` ensures one run per fire time. Overlap policies (`skip` if the previous run is still running, `replace` to cancel it) are checked at insert time.
 
-**Timing wheels for precise firing.** A timing wheel is a circular array of slots, each holding the timers that expire in that tick, so insert and expiry are O(1). Hierarchical wheels (seconds, minutes, hours) cover long ranges with few slots. Here the wheel only holds jobs leased a few seconds ahead from the durable store: if the node dies, those leases expire and the jobs are claimed again elsewhere, so nothing is lost.
+**Timing wheels for precise firing.**
 
-**Fairness and the 09:00 problem.** One tenant submitting 1 M jobs for exactly 09:00 would occupy every poller for over a minute. The claim query is per tenant with a weighted round-robin across tenants that have due jobs, and each tenant has a concurrency limit. Jobs over the limit stay `scheduled` and start late, which shows up in that tenant's lag metric only.
+```mermaid
+flowchart LR
+    S0["slot 0: now"] --> S1["slot 1: +1 s"]
+    S1 --> S2["slot 2: +2 s"]
+    S2 --> S3["slot 3: +3 s"]
+    S3 --> S0
+    P["poller loads jobs due soon"] --> S2
+```
+
+A timing wheel is a circular array of slots, each holding the timers that expire in that tick, so insert and expiry are O(1) (constant time, no matter how many timers there are). Hierarchical wheels (seconds, minutes, hours) cover long ranges with few slots. Here the wheel only holds jobs leased a few seconds ahead from the durable store: if the node dies, those leases expire and the jobs are claimed again elsewhere, so nothing is lost.
+
+**Fairness and the 09:00 problem.** One tenant submitting 1 M jobs for exactly 09:00 would occupy every poller for over a minute. The claim query is per tenant with a weighted round-robin (take turns, giving bigger tenants slightly more turns) across tenants that have due jobs, and each tenant has a concurrency limit. Jobs over the limit stay `scheduled` and start late, which shows up in that tenant's lag metric only.
 
 **Exactly-once effects.** "Exactly once" execution is not achievable across a network boundary, but exactly-once *effect* is: the target stores `job_id` in a unique column or an idempotency table in the same transaction as its side effect, and the scheduler can safely retry forever. For jobs that write to the same Postgres as the scheduler, completing the job and doing the work in one transaction gives a true exactly-once effect.
 
@@ -780,6 +836,26 @@ flowchart LR
 
 > [!question]- Where should the lease expiry time come from?
 > From one clock: the database's `now()`. Worker clocks can drift; if each worker computed expiry locally, a fast clock could steal a lease that is still valid.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: why is cron on a single server not enough?
+> If that server is down at run time, the job never runs; add a second one and every job runs twice.
+
+> [!question]- Easy: what is a lease?
+> A time-limited claim on a job, such as 30 seconds, that the worker must keep renewing.
+
+> [!question]- Easy: why must jobs be idempotent?
+> A crash after the work but before "done" makes the job run again.
+
+> [!question]- Medium: worker 1 pauses for 40 s, the job is re-leased to worker 2, then worker 1 wakes and says "done". What happens?
+> Its update carries attempt 1 but the row now says attempt 2, so it matches no row and is refused.
+
+> [!question]- Medium: 50 million jobs a day. What is the average rate, and what really sizes the system?
+> About 580 jobs a second on average, but the top-of-the-minute and top-of-the-hour bursts size it.
+
+> [!question]- Medium: how do two pollers avoid claiming the same job?
+> The claim uses `FOR UPDATE SKIP LOCKED`, so each poller skips rows the other has locked.
 
 ## 10. Cheat sheet 🟢
 

@@ -39,6 +39,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (where to limit and the algorithms), 4 (Go code, Redis + Lua, the public API case) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Redis Fundamentals]]: Redis is a fast in-memory store that many servers can share; keys can expire on their own after a set time.
+> - [[API Gateway and BFF]]: an API gateway is the front door every API call passes through, where checks like login and limits run once for all services.
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: every reply has a status code (200 ok, 429 too many) and headers (extra lines like `Retry-After`).
+
 **From zero, in 60 seconds** 🟢
 
 Your API can handle only so many requests per second.
@@ -88,6 +93,12 @@ A rate limiter is that lifeguard for an API.
 | HTTP 429 | The "Too Many Requests" reply code | Server says: slow down |
 | Redis | A fast in-memory store many servers can share | Holds the counter `rl:{user:42}` |
 | Atomic | A step that runs as one unbroken piece | Read-check-update with no one in between |
+| TTL | Time after which a Redis key deletes itself | counter key expires after 60 s |
+| Token bucket | A bucket of tokens that refills slowly; each request spends one | 10 tokens max, 1 back per second |
+| Lua script | A small program Redis runs in one go, with nothing else in between | read tokens, refill, take one |
+| Fail open / fail closed | If the limiter breaks: let requests through / block them | open for search, closed for login |
+| API gateway | The front door all API calls pass through | Kong, AWS API Gateway |
+| Hash tag | The `{...}` part of a Redis key; only it decides which shard holds the key | `rl:{user:42}:cur` |
 
 **Picture it**
 
@@ -142,11 +153,43 @@ Think of a **token bucket** as a turnstile that only opens when you drop a token
 
 A client that has been quiet for a while has a full bucket, so it can make 10 quick requests (a **burst**). After that it can only go as fast as tokens drip in: 1 per second. Every other algorithm in this note is a different rule for when the turnstile opens.
 
+### Real-life example: OTPs and booking rushes 🟢
+
+When you log in to a UPI or banking app, you can only ask for a new OTP a few times before it says "try again after some time". That is a rate limit on the "send OTP" button, because every SMS costs money and attackers would love to spam it.
+During a Tatkal rush on IRCTC, or a big film opening on BookMyShow, the site limits how fast each user or IP can hit "search" and "book", so bots cannot grab everything and real users still get through.
+Public APIs like GitHub's tell you your limit in the reply headers and send `429` when you go over.
+
+## Common beginner mistakes 🟢
+
+- **Using `INCR` then `EXPIRE` as two separate calls** → if the second one never runs, the counter never expires and the user is blocked forever → set the expiry in the same atomic step (or use a Lua script).
+- **Limiting by the IP the server sees** → behind a load balancer that is the balancer's IP, so everyone shares one bucket → read the client IP from your own trusted proxy's `X-Forwarded-For`.
+- **Each server keeping its own count** → with 10 servers a user gets 10 times the limit → keep the count in a shared store such as Redis.
+- **Not deciding what happens when Redis is down** → either the whole API dies or login has no limit at all → choose on purpose: fail open with a local limiter for normal calls, fail closed for login and payments.
+- **Returning 429 with no `Retry-After`** → clients retry instantly and make the overload worse → tell them when to come back, and ask them to back off with random delay.
+
+### Rate limit vs things people confuse it with 🟡
+
+| Thing | Question it answers | Example |
+| --- | --- | --- |
+| Rate limit | How many requests may this caller start per second or minute? | 100 per second per API key |
+| Quota | How much may this customer use this month (for billing)? | 1 million calls per month |
+| Concurrency limit | How many of this caller's requests may run at the same time? | at most 5 reports running |
+| Load shedding | The whole server is overloaded; what do we drop first? | reject low-priority calls at 90% CPU |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** a rate limiter counts requests per caller and rejects extras with 429, usually using a token bucket. **Next we open the box**: where limits sit, what key to count by, how each counting rule works, and how to choose one. Each subsection starts with a plain walk-through; the full detail follows.
 
 ### Where to limit, and by what key
 
 **In plain words:** you can put a bouncer at several doors: the outer edge (by IP), the API gateway (by API key or user), and inside each service. Cheap checks go first.
+
+**Step by step:**
+1. A flood of 1 million requests a second from bots hits your site. The edge (CDN or WAF, a web firewall in front of your site) drops most of it by IP before it reaches you.
+2. Real traffic reaches the API gateway. It knows the API key, so it applies "Free plan: 10 per second".
+3. The request reaches the search service. Search is expensive, so the service adds "5 searches per second per user".
+4. Login has its own rule: 5 wrong passwords per account per 15 minutes.
+5. Each layer catches a different kind of overuse, cheapest first.
 
 Limits usually stack in layers, cheapest first:
 
@@ -168,7 +211,7 @@ Choosing the key:
 
 | Key | Good for | Watch out for |
 | --- | --- | --- |
-| IP address | Anonymous traffic, login pages | Behind a load balancer, the socket's IP is the proxy's IP, so everyone shares one bucket. Read the client IP from `X-Forwarded-For` **only** when it is set by your own trusted proxy, otherwise clients can forge it. Many users share one IP behind corporate NAT or a mobile carrier. |
+| IP address | Anonymous traffic, login pages | Behind a load balancer, the socket's IP is the proxy's IP, so everyone shares one bucket. Read the client IP from `X-Forwarded-For` **only** when it is set by your own trusted proxy, otherwise clients can forge it. Many users share one IP behind corporate NAT (network address translation: many devices going out through one public IP) or a mobile carrier. |
 | User ID | Logged-in actions | Not available before authentication. |
 | API key | Public APIs, paid plans | One customer may use many keys; add a tenant-level limit as well. |
 | Tenant / org | Multi-tenant fairness | Needs a second, finer key so one user cannot use the whole tenant's quota. |
@@ -177,6 +220,15 @@ Choosing the key:
 ### The algorithms
 
 **In plain words:** these are different ways to count. The simplest counts requests per minute. Smarter ones smooth out the edges between minutes or use a bucket of tokens.
+
+**Step by step (token bucket, the usual default):**
+1. User 42 has a bucket with room for 10 tokens, refilled at 1 token per second. It starts full.
+2. At 10:00:00 the user fires 10 quick requests. Each takes a token. All 10 pass.
+3. The 11th request finds 0 tokens. It gets `429` and "retry after 1 second".
+4. At 10:00:03, 3 seconds have passed, so 3 tokens are added back when the next request arrives (no background timer needed).
+5. The user can now make 3 more requests. Long-run average: 1 per second; short burst: up to 10.
+
+The other rules below (fixed window, sliding window, leaky bucket, GCRA) just change when the "door" opens.
 
 **1. Fixed window counter.** Keep one counter per key per window, for example `rl:user:42:2026-11-04T10:30`. Increment it on each request, reject when it is above the limit, and let it expire after the window.
 
@@ -187,7 +239,7 @@ INCR  rl:user:42:202611041030
 EXPIRE rl:user:42:202611041030 60
 ```
 
-If the process crashes between the two calls, or the `EXPIRE` is only sent when `INCR` returned 1 and that one call fails, the key has no TTL and lives forever. Once it passes the limit, the user is blocked for good. Atomic versions:
+(`INCR` adds 1 to a counter; `EXPIRE` sets its TTL.) If the process crashes between the two calls, or the `EXPIRE` is only sent when `INCR` returned 1 and that one call fails, the key has no TTL and lives forever. Once it passes the limit, the user is blocked for good. Atomic versions:
 
 ```text
 # Option A (Redis 7.0+): both commands in one MULTI/EXEC; NX only sets a TTL if none exists
@@ -235,10 +287,18 @@ Example: limit 100 per minute. The previous minute had 80 requests, the current 
 
 It assumes the previous window's requests were spread evenly, which is why it is an approximation, but it costs two integers per key.
 
+```mermaid
+flowchart LR
+    P["Previous minute: 80"] -- "x 0.75 still overlaps" --> E["Estimate = 60 + 30 = 90"]
+    C["Current minute so far: 30"] --> E
+    E --> D{"Under 100?"}
+    D -- "yes" --> OK["Allow"]
+```
+
 **4. Token bucket.** Keep `tokens` and `last_refill_time`. On each request, first add `elapsed × rate` tokens (capped at `capacity`), then take one if available. This is **lazy refill**: nothing runs in the background; the bucket is topped up only when it is read. Capacity sets the burst size and rate sets the long-run average.
 
 **5. Leaky bucket.** Two different things share this name:
-- **As a queue:** requests enter a FIFO queue of fixed size and a worker takes them out at a constant rate; when the queue is full, new requests are dropped. Output is perfectly smooth, but requests wait. This is **traffic shaping** (for example, sending to a partner API that allows exactly 10 calls per second).
+- **As a queue:** requests enter a FIFO (first in, first out) queue of fixed size and a worker takes them out at a constant rate; when the queue is full, new requests are dropped. Output is perfectly smooth, but requests wait. This is **traffic shaping** (for example, sending to a partner API that allows exactly 10 calls per second).
 - **As a meter:** a counter that drains at a constant rate and rejects when it would overflow. This behaves like a token bucket viewed upside down.
 
 **6. GCRA (generic cell rate algorithm).** Store a single timestamp per key: the **theoretical arrival time** (TAT) of the next request. With emission interval `T = period / rate` and burst tolerance `τ = T × (burst − 1)`, a request at time `now` is allowed if `now ≥ TAT − τ`; then `TAT = max(TAT, now) + T`.
@@ -248,6 +308,12 @@ It gives the same behaviour as a token bucket while storing one number instead o
 ### Choosing an algorithm
 
 **In plain words:** pick by what you need: exact counts, low memory, or allowing short bursts. The chart below walks you to an answer.
+
+**Step by step:**
+1. Calling a partner that allows exactly 10 calls a second, no bursts? Use a leaky bucket queue.
+2. Is a short burst fine, like a page load firing 8 calls at once? Use a token bucket (or GCRA).
+3. Is every single attempt precious, like OTP or login, and traffic per user small? Use a sliding window log for exact counts.
+4. Otherwise, at huge scale, use the cheap sliding window counter.
 
 ```mermaid
 flowchart TD
@@ -845,7 +911,7 @@ flowchart LR
 
 **Deep dives an interviewer will push on:**
 
-1. **Race conditions.** The read-check-write runs as one Lua script per key (shown above). `MULTI` alone is not enough for token bucket, because the decision depends on values read inside the transaction.
+1. **Race conditions** (two servers acting on the same value at the same moment). The read-check-write runs as one Lua script per key (shown above). `MULTI` (Redis's way to send a batch of commands that run together) alone is not enough for token bucket, because the decision depends on values read inside the transaction.
 2. **Redis Cluster.** A script may only touch keys in one hash slot. A sliding window counter that uses `rl:user:42:1030` and `rl:user:42:1029` would hash the two keys to different slots and fail with `CROSSSLOT`.
 
    Put the shared part in a **hash tag**: `rl:{user:42}:1030` and `rl:{user:42}:1029`; only the text inside `{…}` is hashed, so both land in the same slot. A single hot key still sits on one shard (see [[Hot Keys and Hot Partitions]]).
@@ -858,7 +924,7 @@ flowchart LR
 
    **Fail closed** where letting extra requests through is worse than rejecting, such as `/login` brute-force limits or an endpoint that sends money or SMS.
 5. **Multi-region.** One global Redis adds a cross-region round trip (tens of milliseconds) to every request. The usual answer is a limiter per region with a share of the global quota, or asynchronous counter syncing between regions, accepting that a client hitting several regions at once can briefly exceed the limit.
-6. **Client feedback.** Return `429` with `Retry-After` (seconds, RFC 9110) and quota headers, and document that clients should back off with jitter (see [[Timeouts, Retries and Backoff]]). Without this, rejected clients retry immediately and make the overload worse.
+6. **Client feedback.** Return `429` with `Retry-After` (seconds, RFC 9110) and quota headers, and document that clients should back off with jitter (a small random extra wait, so clients do not all retry at the same instant) (see [[Timeouts, Retries and Backoff]]). Without this, rejected clients retry immediately and make the overload worse.
 
 ### Response headers
 
@@ -903,6 +969,8 @@ RateLimit-Reset: 12
 - **When a simpler option wins:** a single-instance internal tool needs `x/time/rate` in memory, not Redis. A batch job calling a partner needs a client-side limiter (a leaky bucket or `rate.Limiter.Wait`), not a server.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the algorithms, the Go and Redis code, and a full public-API design. **Next comes the senior view**: how Stripe, Cloudflare and Envoy do it, what breaks in production, and the subtle details (transactions vs scripts, hash slots, hybrid limits, the sliding counter's error).
 
 - **Real systems:**
 	- **Stripe** (2017 engineering blog) described four limiters: a request-rate limiter (token bucket in Redis), a concurrent-requests limiter, and two load shedders that reserve capacity for critical traffic when the fleet or workers are saturated.
@@ -968,7 +1036,7 @@ A fourth request at `t = 0` would need `0 ≥ 300 − 200 = 100`, so it is rejec
 
 A rate limit counts **starts per second**; a concurrency limit counts **requests in flight**. A report endpoint that takes 30 seconds can be "1 per second" and still have 30 running at once.
 
-For slow or expensive work, limit concurrency (a semaphore locally, or `INCR`/`DECR` with a TTL safety net in Redis), and remember to release in a `defer` so failures do not leak slots.
+For slow or expensive work, limit concurrency (a semaphore, a counter of free slots that callers take and give back, locally, or `INCR`/`DECR` with a TTL safety net in Redis), and remember to release in a `defer` so failures do not leak slots.
 
 ### The sliding counter's error
 
@@ -1018,6 +1086,26 @@ That is close to **2× the limit inside one 60-second span**, the same bound as 
 - Distributed: one Lua script per check, Redis `TIME` as the clock, hash tags `{…}` for Redis Cluster.
 - Fail open with a local limiter for normal traffic; fail closed for login, OTP and payments.
 - Respond `429` + `Retry-After`; `RateLimit-*` headers are an IETF draft.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What status code does a rate limiter send when you are over the limit?
+> `429 Too Many Requests`, ideally with a `Retry-After` header.
+
+> [!question]- (easy) In a token bucket, what do capacity and refill rate control?
+> Capacity is the largest burst; refill rate is the long-run average allowed.
+
+> [!question]- (easy) Why must many API servers share one count?
+> Otherwise each server allows the full limit, so a user gets the limit times the number of servers.
+
+> [!question]- (medium) What is the boundary burst problem of a fixed window?
+> A client can send the full limit at the end of one window and again at the start of the next: about 2× in one second.
+
+> [!question]- (medium) Limit 100/min, previous minute 80, current 30, 15 s in. Sliding counter estimate?
+> 80 × 0.75 + 30 = 90, so 10 more fit.
+
+> [!question]- (medium) Why does the Redis check run as one Lua script?
+> So read, refill, check and write happen with nothing in between; otherwise two servers can spend the same last token.
 
 ## Links
 

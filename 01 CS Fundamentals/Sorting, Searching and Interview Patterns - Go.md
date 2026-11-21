@@ -21,13 +21,18 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
 > - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Sorting, Searching and Interview Patterns]]: the theory twin. Know what two pointers, sliding window, prefix sums, BFS, DFS, backtracking and DP each do.
+> - [[Arrays and Dynamic Arrays (Go Slices)]]: Go slices and indexing.
+> - [[Complexity Analysis - Big-O and Amortized Cost]]: `O(n)` vs `O(n²)`.
+
 **From zero** 🟢: this file is the hands-on side of [[Sorting, Searching and Interview Patterns]]. It is one small, tested Go function per interview pattern — two pointers, sliding window, prefix sums, BFS, DFS, backtracking and bottom-up DP — each the smallest correct version of its pattern. Read a step, then try the matching exercise.
 
 ## Before the code 🟢
 
 - **Slices** (`[]int`, `[][]byte`): Go's growable lists; every pattern here walks or indexes into them.
 - **Multiple return values** (`(int, int)`): `TwoSumSorted` returns both indices at once instead of a struct.
-- **Maps** (`map[int][]int`): Go's hash table, used as a graph's adjacency list for BFS.
+- **Maps** (`map[int][]int`): Go's hash table, used as a graph's adjacency list (for each node, the list of nodes it connects to) for BFS.
 - **Closures and recursion** (`Subsets`): an inner function calls itself to try "include" and "exclude" for each item (backtracking).
 - **Standard sort helpers** (`slices.Sort`, `sort.Search`): library sorting (pdqsort) and binary search on a condition.
 - **What to run:** `go vet ./patterns/... && go test -race ./patterns/...` inside the module. No goroutines or interfaces are needed here.
@@ -82,7 +87,11 @@ go test -race ./patterns/...
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** which seven patterns this file covers and that each function stands alone. **Next we read the code:** one short function per pattern, each followed by a "How it works" list.
+
 ### Step 1: two pointers — `TwoSumSorted`
+
+**What this code does, in plain words:** on a sorted slice, it starts one index at each end and moves them toward each other until the two values add up to the target.
 
 **Concept.** [[Sorting, Searching and Interview Patterns#Picture it two pointers converging|Two pointers]] only works because the input is sorted: moving `lo` forward only ever increases the sum, and moving `hi` back only ever decreases it, so neither pointer ever needs to cross back over ground it already ruled out. The alternative — a nested loop checking every pair — is the `O(n²)` brute force this pattern replaces.
 
@@ -114,6 +123,8 @@ func TwoSumSorted(nums []int, target int) (int, int) {
 4. The loop ends the moment `lo == hi` (no pair left to check) or a match is found — each pointer only ever moves one way, so the total work is `O(n)`.
 
 ### Step 2: sliding window — `MaxSubarraySum`
+
+**What this code does, in plain words:** it finds the biggest total of any `k` neighbouring numbers by sliding a `k`-wide window one step at a time, adding the new number and subtracting the old one.
 
 **Concept.** [[Sorting, Searching and Interview Patterns#Picture it a sliding window|Sliding window]] trades a recompute-from-scratch sum (`O(n·k)` over all windows) for an incremental update: each slide adds the one new element entering the window and subtracts the one leaving it. This only works because the window size `k` is fixed — a variable-size window needs an extra shrink step, which this fixed-size version doesn't.
 
@@ -147,6 +158,8 @@ func MaxSubarraySum(nums []int, k int) int {
 
 ### Step 3: prefix sums — `PrefixSums`
 
+**What this code does, in plain words:** it builds a running-total slice, so the sum of any range is just one subtraction later.
+
 **Concept.** Precomputing once turns every future range-sum query into one subtraction. The `len(nums)+1` sizing (rather than `len(nums)`) is deliberate: `prefix[0] = 0` lets a range starting at index `0` be computed with the exact same formula as any other range, with no special case.
 
 ```go
@@ -167,7 +180,9 @@ func PrefixSums(nums []int) []int {
 
 ### Step 4: DFS on a grid — `NumIslands`
 
-**Concept.** `NumIslands` is depth-first flood fill: from each unvisited land cell, recurse into every neighboring land cell before moving on, marking each one visited exactly once. This is DFS, not BFS, because the order cells are visited in doesn't matter here — only "has this island been fully marked" does.
+**What this code does, in plain words:** it scans a grid of land (`'1'`) and water (`'0'`); each time it finds new land, it counts one island and marks every connected land cell as seen.
+
+**Concept.** `NumIslands` is depth-first flood fill (like a paint-bucket tool: colour one cell, then spread to every touching cell of the same kind): from each unvisited land cell, recurse into every neighboring land cell before moving on, marking each one visited exactly once. This is DFS, not BFS, because the order cells are visited in doesn't matter here — only "has this island been fully marked" does.
 
 ```go
 // NumIslands counts connected groups of '1' cells, flood-filling each
@@ -220,7 +235,9 @@ The outer loop finds each island's starting cell and counts it:
 
 ### Step 5: BFS on a graph — `ShortestPathBFS`
 
-**Concept.** BFS visits nodes in strictly increasing distance order because it processes a FIFO queue: everything already in the queue when a node is dequeued is at the same or smaller distance. That property is exactly why the first time `goal` is reached, the distance recorded is guaranteed shortest.
+**What this code does, in plain words:** starting from one node, it visits neighbours ring by ring and returns how many steps it took to first reach the goal, or -1 if it never does.
+
+**Concept.** BFS visits nodes in strictly increasing distance order because it processes a FIFO (first in, first out) queue: everything already in the queue when a node is dequeued is at the same or smaller distance. That property is exactly why the first time `goal` is reached, the distance recorded is guaranteed shortest.
 
 ```go
 // ShortestPathBFS returns the fewest edges from start to goal in an
@@ -258,6 +275,8 @@ func ShortestPathBFS(adj map[int][]int, start, goal int) int {
 
 ### Step 6: backtracking — `Subsets`
 
+**What this code does, in plain words:** for each number it tries two branches, "leave it out" and "put it in", and records every complete choice, giving all possible subsets.
+
 **Concept.** Backtracking makes a choice (include or exclude), recurses, then *undoes* the choice before trying the other branch — the explicit `path = path[:len(path)-1]` is that undo. This is the brute-force `2ⁿ` enumeration that DP in the next step replaces when only a count or optimum is needed, not every actual subset.
 
 ```go
@@ -292,6 +311,8 @@ func Subsets(nums []int) [][]int {
 
 ### Step 7: dynamic programming — `CoinChangeMinCoins`
 
+**What this code does, in plain words:** it fills a table where cell `a` holds the fewest coins that make amount `a`, from 1 up to the target, then reads the answer from the last cell.
+
 **Concept.** The naive recursive version of this problem (try every coin, recurse on `amount - coin`) recomputes the same sub-amount many times — that's the overlapping-subproblems property. The bottom-up table here computes each sub-amount's answer exactly once, in increasing order, so every `dp[a-c]` it needs is already final by the time `dp[a]` is computed.
 
 ```go
@@ -320,7 +341,7 @@ func CoinChangeMinCoins(coins []int, amount int) int {
 
 **How it works.**
 1. `dp[0] = 0` by the zero value (left untouched by the initialization loop, which starts at `i := 1`) — zero coins make amount zero, the base case every other cell builds on.
-2. `inf` (a large sentinel, not `math.MaxInt`, to avoid any overflow risk from `+1`) marks "not yet known to be reachable"; a cell that's still `inf` after the loop means no combination of coins reaches that sub-amount.
+2. `inf` (a large sentinel, a special value meaning "not set", not `math.MaxInt`, to avoid any overflow risk from `+1`) marks "not yet known to be reachable"; a cell that's still `inf` after the loop means no combination of coins reaches that sub-amount.
 3. The outer loop over `a` must run in increasing order — `dp[a-c]` is only correct if every smaller sub-amount has already been finalized, which is guaranteed by computing `a = 1, 2, 3, ...` in order rather than recursively.
 4. `dp[amount] == inf` at the end means no combination works; the explicit `-1` return keeps the function's contract separate from the internal sentinel.
 
@@ -379,6 +400,8 @@ fmt.Println(nums) // [1 2 2 5 8] — correctly sorted; pdqsort gives no order
                    // guarantee among the two 2s
 ```
 
+> 🟡 → 🔴 **You now know** how all seven functions work and what the tests prove. **Next comes the advanced part:** the bugs that give a plausible but wrong answer (aliasing, sentinel overflow, DP order) and the memory leak hidden in `queue[1:]`.
+
 ## Pitfalls in the code 🔴
 
 None of the pitfalls below are compile errors or immediate panics — each produces a plausible-looking wrong answer, or a performance regression that only shows up on inputs larger than a casual test would use. That's exactly what makes them worth naming explicitly rather than trusting that "it compiled and the obvious test passed" is sufficient.
@@ -416,6 +439,30 @@ Each of these asks you to change one function and predict the result *before* ru
 1. Change `MaxSubarraySum` to accept a variable-size window bounded by a sum ceiling rather than a fixed `k`, and predict what new "shrink the window" step becomes necessary.
 2. `ShortestPathBFS` returns only the distance. Add a `prev map[int]int` to reconstruct the actual path, and predict what has to be tracked alongside `dist`.
 3. Rewrite `CoinChangeMinCoins` as top-down memoized recursion instead of bottom-up, and predict which test(s) still pass unchanged.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- In `TwoSumSorted`, which pointer moves when the sum is too small?
+> `lo` moves right, to a bigger value.
+
+> [!question]- What does `prefix[0] = 0` buy you?
+> A range starting at index 0 needs no special case: `prefix[r] − prefix[0]`.
+
+> [!question]- What does `CoinChangeMinCoins` return when no combination works?
+> `-1`.
+
+🟡 Medium
+
+> [!question]- Why does `Subsets` copy `path` before saving it?
+> Without the copy, every saved subset shares one backing array and they all end up showing the last state.
+
+> [!question]- Why does `ShortestPathBFS` mark a node when it is discovered, not when it is dequeued?
+> So the same node is never queued twice from two directions.
+
+> [!question]- Why must the DP loop go from amount 1 upward?
+> Each cell reads smaller amounts, which must already be final.
 
 ## Links
 

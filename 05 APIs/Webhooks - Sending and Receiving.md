@@ -39,6 +39,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: a `POST` sends a body to a URL, and a `2xx` status means success.
+> - [[Idempotency and Idempotency Keys]]: an operation that may run twice must have the same effect as running once.
+> - [[REST and HTTP API Design]]: APIs expose URLs that accept requests; with webhooks, *you* expose the URL and the provider calls it.
+
 **From zero, in 60 seconds** 🟢
 
 Instead of your server constantly asking a provider "anything new?", the provider calls *you* when something happens. A **webhook** is that call: a normal web request (`POST`) sent to a URL you registered, carrying an **event** like "payment succeeded".
@@ -80,6 +85,11 @@ That "call me back when it happens" is a webhook.
 | Retry with backoff | Trying again later, waiting longer each time | 1 s, 2 s, 4 s, 8 s... |
 | `2xx` status | HTTP success codes | `200 OK`, `204 No Content` |
 | Outbox | A table where events are saved in the same transaction as the data change | Row in `outbox` next to the payment update |
+| Inbox | A table where the receiver saves each incoming event before processing it | `webhook_inbox` keyed by event id |
+| DLQ / dead letter | Where deliveries go after all retries fail, so someone can replay them | "Resend" button in a dashboard |
+| Jitter | A small random extra wait so retries do not all fire at once | wait 4 s ± 1 s |
+| SSRF | Tricking a server into calling internal addresses for the attacker | a webhook URL of `http://169.254.169.254` |
+| Constant-time compare | Comparing secrets in a way that takes the same time whether they match early or late | `hmac.Equal` in Go |
 
 **Picture it.**
 
@@ -111,6 +121,13 @@ A marketplace has 20,000 open payments at a payment provider and needs to know w
 - **Polling:** ask about every payment every 15 s. That is 20,000 / 15 ≈ **1,333 requests per second**, or about **115 million requests a day**. If about 50,000 payments change state per day (an estimate), more than 99.9% of those calls return "no change". Each change is still seen 7.5 s late on average (half the interval).
 - **Webhooks:** the provider sends one `POST` per change: about **50,000 requests a day**, roughly 2,300 times fewer, and each arrives seconds after the change.
 
+### Real-life example: Razorpay payment confirmation 🟢
+
+When you pay on a shopping site that uses Razorpay or Stripe, the site does not keep asking "is it paid yet?".
+The payment provider calls the shop's URL with a signed message: "payment pay_123 captured".
+The shop checks the signature, saves the event, replies `200` quickly, and a background job marks the order paid and sends your confirmation email.
+If the shop's server was down, the provider tries again later, so the order still gets marked paid.
+
 Webhooks turn "keep asking" into "get told". The price is that the provider now calls *you*, across the internet, with its own retry rules, so your endpoint becomes a public API with its own security and reliability problems.
 
 ## 2. Mental model 🟢
@@ -125,7 +142,25 @@ Think of a courier with a doorbell. You do not stand at the window all day; the 
 
 The rule that follows: **the webhook request only records the event; it never does the business work.**
 
+## Common beginner mistakes 🟢
+
+- **Not checking the signature** → anyone can post a fake "payment captured" → verify the HMAC on the raw body.
+- **Parsing the JSON before verifying** → re-serialised bytes no longer match the signature → verify the exact raw bytes first.
+- **Doing slow work before replying** → the provider times out and retries → save the event, reply `2xx`, work later.
+- **Not handling duplicates** → the order is processed twice → dedupe by the provider's event id.
+- **Sending the webhook inside the database transaction** → events for changes that rolled back, or lost events → use an outbox.
+
+## Often confused 🟡
+
+| These two | First one | Second one |
+| --- | --- | --- |
+| Webhook vs polling | The provider calls you when something happens | You keep asking the provider |
+| Outbox vs inbox | Sender side: events saved with the data change | Receiver side: incoming events saved before processing |
+| Signature vs timestamp check | Proves who sent it and that it was not changed | Stops an old captured request being replayed |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** a webhook is a reverse API call that must be verified, stored and processed later. **Next we open the box**: the receiver's exact steps, the sender's outbox and retry machinery, and a delivery's life cycle.
 
 ### Receiving: verify, persist, acknowledge, process later
 
@@ -166,6 +201,13 @@ sequenceDiagram
 
 ### Sending: outbox, dispatcher, retries, disable
 
+**Step by step:**
+1. An invoice is paid. In the same transaction, the sender writes an `invoice.paid` row to the outbox.
+2. A fan-out job creates one delivery row per subscribed customer endpoint.
+3. A dispatcher signs and `POST`s each delivery with a 10 s timeout.
+4. Customer A answers `200`: delivered. Customer B times out: retry in 1 min, then 5, then 30, with jitter.
+5. After the last retry, B's delivery goes to the dead-letter list, where B can press "resend".
+
 **In plain words:** the sender never fires the web request inside the same breath as the database change. It writes the event into an outbox table in the same transaction, and a separate dispatcher delivers, retries and eventually gives up per customer.
 
 ```mermaid
@@ -193,6 +235,13 @@ flowchart LR
 ### Delivery lifecycle on the sender
 
 **In plain words:** each delivery walks a small life: pending, in flight, delivered — or retrying, paused, dead with a resend button.
+
+**Step by step:**
+1. `Pending`: created from the outbox.
+2. `InFlight`: a dispatcher picked it up and is sending it.
+3. `Delivered` on a `2xx`; otherwise `Retrying` until the next attempt time.
+4. If the endpoint keeps failing, it is `Paused` (its circuit is open) and probed now and then.
+5. `Dead` after all retries or after the endpoint is disabled; "resend" moves it back to `Pending`.
 
 ```mermaid
 stateDiagram-v2
@@ -551,6 +600,8 @@ Stripe offers both: classic snapshot events and, in its newer event destinations
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to receive and send webhooks safely. **Next is the advanced part**: how Stripe, GitHub and others run them, production failures, SSRF protection, secret rotation, circuit breakers and versioning payloads.
+
 - **Real systems:**
 	- **Stripe** signs with a timestamp, retries for up to 3 days in live mode with exponential backoff, does not guarantee order and may send the same event twice.
 		- Its docs also warn that one change occasionally produces two separate Event objects with different ids, so the business update must be idempotent too (the version or state guard), not only the inbox.
@@ -702,6 +753,26 @@ For a breaking change, emit a new event type or let each endpoint pin a version.
 - Sender: outbox → fan-out → signed `POST` → backoff with jitter over about 3 days → DLQ and replay → disable endpoints that keep failing.
 - Customer URLs are SSRF input: check the IP at dial time, refuse redirects.
 - Webhooks can still be missed: run reconciliation against the provider's API.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: who sends the HTTP request in a webhook?
+> The provider calls your endpoint.
+
+> [!question]- Easy: what proves a webhook really came from the provider?
+> An HMAC signature over the raw body, made with a shared secret.
+
+> [!question]- Easy: should the receiver do the business work before replying?
+> No. Store the event, reply `2xx` fast, process later.
+
+> [!question]- Medium: the same event arrives twice. What happens?
+> The inbox insert on the event id does nothing the second time; still reply `2xx`.
+
+> [!question]- Medium: why does the sender use an outbox?
+> So an event exists exactly when the data change committed; no lost or phantom events.
+
+> [!question]- Medium: what stops an attacker replaying a captured webhook next week?
+> The signed timestamp must be within a short window (for example 5 minutes).
 
 ## Links 🟢
 

@@ -33,6 +33,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[AWS 01 - Core Concepts (Regions, AZs, Accounts, Shared Responsibility)]]: AWS resources (VPCs, load balancers, databases) live in an account and a Region, and you create them through AWS's APIs.
+> - [[CI-CD Pipelines (GitHub Actions for Go)]]: every merge runs an automated pipeline with checks and an approval gate before production.
+
 **From zero, in 60 seconds** 🟢
 
 Setting up servers, databases and networks by clicking in a web console is slow and nobody remembers what was clicked.
@@ -77,6 +81,11 @@ Changes go through code review like any other code.
 | Plan / apply | Preview changes, then make them | `terraform plan`, `terraform apply` |
 | Module | A reusable bundle of resources | One "ECS service" module per microservice |
 | Lock | Stops two people changing state at once | DynamoDB or S3 lock |
+| Drift | When the real cloud no longer matches what Terraform recorded | Someone edited a rule in the console |
+| Data source | Something Terraform only reads, never creates | The company's existing VPC |
+| Replace | Delete and recreate a resource because it cannot be changed in place | `-/+` on a database = data risk |
+| Remote backend | Keeping the state file in shared storage instead of a laptop | An S3 bucket |
+| IaC (infrastructure as code) | Describing servers and networks in files kept in Git | `main.tf` |
 
 **Picture it**
 
@@ -122,6 +131,20 @@ resource "aws_ecs_service" "api" {
 
 Run `terraform plan` and Terraform tells you, before touching anything: "this will create 1 ECS service, 1 target group, 0 changes to the VPC." Change `desired_count` to `5` and plan again, and it says: "this will update 1 resource (desired_count: 3 → 5), 0 creates, 0 destroys." That diff-before-you-touch-anything property is what makes infrastructure changes reviewable in a pull request the same way application code is.
 
+```mermaid
+flowchart LR
+    C["Console clicks:<br/>no record, no diff"] --> P["Hard to repeat or undo"]
+    T[".tf files in Git"] --> PL["terraform plan: exact diff"] --> A["apply: same result every time"]
+```
+
+### Real-life example: a new city environment in a day 🟢
+
+Imagine a delivery company like Swiggy wants a full copy of its setup for load testing before a big sale.
+By hand, that means hundreds of console clicks for networks, load balancers and databases, and something is always missed.
+With Terraform, the team reuses the same modules with a different environment name, reads the plan, and applies it in under an hour.
+After the test, one destroy command removes everything, so nothing is left running up the bill.
+Every change is a reviewed pull request, so they always know who changed what and why.
+
 ## 2. Mental model 🟢
 
 Terraform is a **reconciliation loop you run by hand**, not a continuously running controller like a Kubernetes operator:
@@ -133,11 +156,28 @@ Terraform is a **reconciliation loop you run by hand**, not a continuously runni
 
 If someone changes a resource outside Terraform (clicks a button in the AWS console), the next `plan` shows that as **drift**: Terraform will plan to change it back unless you import the new reality or adjust your `.tf` files to match.
 
+## Common beginner mistakes 🟢
+
+- **Keeping state on a laptop when a team shares the infrastructure** → no locking, and two applies can corrupt it → use a remote backend with locking.
+- **Clicking changes in the console** → the next plan tries to undo them (drift) → make every change in `.tf` files.
+- **Applying without reading the plan** → a hidden `replace` can delete a database → always read the add/change/destroy line.
+- **Committing secrets in `.tfvars`** → passwords end up in Git → read them from Secrets Manager or SSM at apply time.
+- **Using `count` for a list that changes** → removing one item shifts the others and Terraform recreates them → use `for_each` with stable keys.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that Terraform keeps your infrastructure in files, shows a plan, and applies it. **Next we open the box**: how state and locking keep a team safe, the building blocks (resources, data sources, modules, variables), and the three kinds of change a plan can contain.
 
 ### The core workflow and where state locking matters
 
 **In plain words:** write, plan, apply. The state file is locked during apply so two people can't change things at once.
+
+**Step by step:**
+1. You change `desired_count` from 3 to 5 in a `.tf` file and open a pull request.
+2. CI runs `terraform plan`: it locks the state in S3, reads it, checks the real AWS values, and prints "1 to change".
+3. A reviewer reads the plan and approves.
+4. `terraform apply` locks the state again, makes the change in AWS, writes the new state, and unlocks.
+5. If a second apply starts meanwhile, it waits or fails instead of colliding.
 
 ```mermaid
 sequenceDiagram
@@ -172,6 +212,13 @@ Local state files (the default, `terraform.tfstate` on disk) have no locking, wh
 
 **In plain words:** resource = something Terraform creates. Data source = something it only reads. Module = a reusable bundle. Variable = an input.
 
+**Step by step:**
+1. A `network` module creates the VPC and subnets and outputs their IDs.
+2. An `ecs_service` module takes those IDs as variables and creates the service and target group.
+3. A `database` module takes the same IDs plus the service's security group and creates RDS.
+4. A data source reads a VPC another team owns, without ever changing it.
+5. The prod folder calls all three modules with prod values; staging calls them with staging values.
+
 - A **resource** block (`resource "aws_ecs_service" "api" {...}`) is one thing Terraform manages end-to-end: create, update in place where possible, or destroy-and-recreate when a change can't be done in place (e.g. changing an RDS instance's `engine` family).
 - A **data source** (`data "aws_vpc" "default" {...}`) reads something Terraform does *not* manage — useful for referencing a VPC or AMI that another team or process owns.
 - A **module** is a directory of `.tf` files with declared input `variable`s and output `output`s, instantiated with `module "api" { source = "./modules/ecs-service" ... }`. Modules are how a reference architecture (VPC + ALB + ECS service + RDS) becomes a parameterized, reusable unit instead of copy-pasted HCL per environment.
@@ -194,6 +241,12 @@ flowchart TB
 ### `plan` and `apply`, and the three change kinds
 
 **In plain words:** each change is create, update in place, or replace. "Replace" deletes and recreates, so watch for it on databases.
+
+**Step by step:**
+1. New log group in the files → plan shows `+` create.
+2. `desired_count` 3 → 5 → plan shows `~` update in place, no downtime.
+3. Database storage type changed → plan shows `-/+` replace: the old database is deleted and a new one made.
+4. Your CI rule: creates and updates may go ahead; any replace or destroy of stateful things waits for a human.
 
 Every resource change in a plan is one of: **create**, **update in place**, or **replace** (destroy then create — shown as `-/+` and flagged because it usually means downtime or data loss for stateful resources).
 
@@ -348,6 +401,8 @@ The reference architecture's CI/CD pipeline (see [[CI-CD Pipelines (GitHub Actio
 A Go step parses that JSON to decide whether the change needs a human: any create/update auto-applies, but a delete or replace of a stateful resource (the database, its subnet group) must pause for approval, even in an otherwise fully automated pipeline.
 
 It compiles and passes `go vet` and `go test -race` on Go 1.24.
+
+**What this code does, in plain words:** it reads the JSON plan, sorts every change into create, update, delete or replace, and says "needs a human" if any database-like resource would be deleted or replaced. The test feeds a sample plan with one of each and checks the counts and the verdict.
 
 ```go
 // Package tfplan parses the JSON that `terraform show -json <planfile>`
@@ -522,6 +577,9 @@ Plan: 1 to add, 1 to change, 1 to destroy.
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the plan/apply workflow, locking, modules and the three change kinds, and how to gate CI on a plan. **Next is the advanced part**: the state, drift and version problems real teams hit, and deeper details like lock mechanics, `for_each` vs `count`, refresh-only plans and OpenTofu.
+
+
 - **Real systems:** most AWS-native shops running ECS/EKS use Terraform or OpenTofu to provision the VPC, cluster, and per-service infrastructure, while CI/CD (GitHub Actions, see [[CI-CD Pipelines (GitHub Actions for Go)]]) handles the application deploy itself (new task definition revision) — Terraform typically owns the slower-moving infrastructure layer, not the every-commit application rollout.
 - **Failure modes → fixes:**
   - Two engineers `apply` at once, state gets corrupted → remote backend with locking (S3 + DynamoDB, or HCP Terraform's built-in locking) is non-negotiable past a single contributor.
@@ -577,6 +635,30 @@ Plan: 1 to add, 1 to change, 1 to destroy.
 - Drift = reality diverged from `.tf` files; a scheduled `plan` job catches it before the next real apply does something surprising.
 - OpenTofu is the open-governance fork of Terraform after HashiCorp's 2023 BSL relicense; command and state are designed to stay compatible.
 - Secrets never belong in `.tfvars` committed to git; pull them from Secrets Manager/SSM at apply time.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does `terraform plan` do?
+> It shows exactly what would be created, changed or destroyed, without touching anything.
+
+> [!question]- What is the state file?
+> Terraform's record of what it built and their real IDs.
+
+> [!question]- Why use a remote backend with locking?
+> So a team shares one state and two applies cannot run at once.
+
+🟡 Medium
+
+> [!question]- A plan shows `-/+` on your RDS instance. What does it mean?
+> Replace: the database would be deleted and recreated, so stop and review.
+
+> [!question]- Someone edited a security group in the console. What will the next plan do?
+> Show drift and plan to change it back to what the files say.
+
+> [!question]- Why prefer `for_each` over `count` for a changing list?
+> `for_each` uses stable keys, so removing one item does not recreate the others.
 
 ## Links
 

@@ -38,6 +38,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (payroll example) and 5 (variants).
 > - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Partitioning and Sharding]]: big data is split into slices (shards) by a key, so each machine holds only part of it.
+> - [[Rate Limiting - Algorithms and Distributed Design]]: you can count each caller's requests and reject the extra ones, so one caller cannot flood the system.
+
 **From zero, in 60 seconds** 🟢
 
 Many companies use your app. Each customer company is a **tenant**.
@@ -84,6 +88,12 @@ This note is about sharing safely: cheap like a shared building, safe like separ
 | Quota | A per-tenant limit on usage | Max 50 workers per tenant |
 | Blast radius | How many customers one failure can hurt | 1 cell of 20 = 5 percent |
 | Cell | A complete, independent copy of the whole service | Cell 7: app, queue, DB, cache |
+| SaaS | Software you rent online instead of installing | a payroll app used by 5,000 companies |
+| Silo / pool / bridge | Own stack per tenant / everything shared / a mix | banks in silos, shops in the pool |
+| RLS (row-level security) | A database rule that hides rows of other tenants | `tenant_id = 42` sees only its rows |
+| Directory | A lookup table: which tenant lives on which shard or cell | tenant 42 → shard 3 |
+| Shuffle sharding | Each tenant gets its own small random set of workers | tenant A on W1+W5, tenant B on W2+W5 |
+| Control plane | The admin side that creates cells and moves tenants, not the request path | "move tenant 42 to cell 5" |
 
 **Picture it**
 
@@ -137,6 +147,30 @@ Think of **housing**.
 
 Where the analogy breaks: tenants can be moved between blocks by software, in minutes or hours, if you design a router for it. Real families cannot.
 
+### Real-life example: Shopify, Slack and Zoho 🟢
+
+Shopify runs millions of online shops on shared machines, but groups shops into isolated "pods", each with its own database, so a problem in one pod does not take down every store.
+Slack moved to a "cellular" design so that a failure in one part of its system affects only some workspaces.
+Business apps like Zoho or Freshworks serve thousands of companies from one product; every row carries the company's ID, so one company can never see another's data.
+And when one big customer runs a huge import, per-customer limits keep small customers fast.
+
+## Common beginner mistakes 🟢
+
+- **Reading the tenant id from the request body** → a user can type someone else's id and read their data → take it from the login token only.
+- **Relying on every developer to add `WHERE tenant_id = ?`** → one forgotten filter is a data breach → enforce it in the database with row-level security.
+- **Limiting only requests per second** → a tenant can send few but very heavy requests and hold every worker → also cap concurrent work per tenant.
+- **Cells that quietly share one auth database or config service** → when that breaks, every cell breaks → give each cell its own copy, or cache it.
+- **Building cells for 30 customers** → lots of cost and moving parts for no gain → a shared pool with quotas is enough at small scale.
+
+### Multi-tenancy vs things people confuse it with 🟡
+
+| Idea | What it splits | Main goal |
+| --- | --- | --- |
+| Multi-tenancy | Customers sharing one product | Cheap sharing with safe isolation |
+| Sharding | Data across databases | Hold more data, take more writes |
+| Cells | The whole stack into full copies | Limit how many customers one failure hits |
+| Shuffle sharding | Workers into many overlapping small sets | Stop one bad tenant from hurting the same others |
+
 ```mermaid
 flowchart LR
     subgraph SILO["Silo: stack per tenant"]
@@ -154,9 +188,18 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** tenants share a system, every request carries a tenant id, and cells limit the damage. **Next we open the box**: how much tenants share, where the data boundary sits, how tenants are placed on shards, how to stop noisy neighbours, how cells work, and shuffle sharding. Each subsection starts with a plain walk-through; the full detail follows.
+
 ### The three isolation models
 
 **In plain words.** The question is which layers a tenant shares: compute, database, network. You can answer it differently per layer.
+
+**Step by step:**
+1. List your tenant types: 9,900 small shops, 3 banks, 1 big retail chain.
+2. Small shops: put them all in shared servers and shared tables (pool). Cheapest.
+3. Banks: their contracts demand their own database, so give them a separate stack (silo).
+4. The retail chain: share the database but give it its own worker pool, so its big jobs do not crowd others.
+5. That mix is the bridge model, where most real SaaS ends up.
 
 **Picture it.**
 
@@ -182,6 +225,13 @@ flowchart TD
 
 **In plain words.** Inside a shared database there are three common ways to keep tenants apart: a `tenant_id` column on every table, one schema per tenant, or one database per tenant.
 
+**Step by step (column + row-level security):**
+1. Every table has a `tenant_id` column.
+2. A policy on the table says "only return rows where `tenant_id` matches the current tenant".
+3. At the start of each request the app sets the current tenant, taken from the login token: 42.
+4. A developer writes `SELECT * FROM orders` and forgets the filter.
+5. The database still returns only tenant 42's orders, because the policy adds the filter itself.
+
 **Picture it.**
 
 ```mermaid
@@ -203,7 +253,7 @@ flowchart LR
 
 Even if a developer forgets the filter, the database returns only that tenant's rows.
 
-Caveat: RLS does not apply to superusers or roles with `BYPASSRLS`, and the table owner skips it unless you run `ALTER TABLE ... FORCE ROW LEVEL SECURITY`; the app must connect as a normal role.
+Caveat: RLS does not apply to superusers or roles with `BYPASSRLS` (a permission that skips the policies), and the table owner skips it unless you run `ALTER TABLE ... FORCE ROW LEVEL SECURITY`; the app must connect as a normal role.
 
 **Why it matters.** Enforcement in the data layer turns "every developer must remember" into "the database refuses". Always make `tenant_id` the leading column of the primary key and the main indexes, so queries stay local to one tenant.
 
@@ -219,6 +269,13 @@ Caveat: RLS does not apply to superusers or roles with `BYPASSRLS`, and the tabl
 ### Tenant-aware sharding and the directory
 
 **In plain words.** When one database cannot hold all tenants, you shard. Sharding by tenant keeps each tenant's data together, so most queries touch one shard and joins stay local. A small **directory** (a lookup table) says which shard each tenant lives on.
+
+**Step by step (moving a big tenant):**
+1. The directory says tenant 42 lives on shard 3.
+2. Tenant 42 grows huge, so you copy its data to a new shard 5.
+3. While copying, new changes keep flowing to shard 5 through change data capture (copying changes from the database log).
+4. Pause tenant 42's writes for a moment, flip the directory to "42 → shard 5", and resume.
+5. No other tenant noticed anything.
 
 **Picture it.**
 
@@ -244,6 +301,13 @@ A pure hash-based placement cannot do this without a rebalance, which is why dir
 
 **In plain words.** A noisy neighbour is one tenant consuming so much shared capacity that others suffer. The cure is to cap what each tenant may take, and to share the remainder fairly.
 
+**Step by step:**
+1. The retail chain drops 4 million jobs into the queue. A corner shop adds 1 job.
+2. With one shared queue, the shop's job waits behind all 4 million.
+3. With one queue per tenant, workers take one job from each tenant in turn, so the shop's job runs next.
+4. A cap of 50 workers per tenant means the chain can never use all 400 workers.
+5. Plans (free, pro, enterprise) set the size of each tenant's caps.
+
 **Picture it.**
 
 ```mermaid
@@ -259,7 +323,7 @@ flowchart TD
 **Example.** The retail chain's import floods the queue with 4 million jobs. Without fairness, the shop's one job waits behind all of them.
 
 - With a **per-tenant queue and round-robin dequeue**, each worker takes one job from each tenant in turn, so the shop's job runs next.
-- With **per-tenant concurrency limits** (a bulkhead per tenant), the chain can use at most, say, 50 of 400 workers.
+- With **per-tenant concurrency limits** (a bulkhead per tenant: a walled-off share of workers, like the watertight sections of a ship), the chain can use at most, say, 50 of 400 workers.
 
 **Why it matters.** The quota belongs to the tenant, not to the shared pool. Otherwise the pool's global limit makes everyone suffer for one tenant. See [[Rate Limiting - Algorithms and Distributed Design]], [[Bulkheads and Concurrency Limits]] and [[Load Shedding and Graceful Degradation]].
 
@@ -271,6 +335,13 @@ Quotas should reflect plans (free, pro, enterprise) and be changeable without a 
 ### Cells: shrinking the blast radius
 
 **In plain words.** Even with perfect tenant isolation, one bad deploy, one poison request, or one overloaded dependency can take down the whole shared stack.
+
+**Step by step:**
+1. Build one full copy of the service: app, queue, database, cache. That is a cell.
+2. Make 20 of them. Put 1/20 of the tenants in each.
+3. A thin router looks up "tenant → cell" and forwards each request.
+4. A bug or bad deploy breaks cell 7. Only 5% of tenants are hit.
+5. New releases go to cell 1 first; if it is healthy, then a few more, then the rest.
 
 So instead of one big stack, run many **cells**: complete, independent copies of the service (app, queues, database, cache). Each tenant is assigned to exactly one cell. A thin **cell router** sends each request to the right cell.
 
@@ -307,6 +378,13 @@ The rules that make cells work:
 ### Shuffle sharding: isolation between tenants inside a pool
 
 **In plain words.** Plain sharding gives each tenant one fixed shard, so a poison tenant kills its whole shard and every tenant on it.
+
+**Step by step:**
+1. You have 8 workers. Each tenant gets 2 of them, picked differently for each tenant.
+2. Tenant A gets W1 and W5. Tenant B gets W2 and W5. Tenant C gets W3 and W7.
+3. Tenant A sends a "poison" request that crashes whatever worker runs it. W1 and W5 go down.
+4. Tenant B still has W2, so it retries there and works. Tenant C never noticed.
+5. Only a tenant with exactly the same pair as A (1 in 28) is fully down.
 
 **Shuffle sharding** gives each tenant a small, random-looking *set* of workers. Two tenants rarely have exactly the same set, so a poison tenant knocks out its own set while almost every other tenant still has at least one healthy worker left.
 
@@ -434,6 +512,8 @@ flowchart TD
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the isolation models, how to stop noisy neighbours, and how cells and shuffle sharding limit damage. **Next comes the senior view**: who runs cells in production, the failure modes, and the details of cell sizing, tenant placement, evacuation, fairness, observability and per-tenant encryption.
+
 - **Real systems.**
   - AWS recommends cell-based architecture to reduce the scope of impact in its Well-Architected guidance, and Route 53 uses shuffle sharding in its Infima library, as described in the Builders' Library.
   - Slack published its migration to a cellular architecture, aimed at limiting the effect of failures in one availability zone or one part of the system.
@@ -442,7 +522,7 @@ flowchart TD
 - **Failure modes and fixes.**
   - *Tenant data leak from a missing filter* → RLS or a data-access layer that requires tenant context; automated tests that query as tenant A and assert nothing of B appears.
   - *One tenant slows all* → per-tenant rate, concurrency and queue limits; alert on top-N tenants by resource use.
-  - *Cell router outage* → keep it stateless, multi-AZ and cached; it should fail static on the last good mapping.
+  - *Cell router outage* → keep it stateless, multi-AZ and cached; it should fail static on the last good mapping (keep serving with the old mapping instead of erroring).
   - *Shared dependency takes all cells down* → dependency audit; give each cell its own copy or cache.
   - *Cell fills up* → enforce max cell size, place new tenants in new cells, and move the largest out.
   - *Wrong tenant in cache keys* → include the tenant id in every cache key and queue name.
@@ -484,7 +564,7 @@ flowchart LR
 
 **In plain words:** Fair sharing is like a queue at a counter where each tenant gets a turn. Paying more can buy you a bigger share of turns.
 
-Round-robin per tenant is equal sharing. **Weighted fair queueing** gives bigger plans proportionally more. **Dominant resource fairness** is useful when tenants use different mixes of CPU and memory. Also add **admission control** that rejects work from a tenant over quota early and cheaply, before it reaches shared resources (see [[Load Shedding and Graceful Degradation]]).
+Round-robin per tenant is equal sharing. **Weighted fair queueing** gives bigger plans proportionally more turns. **Dominant resource fairness** (share by each tenant's most-used resource) is useful when tenants use different mixes of CPU and memory. Also add **admission control** that rejects work from a tenant over quota early and cheaply, before it reaches shared resources (see [[Load Shedding and Graceful Degradation]]).
 
 ### Tenant-aware observability
 
@@ -496,7 +576,7 @@ Add `tenant_id` to logs and traces but be careful with metrics: one label per te
 
 **In plain words:** Give each tenant its own encryption key. Delete the key and that tenant's data becomes unreadable junk, which is a clean way to erase it.
 
-Per-tenant encryption keys (one key per tenant in a KMS) allow "crypto-shredding": deleting the key makes that tenant's data unreadable. It supports erasure promises and limits the damage of a leaked database dump.
+Per-tenant encryption keys (one key per tenant in a KMS, a key management service that stores and guards keys) allow "crypto-shredding": deleting the key makes that tenant's data unreadable. It supports erasure promises and limits the damage of a leaked database dump.
 
 ```mermaid
 flowchart LR
@@ -544,6 +624,26 @@ flowchart LR
 - Cells: independent full stacks, share nothing, capped size, thin router, deploy cell by cell. Blast radius is about 1/N.
 - Shuffle sharding: each tenant gets a random worker subset. 8 workers, 2 each: 28 combos. Needs client retry.
 - Cost: extra capacity, router and directory, hard cross-tenant queries. Do not over-build for 30 tenants.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is a tenant?
+> One customer organisation using your shared product, like one company on a payroll app.
+
+> [!question]- (easy) Where must the tenant id come from?
+> The authenticated login token, never the request body.
+
+> [!question]- (easy) What is a noisy neighbour?
+> A tenant whose heavy use slows down everyone sharing the system.
+
+> [!question]- (medium) 20 equal cells and one breaks. What share of tenants is hit?
+> About 1/20, so 5%.
+
+> [!question]- (medium) Why are per-tenant rate limits alone not enough?
+> A tenant under its rate limit can still send heavy requests that hold all workers; also cap concurrency and cost.
+
+> [!question]- (medium) 8 workers, 2 per tenant, shuffle sharded. How likely is another tenant fully down by a poison tenant?
+> Only if it has the exact same pair: 1 in 28, about 3.6%.
 
 ## Links 🟢
 

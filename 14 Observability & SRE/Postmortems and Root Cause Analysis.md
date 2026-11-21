@@ -41,6 +41,9 @@ Everything below is about doing each box honestly: a timeline that is facts only
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Incident Response]]: during an outage you stop the damage first and find the cause later; a scribe keeps a timestamped log. The postmortem is that "later".
+
 **From zero, in 60 seconds** 🟢
 
 After an outage is fixed, the team writes a short report called a **postmortem**.
@@ -86,6 +89,12 @@ It blames the system, not a person.
 | Blameless | Ask "what let this happen", never "who did it" | "The runbook link was stale", not "Sam forgot" |
 | Action item | A concrete fix with an owner and a date | Add alert on latency near the timeout |
 | SEV1 / SEV2 | Severity levels; lower number = worse | SEV1 = full outage |
+| Trigger | The event that set it off, not the deeper reason | the 14:02 deploy |
+| Latent weakness | A hidden flaw that sits harmless until something sets it off | a timeout nobody updated |
+| Near-miss | Something that almost caused an outage but was caught in time | a bad config stopped by a check |
+| 5 Whys | Asking "why?" again and again down one chain of answers | why did it retry? why was it slow? |
+| Fishbone diagram | A picture that groups possible causes by type (code, config, process) around the symptom | four "bones" for one incident |
+| Idempotency check | A check that makes doing the same thing twice have the effect of doing it once | "event 42 already processed, skip" |
 
 **Picture it**
 
@@ -114,13 +123,24 @@ Where it breaks: aviation reports are slow and formal; a software postmortem sho
 
 ## 1. Why it exists 🟢
 
-After the InvoiceOps webhook-duplication incident is mitigated (see [[Incident Response]]), the team has stopped the bleeding but has learned nothing yet that prevents a repeat. Without a postmortem, the natural outcome is a one-line Slack message — "rolled back the bad deploy, duplicates stopped" — and the actual mechanism (a load-balancer timeout shorter than the handler's p99 latency, which made the client retry a request whose write had already succeeded) stays undiscovered.
+🟢 **Plain version:** The team fixed an outage by undoing a deploy, but that deploy was only the last straw. Four things together caused it: an old settings change made a step slower, a time limit at the front door was never raised to match, the deploy added a bit more delay, and a duplicate check had a small gap. If the team only writes "rolled back the deploy", the other three problems stay and cause the next outage. A postmortem finds and fixes all four.
+
+
+After the InvoiceOps webhook-duplication incident is mitigated (see [[Incident Response]]), the team has stopped the bleeding but has learned nothing yet that prevents a repeat. Without a postmortem, the natural outcome is a one-line Slack message — "rolled back the bad deploy, duplicates stopped" — and the actual mechanism (a load-balancer timeout shorter than the handler's p99 latency, meaning the front-door server gave up before the slowest 1 in 100 requests finished, which made the client retry a request whose write had already succeeded) stays undiscovered.
 
 Three weeks later, a different deploy introduces a slightly slower code path, the same timeout mismatch fires again, and the team re-discovers the same lesson from scratch.
 
-With a postmortem: the timeline shows the deploy at 14:02 did not cause the symptom directly — the actual chain was (a) a config change two weeks earlier raised the handler's average processing time by 90 ms, (b) the load balancer's client timeout was never updated to match, (c) at 14:02 a minor, unrelated deploy added just enough latency to cross that threshold under peak traffic, and (d) the webhook handler's idempotency check had a narrow race window that let a few retried requests slip through before the duplicate check caught them.
+With a postmortem: the timeline shows the deploy at 14:02 did not cause the symptom directly — the actual chain was (a) a config change two weeks earlier raised the handler's average processing time by 90 ms, (b) the load balancer's client timeout was never updated to match, (c) at 14:02 a minor, unrelated deploy added just enough latency to cross that threshold under peak traffic, and (d) the webhook handler's idempotency check had a narrow race window (a short moment where two copies of the same request could both pass the check) that let a few retried requests slip through before the duplicate check caught them.
 
 Four contributing factors, not one. The action items fix the timeout mismatch, widen the idempotency window, and add an alert on handler-latency approaching the LB timeout — three real, different fixes a single sentence like "fixed the deploy" would never have produced.
+
+### Real-life example: a food app's double charges 🟢
+
+Imagine a food app like Swiggy charging some customers twice one evening.
+The incident team stops it in 10 minutes by pausing a payment retry feature.
+In the postmortem the next week, they find three factors: the bank was slow that evening, the app's retry rule fired too early, and the duplicate-payment check only looked at the last 1 minute.
+They fix all three, give each fix an owner and a date, and share the write-up with other teams that use the same retry rule.
+Nobody is blamed for "pushing the button"; the system is changed so the button is safe.
 
 ## 2. Mental model 🟢
 
@@ -128,15 +148,39 @@ A postmortem is closer to an aviation incident report than a bug ticket: it is w
 
 An investigator who writes "the pilot should have noticed X" has stopped investigating — the useful question is **why X was not noticeable**, given the displays, training, and workload at that moment, which is exactly transferable to "why didn't the on-call engineer notice the timeout mismatch before it mattered."
 
+## Common beginner mistakes 🟢
+
+- **Writing "root cause: the bad deploy" and stopping** → the deeper weaknesses stay and cause the next outage → list at least two or three contributing factors.
+- **Naming a person as the cause** ("Sam forgot to check") → people hide details next time → ask what about the system made the mistake easy, and fix that.
+- **Action items with no owner or date** → nobody does them → every item gets one owner, a due date and a category.
+- **Writing the timeline from memory** → times and order come out wrong → build it from logs, dashboards and the scribe's notes.
+- **Filing the postmortem and never reading it again** → the same failure repeats months later → share it widely, archive it searchably, and track the repeat-incident rate.
+
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** what a postmortem is, why it is blameless, and why one outage usually has several causes. **Next we open the box**: when one is required, the standard template, how to tell a trigger from contributing factors, the cause-finding methods, and how to make action items actually get done.
+
 ### When one is required
+
+**In plain words:** big outages always get one; small ones get a short note; near-misses are worth one too.
+
+**Step by step:**
+1. The incident was SEV1 or SEV2? A full postmortem is required.
+2. It was SEV3 or SEV4? A short note is usually enough.
+3. It almost happened but was caught in time (a near-miss)? Write one anyway; it is cheap to learn from because nobody is stressed.
+
 
 A postmortem is mandatory for any SEV1 or SEV2 (see [[Incident Response]] for the severity table), and strongly encouraged for a near-miss — an incident that almost happened, caught just before user impact, which is often cheaper to learn from than a real one because nobody is under pressure while writing it.
 
 ### Blameless, Just Culture
 
 **In plain words:** we still record every detail, but we ask "why did this make sense at the time?" instead of "who messed up?".
+
+**Step by step:**
+1. Write down every fact, including who did what and when.
+2. For each mistake, ask "why did this action make sense to them at that moment?".
+3. Find the system reason: the runbook pointed to a dashboard that was three releases old.
+4. Fix the system (update the runbook link check), not the person.
 
 Blameless does not mean consequence-free or detail-free. It means the write-up never names an individual as the cause and never asks "who" — it asks "what about our systems, processes, or defaults let this happen," which is Sidney Dekker's Just Culture framing: accountability is owed to the organization that builds the conditions people operate under, not extracted from the individual who happened to be on shift.
 
@@ -145,6 +189,14 @@ A postmortem that says "the engineer forgot to check the dashboard" has identifi
 ### The template
 
 **In plain words:** a fixed set of headings so every postmortem is easy to read and compare.
+
+**Step by step:**
+1. Summary and impact: what broke, for how long, and for how many users.
+2. Timeline and detection: the facts in time order, and how it was found.
+3. Response: what was done to stop it.
+4. Causes: the trigger and all contributing factors.
+5. Lessons: what went well, what went badly, where we got lucky.
+6. Action items: each with an owner, a date and a category.
 
 | Section | Content |
 | ------- | ------- |
@@ -162,6 +214,12 @@ A postmortem that says "the engineer forgot to check the dashboard" has identifi
 
 **In plain words:** the trigger is what kicked it off. The root cause is the deeper weakness. Contributing factors are the things that made it worse.
 
+**Step by step:**
+1. Ask "what happened just before it broke?". That is the trigger: the 14:02 deploy.
+2. Ask "why could that deploy cause harm at all?". Those are the contributing factors: the old timeout, the slow config, the race gap.
+3. Ask "which single fix would have stopped this exact outage?". People loosely call that the root cause.
+4. Fix all the factors, not only that one.
+
 - **Trigger:** the immediate event that started the incident (the 14:02 deploy).
 - **Contributing factors:** the conditions that let the trigger cause harm (the mismatched timeout, the narrow idempotency race, the two-week-old config change that raised latency).
 - **Root cause**, used loosely, usually means "the contributing factor that, if fixed alone, would have prevented this specific incident" — but naming only that one and stopping is the single most common postmortem mistake, because the other factors will cause a *different* incident later.
@@ -170,9 +228,23 @@ A postmortem that says "the engineer forgot to check the dashboard" has identifi
 
 **In plain words:** 5 Whys is quick for simple chains. Bigger outages need methods that look at many causes at once.
 
+**Step by step:**
+1. Start with the symptom: "duplicate webhooks".
+2. 5 Whys: why? the client retried. Why? the load balancer timed out. Why? the handler got slower than the timeout. Keep going.
+3. Then draw a fishbone: put the symptom in the middle and list causes under code, config, infrastructure and process.
+4. If several things all had to be true at once, draw a fault tree with AND joins.
+
+```mermaid
+flowchart LR
+    S["Duplicates"] -- "why?" --> R["Client retried"]
+    R -- "why?" --> T["LB timed out"]
+    T -- "why?" --> L["Handler slower than timeout"]
+    L -- "why?" --> C["Old config added 90 ms"]
+```
+
 - **5 Whys.** Ask "why" five times, each answer becoming the next question. Fast and good for a single, linear chain, but it stops at whichever answer sounds complete and rarely branches — run it more than once from the same starting symptom, asking a different first "why" each time, to surface factors a single chain misses.
 - **Fishbone (Ishikawa) diagram.** Groups candidate causes into categories (code, config, infrastructure, dependency, process, people) around the symptom, which is better than 5 Whys at surfacing *several* independent contributing factors at once rather than one linear chain.
-- **Fault tree / causal-factor charting.** Builds an explicit AND/OR tree of conditions required for the failure, useful when the incident genuinely needed multiple independent things to go wrong simultaneously (as the InvoiceOps example did: latency-raising config change AND stale timeout AND a deploy AND a race window, all four present together).
+- **Fault tree / causal-factor charting** (a diagram of which conditions had to be true together). Builds an explicit AND/OR tree of conditions required for the failure, useful when the incident genuinely needed multiple independent things to go wrong simultaneously (as the InvoiceOps example did: latency-raising config change AND stale timeout AND a deploy AND a race window, all four present together).
 
 ```mermaid
 flowchart TD
@@ -190,6 +262,12 @@ flowchart TD
 
 **In plain words:** in big systems, failure needs several holes lining up. Fixing just one "root cause" leaves the others.
 
+**Step by step:**
+1. The system already had hidden weak spots: a stale timeout and a narrow race gap.
+2. Each one alone did no harm for weeks.
+3. Then a small trigger, the deploy, lined them up and the outage happened.
+4. Blaming only the trigger leaves both weak spots waiting for the next trigger.
+
 Richard Cook's *How Complex Systems Fail* argues that failures in complex systems are normally the result of several small, individually survivable conditions combining — the system already contains latent weaknesses (the stale timeout, the narrow race window) that sit harmless until a trigger (the deploy) lines them up.
 
 Writing "root cause: the 14:02 deploy" treats a trigger as if it were the whole explanation and leaves the latent weaknesses in place for the next trigger.
@@ -197,6 +275,12 @@ Writing "root cause: the 14:02 deploy" treats a trigger as if it were the whole 
 ### Action items
 
 **In plain words:** each fix needs a person, a date and a priority, or it never happens.
+
+**Step by step:**
+1. Write the fix: "raise the LB timeout above the handler's p99".
+2. Give it one owner (platform team), a due date (in 7 days) and a priority.
+3. Tag it: prevent (stop it happening), detect (catch it sooner) or mitigate (make it hurt less).
+4. Track it in the same tool as normal work, so overdue items are visible.
 
 Every action item needs an **owner**, a **due date**, a **priority**, and a **category**:
 
@@ -219,7 +303,16 @@ flowchart LR
 
 ### Review and follow-through
 
-A postmortem is reviewed in a short meeting (or async review for a smaller incident), shared beyond the immediate team so the lesson generalizes, and archived searchably — a new on-call engineer hitting a similar symptom should be able to find it.
+**In plain words:** discuss it, share it beyond your team, store it where people can search, and look for patterns across many postmortems.
+
+**Step by step:**
+1. Hold a short review meeting (or comment on the document for a small incident).
+2. Share it with other teams that could hit the same problem.
+3. Archive it with tags so a future on-call can search "webhook duplicates".
+4. Every few months, look across all postmortems for the same factor showing up again.
+
+
+A postmortem is reviewed in a short meeting (or async review, meaning people comment in their own time, for a smaller incident), shared beyond the immediate team so the lesson generalizes, and archived searchably — a new on-call engineer hitting a similar symptom should be able to find it.
 
 Teams that track postmortems in one place over time can run trend analysis: the same contributing factor (stale timeouts, missing alerts on a specific class of thing) appearing across several unrelated incidents is itself a signal worth its own action item.
 
@@ -241,6 +334,8 @@ type ActionItem struct {
 The full version below adds validation — the concrete, checkable rule that turns "we wrote some action items" into "every action item is actually trackable" — plus a due-date-passed report a postmortem review meeting can run directly.
 
 A small action-item validator. Compiles and passes `go vet` and `go test -race` on Go 1.24.
+
+**What this code does, in plain words:** `Validate` looks at one action item and lists everything wrong with it: no description, no owner, no due date, or a category that is not prevent, detect or mitigate. `Overdue` goes through a list and returns the items whose due date has passed and that are not marked closed, ready for the review meeting.
 
 ```go
 package postmortem
@@ -362,6 +457,9 @@ Both tests pass under `go vet` and `go test -race` on Go 1.24.
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the template, the difference between a trigger and contributing factors, the cause-finding methods, and what makes action items stick. **Next is the advanced part**: how real companies run postmortems, how the practice fails (blame, undone actions), what to measure, and traps like hindsight bias that interviewers probe.
+
+
 - **Real systems:** Google's SRE book and workbook both describe blameless postmortems with this template as central practice; incident.io and similar tools automate pulling the timeline from the chat transcript and alert history directly into a draft; many companies publish selected postmortems externally (a practice that itself pressures the writing to be honest and specific, since it will be read outside the team).
 - **Failure modes → fixes:**
   - Postmortem turns into blame, people get defensive and omit details → explicit blameless framing stated at the start of the review meeting, and a facilitator who redirects "who" questions to "what about the system."
@@ -419,6 +517,30 @@ Naming that explicitly turns a day that "wasn't so bad" into a genuine warning a
 - Every action item needs an owner, due date, priority, and category (prevent / detect / mitigate).
 - Watch hindsight bias: write the timeline from what was knowable at each point, not from the now-known answer.
 - Repeat-incident rate is the metric that catches postmortems that read well but changed nothing.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does "blameless" mean?
+> The write-up asks what about the system let the mistake happen, never "who did it".
+
+> [!question]- What four things does every action item need?
+> An owner, a due date, a priority and a category (prevent, detect or mitigate).
+
+> [!question]- Which incidents must get a full postmortem?
+> SEV1 and SEV2, and it is encouraged for near-misses.
+
+🟡 Medium
+
+> [!question]- What is the difference between a trigger and a contributing factor?
+> The trigger set it off (a deploy); contributing factors are the weak spots that let the trigger cause harm (a stale timeout).
+
+> [!question]- When is a fishbone better than 5 Whys?
+> When several independent things went wrong together; 5 Whys follows only one chain.
+
+> [!question]- Which metric shows postmortem actions are not being done?
+> The repeat-incident rate: the same cause keeps coming back.
 
 ## Links
 

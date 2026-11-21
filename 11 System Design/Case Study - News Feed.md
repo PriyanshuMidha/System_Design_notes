@@ -32,6 +32,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Back-of-the-Envelope Estimation]]: turning users and posts into reads and writes per second.
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+> - [[Caching Patterns]]: cache-aside means "check the cache, on a miss load from the database and save a copy".
+> - [[Kafka and Event Streaming]]: a durable log of events that background workers read at their own pace.
+
 **From zero, in 60 seconds** 🟢
 
 Your feed shows new posts from people you follow, newest or best first.
@@ -78,6 +84,10 @@ So it has to prepare each person's list somewhere, either ahead of time or very 
 | Push / pull | Prepare at write time / build at read time | Mail delivered vs going to the post office |
 | Celebrity | An author with millions of followers | A pop star account |
 | Cursor | A bookmark saying "continue after this item" | `?before=post_981` |
+
+| Hydration | Turning a list of post IDs into full posts with text, author and photos | 20 IDs → 20 post cards |
+| Eventual consistency | Everyone sees the change, but not at the same instant | a friend sees your post 2 seconds later |
+| Consumer lag | How far behind the newest event a background worker is | fan-out is 30 s behind |
 
 **Picture it**
 
@@ -136,6 +146,13 @@ The query cost grows with the number of followees, and the work is repeated on e
 - High availability for reads: showing a slightly stale feed is better than an error.
 - Reads far outnumber writes.
 
+### Real-life example: your Instagram home feed 🟢
+
+When you open Instagram, the home feed shows posts from friends and accounts you follow, almost instantly.
+A friend with 300 followers posts a photo; within seconds its ID has been dropped into each of those 300 followers' ready-made lists.
+A film star with tens of millions of followers posts too; that post is not copied into everyone's list, it is fetched and mixed in when each fan opens the app.
+As you scroll, the app asks for "the next 20 after the last one I saw", so you never see a post twice.
+
 **Out of scope** for this note: search, direct messages ([[Case Study - Chat System]]), notifications about likes ([[Case Study - Notification System]]), ads.
 
 ## 2. Mental model 🟢
@@ -149,7 +166,24 @@ This breaks for a celebrity with 50 million followers: the carrier would need 50
 - **Fan-out on read (pull):** gather at read time. Cheap writes, expensive reads.
 - **Hydration:** turning a list of IDs into full posts (author name, text, media URLs, like counts) with batched lookups.
 
+## Common beginner mistakes 🟢
+
+- **Building every feed with one big query at read time** → thousands of heavy queries a second, repeated for nothing → keep a ready list of post IDs per user.
+- **Pushing a celebrity's post to 50 million lists** → one post takes a minute and delays everyone else → pull celebrity posts at read time.
+- **Paging with `OFFSET`** → a new post shifts everything, so you see repeats or miss posts → page with a cursor (the last post ID seen).
+- **Storing whole posts in each feed list** → memory explodes and edits are impossible → store only IDs and hydrate with batched lookups.
+- **Hunting down every copy of a deleted post** → millions of list edits → filter deleted or private posts at hydration time.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the mailbox idea: a ready list of post IDs per user, with celebrities fetched at read time. **Next we open the box**: the five services, the write path when someone posts, and the read path when someone opens the feed.
+
+**Step by step (plain):**
+1. Ravi (300 followers) posts a photo. The post service saves it with ID 9001 and replies "posted" at once.
+2. A background worker reads "Ravi posted 9001" from Kafka and adds 9001 to the top of each follower's list in Redis.
+3. Asha, one of his followers, opens the app. The feed service reads the first 20 IDs from her list.
+4. It adds recent posts from celebrities she follows, removes duplicates and sorts newest first.
+5. It looks up the 20 posts and their authors in one batch, and sends the page with a cursor for the next one.
 
 ```mermaid
 flowchart LR
@@ -175,11 +209,11 @@ flowchart LR
 
 The design has five main parts:
 
-1. **Post service** stores the post with a time-sortable 64-bit ID (see [[Unique ID Generation]]), then publishes a `PostCreated` event. The event is published reliably with the pattern in [[Transactional Outbox and CDC]], so a post is never saved without its event.
+1. **Post service** stores the post with a time-sortable 64-bit ID (see [[Unique ID Generation]]), then publishes a `PostCreated` event. The event is published reliably with the outbox pattern (the event is saved in the same database transaction as the post, then sent) in [[Transactional Outbox and CDC]], so a post is never saved without its event.
 2. **Fan-out workers** consume the event from Kafka (see [[Kafka and Event Streaming]]), page through the author's followers, and push the post ID into each follower's feed list. They skip authors above the celebrity threshold and followers who have not opened the app in 30 days.
 3. **Feed cache** holds one Redis list per user of the newest 800 post IDs.
 4. **Feed service** reads the list, merges in celebrity posts, optionally ranks, then hydrates the page.
-5. **Object caches** for posts and users serve hydration with batched multi-get calls; this is the cache-aside pattern from [[Caching Patterns]].
+5. **Object caches** for posts and users serve hydration with batched multi-get calls (one request that fetches many keys, Redis `MGET`); this is the cache-aside pattern from [[Caching Patterns]].
 
 **Write path, step by step:**
 
@@ -462,6 +496,14 @@ The second test is the reason for cursor pagination: a post that lands between t
 | Chronological | Sort by post ID | Simple, predictable, easy to cache | Engagement may be lower than a ranked feed |
 | Ranked | Candidates → features → model score → re-rank for diversity | Engagement-driven products | A ranking service on the read path, feature stores, harder to cache and debug |
 
+### Things people confuse this with 🟡
+
+| System | What it delivers | How it differs from a news feed |
+| --- | --- | --- |
+| [[Case Study - Chat System]] | Every message to every member, in order | Nothing may be skipped or reordered; a feed can rank, skip and be a little late |
+| [[Case Study - Notification System]] | Alerts about specific events ("Asha liked your post") | Pushed to the phone even when the app is closed; one per event |
+| Search | Posts matching words you typed | Driven by a query, not by whom you follow |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - **Push wastes work on readers who never read.** If most users open the app once a week, pushing every post to them costs more than computing their feed on demand. Skipping inactive followers is the usual fix.
@@ -479,6 +521,8 @@ flowchart TD
 ```
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the write and read paths, the sizing, the API, the data and the merge code. **Next is the advanced part**: real systems and failure stories, picking the celebrity threshold, ranking, hot counters, deletes and blocks, and sharding.
 
 - **Real systems:**
 	- Twitter described its home timeline in "Timelines at Scale" (2012): Redis lists of about 800 entries per user, filled by fan-out on write, with accounts that have very large follower counts handled at read time.
@@ -508,6 +552,15 @@ Teams pick a threshold in the tens or hundreds of thousands of followers and tun
 **Bounding read-time pulls.** A user who follows 300 celebrities would trigger 300 lookups per read. Keep a per-celebrity cache of the latest 100 post IDs (`celeb:{author_id}`), cap how many celebrities are pulled per read (for example the 50 most interacted with), and fetch them in one pipelined round trip.
 
 **Ranking pipeline.**
+
+```mermaid
+flowchart LR
+    C["candidates: ~800 pushed IDs + celebrity posts"] --> F["fetch features"]
+    F --> S["model scores each post"]
+    S --> R["re-rank: diversity, freshness, policy"]
+    R --> P["one page of 20"]
+```
+
 1. *Candidate generation:* the ~800 pushed IDs plus celebrity pulls plus, optionally, recommended posts.
 2. *Feature fetch:* author affinity, post age, engagement so far, media type.
 3. *Scoring:* a model predicts the chance of engagement.
@@ -545,6 +598,26 @@ Keep the chronological path as a fallback when the ranking service is slow, by s
 
 > [!question]- How would you add ranking without hurting p99?
 > Rank a bounded candidate set (about 800 IDs), fetch features in batch, set a tight timeout on the ranking call, and fall back to chronological order on timeout.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is stored in each user's feed list?
+> Only post IDs, newest first, capped at about 800.
+
+> [!question]- Easy: what does fan-out on write mean?
+> When someone posts, the post ID is copied into each follower's list right away.
+
+> [!question]- Easy: why not push a celebrity's post to every follower?
+> 50 million inserts for one post take too long and slow down everyone else's posts.
+
+> [!question]- Medium: 700 posts a second, 200 followers each on average. How many list inserts a second?
+> About 140,000.
+
+> [!question]- Medium: why use a cursor instead of `OFFSET` for the next page?
+> New posts shift offsets, causing repeats or gaps; "older than post X" stays stable.
+
+> [!question]- Medium: a post is deleted but its ID sits in a million lists. What do you do?
+> Mark it deleted and drop it at hydration time; clean the lists lazily or let them age out.
 
 ## 10. Cheat sheet 🟢
 

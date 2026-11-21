@@ -36,6 +36,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Timeouts, Retries and Backoff]]: clients give up after a time limit, and must wait longer (with randomness) before each retry.
+> - [[10 Distributed Systems & Resilience/Circuit Breaker|Circuit Breaker]]: stop calling a failing service for a while and serve a fallback instead.
+> - [[Bulkheads and Concurrency Limits]]: cap how many calls may be in flight at once, so one slow part cannot use up everything.
+
 **From zero, in 60 seconds** 🟢
 
 A server can handle only so many requests per second.
@@ -83,6 +88,11 @@ Turning 30 people away at the door, and dropping desserts from the menu, would h
 | HTTP 503 / 429 | "Too busy, try later" status codes | `503` with `Retry-After: 5` |
 | Dependency | Another service your service calls | Product page calls a reviews service |
 | Fallback | A simpler answer used when the real one fails | Show cached prices, hide reviews |
+| Goodput | Useful answers delivered before the client gave up | 1,000 good answers/s, not 1,500 late ones |
+| Priority (criticality) | How important a request is, so the least important go first | Checkout = critical, prefetch = sheddable |
+| Adaptive limit (AIMD) | A cap on in-flight requests that grows slowly when fast and shrinks fast when slow | 10 → 11 when fine, 11 → 10 when slow |
+| Kill switch | A setting that turns a feature off for everyone at once | Turn off recommendations during a sale |
+| Static stability | Keep working on what you already have when a helper system fails | Run on yesterday's config if the config service is down |
 
 **Picture it**
 
@@ -111,6 +121,8 @@ Where it breaks: a turned-away patient cannot just retry in one second, but soft
 
 ## 1. Why it exists 🟢
 
+🟢 **Plain version:** If more requests arrive than a server can finish, they wait in a line. When the line gets long, every request waits past its time limit, and the server works hard on answers nobody is still waiting for. Turning some requests away at the door keeps the rest fast. Separately, when a nice-to-have part (like reviews) breaks, the page should still load without it, so the user can still buy.
+
 Two different problems, with the same goal of keeping the important things working.
 
 **Overload.** A service can complete 1,000 requests per second at 50 ms each. A flash sale sends 1,500 req/s. Without shedding, the extra 500 req/s queue up (illustrative arithmetic):
@@ -121,7 +133,7 @@ Two different problems, with the same goal of keeping the important things worki
 | 4 s | 2,000 | 2 s | every new request times out before it is served |
 | 10 s | 5,000 | 5 s | the server is 100% busy producing answers nobody reads |
 
-Throughput of *useful* answers (goodput) drops to zero while the CPU is at 100%. Client retries then add more load. This is **congestion collapse**. With shedding, the server serves 1,000 req/s at 50 ms and rejects 500 req/s in under a millisecond each; users who are rejected can retry later, and everyone else gets a fast answer.
+Throughput of *useful* answers (**goodput**) drops to zero while the CPU is at 100%. Client retries then add more load. This is **congestion collapse** (the server is fully busy but almost nothing useful gets out). With shedding, the server serves 1,000 req/s at 50 ms and rejects 500 req/s in under a millisecond each; users who are rejected can retry later, and everyone else gets a fast answer.
 
 **Partial dependency failure.** A product page calls price, stock, reviews and recommendations. If recommendations times out and the page returns a 500, the shop loses the sale because of a widget. Customers can buy without recommendations; they cannot buy without price and stock.
 
@@ -134,6 +146,13 @@ flowchart LR
     RC -. "hide it, keep page" .-> P
 ```
 
+### Real-life example 🟢
+
+When a big cricket final ticket sale opens on BookMyShow, millions of people tap at once.
+Instead of letting every request in and slowing down for everyone, the site puts extra users in a "virtual queue" or shows "high demand, try again in a minute".
+At the same time it switches off extras such as personalised suggestions, so the servers spend their effort on seat selection and payment.
+The people who get in can finish booking quickly, instead of everyone timing out at the payment step.
+
 ## 2. Mental model 🟢
 
 A hospital emergency room on a bad night.
@@ -143,11 +162,28 @@ A hospital emergency room on a bad night.
 - **Graceful degradation:** the cafeteria and the gift shop close so their staff can help; the ER stays open.
 - **Static stability:** if the hospital's central scheduling system goes down, each ward keeps working from the last printed rota instead of stopping.
 
+## Common beginner mistakes 🟢
+
+- **Queueing everything "to be safe"** → under steady overload the line never empties and every request times out → keep queues short and reject early.
+- **Rejecting after doing the expensive work** → if you parse the body and open a DB transaction first, saying "no" saves nothing → check for room at the very start.
+- **Returning 500 because a widget failed** → the user loses the whole page over reviews or recommendations → give optional calls a short timeout and a fallback.
+- **Faking success for a critical write** → "payment done" when it was not is far worse than an error → fail clearly, or queue it as "pending" with an idempotency key.
+- **Fallbacks that call the same broken thing** → a "cache" that misses straight to the same overloaded database adds more load → fallbacks must use separate resources.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that an overloaded server should turn some requests away fast, and that optional parts should quietly drop out when they break. **Next we open the box**: how to sort features into tiers, how each optional call gets a fallback, how a server decides at the door whom to let in, and how to keep the waiting line short. Each step starts with a short walk-through.
 
 ### Step 1: classify features and dependencies
 
 **In plain words:** sort every feature into "must work" (price, stock, pay) and "nice to have" (reviews, recommendations).
+
+**Step by step:**
+1. List every part of the product page: price, stock, reviews, recommendations, confirmation email.
+2. Mark price and stock "critical": without them nobody can buy.
+3. Mark reviews and recommendations "optional": the page works without them.
+4. Mark the confirmation email "deferrable": it can be sent a few minutes later.
+5. Write down what happens when each one fails: critical → clear error; optional → hide; deferrable → queue.
 
 The old notes' core-versus-optional decision, made concrete:
 
@@ -172,9 +208,16 @@ flowchart TD
 
 **In plain words:** each nice-to-have call gets a short time limit and a backup answer, like an empty list.
 
+**Step by step:**
+1. The product page has 800 ms in total. It calls price and stock (300 ms limit) and recommendations (150 ms limit) at the same time.
+2. Price and stock answer in 40 ms: ₹1,299, 14 in stock.
+3. Recommendations is overloaded and silent. At 150 ms its timeout fires.
+4. The page takes the "top sellers" list from its local cache (6 minutes old) instead.
+5. The user gets a full page at 160 ms, and a counter records one fallback for recommendations.
+
 Each optional dependency gets its own short timeout (inside the page's overall deadline), its own [[Bulkheads and Concurrency Limits|bulkhead]] and its own [[10 Distributed Systems & Resilience/Circuit Breaker|breaker]], plus a fallback:
 
-- **Stale data:** serve the last good value. HTTP caches can do this with `Cache-Control: stale-if-error=86400` (RFC 5861), which lets a cache serve a stale response for up to a day when the origin errors.
+- **Stale data:** serve the last good value. HTTP caches can do this with `Cache-Control: stale-if-error=86400` (RFC 5861, the web standard for this header), which lets a cache serve a stale response for up to a day when the origin errors.
 - **Defaults:** "Top sellers" instead of personalised recommendations.
 - **Hide:** remove the reviews block entirely.
 - **Defer:** "Your confirmation email is on its way" while the email job waits in a queue.
@@ -206,6 +249,13 @@ sequenceDiagram
 
 **In plain words:** check at the door, before doing any real work, and say no fast if the server is full.
 
+**Step by step:**
+1. A request arrives. First check: has its deadline already passed? If yes, drop it; nobody is waiting.
+2. Read its priority from the route or a header: checkout is critical, prefetch is sheddable.
+3. Check the in-flight count. Say the limit is 10 and sheddable requests may use only 8 of those slots.
+4. A 9th sheddable request gets `503` with `Retry-After` in under 1 ms. A critical request can still use slots 9 and 10.
+5. When each request finishes, its speed nudges the limit: fast → limit goes up a little; slow → limit drops by 10%.
+
 When the server itself is the bottleneck, it must say no early, before it parses large bodies, opens database transactions or calls other services.
 
 ```mermaid
@@ -223,16 +273,23 @@ flowchart LR
 ```
 
 - **What to return.** `503 Service Unavailable` with `Retry-After` when the server is overloaded; `429 Too Many Requests` when *this client* is over its quota (that is [[Rate Limiting - Algorithms and Distributed Design]]). Clients must back off and honour `Retry-After` ([[Timeouts, Retries and Backoff]]).
-- **Priority tiers.** Google's SRE book describes four request criticalities: `CRITICAL_PLUS`, `CRITICAL`, `SHEDDABLE_PLUS` and `SHEDDABLE`. Criticality is set at the edge and travels with the request through every RPC, so a backend deep in the stack still sheds batch traffic before user traffic. Netflix applies the same idea at its Zuul gateway, putting requests into priority buckets so that, under load, prefetch and logging are shed before requests that start playback.
+- **Priority tiers.** Google's SRE book describes four request criticalities: `CRITICAL_PLUS`, `CRITICAL`, `SHEDDABLE_PLUS` and `SHEDDABLE`. Criticality is set at the **edge** (the first server the request hits) and travels with the request through every **RPC** (call from one service to another), so a backend deep in the stack still sheds batch traffic before user traffic. Netflix applies the same idea at its Zuul gateway (the front door all Netflix API traffic passes through), putting requests into priority buckets so that, under load, prefetch and logging are shed before requests that start playback.
 - **Limits that adapt.** A fixed limit is a guess that ages. An **AIMD** limiter (additive increase, multiplicative decrease, the rule TCP uses for its congestion window) raises the limit slowly while latency stays under a target and cuts it by a fraction when latency rises or calls fail. Netflix's `concurrency-limits` library offers AIMD and latency-gradient algorithms such as Vegas and Gradient2.
 
 ### Step 4: manage the queue, not just the door
 
 **In plain words:** a short line is fine for bursts; a line that never empties must be cut, and newest-first can save users still waiting.
 
+**Step by step:**
+1. A burst of 50 requests arrives in one go. They queue briefly, the queue empties within 100 ms: fine.
+2. Now traffic stays above capacity. The queue has not been empty once in the last 100 ms.
+3. From now on, any request that has waited more than 5 ms is dropped with a fast "busy".
+4. While the queue is backed up, the server also serves the newest request first, because its user is still waiting.
+5. When the queue empties again, it goes back to normal first-come, first-served.
+
 Some queueing absorbs bursts. Long queues create the collapse in section 1. Facebook's *Fail at Scale* describes two techniques:
 
-- **Controlled Delay (CoDel):** if the queue has not been empty at any point in the last `N` ms (100 ms in their description), requests may wait only `M` ms (5 ms) before being dropped. A short burst can queue; a standing queue cannot.
+- **Controlled Delay (CoDel)** (a queue rule first made for network routers): if the queue has not been empty at any point in the last `N` ms (100 ms in their description), requests may wait only `M` ms (5 ms) before being dropped. A short burst can queue; a standing queue cannot.
 - **Adaptive LIFO:** normally serve first in, first out; when a queue is building, switch to last in, first out. The newest requests belong to users still waiting, while the oldest have probably timed out already.
 
 ```mermaid
@@ -602,6 +659,15 @@ And `TestAIMD`: ten 50 ms calls take the limit from 10 to about 10.95; one 1 s c
 | Static stability | Keep running on last-known-good config and pre-provisioned capacity when the control plane fails | Data planes depending on a control plane | Extra capacity held in reserve; stale config |
 | Scale out ([[Autoscaling]]) | Add instances | Load grows over minutes | Too slow for spikes of seconds; needs shedding meanwhile |
 
+### Load shedding versus things people confuse it with 🟡
+
+| Thing | Who it protects | How it differs from load shedding |
+| --- | --- | --- |
+| Rate limiting (429) | Fairness between clients | Caps each client even when the server has spare room; shedding (503) protects the whole server when total demand is too high |
+| Autoscaling | Future capacity | Adds servers over minutes; shedding works in milliseconds while the new servers start |
+| Backpressure | Producers and consumers in a pipeline | Slows the sender down; shedding refuses the extra work outright |
+| Circuit breaker | The caller, from a failing dependency | Runs on the client side and stops calls out; shedding runs on the server and refuses calls in |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - **Shedding drops real users' requests.** It is the right call only when the alternative is failing *everyone*. Pair it with capacity planning so it is rare.
@@ -613,17 +679,19 @@ And `TestAIMD`: ten 50 ms calls take the limit from 10 to about 10.95; one 1 s c
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to sort features into tiers, give optional calls fallbacks, shed at the door by priority with an adaptive limit, and keep queues short with CoDel and LIFO. **Next comes the advanced part**: how Google, Netflix, Facebook and AWS run this in production, the failure modes they hit, and deeper ideas such as priority inversion and static stability.
+
 - **Real systems:**
 	- Google: request criticality propagated through RPCs; client-side adaptive throttling; servers reject early.
 	- Netflix: prioritized load shedding at the Zuul gateway; `concurrency-limits` in services.
 	- Facebook: CoDel and adaptive LIFO in server request queues, as described in *Fail at Scale*.
-	- AWS: load shedding in services and static stability designs, where data planes keep working with their last known configuration when the control plane is impaired, and capacity is pre-provisioned so losing one Availability Zone does not need new instances.
+	- AWS: load shedding in services and static stability designs, where **data planes** (the parts that serve live traffic) keep working with their last known configuration when the **control plane** (the system that manages and configures them) is impaired, and capacity is pre-provisioned so losing one **Availability Zone** (one data-centre site within a cloud region) does not need new instances.
 	- CDNs and HTTP caches: `stale-if-error` and `stale-while-revalidate` serve cached pages while the origin is down.
 - **Failure modes → fixes:**
 	- Server at 100% CPU but goodput near zero → shed early, cap queue wait (CoDel), drop requests whose deadline has passed.
 	- Clients retry rejected requests at once and double the load → `Retry-After`, client retry budgets, jittered backoff.
 	- The fallback calls the failing dependency too (for example a "cache" that misses to the same database) → fallbacks must use independent resources.
-	- Cache tier restarts cold and the database melts → warm-up, request coalescing and limits in front of the database ([[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]).
+	- Cache tier restarts cold and the database melts → warm-up, **request coalescing** (many identical requests share one trip to the database) and limits in front of the database ([[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]).
 	- Configuration service down blocks every deploy and restart → static stability: cache config locally and start with the last good copy.
 	- Autoscaling arrives after the spike is over → shed first, scale second; keep headroom.
 - **What to monitor:**
@@ -631,15 +699,15 @@ And `TestAIMD`: ten 50 ms calls take the limit from 10 to about 10.95; one 1 s c
 	- Fallback rate per dependency (`fallback_total{dep=...}`) and the age of stale data served.
 	- The adaptive limit and in-flight count as gauges.
 	- Queue wait time (not just queue length) and goodput: successful responses delivered within the client's deadline.
-	- SLO burn for critical flows separately from optional ones ([[SLIs, SLOs, SLAs and Error Budgets]]).
+	- **SLO** (the reliability target, such as 99.9% success) burn for critical flows separately from optional ones ([[SLIs, SLOs, SLAs and Error Budgets]]).
 	- Test it: load tests past capacity, and chaos experiments that slow or kill each optional dependency ([[Chaos Engineering]]).
 
 ## 8. Deep dive 🔴
 
-- **Why latency is the right signal.** CPU utilisation lags and varies with request mix; error rate rises only after users already suffer. Queueing shows up first as rising latency at a fixed concurrency, which is what AIMD and gradient limiters watch. TCP congestion control uses the same insight (Vegas reacts to RTT growth before packets drop).
+- **Why latency is the right signal.** CPU utilisation lags and varies with request mix; error rate rises only after users already suffer. Queueing shows up first as rising latency at a fixed concurrency, which is what AIMD and gradient limiters watch. TCP congestion control uses the same insight (Vegas reacts to **RTT** (round-trip time) growth before packets drop).
 - **AIMD dynamics.** Additive increase finds spare capacity slowly; multiplicative decrease backs off fast. Many independent servers running AIMD against a shared dependency converge towards a fair share, as TCP flows do on a shared link. Set a floor so one bad minute cannot drive the limit to zero, and a ceiling so a lucky period cannot raise it beyond what memory allows.
 - **Drop what is already dead.** If a request carries a deadline (gRPC does; HTTP can carry a header set by the gateway) and the deadline has passed by the time it is dequeued, serving it is pure waste. This one check removes most of the "busy producing answers nobody reads" effect.
-- **Priority inversion.** If a critical request depends on a call that the downstream classifies as sheddable, the downstream sheds it and the critical request fails. Criticality must be propagated with the request, not set separately by each service.
+- **Priority inversion** (important work stuck behind unimportant work). If a critical request depends on a call that the downstream classifies as sheddable, the downstream sheds it and the critical request fails. Criticality must be propagated with the request, not set separately by each service.
 - **Retry amplification under shedding.** Rejected clients that retry without backoff add their retries on top of new demand, so a 1.5× overload grows with every round of retries. The server's `Retry-After`, client retry budgets, and in Google's design an explicit "overloaded, do not retry" signal for errors deep in the stack keep shedding from feeding itself.
 - **Brownout control.** Klein et al. proposed a controller that adjusts the share of requests receiving optional content (for example recommendations) to keep response time near a target, which makes degradation gradual rather than all-or-nothing.
 - **Static stability as design, not reaction.** A statically stable system does not need to *do* anything new when a dependency fails: no new instances, no config fetch, no DNS change. That is why AWS designs pre-provision capacity across zones and keep data planes running from cached state. The cost is capacity held idle in normal times.
@@ -676,6 +744,30 @@ And `TestAIMD`: ten 50 ms calls take the limit from 10 to about 10.95; one 1 s c
 - AIMD limit: +1/limit on fast success, ×0.9 on slow or failed; floor and ceiling.
 - Bound queue wait (CoDel: 5 ms when the queue never emptied in 100 ms); adaptive LIFO when backed up; drop expired requests.
 - Monitor shed rate by priority, fallback rate, limit, queue wait and goodput.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is load shedding?
+> Quickly rejecting some requests (503 + `Retry-After`) when overloaded, so the accepted ones still finish fast.
+
+> [!question]- Recommendations are down. What should the product page do?
+> Still load, with cached or generic recommendations, or with the widget hidden.
+
+> [!question]- Which status code means "the server is overloaded" and which means "you, this client, are over quota"?
+> 503 for server overload; 429 for a per-client quota.
+
+🟡 Medium
+
+> [!question]- Capacity is 1,000 req/s and 1,500 req/s arrive with a 2 s client timeout. Roughly when does every new request start timing out without shedding?
+> After about 4 s: the queue holds 2,000, so a new request waits about 2 s, the full timeout.
+
+> [!question]- Limit 10, sheddable share 0.8, 8 sheddable requests in flight. Which of a new sheddable and a new critical request gets in?
+> Only the critical one: sheddable requests may use 8 slots, critical ones may use all 10.
+
+> [!question]- Why switch to newest-first (LIFO) when the queue is backed up?
+> The oldest requests have probably already timed out on the client side; the newest ones still have a user waiting.
 
 ## Links
 

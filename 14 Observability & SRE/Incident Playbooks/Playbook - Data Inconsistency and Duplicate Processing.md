@@ -31,6 +31,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3, the on-call steps (4, 5, 6), fixes (7), the worked example (8), and 9-10.
 > - 🔴 **Interview / SDE-3 prep?** Add 11, 12 and 13. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Incident Response]]: one person leads, you stop the damage first, and you post regular updates.
+> - [[Production Debugging Playbook]]: check "what changed" and scope the problem with real examples before digging in.
+> - [[Delivery Semantics and Exactly-Once]]: queues usually deliver "at least once", so the same message can arrive twice.
+
 **From zero, in 60 seconds** 🟢
 
 Computers talk over networks, and networks sometimes lose replies.
@@ -80,6 +85,12 @@ Another customer's order shows paid in one screen and unpaid in another.
 | Source of truth | The one system whose data is considered correct | The payments ledger, not the cache |
 | Reconciliation | Comparing two data sets and fixing mismatches | Nightly job compares orders with payments |
 | Dual write | Writing the same change to two systems separately | Write DB, then publish event; one may fail |
+| Race condition | Two requests running at the same time step on each other | both read balance 100, both withdraw |
+| Lost update | One writer's change is silently overwritten by another | final balance shows only one withdrawal |
+| Replica lag | A database copy being a few seconds behind the main one | you save, refresh, see the old value |
+| Unique constraint | A database rule that refuses a second row with the same key | second insert of `evt_42` fails |
+| Transactional outbox | Saving the event in the same transaction as the data, then sending it from there | `outbox` table read by a relay |
+| Reversing entry | A new ledger row that cancels a wrong one, instead of deleting it | −₹500 to undo a duplicate +₹500 |
 
 **Picture it**
 
@@ -117,16 +128,24 @@ Symptoms and user impact:
 
 - Customers report two charges, two shipping notifications, or two copies of the same record.
 - Support sees an order "paid" with no payment, or a payment with no order.
-- Dashboards disagree: the data warehouse count differs from the primary database.
+- Dashboards disagree: the data warehouse (a separate database used for reports) count differs from the primary database.
 - A user writes data, refreshes, and sees the old data.
 - Counters, balances or inventory drift from the truth.
 
-Example for this note: InvoiceOps processes payment webhooks. A deploy made the handler slower. The payment provider timed out waiting for the `200 OK`, retried delivery, and the handler (not idempotent) created a second ledger entry for each retried event. Roughly 3% of invoices were double-credited in 40 minutes.
+Example for this note: InvoiceOps processes payment webhooks (calls the payment provider makes to tell us a payment happened). A deploy made the handler slower. The payment provider timed out waiting for the `200 OK`, retried delivery, and the handler (not idempotent) created a second ledger entry (a row in the money record) for each retried event. Roughly 3% of invoices were double-credited in 40 minutes.
 
 Data incidents are slower and more dangerous than outages: bad data keeps spreading to downstream systems, emails and reports, and cannot be rolled back by redeploying code.
 
 > [!tip] Remember
 > Code rollback fixes behaviour; it does not fix the bad rows already written.
+
+### Real-life example: a UPI payment that shows twice 🟢
+
+Think of paying a shop by UPI on a slow network.
+The app sends the payment, the bank processes it, but the "success" reply gets lost, so the app shows "pending" and the user taps "retry".
+If the bank's system had no record of the first request's ID, the user would be charged twice.
+Real payment systems attach a unique ID to every payment request, so the second attempt is recognised and the money moves only once.
+This playbook is about what to do when that protection is missing or broken.
 
 ## 2. Mental model 🟢
 
@@ -157,11 +176,27 @@ flowchart TD
     G --> X
 ```
 
+## Common beginner mistakes 🟢
+
+- **Fixing data while the bug is still writing more** → you repair a moving target → pause the consumer or flag the feature off first.
+- **Assuming a rollback fixes the data** → it only stops new bad rows; the old ones stay → write a reviewed repair script.
+- **Deleting duplicate money rows** → the audit trail is gone → add reversing entries instead.
+- **Saving the idempotency key after the effect** → a crash in between still causes a duplicate → insert the key in the same transaction as the effect.
+- **Choosing a dedupe key like "amount + user"** → two real, identical purchases get dropped → use the provider's event ID or a request ID.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that messages can arrive twice and that idempotency makes the second arrival harmless. **Next we open the box**: exactly where duplicates are born, the shapes bad data takes, why writing to two systems drifts, and the on-call steps to find and repair each cause.
 
 ### Where duplicates are born
 
 **In plain words:** any time a message or request can be sent more than once, the receiver might process it more than once. Retries are a feature of reliable systems; duplicates are the price.
+
+**Step by step:**
+1. The payment provider sends event `evt_42` to our webhook.
+2. Our handler writes a ledger entry, but takes 11 s to reply.
+3. The provider gives up at 10 s and sends `evt_42` again.
+4. Without a check, the handler writes a second ledger entry. With a unique row for `evt_42`, the retry is refused and we just reply 200.
 
 ```mermaid
 sequenceDiagram
@@ -183,6 +218,11 @@ Fixed version: the handler first records `evt_42` in a unique-keyed table, in th
 
 **In plain words:** "the data is wrong" comes in a few shapes: doubles, missing rows, old values, or two systems that disagree. Each shape has a usual cause.
 
+**Step by step:**
+1. Take one bad example, say invoice 9123.
+2. Ask its shape: two rows for one event (duplicate), a value missing one change (lost update), an old value (stale read), a payment with no order (orphan), or two systems disagreeing (divergence)?
+3. Use the table to jump to the usual cause for that shape.
+
 | Type | How it looks | Typical cause |
 | --- | --- | --- |
 | Duplicate | Same logical event twice | Retry or redelivery without idempotency |
@@ -190,11 +230,17 @@ Fixed version: the handler first records `evt_42` in a unique-keyed table, in th
 | Stale read | Old value after write | Read from lagging replica or stale cache |
 | Phantom or orphan | Child row without parent, payment without order | Dual write, partial failure |
 | Divergence | Two stores disagree | Failed event publish, consumer error, bug in transform |
-| Out-of-order | Older update overwrites newer | Unordered consumer, retries, clock skew |
+| Out-of-order | Older update overwrites newer | Unordered consumer, retries, clock skew (server clocks disagreeing) |
 
 ### Dual write: the classic source of drift
 
 **In plain words:** the app saves to the database and then sends a message. If it crashes in between, one happened and the other didn't. Now they disagree.
+
+**Step by step:**
+1. The order service commits "order 55 paid" to its database.
+2. Before it publishes the "order paid" event, the pod crashes.
+3. The shipping service never hears about order 55, so it never ships.
+4. With an outbox, the event row is saved in the same transaction, and a relay sends it later even after a crash.
 
 ```mermaid
 sequenceDiagram
@@ -216,7 +262,7 @@ The fix is the **transactional outbox**: write the event to an `outbox` table in
 ## 4. First 5 minutes 🟡
 
 1. **Confirm and size it.** Pick two or three concrete examples (order IDs, invoice IDs). Count affected rows with a read-only query. Is it still growing? Which tenants, regions or time window?
-2. **Check what changed.** Deploys, migrations, backfills, config, broker rebalances, consumer lag or restarts, replica failover, provider incidents, feature flags in the last 24 hours.
+2. **Check what changed.** Deploys, migrations, backfills (jobs that rewrite old data), config, broker rebalances (the queue reshuffling which consumer reads what), consumer lag or restarts, replica failover, provider incidents, feature flags in the last 24 hours.
 3. **Stop the damage first**, whichever applies:
    1. Pause the consumer group or scale it to 0 (messages wait in the broker; confirm retention is longer than the outage).
    2. Disable the endpoint or flag the feature off.
@@ -226,6 +272,14 @@ The fix is the **transactional outbox**: write the event to an `outbox` table in
 4. **Communicate.** Declare severity per [[Incident Response]]. Money, privacy or legal exposure usually raises severity. Inform support with the exact customer-facing wording and tell finance if money moved.
 
 ## 5. Diagnosis flowchart 🟡
+
+**In plain words:** look at how far apart the two copies are and where the data went wrong, then follow the matching branch.
+
+**Step by step:**
+1. Duplicates about 30-60 s apart? Retries after a timeout (6.2).
+2. Duplicates right after consumer restarts or rebalances? Redelivery (6.3).
+3. Writes milliseconds apart on the same row, one change lost? A race (6.4).
+4. Old values right after a save? Replica or cache lag (6.5). Two systems disagree? Lost events (6.6). Started at a deploy? 6.7.
 
 ```mermaid
 flowchart TD
@@ -250,6 +304,12 @@ flowchart TD
 
 **In plain words:** first count how many records are bad and pull a few real examples. Numbers and examples beat guessing.
 
+**Step by step:**
+1. Run a read-only query grouping by the business key (say `provider_event_id`) with `count(*) > 1`.
+2. Note how many rows, which tenants, and the time window.
+3. Pull three real examples and look at the gap between the two copies.
+4. Check whether new duplicates are still appearing.
+
 ```sql
 -- Duplicates by business key (adjust table and key)
 SELECT provider_event_id, count(*) AS n, min(created_at), max(created_at)
@@ -273,6 +333,12 @@ What it means: if the duplicated rows cluster in one window, correlate with depl
 
 **In plain words:** if your handler is slow, the caller gives up and sends again, while the first one is still running. Both finish.
 
+**Step by step:**
+1. Find the caller's timeout (say the provider waits 10 s).
+2. Graph your handler's p99: if it is above 10 s, retries are guaranteed.
+3. Check logs for the same event ID arriving twice, about one timeout apart.
+4. Fix: reply fast (store, then process later) and dedupe on the event ID.
+
 Check provider and gateway retry behaviour and handler latency.
 
 ```promql
@@ -293,6 +359,11 @@ What it means: a handler p99 above the caller timeout guarantees retries. The fi
 ### 6.3 Consumer redelivery (Kafka example)
 
 **In plain words:** a queue reader that crashes before saying "done" gets the same messages again after restart.
+
+**Step by step:**
+1. Run `kafka-consumer-groups.sh --describe` and check for frequent rebalances or restarts.
+2. Compare processing time with `max.poll.interval.ms`; slower means Kafka thinks the consumer died.
+3. Check when the code commits the offset: after the work is right, but needs an idempotent handler.
 
 ```bash
 kafka-consumer-groups.sh --bootstrap-server broker:9092 --describe --group payments-consumer
@@ -318,6 +389,12 @@ For SQS the equivalent is a visibility timeout shorter than processing time; see
 ### 6.4 Races and lost updates
 
 **In plain words:** two requests read the same value, both change it, and the second save wipes out the first.
+
+**Step by step:**
+1. Find two writes to the same row a few milliseconds apart.
+2. Check whether the final value reflects only one of them.
+3. Look for code that reads a value, changes it in the app, then writes it back.
+4. Fix with an atomic update (`SET balance = balance - 30 WHERE ...`), a row lock, or a version column (a counter checked on every update).
 
 ```sql
 -- PostgreSQL: are transactions waiting on locks?
@@ -346,11 +423,17 @@ kubectl get pods -l app=billing-cron
 kubectl get cronjob billing -o jsonpath='{.spec.concurrencyPolicy}'   # Allow, Forbid, Replace
 ```
 
-`concurrencyPolicy: Allow` (the default) lets overlapping runs happen.
+`concurrencyPolicy: Allow` (the default Kubernetes CronJob setting) lets overlapping runs happen.
 
 ### 6.5 Replica lag and cache staleness
 
 **In plain words:** copies of the database or cache can be a few seconds behind. Reading from them can show old data.
+
+**Step by step:**
+1. Check replica lag with `pg_stat_replication` (replay lag in seconds).
+2. Check Redis replication with `INFO replication`, and the cache TTL for that key.
+3. If lag is a few seconds and the read went to a replica, that explains "I saved but see old data".
+4. Fix: read from the primary for a short time after a write, or update the cache on write.
 
 ```sql
 -- On the primary: replication lag per replica
@@ -371,6 +454,11 @@ What it means: a replay lag of seconds explains "I saved but I still see the old
 ### 6.6 Lost events and divergence between systems
 
 **In plain words:** one system wrote something but the message to the other system never arrived. Compare the two to find the gap.
+
+**Step by step:**
+1. Check the outbox for old rows not yet published: the relay is down.
+2. Check the dead letter queue: a growing count means the other side rejects some messages.
+3. Compare counts and checksums (short fingerprints of the data) per hour in both systems to find where they split.
 
 ```sql
 -- Outbox rows stuck unpublished
@@ -396,6 +484,11 @@ FROM payments WHERE created_at >= now() - interval '24 hours' GROUP BY 1 ORDER B
 
 **In plain words:** new code or a database change can start writing wrong data. Check what changed when the problem began.
 
+**Step by step:**
+1. List deploys and migrations around the first bad row's time.
+2. Compare rows written just before and just after.
+3. Look for what all bad rows share: one field, a rounding rule, a timezone, a unit.
+
 ```bash
 git log --since="2 days ago" --oneline -- migrations/ internal/payments/
 kubectl rollout history deploy/payments
@@ -413,7 +506,7 @@ Diff the shape of data before and after the deploy time. A transform bug (wrong 
 | --- | --- |
 | Retry duplicates | Dedupe at the handler now (unique constraint on the event ID), block double-effects (emails, payouts) with a flag. |
 | Consumer redelivery | Scale consumers to 0 or pin the group; fix the poll timeout or processing time. |
-| Race | Serialise the hot path (single writer, advisory lock) as a stopgap. |
+| Race | Serialise the hot path (single writer, advisory lock: an app-defined lock in Postgres) as a stopgap. |
 | Replica or cache lag | Route reads for the affected flows to the primary, shorten TTLs, flush the affected cache keys. |
 | Lost events | Restart the outbox relay; replay from outbox or the broker offsets. |
 | Bad deploy | Roll back; stop the backfill job. |
@@ -465,7 +558,7 @@ INSERT INTO processed_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING;
 
 - **Transactional outbox** instead of dual writes.
 - **Atomic updates or optimistic locking** (version column) for concurrent writers.
-- **Leader locks** for cron jobs, with fencing tokens where a lock can expire; see [[Distributed Locks and Fencing Tokens]].
+- **Leader locks** for cron jobs, with fencing tokens (an increasing number that lets storage reject an old lock holder) where a lock can expire; see [[Distributed Locks and Fencing Tokens]].
 - **Sagas with compensations** for multi-step workflows; see [[Saga Pattern]].
 - **Constraints in the database** (unique, foreign keys, check constraints) as the last line of defence.
 
@@ -519,7 +612,7 @@ sequenceDiagram
 | Optimistic locking (version column) | Detects concurrent update | Retry on conflict | Low contention, user edits |
 | Pessimistic lock (`FOR UPDATE`) | Serialises writers | Waiting, deadlock risk | High contention, short transactions |
 | Transactional outbox | No lost events from dual writes | Relay process, at-least-once downstream | DB change plus event |
-| Kafka transactions (EOS) | Atomic produce and offset commit within Kafka | Complexity, only within Kafka | Stream processing pipelines |
+| Kafka transactions (EOS, exactly-once semantics) | Atomic produce and offset commit within Kafka | Complexity, only within Kafka | Stream processing pipelines |
 | Reconciliation job | Detects drift after the fact | Compute, a source of truth | All multi-store systems |
 | Saga | Eventual consistency with compensation | Complex state handling | Multi-service workflows |
 
@@ -532,6 +625,9 @@ sequenceDiagram
 - **Exactly-once** across systems is not achievable in general; you build at-least-once plus idempotence.
 
 ## 11. In production 🔴
+
+> 🟡 → 🔴 **You now know** where duplicates and drift come from, how to find each cause, and how to repair data safely. **Next is the advanced part**: the alerts and logging that catch this early, and the deeper ideas (why exactly-once delivery is a myth, commit ordering, read-your-writes, out-of-order updates, singleton jobs).
+
 
 - Alert on `duplicate_events_total`, consumer lag, outbox oldest age, DLQ depth, replica lag, reconciliation diffs.
 - Log the idempotency key and event ID on every write path so you can trace one event across systems.
@@ -578,7 +674,7 @@ The third row is why some systems store consumer offsets in the same database as
 
 **In plain words:** after you save something, read it back from the main database, not a copy that may still be behind.
 
-A common pattern is to record the write's log position (such as a PostgreSQL LSN) and route the next read to a replica only if its replay position has passed that value, otherwise read from the primary. A simpler approximation is to pin the session to the primary for a few seconds after a write.
+A common pattern is to record the write's log position (such as a PostgreSQL LSN, log sequence number) and route the next read to a replica only if its replay position has passed that value, otherwise read from the primary. A simpler approximation is to pin the session to the primary for a few seconds after a write.
 
 ### Out-of-order updates
 
@@ -597,7 +693,7 @@ If events for the same entity can arrive out of order (two partitions, retries),
 
 **In plain words:** a scheduled job running on 3 servers runs 3 times unless only one is allowed to run it.
 
-A job scheduled on N replicas runs N times unless one acquires a lock. Use the scheduler's `concurrencyPolicy: Forbid`, a database advisory lock, or leader election; see [[Leader Election]].
+A job scheduled on N replicas runs N times unless one acquires a lock. Use the scheduler's `concurrencyPolicy: Forbid`, a database advisory lock, or leader election (the replicas agree on one leader that does the job); see [[Leader Election]].
 
 ## 13. Interview questions 🔴
 
@@ -636,6 +732,30 @@ A job scheduled on N replicas runs N times unless one acquires a lock. Use the s
 - Atomic update or version column against lost updates.
 - Repair: snapshot, dry-run, review, batch, reconcile; prefer reversing entries for money.
 - Tools: `kafka-consumer-groups.sh --describe`, `pg_stat_activity`, `pg_stat_replication`, `redis-cli INFO replication`, `kubectl logs`.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does idempotent mean?
+> Doing it twice has the same effect as doing it once.
+
+> [!question]- What do you do before repairing bad data?
+> Stop the damage: pause the consumer, flag the feature off, stop side effects.
+
+> [!question]- Why does a code rollback not fix the incident fully?
+> It stops new bad rows, but the bad rows already written stay.
+
+🟡 Medium
+
+> [!question]- Duplicates are about 10 s apart and the caller times out at 10 s. Cause?
+> Retries after the caller's timeout, because the handler is slower than 10 s and not idempotent.
+
+> [!question]- Why must the idempotency key be saved in the same transaction as the effect?
+> A crash between two separate writes would still let the retry repeat the effect.
+
+> [!question]- Commit the Kafka offset before or after doing the work?
+> After; a crash then causes a duplicate (fixed by idempotency) instead of a lost message.
 
 ## Links
 

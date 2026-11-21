@@ -37,6 +37,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[OOP in Go - Structs, Interfaces, Embedding]]: Go uses structs with methods instead of classes, and has no inheritance.
+> - [[Interfaces]]: a type fits an interface just by having its methods, with no `implements` keyword.
+> - [[Design Principles - DRY, KISS, YAGNI, Coupling and Cohesion]]: keep each rule in one place, keep code simple, and do not build for needs nobody stated.
+
 **From zero, in 60 seconds** 🟢
 
 **SOLID** is five rules that keep code easy to change: each part has one job, you add features without editing old code, any version of a thing can stand in for another, interfaces stay small, and business code depends on interfaces, not on concrete tools. This note takes one "god handler" that does everything and splits it, rule by rule, into small Go pieces. Read the before/after picture first, then the plain-words line above each code block.
@@ -59,6 +64,10 @@ SOLID is five rules for cutting such code into small pieces that change and test
 | Constructor | A function that builds a value and hands it its dependencies | `NewService(repo, pay)` |
 | Fake | A small in-memory stand-in used in tests | A map-backed order store |
 | Contract | What an interface promises, including errors | "Missing ID returns `ErrNotFound`" |
+| Actor | A group of people whose requests change a piece of code | The payments team, the mobile team |
+| God handler | One huge function that does every job | Parse, price, save, charge and notify in one place |
+| Contract test | One test every implementation of an interface must pass | Run it on the in-memory store and the Postgres repo |
+| Idempotent | Safe to repeat: a retry does not do the work twice | A retried `Place` does not charge again |
 
 **Picture it**
 
@@ -87,16 +96,20 @@ Where it breaks: a kitchen hires people once; in Go, `main` can swap a whole imp
 
 ## 1. Why it exists 🟢
 
-A food-delivery team has one 400-line HTTP handler, `CreateOrderHandler`. It parses JSON, validates the cart, reserves stock with raw SQL, calls the Razorpay SDK, inserts the order and sends a push notification. Over one quarter four different people need changes:
+A food-delivery team has one 400-line HTTP handler, `CreateOrderHandler`. It parses JSON, validates the cart, reserves stock with raw SQL, calls the Razorpay SDK (the payment company's ready-made Go library), inserts the order and sends a push notification. Over one quarter four different people need changes:
 
 - the mobile team renames a JSON field,
 - the business team adds a 10% festival discount,
 - the platform team moves orders from MySQL to PostgreSQL,
 - the payments team adds Stripe for international cards.
 
-All four edits land in the same function, so every change risks breaking the other three, every code review needs all four teams, and the function cannot be unit-tested without a database, a payment sandbox and a push service.
+All four edits land in the same function, so every change risks breaking the other three, every code review needs all four teams, and the function cannot be unit-tested (checked alone, in milliseconds) without a database, a payment sandbox (the payment company's test system) and a push service.
 
 SOLID is a set of rules for splitting such code so that each of those four changes touches one small, testable piece.
+
+### Real-life example: a new way to pay 🟢
+
+Think of a food app like Swiggy adding a new way to pay, say "pay later". If the checkout code calls each payment company directly, adding one more option means editing checkout and re-testing everything around it. With SOLID, checkout only knows a small `Charger` interface with one `Charge` method. The new option is one new type with a `Charge` method, plugged in by `main`. Checkout itself does not change, so the risk stays inside the new piece.
 
 ## 2. Mental model 🟢
 
@@ -113,12 +126,30 @@ Terms used below:
 - **Constructor injection:** passing dependencies into `NewService(...)` instead of the service creating them or reading globals.
 - **Composition root:** the one place, usually `main`, where concrete types are created and wired together.
 
+## Common beginner mistakes 🟢
+
+- **Writing an interface next to every struct** (`UserService` plus `userServiceImpl`) → it adds a file and buys nothing → declare a small interface in the package that uses it, when a second version or a test fake exists.
+- **Reading SRP as "one function per type"** → you get dozens of tiny types and the flow is hard to follow → split by who asks for changes, not by size.
+- **Trusting that "it compiles" means "it can replace the other one"** → a fake can return `(Order{}, nil)` where the real store returns `ErrNotFound`, and the service skips the payment → run one contract test on every implementation.
+- **Putting the interface in the provider's package** → the business code must import the storage code, and you can end up with an import cycle → put the interface where it is used.
+- **Applying every rule everywhere** → a 200-line script does not need five interfaces → use SOLID where code really changes or needs testing.
+
+### Compare: Dependency Inversion vs Dependency Injection 🟡
+
+| Idea | What it is about | Go example |
+| --- | --- | --- |
+| Dependency Inversion (the D in SOLID) | Which way the imports point: business code must not import storage code | `checkout` declares `OrderStore`; `postgres` satisfies it without importing `checkout` |
+| Dependency Injection | How a dependency arrives: passed in instead of created inside | `NewService(store, charger)` called from `main` |
+| DI container | A framework that does the injection for you | Spring in Java; in Go usually hand wiring, or `google/wire` |
+
+> 🟢 → 🟡 **You now know** the five rules in plain words and the problem they fix: one big handler that four teams keep breaking. **Next we open the box**: what each rule says, how it looks in Go, the before-and-after picture of the handler, and one small Go move per rule.
+
 ## 3. How it works 🟡
 
 | Principle | Original statement | What it means in Go |
 | --- | --- | --- |
-| **S**ingle Responsibility | A module should have one reason to change; later restated as "responsible to one actor" | Split by actor: handler (API team), service (business), repository (storage), adapter (provider) |
-| **O**pen-Closed | Open for extension, closed for modification | New behaviour arrives as a new value: an interface implementation, a `func` strategy, or a registry entry |
+| **S**ingle Responsibility | A module should have one reason to change; later restated as "responsible to one actor" (one group of people who ask for changes) | Split by actor: handler (API team), service (business), repository (storage), adapter (provider) |
+| **O**pen-Closed | Open for extension, closed for modification | New behaviour arrives as a new value: an interface implementation, a `func` strategy, or a registry entry (a new name-to-implementation row in a map) |
 | **L**iskov Substitution | Subtypes must be usable wherever the base type is expected | Every implementation honours the interface's behavioural contract: same errors for the same situations, no extra preconditions |
 | **I**nterface Segregation | Clients should not depend on methods they do not use | Small interfaces (`io.Reader`, `io.Writer`) composed when needed (`io.ReadWriter`) |
 | **D**ependency Inversion | High-level policy and low-level detail both depend on abstractions | The service package owns the interface; the Postgres package imports nothing from it yet satisfies it implicitly |
@@ -142,6 +173,13 @@ flowchart LR
 The solid arrows are imports and calls. The dotted arrows are not imports: `postgres` never imports `checkout`, so the business package depends on nothing concrete, and storage can change without touching it.
 
 ### Before and after, as a class diagram
+
+**Step by step:**
+1. Look at the left box: `CreateOrderHandler` parses JSON, checks the cart, writes SQL, calls Razorpay and sends a push. Six reasons to change.
+2. Pull out `Handler`: it only reads JSON and writes the HTTP reply.
+3. Pull out `Service`: it holds the business rules and calls two small interfaces.
+4. `OrderStore` and `Charger` are those interfaces; `PostgresRepo` and `RazorpayAdapter` fill them.
+5. Now a storage change touches only `PostgresRepo`, and a new provider is only a new adapter.
 
 ```mermaid
 classDiagram
@@ -183,11 +221,18 @@ classDiagram
     Charger <|.. RazorpayAdapter
 ```
 
-The left box is the god handler: one type, six reasons to change. On the right, each type has one actor, and `Service` sees only two narrow interfaces.
+The left box is the god handler (one function that does every job): one type, six reasons to change. On the right, each type has one actor, and `Service` sees only two narrow interfaces.
 
 ### Each principle, one Go move
 
 **In plain words: one small change in Go for each of the five rules.**
+
+**Step by step:**
+1. S: cut the god handler into handler, service, repository and payment adapter, one per team.
+2. O: add Stripe as a new `StripeAdapter` that has a `Charge` method; the service is not edited.
+3. L: make sure every `OrderStore` returns `ErrNotFound` for a missing ID, exactly like the real one.
+4. I: give the service an `OrderStore` with only `Get` and `Save`, not a 5-method monster.
+5. D: the service receives `OrderStore` and `Charger` in `NewService`; `main` decides which real types to pass.
 
 **SRP.** The god handler becomes four pieces:
 
@@ -261,6 +306,8 @@ func (s *Service) Place(ctx, id, user, amount) (Order, error) {
 ### The tested code
 
 **In plain words: the cleaned-up service, after all five rules, with tests.**
+
+**What this code does, in plain words:** `Service.Place` first asks the store whether the order already exists. If the store says `ErrNotFound`, it applies the price rules, charges through the `Charger` and saves the order; if the order exists, it returns it without charging again. `OrderStore` and `Charger` are tiny interfaces declared next to the service, and `MemStore` is the in-memory version used in tests.
 
 The service below is the "after" picture. `Place` is idempotent per order id: a client retry returns the stored order instead of charging twice (see [[Idempotency and Idempotency Keys]]). That idempotency **depends on the `OrderStore` contract**: an unknown id must produce `ErrNotFound`.
 
@@ -388,7 +435,7 @@ func CheckStoreContract(ctx context.Context, s OrderStore) error {
 
 **In plain words: this fake compiles and fits the interface, but behaves differently, so callers break.**
 
-Here is a store that compiles, satisfies `OrderStore`, and passes a lazy test that only checks `Save` then `Get`. It returns `(Order{}, nil)` for a missing id, which is a common shortcut in hand-written fakes and in repositories that map `sql.ErrNoRows` to "no error".
+Here is a store that compiles, satisfies `OrderStore`, and passes a lazy test that only checks `Save` then `Get`. It returns `(Order{}, nil)` for a missing id, which is a common shortcut in hand-written fakes and in repositories that map `sql.ErrNoRows` (Go's "the query found no row" error) to "no error".
 
 Trace `Place(ctx, "o1", "u1", 1000)` with it:
 
@@ -397,9 +444,9 @@ Trace `Place(ctx, "o1", "u1", 1000)` with it:
 3. `err == nil`, so `Place` believes the order already exists and returns the empty `Order{}`.
 4. **No charge, no save, no error.** The customer sees success and the restaurant never gets paid.
 
-Nothing about the types is wrong. The substitute broke the **error semantics** of the contract, which is exactly what Liskov substitution forbids. The fix is a **contract test**: one function every implementation must pass, run in the in-memory package and in the Postgres integration tests alike (see [[Contract Testing]] and [[Testing LLD Code]]).
+Nothing about the types is wrong. The substitute broke the **error semantics** of the contract, which is exactly what Liskov substitution forbids. The fix is a **contract test**: one function every implementation must pass, run in the in-memory package and in the Postgres integration tests (tests that talk to a real database) alike (see [[Contract Testing]] and [[Testing LLD Code]]).
 
-The standard library has the same kind of rule. `io.Writer` documents: "Write must return a non-nil error if it returns n < len(p)." `LimitedWriter` honours it. A writer that silently truncates breaks it, and `io.Copy` (and the `WriteTo` methods it may call) has to detect the short write and report `io.ErrShortWrite` on the writer's behalf.
+The standard library has the same kind of rule. `io.Writer` documents: "Write must return a non-nil error if it returns n < len(p)." `LimitedWriter` honours it. A writer that silently truncates (writes only part of the data and says nothing) breaks it, and `io.Copy` (and the `WriteTo` methods it may call) has to detect the short write and report `io.ErrShortWrite` on the writer's behalf.
 
 ```go
 package checkout
@@ -562,7 +609,7 @@ ok  	example.com/solid	1.568s
 
 **In plain words: pin the behaviour with a test first, then pull out one piece at a time.**
 
-1. **Write a test at the HTTP edge first** (httptest) so the refactor cannot change behaviour.
+1. **Write a test at the HTTP edge first** (httptest, Go's package for calling a handler without a real server) so the refactor cannot change behaviour.
 2. **Extract the service:** move everything between "parsed request" and "response struct" into `Service.Place`. The handler keeps JSON and status codes.
 3. **Extract the repository:** move SQL behind the two methods `Place` calls. Declare `OrderStore` in the service package.
 4. **Extract the payment adapter:** wrap the SDK in a type with a `Charge` method; translate SDK errors to domain errors (see [[Adapter]]).
@@ -580,7 +627,7 @@ How each principle shows up in Go compared with class-based languages:
 | OCP | Abstract base class with overridable methods | Interface implementation, `func` value, or registry map | One level of indirection per extension point |
 | LSP | Subclass overrides must keep the parent's contract | Every interface implementation keeps the documented contract; enforce with contract tests | A contract test per interface that has more than one implementation |
 | ISP | Many small interfaces declared up front by the provider | Tiny interfaces declared by the consumer, composed by embedding | Nearly free, because satisfaction is implicit |
-| DIP | DI container (Spring, .NET DI) | Constructor injection, wiring by hand in `main`; `google/wire` generates the same code | Manual wiring code in `main` |
+| DIP | DI container (a framework that builds and wires objects for you: Spring, .NET DI) | Constructor injection, wiring by hand in `main`; `google/wire` generates the same code | Manual wiring code in `main` |
 
 Three ways to supply a dependency:
 
@@ -598,13 +645,15 @@ Three ways to supply a dependency:
 - **LSP is not optional.** Unlike the other four, which you can apply lightly, a broken contract is a bug, not a style choice.
 - **Not for scripts and one-off tools.** A 200-line migration script gains nothing from interfaces.
 
+> 🟡 → 🔴 **You now know** each rule as one Go move, what a broken substitute does, and how to refactor a god handler safely. **Next comes the senior view**: SOLID in the Go standard library, the real bugs it prevents, and what a full interface contract must spell out.
+
 ## 7. In production 🔴
 
-- **Real systems:** The Go standard library is the best SOLID example: `io.Reader`/`io.Writer` (ISP), `database/sql` depending on the `database/sql/driver` interfaces that drivers such as pgx's `stdlib` package satisfy (DIP), and `http.Handler` (one method, endlessly decorated). Ports-and-adapters layouts apply DIP at the package level (see [[Hexagonal Architecture (Ports and Adapters)]]).
+- **Real systems:** The Go standard library is the best SOLID example: `io.Reader`/`io.Writer` (ISP), `database/sql` depending on the `database/sql/driver` interfaces that drivers such as pgx's `stdlib` package (pgx is a popular PostgreSQL driver for Go) satisfy (DIP), and `http.Handler` (one method, endlessly decorated). Ports-and-adapters layouts (business code in the middle, every outside tool plugged in through an interface) apply DIP at the package level (see [[Hexagonal Architecture (Ports and Adapters)]]).
 - **Failure modes and fixes:**
 	- *Fake and real repository disagree on not-found* (the example above): tests pass, production double-charges or skips charging. Fix: a shared contract test run against both.
 	- *A wrapper returns `n < len(p)` with a nil error:* data is silently truncated. Fix: honour the `io.Writer` rule, and test with `io.Copy`.
-	- *Import cycle after "inverting" a dependency:* the interface was put in the provider package, so the consumer imports the provider and the provider imports the consumer's types. Fix: move the interface to the consumer; move shared domain types to a leaf package.
+	- *Import cycle after "inverting" a dependency:* the interface was put in the provider package, so the consumer imports the provider and the provider imports the consumer's types. Fix: move the interface to the consumer; move shared domain types to a leaf package (one that imports none of your other packages).
 	- *Interface grows to 20 methods:* every new consumer drags in all of them. Fix: split by consumer; one struct can satisfy several small interfaces.
 - **What to monitor:** these are design-time properties, so the signals are in the code base: import-graph cycles (the Go compiler rejects them outright), the number of methods per interface, and how many packages a typical change touches (`git log --stat`).
 
@@ -620,13 +669,13 @@ Three ways to supply a dependency:
 
 - **Preconditions** callers must meet. A substitute may *weaken* them (accept more) but never *strengthen* them. A `Charger` that rejects amounts above ₹10,000 when the interface does not say so breaks callers.
 - **Postconditions** the method guarantees. A substitute may *strengthen* them but never *weaken* them. `Save` then `Get` must return the saved order.
-- **Error semantics:** which sentinel means what (`ErrNotFound`, `ErrConflict`), whether errors are wrapped (so callers use `errors.Is`), and whether a failed call had side effects.
+- **Error semantics:** which sentinel (a fixed, named error value that callers compare against) means what (`ErrNotFound`, `ErrConflict`), whether errors are wrapped (so callers use `errors.Is`), and whether a failed call had side effects.
 - **Concurrency:** is the implementation safe for concurrent use? `*sql.DB` is documented as safe; a map-backed fake without a mutex is not, and `go test -race` catches the difference.
 - **Context:** does it return promptly when `ctx` is cancelled?
 
 Put this in the interface's doc comment, as `OrderStore` does, and encode it in the contract test.
 
-**OCP and closed sets.** OCP assumes the set of variants is open. When the set is closed and small (order statuses, seat types), a `switch` over a typed constant is clearer than an interface per case, and the `exhaustive` linter can flag a missing case.
+**OCP and closed sets.** OCP assumes the set of variants is open. When the set is closed and small (order statuses, seat types), a `switch` over a typed constant is clearer than an interface per case, and the `exhaustive` linter (a tool that reads your code and flags problems) can flag a missing case.
 
 Use an interface when variants are added by other teams or at runtime; use a switch when you own every case.
 
@@ -666,6 +715,26 @@ Use an interface when variants are added by other teams or at runtime; use a swi
 - DIP = the consumer owns the interface; `main` builds concrete types and injects them.
 - Red flags: `IFoo`/`FooImpl` pairs, 20-method interfaces, globals for dependencies, fakes that return `(zero, nil)`.
 - SOLID yields to KISS when nothing varies.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What do the five letters of SOLID stand for?
+> Single Responsibility, Open-Closed, Liskov Substitution, Interface Segregation, Dependency Inversion.
+
+> [!question]- 🟢 In SRP, what is the "one reason to change"?
+> One actor: one group of people whose requests change that code, such as the payments team.
+
+> [!question]- 🟢 Where should a Go interface be declared?
+> In the package that uses it, listing only the methods that package calls.
+
+> [!question]- 🟡 Your fake store returns `(Order{}, nil)` for a missing ID. Which rule does it break, and what happens?
+> Liskov: the service thinks the order already exists and returns success with no charge and no save.
+
+> [!question]- 🟡 How do you add Stripe without editing the order service (Open-Closed)?
+> Write a `StripeAdapter` with a `Charge` method and pass it in from `main`, or add it to a provider map.
+
+> [!question]- 🟡 Dependency Inversion vs Dependency Injection in one line each?
+> Inversion is about which way imports point (business code owns the interface); injection is passing dependencies in through the constructor.
 
 ## Links 🟢
 

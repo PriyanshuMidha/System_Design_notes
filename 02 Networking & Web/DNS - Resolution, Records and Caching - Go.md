@@ -20,6 +20,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add the "Code", "Design decisions" and "Tests" sections.
 > - 🔴 **Interview / SDE-3 prep?** Add "Pitfalls" and do the exercises. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[How the Internet Works - IP, Ports, Packets, OSI vs TCP-IP]]: a name must become an IP address before your program can connect.
+> - [[DNS - Resolution, Records and Caching]] (theory twin): a resolver looks names up, and each answer may be reused for TTL seconds.
+
 **From zero, in 60 seconds** 🟢
 
 In plain words: Go can look up a domain name for you, but it forgets the answer immediately — ask twice and it goes to the network twice. This file builds a small wrapper that remembers each answer for a set time (a **cache** with a **TTL**, a countdown timer), and shows how to point Go at a specific DNS server. Read the short explanations around each code block first; the code just does what the sentence above it says.
@@ -28,7 +32,7 @@ In plain words: Go can look up a domain name for you, but it forgets the answer 
 
 - **Interfaces:** `Resolver` is a one-method interface, so a real `*net.Resolver` or a test fake can be plugged in.
 - **`context.Context`:** every lookup takes a context, so a caller can cancel or time out a slow DNS query.
-- **`sync.Mutex`:** guards the shared `cache` map, because many goroutines may call `Lookup` at once.
+- **`sync.Mutex`:** a lock that guards the shared `cache` map, because many goroutines (Go's light-weight concurrent functions) may call `Lookup` at once.
 - **Injectable clock (`Now func() time.Time`):** tests move time forward by hand instead of sleeping.
 - **`net.Resolver{PreferGo, Dial}`:** forces the pure-Go resolver and points it at a chosen DNS server.
 - **Run:** `go vet ./...` then `go test -race ./...` in a module containing `dnscache.go` and `dnscache_test.go`.
@@ -57,9 +61,14 @@ go test -race ./...
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** the goal: remember each DNS answer for a fixed time so the second lookup skips the network. **Next we read the code**: a small interface, a map of saved answers with expiry times, and a resolver pinned to one DNS server.
+
 ### The bare call this wraps
 
 Go's resolver answers a query but caches nothing — every call is a fresh network round trip unless the caller caches it:
+
+**What this code does, in plain words:** it asks Go's built-in resolver for the IP addresses of `example.com`. Call it twice and it asks the network twice.
+
 
 ```go
 addrs, err := net.DefaultResolver.LookupHost(context.Background(), "example.com")
@@ -183,9 +192,9 @@ func realResolverExample() *net.Resolver {
 
 **Concept.** `net.DefaultResolver.LookupHost` makes a fresh query every call — the standard library intentionally does no caching, leaving TTL handling to the caller (the `CachingResolver` above) or to the OS resolver it delegates to.
 
-Go has **two resolver implementations**: a pure-Go one (parses `/etc/resolv.conf` and speaks DNS itself) and a cgo one (calls the OS's native resolver via libc).
+Go has **two resolver implementations**: a pure-Go one (parses `/etc/resolv.conf`, the file listing which DNS servers this machine uses, and speaks DNS itself) and a cgo one (cgo lets Go call C code; this path calls the OS's native resolver via libc, the standard C library).
 
-Go picks automatically based on `/etc/resolv.conf` and `GODEBUG=netdns=`, but setting `Resolver.PreferGo = true` forces the pure-Go path — useful in minimal containers without a working libc resolver, or when a specific DNS server needs to be targeted directly.
+Go picks automatically based on `/etc/resolv.conf` and `GODEBUG=netdns=` (an environment setting that switches some Go runtime behaviours), but setting `Resolver.PreferGo = true` forces the pure-Go path — useful in minimal containers without a working libc resolver, or when a specific DNS server needs to be targeted directly.
 
 **How it works.**
 1. `PreferGo: true` forces Go's own DNS client instead of delegating to libc — the alternative (leaving it unset) means behavior silently depends on the host's `/etc/resolv.conf`, which is harder to reason about in a container.
@@ -389,6 +398,8 @@ The remaining two phases move the injected clock forward without any real delay,
 
 ### TestRealResolverExampleIsWellFormed
 
+**What this code does, in plain words:** it builds the pinned resolver and checks two settings on it: it uses Go's own DNS code, and it has a custom dial function. No real DNS query is made.
+
 **Property proved:** `realResolverExample` actually returns a resolver configured the way the surrounding text claims — `PreferGo` set, and a non-nil custom `Dial`. This guards against a future edit silently dropping one of those two settings.
 
 | Input | Expected output |
@@ -426,6 +437,8 @@ Reading it: `go vet` found nothing to flag, and both tests pass under the race d
 
 ## Pitfalls in the code 🔴
 
+> 🟡 → 🔴 **You now know** how the cache decides hit or miss and how the pinned resolver is built. **Next, the advanced part**: small mistakes that silently break the cache, and exercises that push it toward a production version.
+
 - **Caching an error result** would mean a transient upstream failure gets "remembered" and returned to every subsequent caller until some other code path clears it — this is why `Lookup` returns early on `err != nil`, before ever touching `c.cache`.
 - **Comparing `now().Before(e.expires)` the wrong way round** (e.g. `After` instead of `Before`) would silently invert expiry, caching forever or never caching at all — exactly the kind of off-by-one the TTL-expiry test exists to catch.
 - **Forgetting `PreferGo: true`** would make `realResolverExample`'s custom `Dial` meaningless on a system where Go picks the cgo resolver instead, since the cgo path doesn't go through Go's own dialing code at all.
@@ -437,6 +450,26 @@ Reading it: `go vet` found nothing to flag, and both tests pass under the race d
 
    Predict what a repeated lookup for a permanently broken host now does differently, then write a test for it.
 3. Add a `Close` method that clears the cache map, and a test proving a lookup immediately after `Close` is a cache miss even though the TTL hasn't expired. Predict whether the existing mutex is sufficient for this without any other change.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 Does Go's `net.Resolver` remember answers between calls?
+> No. Every call goes to the network unless you wrap it in a cache like `CachingResolver`.
+
+> [!question]- 🟢 What does `entry.expires` hold?
+> The moment the saved answer stops being fresh: the time it was saved plus the TTL.
+
+> [!question]- 🟢 Why does the cache take a `Now` function instead of calling `time.Now()` directly?
+> So tests can move time forward instantly instead of sleeping.
+
+> [!question]- 🟡 Why is the lock not held during `Upstream.LookupHost`?
+> A slow network call under the lock would make every other lookup wait, even for other hosts.
+
+> [!question]- 🟡 Why does `Lookup` return early on an error instead of caching it?
+> A short network hiccup would otherwise be remembered and returned to everyone until it expired.
+
+> [!question]- 🟡 Why is `PreferGo: true` needed for the custom `Dial` to matter?
+> On the cgo path the OS resolver does the lookup, so Go's dial function is never used.
 
 ## Links
 

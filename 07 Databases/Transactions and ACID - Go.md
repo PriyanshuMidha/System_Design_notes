@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Work through the Code steps 1-4, then Design decisions and Tests.
 > - 🔴 **Interview / SDE-3 prep?** Add Pitfalls and do the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Transactions and ACID]]: the theory half. `BEGIN ... COMMIT` makes a group of writes all-or-nothing, and "read then write" can still oversell.
+> - [[SQL Essentials]]: you can read `UPDATE ... WHERE ... RETURNING` and `INSERT`.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on twin of [[Transactions and ACID]]. It shows, in real Go code, how to sell the last unit of stock to exactly one buyer, and how to wrap any group of database writes so they all happen or none happen. The heart of it is a small helper called `InTx`: you hand it a function, and it opens the transaction, commits on success, rolls back on any error or crash, and quietly retries the whole thing when the database says "try again". Read the theory note first if words like commit, rollback or deadlock feel new. Then read this top to bottom: each code block comes with a plain explanation of every line that matters.
@@ -40,7 +44,7 @@ This file is the hands-on twin of [[Transactions and ACID]]. It shows, in real G
 - **`context.Context`**: carries a deadline or cancellation into every query, so a slow transaction can be stopped.
 - **`defer` and `recover()`**: `defer` runs the rollback on every exit path; `recover` catches a panic so the transaction still rolls back before the panic continues.
 - **Interfaces and generics** (`Tx` interface, `runOnce[T Tx]`): the helper works with a real `*sql.Tx` or a fake one in tests.
-- **Error wrapping** (`errors.Is`, `errors.As`): look inside a wrapped error for the SQLSTATE code (40001, 40P01) that says "retry the whole transaction".
+- **Error wrapping** (`errors.Is`, `errors.As`): look inside a wrapped error for the SQLSTATE code (the database's five-character error code) (40001, 40P01) that says "retry the whole transaction".
 - **What to run**: `go vet ./... && go test -race ./...`; no database is needed for the tests.
 
 ## What this code shows 🟢
@@ -92,6 +96,8 @@ INSERT INTO products VALUES (1, 'Cheque book (50 leaves)', 25000, 1);
 ```
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** the goal: sell the last unit to exactly one buyer and never leave half-done work. **Next we open the box**: the one-statement stock reservation, a reusable `InTx` helper that commits, rolls back and retries, how `BuyOne` uses it, and the payment-webhook transaction in SQL.
 
 ### Step 1: reserve one unit with a conditional UPDATE
 
@@ -431,6 +437,8 @@ func (f *fakeTx) Rollback() error { f.rolledBack = true; return nil }
 | `pgErr{"23505"}` (unique violation) | false |
 | `errors.New("boom")` | false |
 
+**What this code does, in plain words:** it feeds `Retryable` different errors (a serialization failure, a deadlock wrapped inside another error, a duplicate key, a plain error) and checks that only the first two say "retry".
+
 ```go
 func TestRetryable(t *testing.T) {
 	cases := map[string]struct {
@@ -602,11 +610,13 @@ The pgx v5 driver also ships `pgx.BeginFunc`, which handles commit and rollback 
 
 ## Pitfalls in the code 🔴
 
+> 🟡 → 🔴 **You now know** how the helper behaves on success, error, retry and panic. **Next are the traps** a reviewer would flag: ignored rollback errors, side effects repeated by retries, business errors that must not retry, and missing jitter.
+
 - **`runOnce` ignores the `Rollback` error on purpose.** After a failed `Commit` or a dead connection the rollback may fail too; the original error is the one the caller needs.
 - **Retried callbacks must be idempotent outside the database.** `InTx` may call `fn` up to `attempts` times. An HTTP call or email inside `fn` repeats on every retry.
 - **`ErrOutOfStock` must not be retryable.** It is a business outcome. Retrying it would loop until `attempts` runs out and then report a misleading "failed after N attempts".
 - **`InTx` returns the wrapped error after giving up.** The `%w` keeps `Retryable(err)` true, which the `TestInTxGivesUp` test checks; a caller that wants to treat exhaustion differently should compare with `errors.Is` on the underlying code.
-- **The backoff here has no jitter.** Two workers that fail together retry together. Real services add jitter, as in [[Timeouts, Retries and Backoff]].
+- **The backoff here has no jitter** (a small random extra wait). Two workers that fail together retry together. Real services add jitter, as in [[Timeouts, Retries and Backoff]].
 - **Isolation level.** `BuyOne` asks for `LevelReadCommitted`; at that level the conditional `UPDATE` is safe. At REPEATABLE READ a concurrent change to the same row would raise `40001` and `InTx` would retry it.
 
 ## Exercises 🔴
@@ -614,6 +624,30 @@ The pgx v5 driver also ships `pgx.BeginFunc`, which handles commit and rollback 
 1. Change `InTx` so the first backoff is 1 ms instead of 10 ms. Predict how the elapsed times of `TestInTxRetriesWholeTransaction` and `TestInTxGivesUp` change, then run them with `-v`.
 2. Remove `40P01` from `Retryable`. Which test fails, and what does `TestInTxGivesUp` report?
 3. In `TestInTxRollsBackOnPanic`, change `InTx` so it no longer re-panics after the rollback. Predict which assertion fails and why the test is written with a `recover` in a `defer`.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why does `ReserveUnit` use `UPDATE ... WHERE stock > 0` instead of reading the stock first?
+> The check and the write happen in one statement, so two buyers cannot both see "1 left" and both win.
+
+> [!question]- What does `InTx` do if the callback returns an error?
+> It rolls the transaction back and returns the error (retrying only for 40001 or 40P01).
+
+> [!question]- Why do the tests need no database?
+> They use a fake transaction that just records whether `Commit` or `Rollback` was called.
+
+🟡 Medium
+
+> [!question]- Why must a retry start a whole new transaction, not just repeat the failed statement?
+> In PostgreSQL the failed transaction is already aborted; every later statement is rejected until rollback.
+
+> [!question]- Why must `ErrOutOfStock` not be retryable?
+> It is a real business outcome; retrying would just loop until the attempts run out.
+
+> [!question]- Why is sending an email inside the `InTx` callback dangerous?
+> The callback can run several times on retry, and an email cannot be un-sent if the commit fails; use an outbox row instead.
 
 ## Links
 

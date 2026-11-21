@@ -30,6 +30,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works, with the small whiteboard code), section 4 (the full worked example) and sections 5 and 6 (variants and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Interfaces]]: `http.Handler` is just "anything with a `ServeHTTP` method", so a wrapper can be one too.
+> - [[Context Package]]: each request carries a `ctx`, and `context.WithValue` adds a value (like the user ID) for inner code to read.
+> - [[Adapter]]: a wrapper can hold another object and forward calls to it; an adapter changes the shape, a decorator keeps it.
+
 **From zero, in 60 seconds** 🟢
 
 Many requests need the same extra jobs: log it, check login, catch crashes.
@@ -68,6 +73,10 @@ The handler itself stays focused on business logic.
 | Cross-cutting concern | A job every handler needs, not tied to one feature | request IDs |
 | Panic | A Go crash that unwinds the goroutine | nil pointer access |
 | Context | Go value that carries request data and cancel signals | user ID set by auth |
+| `ResponseWriter` | The object a handler uses to send the status and body back | `w.WriteHeader(401)` |
+| `RoundTripper` | The interface an HTTP client uses to send one request and get one response | A wrapper that adds an auth header |
+| `httptest` | Go's package for calling handlers in tests with no real network | `httptest.NewRecorder()` |
+| Short-circuit | A layer answers itself and does not call the next one | Auth returns 401 |
 
 **Picture it**
 
@@ -108,6 +117,10 @@ Three things to get right, all shown below:
 - A logging middleware can only log the status code if a `ResponseWriter` wrapper captures status and bytes.
 - An example that calls `http.ListenAndServe` blocks forever and produces nothing to check; running the chain through `httptest` does.
 
+### Real-life example 🟢
+
+Picture placing an order in the Zomato or Swiggy app. Before your request reaches the "create order" code, it passes several checkpoints: are you logged in, are you sending too many requests too fast, and a log line records how long it took. Each checkpoint does one small job and then hands the request on, like layers of wrapping paper around a gift. The core "create order" code never needs to know the checkpoints exist. Those layers are decorators; in web servers they are called middleware.
+
 ## 2. Mental model 🟢
 
 Gift wrapping. The gift (the handler) is wrapped in paper (logging), then a box (auth), then more paper (recover). Each layer has the same outside shape, "a parcel", so you can add or remove layers without the gift knowing.
@@ -116,12 +129,14 @@ Opening the parcel goes from the outside in; the layers you pass on the way in a
 
 That return trip is where an outer layer sees what an inner layer did, such as the status code the handler wrote.
 
+> 🟢 → 🟡 **You now know** that a decorator wraps something, keeps the same outside shape, and adds one job before or after. **Next we open the box**: the five rules every Go middleware follows, why the layers sit in a fixed order, and the same idea used on streams and repositories.
+
 ## 3. How it works 🟡
 
 1. **Same interface in and out.** A decorator accepts an `http.Handler` and returns an `http.Handler`. Go names this shape `type Middleware func(http.Handler) http.Handler`.
 2. **Before and after.** Inside, the wrapper runs code, calls `next.ServeHTTP(w, r)`, then runs more code. It may also **not** call `next` (Auth returns 401), which makes that layer a short-circuit.
 3. **Chaining order.** `Chain(h, a, b, c)` builds `a(b(c(h)))`, so the first middleware listed is the outermost and runs first on the way in. Writing `Chain` once avoids the error-prone nesting `Logging(Auth(final))`.
-4. **Passing data inward.** A layer adds request-scoped values (request ID, user) with `context.WithValue` and passes `r.WithContext(ctx)` inward. Keys are an unexported type (`ctxKey`), so no other package can collide with them.
+4. **Passing data inward.** A layer adds request-scoped values (data that belongs to this one request only: request ID, user) with `context.WithValue` and passes `r.WithContext(ctx)` inward. Keys are an unexported type (`ctxKey`), so no other package can collide with them.
 5. **Seeing results outward.** To see the status code, a layer passes inner layers a **decorated `ResponseWriter`** (`statusRecorder`) that records `WriteHeader` and counts bytes in `Write`.
 
 One successful request through the exact chain in the worked example:
@@ -178,7 +193,7 @@ flowchart LR
 
 Order matters here too: with the counter outside gzip, it would count 1,200 plain bytes; inside, it counts the 46 compressed bytes.
 
-A repository decorator uses **struct embedding** to override only some methods:
+A repository decorator uses **struct embedding** (putting the interface inside the struct with no field name, so its methods pass through) to override only some methods:
 
 ```mermaid
 classDiagram
@@ -205,7 +220,7 @@ classDiagram
     cachedRepo o-- ShowRepo : wraps
 ```
 
-`cachedRepo` writes `Get` (cache first) and `Save` (write, then invalidate). `List` is promoted from the embedded `ShowRepo` and passes straight through.
+`cachedRepo` writes `Get` (cache first) and `Save` (write, then invalidate). `List` is promoted (made callable on the outer struct) from the embedded `ShowRepo` and passes straight through.
 
 ### Whiteboard version
 
@@ -259,6 +274,15 @@ One `package main` with `Logging` and `Auth` middleware (Logging captures status
 `main` drives the handler chain with `httptest.NewRecorder`, so nothing listens on a port and the program ends.
 
 Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
+
+**Step by step:**
+
+1. `Middleware` is a function that takes a handler and returns a new handler that wraps it. `Chain` applies a list of them so the first one listed runs first.
+2. `statusRecorder` wraps the response writer and remembers the status code and the number of bytes written.
+3. `Recover` turns a panic into a 500, `RequestID` adds an ID to each request, `Logging` writes one line per request, `Auth` checks the token, and `RateLimit` allows `n` requests per time window.
+4. `createOrder` is the real handler at the centre; it reads the user that `Auth` put in the context.
+5. The same wrapping idea is then used for writers (`countingWriter`), HTTP clients (`WithAuth`, `WithRetry`) and a repository (`cachedRepo`).
+6. `main` sends test requests through the chain with `httptest`, so nothing listens on a port, and prints the results.
 
 ```go
 package main
@@ -833,16 +857,24 @@ What to notice:
 - **The round tripper** added the token and retried one 503, so the server saw 2 attempts; the caller's own request was not modified (the test checks this).
 - **The repository** read the inner store twice: once to fill the cache, once after `Save` invalidated it. The second `Get` was a cache hit.
 
+## Common beginner mistakes 🟢
+
+- **Mistake:** logging the status code before calling `next`, or without a wrapper. → **Why it's wrong:** the status is not known yet, so every line says 200, even for errors. → **Do this instead:** wrap the writer in `statusRecorder`, call `next.ServeHTTP(rec, r)`, then log `rec.status` and `rec.bytes`, as `Logging` does.
+- **Mistake:** listing middlewares in the wrong order, for example `Recover` last. → **Why it's wrong:** a panic in an outer layer is never caught, and the server drops the connection. → **Do this instead:** put `Recover` first in `Chain(...)`; `Chain` makes the first one listed the outermost.
+- **Mistake:** putting business rules ("orders over ₹10,000 need approval") in middleware. → **Why it's wrong:** the rule hides far from the order code and runs for routes it should not touch. → **Do this instead:** keep middleware for concerns shared by many routes, like `Auth` and `RateLimit`, and keep order rules in the order code.
+- **Mistake:** a caching decorator that overrides only `Get`. → **Why it's wrong:** the embedded `Save` still runs, but the old copy stays in the cache, so readers see stale data. → **Do this instead:** override `Save` as well and delete the cache entry, as `cachedRepo.Save` does.
+- **Mistake:** storing values in the context with a plain string key such as `"user"`. → **Why it's wrong:** another package can use the same string and overwrite your value. → **Do this instead:** use a private key type, like `ctxKey` with `requestIDKey` and `userKey`.
+
 ## 5. Variants and comparison 🟡
 
 **Where decorators appear in Go:**
 
 | Variant | Interface wrapped | Typical layers | Watch out for |
 | --- | --- | --- | --- |
-| HTTP middleware | `http.Handler` | recover, request ID, logging, auth, rate limit, CORS, gzip | Order; hidden `Flusher`/`Hijacker` on wrapped writers |
+| HTTP middleware | `http.Handler` | recover, request ID, logging, auth, rate limit, CORS (rules about which websites may call the API), gzip | Order; hidden `Flusher`/`Hijacker` (extra writer abilities for streaming and WebSockets) on wrapped writers |
 | `ResponseWriter` wrapper | `http.ResponseWriter` | status and byte capture, compression | Must forward `Unwrap`; first `WriteHeader` wins |
 | Stream decorators | `io.Reader`, `io.Writer` | `bufio`, `gzip`, `io.LimitReader`, `io.TeeReader`, `io.MultiWriter`, hashing | Flush and close the outer layer first (`gzip.Writer.Close` writes the footer) |
-| Client decorators | `http.RoundTripper` | auth headers, retries, tracing, metrics | Never mutate the caller's request; drain bodies before retrying |
+| Client decorators | `http.RoundTripper` | auth headers, retries, tracing (recording each step of a request across services), metrics | Never mutate the caller's request; drain bodies before retrying |
 | Repository decorators | Your own interface | cache, metrics, tracing, retries | Promoted methods bypass the decorator |
 | Strategy decorators | A strategy interface | surcharges around base pricing | Order changes the result (see [[Strategy and Template Method]]) |
 
@@ -865,13 +897,15 @@ Pure decorators always call `next`. Middleware that may stop the chain (Auth, Ra
 - **Each layer costs a function call, and sometimes an allocation** (a wrapped writer, a derived context). That is small next to network I/O, but a context value lookup walks the chain of parent contexts, so do not stack dozens of `WithValue` layers.
 - **Decorators that need more than the interface** (a cache that must invalidate on writes) must override every method that matters. Forgetting one, such as `Save`, produces stale data that tests rarely catch.
 
+> 🟡 → 🔴 **You now know** how to write, order and test middleware, plus decorators for streams, clients and repositories. **Next comes the production view**: middleware in real Go routers and tracing tools, the bugs that wrong order or a careless wrapper cause, and how to log every request even when one panics.
+
 ## 7. In production 🔴
 
 **Real systems:**
 
 - `net/http` itself: `http.StripPrefix`, `http.TimeoutHandler` and `http.MaxBytesHandler` are standard-library middleware.
-- Routers such as chi apply middleware with `r.Use(...)`; chi's docs ask for its `Logger` to come before its `Recoverer`, the opposite trade-off from this note's order (see section 8).
-- OpenTelemetry: `otelhttp.NewHandler` decorates a server handler, and `otelhttp.NewTransport` decorates a client `RoundTripper`, to create spans and propagate trace context.
+- Routers such as chi (a popular Go HTTP router) apply middleware with `r.Use(...)`; chi's docs ask for its `Logger` to come before its `Recoverer`, the opposite trade-off from this note's order (see section 8).
+- OpenTelemetry: `otelhttp.NewHandler` decorates a server handler, and `otelhttp.NewTransport` decorates a client `RoundTripper`, to create spans (timed records of one step) and propagate trace context (pass the trace ID on to the next service).
 - Streams: `gzip.NewWriter(w)`, `bufio.NewWriter(w)`, `io.TeeReader(r, hash)` to hash a body while reading it, `io.LimitReader` to cap input size.
 
 **Where it shows up in LLD problems:**
@@ -887,7 +921,7 @@ Pure decorators always call `next`. Middleware that may stop the chain (Auth, Ra
 - Wrong order: logging inside auth never logs 401s; recover inside logging misses panics in logging. Fix: define the chain once with `Chain`, and test the order (`TestChainFirstIsOutermost`).
 - The status wrapper breaks streaming or WebSockets, because inner code type-asserts `w.(http.Flusher)` or `w.(http.Hijacker)` and the wrapper does not have those methods. Fix: implement `Unwrap` and have handlers use `http.NewResponseController(w).Flush()` (Go 1.20+), or forward `Flush`/`Hijack` explicitly in the wrapper.
 - A RoundTripper sets headers on the caller's request, which races when the request is reused. Fix: `r.Clone(r.Context())` before changing it; the `http.RoundTripper` contract forbids modifying the request.
-- Retrying requests with bodies resends an empty body. Fix: retry only idempotent requests without bodies, or requests whose `GetBody` is set.
+- Retrying requests with bodies resends an empty body. Fix: retry only idempotent requests (safe to send twice, like `GET`) without bodies, or requests whose `GetBody` is set.
 - A panic in a goroutine started by a handler crashes the whole process; no middleware can recover it. Fix: recover inside that goroutine.
 
 **What to monitor:** request count, latency histogram and status class per route, all emitted by one metrics middleware; the count of recovered panics; 401 and 429 rates (a spike means a broken client or an attack); and for client decorators, retries per request.
@@ -946,6 +980,26 @@ Both are valid; choose one and test it.
 - Streams: `gzip`, `bufio`, `io.LimitReader`, `io.TeeReader` are decorators; the order of layers changes what each sees.
 - RoundTripper decorators: clone the request, drain bodies, retry only safe requests.
 - Embedded partial decorators: promoted methods bypass you; test with `httptest`, never `ListenAndServe`.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What makes a wrapper a decorator?
+> It has the same interface as the thing it wraps and adds one job before or after calling it.
+
+> [!question]- 🟢 What is the Go type of HTTP middleware?
+> `func(http.Handler) http.Handler`.
+
+> [!question]- 🟢 In `Chain(h, Recover, Logging, Auth)`, which layer runs first on the way in?
+> `Recover`, the first one listed, because it is the outermost.
+
+> [!question]- 🟡 Why must Logging sit outside Auth?
+> So requests that Auth rejects with 401 still pass back through Logging and get logged with their real status.
+
+> [!question]- 🟡 How does a logging middleware learn the status code the handler wrote?
+> It passes inner layers a wrapped `ResponseWriter` that records the first `WriteHeader` and counts bytes.
+
+> [!question]- 🟡 `cachedRepo` embeds `ShowRepo` but forgets to write `Save`. What breaks?
+> `Save` passes straight to the inner store without clearing the cache, so later `Get` calls return stale data.
 
 ## Links 🟢
 

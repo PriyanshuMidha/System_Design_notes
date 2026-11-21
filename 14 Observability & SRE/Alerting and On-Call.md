@@ -40,6 +40,10 @@ CPU at 85% might be a batch job finishing on schedule — nobody should be woken
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[SLIs, SLOs, SLAs and Error Budgets]]: an SLO like "99.9% over 30 days" gives you an error budget, a fixed amount of failure you may spend.
+> - [[Metrics and Prometheus]]: Prometheus collects counters, and `rate(...)` turns them into "per second" so you can compare error share to a limit.
+
 **From zero, in 60 seconds** 🟢
 
 An **alert** is a message that wakes a human up to fix something.
@@ -85,6 +89,12 @@ Good alerting means the phone only buzzes when a real user is hurting.
 | Cause | Something inside the system that might lead to a symptom | CPU at 90% |
 | SLO / error budget | A reliability target, and the failures you are allowed under it | 99.9% success = 0.1% may fail |
 | Runbook | A short "what to do when this fires" page | Steps to check and roll back |
+| Burn rate | How many times faster than "just OK" you are spending the error budget | 14.4× = 30-day budget gone in about 2 days |
+| Flapping | An alert that keeps firing and clearing every few minutes | error rate bouncing around 5% |
+| Alertmanager | The Prometheus part that groups alerts and sends them to the right place | pages go to PagerDuty, tickets to Slack |
+| Escalation policy | Who gets called next if the first person does not answer | primary, then secondary after 5 min |
+| MTTR | Mean time to resolve: average time from start to fix | 30 minutes |
+| Dead-letter queue (DLQ) | A side queue where messages that keep failing are parked | 20 failed payment events waiting |
 
 **Picture it**
 
@@ -112,11 +122,19 @@ Where it breaks: a smoke alarm has one sensor; a service alert can (and should) 
 
 ## 1. Why it exists 🟢
 
-A service alerts on "CPU > 80%" and "disk > 85%" and "GC pause > 100ms." All three fire during a Tuesday afternoon batch job that runs every week, is fully expected, and causes zero user impact.
+A service alerts on "CPU > 80%" and "disk > 85%" and "GC pause > 100ms." (A GC pause is when Go's garbage collector briefly slows the program to free memory.) All three fire during a Tuesday afternoon batch job that runs every week, is fully expected, and causes zero user impact.
 
 The on-call engineer gets paged, checks dashboards, finds nothing wrong, goes back to sleep (or doesn't), and next week ignores the page entirely — which is exactly the moment a real outage's page gets ignored too.
 
 **Measured (illustrative):** teams that migrate from cause-based thresholds to symptom-based, SLO-burn alerting commonly report their page volume dropping by an order of magnitude while they catch the same or more real incidents, because they stop paging on things that were never actually breaking anything for a user — this is the standard motivation cited in the SRE workbook's alerting chapter, not a number measured in this vault.
+
+### Real-life example: Swiggy at dinner time 🟢
+
+Think of Swiggy at 8 p.m. on a Saturday.
+CPU on many servers sits at 85% because it is the busiest hour; that is expected, so nobody is woken up.
+But if 5% of orders start failing at checkout for 10 minutes, the on-call engineer's phone rings, because real people cannot get food.
+A disk that will be full in 10 days opens a ticket for Monday instead.
+Same tools, three different responses, chosen by "are users hurting right now?".
 
 ## 2. Mental model 🟢
 
@@ -124,11 +142,36 @@ Ask of every potential alert: **"if a human saw this happen right now, at 3 a.m.
 
 If a user is being actively harmed right now, it's a page. Everything else — "this is interesting, keep an eye on it" — is a dashboard, not an alert at all.
 
+## Common beginner mistakes 🟢
+
+- **Paging on CPU, disk or memory alone** → these are often fine (a weekly batch job), so people learn to ignore pages → page on what users feel (errors, slowness, budget burn) and make causes tickets or dashboards.
+- **Writing an alert with no runbook link** → at 3 a.m. the responder starts from zero → add a `runbook` URL with the first checks and fixes.
+- **Using one short window, like "errors > 1% for 1 minute"** → it fires on every blip → require a short and a long window to agree.
+- **Silencing a noisy alert forever** → a real problem later goes unseen → fix or delete the alert, and always give silences an end time.
+- **Never reviewing past pages** → noise slowly grows until on-call burns out → review every page each week and ask "did a human need to act?".
+
+### Page vs ticket vs dashboard 🟡
+
+| | Page | Ticket | Dashboard only |
+| --- | --- | --- | --- |
+| When | Users hurt right now | Will hurt later if ignored | Interesting, no action needed |
+| Example | 8% of checkouts fail | Disk 90% full and growing | CPU 85% during a batch job |
+| Who acts | On-call, immediately | Team, in work hours | Nobody, unless curious |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** to page on symptoms users feel, ticket on slow-growing causes, and link every page to a runbook. **Next we open the box**: what a Prometheus alert rule contains, how burn-rate alerts check two windows, how Alertmanager groups and routes alerts, and how on-call itself is run.
 
 ### Alert anatomy
 
 **In plain words:** every alert needs a condition, how long it must hold, how serious it is, and a link to what to do.
+
+**Step by step:**
+1. `expr`: the condition, here "checkout 5xx (server error) share is above 5%". `code=~"5.."` means "any status code starting with 5".
+2. `for: 10m`: it must stay true for 10 minutes in a row, so one bad reading does not fire.
+3. `severity: page`: this one should wake a person, not just post to Slack.
+4. `owner: checkout-team`: that team's on-call gets it.
+5. `runbook`: a link to the page that says what to check first.
 
 Every alert rule (Prometheus `alerting rule` shown, but the fields generalize) needs:
 
@@ -157,6 +200,13 @@ Every alert rule (Prometheus `alerting rule` shown, but the fields generalize) n
 ### Static thresholds vs multi-window multi-burn-rate
 
 **In plain words:** instead of a fixed line, ask "how fast are we spending our error budget?". Check a short and a long window together so blips don't page you.
+
+**Step by step:**
+1. The SLO is 99.9%, so 0.1% (0.001) of requests may fail over 30 days.
+2. In the last hour, 1.5% failed. Burn rate = 0.015 ÷ 0.001 = 15×, above the 14.4× line.
+3. In the last 5 minutes, 2% failed: 20×, also above the line.
+4. Both windows agree, so it pages. If only the 5-minute window were high, it was a blip and stays quiet.
+5. A slower tier (1× over 3 days and 6 hours) opens a ticket for a slow, steady leak.
 
 ```mermaid
 flowchart LR
@@ -218,7 +268,7 @@ and
 ) > (1 * 0.001)
 ```
 
-A Prometheus rule for the fast tier, with the `for:` kept short since the two-window `and` already does the debouncing:
+A Prometheus rule for the fast tier, with the `for:` kept short since the two-window `and` already does the debouncing (ignoring quick on-off bounces):
 
 ```yaml
 groups:
@@ -244,6 +294,19 @@ groups:
 
 **In plain words:** precision = how many alerts were real. Recall = how many real problems got an alert. Flapping is an alert switching on and off; a buffer zone stops it.
 
+**Step by step:**
+1. An alert fired 10 times last month; 8 were real problems. Precision = 8 of 10 = 80%.
+2. There were 9 real problems; the alert caught 8. Recall = 8 of 9 ≈ 89%.
+3. A line set right at the normal wobble (the noise floor) makes the alert flap on and off.
+4. Hysteresis fixes it: fire above 5%, but only clear once it falls below 3%.
+
+```mermaid
+flowchart LR
+    OK["Quiet"] -- "error rate above 5%" --> F["Firing"]
+    F -- "falls to 4%: stay firing" --> F
+    F -- "falls below 3%" --> OK
+```
+
 An alert's **precision** is "of the times it fired, how many were real problems"; its **recall** is "of the real problems, how many did it catch." Pushing threshold tighter raises recall but hurts precision (more false pages); the multi-window design above is specifically chosen to keep both high at once.
 
 **Flapping** — an alert repeatedly firing and resolving within minutes — is usually a threshold sitting exactly at the noise floor; fix it with `for:`, a wider window, or **hysteresis** (fire at one threshold, only resolve once it drops back below a lower one, so a value oscillating around a single line doesn't retrigger every few seconds).
@@ -251,6 +314,13 @@ An alert's **precision** is "of the times it fired, how many were real problems"
 ### Alertmanager: grouping, inhibition, silences, routing
 
 **In plain words:** one alert pipe that bundles related alerts, hides follow-on noise, mutes during maintenance, and sends each alert to the right team.
+
+**Step by step:**
+1. Three pods (running copies of a service) go down in one cluster (a group of machines). Three rules fire.
+2. Alertmanager groups them into one message: "3 pods down in cluster A".
+3. If "cluster down" is already firing, an inhibition rule hides the smaller "pod down" alerts.
+4. If it is a planned maintenance window, a silence mutes them until a set end time.
+5. The routing tree reads `severity`: `page` goes to PagerDuty (the phone-call tool), `ticket` goes to a Slack channel.
 
 ```mermaid
 flowchart LR
@@ -271,6 +341,16 @@ flowchart LR
 
 ### Alert lifecycle
 
+**In plain words:** an alert waits in "pending" until the problem has lasted long enough, then "fires", then "resolves" when it clears.
+
+**Step by step:**
+1. Inactive: errors are normal.
+2. Errors cross the line. The alert becomes Pending, and the `for:` timer starts.
+3. If errors drop before the timer ends, it goes back to Inactive. Nobody is bothered.
+4. If errors stay high the whole time, it becomes Firing and someone is notified.
+5. When errors fall back, it is Resolved.
+
+
 ```mermaid
 stateDiagram-v2
     [*] --> Inactive
@@ -290,35 +370,68 @@ A runbook linked from every paging alert should contain, at minimum:
 
 1. **Symptom** — what the alert means in plain language.
 2. **Dashboards** — direct links to the exact panels relevant to this alert, not "go check Grafana."
-3. **Likely mitigations** — rollback, feature-flag off, scale out, failover, block an abusive client (see [[Production Debugging Playbook]] for the general mitigation menu).
+3. **Likely mitigations** — rollback, feature-flag off (switch a new feature off without a deploy), scale out (add more copies), failover (switch to a standby), block an abusive client (see [[Production Debugging Playbook]] for the general mitigation menu).
 4. **Escalation** — who to pull in and how, if the on-call engineer can't resolve it alone within a stated time.
 
 An alert that pages without a runbook forces the responder to reconstruct, from scratch, at 3 a.m., knowledge that the alert's author already had when they wrote the threshold.
 
 ### On-call practice
 
+**In plain words:** a rotation decides whose turn it is, a backup covers them, and you track how often people get woken up.
+
+**Step by step:**
+1. This week Asha is primary on-call and Ravi is secondary.
+2. A page rings Asha. If she does not acknowledge in 5 minutes, it rings Ravi, then the team lead.
+3. At the end of the week Asha hands over: "the queue alert is still flaky; a fix is in review".
+4. The team counts pages per shift. 20 pages a night means the alerts need fixing, not more people.
+
+
 - **Rotation and escalation policy.** A primary responder, a secondary as backup if the primary doesn't acknowledge within a few minutes, and a defined escalation chain beyond that — never a single point of failure for who gets paged.
 - **Handoff.** The outgoing on-call briefs the incoming one on anything still simmering: a known flaky alert, an in-progress mitigation, a change that's still being watched.
 - **Follow-the-sun.** Multi-region teams rotate the "business hours" on-call window to a team in a different timezone instead of waking one team at 3 a.m. every time.
-- **Page budget and toil.** Track pages per on-call shift per person; a rotation that's paged 20 times a night is an alerting-quality problem (see hygiene below), not a staffing problem to solve by hiring more people to suffer the same bad alerts.
+- **Page budget and toil.** Track pages per on-call shift per person; a rotation that's paged 20 times a night is an alerting-quality problem (see hygiene below; toil means repetitive manual work that adds no lasting value), not a staffing problem to solve by hiring more people to suffer the same bad alerts.
 - **MTTD / MTTA / MTTR.** Mean time to detect, to acknowledge, and to resolve. **Mean** MTTR is a famously misleading summary: one 8-hour (480-minute) outage and nineteen 5-minute ones average to `(480 + 19×5) / 20 ≈ 28.75 minutes` across the 20 incidents — which hides that the one bad outage actually ran 96× as long as every other incident — look at the distribution (p50/p90 of resolution time), not the mean, the same percentile lesson as request latency.
 
 ### Blackbox probes and the dead-man's-switch
 
 **In plain words:** a probe tests your service from outside like a user. A dead-man's-switch is an alert that should always fire; if it stops, your alerting is broken.
 
+**Step by step:**
+1. Every minute, a probe outside your network calls `https://shop.example.com/health`, just like a user would.
+2. If DNS is broken or the certificate has expired, the probe fails, even though your app's own metrics look fine.
+3. Separately, a `Watchdog` alert is set to always fire, every minute, to an outside service.
+4. If that steady "I'm alive" message stops arriving, the outside service pages you: your alerting itself is down.
+
 A **blackbox/synthetic probe** calls your service from outside, the way a real user would, catching failures your own metrics can't see (DNS misconfiguration, a certificate that expired, a load balancer silently dropping all traffic). The **dead-man's-switch** (often literally named `Watchdog`) is an alert that is *always* firing by design, routed to a receiver that pages if the notification stream itself ever stops — it exists purely to prove the alerting pipeline is alive, because an alerting system that's down looks identical to "everything is fine."
 
 ### Async-system alerts
 
+**In plain words:** queues have no "slow request", so you watch how old the waiting work is and whether it keeps growing.
+
+**Step by step:**
+1. Watch the age of the oldest waiting message. 2 seconds is fine; 20 minutes is a problem.
+2. Watch consumer lag: how many messages behind the reader is. Steady is fine; growing is bad.
+3. Watch the dead-letter queue. It should stay flat; growth means messages keep failing.
+4. For scheduled jobs, each run sends a "done" heartbeat. No heartbeat for longer than the schedule means the job or the scheduler died.
+
+
 Queue- and job-based systems need their own symptom alerts, since they don't have per-request latency:
 
 - **Oldest-message / oldest-job age** exceeding a threshold — a job sitting unprocessed is the queue equivalent of a slow request.
-- **Consumer lag** (how far behind the consumer is from the latest produced offset) growing instead of holding steady.
+- **Consumer lag** (how far behind the consumer is from the latest produced offset, the position number of the newest message) growing instead of holding steady.
 - **DLQ (dead-letter queue) growth** — messages that failed processing and were set aside; a flat line is healthy, any sustained growth is a symptom.
 - **Missed cron heartbeat** — a scheduled job that should run every N minutes pushes a heartbeat metric each time it completes; alert if that metric is stale by more than N minutes, which also catches "the scheduler itself died" that a per-run alert never would.
 
 ### Paging hygiene
+
+**In plain words:** look back at every page regularly and remove or fix the ones that needed no action.
+
+**Step by step:**
+1. Every week, list last week's pages, say 14 of them.
+2. For each, ask: "did a human need to act?". Say 9 were yes and 5 were no.
+3. Widen the window or raise the line on the 5, or delete them.
+4. Next week, check the number went down without missing a real problem.
+
 
 A weekly or biweekly review of the last period's pages, asking **for every page: was this actionable?** Alerts that paged but required no action get tuned (wider window, different threshold) or deleted outright. An alerting system is a living thing that needs active pruning, not a one-time setup — an alert that made sense for last year's traffic pattern can be pure noise for this year's.
 
@@ -462,7 +575,10 @@ func TestEvaluate_NothingBurningIsNone(t *testing.T) {
 
 ## 7. In production 🔴
 
-- **Real systems:** Prometheus + Alertmanager is the de facto open-source stack for exactly this pipeline; PagerDuty and Opsgenie implement the escalation-policy and on-call-schedule layer on top of whatever fires the alert; Grafana's unified alerting and Datadog Monitors implement the same rule/routing model against different backends.
+> 🟡 → 🔴 **You now know** alert rule fields, two-window burn-rate alerts, Alertmanager grouping and routing, and how on-call rotations and hygiene work. **Next is the advanced part**: how real teams run this stack, how it fails silently, how to cut pages sharply without missing outages, and why the numbers (like 14.4×) are what they are.
+
+
+- **Real systems:** Prometheus + Alertmanager is the de facto open-source stack for exactly this pipeline; PagerDuty and Opsgenie (paid paging tools) implement the escalation-policy and on-call-schedule layer on top of whatever fires the alert; Grafana's unified alerting and Datadog Monitors implement the same rule/routing model against different backends.
 - **Failure modes → fixes:**
   - Alert fires but nobody owns it → every alert rule needs an `owner` label set at creation time, enforced in code review of the alerting rules file, not discovered during an incident.
   - Alertmanager itself goes down silently → the dead-man's-switch Watchdog alert exists exactly to catch this.
@@ -480,8 +596,8 @@ func TestEvaluate_NothingBurningIsNone(t *testing.T) {
 - **Choosing the burn-rate multipliers.** `14.4×` isn't arbitrary: it's chosen so that a sustained outage at that rate consumes 2% of a 30-day budget in exactly the 1-hour long window, which is small enough that false positives are cheap but the 5-minute short window still lets it page within minutes.
 
   Different SLO targets or window lengths change the multiplier; the workbook's chapter 5 derives the formula rather than hardcoding "14.4" as magic.
-- **Multi-tenant and per-cohort alerting.** A top-line burn-rate alert averages across all traffic; a single large, broken tenant can be invisible if its traffic share is small relative to total volume. A second tier of alerts scoped `by (tenant)` with a much higher bar (page only if one tenant's own burn rate is extreme) catches this without multiplying noise for the common case.
-- **Alert-as-code.** Treating alerting rules as version-controlled YAML (Prometheus rule files, reviewed in pull requests, linted with `promtool check rules`) is what makes the owner/runbook/severity discipline enforceable at scale instead of relying on everyone remembering to fill them in by hand in a UI.
+- **Multi-tenant and per-cohort alerting** (a cohort is one slice of users, like one customer or one region). A top-line burn-rate alert averages across all traffic; a single large, broken tenant can be invisible if its traffic share is small relative to total volume. A second tier of alerts scoped `by (tenant)` with a much higher bar (page only if one tenant's own burn rate is extreme) catches this without multiplying noise for the common case.
+- **Alert-as-code.** Treating alerting rules as version-controlled YAML (Prometheus rule files, reviewed in pull requests, linted with `promtool check rules`, Prometheus's rule checker) is what makes the owner/runbook/severity discipline enforceable at scale instead of relying on everyone remembering to fill them in by hand in a UI.
 
 ## 9. Interview questions 🔴
 
@@ -513,6 +629,30 @@ func TestEvaluate_NothingBurningIsNone(t *testing.T) {
 - Look at the MTTR distribution, not the mean — one bad outage skews the average past meaning.
 - Dead-man's-switch: an alert that's always firing, to prove the pipeline itself is alive.
 - Review pages regularly; delete or tune every alert that fired without requiring action.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Should "CPU at 85%" wake someone up?
+> Usually no. It is a cause that may be harmless; make it a dashboard or ticket.
+
+> [!question]- What must every paging alert link to?
+> A runbook: a short page on what to check and what to do.
+
+> [!question]- What does `for: 10m` do?
+> The condition must stay true for 10 minutes in a row before the alert fires.
+
+🟡 Medium
+
+> [!question]- SLO 99.9%. The last hour had 2% errors. What is the burn rate?
+> 0.02 ÷ 0.001 = 20×, above the 14.4× page line (if the 5-minute window agrees).
+
+> [!question]- Why does a burn-rate alert need two windows?
+> The short window alone flaps on blips; the long window alone is slow. Both agreeing means a real, ongoing problem.
+
+> [!question]- What is a dead-man's-switch alert for?
+> It always fires; if its messages stop, the alerting pipeline itself is broken.
 
 ## Links
 

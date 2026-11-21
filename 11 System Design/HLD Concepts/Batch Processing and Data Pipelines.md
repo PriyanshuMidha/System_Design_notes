@@ -34,6 +34,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5 (variants).
 > - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Stream Processing Basics]]: streaming handles each event within seconds as it arrives; this note is the opposite style, handling a whole day's data in one go.
+> - [[Partitioning and Sharding]]: big data is split into slices by a key, so many machines can each work on one slice.
+
 **From zero, in 60 seconds** 🟢
 
 Some work does not need an answer right now. "Yesterday's sales per city" can wait until morning.
@@ -82,6 +86,12 @@ So the work is split across many machines, run overnight, and the report is read
 | Idempotent | Running it twice gives the same result as once | Overwrite a day's partition, do not append |
 | Backfill | Re-running a job for old dates | Recompute last month after a bug fix |
 | CDC | Change data capture: copy DB changes as they happen | Read the MySQL binlog |
+| OLTP / OLAP | The live app database (many small writes) / the analytics side (big reads) | Postgres for orders / BigQuery for reports |
+| Object storage | Cheap storage for files of any size | S3 holding `events/dt=2026-11-09/` |
+| Parquet | A file format that stores data column by column, compressed | read only the `amount` column |
+| Data lake / warehouse | A big cheap folder of files / a fast, strict SQL store for reports | S3 lake, Snowflake warehouse |
+| Data skew | One key holding far more rows than the rest | `user_id = null` is 40% of rows |
+| Event time | When something actually happened, not when it reached you | sale at 11:58 p.m., arrived 12:05 a.m. |
 
 **Picture it**
 
@@ -159,7 +169,24 @@ flowchart LR
 > [!tip] Remember
 > Split by partition, shuffle by key, retry by task, schedule by DAG.
 
+### Real-life example: restaurant payouts and Spotify Wrapped 🟢
+
+Every week Swiggy or Zomato pays thousands of restaurants. Nobody needs that number live; it needs to be exactly right.
+So a batch pipeline runs at night: it pulls all orders, refunds and commissions for the period, joins them, adds them up per restaurant, checks the totals, and writes the payout table.
+If one step fails, it is simply re-run for that week, and because it overwrites its own output, nobody is paid twice.
+Spotify Wrapped is the same idea at a huge scale: a year of listening data crunched in big batch jobs, long before December.
+
+## Common beginner mistakes 🟢
+
+- **Appending results on every run** → a retry or backfill silently doubles revenue → overwrite the day's partition, or upsert by key.
+- **Using streaming for a daily report** → you pay for always-on machines and hard late-data logic → use a nightly batch job when "by 6 a.m." is the real need.
+- **Running heavy reports on the live database** → every customer request slows down → copy data out (CDC or a replica) and run reports there.
+- **Using `now()` inside a job** → a re-run for last Tuesday uses today's date → pass the run's date in as a parameter.
+- **Spinning up a Spark cluster for 2 GB** → cluster overhead is bigger than the work → use one machine with SQL (DuckDB, a Postgres replica, warehouse SQL).
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** batch means cutting a big, finished pile of data into slices, working on them in parallel, and making every step safe to re-run. **Next we open the box**: MapReduce and Spark, why one slow key ruins a job, file layout, how pipelines are scheduled, and how re-runs stay safe. Each subsection starts with a plain walk-through; the full detail follows.
 
 ### 3.1 MapReduce: the original mental model
 
@@ -205,12 +232,19 @@ Step by step:
 
 **In plain words:** Spark keeps the same idea but describes the whole job as a graph of transformations and runs it lazily. It keeps intermediate data in memory when it can, which makes multi-step jobs far faster than writing every step to disk.
 
+**Step by step:**
+1. You write: read orders, keep India only, group by user, sum the amount, join with users, write the result.
+2. Nothing runs yet. Spark just records the plan (lazy).
+3. When you call `write`, Spark cuts the plan into stages at every step that needs data from many slices (group by, join).
+4. Steps inside a stage (read, filter, map) run back to back on each slice, in memory.
+5. Between stages, data is shuffled so equal keys meet. If a slice is lost, Spark rebuilds it from the recorded plan.
+
 Terms:
 
 - **Narrow transformation:** each output partition depends on one input partition (`filter`, `map`). No shuffle, so steps are **pipelined** together in one stage.
 - **Wide transformation:** each output partition needs data from many input partitions (`groupBy`, `join`, `distinct`). Requires a shuffle and starts a new **stage**.
 - **Lazy evaluation:** nothing runs until an **action** (`write`, `count`) is called, so the planner can optimise the whole graph.
-- **Lineage:** the recorded recipe of how a partition was built. If a partition is lost, Spark recomputes it from lineage, as in the RDD paper.
+- **Lineage:** the recorded recipe of how a partition was built. If a partition is lost, Spark recomputes it from lineage, as in the RDD paper (RDD, resilient distributed dataset, was Spark's original data abstraction).
 
 ```mermaid
 flowchart TD
@@ -242,6 +276,13 @@ flowchart TD
 
 **In plain words:** A job is only as fast as its slowest task. If one key (say `user_id = null`, or a huge customer) holds 40% of the rows, one task gets 40% of the work and everyone waits. That is **data skew**, the batch version of [[Hot Keys and Hot Partitions]].
 
+**Step by step:**
+1. You join 1 billion orders with users, grouped by `user_id`. Spark makes 200 tasks.
+2. 400 million orders have `user_id = null` (guest checkout). All of them land in one task.
+3. 199 tasks finish in 2 minutes. The null task runs for an hour.
+4. Fix: drop or handle the nulls before the join, or copy the small users table to every machine (broadcast) so nothing needs shuffling.
+5. Now all 200 tasks finish in about the same time.
+
 Fixes:
 
 1. **Broadcast join:** if one side is small (under a few hundred MB), copy it to every worker so the big side is never shuffled.
@@ -263,8 +304,23 @@ flowchart TD
 
 **In plain words:** Analytics reads a few columns of many rows ("sum of `amount`"). Storing data by **column** (Parquet, ORC) lets the engine read only the needed columns and compress them well. See [[Time-Series and Columnar Storage]].
 
+**Step by step:**
+1. The query is "total `amount` for 9 November".
+2. Files are stored in date folders, so the engine opens only `dt=2026-11-09/` and skips 3 years of others (partition pruning).
+3. Inside each Parquet file it reads only the `amount` column, not the other 40 columns.
+4. Each block of the file stores the min and max of each column, so blocks that cannot match are skipped (predicate pushdown).
+5. Result: the engine reads maybe 1% of the bytes on disk.
+
+```mermaid
+flowchart LR
+    Q["Sum amount for Nov 9"] --> P["Open only dt=2026-11-09"]
+    P --> C["Read only the amount column"]
+    C --> S["Skip blocks by min/max"]
+    S --> R["Answer"]
+```
+
 - **Partition directories by date:** `events/dt=2026-11-09/part-0001.parquet`. A query with a date filter reads only those folders (**partition pruning**).
-- **Predicate pushdown:** Parquet stores min/max per column chunk, so row groups that cannot match are skipped.
+- **Predicate pushdown:** Parquet stores min/max per column chunk, so row groups (blocks of rows inside a Parquet file) that cannot match are skipped.
 - **Avoid the small-files problem:** millions of 1 MB files make listing and opening slow. Compact into files of 128 MB to 1 GB.
 
 > [!tip] Remember
@@ -273,6 +329,13 @@ flowchart TD
 ### 3.5 Orchestration: the pipeline DAG
 
 **In plain words:** A pipeline has many steps with dependencies: "load orders" and "load users" must both finish before "build daily revenue". An **orchestrator** (Airflow-style) runs steps in order, retries failures, alerts people, and records which dates have been done.
+
+**Step by step:**
+1. At 01:00 the orchestrator starts the run for `dt=2026-11-09`.
+2. It waits (a "sensor") until today's orders, users and payments files have arrived.
+3. It runs the extract steps in parallel, then a check that row counts look normal.
+4. If "build daily_revenue" fails, it retries just that step, with a growing wait between tries.
+5. After quality checks pass, it publishes the new partition and tells the dashboard. If checks fail, it alerts a person and publishes nothing.
 
 ```mermaid
 flowchart LR
@@ -299,10 +362,17 @@ Rules of a healthy DAG:
 
 **In plain words:** Jobs fail halfway and get retried. If a retry appends the same rows again, your revenue doubles. An **idempotent** job overwrites its own output for its interval, so running it twice leaves the same result.
 
+**Step by step:**
+1. The job for 9 November writes its output to a temporary folder, `_tmp/run-17`.
+2. It crashes before finishing. The real table is untouched.
+3. The orchestrator retries. Run 18 writes to `_tmp/run-18` and finishes.
+4. In one quick step, the table's 9 November partition is swapped to run 18's output.
+5. Running it a third time would swap in identical data. Nothing doubles.
+
 Three patterns:
 
 1. **Overwrite the partition:** the job for `dt=2026-11-09` replaces the whole `dt=2026-11-09` folder (write to a temp path, then atomically swap or rename).
-2. **Upsert by primary key:** `MERGE INTO target USING staging ON id WHEN MATCHED UPDATE WHEN NOT MATCHED INSERT`.
+2. **Upsert by primary key** (update the row if it exists, insert it if not): `MERGE INTO target USING staging ON id WHEN MATCHED UPDATE WHEN NOT MATCHED INSERT`.
 3. **Deterministic output IDs:** derive the ID from the input (`hash(order_id, dt)`), so duplicates collide and are dropped.
 
 ```mermaid
@@ -342,7 +412,7 @@ Assumptions (estimates): 2 million orders per day, 1 KB per order row, 5 million
 
 **Step 2: design.**
 
-1. **Ingest orders by CDC.** A connector reads the database transaction log (binlog or WAL) and writes change events to Kafka, then to the raw zone as files. This avoids heavy queries on the primary and captures updates and deletes. See [[Transactional Outbox and CDC]].
+1. **Ingest orders by CDC.** A connector reads the database transaction log (binlog in MySQL or WAL in PostgreSQL: the database's own record of every change) and writes change events to Kafka, then to the raw zone as files. This avoids heavy queries on the primary and captures updates and deletes. See [[Transactional Outbox and CDC]].
 2. **Ingest payments and refunds** from the payment provider's daily settlement file, landing as-is in `raw/payments/dt=...`.
 3. **Transform (01:30):** for the interval `dt=D`, read raw changes, keep the latest version of each order (dedupe by `order_id`, take highest log position), join with payments and refunds.
 4. **Aggregate:** `GROUP BY city, restaurant_id` for revenue, refunds, net.
@@ -425,7 +495,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | Storage | Files on object storage (S3), any format | Managed columnar tables | Open files (Parquet) plus a table layer |
 | Schema | On read (flexible) | On write (strict) | Enforced by table format, can evolve |
-| Transactions | None (files) | Yes | Yes (via Delta, Iceberg, Hudi metadata) |
+| Transactions | None (files) | Yes | Yes (via Delta, Iceberg, Hudi metadata: open table formats that add a change log on top of plain files) |
 | Cost | Lowest | Highest per TB | Low storage, pay for compute |
 | Typical use | Raw landing, ML, logs | BI, finance, governed reporting | One copy for BI and ML |
 | Weakness | Swamp: no governance, no updates | Costly for raw and unstructured data | Newer; table maintenance (compaction) is on you |
@@ -500,9 +570,11 @@ flowchart LR
 - **Freshness vs cost:** hourly runs cost roughly 24 times a daily run's compute per day if each reprocesses everything. Use **incremental** processing (only new or changed partitions).
 - **CDC vs periodic dumps:** CDC captures every change and deletes with low load on the source, but needs operations: connector health, schema changes, snapshot handling. A nightly full dump is simpler, and fine for small tables.
 - **Warehouse vs lake:** a warehouse is easier for analysts but costly for raw data; a lake is cheap but needs governance. A lakehouse tries to give both and adds table maintenance chores.
-- **Immutable raw vs privacy:** keeping raw data forever conflicts with GDPR erasure. Plan for deletion in raw files (table formats with row-level delete, or tokenize PII before landing).
+- **Immutable raw vs privacy:** keeping raw data forever conflicts with GDPR erasure (the EU rule that people can ask for their personal data to be deleted). Plan for deletion in raw files (table formats with row-level delete, or tokenize PII before landing).
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how batch jobs run, how pipelines are scheduled, and which store to land data in. **Next comes the senior view**: who runs this at scale, what to monitor, how pipelines fail in production, and the deep reasons behind shuffles, exactly-once output, late data and CDC.
 
 - **Public examples:** Google built MapReduce (2004) for indexing and log analysis; Spark came from UC Berkeley's AMPLab and is widely used for ETL; Airbnb created Apache Airflow, now a common orchestrator; LinkedIn's Kafka feeds both stream and batch consumers; Uber and Netflix have written about lakehouse-style table formats (Hudi came from Uber, Iceberg from Netflix). These attributions are well documented on the projects' own sites.
 - **Metrics to watch:** job duration vs the SLA, freshness (time since the last successful partition), rows in vs out, rows rejected by quality gates, retries per task, skew (max task time over median), shuffle bytes, small-file count.
@@ -575,7 +647,7 @@ flowchart LR
 
 **In plain words:** A sale at 11:58 p.m. may only reach you at 12:05 a.m. Count it on the day it happened, not the day it arrived.
 
-A record carries two clocks: when it happened (**event time**) and when you processed it (**processing time**). Reports must group by event time, but data arrives late (mobile app offline for 2 hours). Batch handles this by reprocessing a trailing window; streaming handles it with watermarks and allowed lateness.
+A record carries two clocks: when it happened (**event time**) and when you processed it (**processing time**). Reports must group by event time, but data arrives late (mobile app offline for 2 hours). Batch handles this by reprocessing a trailing window; streaming handles it with watermarks (a moving marker that says "we think all events before this time have arrived") and allowed lateness.
 
 Define the lateness you accept (for example 7 days) and what happens after it (drop, or write a correction).
 
@@ -596,7 +668,7 @@ A customer changes city. Do past orders show the old city or the new one? **SCD 
 
 **In plain words:** CDC means reading the database's own diary of changes, so you copy every change without slowing the database down.
 
-- **Log-based CDC** (Debezium on MySQL binlog or PostgreSQL WAL) reads the same log used for replication, so it adds little load and sees every commit in order, including deletes.
+- **Log-based CDC** (Debezium, a popular open-source CDC tool, on MySQL binlog or PostgreSQL WAL) reads the same log used for replication, so it adds little load and sees every commit in order, including deletes.
 - **Initial snapshot** copies existing rows, then streaming of changes takes over from a recorded log position. Get this handover wrong and you lose or duplicate rows.
 - **Schema changes** in the source must flow through (add column, rename). Plan schema evolution rules.
 - **Why not dual-write** from the application to both DB and Kafka? A crash between the two writes leaves them inconsistent. Use CDC or the outbox pattern in [[Transactional Outbox and CDC]].
@@ -663,6 +735,26 @@ sequenceDiagram
 - Late data: reprocess the last N days or add correction rows.
 - Lambda = batch + speed; Kappa = replay one stream.
 - Do not use a cluster for data that fits on one machine.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) When is batch a better fit than streaming?
+> When results can wait minutes to hours, like a 6 a.m. report, billing or ML training data.
+
+> [!question]- (easy) What does idempotent mean for a batch job?
+> Running it twice for the same date gives the same output as running it once.
+
+> [!question]- (easy) What is a backfill?
+> Re-running the pipeline for past dates, for example after a bug fix.
+
+> [!question]- (medium) 199 of 200 tasks are done and one runs for an hour. Likely cause and fix?
+> Data skew on one key; filter nulls, broadcast the small side, or salt the hot key.
+
+> [!question]- (medium) Why is a shuffle expensive?
+> Every map task sends a piece to every reduce task, with disk writes, sorting and network transfer in between.
+
+> [!question]- (medium) A refund for 9 November arrives on 12 November. Two ways to handle it?
+> Recompute the last 7 days every night, or add a correction row dated 12 November.
 
 ## Links 🟢
 

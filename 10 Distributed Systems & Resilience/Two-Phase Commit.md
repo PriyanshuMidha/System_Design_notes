@@ -37,6 +37,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Transactions and ACID]]: inside one database, a transaction's changes all happen or none do, and a log on disk lets it survive crashes.
+> - [[Consensus - Raft and Paxos]]: a group of servers can agree on a value as long as a majority is up.
+
 **From zero, in 60 seconds** 🟢
 
 You move 100 rupees from an account in one database to an account in another.
@@ -84,6 +88,10 @@ Both banks must do their part, or neither must.
 | Durable log | A record written to disk that survives a crash | Write-ahead log entry "COMMIT tx42" |
 | Lock | A mark that stops others changing a row until you finish | Row of account 17 locked |
 | In doubt | Voted yes, but does not yet know the final decision | Shard B waiting for the coordinator |
+| Commit point | The moment the coordinator's decision is saved to disk; after it, the outcome cannot change | "tx-81 COMMIT" written and fsynced |
+| fsync | Forcing data from memory onto the disk before replying | Save the prepare record, then vote yes |
+| Blocking protocol | Participants may have to wait, stuck, for one machine to come back | Shard B holds locks until the coordinator restarts |
+| Saga | A chain of local steps with "undo" steps instead of one global commit | Book flight, then hotel; if hotel fails, cancel flight |
 
 **Picture it**
 
@@ -118,7 +126,14 @@ Where it breaks: guests can change their minds, but a participant that voted yes
 
 An order moves money between two shards: debit account 17 on shard A, credit account 92 on shard B. Each shard has its own local transactions. Commit A first and crash before B, and money disappears; commit B first and crash before A, and money is created. Local transactions cannot fix this because no single database sees both writes.
 
-**Atomic commit** is the requirement: all participants commit, or all abort, even if some crash in the middle. 2PC (Gray, 1978) is the standard protocol for it inside databases that span several nodes or several resource managers (a database plus a message queue, for example).
+**Atomic commit** is the requirement: all participants commit, or all abort, even if some crash in the middle. 2PC (Gray, 1978) is the standard protocol for it inside databases that span several nodes or several **resource managers** (any system that can hold part of a transaction: a database plus a message queue, for example).
+
+### Real-life example 🟢
+
+Some banking and fintech apps keep their ledger in a distributed SQL database such as CockroachDB, where account 17 and account 92 may live on different machines.
+When the app moves ₹500 between them, the developer writes one ordinary `BEGIN ... COMMIT`.
+Behind that single `COMMIT`, the database runs a two-phase-commit-style protocol across the machines, so the debit and the credit land together or not at all.
+You rarely write 2PC yourself; you mostly meet it hidden inside databases and Kafka transactions.
 
 ## 2. Mental model 🟢
 
@@ -135,7 +150,24 @@ If the officiant faints right after both said yes, the couple is in limbo: neith
 - **Prepared / in doubt:** a participant that voted yes and has not yet heard the outcome.
 - **Commit point:** the moment the coordinator durably records "commit".
 
+## Common beginner mistakes 🟢
+
+- **Calling 2PC a consensus algorithm** → it needs every participant to say yes, not a majority, and stalls if the coordinator is lost → use Raft or Paxos when you need agreement that survives failures.
+- **Letting a prepared database decide on its own after a timeout** → another database may already have committed, so atomicity breaks → a prepared participant must wait or ask the others.
+- **Using 2PC across microservices** → every service's outage becomes everyone's outage, and locks are held across the network → use a saga or a transactional outbox.
+- **Turning on `PREPARE TRANSACTION` and never watching it** → a forgotten prepared transaction holds locks and stops Postgres cleaning dead rows → alert on old rows in `pg_prepared_xacts`.
+- **Sending commit messages only once** → a lost message leaves a database in doubt forever → retry phase 2 until every participant acknowledges, with idempotent handlers.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a coordinator asks everyone "ready?" and commits only if all say yes, and that a dead coordinator leaves the yes-voters stuck. **Next we open the box**: exactly what each side writes to disk in each phase, the states a participant moves through, and how everyone recovers after a crash.
+
+**Step by step:**
+1. The coordinator sends "PREPARE tx-81" to shard A (debit account 17) and shard B (credit account 92).
+2. Each shard makes its change, saves it plus a "prepared" note to disk, keeps its row locked, and answers "yes".
+3. Both said yes, so the coordinator writes "tx-81 COMMIT" to its own disk. This is the commit point: no going back now.
+4. It sends "COMMIT tx-81" to both shards, and resends until each one answers "done".
+5. Each shard makes the change final and unlocks the row. If either had said "no", the coordinator would have sent "ABORT" instead.
 
 ```mermaid
 sequenceDiagram
@@ -161,12 +193,19 @@ sequenceDiagram
 2. Each participant checks constraints, writes all changes and a *prepare record* to its log, fsyncs, and keeps its row locks. Then it votes **yes**. If anything fails it votes **no** and aborts locally.
 
 **Phase 2, decide.**
-1. All yes → the coordinator fsyncs `COMMIT` to its log. Any no or timeout → it records `ABORT` (with presumed abort it need not even write it).
+1. All yes → the coordinator fsyncs `COMMIT` to its log. Any no or timeout → it records `ABORT` (with **presumed abort**, the rule "no record means abort", it need not even write it).
 2. It sends the decision to every participant and **retries until each acknowledges**. Participants apply it and release locks. Commit and abort messages must be idempotent because they are retried.
 
 ### Participant states
 
 **In plain words:** each database goes from working, to prepared (promised to commit), to committed or aborted. Once prepared, it cannot decide alone.
+
+**Step by step:**
+1. Shard B starts "working": it is making its changes. If something goes wrong now, it can just abort alone.
+2. Shard B votes yes. It is now "prepared": its changes are on disk and its rows are locked.
+3. The coordinator crashes. Shard B waits 30 s and hears nothing.
+4. Shard B cannot abort (A may already have committed) and cannot commit (A may have voted no). It stays prepared, rows still locked.
+5. When the coordinator comes back and sends "COMMIT", shard B finally commits and unlocks.
 
 ```mermaid
 stateDiagram-v2
@@ -189,6 +228,12 @@ It cannot commit on its own either, because another participant may have voted n
 ### Recovery rules
 
 **In plain words:** after a crash, the coordinator resends its saved decision; a prepared database keeps asking until it hears the answer.
+
+**Step by step:**
+1. The coordinator restarts and reads its log. It finds "tx-81 COMMIT", so it resends COMMIT to every shard.
+2. It finds tx-82 with no decision written. Presumed abort: it sends ABORT for tx-82.
+3. Shard B restarts and finds tx-81 still prepared in its own log. It keeps the locks and asks the coordinator "what happened to tx-81?"
+4. The coordinator answers "COMMIT". Shard B commits and releases the locks.
 
 - **Coordinator restarts:** for each transaction in its log, resend the logged decision. A transaction with no decision record is aborted (**presumed abort**).
 - **Participant restarts:** for each prepared transaction in its log, ask the coordinator for the outcome. Until it gets one, the transaction stays prepared and its locks stay held, even across the restart.
@@ -526,7 +571,7 @@ Representative output (PostgreSQL 17):
 
 Any `UPDATE` on account 17 now waits on that row lock until someone runs `COMMIT PREPARED` or `ROLLBACK PREPARED`.
 
-A forgotten prepared transaction also holds back the xmin horizon, so `VACUUM` cannot remove dead rows newer than it in that database or in the shared catalogs, and cannot advance freezing toward wraparound protection (see [[Isolation Levels and MVCC]]).
+A forgotten prepared transaction also holds back the **xmin horizon** (the oldest transaction Postgres must still keep old row versions for), so `VACUUM` (Postgres's clean-up of dead rows) cannot remove dead rows newer than it in that database or in the shared catalogs, and cannot advance freezing toward wraparound protection (Postgres's guard against its transaction counter running out) (see [[Isolation Levels and MVCC]]).
 
 Alert on any row in `pg_prepared_xacts` older than a few minutes.
 
@@ -538,8 +583,8 @@ Alert on any row in `pg_prepared_xacts` older than a few minutes.
 | Presumed abort / presumed commit | Optimizations that skip writing (and acknowledging) one outcome; missing record means abort (or commit) | Inside real 2PC implementations | Fewer fsyncs and messages |
 | 3PC (Skeen, 1981) | Adds a pre-commit phase so participants can finish without the coordinator | Theory; synchronous networks with crash-only faults | Not safe under network partitions or unbounded delay; rarely used |
 | 2PC over consensus groups (Paxos Commit, Spanner) | Coordinator and each participant are replicated Raft/Paxos groups, so none of them "crashes" for good | Distributed SQL: Spanner, CockroachDB, YugabyteDB | Each step is a consensus write; higher latency, no blocking on a single machine |
-| Percolator (Google, 2010; TiDB) | Client-driven 2PC on a key-value store: one "primary" lock decides the transaction; other keys point at it | Large transactional KV stores | Lock cleanup by readers; timestamp oracle |
-| XA (X/Open, 1991) | Standard API for a transaction manager to drive 2PC across heterogeneous resources (databases, JMS brokers) | Legacy enterprise stacks (Java EE JTA) | Heuristic outcomes, driver bugs, poor support in cloud services |
+| Percolator (Google, 2010; TiDB) | Client-driven 2PC on a key-value store: one "primary" lock decides the transaction; other keys point at it | Large transactional KV stores | Lock cleanup by readers; timestamp oracle (one service that hands out increasing timestamps) |
+| XA (X/Open, 1991) | Standard API for a transaction manager to drive 2PC across heterogeneous resources (databases, JMS brokers, which are Java message queues) | Legacy enterprise stacks (Java EE JTA) | Heuristic outcomes (a resource decides on its own and may break atomicity), driver bugs, poor support in cloud services |
 | [[Saga Pattern]] | Sequence of local transactions with compensating actions, no global locks | Microservices, long-running business flows | No isolation: others see intermediate states; compensations must be designed |
 | [[Transactional Outbox and CDC]] | Write the event in the same local transaction as the state change; relay it later | "Update my DB and publish an event" | Eventual consistency; consumers must be idempotent |
 
@@ -560,11 +605,13 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the two phases, the commit point, why a prepared participant is stuck when the coordinator dies, how recovery works, and the alternatives (sagas, outbox, Percolator). **Next comes the advanced part**: how Spanner, CockroachDB, Kafka and PostgreSQL use 2PC in production, the failure modes, and why 3PC does not fix blocking while consensus groups do.
+
 - **Real systems:**
 	- **Spanner** runs 2PC across Paxos groups; the coordinator is the leader of one participant group, so its log is replicated (see [[Distributed SQL]]).
-	- **CockroachDB** uses a transaction record plus parallel commits, a 2PC variant built on Raft-replicated ranges.
-	- **Kafka transactions** (KIP-98): a transaction coordinator writes the decision to an internal log, then writes commit markers to every partition involved. This is a 2PC-shaped protocol (see [[Kafka and Event Streaming]] and [[Delivery Semantics and Exactly-Once]]).
-	- **PostgreSQL** (`PREPARE TRANSACTION`) and **MySQL** (`XA START … XA PREPARE … XA COMMIT`) act as participants; Citus uses PostgreSQL's 2PC for multi-shard writes.
+	- **CockroachDB** uses a transaction record plus parallel commits (a variant that saves one round trip), a 2PC variant built on Raft-replicated ranges (slices of the key space, each kept by a Raft group).
+	- **Kafka transactions** (KIP-98, the Kafka design proposal that added them): a transaction coordinator writes the decision to an internal log, then writes commit markers to every partition involved. This is a 2PC-shaped protocol (see [[Kafka and Event Streaming]] and [[Delivery Semantics and Exactly-Once]]).
+	- **PostgreSQL** (`PREPARE TRANSACTION`) and **MySQL** (`XA START … XA PREPARE … XA COMMIT`) act as participants; Citus (an extension that shards PostgreSQL) uses PostgreSQL's 2PC for multi-shard writes.
 - **Failure modes → fixes:**
 	- Coordinator dies after prepare → recovery process that reads the coordinator log and finishes every open transaction; replicate the coordinator log (consensus) to remove the single point.
 	- Orphaned prepared transactions after the application lost its coordinator state → monitor `pg_prepared_xacts`, resolve by checking the coordinator log, never guess.
@@ -581,7 +628,7 @@ flowchart LR
   - That reasoning assumes a participant that does not answer has crashed.
   - Under a network partition, one side can commit while the other aborts. Real networks are asynchronous, so 3PC is mostly a textbook answer.
 - **Cooperative termination.** A participant in doubt can ask the other participants. If any has committed or aborted, or never voted (and can therefore abort), the outcome is known. Only if all live participants are prepared must they wait for the coordinator.
-- **Isolation still matters.** 2PC gives atomicity across nodes; isolation comes from each participant's locks or MVCC. Distributed SQL engines also need a global timestamp order (TrueTime or hybrid logical clocks; see [[Clocks and Ordering]]) so cross-shard reads see a consistent snapshot.
+- **Isolation still matters.** 2PC gives atomicity across nodes; isolation comes from each participant's locks or MVCC (keeping several versions of a row so readers do not block writers). Distributed SQL engines also need a global timestamp order (TrueTime or hybrid logical clocks; see [[Clocks and Ordering]]) so cross-shard reads see a consistent snapshot.
 - **Read-only participants** can vote "read-only" and drop out of phase 2, a common optimization.
 
 ## 9. Interview questions 🔴
@@ -617,6 +664,30 @@ flowchart LR
 - PostgreSQL: `PREPARE TRANSACTION`, `COMMIT PREPARED`, `pg_prepared_xacts`; `max_prepared_transactions` defaults to 0.
 - Fault-tolerant 2PC = participants and coordinator are Paxos/Raft groups (Spanner, CockroachDB).
 - Across services: [[Saga Pattern]] or [[Transactional Outbox and CDC]].
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What happens in phase 1 of 2PC?
+> The coordinator asks every participant to prepare; each saves its changes, keeps its locks and votes yes or no.
+
+> [!question]- One participant votes no. What is the outcome?
+> The whole transaction aborts everywhere.
+
+> [!question]- What is the commit point?
+> The moment the coordinator's commit decision is safely written to its disk.
+
+🟡 Medium
+
+> [!question]- Why can't a prepared participant abort on its own after a timeout?
+> The coordinator may already have logged commit and another participant may have committed; aborting would break atomicity.
+
+> [!question]- The coordinator restarts and finds no decision for tx-82. What does it do?
+> Aborts it (presumed abort) and tells the participants.
+
+> [!question]- Five services each 99.9% available take part in one 2PC. Roughly what is the combined availability?
+> About 99.5% (0.999 to the power 5), because every one of them must be up.
 
 ## Links
 

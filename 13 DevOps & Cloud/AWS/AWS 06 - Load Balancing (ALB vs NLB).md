@@ -29,6 +29,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[AWS 05 - ECS, Fargate and ECR]]: an ECS service keeps N tasks running, each with its own IP address, and a rolling deploy swaps old tasks for new ones.
+> - [[Load Balancing]]: a load balancer spreads requests over many copies using a rule such as round robin, and skips copies that fail health checks.
+
 **From zero, in 60 seconds** 🟢
 
 Your app runs as several copies. Users need one address to hit, not six.
@@ -75,6 +79,12 @@ A load balancer is that single front door that spreads requests over healthy cop
 | Layer 4 (L4) | Only sees connections: IPs, ports, TCP/UDP | Forward any TCP on port 443 |
 | TLS termination | Decrypting HTTPS at the load balancer | ALB holds the certificate |
 | Draining | Letting a target finish current requests before removal | 30 s grace during a deploy |
+| Listener | The port and protocol a load balancer listens on, plus its routing rules | HTTPS on 443 |
+| Healthy / unhealthy threshold | How many checks in a row must pass / fail before a target's state flips | 3 passes in a row = healthy |
+| Static IP | An address that never changes, so others can allowlist it | One fixed IP per AZ on an NLB |
+| Cross-zone load balancing | Spreading traffic over targets in all AZs, not just the AZ that got the request | On by default for ALB |
+| `X-Forwarded-For` | A header the ALB adds with the real client's IP address | `X-Forwarded-For: 49.36.10.5` |
+| Idle timeout | How long an open connection may sit unused before it is closed | ALB default 60 seconds |
 
 **Picture it**
 
@@ -104,20 +114,45 @@ Where it breaks: a receptionist handles one letter at a time, while both load ba
 
 An ECS service with 6 tasks across 2 AZs needs one stable entry point that clients and DNS can point at, one place to terminate TLS (or not), and one place to decide which of those 6 tasks gets each new request or connection.
 
-AWS could ask every team to run their own load-balancing software (HAProxy, Envoy, Nginx) on EC2, but that means patching it, scaling it, and making it highly available — undifferentiated work every team would otherwise duplicate.
+AWS could ask every team to run their own load-balancing software (HAProxy, Envoy, Nginx: popular open-source proxies) on EC2, but that means patching it, scaling it, and making it highly available — undifferentiated work (chores that are the same for everyone and give no edge) every team would otherwise duplicate.
 
 Elastic Load Balancing is a managed, horizontally-scaling product that does this instead, and AWS offers two shapes of it because HTTP-aware routing and raw-connection throughput have genuinely different implementations and trade-offs.
+
+### Real-life example: one app, two load balancers 🟢
+
+Say a ride-hailing app like Ola runs its rider API and its driver-tracking service on AWS.
+The rider API is plain HTTPS, so an ALB reads each request and sends `/rides/*` to the rides service and `/payments/*` to the payments service.
+Driver phones stream location over a custom TCP protocol, and some partners must allowlist a fixed address, so that service sits behind an NLB with one static IP per AZ.
+In both cases, if a copy fails its health checks a few times in a row, it stops getting traffic within seconds.
+And during deploys, old copies are drained so no rider sees a dropped request.
 
 ## 2. Mental model 🟢
 
 Picture two different employees at a reception desk:
 
-- **ALB** reads the letter inside the envelope (the HTTP request: path, host header, cookies) before deciding which department to route it to. It can also open a new envelope and staple on a response (TLS termination, redirects, fixed responses) and understands HTTP semantics like WebSocket upgrades.
+- **ALB** reads the letter inside the envelope (the HTTP request: path, host header, cookies) before deciding which department to route it to. It can also open a new envelope and staple on a response (TLS termination, redirects, fixed responses) and understands HTTP semantics like WebSocket upgrades (switching an HTTP connection into a long-lived two-way channel).
 - **NLB** looks only at the envelope's address (the TCP/UDP connection: source/destination IP and port) and forwards the whole, unopened envelope. It does not read HTTP at all — it just moves connections, extremely fast, and optionally passes TLS straight through without decrypting it.
+
+## Common beginner mistakes 🟢
+
+- **Picking NLB for an HTTP API that needs path routing** → an NLB cannot read paths or headers → use an ALB.
+- **Using `instance` targets for Fargate tasks** → Fargate tasks have their own IPs, not instances → use an `ip` target group.
+- **Letting the app close idle connections sooner than the ALB** → the ALB reuses a closed connection and returns 502 ("bad gateway": the backend gave no valid answer) → set the app's idle timeout above 60 seconds.
+- **Setting the deregistration delay shorter than your slowest request** → long requests are cut off during deploys → set it above your slowest expected request.
+- **Trusting `X-Forwarded-For` from anyone** → a client can fake it if it can reach the app directly → only trust it when the ALB is the only way in.
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that a load balancer is one front door for many copies, that an ALB reads HTTP and an NLB only forwards connections. **Next we open the box**: how listeners and rules pick a target group, how health checks decide who gets traffic, and how draining protects deploys.
+
 **In plain words:** both kinds sit in front of target groups. The ALB opens each request and decides; the NLB just passes the connection along.
+
+**Step by step (one HTTPS request through an ALB):**
+1. The browser connects to the ALB's listener on port 443. The ALB decrypts it with the certificate from ACM (AWS's certificate service).
+2. The ALB reads the request: path `/api/orders`, host `example.com`.
+3. Listener rules are checked in order. "Path `/api/*`" matches, so the target group `api-service` is chosen.
+4. The ALB picks one healthy task in that group and opens a new connection to it, adding `X-Forwarded-For` with the client's IP.
+5. An NLB would skip steps 2-3: it forwards the raw connection (even still encrypted, called TLS passthrough) to a target by address and port.
 
 ```mermaid
 flowchart TB
@@ -151,6 +186,13 @@ flowchart TB
 ### Target groups and health checks
 
 **In plain words:** a target group is a list of servers plus a health test. A server gets traffic only after passing several tests in a row.
+
+**Step by step (healthy threshold 3, unhealthy threshold 2, check every 10 s):**
+1. A new task registers. It starts as unhealthy and gets no traffic.
+2. `/readyz` passes at 10 s, 20 s and 30 s: three in a row, so it becomes healthy and starts getting requests.
+3. Later one check fails, then the next passes: the fail streak resets, nothing changes.
+4. Two checks fail in a row: it becomes unhealthy and stops getting new requests.
+5. During a deploy the old task is deregistered: it drains, finishing open requests for up to the deregistration delay, then is removed.
 
 Both ALB and NLB route to **target groups**, never directly to an instance or task. A target group owns:
 
@@ -257,6 +299,8 @@ func (t *TargetHealth) Report(passed bool) bool {
 func (t *TargetHealth) Healthy() bool { return t.healthy }
 ```
 
+**What this code does, in plain words (tests below):** the tests feed the model a series of passes and fails and check that a new target starts unhealthy, needs the full streak of passes to become healthy, and that one opposite result in the middle of a streak starts the count again.
+
 Tests (Go 1.24, `go vet` and `go test -race` pass) proving the three behaviors that matter operationally: a target starts unhealthy, a single failure does not erase progress toward healthy from scratch in a confusing way (it resets the streak, as AWS's own thresholds do), and reaching the opposite threshold actually flips state:
 
 ```go
@@ -311,26 +355,35 @@ func TestBecomesUnhealthyAfterThresholdFailures(t *testing.T) {
 
 | Load balancer | Layer | Routes on | Static IP | Preserves client IP | Typical use |
 | --- | --- | --- | --- | --- | --- |
-| **ALB** | 7 (HTTP/HTTPS/HTTP2/gRPC/WebSocket) | Path, host, header, query string, source IP rules | No (use an Elastic IP-backed NLB or a Global Accelerator in front if one is required) | Via `X-Forwarded-For` header (connection itself is re-originated) | Web APIs, microservice path/host routing, Lambda targets, WAF integration |
+| **ALB** | 7 (HTTP/HTTPS/HTTP2/gRPC/WebSocket) | Path, host, header, query string, source IP rules | No (use an Elastic IP-backed NLB or a Global Accelerator in front if one is required; an Elastic IP is a fixed public IP you own, and Global Accelerator gives fixed IPs on AWS's global network) | Via `X-Forwarded-For` header (connection itself is re-originated) | Web APIs, microservice path/host routing, Lambda targets, WAF (web application firewall) integration |
 | **NLB** | 4 (TCP/UDP/TLS) | Destination IP/port only | Yes — one static or Elastic IP per AZ | `instance` targets and UDP `ip` targets: yes, on by default. TCP/TLS `ip` targets (the ECS `awsvpc` case): off by default — enable `preserve_client_ip.enabled` on the target group | Extreme throughput/low latency, non-HTTP protocols, clients needing a fixed IP to allowlist, TLS passthrough to the app |
 | **Classic Load Balancer (CLB)** | Mixed, legacy | Basic HTTP or TCP | No | Partial | Legacy only — AWS recommends ALB or NLB for all new designs |
-| **Gateway Load Balancer (GWLB)** | 3 (IP) | Transparently inserts third-party virtual appliances (firewalls, IDS/IPS) into the traffic path | N/A | Yes | Security-appliance insertion, not a general app load balancer |
+| **Gateway Load Balancer (GWLB)** | 3 (IP) | Transparently inserts third-party virtual appliances (firewalls, IDS/IPS: systems that detect or block attacks) into the traffic path | N/A | Yes | Security-appliance insertion, not a general app load balancer |
 
 > [!warning] Interview trap
-> "ALB is just a faster, newer version of NLB" is wrong — they operate at different OSI layers and are not drop-in replacements. Choosing ALB for a raw TCP protocol that isn't HTTP, or choosing NLB when you need path-based routing, both fail outright rather than just underperforming.
+> "ALB is just a faster, newer version of NLB" is wrong — they operate at different OSI layers (the standard 7-layer model of networking, where 4 is connections and 7 is the application request) and are not drop-in replacements. Choosing ALB for a raw TCP protocol that isn't HTTP, or choosing NLB when you need path-based routing, both fail outright rather than just underperforming.
 
 ## 6. Trade-offs and when not to use 🟡
 
 - ALB cannot route non-HTTP TCP/UDP traffic (a raw database protocol, custom binary protocol) — NLB or a target-level proxy is required there.
 - NLB cannot read HTTP at all, so it cannot do path/host-based routing, cannot terminate TLS and inspect the plaintext request, and cannot attach AWS WAF — anything needing HTTP awareness needs ALB in front, or behind, it.
 - Cross-zone load balancing is enabled by default (and free) for ALB but, for NLB, is optional and (when enabled) billed for the inter-AZ data transfer — leaving it off with very unevenly distributed AZ capacity can concentrate load on one AZ's targets.
-- A single, low-traffic internal service sometimes does not need a load balancer at all — a private DNS record pointing straight at one ECS task (through Cloud Map service discovery) is simpler, though it loses health-check-based failover.
+- A single, low-traffic internal service sometimes does not need a load balancer at all — a private DNS record pointing straight at one ECS task (through Cloud Map service discovery, AWS's registry of service names to addresses) is simpler, though it loses health-check-based failover.
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how listeners, rules and target groups route traffic, how health-check thresholds flip a target's state, and how draining protects deploys. **Next is the advanced part**: the 502s and dropped connections teams actually see, what to monitor, and deeper details like client IP preservation, target types and rule priority.
+
+
 - **Real systems:** Most AWS-hosted HTTP APIs sit behind an ALB that terminates TLS (ACM-issued certificate — see [[AWS 09 - Route 53 and ACM]]) and forwards to an ECS or EKS target group in `ip` mode. NLB shows up for gRPC services that want a static IP for client allowlisting, for extreme-throughput use cases, and whenever TLS must pass through unterminated to the backend (mutual TLS to the app itself).
 - **Failure modes → fixes:**
-  - 502 from the ALB → the target closed the connection before responding, often because the app's keep-alive idle timeout is shorter than the ALB's idle timeout (default 60s) — set the app's HTTP server idle timeout higher than the ALB's.
+  - 502 from the ALB → the target closed the connection before responding, often because the app's keep-alive (reusing one connection for many requests) idle timeout is shorter than the ALB's idle timeout (default 60s) — set the app's HTTP server idle timeout higher than the ALB's.
+
+    ```mermaid
+    flowchart LR
+        A["App closes idle connection<br/>after 30 s"] --> B["ALB still thinks it is open<br/>(its limit is 60 s)"]
+        B --> C["Sends next request on it"] --> D["502"]
+    ```
   - All targets unhealthy right after a deploy → health-check path/port mismatch, or the app needs longer than `HealthyThreshold × interval` to start — raise `healthCheckGracePeriodSeconds` on the ECS service.
   - Uneven load across AZs → cross-zone load balancing disabled on an NLB with unbalanced target counts per AZ.
   - Dropped connections during a deploy → deregistration delay set too low for the app's longest-running request; raise it to exceed the slowest expected request duration.
@@ -374,6 +427,30 @@ func TestBecomesUnhealthyAfterThresholdFailures(t *testing.T) {
 - Cross-zone load balancing is free and default on ALB, optional and billed on NLB.
 - Routing algorithms (round robin, least connections, consistent hashing) live in [[Load Balancing]] — this note is the AWS product layer on top of them.
 - Set the app's HTTP idle timeout higher than the ALB's to avoid spurious 502s.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Which load balancer can route by URL path?
+> The ALB, because it reads the HTTP request.
+
+> [!question]- Which one gives you a static IP per AZ?
+> The NLB.
+
+> [!question]- What is a target group?
+> A named set of targets plus the health check that decides which of them get traffic.
+
+🟡 Medium
+
+> [!question]- Healthy threshold is 3. A new task passes, passes, fails, passes. Is it healthy yet?
+> No. The fail reset the streak; it needs three passes in a row.
+
+> [!question]- Why do Fargate tasks need an `ip` target group?
+> Each task has its own network card and IP in awsvpc mode, so there is no instance to point at.
+
+> [!question]- The app sets a 30-second idle timeout and you see random 502s. Why?
+> The app closes idle connections before the ALB's 60-second limit, so the ALB sends requests on dead connections; raise the app's timeout above 60 s.
 
 ## Links
 

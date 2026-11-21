@@ -20,6 +20,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add the Code steps, Tests and Design decisions.
 > - 🔴 **Interview / SDE-3 prep?** Add Pitfalls and do the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - Nothing. This note starts from zero. It helps to glance at the flowchart in [[Data Structures Overview and Big-O Cheat Sheet]] first, because this code is that flowchart written in Go.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on twin of [[Data Structures Overview and Big-O Cheat Sheet]]. That note has a flowchart that answers "which data structure should I use?". This note turns that flowchart into one tiny Go function, `Choose`: you describe what your code needs (look up by key? always want the smallest? first in, first out?) as a small struct of yes/no flags, and `Choose` returns the name of the right structure. A test then checks every branch, so if the flowchart and the code ever drift apart, the test fails. Read the theory note's flowchart first, then read this top to bottom — it is short, and the only Go you need is structs, a `switch`, and a simple table-driven test.
@@ -55,13 +58,15 @@ flowchart LR
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** that this file turns a "which structure?" flowchart into one function. **Next we read the code:** first the checklist struct `Need`, then the `Choose` function that walks it in priority order. Each step starts with one plain-words line.
+
 ### Step 1: `Need`, the seven questions the flowchart asks
 
 **In plain words:** before picking a structure, write down what your code actually needs as a checklist of yes/no boxes. `Need` is that checklist as a Go struct.
 
 **Concept.** Each field mirrors one branch of [[Data Structures Overview and Big-O Cheat Sheet#Choosing a structure]]'s decision flowchart.
 
-The alternative — a single `enum`-style string field naming one need — was rejected because real code sometimes needs more than one property at once (the leaderboard example needs both `AlwaysNeedTheMin` and `RandomAccessByKey`).
+The alternative — a single `enum`-style (one value picked from a fixed list of names) string field naming one need — was rejected because real code sometimes needs more than one property at once (the leaderboard example needs both `AlwaysNeedTheMin` and `RandomAccessByKey`).
 
 A struct of booleans lets `Choose` pick a priority order explicitly instead of forcing the caller to collapse several needs into one label.
 
@@ -145,6 +150,8 @@ It also checks one overlapping case, the leaderboard, to pin the priority order:
 
 A failure here would mean `Choose`'s `switch` branch order or return strings drifted out of sync with the flowchart in the theory note — exactly the kind of silent documentation/code mismatch this test exists to catch.
 
+**What this code does, in plain words:** it lists six example checklists with the structure each one should get, runs `Choose` on each, and complains if any answer differs.
+
 ```go
 package datastructures
 
@@ -200,14 +207,36 @@ Reading it: one test, six table cases (not `t.Run` subtests, so they report as o
 
 ## Pitfalls in the code 🔴
 
+> 🟡 → 🔴 **You now know** how `Choose` works and how the test pins its answers. **Next comes the advanced part:** the ways this kind of priority `switch` breaks silently, and exercises that make you predict the result before you run it.
+
 - Adding a new field to `Need` without also adding a `case` for it in `Choose` silently falls through to whatever `case` comes next (or `default`) — there's no compiler warning for an unhandled boolean field, unlike an unhandled case in a `switch` over an enum type.
-- The priority order in `Choose` is load-bearing: swapping the order of two `case` branches changes behaviour for any `Need` that sets both of their fields, with no type error to catch the swap.
+- The priority order in `Choose` is load-bearing (other behaviour depends on it, so changing it breaks things): swapping the order of two `case` branches changes behaviour for any `Need` that sets both of their fields, with no type error to catch the swap.
 
 ## Exercises 🔴
 
 1. **Change it, predict the result:** add a new field `NeedsPrefixSearch bool` to `Need`, with a `case` in `Choose` returning `"trie"`. Where in the priority order should it go relative to `RandomAccessByKey`, and why — think about which need a trie actually satisfies better.
 2. **Change it, predict the result:** reorder the `AlwaysNeedTheMin` and `FIFO` cases in `Choose` (put `FIFO` first). Construct a `Need{AlwaysNeedTheMin: true, FIFO: true}` and predict what `Choose` now returns before running it.
 3. **Change it, predict the result:** change `Choose`'s `default` case to return `"hash table (map)"` instead of `"slice"`. Explain in one sentence why the theory note's advice ("start with a slice or map") still holds even though you changed which one is the literal default.
+
+## Self-check 🟢🟡
+
+> [!question]- What does `Choose(Need{})` return, with no fields set?
+> `"slice"`, the `default` case: start simple.
+
+> [!question]- What does `Choose(Need{FIFO: true})` return?
+> `"queue (ring buffer or channel)"`.
+
+> [!question]- Why is `Need` a struct of `bool` fields and not one enum value?
+> Real code can need several things at once, like the leaderboard's "min" and "lookup by key".
+
+> [!question]- For `Need{AlwaysNeedTheMin: true, RandomAccessByKey: true}`, which wins and why?
+> `"heap"`, because its `case` comes first in the `switch`, and the first true case wins.
+
+> [!question]- Why was a map from `Need` to a name rejected?
+> A map cannot say which need wins when several fields are true; the `switch` order can.
+
+> [!question]- You add a `NeedsPrefixSearch` field but forget its `case`. What happens?
+> No compiler error; the need is silently ignored and an earlier case or `default` answers instead.
 
 ## Links
 

@@ -32,6 +32,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Latency Numbers Every Engineer Should Know]]: reading memory takes well under a millisecond, while a database query over the network takes several milliseconds or more.
+> - [[Memory Hierarchy and CPU Caches]]: small, fast storage sits in front of big, slow storage, and the fast part keeps copies of what you used recently.
+
 **From zero, in 60 seconds** 🟢
 
 Your database is a filing cabinet down the hall: it has the real answer, but every trip there is slow. A **cache** is a sticky note on your monitor: a quick copy of an answer you keep fetching anyway.
@@ -76,6 +80,10 @@ So the server keeps a quick copy of the answer nearby and reuses it for the next
 | Hit ratio | Share of reads the cache answers | 95 of 100 reads hit = 95% |
 | Stale | A copy that no longer matches the source | Cache says ₹499, DB now says ₹549 |
 | Redis | A fast in-memory key-value server many apps share | `SET`, `GET`, `EXPIRE` |
+| TTL (time to live) | How long a cached copy may be used before it expires | 60 s for a product price |
+| Eviction | The cache throwing out an entry because it is full | Oldest unused product dropped |
+| p50 / p99 | The time that 50% / 99% of requests finish within | p99 = 20 ms: only 1 in 100 is slower |
+| CDN | A network of servers near users that keep copies of files | An image served from a Mumbai server |
 
 **Picture it**
 
@@ -103,13 +111,22 @@ Where it breaks: a real sticky note never vanishes on its own, but cache entries
 
 ## 1. Why it exists 🟢
 
+🟢 **Plain version:** Asking the database takes about 20 ms. Asking Redis takes well under 1 ms. If the cache answers 95 out of 100 reads, the database only does 5 of them, so it stays calm and the page is fast. One cache server is often cheaper than the extra database servers you would need without it. The bullets below put real measured numbers on this.
+
 Take a product page that needs one product row plus its price and stock. Without a cache, every view runs the queries against PostgreSQL.
 
-- **Latency:** say the queries take 20 ms at p50 (an estimate for an indexed lookup plus a join on a busy primary). A Redis `GET` on the same host took **0.063 ms at p50 and 0.319 ms at p99** (measured on Redis 8.2 with `redis-benchmark -t get -c 1 -n 20000`, localhost). Across a network inside one zone, add roughly 0.2–0.5 ms (estimate).
-- **Load:** at 5,000 reads per second, the database runs 5,000 query sets per second. With a 95% hit ratio it runs 250. That is the difference between needing read replicas and not.
+- **Latency:** say the queries take 20 ms at p50 (an estimate for an indexed lookup plus a join on a busy **primary**, the main database server that takes writes). A Redis `GET` on the same host took **0.063 ms at p50 and 0.319 ms at p99** (measured on Redis 8.2 with `redis-benchmark -t get -c 1 -n 20000`, localhost). Across a network inside one zone, add roughly 0.2–0.5 ms (estimate).
+- **Load:** at 5,000 reads per second, the database runs 5,000 query sets per second. With a 95% hit ratio it runs 250. That is the difference between needing **read replicas** (extra copies of the database that only answer reads) and not.
 - **Cost:** memory is more expensive per GB than disk, but one cache node that absorbs 95% of reads is often cheaper than the extra database capacity it replaces.
 
 The same idea appears in hardware ([[Memory Hierarchy and CPU Caches]]) and in the operating system ([[Page Cache, File Systems and fsync]]). This note is about caches you design yourself in a backend system.
+
+### Real-life example: a restaurant menu on Swiggy 🟢
+
+When you open a popular restaurant on a food app like Swiggy, thousands of other people are opening the same menu at the same minute.
+The menu changes rarely, maybe a few times a day, so the app can keep a ready copy in a cache instead of asking the database every time.
+Your phone gets the menu in a blink, and the database is left free for things that must be exact, like placing your order and taking payment.
+If the restaurant changes a price, the copy is refreshed or expires after its TTL, so for a short while some people may still see the old price.
 
 ## 2. Mental model 🟢
 
@@ -121,7 +138,17 @@ Three problems follow directly from the analogy:
 - **The monitor has limited space.** When it is full, some note must go. That is **eviction** (see [[Cache Eviction Policies - LRU, LFU, TTL]]).
 - **If the note falls off, many people walk to the cabinet at once.** That is a **stampede** (see [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]).
 
+## Common beginner mistakes 🟢
+
+- **Treating the cache as the only copy** → a cache can be wiped or restarted at any time, so data that lives only there is lost → always keep the real value in the database and let the cache be a copy.
+- **Caching without a TTL or size limit** → old keys pile up and memory fills, or stale prices live forever → give every entry a TTL and set a memory limit with an eviction policy.
+- **Leaving the user or tenant out of the key** → `dashboard:summary` built for one customer is shown to another → put the user or tenant ID in the key for any private data.
+- **Caching data that must be exact** → a cached balance or payment status can be a few seconds old → read those straight from the database.
+- **Watching only the average speed** → the average looks great while 1 in 20 users waits 20 ms on a miss → also track hit ratio per key prefix and p99 latency.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a cache is a fast, throw-away copy and that the hit ratio decides how much it helps. **Next we open the box**: the exact steps of a cached read, the small formula behind hit ratio, the layers where caches live, and why "inside the program" and "shared Redis" behave so differently.
 
 ### A read through a cache
 
@@ -135,6 +162,20 @@ Who performs step 4 (the application, the cache library or a background job) is 
 ### Hit-ratio maths
 
 **In plain words:** one tiny formula tells you what a cache buys: the average read pays the cache lookup always, and the slow database trip only on the misses. The database feels misses, not hits.
+
+**Step by step:**
+1. 100 reads arrive. Every one checks the cache first, which costs about 0.5 ms.
+2. Say 95 are hits. They are done after that 0.5 ms.
+3. The other 5 are misses. Each also walks to the database and pays about 20 ms more.
+4. Spread over all 100 reads, the misses add 5 × 20 ms ÷ 100 = 1 ms. So the average read takes about 1.5 ms.
+5. The database only saw 5 reads, not 100. That is why the miss share matters most.
+
+```mermaid
+flowchart LR
+    R["100 reads"] --> C["Cache check<br/>(0.5 ms each)"]
+    C -- "95 hits" --> D["Done"]
+    C -- "5 misses" --> DB["Database<br/>(+20 ms each)"] --> D
+```
 
 Let `h` be the hit ratio, `t_c` the cache lookup time and `t_db` the source-of-truth time. A miss usually pays for the cache lookup as well, so:
 
@@ -162,6 +203,14 @@ Two lessons:
 
 **In plain words:** a request can be answered from a cache at nearly every hop on its journey, from the browser all the way into the database's own memory. Each layer answers for a different audience.
 
+**Step by step:**
+1. You open a product page. Your **browser** first checks its own saved copy of the logo and scripts. If they are still fresh, no request leaves your phone.
+2. Requests that do leave go to a nearby **CDN** server, which may already hold the product images for everyone in your city.
+3. The API call passes a **reverse proxy** (a server in front of the app that forwards requests and can reuse public answers).
+4. Inside the app, a small **in-process** map may already know common things like the list of categories.
+5. If not, the app asks the shared **Redis** cache for `product:42:v1`.
+6. Only if every layer misses does the app query the database, which still keeps hot pages of its tables in its own memory.
+
 A request can meet a cache at almost every hop:
 
 ```mermaid
@@ -176,12 +225,12 @@ flowchart LR
 
 | Layer | What it holds | Who controls freshness | Shared by |
 | --- | --- | --- | --- |
-| Browser | Static assets, API responses marked cacheable | HTTP headers (`Cache-Control`, `ETag`) | One user |
+| Browser | Static assets, API responses marked cacheable | HTTP headers (`Cache-Control`: how long a copy may be reused; `ETag`: a fingerprint of the content to check if it changed) | One user |
 | CDN | Images, JS/CSS, public pages, video segments | HTTP headers + purge API | Everyone near that edge |
 | Reverse proxy / gateway | Public `GET` responses | Proxy config + headers | All users of that proxy |
 | In-process (L1) | Small, hot, rarely changing data: config, feature flags, lookup tables | Your code | One process |
 | Distributed (L2) | Sessions, rendered fragments, query results, counters | Your code | Every instance of every service that uses it |
-| Database internals | Hot pages and index blocks (PostgreSQL `shared_buffers`), precomputed results (materialized views) | The database engine | All queries |
+| Database internals | Hot pages and index blocks (PostgreSQL `shared_buffers`, its memory area for recently used table pages), precomputed results (**materialized views**: a saved query result the database refreshes on demand) | The database engine | All queries |
 
 Details of the HTTP layers belong to [[HTTP Caching - Cache-Control, ETag, Conditional Requests]] and [[CDN and Edge]].
 
@@ -196,6 +245,13 @@ Cold caches are normal after deploys, purges and new regions.
 
 **In plain words:** a cache inside your program is fastest but private to each instance; a shared cache like Redis is one copy for everyone but costs a network hop. Many systems use a small one in front of the other.
 
+**Step by step:**
+1. Your service runs as two copies, instance A and instance B.
+2. Instance A keeps its own little map. It reads `category:list` once, keeps it, and answers the next reads in about 100 nanoseconds.
+3. Instance B has its own separate map, so it must fetch the same value once more.
+4. An admin renames a category. Instance A's map still shows the old name until its TTL ends, while B, having fetched later, may show the new one.
+5. With Redis instead, both instances read one shared copy, so a single delete fixes both, but every read now pays a network trip of about 0.1 to 0.5 ms.
+
 ```mermaid
 flowchart TB
     subgraph A["Instance A"]
@@ -209,7 +265,7 @@ flowchart TB
     RD -- "miss" --> PG[("PostgreSQL<br/>source of truth")]
 ```
 
-- **In-process** (a Go map behind a mutex, or a library such as Ristretto): no network hop, no serialisation. But each instance has its own copy, so instances disagree after a write, memory is multiplied by the instance count, and the cache is empty after each restart.
+- **In-process** (a Go map behind a **mutex**, a lock that lets only one goroutine touch the map at a time, or a library such as Ristretto, a ready-made Go cache): no network hop, no **serialisation** (turning a Go value into bytes, for example JSON, so it can be sent or stored). But each instance has its own copy, so instances disagree after a write, memory is multiplied by the instance count, and the cache is empty after each restart.
 - **Distributed** (Redis, Memcached): one shared copy, survives deploys of the application, one place to invalidate. But it costs a network round trip plus encoding and decoding, and it is another service that can fail.
 - **Both (two-level):** a tiny L1 with a short TTL in front of Redis. How to keep the two levels in step is covered in [[Caching Patterns]].
 
@@ -247,6 +303,8 @@ func (c *Cache) Get(key string) (string, bool) {
 The full version below adds `Set`, a hit-ratio method, an injectable clock for tests, and the latency formula from section 3.
 
 ### Full code (Go 1.24, standard library only)
+
+**What this code does, in plain words:** it keeps a map from key to value, and stamps every value with the time it expires. `Get` throws away an expired value when someone reads it and counts the read as a miss. It also counts hits and misses so you can print the hit ratio.
 
 ```go
 // Package fundamentals is a minimal in-process cache with TTL and hit-ratio stats.
@@ -401,7 +459,7 @@ func TestConcurrentAccess(t *testing.T) {
 
 How much memory do 1 million cached products need? Measured on Redis 8.2: 100,000 keys named like `product:42:v1`, each holding a 500-byte string, grew `used_memory` by **about 575 bytes per key** without a TTL and **about 590 bytes per key** with one (the expiry is stored in a second table). `MEMORY USAGE product:42:v1` reported 528 bytes for one key.
 
-So 1 million such products need roughly 590 MB, before replication and before the fragmentation headroom that Redis needs (an estimate: plan for 1.3–1.5× the data size). The extra ~90 bytes per key over the value size is per-key overhead, which is why caching millions of tiny values costs more than their raw size suggests.
+So 1 million such products need roughly 590 MB, before replication and before the **fragmentation** (small unusable gaps left in memory as values come and go) headroom that Redis needs (an estimate: plan for 1.3–1.5× the data size). The extra ~90 bytes per key over the value size is per-key overhead, which is why caching millions of tiny values costs more than their raw size suggests.
 
 ## 5. Variants and comparison 🟡
 
@@ -412,6 +470,17 @@ So 1 million such products need roughly 590 MB, before replication and before th
 | Distributed cache | Shared Redis or Memcached cluster | Data shared across instances, sessions, query results | Network hop, serialisation, another service to run |
 | Two-level (L1 + L2) | Short-TTL L1 in front of Redis | Very hot keys where even Redis is the bottleneck | Two places to invalidate |
 | Database-side (materialized view, buffer pool) | The database precomputes or keeps hot pages in RAM | Expensive aggregations that can be a few minutes old | Refresh cost; still a database round trip |
+
+### Cache vs read replica 🟡
+
+People often mix these up, because both take read load off the main database.
+
+| | Cache (Redis) | Read replica |
+| --- | --- | --- |
+| What it holds | Only the keys you chose to copy, for a TTL | A full copy of the whole database |
+| How you read it | `GET product:42:v1` by exact key | Any SQL query |
+| Safe to lose? | Yes, it refills from the database | Yes, but rebuilding it takes hours |
+| Typical speed | Under 1 ms | Same as the main database, several ms |
 
 ## 6. Trade-offs and when not to use 🟡
 
@@ -427,8 +496,10 @@ Measure first: find the slow, hot reads in your traces, then cache those.
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how a cached read works, how hit ratio turns into speed and database load, and where each kind of cache lives. **Next is the advanced part**: how big companies design keys, what breaks when a cache fails, what to put on a dashboard, and why the size of the "hot" data matters more than the size of all data.
+
 - **Real systems:**
-	- Facebook ran Memcached as a look-aside cache in front of MySQL at very large scale, and published the problems that followed (stale sets, thundering herds, cross-region invalidation) in *Scaling Memcache at Facebook* (NSDI 2013).
+	- Facebook ran Memcached (an older, simpler in-memory key-value server) as a **look-aside** cache (the app checks the cache first and fills it itself on a miss) in front of MySQL at very large scale, and published the problems that followed (stale sets, thundering herds, cross-region invalidation) in *Scaling Memcache at Facebook* (NSDI 2013).
 	- PostgreSQL's `shared_buffers` is a database-managed page cache; the docs suggest starting at 25% of RAM on a dedicated server.
 	- CDNs such as CloudFront and Cloudflare cache at the edge (see [[CDN and Edge]]).
 - **Key design:** keys are stable, explicit and include everything that changes the answer.
@@ -494,6 +565,30 @@ clients:ws_123:list:v1:9f2c1a        <- hash of status=active&page=1&sort=name
 - Size by working set; measure bytes per key (about 590 B for a 500 B value with TTL on Redis 8.2).
 - Monitor hit ratio per prefix, evictions, memory, miss latency and DB load from misses.
 - Do not cache data that changes on every read, must be exact, or is cheap to fetch.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is a cache hit?
+> A read that finds the value in the cache, so it skips the slow trip to the database.
+
+> [!question]- If you wipe a cache, what should happen to the system?
+> It gets slower for a while but stays correct, because the database still has the real data.
+
+> [!question]- What does a TTL do?
+> It sets how long a cached copy may be used before it expires and must be fetched again.
+
+🟡 Medium
+
+> [!question]- Going from a 90% to a 99% hit ratio: by how much does database load fall?
+> By 10 times, from 10 misses per 100 reads to 1, because the database only sees misses.
+
+> [!question]- Why can p99 latency stay bad even when the hit ratio is 95%?
+> 5% of reads miss, which is more than 1%, so the p99 read is a miss and pays the full database time.
+
+> [!question]- Name one cost of an in-process cache compared with Redis.
+> Each instance holds its own copy, so after a write the instances disagree, and the copy is empty after every restart.
 
 ## Links 🟢
 

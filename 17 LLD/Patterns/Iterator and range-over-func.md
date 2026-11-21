@@ -31,6 +31,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Generics and Iterators]]: `iter.Seq[V]` is a function type, and Go 1.23 lets `for range` loop over such functions.
+> - [[Interfaces]]: callers can depend on "something that hands out orders" without knowing where the orders live.
+> - [[Error Handling]]: a step that can fail returns an `error`, and the caller must check it rather than drop it.
+
 **From zero, in 60 seconds** 🟢
 
 An **iterator** lets you walk through items one by one without knowing how they are stored: a slice, a tree, or pages from an API. Since Go 1.23, you can write iterators as functions that work with a plain `for range` loop, called **range-over-func**. This note shows the four Go styles of iterators and builds one that fetches pages from an API as you loop. Read the plain-words line above each code block first.
@@ -53,6 +58,9 @@ An iterator gives code the same habit: get the next item only when asked, and cl
 | Pagination | Reading a big table in fixed-size chunks | 4 rows per page |
 | Keyset | Remember the last ID and ask for rows after it | `WHERE id > $last` |
 | Goroutine leak | A goroutine stuck forever, never freed | Sender blocked on a channel nobody reads |
+| Push iterator | The iterator drives and calls your loop body once per item | `for o := range store.All()` |
+| Pull iterator | Your code drives and asks for the next item when it wants one | `for rows.Next() { ... }` |
+| Cursor | The iterator's "where am I" state, often an open database result | The last ID seen plus an open query |
 
 **Picture it**
 
@@ -89,7 +97,11 @@ An iterator gives the caller a plain loop and keeps three things inside it:
 
 - **Storage is hidden.** The same loop works over a slice in tests and over database pages in production.
 - **Evaluation is lazy.** Nothing is fetched until the loop asks for it. In the worked example, finding the sixth order with a page size of 4 costs **2** page fetches out of 3.
-- **Paging and cleanup live in one place.** The iterator knows the keyset (the last ID seen, used as `WHERE id > $last` for the next page), the page size and when to release the cursor.
+- **Paging and cleanup live in one place.** The iterator knows the keyset (the last ID seen, used as `WHERE id > $last` for the next page), the page size and when to release the cursor (the open position in the database result).
+
+### Real-life example 🟢
+
+Picture scrolling your order history in Swiggy or Flipkart. The app does not download all your past orders at once; it loads about 10, and fetches the next 10 only when you reach the bottom. If you find the order you wanted and stop scrolling, nothing more is loaded. Your thumb just keeps asking for "the next one", and the app hides where the orders come from and how they are fetched. That "give me the next item, and stop when I stop" idea is an iterator.
 
 ## 2. Mental model 🟢
 
@@ -98,9 +110,11 @@ A card dealer. You do not get the deck; you get one card each time you ask, and 
 Go has two ways to hold that conversation:
 
 - **Push** (`iter.Seq`, callbacks): the dealer drives. It calls your code (`yield`) once per card; you answer `true` for "keep going" or `false` for "stop". A `for range` loop over a function is written like a normal loop, but the loop body is the `yield` function.
-- **Pull** (`Next`/`Err`/`Close`, `iter.Pull`): you drive. You call `Next()` whenever you want the next card. That is what you need to walk two sequences in step, such as merging two sorted streams.
+- **Pull** (`Next`/`Err`/`Close`, `iter.Pull`): you drive. You call `Next()` whenever you want the next card. That is what you need to walk two sequences in step, such as merging two sorted streams (two lists already in order, combined into one ordered list).
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** what an iterator is for: one item at a time, fetched lazily, with cleanup the moment you stop. **Next we open the box**: the four Go styles side by side, the rules `yield` must follow, and how a paginated iterator fetches only the pages it needs.
 
 **In plain words: a function that hands out items one at a time, and stops when the loop stops.**
 
@@ -118,7 +132,7 @@ Go has two ways to hold that conversation:
 The language rules for range-over-func belong to [[Generics and Iterators]]. The parts a design needs are:
 
 - `iter.Seq[V]` is `func(yield func(V) bool)`, and `iter.Seq2[K, V]` is `func(yield func(K, V) bool)`.
-- The compiler turns the loop body into the `yield` function. A `break` or `return` in the body makes `yield` return `false`; a panic in the body unwinds through the iterator.
+- The compiler turns the loop body into the `yield` function. A `break` or `return` in the body makes `yield` return `false`; a panic in the body unwinds (exits function by function, running each `defer`) through the iterator.
 - After `yield` returns `false`, the iterator **must return** without calling `yield` again. Calling it again panics at run time.
 - Because the iterator function returns (or unwinds), its `defer` statements run on every exit: the last item, a `break`, an error, a panic.
 
@@ -234,6 +248,17 @@ func main() {
 **In plain words: a paginated API iterator and a tree walker, with tests.**
 
 `Store.All` is the paginated iterator, `Cursor` adapts it to the `sql.Rows` style with `iter.Pull2`, `Filter` and `Map` compose iterators, and `ChanOrders` is the channel style kept only to show its leak.
+
+**What this code does, in plain words:** the first block has an in-memory order store, `Store.All` that fetches one page at a time and stops when the loop stops, a `Cursor` that offers the same data as `Next`/`Err`/`Close`, and small `Filter` and `Map` helpers. The second block is the tests: a full run, an early `break`, a failure halfway, the pull style, the old callback APIs, and the channel version that leaks.
+
+**Step by step:**
+
+1. `Store` holds the orders, and `Page` returns up to `limit` orders with an ID bigger than `after` (keyset paging).
+2. `Store.All` returns an iterator. It asks `Page` for one page, hands each order to the loop through `yield`, and fetches the next page only when the loop wants more.
+3. If the loop breaks, `yield` returns false and `All` returns at once; the `defer` releases the cursor every time.
+4. `Cursor` wraps the same iterator in `Next` / `Order` / `Err` / `Close` style, using `iter.Pull2`.
+5. `Filter` and `Map` build new iterators on top of old ones; nothing runs until a loop pulls.
+6. `ChanOrders` is the old channel style, kept only so the tests can show its leak; `main` runs each style.
 
 ```go
 // main.go
@@ -646,7 +671,7 @@ The tests check every way out of a loop, because that is where iterators break:
 - **Callbacks:** `fs.WalkDir` stops at once on `fs.SkipAll`, and `sync.Map.Range` stops when the function returns `false`.
 - **Leak:** after a `break`, the channel producer is still blocked; it only exits when the test drains the channel.
 
-**Measured cost** (`go test -bench . -benchmem -count 3`, Apple M4, Go 1.24.4, summing 1,000 ints, on a quiet machine where the 3 runs agree within about 10%). A re-run while the machine was heavily loaded measured `iter.Pull` at about twice the time below, so read the rows as ratios, not as fixed costs:
+**Measured cost** (a benchmark, a test that times code: `go test -bench . -benchmem -count 3`, Apple M4, Go 1.24.4, summing 1,000 ints, on a quiet machine where the 3 runs agree within about 10%). A re-run while the machine was heavily loaded measured `iter.Pull` at about twice the time below, so read the rows as ratios, not as fixed costs:
 
 | Style | Time per 1,000 items | Per item | Allocations |
 | --- | --- | --- | --- |
@@ -654,7 +679,15 @@ The tests check every way out of a loop, because that is where iterators break:
 | `iter.Pull` | 73 µs | ≈ 73 ns | 13 (368 B) |
 | Unbuffered channel + goroutine | 180 µs | ≈ 180 ns | 2 (128 B) |
 
-A push iterator is a function call per item. `iter.Pull` switches between two stacks on every item, and a channel adds a goroutine handoff on top. For a database iterator these costs vanish next to the query; for an in-memory hot loop they do not.
+A push iterator is a function call per item. `iter.Pull` switches between two stacks on every item, and a channel adds a goroutine handoff on top. For a database iterator these costs vanish next to the query; for an in-memory hot loop (a loop that runs millions of times) they do not.
+
+## Common beginner mistakes 🟢
+
+- **Mistake:** loading every row into a slice before looping. → **Why it's wrong:** millions of rows sit in memory when the answer was the sixth one. → **Do this instead:** fetch one page at a time inside the iterator, as `Store.All` does with `Page`.
+- **Mistake:** ignoring the `bool` that `yield` returns. → **Why it's wrong:** when the caller writes `break`, your loop keeps going, and Go panics because `yield` was called after the loop stopped. → **Do this instead:** write `if !yield(o, nil) { return }`, as in `Store.All`.
+- **Mistake:** using a channel fed by a goroutine as the iterator, like `ChanOrders`. → **Why it's wrong:** if the caller stops early, the goroutine waits forever to send the next item (a leak). → **Do this instead:** use a range-over-func iterator (`iter.Seq` / `iter.Seq2`), which simply returns when the loop stops.
+- **Mistake:** forgetting cleanup when the loop ends early or fails. → **Why it's wrong:** the database cursor stays open, and open cursors pile up. → **Do this instead:** release it with `defer` inside the iterator, as `Store.All` does with `s.open--`, and always call `Cursor.Close` when using the pull style.
+- **Mistake:** dropping errors halfway through paging. → **Why it's wrong:** the caller sees a short list and thinks it saw everything. → **Do this instead:** yield the error as the second value (`iter.Seq2[Order, error]`) and stop.
 
 ## 5. Variants and comparison 🟡
 
@@ -677,11 +710,13 @@ A push iterator is a function call per item. `iter.Pull` switches between two st
 - **Do not use channels as iterators.** Use a channel only when producer and consumer really should run concurrently, and then pass a `ctx` so the producer can stop ([[Goroutines and Channels]]).
 - **Iterators are not goroutine-safe.** A sequence is driven by one loop. Two goroutines ranging over the same `Store.All` would race on its counters, and `yield` must never be called from another goroutine without synchronisation.
 
+> 🟡 → 🔴 **You now know** how to write push and pull iterators, compose them and test every way out of a loop. **Next comes the production view**: iterators in Go's standard library, the leaks and silent truncations they cause, and the deeper costs of `iter.Pull`, channels and `OFFSET` paging.
+
 ## 7. In production 🔴
 
 - **Real systems:**
-	- `database/sql.Rows`: `for rows.Next() { rows.Scan(…) }`, then `rows.Err()`, with `defer rows.Close()`. An unclosed `Rows` holds a pooled connection.
-	- `bufio.Scanner`: `Scan()` returns `false` at EOF and on error; only `Err()` tells them apart.
+	- `database/sql.Rows`: `for rows.Next() { rows.Scan(…) }`, then `rows.Err()`, with `defer rows.Close()`. An unclosed `Rows` holds a pooled connection (one of a small shared set of reusable database connections).
+	- `bufio.Scanner`: `Scan()` returns `false` at EOF (end of the input) and on error; only `Err()` tells them apart.
 	- `fs.WalkDir` and `filepath.WalkDir`: callbacks that stop with `fs.SkipDir` or `fs.SkipAll` (the latter since Go 1.20). [[File Search (Unix find)]] is built on this.
 	- `slices.All`, `slices.Values`, `slices.Backward`, `maps.Keys`, `maps.All` (Go 1.23) and `strings.Lines`, `strings.SplitSeq`, `strings.FieldsSeq` (Go 1.24) return `iter.Seq` values.
 	- Paginated order exports and admin scans: the `Store.All` shape, with the keyset query of [[Pagination, Filtering and Sorting]].
@@ -703,7 +738,7 @@ Range-over-func has no second goroutine, so it has nothing to leak.
 
 **What `iter.Pull` costs.** It runs the push iterator on a separate goroutine stack and switches to it on each `next()` call.
 
-The runtime hands control over directly with a coroutine switch instead of parking one goroutine on a channel and waking the other through the scheduler, which is why it measured faster than the channel version above but far slower than a plain range.
+The runtime hands control over directly with a coroutine switch (jumping straight to the other paused function) instead of parking one goroutine on a channel and waking the other through the scheduler (the part of Go that decides which goroutine runs next), which is why it measured faster than the channel version above but far slower than a plain range.
 
 Until `stop()` is called or the sequence ends, that suspended iterator holds whatever it opened.
 
@@ -758,6 +793,26 @@ If the export must be consistent, run all pages inside one `REPEATABLE READ` tra
 - Measured on 1,000 ints: range-over-func 2.5 µs, `iter.Pull` 73 µs, channel 180 µs.
 - Channel iterators leak on early stop; keyset paging beats `OFFSET`.
 - Test full run, early break and error, and assert the cleanup.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What is an iterator, in one line?
+> Code that hands out items one at a time, so the caller never needs to know how they are stored.
+
+> [!question]- 🟢 What does "lazy" mean for the paginated iterator?
+> It fetches the next page only when the loop asks for more items.
+
+> [!question]- 🟢 What must an iterator do when `yield` returns `false`?
+> Return at once and never call `yield` again; its `defer` then cleans up.
+
+> [!question]- 🟡 Why does a channel-based iterator leak after a `break`?
+> The producer goroutine blocks forever trying to send the next item that nobody will receive.
+
+> [!question]- 🟡 How should a database iterator report a failed page fetch?
+> Use `iter.Seq2[Order, error]` and yield `(Order{}, err)` once, then stop.
+
+> [!question]- 🟡 Why is keyset paging better than `OFFSET` deep into a table?
+> `OFFSET` still reads and throws away every skipped row, so pages get slower; keyset jumps straight to `id > last` through the index.
 
 ## Links 🟢
 

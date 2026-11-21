@@ -31,6 +31,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (lifecycle, determinism, retries), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Saga Pattern]]: a multi-step process across services undoes earlier steps (compensates) when a later step fails.
+> - [[Background Jobs and Worker Pools]]: workers take jobs from a queue, retry failures, and may run a job twice.
+> - [[Timeouts, Retries and Backoff]]: give every call a time limit and retry with growing waits.
+> - [[Idempotency and Idempotency Keys]]: a stable key lets a repeated call (such as a charge) take effect only once.
+
 **From zero, in 60 seconds** 🟢
 
 Some business tasks have many steps and can take days: reserve stock, charge the card, book a courier.
@@ -76,6 +82,10 @@ A workflow engine remembers every finished step, so the process picks up exactly
 | Deterministic | Same input always gives the same path through the code | No `time.Now()` or random numbers |
 | Idempotent | Doing it twice has the same effect as once | Charge with key `order-7` only once |
 | Retry with backoff | Try again after waiting longer each time | Wait 1 s, 2 s, 4 s ... |
+| Compensation | A step that undoes an earlier step after a later one fails | Refund the charge, release the stock |
+| Webhook | An HTTP call another company's system makes to yours to report something | Courier says "booked" |
+| Temporal | A popular open-source workflow engine with SDKs for Go and other languages | `workflow.ExecuteActivity(...)` |
+| Continue-As-New | Restarting a long workflow with a fresh, empty history but the same ID | A monthly billing loop every year |
 
 **Picture it**
 
@@ -122,6 +132,8 @@ Built by hand, this becomes:
 
 The business logic ("charge, then ship, refund on failure") is scattered across 6 places. Each new step needs a migration, a queue and new crash-recovery logic. A bug in any one leaves orders stuck in `CHARGING` with nobody knowing whether the card was charged.
 
+**Real-life example.** Ordering on an e-commerce app like Flipkart is a long process: hold the item, take payment, wait for a seller to pack it, book a courier, then wait days for delivery, with refunds if anything fails. Ride and food apps run similar multi-step flows; Uber built Cadence, the engine Temporal grew from, for exactly this. The engine is what lets that whole process survive server restarts without charging twice or forgetting a step.
+
 A workflow engine lets you write the flow as one function and makes the engine responsible for persistence, retries, timers and recovery.
 
 **Same flow, by hand vs with an engine:**
@@ -154,6 +166,14 @@ Terms:
 - **Signal:** a message sent into a running workflow from outside (for example "courier confirmed").
 - **Durable timer:** a sleep stored by the engine, so `Sleep(48h)` survives restarts and costs no worker resources while waiting.
 
+## Common beginner mistakes 🟢
+
+- **Calling `time.Now()` or making HTTP calls inside workflow code** → on replay the code takes a different path and the engine raises a nondeterminism error → use the SDK's time functions and put all I/O in activities.
+- **Assuming an activity runs exactly once** → a worker can finish the charge and die before reporting, so it is retried → pass a stable idempotency key to the payment API.
+- **Leaving out the StartToClose timeout** → an activity stuck on a hung call waits forever → always set it, and heartbeat long activities.
+- **Changing workflow code without versioning** → workflows already running replay against the new code and fail → wrap changes with `GetVersion` and replay-test saved histories.
+- **Passing big files as activity inputs or results** → everything is stored in history, which has size limits → pass IDs and keep the data in a store.
+
 **The cook's notebook, drawn:**
 
 ```mermaid
@@ -164,6 +184,8 @@ flowchart LR
 ```
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a workflow engine saves the result of every finished step and replays your function after a crash, skipping what is already done. **Next we open the box**: how workers and the engine pass tasks, the life of one execution, what "deterministic" really forbids, and how retries and timeouts are declared.
 
 ```mermaid
 sequenceDiagram
@@ -196,6 +218,13 @@ Step by step:
 
 **In plain words:** a workflow is started, runs, may wait for days, and ends as done, failed, cancelled or timed out. The picture shows each move.
 
+**Step by step:**
+1. The client starts workflow `order-7`. It is now running.
+2. It reserves stock and charges the card, then waits up to 48 hours for the courier's webhook (a signal).
+3. While it waits, no worker is busy: the engine just holds a durable timer.
+4. The signal arrives on day 2. The workflow wakes, books the delivery and completes.
+5. Had the timer fired first, the workflow would run its compensations (refund, release stock) and end as failed or completed with a refund.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Running: StartWorkflow(id)
@@ -218,6 +247,13 @@ stateDiagram-v2
 
 **In plain words:** the flow code is run again during replay, so it must make the same choices every time. Time, random numbers and network calls go through the engine.
 
+**Step by step (how a bad line breaks replay):**
+1. Workflow code says: "if `time.Now()` is before 6 pm, use express courier, else standard".
+2. The first run happens at 5:59 pm, so history records "scheduled express courier".
+3. The worker crashes. Another worker replays the function at 6:01 pm.
+4. Now the code asks for "standard courier", but history says "express". The engine sees the mismatch and stops with a nondeterminism error.
+5. Using `workflow.Now(ctx)` instead returns the time recorded in history, so the replay makes the same choice.
+
 Workflow code runs many times over the life of one execution. Anything that could differ between runs must go through the SDK so its value is recorded in history:
 
 | Do not use in workflow code | Use instead (Temporal Go SDK) |
@@ -231,6 +267,13 @@ Workflow code runs many times over the life of one execution. Anything that coul
 ### Retries and timeouts
 
 **In plain words:** you declare once how to retry a step (wait 1 s, then 2 s, then 4 s ...) and how long it may take; the engine does the rest.
+
+**Step by step:**
+1. `BookCourier` has StartToClose = 30 s, so any single attempt is cut off after 30 seconds.
+2. The first attempt fails with a timeout from the courier API. The engine waits 1 s and tries again.
+3. Further failures wait 2 s, 4 s, 8 s ... up to the maximum interval.
+4. You set MaximumAttempts = 3. After the third failure the activity fails for good, and the workflow runs its compensation.
+5. A "card declined" error is marked non-retryable, so it stops at once with no retries.
 
 Activities get retry policies declared once, not hand-written loops. Temporal's default activity retry policy:
 
@@ -622,7 +665,7 @@ The 48-hour wait is a durable timer: no goroutine sleeps for 48 hours. The engin
 | AWS Step Functions | State machine in JSON (Amazon States Language); each state calls a Lambda or AWS API | AWS-native orchestration, few custom services | Logic in JSON, not code; per-transition pricing on Standard |
 | Azure Durable Functions | Orchestrator functions replayed from history, like Temporal | Azure Functions shops | Azure lock-in; same determinism rules |
 | Restate, DBOS, Inngest | Durable execution as a library or lightweight service, often journaling steps in a DB you already run | Smaller teams wanting durable steps without a big cluster | Younger ecosystems |
-| Airflow, Argo Workflows | DAGs of batch tasks on a schedule | Data pipelines, ETL, ML training | Not built for per-request workflows with signals and low latency |
+| Airflow, Argo Workflows | DAGs (graphs of tasks where each runs after the ones it depends on) of batch tasks on a schedule | Data pipelines, ETL (extract, transform, load: moving data into a warehouse), ML training | Not built for per-request workflows with signals and low latency |
 | Hand-built state machine | Status column + queues + cron + webhook handlers | Two or three steps, short-lived | Recovery and retries are your code and your bugs |
 | Choreography with events | Each service reacts to the previous one's event | Loosely coupled flows with no central owner | Hard to see the whole flow or change it; see [[Saga Pattern]] |
 
@@ -646,7 +689,9 @@ The 48-hour wait is a durable timer: no goroutine sleeps for 48 hours. The engin
 
 ## 7. In production 🔴
 
-- **Real systems:** Cadence was built at Uber and open-sourced in 2017; Temporal was forked from it in 2019 by Cadence's original authors. Typical uses: order and payment flows, onboarding and KYC with human steps, infrastructure provisioning, subscription billing loops, and long-running sagas.
+> 🟡 → 🔴 **You now know** how the engine and workers pass tasks, why workflow code must be deterministic, how retries and timeouts work, and the same flow in a toy engine and in Temporal. **Next is the advanced part**: real deployments, the production failures, and how replay, at-least-once activities and versioning work under the hood.
+
+- **Real systems:** Cadence was built at Uber and open-sourced in 2017; Temporal was forked from it in 2019 by Cadence's original authors. Typical uses: order and payment flows, onboarding and KYC (know your customer: identity checks) with human steps, infrastructure provisioning, subscription billing loops, and long-running sagas.
 - **Failure modes → fixes:**
 	- *Nondeterminism error after a deploy.* Workflow code changed the order or type of commands. Fix: wrap changes in `GetVersion`, run replay tests against saved histories in CI (the Go SDK has a `WorkflowReplayer` for this).
 	- *Activity charged twice.* The activity succeeded but the worker died before reporting, so it was retried. Fix: pass a stable idempotency key (workflow ID plus activity name) to the payment API; see [[Idempotency and Idempotency Keys]].
@@ -707,6 +752,30 @@ flowchart LR
 - Version changes with `GetVersion`; replay-test histories in CI.
 - Long loops → Continue-As-New (history limits: 51,200 events / 50 MB in Temporal).
 - Step Functions: Standard (1 year, exactly-once steps) vs Express (5 min, at-least-once async / at-most-once sync).
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does a workflow engine save after each finished step?
+> The step's result, in the workflow's event history.
+
+> [!question]- What is an activity?
+> One step that touches the outside world, such as charging a card; it can fail and be retried.
+
+> [!question]- After a crash, does the engine run finished steps again?
+> No. It replays the code and returns the saved results for steps already in history.
+
+🟡 Medium
+
+> [!question]- Why can't workflow code call `time.Now()` directly?
+> On replay the time is different, so the code could take another path than the one recorded in history.
+
+> [!question]- Why must a charge activity still use an idempotency key?
+> The worker can charge and die before reporting, so the engine retries the activity.
+
+> [!question]- What do you do for a workflow that loops forever, like a monthly subscription?
+> Call Continue-As-New regularly so the history starts fresh and stays under its size limit.
 
 ## Links
 

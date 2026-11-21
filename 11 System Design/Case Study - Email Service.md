@@ -35,6 +35,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 9, 10 and 11. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+> - [[Back-of-the-Envelope Estimation]]: turning "100 million users" into messages per second and petabytes.
+> - [[Kafka and Event Streaming]]: a durable queue that keeps messages safe until a worker has handled them.
+
 **From zero, in 60 seconds** 🟢
 
 Email moves between companies' servers using an old, shared language called **SMTP**.
@@ -73,6 +78,10 @@ All of that happens across servers that do not trust each other, while spammers 
 | Spam filter | Code that scores how likely a message is junk | Score 9/10 -> Junk folder |
 | Mailbox storage | Where each user's messages are kept | Messages for `ana@` on a shard |
 | Push | Telling a device right away that mail arrived | Phone notification |
+
+| Bounce | A reply mail saying "could not deliver" | "user unknown at x.com" |
+| Blob store | Cheap storage for big files, found by an ID | attachments in object storage |
+| Shard | One slice of the data on its own database | all of ana@'s mail on shard 12 |
 
 **Picture it**
 
@@ -118,9 +127,16 @@ Behind that: millions of servers that do not trust each other, a protocol from t
 - **Durability: never lose an accepted message.** Once we answer `250 OK` to a sending server, the mail must survive any single failure.
 - **Availability:** inbound SMTP must be up (senders retry for days, but outages hurt trust); mailbox reads high availability.
 - **Latency:** inbox list under about 200 ms; delivery to inbox within a few seconds p99; search under about 500 ms.
-- **Security:** authenticate senders, stop forgery, encrypt in transit (STARTTLS), isolate attachments' malware risk.
+- **Security:** authenticate senders, stop forgery, encrypt in transit (STARTTLS, a command that switches an SMTP connection to encrypted), isolate attachments' malware risk.
 - **Scale:** hundreds of millions of users, petabytes of data, mailboxes that grow forever.
 - Out of scope: calendar, chat, enterprise admin, end-to-end encryption (PGP/S-MIME).
+
+### Real-life example: an OTP email 🟢
+
+You sign up on a shopping site and it emails you a one-time code. Your Gmail inbox shows it within seconds.
+Behind the scenes the site's mail server looked up Gmail's mail servers, connected over SMTP, and handed the message over.
+Gmail checked the site really owns its domain (SPF, DKIM, DMARC), scored it for spam, saved it in your mailbox and pinged your phone.
+If Gmail had been busy, the site's server would have retried a few minutes later instead of giving up.
 
 **Glossary.**
 - **MTA** (mail transfer agent): a server that speaks SMTP to move mail between domains. **MUA**: the user's mail client.
@@ -154,7 +170,24 @@ flowchart LR
     OUT -->|"SMTP with retries"| R["Recipient's server"]
 ```
 
+## Common beginner mistakes 🟢
+
+- **Trusting the `From:` line** → anyone can type any address there → check SPF, DKIM and DMARC.
+- **Saying `250 OK` before the message is safely stored** → a crash loses mail the sender thinks was delivered → write to a replicated queue first, then say OK.
+- **Retrying a `550 user unknown`** → it will never work and hurts your sending reputation → stop on `5yz`, retry only on `4yz`.
+- **Storing every attachment copy separately** → one file sent to 1,000 people is stored 1,000 times → store blobs by content hash so copies share one blob.
+- **One global outbound queue** → one slow domain blocks everyone's mail → use per-domain queues and rate limits.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the two jobs: accept mail from strangers safely, and deliver outgoing mail patiently. **Next we open the box** and walk through the receiving path and the sending path, server by server.
+
+**Step by step (plain):**
+1. A shop's server wants to mail `ana@ourmail.com`. It asks DNS (the internet's address book) "who takes mail for ourmail.com?" and gets our inbound servers.
+2. It connects and says who the mail is from and to. We check the shop's address is not on a spam list and that Ana exists.
+3. We check the shop's signature and run the spam and virus filters.
+4. We save the mail safely in a queue, then reply "250 OK".
+5. A worker files it in Ana's mailbox, adds it to her search index, and her phone buzzes.
 
 ```mermaid
 flowchart TB
@@ -189,7 +222,7 @@ flowchart TB
 **Receiving a message, step by step**
 1. A remote server looks up our domain's MX record in DNS and opens an SMTP connection to one of our inbound hosts through the load balancer.
 2. The inbound host checks the connecting IP against reputation lists and rate limits. Bad IPs are refused before any data is read.
-3. It reads `MAIL FROM`, `RCPT TO`, then the message data. It rejects unknown recipients immediately (`550`), which keeps backscatter low.
+3. It reads `MAIL FROM`, `RCPT TO`, then the message data. It rejects unknown recipients immediately (`550`), which keeps backscatter (bounces we would otherwise send to forged sender addresses) low.
 4. The filter pipeline runs SPF, DKIM and DMARC checks, spam scoring and malware scanning of attachments.
 5. The accepted message is written **durably** to the delivery queue (replicated, one record per recipient), and only then does the host answer `250 OK`.
 6. A delivery worker stores the body and attachments in the blob store, inserts a metadata row into the recipient's shard, and enqueues an index job.
@@ -239,7 +272,7 @@ All inputs are **estimates** for a large provider; the point is the method.
 | Mailbox list reads | each user opens inbox ~20 times/day | 100M x 20 / 86,400 | ~23,000 reads/s avg |
 
 What the numbers tell us:
-- Blobs are **100x bigger than metadata**. They need cheap, durable, horizontally scalable object storage (erasure coded, about 1.5x overhead instead of 3x copies). See [[File Uploads and Object Storage]].
+- Blobs are **100x bigger than metadata**. They need cheap, durable, horizontally scalable object storage (erasure coded: data split into pieces plus a few extra repair pieces, about 1.5x overhead instead of 3x copies). See [[File Uploads and Object Storage]].
 - Metadata at 2 TB/day is a sharding problem, not a single-database problem. Shard by user.
 - Reads are small compared to the write volume of the inbound edge, so the **inbound pipeline** is where the throughput challenge is.
 - Dedup matters: one 5 MB deck sent to 1,000 colleagues is 1 blob, not 1,000.
@@ -307,8 +340,8 @@ erDiagram
 Design choices:
 - **Primary key `(user_id, message_id)`.** All rows of one user sit together, so "list my inbox" is one partition scan and a shard holds whole mailboxes. A time-ordered `message_id` (see [[Unique ID Generation]]) gives newest-first listing without a sort.
 - **Labels are a set on the message, not a folder.** Gmail-style labels let one message be in "Inbox" and "Receipts". A secondary table `(user_id, label_id, internal_date, message_id)` serves "list messages with label X". An IMAP folder is just a label.
-- **Blobs are content-addressed** (`sha256` of the bytes). Writing the same attachment again is a no-op. A reference count, or a periodic garbage collection, deletes blobs nobody references.
-- **`history_id`** is a per-user monotonic counter bumped by every change. It powers sync (deep dive 3).
+- **Blobs are content-addressed** (named by `sha256` of the bytes, a fingerprint that is the same for identical files). Writing the same attachment again is a no-op. A reference count, or a periodic garbage collection, deletes blobs nobody references.
+- **`history_id`** is a per-user monotonic counter (it only ever goes up) bumped by every change. It powers sync (deep dive 3).
 - **Where to store metadata:** a sharded relational database (MySQL or Postgres with a shard map) or a wide-column store (Cassandra, Bigtable-style). The access pattern is "everything for one user, ordered by time", which fits both. See [[Choosing a Database - Decision Guide]].
 
 ```mermaid
@@ -349,13 +382,21 @@ flowchart TD
     Q3 -->|"Mostly append-only"| WC["Wide-column store"]
 ```
 
+### Things people confuse this with 🟡
+
+| System | What it does | How it differs from an email service |
+| --- | --- | --- |
+| [[Case Study - Notification System]] | Sends alerts (push, SMS, email) from your app to your users | Only sends; often hands email to a provider such as SES; no mailboxes or search |
+| [[Case Study - Chat System]] | Real-time messages inside one app | One trusted system, open connections, no strangers' servers to verify |
+| Bulk email provider (SES, SendGrid) | Sends email for other companies | Outbound path only, focused on deliverability and reputation |
+
 ## 6. Trade-offs 🟡
 
 - **Reject early vs accept then discard.** Refusing at SMTP time (`550`) is cheap and honest, but a false positive loses a real mail silently from the sender's view (they get a bounce, which is at least visible). Accepting then quarantining in Spam is safer for the user but costs storage and CPU. Real providers do both: hard-reject the obviously bad, quarantine the doubtful.
 - **Durability vs latency at the SMTP edge.** Waiting for a replicated queue write before `250 OK` adds a few milliseconds per message. It is the price of "never lose accepted mail".
 - **Dedup vs privacy and complexity.** Content-addressed blobs save huge space (forwarded attachments) but need reference counting and careful handling when a user deletes. Deduping only within a user's own data avoids cross-user leakage ("does anyone else have this file?" attacks).
 - **Per-user index freshness.** Indexing asynchronously means a mail may be missing from search for a second or two. Acceptable. Indexing synchronously would couple delivery latency to index latency.
-- **Strict DMARC enforcement.** Rejecting everything that fails DMARC stops phishing but also breaks mailing lists that rewrite messages. Providers use ARC headers and heuristics to soften it.
+- **Strict DMARC enforcement.** Rejecting everything that fails DMARC stops phishing but also breaks mailing lists that rewrite messages. Providers use ARC headers (a chain of signatures each forwarding server adds) and heuristics to soften it.
 - **When a simpler design wins.** For a company with 5,000 mailboxes, run Postfix and Dovecot with Maildir on a replicated disk, or just buy hosted email. Building this architecture is only worth it at provider scale.
 
 ```mermaid
@@ -366,9 +407,11 @@ flowchart LR
 
 ## 7. In production 🔴
 
-- **Real examples.** The protocols are fixed by the RFCs listed above, so every provider looks the same from outside. In 2024 Google and Yahoo announced stricter sender requirements for bulk senders: SPF, DKIM, DMARC and a low spam-complaint rate (see Google's email sender guidelines). Open-source stacks like Postfix (MTA), Dovecot (IMAP) and Rspamd (spam scoring) show the same components at small scale.
+> 🟡 → 🔴 **You now know** both pipelines, the sizing, the API and how mailboxes are stored. **Next is the advanced part**: production failures, sender checks in depth, retries and bounces, threads and sync, per-user search, and scaling the whole thing.
+
+- **Real examples.** The protocols are fixed by the RFCs (the official internet standards documents) listed above, so every provider looks the same from outside. In 2024 Google and Yahoo announced stricter sender requirements for bulk senders: SPF, DKIM, DMARC and a low spam-complaint rate (see Google's email sender guidelines). Open-source stacks like Postfix (MTA), Dovecot (IMAP) and Rspamd (spam scoring) show the same components at small scale.
 - **Failure: a recipient domain is down.** Its mail piles up in our outbound queue. Handle with per-domain queues so one slow domain does not block others, exponential backoff, and a cap on queue age (for example give up after 3 to 5 days and bounce).
-- **Failure: our IP gets blocklisted.** Mail to Gmail or Outlook is deferred or rejected. Fix: separate IP pools for transactional vs marketing mail, warm up new IPs gradually, monitor complaint rate, honour unsubscribe.
+- **Failure: our IP gets blocklisted.** Mail to Gmail or Outlook is deferred or rejected. Fix: separate IP pools for transactional vs marketing mail, warm up new IPs gradually (start with small daily volumes so receivers learn to trust them), monitor complaint rate, honour unsubscribe.
 - **Failure: a spam wave hits.** Inbound rate jumps 10x. The edge sheds by reputation first (reject bad IPs with `421` "try later"), and the filter fleet autoscales. Legit senders retry, so deferring is safe; see [[Load Shedding and Graceful Degradation]].
 - **Failure: a shard of mailbox metadata is down.** Inbound mail for those users still queues (queue is separate); reads for those users fail until failover. Replicas promote; the queue replays into the shard afterwards.
 - **What to monitor.** Inbound accepted vs rejected per reason; queue depth and age per recipient domain; delivery latency p99 (SMTP accept to inbox row); bounce rate; spam-complaint rate; DKIM/SPF pass rate; search index lag; blob store error rate.
@@ -404,7 +447,7 @@ flowchart TD
     ML -->|"Low"| IN["Inbox"]
 ```
 
-**Example.** A phisher sends from a VPS pretending to be `alerts@paypal.example`. Step 1: the IP is not in `paypal.example`'s SPF record, so SPF fails. Step 2: no DKIM signature from that domain. Step 3: the domain's DMARC policy says `reject`, so the connection is refused with `550` before the body is stored. The user never sees it.
+**Example.** A phisher sends from a VPS (a cheap rented virtual server) pretending to be `alerts@paypal.example`. Step 1: the IP is not in `paypal.example`'s SPF record, so SPF fails. Step 2: no DKIM signature from that domain. Step 3: the domain's DMARC policy says `reject`, so the connection is refused with `550` before the body is stored. The user never sees it.
 
 **Cheap first.** Reputation and recipient checks use only the connection and envelope, so they run before reading the (large) data. SPF and DKIM need a few DNS lookups (cached). Spam ML and attachment scanning cost the most CPU and run only on survivors. Attachments are scanned in a sandbox and Office macros or executables are blocked or flagged.
 
@@ -517,7 +560,7 @@ flowchart LR
 - **Fields.** `from`, `to`, `subject`, `body`, `label`, `date`, `has_attachment`, `size`. Operators such as `from:` map to field queries; free text maps to body and subject.
 - **Attachments.** Text is extracted (PDF, Office) and indexed asynchronously; OCR for images is optional and expensive.
 - **Update path.** Delivery enqueues an index job keyed by `user_id`, so one user's updates stay ordered. The indexer writes to a small in-memory segment, flushed and merged in the background (an LSM-style approach, see [[Storage Engines - B-tree vs LSM and WAL]]). Label changes are small updates to the posting for that message.
-- **Result order.** Date descending for mail (not TF-IDF relevance), with recency as the dominant factor.
+- **Result order.** Date descending for mail (not TF-IDF relevance, a classic score for how well words match), with recency as the dominant factor.
 - **Cost.** An index is often 20 to 50% of the text size (estimate); do not index spam folders or old, rarely searched mail as eagerly.
 
 **Failure.** If indexer lag grows, search is stale but mail still arrives. The index is a **derived** store: it can always be rebuilt from the mailbox, so a lost index is an incident, not data loss.
@@ -528,11 +571,11 @@ flowchart LR
 ## 9. Bottlenecks, scaling and failure handling 🔴
 
 **Scaling plan**
-1. **Inbound SMTP fleet:** stateless; add hosts behind an L4 load balancer. Multiple MX records with equal preference spread load across regions.
+1. **Inbound SMTP fleet:** stateless; add hosts behind an L4 load balancer (one that forwards raw TCP connections). Multiple MX records with equal preference spread load across regions.
 2. **Filters:** scale horizontally; cache DNS lookups for SPF and DKIM keys, since the same domains repeat.
 3. **Queue:** partition by `hash(recipient_user_id)`; add partitions as volume grows.
 4. **Metadata:** shard by `user_id` through a shard map (not raw `hash mod N`, so you can move a hot or large mailbox). See [[Partitioning and Sharding]].
-5. **Blobs:** object storage scales on its own; use lifecycle rules to move old mail to cold tiers.
+5. **Blobs:** object storage scales on its own; use lifecycle rules to move old mail to cold tiers (cheaper, slower storage classes).
 6. **Search:** add index shards; move large users to dedicated shards.
 7. **Multi-region:** each user has a home region for writes and a replica in a second region; MX records point at the nearest region and mail is routed to the home region. See [[Multi-Region Architecture]].
 
@@ -581,6 +624,26 @@ flowchart LR
 - **Red flags.** Storing attachments in the database; no mention of spam or authentication; synchronous delivery from the SMTP session into the DB; retrying hard bounces forever; global search index without user isolation.
 - **Follow-ups to prepare.** "Add undo send" (delay in the outbound queue by 10 to 30 s). "Support huge attachments" (upload to object storage, send a link; see [[Case Study - File Storage and Sync]]). "Snooze and scheduled send" (a delayed queue). "Confidential mode" (link with expiry, no forwarding). "Mailing lists" (fan-out expansion in a worker, VERP bounce addresses). "Delivery receipts" (not reliable; tracking pixels have privacy cost).
 - **Decision guides to cite.** [[Choosing a Database - Decision Guide]], [[Choosing Storage for Files, Search and Analytics - Decision Guide]], [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]], [[Choosing Consistency, Replication and Partitioning - Decision Guide]].
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what protocol do mail servers use to talk to each other?
+> SMTP.
+
+> [!question]- Easy: what does an MX record tell a sender?
+> Which servers accept mail for a domain.
+
+> [!question]- Easy: why must we save the mail before replying `250 OK`?
+> After OK the sender forgets it, so a crash before saving would lose it for good.
+
+> [!question]- Medium: the reply is `451 try again` vs `550 user unknown`. What do you do with each?
+> Retry `451` later with backoff; stop on `550` and send a bounce to the sender.
+
+> [!question]- Medium: why store attachments by content hash?
+> The same file forwarded to 1,000 people is stored once.
+
+> [!question]- Medium: a phone was offline for a day. How does it catch up cheaply?
+> It sends its last `history_id` and gets only the changes after it.
 
 ## 12. Cheat sheet 🟢
 

@@ -36,6 +36,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (the schemes and the Snowflake layout), 4 (Go code and tests) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Back-of-the-Envelope Estimation]]: you can turn "50,000 orders a second" or "2 to the power 41" into rough, rounded numbers quickly.
+> - [[Partitioning and Sharding]]: one big table can be split over several databases (shards), and each shard works on its own.
+
 **From zero, in 60 seconds** 🟢
 
 Every order, user or message needs its own number, an ID, so you can find it later.
@@ -82,6 +86,12 @@ Unique ID generation is how many machines hand out numbers that never clash.
 | Worker ID | A unique number for each generator | Machine 17 |
 | UUID | A 128-bit ID, often mostly random | `018f...-7...` (UUIDv7) |
 | B-tree index | The sorted structure a database uses to find rows | Primary key index |
+| Sequence (in Snowflake) | A small counter that restarts every millisecond | 0, 1, 2 ... up to 4,095 |
+| Lease | A short-term claim that expires unless renewed | "worker 17 is mine for 30 s" |
+| etcd / ZooKeeper | Small, reliable stores used to hand out leases and locks | `/idgen/workers/17` in etcd |
+| NTP | The service that keeps server clocks in sync; it can nudge a clock back | a 5 ms step back after a sync |
+| Collision | Two records getting the same ID by accident | two orders both `1042` |
+| Time-ordered (k-sorted) | IDs made later are roughly bigger | sort by ID ≈ sort by time |
 
 **Picture it**
 
@@ -121,7 +131,7 @@ You have three ways out, and each has a cost:
 | Random 128-bit IDs (UUIDv4) | Unique without coordination, but random keys scatter inserts across the whole B-tree index, and they say nothing about time. |
 | Time-ordered IDs built locally (Snowflake, UUIDv7, ULID) | Unique without coordination and roughly sorted by time. You must manage worker numbers and clocks. |
 
-A second, quieter problem: sequential IDs leak business data. If a customer sees order `1042` today and `1342` tomorrow, they know you took about 300 orders in a day. Public IDs that are easy to guess also invite enumeration attacks (`/orders/1043`, `/orders/1044`, …).
+A second, quieter problem: sequential IDs leak business data. If a customer sees order `1042` today and `1342` tomorrow, they know you took about 300 orders in a day. Public IDs that are easy to guess also invite enumeration attacks (trying IDs one after another to read other people's data) (`/orders/1043`, `/orders/1044`, …).
 
 ## 2. Mental model 🟢
 
@@ -140,7 +150,24 @@ Think of a deli counter with many ticket machines instead of one.
 
 The two ways this breaks are just as clear in the analogy: two machines given the **same number**, or a machine whose **clock is turned back** so it reprints minutes it already used.
 
+### Real-life example: Discord and Twitter IDs 🟢
+
+Every Discord message, user and server has a long number like `1052789423012347904`. That is a Snowflake ID: the first part is the time it was made, so Discord can sort messages by ID and even tell you when an account was created.
+Twitter invented Snowflake in 2010 when one database counter could no longer keep up with tweets.
+In India, every UPI payment gets a unique transaction reference that you quote when a payment is stuck; the bank's many servers must create these without ever repeating one.
+In all three cases, thousands of machines make IDs at the same time without asking each other.
+
+## Common beginner mistakes 🟢
+
+- **Using each shard's own auto-increment** → two shards both make order `1042` → use one scheme that is unique across all machines (UUIDv7 or Snowflake).
+- **Giving two servers the same worker number** (a copied config) → they create identical IDs in the same millisecond → lease the number so only one live process can hold it.
+- **Ignoring the clock going backwards** → the generator reuses old timestamps and repeats IDs → remember the last time used; wait or refuse if the clock is behind.
+- **Sending 64-bit IDs to a browser as JSON numbers** → JavaScript rounds the last digits → send IDs as strings.
+- **Using an ID as a secret** (like a password-reset link) → IDs can be guessed or decoded → use a separate random token with an expiry.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the two fixes: long random IDs, or IDs built from time + machine number + counter. **Next we open the box**: what every scheme must decide, the schemes from simplest to most spread out, the exact Snowflake bit layout, and how each machine safely gets its number. Most subsections start with a plain walk-through; the full detail follows.
 
 ### What an ID scheme must decide
 
@@ -155,6 +182,13 @@ The two ways this breaks are just as clear in the analogy: two machines given th
 
 **In plain words:** from "one database counts for everyone" to "every machine makes its own IDs with no talking at all". The further down the list, the less waiting, but the more you must manage.
 
+**Step by step:**
+1. One database counts 1, 2, 3 for everyone. Simple, but every new order waits on that one box.
+2. A ticket server is a database whose only job is counting. Still one call per ID.
+3. Batches: a server grabs 1,000 numbers at once (say 5,001-6,000) and hands them out from memory. One call per 1,000 IDs.
+4. Random UUIDs: each machine just picks a huge random number. No calls at all, but no time order.
+5. UUIDv7 and Snowflake: each machine builds the ID from the time plus something unique. No calls, and IDs sort by time.
+
 ```mermaid
 flowchart LR
     A["DB counter<br/>(one box decides)"] --> B["Ticket server / batches<br/>(ask now and then)"] --> C["UUID, UUIDv7, Snowflake<br/>(each machine decides alone)"]
@@ -162,17 +196,24 @@ flowchart LR
 
 - **Database auto-increment** (`BIGSERIAL`, `GENERATED ALWAYS AS IDENTITY`). One sequence, strictly increasing, 8 bytes. Fine until you need more than one writer.
 - **Ticket server** (Flickr, 2010). A dedicated database whose only job is handing out numbers. Flickr ran two of them; one gave odd numbers and the other even numbers (`auto_increment_increment = 2`, offsets 1 and 2), so either could fail without causing duplicates. Every ID is still one network call.
-- **ID batches (hi/lo or segment allocation).** A service grabs a range, for example 1,000 numbers, from the database in one update (`UPDATE id_alloc SET max_id = max_id + 1000 … RETURNING max_id`) and hands them out from memory.
+- **ID batches (hi/lo or segment allocation: the "high" part comes from the database, the "low" part is counted in memory).** A service grabs a range, for example 1,000 numbers, from the database in one update (`UPDATE id_alloc SET max_id = max_id + 1000 … RETURNING max_id`) and hands them out from memory.
 
   One database call per 1,000 IDs instead of per ID. IDs are unique and increasing per server but not globally ordered, and a crash wastes the rest of the batch.
 - **UUIDv4.** 122 random bits (6 bits are fixed for version and variant). The chance of a collision is negligible, and no coordination is needed. The downsides are 16 bytes and no time order.
 - **UUIDv7** (RFC 9562, May 2024). A 48-bit Unix-millisecond timestamp first, then version bits, then 74 random bits. Unique without coordination, like v4, and time-ordered, like Snowflake.
-- **ULID.** The same idea as UUIDv7 that came earlier: 48-bit milliseconds plus 80 random bits, written as 26 Crockford Base32 characters (for example `01JBRQ2Y0G4X…`). It fits in a UUID column.
+- **ULID.** The same idea as UUIDv7 that came earlier: 48-bit milliseconds plus 80 random bits, written as 26 Crockford Base32 characters (digits and capital letters, leaving out look-alikes such as I, L, O) (for example `01JBRQ2Y0G4X…`). It fits in a UUID column.
 - **Snowflake** (Twitter, 2010). 64 bits: 1 unused sign bit, a 41-bit millisecond timestamp since a custom epoch, a 10-bit worker ID and a 12-bit sequence. The worker ID is assigned once; after that every ID is created locally.
 
 ### The Snowflake bit layout
 
 **In plain words:** a Snowflake ID is one 64-bit number cut into slices: time, then machine number, then a counter.
+
+**Step by step (worker 7, 5 ms after our chosen start date):**
+1. Take the time: 5 ms. Shift it left by 22 bits, so it sits in the top part of the number.
+2. Take the worker number, 7. Shift it left by 12 bits, so it sits in the middle.
+3. Take the counter for this millisecond, 0. It sits in the lowest 12 bits.
+4. Glue the three together: 21,000,192. That is the ID.
+5. A second ID in the same millisecond uses counter 1: 21,000,193. In the next millisecond the counter resets to 0.
 
 ```mermaid
 flowchart LR
@@ -191,6 +232,13 @@ The arithmetic, with units:
 ### How a generator gets its worker ID and issues IDs
 
 **In plain words:** at start-up each machine borrows a unique machine number (for example from a lease in a database or ZooKeeper). After that it makes IDs alone, with no network calls.
+
+**Step by step:**
+1. An order-service pod starts. It asks etcd for a 30-second lease.
+2. It tries to claim "worker 17" under that lease. etcd says yes only if nobody holds 17.
+3. Every 10 seconds the pod renews the lease, so 17 stays its own.
+4. Now every new ID is built locally: time + 17 + counter. No network call per ID.
+5. If the pod dies, renewals stop, the lease expires after 30 s, and 17 is free for the next pod.
 
 The worker ID is the only part that needs coordination, and it happens once at start-up, not per ID.
 
@@ -211,7 +259,7 @@ sequenceDiagram
     Note over P,E: If the pod dies, the lease expires after 30 s and worker 17 becomes free again
 ```
 
-Other ways to hand out worker IDs: a Kubernetes StatefulSet ordinal (`order-svc-17` gets 17), a ZooKeeper ephemeral sequential node, or a row in a database table. Whatever you choose, **two live processes must never hold the same number**, because then they will produce identical IDs in the same millisecond.
+Other ways to hand out worker IDs: a Kubernetes StatefulSet ordinal (a StatefulSet gives each pod a fixed number in its name, so `order-svc-17` gets 17), a ZooKeeper ephemeral sequential node (an entry that gets the next number and vanishes when its owner disconnects), or a row in a database table. Whatever you choose, **two live processes must never hold the same number**, because then they will produce identical IDs in the same millisecond.
 
 ## 4. Worked example 🟡
 
@@ -588,7 +636,7 @@ PostgreSQL 17 ships `gen_random_uuid()` (version 4) in core. PostgreSQL 18 added
 
 - **Do not distribute what is not distributed.** One PostgreSQL primary handles tens of thousands of sequence calls per second; if all writes go to one primary anyway, `GENERATED ALWAYS AS IDENTITY` is the simplest correct answer.
 - **Snowflake costs operations.** You now run worker-ID leasing, must watch clock sync, and must ensure two pods never share a worker ID. UUIDv7 needs none of this at the price of 8 more bytes per key and per index entry.
-- **Random keys hurt B-tree indexes.** A UUIDv4 primary key lands on a random leaf page on every insert, so the working set is the whole index and pages split all over it.
+- **Random keys hurt B-tree indexes.** A UUIDv4 primary key lands on a random leaf page (the bottom-level blocks of the index that hold the keys) on every insert, so the working set (the part that must be in memory) is the whole index and pages split all over it.
 
   Time-ordered keys (v7, ULID, Snowflake) append to the right-hand edge, so only the last few pages are hot. The size of the effect depends on how much of the index fits in memory; measure it on your own data before quoting a number.
 - **Time-ordered IDs reveal time.** Anyone can decode a Snowflake or UUIDv7 to get the creation time, and the sequence part hints at volume. If that matters (for example, signup dates of users), expose a separate random public ID, or use UUIDv4 for the public one.
@@ -596,6 +644,8 @@ PostgreSQL 17 ships `gen_random_uuid()` (version 4) in core. PostgreSQL 18 added
 - **64-bit IDs and JavaScript.** JavaScript numbers are doubles with 53 bits of integer precision, so a Snowflake ID above 2^53 loses its last digits in a browser. Send IDs as JSON strings (Twitter added `id_str` for this reason).
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** each scheme, the Snowflake layout and how worker numbers are handed out. **Next comes the senior view**: how Twitter, Discord, Instagram and others do it, what breaks in production (shared worker numbers, clocks jumping back), and the maths of collisions and index locality.
 
 - **Real systems:**
 	- **Twitter** created Snowflake in 2010 when it moved off MySQL auto-increment; its layout (41/10/12 bits, epoch 1288834974657) became the model for the others.
@@ -605,7 +655,7 @@ PostgreSQL 17 ships `gen_random_uuid()` (version 4) in core. PostgreSQL 18 added
 	- **Flickr** ran two ticket-server MySQL instances, one issuing odd and one issuing even numbers.
 - **Failure modes and fixes:**
 	- *Two processes share a worker ID* (a copied config, or a pod restarted while the old one is still alive) → lease the ID with a TTL (etcd, ZooKeeper) and stop generating if the lease is lost; or derive it from something unique by construction, such as a StatefulSet ordinal.
-	- *The clock steps backwards* (an NTP correction or a VM migration) → tolerate a few milliseconds by reusing the last timestamp, refuse larger jumps with an error and alert. Run NTP or chrony in slew mode so corrections are gradual instead of jumps.
+	- *The clock steps backwards* (an NTP correction or a VM migration) → tolerate a few milliseconds by reusing the last timestamp, refuse larger jumps with an error and alert. Run NTP or chrony in slew mode (the clock is sped up or slowed down slightly instead of being set back) so corrections are gradual instead of jumps.
 	- *Sequence exhaustion inside one millisecond* → the generator waits for the next millisecond. Spikes show up as small latency bumps; if it happens constantly, add workers.
 	- *Leap seconds* → use a smeared clock (Google Public NTP and Amazon Time Sync Service, for example, smear leap seconds over many hours) so the Unix time never repeats.
 	- *IDs used as JSON numbers* → precision loss in browsers; serialize as strings.
@@ -645,7 +695,7 @@ The simple generator above uses pure randomness, so two v7 IDs from the same mil
 
 **In plain words:** with this many random bits, two IDs matching by chance is so unlikely you can ignore it. A bad random generator is the real risk.
 
-For `n` random IDs with `b` random bits, the chance of any collision is about `n² / 2^(b+1)` (the birthday bound). UUIDv7 has 74 random bits per millisecond, so collisions only matter between IDs from the same millisecond.
+For `n` random IDs with `b` random bits, the chance of any collision is about `n² / 2^(b+1)` (the birthday bound: the same maths that says 23 people already give a 50% chance of a shared birthday). UUIDv7 has 74 random bits per millisecond, so collisions only matter between IDs from the same millisecond.
 
 Even at 1,000,000 IDs in one millisecond: (10^6)² / 2^75 ≈ 10^12 / 3.8 × 10^22 ≈ 2.6 × 10^-11. UUIDv4 with 122 bits is lower still. Bad randomness (for example, forking a process with a seeded `math/rand`) is the realistic cause of duplicates, so always use `crypto/rand`.
 
@@ -701,6 +751,26 @@ With many concurrent writers, the right-most page can itself become a contention
 - Hard parts: unique worker IDs (lease with a TTL) and clock rollback (tolerate small, refuse large, persist last timestamp).
 - Instagram: per-shard PL/pgSQL, `ms << 23 | shard << 10 | seq % 1024`, with `clock_timestamp()` instead of `now()`.
 - Send 64-bit IDs to browsers as strings; never use IDs as secrets.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) Why does each shard's own auto-increment break after sharding?
+> Each shard counts on its own, so two shards hand out the same number.
+
+> [!question]- (easy) What three parts make a Snowflake ID?
+> Time in milliseconds, a worker (machine) number, and a counter within that millisecond.
+
+> [!question]- (easy) Why put the time first in an ID?
+> IDs then sort roughly by creation time, and new rows go to the end of the index.
+
+> [!question]- (medium) How many IDs per second can one Snowflake worker make?
+> 4,096 per millisecond, so about 4 million per second.
+
+> [!question]- (medium) Why is UUIDv7 usually better than UUIDv4 as a primary key?
+> It is still coordination-free, but time-ordered, so inserts append to the end of the B-tree instead of landing randomly.
+
+> [!question]- (medium) The clock jumps back 2 seconds on a worker. What should the generator do?
+> Notice the time is below the last one used and refuse with an error and alert, instead of reusing old timestamps.
 
 ## Links
 

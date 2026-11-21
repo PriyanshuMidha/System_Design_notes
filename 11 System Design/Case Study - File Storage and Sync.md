@@ -34,6 +34,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[File Upload Architecture]]: big files go straight from the app to object storage through a short-lived signed link, not through your server.
+> - [[Partitioning and Sharding]]: splitting data across many databases so each holds one slice.
+> - [[Real-time APIs - WebSocket, SSE and Long Polling]]: ways for the server to tell a device "something changed" without it asking again and again.
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+
 **From zero, in 60 seconds** 🟢
 
 Dropbox and Google Drive keep your files the same on every device.
@@ -73,6 +79,10 @@ A sync service sends only the changed pieces and tells every device what changed
 | Journal / cursor | A numbered list of changes and a device's place in it | "I have seen up to change 98231" |
 | Egress | Data sent out of a cloud, billed per GB | Downloading files to phones |
 
+| Presigned URL | A short-lived link that lets a device upload or download one object directly | "PUT this chunk to S3, valid 1 hour" |
+| Namespace | One folder tree that syncs as a unit: your root folder, or one shared folder | "Team Docs" is namespace 77 |
+| MiB / GiB | Binary megabyte / gigabyte (1,024-based); about the same as MB / GB | 4 MiB ≈ 4.2 MB |
+
 **Picture it**
 
 ```mermaid
@@ -107,6 +117,13 @@ At a few million active users this design fails on every axis:
 - a lost upload at 99% that must restart from zero,
 - and egress (outbound data transfer, billed by cloud providers per GB) for every device.
 
+### Real-life example: photos on Google Drive 🟢
+
+You save a 50 MB slide deck to Google Drive on your laptop, then fix one typo.
+A few seconds later your phone shows the new version, and Drive did not re-send all 50 MB, only the changed piece.
+If your laptop was offline on a train, it uploads when you reconnect.
+If you also edited the same file on your phone while offline, Dropbox-style apps keep both and name one "conflicted copy" instead of losing your work.
+
 **Functional requirements**
 - Upload and download files from a few bytes to many GiB; uploads resume after a network drop.
 - Automatic sync of a folder across a user's devices (laptop, phone, web).
@@ -115,7 +132,7 @@ At a few million active users this design fails on every axis:
 - Offline edits that sync later, with conflicts surfaced rather than lost.
 
 **Non-functional requirements**
-- **Durability first.** A committed file must never be lost (object storage designed for 11 nines of durability, per AWS).
+- **Durability first.** A committed file must never be lost (object storage designed for 11 nines of durability, per AWS: 99.999999999%, so losing a file is extremely rare).
 - **Strongly consistent metadata.** After a commit, every device that asks sees the new version, and a commit never points at a missing chunk.
 - **Sync latency** of a few seconds from commit on one device to the change appearing on another (a target, not a guarantee, when devices are online).
 - **Bandwidth efficiency.** Upload only changed bytes; deduplicate identical chunks.
@@ -142,7 +159,17 @@ flowchart LR
     V2["Book v2: pages A D C<br/>(only D is new)"] --> W
 ```
 
+## Common beginner mistakes 🟢
+
+- **Re-uploading the whole file after each edit** → wastes bandwidth and time → split into chunks and upload only chunks whose hash is new.
+- **Routing file bytes through your API servers** → they become the bottleneck → hand out presigned URLs so devices talk to object storage directly.
+- **Using "last writer wins" for user files** → one device silently wipes the other's edit → commit only if the base version matches; otherwise save a conflicted copy.
+- **Polling for changes every few seconds** → millions of empty requests → keep a long-poll or WebSocket open just to say "something changed", then fetch.
+- **Deleting a chunk as soon as one file stops using it** → another version or user may still need it → count references and delete only after a grace period.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the two tricks: send only changed chunks, and sync devices from a numbered change list. **Next we open the box**: the parts of the system, an upload step by step, and a sync step by step.
 
 ```mermaid
 flowchart LR
@@ -165,13 +192,20 @@ flowchart LR
 
 The pieces:
 - **Client.** It watches the sync folder, cuts changed files into chunks, hashes them, and keeps a local index of `path → (version, chunk hashes)` so it knows what it already has.
-- **Metadata API.** It is stateless. It authenticates, presigns URLs, and commits versions.
+- **Metadata API.** It is stateless (keeps nothing in memory between requests). It authenticates, presigns URLs, and commits versions.
 - **Metadata DB.** It is a relational database sharded by **namespace** (a user's root folder or a shared folder). One namespace lives on one shard, so a commit is a single-shard transaction ([[Partitioning and Sharding]]).
 - **Object storage.** It holds immutable chunks. A chunk is never modified, only created and eventually garbage-collected.
 - **Notification service.** It holds long-poll or WebSocket connections and tells devices "namespace N changed" ([[Real-time APIs - WebSocket, SSE and Long Polling]], [[Scaling WebSockets]]).
 - **CDN.** It serves downloads of popular shared files close to users ([[CDN and Edge]]).
 
 ### Upload, step by step
+
+**Step by step (plain):**
+1. You save `deck.pptx` (8 MiB) on your laptop. The app cuts it into 2 chunks of 4 MiB and fingerprints each.
+2. It asks the server "which of these 2 fingerprints are new?" The server says "only the second one".
+3. The server gives the app a one-hour upload link for that chunk. The app uploads it straight to object storage.
+4. The app says "commit: deck.pptx is now chunks [A, B'], based on version 6".
+5. The server checks version 6 is still the latest, saves version 7, and adds a line to the change list.
 
 ```mermaid
 sequenceDiagram
@@ -202,6 +236,13 @@ sequenceDiagram
 Resumability falls out of the design: every chunk is a separate idempotent PUT to a content-addressed key, so a retry after a dropped connection just re-sends the missing chunks. The commit is the only step that changes what users see, and it is all-or-nothing.
 
 ### Sync, step by step
+
+**Step by step (plain):**
+1. Your phone holds a cursor: "I have seen change 98,230".
+2. It keeps a long-poll open. The server answers "namespace changed".
+3. The phone asks "what changed after 98,230?" and gets "98,231: deck.pptx is now version 7".
+4. It downloads only chunk B', since it already has chunk A, and rebuilds the file.
+5. Only after the file is on disk does it move its cursor to 98,231.
 
 ```mermaid
 flowchart TD
@@ -383,7 +424,7 @@ The `refcount` increments on the global `chunks` table live on other shards, so 
 
 **In plain words:** cutting every 4 MB breaks badly when you insert a byte at the start. Cutting where the content itself says "cut here" keeps most chunks the same.
 
-Fixed-size chunks are simple, but inserting one byte at the front shifts every boundary and every chunk hash changes. **Content-defined chunking** (CDC) picks boundaries where a rolling hash of the last few dozen bytes matches a pattern, so boundaries move with the content.
+Fixed-size chunks are simple, but inserting one byte at the front shifts every boundary and every chunk hash changes. **Content-defined chunking** (CDC) picks boundaries where a rolling hash (a fingerprint of the last few dozen bytes, updated cheaply as it slides forward) of the last few dozen bytes matches a pattern, so boundaries move with the content.
 
 The code below implements both (the CDC loop is a simplified FastCDC-style gear hash) and measures the bytes a client must re-upload after a one-byte insert.
 
@@ -569,8 +610,16 @@ In production the same parameters are scaled up (for example 1 MiB minimum, 4 Mi
 | --- | --- | --- | --- |
 | Last writer wins | Highest timestamp overwrites | Never for user files | Silent data loss |
 | Base-version check + conflicted copy | Commit requires `base_version = head`; loser saved as "file (conflicted copy)" | Binary files, general sync (Dropbox does this) | The user merges manually |
-| Version vectors | Each replica's counter detects concurrent edits even offline and peer-to-peer | Multi-master or peer sync | Metadata grows with the number of writers ([[Clocks and Ordering]]) |
+| Version vectors (one counter per device, kept together) | Each replica's counter detects concurrent edits even offline and peer-to-peer | Multi-master or peer sync | Metadata grows with the number of writers ([[Clocks and Ordering]]) |
 | CRDT or operational transform | Merge edits at the operation level | Collaborative documents (Google Docs style) | Only for structured content ([[CRDTs and Conflict Resolution]]) |
+
+### Things people confuse this with 🟡
+
+| System | What it does | How it differs from file sync |
+| --- | --- | --- |
+| Object storage (S3) | Stores blobs by key | No folders, devices, versions or sync; it is the warehouse this design sits on |
+| [[Case Study - Collaborative Document Editor]] | Merges many people's keystrokes live | Works on small ops inside one document; file sync moves whole files and keeps conflicted copies |
+| Backup tool (restic, Time Machine) | Copies a machine's files for disaster recovery | One-way and periodic; no live sync between devices |
 
 ## 6. Trade-offs and when not to use 🟡
 
@@ -588,13 +637,15 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the upload and sync paths, the API, the tables and the chunking code. **Next is the advanced part**: real systems and failure stories, deleting unused chunks safely, cheaper storage tiers, why commits in one folder are numbered one by one, and renames, deletes and big downloads.
+
 - **Real systems.**
 	- Dropbox documents a content hash computed over 4 MiB blocks with SHA-256, and a cursor-plus-longpoll change API.
 	- Backup tools such as restic and Borg use content-defined chunking for dedup.
 	- S3 and other object stores provide multipart upload with the 5 MiB minimum part size and 10,000-part limit.
 - **Failure modes and fixes.**
 	- *Upload dies at 99%.* Chunks already uploaded remain; `GET /uploads/U` returns the missing set; the client resumes.
-	- *Presigned URL expires mid-upload.* The client asks for fresh URLs for the remaining chunks. SigV4 presigned URLs can last at most 7 days; use short expiries (about an hour) and refresh them.
+	- *Presigned URL expires mid-upload.* The client asks for fresh URLs for the remaining chunks. SigV4 (AWS's request-signing scheme) presigned URLs can last at most 7 days; use short expiries (about an hour) and refresh them.
 	- *Client lies about a hash.* Verify a sample, or have object storage check a `x-amz-checksum-sha256` header on PUT, so a chunk key always matches its bytes. Otherwise one user could poison a shared dedup chunk.
 	- *Orphan chunks* from abandoned uploads are deleted by GC after a grace period.
 	- *Reconnect storm after a notification-service deploy.* Millions of long-polls reconnect at once. Add jitter on the client and drain connections gradually.
@@ -615,6 +666,15 @@ flowchart LR
 **In plain words:** a chunk can only be deleted when no file version uses it anymore, so you must count or scan carefully.
 
 A chunk can be deleted only when no version references it and no in-flight upload is about to. Two approaches:
+
+```mermaid
+flowchart LR
+    V["version purged"] --> D["chunk refcount - 1"]
+    D --> Z{"refcount = 0?"}
+    Z -- "no" --> K["keep chunk"]
+    Z -- "yes" --> G["wait grace period"]
+    G --> X["delete chunk"]
+```
 - **Reference counts.** Increment when a version that uses the chunk commits; decrement when a version is purged (after the retention window). The counts live on a different shard from the version rows, so they are updated asynchronously and can drift after bugs or partial failures.
 - **Mark and sweep.** Periodically scan all live version chunk lists (mark), then delete unmarked chunks older than a grace period (sweep). It is slow but self-correcting.
 
@@ -626,7 +686,7 @@ Production systems typically combine them: refcounts for fast reclamation, plus 
 
 Most files are rarely read after a few weeks. A tiering job moves chunks that have not been read for a while to colder classes.
 
-- In S3, Standard-IA has a 30-day minimum storage duration, and Glacier Flexible Retrieval has a 90-day minimum with retrieval delays from minutes to hours.
+- In S3, Standard-IA (infrequent access: cheaper to keep, dearer to read) has a 30-day minimum storage duration, and Glacier Flexible Retrieval has a 90-day minimum with retrieval delays from minutes to hours.
 - Chunks shared by many versions or users should stay warm.
 - Old versions beyond the retention policy are purged, which feeds GC.
 
@@ -674,6 +734,26 @@ The client downloads chunks in parallel (for example 4 to 8 at a time) via presi
 
 > [!question]- What dominates the cost, and how do you reduce it?
 > Storage (hundreds of PB) and egress (about 15 Gbit/s in the estimate above), not compute. Reduce storage with dedup, compression, erasure coding and tiering to infrequent-access or archive classes; reduce egress with delta sync, LAN sync between a user's devices, and CDN caching for shared files.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: why cut files into chunks?
+> So an edit re-uploads only the changed chunks, and identical chunks are stored once.
+
+> [!question]- Easy: what is a chunk hash used for?
+> As its fingerprint and storage key: same bytes, same hash, so duplicates are spotted.
+
+> [!question]- Easy: how does a device know what changed?
+> It asks for journal entries after its saved cursor.
+
+> [!question]- Medium: why can content-defined chunking beat fixed 4 MiB blocks?
+> Inserting one byte shifts every fixed boundary, so every hash changes; CDC boundaries follow the content and realign after the edit.
+
+> [!question]- Medium: two devices edit the same file offline. What happens on commit?
+> The second commit's base version is no longer the head, so it is saved as a "conflicted copy" for the user to merge.
+
+> [!question]- Medium: why take the journal `seq` from a locked counter row, not a database sequence?
+> A sequence can hand out 98231 and 98232 and commit them out of order, so a device could skip 98231 for ever.
 
 ## 10. Cheat sheet 🟢
 

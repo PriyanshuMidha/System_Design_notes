@@ -30,6 +30,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Interfaces]]: in the GoF State form, each state is a type with the same methods, and the machine calls the current one.
+> - [[Design Patterns Overview and Chooser]]: State is the behavioural pattern for "status must move only along legal edges".
+> - [[Strategy and Template Method]]: a swappable behaviour behind an interface; a state is like a strategy that picks its own successor.
+
 **From zero, in 60 seconds** 🟢
 
 Many objects move through stages: an order is placed, paid, shipped, delivered, or cancelled. A **state machine** writes down the allowed moves, like "paid can go to shipped, but not back to placed", and rejects any other move. In Go this is often a small table of allowed transitions plus one method that checks it. This note builds one and saves the transitions safely in a database. Read the plain-words line above each code block first.
@@ -52,6 +57,10 @@ A state machine writes the allowed moves down in one place and refuses everythin
 | Enum | A fixed set of named values | `const (Placed Status = iota; Paid)` |
 | Concurrency | Two requests running at the same time | Customer cancels while shop packs |
 | Compare-and-set (CAS) | Write only if the value is still what you read | `... WHERE status = 'paid'` |
+| Terminal state | An end state that no event can leave | `Delivered`, `Cancelled` |
+| Actor | Who is firing the event, which decides if it is allowed | Customer, store, rider |
+| Outbox | An event row saved in the same transaction as the change, sent later | `order.pack o1: paid -> packed` |
+| Sweeper | A background job that runs every so often and fires timeouts | Expires orders past their hold time |
 
 **Picture it**
 
@@ -90,6 +99,10 @@ A state machine fixes both problems in one place:
 - **One table of legal moves.** Every handler calls `Fire(id, event, actor)`, and illegal moves fail the same way everywhere.
 - **One atomic save.** The write says "move from `paid` to `packed` **only if it is still `paid`**". The test below runs that race 100 times; exactly one side wins every time.
 
+### Real-life example 🟢
+
+Picture tracking a Swiggy order: "Order placed", "Paid", "Being packed", "Out for delivery", "Delivered". The app never jumps from "Paid" straight to "Delivered", and once the rider has picked up the food, the Cancel button is gone. Now picture you tapping Cancel at the same moment the restaurant taps "Packed": only one of you can win. A state machine is the single list of which moves are allowed from each status, plus a save that only works if the status has not changed underneath you.
+
 ## 2. Mental model 🟢
 
 A **board game**. The squares are the states, the arrows printed on the board are the transitions, and a move is only legal along an arrow. Some arrows have a condition printed next to them ("only if you rolled a six": a guard), some can only be used by a certain player (an actor rule), and some squares have no arrows out (terminal states: the game is over for that piece).
@@ -100,6 +113,8 @@ The two Go forms differ in where the rules live:
 - **Behaviour form (GoF State):** each square is a type that knows what to do with every input. The object holds "the current square" and forwards each input to it.
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** what a state machine is: named stages, allowed moves, and everything else refused. **Next we open the box**: the order lifecycle as a table, the six steps of one move including the compare-and-set save, and the GoF State form for a vending machine.
 
 **In plain words: list the stages and the allowed moves; every change goes through one check.**
 
@@ -132,7 +147,7 @@ stateDiagram-v2
 
 1. Load the order.
 2. Look up `(current status, event)` in the `transitions` map. No row means `ErrInvalidTransition`.
-3. Check the actor against the rule's allowed roles (a bit set). Wrong role means `ErrForbidden`.
+3. Check the actor against the rule's allowed roles (a bit set: one on/off bit per role, packed into one number). Wrong role means `ErrForbidden`.
 4. Run the guard, if any. `expire` checks that the hold time has passed.
 5. Save with **compare-and-set**: update only if the status is still the one you read. If another request moved it first, return `ErrConflict`.
 6. In the same atomic step, append an outbox event such as `order.pack o1: paid -> packed`.
@@ -232,6 +247,15 @@ func main() {
 **In plain words: an order state machine with guards, and tests for every allowed and blocked move.**
 
 One `package main` with both forms: the order lifecycle as a transition table (typed states with `String()`, guards, actor bit sets, terminal and error states, a compare-and-set repository with an outbox) and the vending machine as GoF State. It compiles with Go 1.24 and passes `go vet` and `go test -race`, using only the standard library.
+
+**Step by step:**
+
+1. `Status`, `Event` and `Actor` are small typed numbers with readable names (`String()`), so a typo cannot slip in as a string.
+2. `transitions` is the one table of legal moves: for each `edge` (current status + event) it gives a `rule` with the next status, who may fire it, and an optional `guard`.
+3. `Next` checks a move without changing anything: is it in the table, is the actor allowed, does the guard (such as `holdExpired`) pass?
+4. `OrderRepo.Fire` loads the order, calls `Next`, then saves with `compareAndSet`, which only writes if the status is still the old one, and adds an outbox event.
+5. The vending machine shows the other style: each state (`idle`, `hasMoney`, `dispensing`, ...) is its own type, and `rejectAll` refuses anything a state does not handle.
+6. `main` walks an order through its life and runs the vending machine.
 
 ```go
 // Command fsm shows two ways to build a state machine in Go:
@@ -840,7 +864,7 @@ COMMIT;
 
 In Go, compare the command tag's rows affected with 1 (`RowsAffected()` in `database/sql` and pgx). A timeout transition can run as one set-based statement from a sweeper job, with the same compare-and-set predicate and the same guard as `holdExpired` (`hold_until <= now()`).
 
-A data-modifying CTE writes the outbox rows in the same statement, so expired orders announce themselves like every other transition:
+A data-modifying CTE (a `WITH` part of a SQL statement that can itself insert or update) writes the outbox rows in the same statement, so expired orders announce themselves like every other transition:
 
 ```sql
 WITH expired AS (
@@ -855,6 +879,14 @@ SELECT gen_random_uuid()::text, 'order.expire',
 FROM expired;
 ```
 
+## Common beginner mistakes 🟢
+
+- **Mistake:** scattering checks like `if status == "paid" || status == "packed"` across handlers. → **Why it's wrong:** one handler forgets a check, and an order skips packing. → **Do this instead:** keep every legal move in one `transitions` table and check it in `Next`.
+- **Mistake:** reading the status, checking it in Go, then writing without checking it again. → **Why it's wrong:** Cancel and Pack can both pass the check and both write. → **Do this instead:** save only if the status is still the old one, as `compareAndSet` does (`UPDATE ... AND status = old`), and return `ErrConflict` otherwise.
+- **Mistake:** letting anyone fire any event. → **Why it's wrong:** a customer could mark their own order `Delivered`. → **Do this instead:** list who may fire each move (`actors`, such as `Rider` for `Deliver`) and check it in `Next`.
+- **Mistake:** forgetting time-based rules. → **Why it's wrong:** a hold could expire while the customer is still paying. → **Do this instead:** add a guard, like `holdExpired`, that returns `ErrHoldActive` until the hold time has passed.
+- **Mistake:** writing every method in every vending state. → **Why it's wrong:** lots of copied "not allowed" code that can drift. → **Do this instead:** embed `rejectAll` and override only the inputs each state accepts.
+
 ## 5. Variants and comparison 🟡
 
 | Form | How it works | Use when | Cost |
@@ -862,7 +894,7 @@ FROM expired;
 | `switch` on an enum | One `switch o.Status` per method | 2 to 4 states with simple rules | Rules spread across methods as they grow |
 | Enum + transition table (data) | `map[edge]rule`; one generic `Next` | Many states, uniform behaviour, persisted status, rules you want to print, review and test exhaustively | Per-state behaviour beyond "allowed or not" goes into guards and actions |
 | State interface (GoF State, behaviour) | One type per state; the context delegates every input | Few states that react very differently to the same inputs (vending, TCP connection, elevator) | More types; the full transition graph is not visible in one place |
-| State functions | `type stateFn func(*lexer) stateFn`: each state returns the next | Lexers and parsers driven by input, as in `text/template/parse` | Hard to persist; only one goroutine runs it |
+| State functions | `type stateFn func(*lexer) stateFn`: each state returns the next | Lexers (code that splits text into tokens) and parsers driven by input, as in `text/template/parse` | Hard to persist; only one goroutine runs it |
 | FSM library (`github.com/looplab/fsm`) | Events and callbacks declared as data | You want enter and leave callbacks without writing the engine | A dependency and string-typed states |
 
 The two main forms mix well: a table for the legal moves, and a small State interface for the per-state behaviour of a few complex states.
@@ -878,13 +910,15 @@ The two main forms mix well: a table for the legal moves, and a small State inte
 **Pitfalls:**
 
 - **Rebuilding the table on every call.** A transition method that builds its `allowed` map inside the method allocates on every transition. Build it once, as a package-level variable.
-- **Check, then write.** Reading the status, deciding, and then `UPDATE ... SET status` without the `AND status = $from` predicate is a time-of-check-to-time-of-use race. The compare-and-set is the actual lock.
+- **Check, then write.** Reading the status, deciding, and then `UPDATE ... SET status` without the `AND status = $from` predicate is a time-of-check-to-time-of-use race (the value changes between when you check it and when you use it). The compare-and-set is the actual lock.
 - **Raw strings everywhere.** `"Paid"` versus `"paid"` compiles. Typed constants with `String()` do not drift; convert to text only at the edge (JSON, SQL).
 - **Persisting iota values.** Insert a constant in the middle and every stored number now means a different state. Store names, or assign explicit numbers and never change them.
 - **No terminal states, or terminal states with exits.** A diagram without end states hides which orders are finished. Make them explicit and test that no edge leaves them.
 - **Permissions checked in handlers.** If only the rider handler checks the rider role, the next handler forgets. Put the allowed actors in the rule.
 - **Rules only in the client.** An app that hides the Cancel button after packing gives a hint, not a rule. Old app versions and direct API calls still send `cancel`, so the server's table must refuse it.
 - **In-memory timers for business timeouts.** `time.AfterFunc` per order is lost on restart. Drive expiry from a stored deadline with a sweeper or a delayed job ([[Task Scheduler (delayed and recurring jobs)]]).
+
+> 🟡 → 🔴 **You now know** both Go forms, how to test every legal and illegal move, and how to store transitions safely in PostgreSQL. **Next comes the production view**: state machines inside Go's own library, the stuck and double-moved orders seen in real systems, and finer points like guards versus actions.
 
 ## 7. In production 🔴
 
@@ -897,13 +931,13 @@ The two main forms mix well: a table for the legal moves, and a small State inte
 	- Transitions applied but nobody told → outbox row in the same transaction; listeners subscribe as in [[Observer and Event Bus]].
 	- Orders stuck in `reserved` forever → a stored `hold_until` and a sweeper that fires `expire`; alert on the age of the oldest non-terminal order.
 	- A new status added to the enum but not to the table → the every-edge test fails, which is the point of writing the spec separately.
-- **What to monitor:** count of orders per state, time spent in each state (p50 and p99), rejected transitions by reason (invalid, forbidden, guard, conflict), and the age of the oldest order in each non-terminal state.
+- **What to monitor:** count of orders per state, time spent in each state (p50 and p99: the times that half, and 99 out of 100, orders stay under), rejected transitions by reason (invalid, forbidden, guard, conflict), and the age of the oldest order in each non-terminal state.
 
 ## 8. Deep dive 🔴
 
 - **Guards vs actions.** A guard decides **whether** a transition may happen and must not have side effects (it may run and then lose the compare-and-set). An action is what happens **because** it happened (refund, email). Run actions after the commit, driven by the outbox event, so a lost race never refunds anyone.
 - **Status predicate vs version column.** `WHERE status = $from` is enough when the machine has no cycles back to an earlier state. If an order could return to a state it was in before (for example, if a retry moved `payment_failed` back to `reserved`), an update could match the status it read even though other transitions happened in between (the ABA problem). A `version` column incremented on every write, with `WHERE version = $read_version`, closes that gap. It also protects guards that read other fields: if a support agent extends `hold_until` while the status stays `reserved`, a status-only predicate lets an `expire` decided on the old deadline go through. See [[Locking - Optimistic vs Pessimistic]].
-- **Pessimistic alternative.** `SELECT ... FOR UPDATE` locks the row for the whole decision. It is simpler to reason about when the guard needs several reads, but it holds a lock across application code.
+- **Pessimistic alternative** (lock first, then decide). `SELECT ... FOR UPDATE` locks the row for the whole decision. It is simpler to reason about when the guard needs several reads, but it holds a lock across application code.
 - **Embedding for default behaviour.** `rejectAll` uses struct embedding so each vending state writes only the inputs it accepts. The embedded methods are promoted, so `idle` satisfies `VendingState` with one override. The mechanics are in [[Structs, Methods and Embedding]].
 - **Exhaustive tests stay cheap.** 9 states × 8 events = 72 pairs. Testing all 72 against an independent list costs microseconds and catches both missing and extra edges.
 
@@ -937,6 +971,26 @@ The two main forms mix well: a table for the legal moves, and a small State inte
 - Timeouts are transitions with a stored deadline, fired by a sweeper.
 - Terminal states have no exits; test every edge and every non-edge.
 - Table for persisted lifecycles; GoF State when behaviour differs per state.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What three things define a state machine?
+> The states, the events, and a table of which event moves which state to which next state.
+
+> [!question]- 🟢 What is a terminal state?
+> A state no event can leave, such as `Delivered` or `Cancelled`.
+
+> [!question]- 🟢 Why should a status change go through one `Fire` function instead of `status = "x"` anywhere?
+> So illegal moves are refused the same way everywhere, and no handler can forget a check.
+
+> [!question]- 🟡 The customer cancels and the store packs within 50 ms. How does the save pick one winner?
+> Compare-and-set: `UPDATE ... WHERE status = 'paid'`; the second write changes 0 rows and gets `ErrConflict`.
+
+> [!question]- 🟡 Why store the state as its name, not its `iota` number?
+> Adding a constant in the middle would shift every number and silently change the meaning of stored rows.
+
+> [!question]- 🟡 Table form or GoF State form for a vending machine?
+> GoF State, because each state reacts very differently to the same inputs; use the table for persisted lifecycles like orders.
 
 ## Links 🟢
 

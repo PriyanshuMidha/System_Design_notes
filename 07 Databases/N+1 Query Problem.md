@@ -32,6 +32,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6 (fixes and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[SQL Essentials]]: you can read a `SELECT ... WHERE id = 7` and a simple `JOIN` of two tables.
+> - [[Indexing Fundamentals]]: looking up one row by its ID through an index is very fast, so each single query here is cheap.
+
 **From zero, in 60 seconds** 🟢
 
 Your code asks the database for a list of 50 things. Then, for each thing on the list, it asks one more question. That is 51 separate trips to the database: 1 for the list plus N for the items. That pattern is the **N+1 problem**.
@@ -74,6 +78,10 @@ The fix is to ask for all 50 client names in one trip.
 | JOIN | One query that combines rows from two tables | `invoices JOIN clients` |
 | Batch query | One query for many IDs at once | `WHERE id = ANY($1)` |
 | Connection pool | A fixed set of open database connections shared by requests | 20 connections |
+| Foreign key | A column that holds the ID of a row in another table | `invoices.client_id = 7` |
+| Lazy loading | An ORM fetches a related row only when your code first touches it | reading `invoice.client` runs a query |
+| DataLoader | A helper that waits a moment, gathers many single lookups, and runs them as one query | 50 `Load(id)` calls become 1 query |
+| `pg_stat_statements` | A PostgreSQL add-on that counts how often each query ran and how long it took | shows a query called 2 million times |
 
 **Picture it**
 
@@ -111,7 +119,7 @@ SELECT ... FROM clients WHERE id = 9                            -- one per invoi
 ...
 ```
 
-Each client lookup is a primary-key hit that the server answers in microseconds. The cost is the **round trip**: the network hop, the driver, and borrowing a pooled connection. With roughly 1 ms per round trip (an estimate for an app and database in the same region):
+Each client lookup is a primary-key hit (a lookup by the table's unique ID column, through its index) that the server answers in microseconds. The cost is the **round trip**: the network hop, the driver, and borrowing a pooled connection. With roughly 1 ms per round trip (an estimate for an app and database in the same region):
 
 | Page size | Queries (N+1) | Waiting (≈1 ms each) | Batched queries | Waiting |
 | --------- | ------------- | -------------------- | --------------- | ------- |
@@ -121,20 +129,43 @@ Each client lookup is a primary-key hit that the server answers in microseconds.
 
 At 200 page views per second, the N+1 version sends 10,200 queries per second where 400 would do. Latency grows with the page size, which is the signature of the bug.
 
+### Real-life example 🟢
+
+Picture a food app's home screen listing 20 restaurants, each with its rating and delivery time.
+If the app's server loads the 20 restaurants and then asks the database for each rating one at a time, that is 21 trips.
+With 1 ms per trip it hardly shows, but when the list grows to 100 and a million people open the app at dinner, those extra trips pile up.
+Fetching all 20 ratings in one query keeps the screen fast no matter how long the list is.
+
+## Common beginner mistakes 🟢
+
+- **Calling the database inside a `for` loop** → one query per row, so time grows with the page size → collect the IDs first, then run one query with `WHERE id = ANY($1)`.
+- **Judging by "each query is only 0.02 ms"** → the cost is the trip there and back, not the work inside the database → count queries per request, not just time per query.
+- **"Fixing" it with one goroutine per row** → still N queries, and now N connections at once, which can empty the pool → batch the lookups instead.
+- **Trusting the batch result to have every ID** → `ANY` silently skips IDs that do not exist, so you print a blank name → check for missing IDs when you match rows back.
+- **Joining several one-to-many tables in one query** → rows multiply (50 × 10 × 3 = 1,500) → run one batched query per child table.
+
 ## 2. Mental model 🟢
 
 The number that matters is **round trips per request**, not milliseconds per query.
 
 Think of a waiter who walks to the kitchen once per dish instead of once per table. Each trip is short, but 50 trips are slow, and the corridor fills up with waiters. Batching means writing the whole order on one ticket.
 
+```mermaid
+flowchart LR
+    W["waiter"] -- "50 trips, 1 dish each" --> K["kitchen"]
+    W2["waiter with one ticket"] -- "1 trip, all 50 dishes" --> K
+```
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the bug: a query inside a loop, paid as one round trip per row. **Next we open the box**: where that loop hides in real code, what the traffic to the database looks like, and the exact steps of the batched fix.
 
 N+1 hides wherever code that loads one related row runs inside a loop:
 
 - **Loops in Go handlers.** A repository call per row (`GetClient(ctx, inv.ClientID)`), often buried inside a helper or a JSON-building function.
-- **ORM lazy loading.** In Rails, Django and Hibernate, reading `invoice.client` runs a query the first time. GORM has no lazy loading, so in Go the N+1 is an explicit call in a loop, such as `db.First(&client, inv.ClientID)`.
-- **GraphQL resolvers.** The `client` field resolver runs once per invoice in the result. See [[GraphQL]].
-- **Service calls.** One HTTP or gRPC call per item to another service: the same bug, with round trips of tens of milliseconds instead of about one.
+- **ORM lazy loading** (the ORM runs a hidden query the first time you touch a related object). In Rails, Django and Hibernate, reading `invoice.client` runs a query the first time. GORM has no lazy loading, so in Go the N+1 is an explicit call in a loop, such as `db.First(&client, inv.ClientID)`.
+- **GraphQL resolvers** (in GraphQL, a resolver is the small function that fills in one field of the answer). The `client` field resolver runs once per invoice in the result. See [[GraphQL]].
+- **Service calls.** One HTTP or gRPC (a fast way for one service to call a function on another over the network) call per item to another service: the same bug, with round trips of tens of milliseconds instead of about one.
 
 ```mermaid
 flowchart LR
@@ -152,7 +183,11 @@ flowchart LR
 
 **In plain words:** the diagram below shows the actual back-and-forth with the database — the slow version chats 51 times, the fast version chats twice.
 
-
+**Step by step:**
+1. The handler asks for 50 invoices of workspace 42. One trip, 50 rows back.
+2. Naive way: for invoice 1 it asks "who is client 7?", waits, then invoice 2 asks "who is client 9?", waits, and so on 50 times.
+3. Batched way: it looks at all 50 invoices, sees only 7 different client IDs, and asks once for those 7.
+4. The 7 clients come back in one trip and are matched to the 50 invoices in Go memory.
 
 ```mermaid
 sequenceDiagram
@@ -176,7 +211,14 @@ sequenceDiagram
 
 **In plain words:** the fix is a recipe — gather the IDs, drop duplicates, fetch them all with one query, then match them back up in memory, like doing one shop run for the whole list.
 
-Collect the foreign keys, remove duplicates, fetch each chunk with one query and stitch the result by key:
+**Step by step:**
+1. Load the page: 50 invoices.
+2. Pull out each invoice's `client_id`: 50 values such as 7, 9, 7, 3, 9...
+3. Sort them and drop repeats: 3, 7, 9, 12, 15, 21, 30. Now 7 IDs.
+4. Run one query: `SELECT ... FROM clients WHERE id = ANY($2)` with those 7 IDs.
+5. Put the 7 clients in a map keyed by ID, then walk the 50 invoices in order and look each client up. If one is missing, return an error.
+
+Collect the foreign keys (the `client_id` values), remove duplicates, fetch each chunk with one query and stitch the result by key:
 
 ```mermaid
 flowchart LR
@@ -261,7 +303,7 @@ Two details matter. The batch query silently omits IDs that do not exist, so the
 
 And with 50 distinct clients and a chunk size of 20, the batched version runs 1 + 3 queries: the count depends on the number of chunks, not on the page size.
 
-The pgx side sends the whole ID slice as one `bigint[]` parameter, and the `workspace_id` filter keeps a bad ID from reading another tenant's client. With sqlc, the same query is declared once and sqlc generates a method that takes `[]int64`. sqlc does not allow mixing `$n` and named parameters in one query, so both are named here:
+The pgx side (pgx is the popular PostgreSQL driver for Go) sends the whole ID slice as one `bigint[]` parameter, and the `workspace_id` filter keeps a bad ID from reading another tenant's client. With sqlc (a tool that turns SQL files into type-safe Go functions), the same query is declared once and sqlc generates a method that takes `[]int64`. sqlc does not allow mixing `$n` and named parameters in one query, so both are named here:
 
 ```sql
 -- name: ClientsByIDs :many
@@ -332,7 +374,7 @@ flowchart LR
 ```
 
 - **JOIN with several 1:N relations multiplies rows.** 50 invoices × 10 line items × 3 payments in one JOIN return 1,500 rows. Three separate queries return 50 + 500 + 150 = 700.
-- **`LIMIT` applies to joined rows, not to parents.** Joining line items and then `LIMIT 50` gives 50 *items*. Page the parents first (subquery or CTE), then join or batch the children.
+- **`LIMIT` applies to joined rows, not to parents.** Joining line items and then `LIMIT 50` gives 50 *items*. Page the parents first (subquery or CTE, a named sub-query written with `WITH`), then join or batch the children.
 - **Over-fetching.** `Preload` everything, or joining a wide `clients` row, moves bytes the page never shows.
 - **Huge ID lists.** An `IN ($1, …, $n)` list has a hard ceiling: the protocol's Bind message counts parameters in 16 bits, so 65,535 at most. `= ANY($1)` sends one array parameter, but a 100,000-element array is still a slow, memory-heavy query. Chunk it, or ask why one page needs 100,000 IDs.
 - **When N+1 is fine.** N is small and bounded (a detail page with 2 related rows), or each lookup hits an in-process cache.
@@ -353,6 +395,8 @@ sequenceDiagram
 - **Parallel goroutines are not a fix.** They cut latency but take up to N pool connections per request and leave the database load unchanged (see the trap question).
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the fixes and their costs. **Next is the senior view**: spotting N+1 in a live system from query counts and traces, the ways "fixes" go wrong in production, and how a Go DataLoader batches without an event loop.
 
 - **Real systems:**
 	- Facebook's DataLoader (JavaScript) popularised per-tick batching for GraphQL. gqlgen projects use Go loaders such as `dataloadgen`.
@@ -387,12 +431,12 @@ flowchart LR
     D --> F["find the route: per-request<br/>query count or trace staircase"]
 ```
 
-- **Detect it per request.** A pgx `QueryTracer` increments a counter stored in the request context. Middleware creates the counter once per request, logs the total when the request ends, and alerts when it crosses a budget. The code is in the Go note.
+- **Detect it per request.** A pgx `QueryTracer` (a hook pgx calls around every query) increments a counter stored in the request context. Middleware creates the counter once per request, logs the total when the request ends, and alerts when it crosses a budget. The code is in the Go note.
 
-- **Detect it in traces.** With a pgx OpenTelemetry tracer (for example `otelpgx`), an N+1 request shows a "staircase" of 50 identical sibling DB spans under one HTTP span. See [[Distributed Tracing with OpenTelemetry]].
+- **Detect it in traces.** With a pgx OpenTelemetry tracer (for example `otelpgx`), an N+1 request shows a "staircase" of 50 identical sibling DB spans (a span is one timed step in a trace) under one HTTP span. See [[Distributed Tracing with OpenTelemetry]].
 - **Failure modes → fixes:**
-	- Page size raised from 20 to 100, and p99 jumps 5× → batch the lookups; add a query-count test.
-	- Someone "fixes" latency with an `errgroup` per row, and the pool runs dry at peak → batch instead; see [[Connection Pooling]].
+	- Page size raised from 20 to 100, and p99 (the time 99 out of 100 requests finish within) jumps 5× → batch the lookups; add a query-count test.
+	- Someone "fixes" latency with an `errgroup` (a Go helper that runs goroutines and waits for all) per row, and the pool runs dry at peak → batch instead; see [[Connection Pooling]].
 	- A shared, long-lived loader returns stale data, or another tenant's row → one loader per request, with the tenant in every query.
 - **What to monitor:** queries per request (histogram per route), `pg_stat_statements` calls per route call, DB spans per trace, and pool wait time.
 
@@ -474,6 +518,9 @@ sequenceDiagram
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** Never ask the database a question inside a loop. Gather all the IDs first, ask once, and match the answers back in memory. Count how many queries one page makes; if it grows with the list size, you have N+1. Running the loop in parallel is not a fix.
+
+
 - N+1 = 1 list query + 1 query per row; cost grows with page size.
 - Cost is round trips (~1 ms each in-region, an estimate), not server time.
 - Detect: `pg_stat_statements` sorted by `calls`, query count per request, span staircases.
@@ -482,6 +529,30 @@ sequenceDiagram
 - GraphQL → one DataLoader per request.
 - Goroutines per row hide latency but multiply connections.
 - Guard with a query-count test.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What do the "1" and the "N" stand for in N+1?
+> 1 query to load the list, then N more queries, one per item in the list.
+
+> [!question]- Why is N+1 slow if each query takes 0.02 ms?
+> Every query pays a network round trip of about 1 ms, and they run one after another.
+
+> [!question]- What is the simplest fix?
+> Collect the IDs, fetch them all with one query such as `WHERE id = ANY($1)`, and match them in a map.
+
+🟡 Medium
+
+> [!question]- Invoice to client is many-to-one. JOIN or batch?
+> A JOIN: one round trip and little duplicated data.
+
+> [!question]- How do you spot N+1 in `pg_stat_statements`?
+> Sort by `calls`: a cheap query called about page-size times per list query is the sign.
+
+> [!question]- Why does one goroutine per row make things worse under load?
+> It still sends N queries and grabs up to N pool connections per request, which can starve every other request.
 
 ## Links
 

@@ -34,6 +34,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+> - [[Back-of-the-Envelope Estimation]]: turning "16 million messages a day" into messages per second.
+> - [[Queues vs Streams and Broker Comparison]]: a queue holds jobs until a worker takes them; different brokers (Kafka, SQS, RabbitMQ) suit different jobs.
+
 **From zero, in 60 seconds** 🟢
 
 Apps send you messages in many ways: phone push, SMS, email.
@@ -74,6 +79,10 @@ A notification system keeps urgent messages fast, never sends twice, and respect
 | Dead letter queue | A parking spot for messages that kept failing | Inspect later by hand |
 | Device token | An address for one app on one phone | FCM token string |
 
+| Segment | A saved list of users chosen by a rule, used for campaigns | "users in Mumbai who ordered last month" |
+| Quiet hours | Times a user should not get marketing messages | no promos 22:00-08:00 local time |
+| Circuit breaker | A switch that stops calling a failing provider for a while | SMS provider down → stop for 30 s |
+
 **Picture it**
 
 ```mermaid
@@ -109,7 +118,7 @@ Without a shared service, every team calls Twilio and SES directly. Each one re-
 **Functional requirements**
 - Channels: **mobile push** (iOS via APNs, Android via FCM), **email**, **SMS**, **in-app inbox**.
 - Two classes: **transactional** (OTP, order shipped, payment receipt; triggered by an event, one recipient) and **marketing** (campaigns to a **segment**, a saved query such as "users in Mumbai who booked a movie in the last 30 days").
-- **Templates** with versions and locales (`order_shipped`, v3, `hi-IN`).
+- **Templates** with versions and locales (language plus country, such as `hi-IN` for Hindi in India) (`order_shipped`, v3, `hi-IN`).
 - **User preferences**: opt out per channel and category, **quiet hours** in the user's time zone (no promos 22:00 to 08:00), unsubscribe links.
 - **Scheduling**: send at a time, or at 10:00 in each user's local time.
 - **Delivery tracking**: queued, sent, delivered, opened or clicked, failed, with reasons.
@@ -119,6 +128,13 @@ Without a shared service, every team calls Twilio and SES directly. Each one re-
 - At-least-once internally, effectively-once to the user via deduplication.
 - Marketing must never starve transactional traffic.
 - Horizontal scaling for broadcasts of tens of millions of messages.
+
+### Real-life example: a Swiggy order 🟢
+
+You order dinner on Swiggy. You get a push "Order confirmed", later "Your rider is nearby", and an email receipt.
+That same evening, Swiggy may also send a "50% off tomorrow" push to millions of users.
+Your "rider is nearby" must not wait behind those millions of promos, and if the app retries a request you should not get the same push twice.
+If you turned off promotional pushes in settings, you still get order updates but not the sale message.
 
 **Out of scope**: building an SMS gateway or mail server, campaign authoring UI, A/B testing analytics, rich content rendering.
 
@@ -142,7 +158,24 @@ flowchart LR
     K -- "undeliverable" --> DL["Dead-letter shelf"]
 ```
 
+## Common beginner mistakes 🟢
+
+- **One queue for everything** → an OTP waits behind 5 million promos → use separate queues and worker pools per priority and channel.
+- **Calling the SMS or email provider inside the user's request** → the request hangs when the provider is slow → accept with `202`, queue it, and send in the background.
+- **No idempotency key** → a retrying service sends the same push twice → dedupe on `(producer, idempotency_key)`.
+- **Quiet hours in server time** → users in other time zones get promos at 3 a.m. → store each user's time zone and use local time.
+- **Keeping dead device tokens** → a big campaign wastes much of its speed on phones that uninstalled → disable tokens when APNs or FCM says they are gone.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the three rules: urgent messages get their own line, repeats are dropped, and providers are treated as unreliable. **Next we open the box**: what happens when a request arrives, how an OTP is delivered when a provider fails, and the life of one message.
+
+**Step by step (plain):**
+1. The bank's login service asks to send an OTP SMS with key `otp-login-5521`.
+2. The gate checks: seen this key before? No. Has the user blocked SMS? No.
+3. It fills in the template ("Your code is 482913") and puts it in the high-priority SMS queue. The bank gets `202 Accepted`.
+4. An SMS worker takes it and calls provider A. Provider A times out, so after a short wait the worker tries provider B.
+5. Provider B accepts it and later calls back "delivered". The log row is updated.
 
 ```mermaid
 flowchart LR
@@ -390,7 +423,7 @@ erDiagram
 
 **In plain words:** the code says no to a repeat key, and no if this user already got too many messages in the last hour.
 
-The gate below keeps an in-memory sliding-window log per user. In production the same logic runs against Redis (a sorted set per user, `ZREMRANGEBYSCORE` then `ZCARD` then `ZADD` in a Lua script) so all gate instances share state; the algorithm and the test cases are the same. The clock is injected so the test controls time.
+The gate below keeps an in-memory sliding-window log per user. In production the same logic runs against Redis (a sorted set per user, `ZREMRANGEBYSCORE` (drop entries older than the window) then `ZCARD` (count what is left) then `ZADD` in a Lua script) so all gate instances share state; the algorithm and the test cases are the same. The clock is injected so the test controls time.
 
 ```go
 // Package notify holds the admission gate that sits in front of the
@@ -571,10 +604,18 @@ func TestConcurrentChecksRespectCap(t *testing.T) {
 
 | Channel | Provider protocol | Invalid recipient signal | Delivery receipt |
 | --- | --- | --- | --- |
-| iOS push | APNs over HTTP/2 | HTTP 410, reason `Unregistered` | None by default; the app can report opens |
-| Android push | FCM HTTP v1 API | Error `UNREGISTERED` | None by default; the app can report opens |
+| iOS push | APNs (Apple Push Notification service) over HTTP/2 | HTTP 410, reason `Unregistered` | None by default; the app can report opens |
+| Android push | FCM (Firebase Cloud Messaging, Google's push service) HTTP v1 API | Error `UNREGISTERED` | None by default; the app can report opens |
 | Email | SES API or SMTP | Bounce notification (hard bounce) | Delivery, bounce and complaint notifications |
 | SMS | Twilio REST API | Error codes for invalid or unreachable numbers | Status callback (`sent`, `delivered`, `undelivered`, `failed`) |
+
+### Things people confuse this with 🟡
+
+| System | What it does | How it differs from a notification system |
+| --- | --- | --- |
+| [[Case Study - Email Service]] | Runs mailboxes and talks SMTP to other mail servers | This system only sends, and hands email to a provider such as SES |
+| [[Case Study - Chat System]] | Real-time conversation between users | Uses push only as a wake-up for offline users; messages live in chats |
+| APNs / FCM themselves | Deliver a push to one device | Pure delivery pipes; no preferences, dedupe, templates or priorities |
 
 ## 6. Trade-offs and when not to use 🟡
 
@@ -593,6 +634,8 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the gate, the queues, the delivery path, the sizing, the API and the admission-gate code. **Next is the advanced part**: how providers really behave, failure stories, sending to 20 million users safely, dedupe at three levels and keeping device tokens clean.
+
 - **Real systems and provider behaviour (documented):**
 	- APNs returns HTTP `410` with reason `Unregistered` when a device token is no longer active; FCM HTTP v1 returns `UNREGISTERED`. Both mean "delete or disable this token", and continuing to send to dead tokens wastes quota.
 	- SES accounts have a maximum send rate and a 24-hour sending quota; new accounts start in a sandbox that only sends to verified addresses. SES publishes bounce, complaint and delivery events, and high bounce or complaint rates can lead to account review, so hard bounces must suppress the address.
@@ -603,7 +646,7 @@ flowchart LR
 	- *Provider outage or slow responses* → per-provider timeouts, a circuit breaker, and failover to a second provider for SMS and email; keep retries capped and jittered so a recovering provider is not hit by a retry storm.
 	- *Duplicate sends after a worker crash* → record `sending` with an attempt ID before the call, use the provider's idempotency features where they exist, and check the log before retrying a non-OTP message.
 	- *Poison message* (template fails to render for one locale) → after N attempts move it to the dead letter queue with the error; alert and fix, then redrive ([[Dead Letter Queues and Poison Messages]]).
-	- *Quiet hours computed in server time* → always store the user's IANA time zone and compute local time per user; a 10:00 local campaign becomes a rolling send across time zones.
+	- *Quiet hours computed in server time* → always store the user's IANA time zone (a standard name such as `Asia/Kolkata`) and compute local time per user; a 10:00 local campaign becomes a rolling send across time zones.
 	- *Producers lose events when the DB commit and the notify call disagree* → producers write the "order shipped" event with the [[Transactional Outbox and CDC]] pattern, so a notification is requested if and only if the order change committed.
 - **SLOs and monitoring (targets, estimates):** transactional time-to-provider p99 under 2 s; queue age (oldest message) per queue, with a strict alert on `*.high`; provider error rate and latency per provider; hard-bounce rate and complaint rate for email; invalid-token rate for push; DLQ depth; campaign progress (sent per second vs plan).
 
@@ -620,10 +663,19 @@ A campaign is a job, not a request. The campaign service stores `campaign(id, se
 
 ### 8.2 Deduplication at three levels
 
+```mermaid
+flowchart LR
+    P["producer retries"] --> U["unique key at the API"]
+    U --> Q["queue redelivers"]
+    Q --> C["worker: queued → sending, once"]
+    C --> V["provider gap: crash after send"]
+    V --> D["device shows it once by message ID"]
+```
+
 **In plain words:** repeats are blocked in three places: when the request arrives, before sending, and on the phone.
 
 1. **Producer to API:** the `(producer, idempotency_key)` unique index; a retrying producer gets the same ID. Keys must describe the business event (`order-ORD-7781-shipped`), not the HTTP attempt.
-2. **Queue to worker:** queues redeliver after a visibility timeout or a consumer crash. The worker does a conditional update `status = 'sending' WHERE status = 'queued'` (a compare-and-set) before calling the provider; a second worker sees zero rows updated and skips.
+2. **Queue to worker:** queues redeliver after a visibility timeout (the time a taken message stays hidden before the queue offers it again) or a consumer crash. The worker does a conditional update `status = 'sending' WHERE status = 'queued'` (a compare-and-set) before calling the provider; a second worker sees zero rows updated and skips.
 3. **Worker to provider:** the unavoidable gap. If the process dies after the provider accepted the message and before the log update, the redelivered message is sent again. Keep that window small and, for high-value messages, query the provider by your own reference ID before resending.
 
 ### 8.3 Device token hygiene
@@ -658,6 +710,26 @@ Without this, a broadcast spends a large share of its throughput on tokens that 
 
 > [!question]- The SMS provider times out. Retry or fail over?
 > A timeout means "unknown". Retry the same provider with backoff and jitter a limited number of times; if its circuit is open, fail over. For OTPs a possible duplicate is acceptable; for financial alerts, query the first provider for the message before sending again.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: why put messages in a queue instead of sending them directly?
+> Providers are slow and sometimes down; the queue lets workers send at a safe speed and retry.
+
+> [!question]- Easy: why separate queues for OTPs and promotions?
+> So millions of promos never delay an urgent login code.
+
+> [!question]- Easy: what does APNs `410 Unregistered` tell you?
+> The device token is dead; disable it and stop sending to it.
+
+> [!question]- Medium: 20 million pushes in 30 minutes. Roughly what rate?
+> 20,000,000 ÷ 1,800 s ≈ 11,000 messages a second.
+
+> [!question]- Medium: the worker's call to the SMS provider times out. Is it safe to fail over to another provider?
+> It may cause a duplicate, since the first one may have sent it; fine for an OTP, but for a "you were charged" message query the first provider first.
+
+> [!question]- Medium: how do you pause a 20 million-user campaign halfway?
+> Expand the segment lazily in batches; set the campaign to paused so the expander stops and workers skip queued messages.
 
 ## 10. Cheat sheet 🟢
 

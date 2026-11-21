@@ -39,6 +39,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[LLD Interview Method]]: the step order these notes follow: clarify, entities, APIs, storage, code, edge cases.
+> - [[Strategy and Template Method]]: a rule behind an interface you can swap, here the cancellation refund rule.
+> - [[Concurrency for LLD]]: goroutines run at the same time; a mutex makes them take turns on shared data.
+> - [[Movie Ticket Booking]]: the hold, then pay, then confirm pattern with an expiry timer; here it spans several nights.
+
 **From zero, in 60 seconds** 🟢
 
 A hotel sells nights, not rooms. If you stay from the 10th to the 12th, you use the nights of the 10th and the 11th. The check-out day is not a night. So the system keeps a counter for each room type for each night, like "deluxe, 10th: 3 left". Booking a stay means taking one from every night of the stay, all together or not at all. While you pay, the rooms are kept aside for a few minutes; that is a **hold**.
@@ -74,6 +80,10 @@ This note designs a system where one guest wins, the other is told "sold out", a
 | Mutex / lock | Lets only one goroutine change shared data at a time | `mu.Lock()` around the counters |
 | Strategy | A swappable piece of behaviour behind an interface | Flexible vs non-refundable refund rule |
 | Transaction | A group of DB changes that all happen or none do | Reserve 3 nights or none |
+| TTL (time to live) | How long a hold lasts before it is released | 10 minutes |
+| Atomic | Done as one step nobody can cut into | Check all nights and reserve all nights together |
+| Invariant | A rule that must always be true | `booked + held <= total` on every night |
+| Exclusion constraint | A PostgreSQL rule that rejects a row overlapping another row | Room 101 cannot have two stays on the 11th |
 
 **Picture it**
 
@@ -118,7 +128,7 @@ The hotel must never sell more rooms than it has, even with many guests booking 
 3. Name the entities: `RoomType`, night inventory, `Hold`, `Booking`, `CancellationPolicy`, `Hotel`.
 4. Write `PlaceHold` (check all nights, then reserve all) and the expiry sweep.
 5. Add `Confirm` (idempotent), `ReleaseHold`, `Cancel` with the policy.
-6. Test overlaps, back-to-back stays, partial failure, expiry, idempotent confirm, refunds, and 60 concurrent guests under `-race`. Then show the PostgreSQL schema with the guarded update and the exclusion constraint.
+6. Test overlaps, back-to-back stays, partial failure, expiry, idempotent confirm, refunds, and 60 concurrent guests under `-race` (Go's race detector, which flags unsafe shared access). Then show the PostgreSQL schema with the guarded update and the exclusion constraint.
 
 ## Step 1: Clarify requirements 🟢
 
@@ -129,8 +139,8 @@ The hotel must never sell more rooms than it has, even with many guests booking 
 - Can one booking take several rooms? *Assume: yes, `rooms >= 1`, same type and dates.*
 - How long does a hold last? *Assume: 10 minutes, which covers a payment page.*
 - What is the price? *Assume: a flat rate per room type per night; seasonal pricing is a follow-up.*
-- Cancellation rules? *Assume: per hotel. Flexible: full refund until 48 hours before check-in at 14:00, then the first night is kept. Non-refundable: no refund. Cancelling after the check-in time is not allowed (that is a no-show).*
-- Is deliberate overbooking allowed, as some hotels do? *Assume: no; it becomes a configurable allowance in Step 10.*
+- Cancellation rules? *Assume: per hotel. Flexible: full refund until 48 hours before check-in at 14:00, then the first night is kept. Non-refundable: no refund. Cancelling after the check-in time is not allowed (that is a no-show: the guest never arrives).*
+- Is deliberate overbooking (selling more rooms than exist, betting some guests cancel) allowed, as some hotels do? *Assume: no; it becomes a configurable allowance in Step 10.*
 
 ### Functional
 
@@ -149,7 +159,7 @@ The hotel must never sell more rooms than it has, even with many guests booking 
 
 ### Out of scope
 
-- Payments, room assignment at check-in, housekeeping, loyalty points, channel managers (Booking.com sync).
+- Payments, room assignment at check-in, housekeeping, loyalty points, channel managers (tools that keep room counts in sync with sites like Booking.com).
 - Search across many hotels by city and price (the system design side).
 
 ## Step 2: Actors and use cases 🟢
@@ -167,13 +177,13 @@ The hardest use case is **PlaceHold** under concurrency across several nights. C
 
 | Entity | Key fields | Why it exists |
 |---|---|---|
-| `Date` | midnight UTC | A calendar night, never a timestamp with hours |
+| `Date` | midnight UTC (the world reference clock, no time zone) | A calendar night, never a timestamp with hours |
 | `RoomType` | Code, Total, NightPaise | What the guest buys and how many exist |
 | night inventory | (type, night) to total, booked, held | The counter that must never go below zero free |
 | `Hold` | ID, guest, type, dates, rooms, Amount, ExpiresAt, BookingID | A temporary claim on every night of a stay |
 | `Booking` | ID, HoldID, dates, rooms, Amount, Status, RefundPaise, PaymentRef | The confirmed stay |
 | `CancellationPolicy` | `Refund(booking, now)` | The refund rule changes per hotel and per rate plan |
-| `Hotel` | types, inventory, holds, bookings, policy, clock, one mutex | The facade; owns the lock |
+| `Hotel` | types, inventory, holds, bookings, policy, clock, one mutex | The facade (one front object hiding the parts); owns the lock |
 
 Modelling insights:
 
@@ -182,6 +192,8 @@ Modelling insights:
 - **The hold remembers its booking ID.** That makes `Confirm` idempotent without a separate key table.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know that a stay is a set of nights, how half-open ranges work, and what a hold is. Next we open the box: how the entities link, the API, two ways to store inventory in PostgreSQL, and the Go code.
 
 ```mermaid
 classDiagram
@@ -262,7 +274,7 @@ type BookingService interface {
 var _ BookingService = (*Hotel)(nil) // compile-time check
 ```
 
-`410 Gone` on an expired hold tells the payment flow to refund: the money arrived after the rooms were released. API-level retries and keys are covered in [[Idempotency and Idempotency Keys]].
+`410 Gone` (the HTTP code for "this existed but is gone now") on an expired hold tells the payment flow to refund: the money arrived after the rooms were released. API-level retries and keys are covered in [[Idempotency and Idempotency Keys]].
 
 ## Step 6: Storage and repositories 🟡
 
@@ -336,7 +348,7 @@ RETURNING h.room_type_id, h.check_in, h.check_out, h.rooms;
 
 Rows for each night must exist before anyone books, so a nightly job creates them a year ahead.
 
-Under Read Committed, an `UPDATE` that waits on a locked row re-checks its `WHERE` against the newest row version, so the `total - booked - held >= $4` guard sees the other transaction's hold.
+Under Read Committed (PostgreSQL's default isolation level: each statement sees data committed before it started), an `UPDATE` that waits on a locked row re-checks its `WHERE` against the newest row version, so the `total - booked - held >= $4` guard sees the other transaction's hold.
 
 The `CHECK` constraint is the last line of defence. Row locks in general are in [[Locking - Optimistic vs Pessimistic]]; transaction rules in [[Transactions and ACID]].
 
@@ -367,7 +379,7 @@ ERROR:  conflicting key value violates exclusion constraint "room_stays_room_id_
 DETAIL:  Key (room_id, stay)=(101, [2026-12-11,2026-12-13)) conflicts with existing key (room_id, stay)=(101, [2026-12-10,2026-12-12)).
 ```
 
-The SQLSTATE is `23P01` (`exclusion_violation`); the app maps it to 409 and tries the next free room. `daterange` is half-open `[)` by default, which matches "the check-out day is not a night". The `WHERE (status = 'active')` predicate makes cancelled stays stop counting. GiST and range indexes are covered in [[Index Types and Index Design]].
+The SQLSTATE (the database's 5-character error code) is `23P01` (`exclusion_violation`); the app maps it to 409 and tries the next free room. `daterange` is half-open `[)` by default, which matches "the check-out day is not a night". The `WHERE (status = 'active')` predicate makes cancelled stays stop counting. GiST (a Postgres index type that can search ranges) and range indexes are covered in [[Index Types and Index Design]].
 
 | | Model A: counters per night | Model B: exclusion constraint |
 |---|---|---|
@@ -375,7 +387,7 @@ The SQLSTATE is `23P01` (`exclusion_violation`); the app maps it to 409 and trie
 | Invariant lives in | the guarded `UPDATE` plus `CHECK` | the `EXCLUDE` constraint |
 | Concurrency | row locks on the night rows | the constraint check on insert |
 | Availability query | `min(total - booked - held)` over nights | count rooms with no overlapping active stay |
-| Fits | OTAs and most hotels | small hotels, room choice, assignment at check-in |
+| Fits | OTAs (online travel agencies such as MakeMyTrip) and most hotels | small hotels, room choice, assignment at check-in |
 
 ```go
 type InventoryRepo interface {
@@ -405,7 +417,7 @@ type HoldRepo interface {
 Patterns not used, and why:
 
 - No pricing strategy in the code: one flat rate is the stated scope. Seasonal and weekend rates would be the second strategy, applied per night (Step 10).
-- No per-night lock objects: one mutex makes "all nights or none" trivial. Fine-grained locks would need a fixed lock order to avoid deadlock, as the SQL version does.
+- No per-night lock objects: one mutex makes "all nights or none" trivial. Fine-grained locks would need a fixed lock order to avoid deadlock (two goroutines each waiting forever for the other's lock), as the SQL version does.
 
 ## Folder structure 🟡
 
@@ -976,25 +988,27 @@ func TestConcurrentHoldsNeverOverbook(t *testing.T) {
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working hotel and its tests. Next is interview depth: the last room raced by two guests, late payments, cancel deadlines, SQL deadlocks, time zones and overbooking.
+
 | Edge case | What happens | How the design handles it |
 |---|---|---|
 | Two guests take the last room at once | Both see 1 free | Check and reserve under one lock; in SQL, the guarded `UPDATE` plus `CHECK` |
 | Stay spans a sold-out middle night | Partial hold on the free nights | Phase 1 checks every night before phase 2 touches any |
 | Back-to-back stays (out 12th, in 12th) | Wrongly rejected as overlap | Half-open `[in, out)`; `daterange` is `[)` by default |
 | `checkOut <= checkIn` | Zero or negative nights | `ErrBadDates` |
-| Guest abandons the payment page | Rooms locked forever | TTL plus sweep; production uses a sweeper job with `SKIP LOCKED` |
+| Guest abandons the payment page | Rooms locked forever | TTL plus sweep; production uses a sweeper job with `SKIP LOCKED` (skip rows another transaction has locked instead of waiting) |
 | Payment succeeds after the hold expired | Money taken, no room | `Confirm` returns `ErrHoldExpired` (410); the payment is refunded |
 | Payment callback delivered twice | Two bookings | The hold stores `BookingID`; a retry returns the same booking |
 | Cancel at exactly the free-cancel deadline | Off-by-one dispute | `now.Before(deadline)` means the deadline itself is late; the test pins it |
 | Cancel after check-in time | Refund for a used night | `ErrTooLate`; no-shows are a separate flow |
 | Double cancel | Inventory released twice, counter goes up | `ErrAlreadyCancel`; in SQL `UPDATE ... WHERE status = 'confirmed'` |
 | Overlapping holds lock the same nights in different orders (SQL) | Deadlock | `SELECT ... ORDER BY night FOR UPDATE` before the update |
-| Time zones | Night computed from a UTC timestamp lands on the wrong date; the 14:00 check-in is a local time | Take check-in and check-out from the guest as calendar dates in the hotel's calendar and never derive them from a timestamp. The code stores those dates as midnight UTC only as a label, and it adds `CheckInHour` to that UTC midnight, so the deadline is 14:00 UTC; that is right only for a hotel on UTC. In production, store the hotel's IANA zone and build the check-in instant with `time.Date(y, m, d, 14, 0, 0, 0, loc)` |
+| Time zones | Night computed from a UTC timestamp lands on the wrong date; the 14:00 check-in is a local time | Take check-in and check-out from the guest as calendar dates in the hotel's calendar and never derive them from a timestamp. The code stores those dates as midnight UTC only as a label, and it adds `CheckInHour` to that UTC midnight, so the deadline is 14:00 UTC; that is right only for a hotel on UTC. In production, store the hotel's IANA zone (a named time zone such as `Asia/Kolkata`) and build the check-in instant with `time.Date(y, m, d, 14, 0, 0, 0, loc)` |
 
 ### Common mistakes
 
 - Treating a stay as `[in, out]` and blocking the check-out day.
-- Checking availability, unlocking, then reserving (check-then-act).
+- Checking availability, unlocking, then reserving (check-then-act: another guest can grab the room in the gap).
 - Reserving night by night and returning on the first full night, leaving earlier nights held.
 - Holds without expiry, or expiry that runs only from a cron job so the in-memory path never sees it.
 - A refund computed with `float64`, or a policy hard-coded with `if hotel == ...`.
@@ -1007,7 +1021,7 @@ func TestConcurrentHoldsNeverOverbook(t *testing.T) {
 | Deliberate overbooking (sell 102 percent) | `total` becomes `capacity + allowance` per type; the walk-out cost is a business decision |
 | Specific room choice | Model B: `room_stays` with the exclusion constraint |
 | Modify dates | Place a new hold for the new range, confirm it, then cancel the old booking, so the guest never loses the old room |
-| Many hotels, high traffic | Shard by hotel; inventory rows are naturally per hotel, and the hot rows are popular nights |
+| Many hotels, high traffic | Shard (split the data and load across servers) by hotel; inventory rows are naturally per hotel, and the hot rows are popular nights |
 | Channel managers (OTA sync) | Publish inventory changes as events; allocate per-channel quotas |
 | Faster expiry | A min-heap of holds by `ExpiresAt` in memory, or the indexed `expires_at` in SQL |
 
@@ -1095,6 +1109,26 @@ I model inventory per room type per night, with total, booked and held counters,
 - Confirm is idempotent through `Hold.BookingID`.
 - Refund = `CancellationPolicy.Refund(booking, now)`; no cancel after check-in time.
 - SQL: lock night rows `ORDER BY night FOR UPDATE`, guarded `UPDATE`, `CHECK (booked + held <= total)`; specific rooms: `EXCLUDE USING gist (room_id WITH =, stay WITH &&)` with `btree_gist`, error 23P01.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 Check in on the 10th, check out on the 12th. Which nights are used?
+> The 10th and the 11th; the check-out day is not a night.
+
+> [!question]- 🟢 Why does a hold expire?
+> So a guest who leaves the payment page does not lock rooms forever; after the TTL the rooms go back.
+
+> [!question]- 🟢 Why is inventory stored per night?
+> A stay needs a room on every one of its nights, and two stays only clash on nights they share.
+
+> [!question]- 🟡 Night 10 is free, night 11 is full. What does a 10-12 hold change?
+> Nothing. Phase 1 checks every night first and fails before Phase 2 reserves any.
+
+> [!question]- 🟡 The payment callback arrives twice. How is one booking made?
+> The hold stores its `BookingID` after the first confirm; the retry finds it and returns the same booking.
+
+> [!question]- 🟡 How does SQL stop two transactions overbooking the same night?
+> Lock night rows in date order with `FOR UPDATE`, update only `WHERE total - booked - held >= n`, and back it with `CHECK (booked + held <= total)`.
 
 ## Links 🟢
 

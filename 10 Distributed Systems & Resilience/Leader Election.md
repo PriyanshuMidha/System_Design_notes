@@ -36,6 +36,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Consensus - Raft and Paxos]]: a group of servers can agree on one answer by majority vote, even when some crash; etcd and ZooKeeper are built this way.
+> - [[Clocks and Ordering]]: clocks on different machines disagree and can jump, so "my lease ends at 10:00:15" is only roughly true.
+
 **From zero, in 60 seconds** 🟢
 
 You run 3 copies of a service, so one crash does not stop you.
@@ -84,6 +88,10 @@ Leader election lets the copies agree that exactly one of them does the job, and
 | Network partition | Machines are alive but cannot reach each other | A switch fails between two racks |
 | Split brain | Two copies both think they are leader | Both pods run the billing job |
 | Epoch / fencing token | A number that goes up with every new leader | Leader #7 replaced leader #6 |
+| Compare-and-set | "Change it only if it still looks like what I last saw", done in one step | Set holder = A only if the lease is free |
+| Renew deadline | How long the leader keeps acting without a successful renew | 10 s, shorter than the 15 s lease |
+| GC pause | The program freezes while its memory cleaner runs | Pod A stops for 12 s, then wakes up |
+| Failover | Another copy taking over when the leader dies | Pod B becomes leader 15 s later |
 
 **Picture it**
 
@@ -116,9 +124,9 @@ You deploy a billing service with 3 replicas for availability. It has a job, "ch
 
 You need: one replica runs it, and if that replica dies, another takes over within seconds. That is leader election. The same need appears in:
 
-- **Single writer:** a primary database; a Kafka partition leader; one owner per shard.
-- **Coordinator:** a cluster controller, Kubernetes' `kube-controller-manager` and `kube-scheduler`, which run with several replicas and one active.
-- **Scheduler:** the cron runner above, a job dispatcher, a cache warmer.
+- **Single writer:** a primary database; a Kafka partition leader (the one broker that accepts writes for a slice of a topic); one owner per **shard** (a slice of the data).
+- **Coordinator:** a cluster controller, Kubernetes' `kube-controller-manager` and `kube-scheduler` (the Kubernetes parts that manage and place workloads), which run with several replicas and one active.
+- **Scheduler:** the cron runner above (cron = a job that runs on a timetable), a job dispatcher, a cache warmer.
 
 The hard part is not choosing; it is guaranteeing that two instances never both believe they lead (**split brain**) when the network is partitioned or a process is paused.
 
@@ -129,6 +137,12 @@ flowchart LR
     A["Run on all copies"] --> T["Everyone charged 3 times"]
     E["Leader election"] --> O["Exactly one runs it"]
 ```
+
+### Real-life example 🟢
+
+When you hold seats on BookMyShow, they are reserved for about 10 minutes. Some background job must release seats whose hold has run out.
+The booking service runs on many servers, but that clean-up job must run on only one of them at a time, or two servers could release and resell the same seat in a messy race.
+So the servers elect one leader to run the clean-up. If that server crashes, another one takes over within seconds and seats keep getting released.
 
 ## 2. Mental model 🟢
 
@@ -143,11 +157,28 @@ If the holder does not come back, after the sand runs out anyone may take the ba
 - **Renew deadline:** how long the leader keeps acting without a successful renewal. Always shorter than the TTL.
 - **Epoch (or term, generation, `leaseTransitions`):** a number that grows each time leadership changes. Used as a fencing token.
 
+## Common beginner mistakes 🟢
+
+- **"Lowest IP is leader", decided by each node on its own** → during a network split each side picks its own leader → let a consistent store (etcd, ZooKeeper, a DB row) decide.
+- **Using a single Redis key as the lease** → Redis can lose the key during failover, giving two leaders → use a consensus-backed store, and fence writes.
+- **The leader keeps working until the lease has fully expired** → a follower may take over at that exact moment → stop early, at the renew deadline (10 s of a 15 s lease).
+- **No epoch on writes** → an old leader waking from a pause can still write → send the epoch with every write and reject older ones.
+- **Electing a leader just to run a cron job once** → a unique row per `(job, date)` or `SKIP LOCKED` does it with no election → use the database constraint when you can.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a leader is just whoever holds an expiring lease in a shared, consistent store, and that it must keep renewing. **Next we open the box**: the full life of a lease from grab to takeover, the states each copy moves through, and the four rules that keep two leaders from existing at once.
 
 ### The lease lifecycle
 
 **In plain words:** grab the lease, renew it before it runs out, and if you cannot renew in time, stop acting as leader.
+
+**Step by step:**
+1. Pod A asks etcd: "make me holder if nobody holds it". It wins: holder A, epoch 7, expires in 15 s.
+2. Pod B asks the same and is told "no, A holds it". B retries every 2 s.
+3. A renews every 2 s, pushing the expiry forward each time.
+4. A freezes. After 10 s with no successful renew, A's own rule says "stop leading", even though it is frozen and cannot act anyway.
+5. At 15 s the lease expires. B's next try wins: holder B, epoch 8. When A wakes and tries to renew, it is told "held by B" and becomes a follower.
 
 ```mermaid
 sequenceDiagram
@@ -178,6 +209,13 @@ sequenceDiagram
 
 **In plain words:** each copy is either a follower waiting, a candidate trying to grab the lease, or the leader doing the work.
 
+**Step by step:**
+1. Pod C starts as a follower and watches the lease.
+2. The lease looks expired, so C becomes a candidate and tries to grab it.
+3. If C's compare-and-set works, C is leader and the epoch goes up by 1. If someone else won, C goes back to follower.
+4. As leader, C stays leader only while renewals keep succeeding within the renew deadline.
+5. On a clean shutdown, C releases the lease so another pod can take over at once.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Follower
@@ -193,7 +231,7 @@ stateDiagram-v2
 
 **In plain words:** let the store decide, renew early, step down on time, and protect writes with a growing number.
 
-1. **The store decides.** Acquisition must be an atomic compare-and-set (or create-if-absent) on a linearizable store. Two instances cannot both succeed.
+1. **The store decides.** Acquisition must be an **atomic** (all-or-nothing, no one can sneak in between) compare-and-set (or create-if-absent) on a linearizable store (one that acts like a single copy). Two instances cannot both succeed.
 2. **The leader gives up early.** It stops leader-only work when `now - lastSuccessfulRenew >= renewDeadline` (10 s), while followers wait for the full lease duration (15 s). The gap absorbs clock-rate differences and in-flight requests.
 3. **Every takeover bumps the epoch.** Downstream systems reject writes carrying an older epoch. This handles the case rule 2 cannot: a leader paused *in the middle* of a write.
 4. **Release on shutdown.** A leader that stops cleanly deletes the lease so a follower takes over immediately instead of waiting 15 s.
@@ -439,10 +477,18 @@ That still assumes clocks *run* at roughly the same rate, which is why the 10 s 
 | Ring (Chang–Roberts, 1979) | An election message circulates the ring collecting the highest ID | Textbook vocabulary | Same partition problem; `O(n)` to `O(n²)` messages |
 | Consensus built in (Raft term) | Candidates request votes; a majority makes a leader for that term | You are building the replicated system itself | You must run a Raft group |
 | etcd election | `concurrency.NewSession` (lease, default TTL 60 s, kept alive in the background), then `Election.Campaign`; the leader is the key with the lowest create revision under a prefix | Go services already running etcd | Needs an etcd cluster; revision of the key works as an epoch |
-| ZooKeeper | Each candidate creates an ephemeral sequential znode; the lowest sequence leads; each watches only its predecessor | JVM ecosystems already on ZooKeeper | Session timeouts to tune; no herd on change |
+| ZooKeeper | Each candidate creates an ephemeral sequential znode (a ZooKeeper entry that gets a rising number and vanishes when its owner's session dies); the lowest sequence leads; each watches only its predecessor | JVM ecosystems already on ZooKeeper | Session timeouts to tune; no herd on change |
 | Consul session | `PUT ?acquire=<session>` on a key; session tied to health checks; `lock-delay` (default 15 s) blocks reacquire after a release by invalidation | Consul shops | Health-check-based expiry |
 | Kubernetes Lease | client-go `leaderelection` updates a `coordination.k8s.io/v1` Lease: `holderIdentity`, `renewTime`, `leaseTransitions` | Anything running in Kubernetes | Typical 15 s lease, 10 s renew deadline, 2 s retry; API-server load from renewals |
-| Database lease | `pg_try_advisory_lock(42)` on a session, or a `leases` row updated with `WHERE expires_at < now()` | You already have PostgreSQL and no etcd | The database becomes a dependency of failover; advisory locks are lost silently when the connection drops |
+| Database lease | `pg_try_advisory_lock(42)` (a Postgres lock on a number, not on a row) on a session, or a `leases` row updated with `WHERE expires_at < now()` | You already have PostgreSQL and no etcd | The database becomes a dependency of failover; advisory locks are lost silently when the connection drops |
+
+### Leader election versus things people confuse it with 🟡
+
+| Thing | What it decides | How it differs from leader election |
+| --- | --- | --- |
+| Distributed lock | Who may touch one resource right now | Usually short and per task; leader election is a long-lived role that is renewed for hours |
+| Consensus (Raft) | One agreed order of all writes | Raft elects a leader internally; app-level election usually borrows a store that already runs Raft |
+| Failure detection | Whether a node is probably dead | Only a hint; the election store and fencing give the actual safety |
 
 ### PostgreSQL lease row
 
@@ -500,15 +546,17 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the lease life cycle, the follower/candidate/leader states, the four safety rules, and how etcd, ZooKeeper, Kubernetes and PostgreSQL implement them. **Next comes the advanced part**: real systems such as Patroni, KRaft and Redis Sentinel, production failure modes, and the finer points of renew deadlines, thundering herds and epochs in the data path.
+
 - **Real systems:**
 	- `kube-controller-manager` and `kube-scheduler` run several replicas with one active via a Lease object.
 	- Patroni elects the PostgreSQL primary through a lease in etcd, Consul or ZooKeeper (see [[High Availability and Failover]]).
-	- Kafka: the KRaft controller quorum elects the active controller with Raft; the controller then picks a leader for each partition from its in-sync replicas.
-	- Redis Sentinel: sentinels agree (by majority) that the master is down and elect one sentinel to run the failover.
+	- Kafka: the KRaft controller quorum (Kafka's built-in Raft group) elects the active controller with Raft; the controller then picks a leader for each partition from its in-sync replicas (the copies that are fully caught up).
+	- Redis Sentinel (helper processes that watch Redis and run failover): sentinels agree (by majority) that the master is down and elect one sentinel to run the failover.
 - **Failure modes → fixes:**
 	- Leadership flapping during GC pauses or a slow store → longer lease, separate the renewal goroutine from heavy work, alert on transitions.
 	- Old leader keeps writing after a pause → fencing: pass the epoch to every downstream write and reject older ones (see [[Distributed Locks and Fencing Tokens]]).
-	- 15-second outage on every deploy → release the lease on `SIGTERM` (client-go's `ReleaseOnCancel: true`).
+	- 15-second outage on every deploy → release the lease on `SIGTERM` (the polite "please shut down" signal) (client-go's `ReleaseOnCancel: true`).
 	- Leader holds the lease but its work loop is stuck → tie renewal to a health signal from the work loop, not just to "process is alive".
 	- Advisory-lock leader loses its DB connection and the lock with it, but keeps running → check the lock (or re-acquire) before each unit of work, or use the lease row with an epoch.
 - **What to monitor:** current leader identity, leadership transitions per hour, time since last successful renewal, renewal latency, and time with no leader during failovers.
@@ -517,7 +565,7 @@ flowchart LR
 
 - **Why renew deadline < lease duration.** The leader starts its 10 s countdown from when it *sent* its last successful renewal (the Go example records the time before calling the store for this reason), while the store computes expiry from when it *received* it, which is later. So the leader always believes its lease ends before the store does. The 5 s gap also absorbs a clock that runs a little fast and the time to finish an in-flight operation.
 - **Detection vs safety.** A failure detector (heartbeats, phi accrual; see [[Failure Detection, Gossip and Membership]]) can say a leader is *probably* dead. It can never be sure, because a slow node looks like a dead one. So the safety of election must come from the store's atomic compare-and-set and from fencing, never from "I think the leader is dead".
-- **Thundering herd.** With 100 candidates all watching one key, every change wakes 100 clients that all retry. ZooKeeper's recipe avoids this: each candidate watches only the znode just below its own, so one change wakes one client. etcd's `Campaign` does the same by waiting on the key with the previous revision.
+- **Thundering herd** (many waiting clients all waking at once). With 100 candidates all watching one key, every change wakes 100 clients that all retry. ZooKeeper's recipe avoids this: each candidate watches only the znode just below its own, so one change wakes one client. etcd's `Campaign` does the same by waiting on the key with the previous revision.
 - **Observers.** Followers often need to know who leads (to forward requests). etcd `Election.Observe` streams leader changes; Kubernetes clients read `holderIdentity`.
 - **Epoch in the data path.** The strongest form puts the epoch inside the store transaction itself: etcd transactions can check that the leader key still has its create revision (`Txn().If(Compare(CreateRevision(leaderKey), "=", rev))`), so a write succeeds only while that exact leadership is live.
 
@@ -605,6 +653,30 @@ func RunAsLeader(ctx context.Context, cli *clientv3.Client, id string, work func
 - Bully and ring are vocabulary; they split-brain under partitions.
 - Tools: etcd `concurrency.Election`, ZooKeeper ephemeral sequential znodes, Consul sessions, K8s Lease, a PostgreSQL lease row.
 - Prefer no leader at all when a unique constraint or `SKIP LOCKED` does the job.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is a lease?
+> A record in a shared store saying "X is leader until time T", which the leader must keep renewing.
+
+> [!question]- What is split brain?
+> Two copies both believing they are the leader and both doing leader work.
+
+> [!question]- Why release the lease on shutdown?
+> So a follower can take over right away instead of waiting for the lease to expire.
+
+🟡 Medium
+
+> [!question]- Lease 15 s, renew deadline 10 s, retry 2 s. The leader dies. Roughly how long until a new leader acts?
+> About 15 to 17 s: full lease expiry plus up to one retry period.
+
+> [!question]- Why must the renew deadline be shorter than the lease?
+> So the old leader always stops before anyone else can take over, covering delays and small clock differences.
+
+> [!question]- The old leader froze mid-write and wakes after a new leader took over. What stops its write?
+> The fencing epoch: its write carries epoch 7, the database has seen 8, so it rejects the write.
 
 ## Links
 

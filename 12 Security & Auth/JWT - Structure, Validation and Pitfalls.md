@@ -32,6 +32,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Authentication vs Authorization]]: after login the server needs a way to know "this request is from user 42" on every call.
+> - [[Sessions and Cookies]]: one way is a random ID in a cookie that the server looks up; a JWT is the other way, where the facts travel inside the token.
+
 **From zero, in 60 seconds** 🟢
 
 A **JWT** (JSON Web Token) is a small text pass a server gives you after login.
@@ -74,6 +78,12 @@ A JWT is a signed note the client carries: "this is user 42, valid until 09:00",
 | Public key | Key anyone can use to verify, but not to sign | Published in a JWKS URL |
 | Stateless | The server stores nothing per user to check a request | Any pod can verify locally |
 | Expiry (`exp`) | Time after which the token is rejected | `exp: 1700000000` |
+| Issuer (`iss`) / Audience (`aud`) | Who made the token / which service it is meant for | `iss: auth.example.com`, `aud: orders-api` |
+| `kid` (key id) | A label in the header saying which key signed this token | `kid: 2026-11-a` |
+| HMAC | A hash that also needs a secret key, used for HS256 signatures | Same secret signs and checks |
+| Clock skew / leeway | Server clocks differ by a few seconds; leeway is the grace period you allow | 30 s leeway on `exp` |
+| Denylist | A list of tokens you have cancelled and must reject | Redis set of revoked `jti` values |
+| Pod | One running copy of your service (Kubernetes word) | 20 pods behind a load balancer |
 
 **Picture it**
 
@@ -101,11 +111,24 @@ Where it breaks: anyone can read the wristband print (JWTs are signed, not encry
 
 ## 1. Why it exists 🟢
 
-An API running behind a load balancer on 20 stateless pods needs to know who is calling on every request. A server-side session keyed by a session ID means every pod either shares one session store (a network hop and a single point of failure on every request) or sticks a client to one pod (breaks autoscaling and rolling deploys).
+An API running behind a load balancer (the server that spreads requests across many copies) on 20 stateless pods needs to know who is calling on every request. A server-side session keyed by a session ID means every pod either shares one session store (a network hop and a single point of failure on every request) or sticks a client to one pod (breaks autoscaling, adding or removing pods with load, and rolling deploys, replacing pods one by one).
 
 A JWT moves the session data into the request itself: the client sends `Authorization: Bearer <token>`, and any pod can verify the signature locally — against a shared secret (HS256) or a public key it already cached (RS256/EdDSA) — with no network call.
 
 The cost is that the token now carries its own expiry and claims, and the server can no longer just "delete the session row" to log someone out early; see [[Access and Refresh Tokens]] for how real systems close that gap.
+
+### Real-life example: one login, many Swiggy services 🟢
+
+When you open Swiggy, your one login is used by many separate back-end services: menus, cart, orders, payments, delivery tracking. If each of them had to ask one central database "who is this?" on every tap, that database would become a choke point. Instead, after login the app gets a short-lived JWT saying "user 42, expires in 10 minutes", signed by the login service. Each service checks the signature with the login service's public key and gets the answer locally, in well under a millisecond.
+
+### JWT vs session cookie 🟡
+
+| | JWT | Session ID in a cookie |
+| --- | --- | --- |
+| Where the facts live | Inside the token | On the server, in a store like Redis |
+| Check cost | Verify a signature, no network call | One store lookup per request |
+| Log out one user right now | Hard: token works until `exp` | Easy: delete the row |
+| Can the user read it? | Yes, anyone can decode it | No, it is just a random string |
 
 ## 2. Mental model 🟢
 
@@ -115,11 +138,28 @@ If you scribble "first class" onto economy seat 32B, the stamp no longer matches
 
 That is the one fact every JWT bug traces back to: **encoded, not encrypted**. Never put a password, a secret, or anything you would not want visible in a browser extension's network tab into a JWT payload.
 
+## Common beginner mistakes 🟢
+
+- **Thinking a JWT is encrypted** → anyone can paste it into a decoder and read it → never put passwords, card numbers or secrets in claims.
+- **Decoding without verifying** → reading claims with a "decode" function skips the signature check, so a forged token is trusted → always use the library's verify/parse with a key.
+- **Letting the token choose the algorithm** → attackers send `alg: none` → hard-code the allowed algorithm (`WithValidMethods`).
+- **Giving tokens a 30-day expiry** → a stolen token works for a month and you cannot cancel it → keep access tokens to 5-15 minutes and use a refresh token.
+- **Skipping the `aud` check** → a token for one service works on another → check that `aud` names this service.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a JWT is a signed, readable pass any server can check by itself. **Next we open the box**: what the three parts hold, how the signing keys work and reach every server, what a verifier must check, and which attacks hit a careless verifier.
 
 ### Structure
 
 **In plain words:** three chunks of text joined by dots: a header (how it was signed), the claims (the facts), and the signature (the tamper seal).
+
+**Step by step:**
+1. The issuer writes a header: `{"alg":"RS256","kid":"2026-11-a"}`.
+2. It writes the claims: `{"sub":"42","aud":"orders-api","exp":1700000600}`.
+3. It base64url-encodes both (turns them into URL-safe text) and joins them with a dot.
+4. It signs that text with its private key and adds the signature as the third part.
+5. Any verifier re-computes the check over parts 1 and 2. If even one letter in the claims changed, the signature no longer matches.
 
 ```mermaid
 flowchart LR
@@ -140,8 +180,15 @@ Keep the payload small and free of secrets — it is fully readable by anyone ho
 
 **In plain words:** HS256 uses one shared password to sign and check. RS256/EdDSA use a private key to sign and a public key to check, so checkers can't forge passes. JWKS is just a URL that lists the public keys.
 
+**Step by step:**
+1. The auth server keeps one private key, labelled `kid = 2026-11-a`, and signs every token with it.
+2. It publishes the matching public key at `/.well-known/jwks.json`.
+3. The orders service fetches that file once and caches it.
+4. A token arrives with `kid = 2026-11-a`; orders finds that key in its cache and checks the signature locally.
+5. Next month the auth server adds key `2026-11-b`. A token with the new `kid` misses the cache, so orders fetches the file again and carries on, with no redeploy.
+
 - **HS256** (HMAC-SHA256): one shared secret signs and verifies. Simple, but every verifier must hold the secret, so any verifying service could also forge tokens. Fine for a single service that both issues and checks its own tokens.
-- **RS256** (RSA) and **EdDSA** (Ed25519): the issuer holds a private key and signs; every other service verifies with the matching **public** key. This is the right choice once more than one service needs to verify tokens, because a compromised verifier cannot forge new ones.
+- **RS256** (RSA, the classic public-key method) and **EdDSA** (Ed25519, a newer, smaller and faster one): the issuer holds a private key and signs; every other service verifies with the matching **public** key. This is the right choice once more than one service needs to verify tokens, because a compromised verifier cannot forge new ones.
 - A **JWKS** (JSON Web Key Set) is a small JSON document of public keys, normally served at `/.well-known/jwks.json`, each tagged with a `kid`. Verifiers fetch and cache it.
 
 ```mermaid
@@ -165,6 +212,13 @@ sequenceDiagram
 
 **Key rotation with overlap:** publish the new key in the JWKS alongside the old one, start signing new tokens with the new `kid`, and only remove the old key once every token signed with it has expired. A verifier that refreshes its JWKS cache on an unknown `kid` (shown above) never has to be redeployed for routine rotation.
 
+```mermaid
+flowchart LR
+    A["Week 1: JWKS has key A<br/>sign with A"] --> B["Week 2: JWKS has A + B<br/>sign with B"]
+    B --> C["Old A tokens expire"]
+    C --> D["Week 3: remove A"]
+```
+
 ### Validation checklist
 
 **In plain words:** go through this list on every token. Skipping even one item is a real hole.
@@ -175,12 +229,19 @@ A verifier that skips any of these has a real vulnerability, not a theoretical o
 2. Verify the **signature** with the correct key for that algorithm.
 3. Check **`iss`** matches the expected issuer.
 4. Check **`aud`** matches this service (a token meant for `orders-api` must not work against `payments-api`).
-5. Check **`exp`** has not passed and **`nbf`** has, both with a small leeway (20–60s) for clock skew.
-6. If the service tracks revocation, check **`jti`** against a denylist or the user's token version.
+5. Check **`exp`** has not passed and **`nbf`** has, both with a small leeway (20–60s) for clock skew (servers' clocks never agree exactly).
+6. If the service tracks revocation, check **`jti`** (the token's unique ID) against a denylist (a list of cancelled tokens) or the user's token version.
 
 ### Attacks that skipping step 1 enables
 
 **In plain words:** if you let the token pick its own algorithm, an attacker can pick "none" or trick you into using the public key as a password.
+
+**Step by step (the `alg: none` attack):**
+1. The attacker writes a header `{"alg":"none"}` and claims `{"sub":"admin"}`, with an empty signature.
+2. A careless verifier reads `alg` from the token and thinks "none means nothing to check".
+3. It trusts the claims, and the attacker is now admin.
+4. The key-confusion attack works the same way: header says `HS256`, and the verifier uses its RSA public key, which everyone has, as the HMAC secret.
+5. A safe verifier ignores the header's choice. It says "I only accept RS256" before looking at anything else, so both tricks fail with 401.
 
 ```mermaid
 sequenceDiagram
@@ -209,7 +270,7 @@ sequenceDiagram
     end
 ```
 
-A third live risk is **`kid`/`jku` injection**: a malicious `kid` like `../../dev/null` or a `jku` pointing at an attacker-controlled JWKS URL, if the verifier blindly fetches whatever URL or file path the token names.
+A third live risk is **`kid`/`jku` injection** (`jku` is a header field holding a URL to fetch keys from): a malicious `kid` like `../../dev/null` or a `jku` pointing at an attacker-controlled JWKS URL, if the verifier blindly fetches whatever URL or file path the token names.
 
 The fix is the same shape as the others — never let the token tell the verifier where to find the key; the verifier's own configuration names the trusted JWKS URL, and `kid` only selects among keys that URL already returned.
 
@@ -390,7 +451,10 @@ func TestKeyConfusionAttackRejected(t *testing.T) {
 
 ## 7. In production 🔴
 
-- **Real systems:** Auth0, Okta and Keycloak issue RS256/EdDSA access and ID tokens with JWKS endpoints; AWS Cognito and Firebase Auth do the same; most OIDC providers (see [[OAuth 2.0 and OpenID Connect]]) use JWTs for ID tokens by specification.
+> 🟡 → 🔴 **You now know** the token's parts, how keys are published and rotated, the six checks and the attacks they block. **Next we look at real systems**: how JWT setups fail in production, what to monitor, and the deeper questions on revocation, audience and key sources that SDE-3 interviews dig into.
+
+
+- **Real systems:** Auth0, Okta and Keycloak issue RS256/EdDSA access and ID tokens with JWKS endpoints; AWS Cognito and Firebase Auth do the same; most OIDC (OpenID Connect, the "log in with Google" standard) providers (see [[OAuth 2.0 and OpenID Connect]]) use JWTs for ID tokens by specification.
 - **Failure modes → fixes:**
   - Verifier accepts `alg=none` or lets the token pick its algorithm → pin `WithValidMethods` in code, never derive trust from the header.
   - `kid` rotation breaks verification fleet-wide → always fetch-on-unknown-`kid` with a short cache TTL, and keep the old key published during the overlap window.
@@ -402,8 +466,8 @@ func TestKeyConfusionAttackRejected(t *testing.T) {
 
 - **Why `aud` matters even with one issuer.** If the same authorization server issues tokens for both `orders-api` and `payments-api`, a token meant for the (lower-trust) orders service must not be accepted by payments. Without an `aud` check, a token leaked to or stolen from orders-api works everywhere that issuer is trusted — this is exactly the class of bug OWASP API Security Top 10 2023 names under API2 Broken Authentication.
 - **The revocation problem, properly.** Three real strategies, in order of operational cost: (1) accept the delay — keep `exp` to 5–15 minutes and let the natural expiry be the revocation; (2) a `jti` denylist in Redis with TTL equal to the token's remaining lifetime, checked on every request — brings back a lookup but only for the (rare) revoked set; (3) a per-user `token_version` claim, bumped in the user record on logout-everywhere or password change, checked against the current stored version — one lookup per request again, but cheap and simple to reason about. There is no way to get instant, free revocation from a bare JWT; something must be checked server-side.
-- **`kid`/`jku`/`x5u` injection in the wild.** Several 2018–2022 CVEs in JWT libraries stemmed from trusting a `jku` (JWK Set URL) or `x5u` (X.509 URL) header claim and fetching whatever URL it named, or treating `kid` as a filesystem path. RFC 8725 §3.9 names this explicitly: never resolve an untrusted URL or path from inside the token; keep the set of trusted key sources in verifier configuration.
-- **Clock skew and leeway.** Distributed systems never have perfectly synced clocks; 20–60 seconds of leeway on `exp`/`nbf` absorbs normal NTP drift without materially extending the attack window on a stolen token.
+- **`kid`/`jku`/`x5u` injection in the wild.** Several 2018–2022 CVEs (publicly numbered security bugs) in JWT libraries stemmed from trusting a `jku` (JWK Set URL) or `x5u` (X.509 URL) header claim and fetching whatever URL it named, or treating `kid` as a filesystem path. RFC 8725 §3.9 names this explicitly: never resolve an untrusted URL or path from inside the token; keep the set of trusted key sources in verifier configuration.
+- **Clock skew and leeway.** Distributed systems never have perfectly synced clocks; 20–60 seconds of leeway on `exp`/`nbf` absorbs normal NTP drift (NTP: the protocol servers use to sync their clocks) without materially extending the attack window on a stolen token.
 - **Minimal claims, by design.** Every byte in the payload is sent on every request and is fully readable; keep it to what authorization actually needs (`sub`, `role` or scopes, tenant id) and resolve anything larger (full user profile) by a lookup keyed on `sub`.
 
 ## 9. Interview questions 🔴
@@ -438,6 +502,26 @@ func TestKeyConfusionAttackRejected(t *testing.T) {
 - Validation checklist: signature, allowed alg, `iss`, `aud`, `exp`/`nbf` (+leeway), optionally `jti` against a denylist.
 - Known attacks: `alg=none`, RS256/HS256 key confusion, `kid`/`jku` injection — all fixed by never trusting the token to pick its own verification method or key source.
 - Revocation needs extra state: short `exp` + refresh token, a `jti` denylist, or a token-version check. A bare JWT alone cannot be revoked early.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What are the three parts of a JWT?
+> Header, payload (claims) and signature, joined by dots.
+
+> [!question]- (easy) Can a user read the claims in their JWT?
+> Yes. It is only encoded and signed, not encrypted.
+
+> [!question]- (easy) Why do JWTs suit many servers behind a load balancer?
+> Any server can check the signature by itself, with no shared session store.
+
+> [!question]- (medium) Why use RS256 instead of HS256 when five services verify tokens?
+> With HS256 every verifier holds the signing secret and could forge tokens; with RS256 they hold only the public key.
+
+> [!question]- (medium) A token for `orders-api` is sent to `payments-api`. Which check stops it?
+> The `aud` (audience) check.
+
+> [!question]- (medium) How do you rotate signing keys without breaking live tokens?
+> Publish the new key next to the old one, sign with the new one, and remove the old key only after its last tokens expire.
 
 ## Links
 

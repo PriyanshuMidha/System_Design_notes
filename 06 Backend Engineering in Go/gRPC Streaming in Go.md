@@ -29,6 +29,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[gRPC Services in Go]]: how a normal one-request, one-response gRPC method is defined, served and called.
+> - [[Goroutines and Channels]]: goroutines run at the same time and pass values through channels.
+> - [[select and Concurrency Patterns]]: `select` waits on several channels or a cancelled context at once.
+
 **From zero, in 60 seconds** 🟢
 
 A normal RPC is one question, one answer. **Streaming** keeps the call open so one side (or both) can keep sending messages over it.
@@ -68,6 +73,11 @@ The client handles each as it arrives, and the server slows down if the client f
 | Goroutine | A cheap Go function running concurrently | One reading, one writing |
 | Context cancel | Telling the other side "stop, I'm done" | `cancel()` ends the stream |
 
+| Server-streaming | One request in, many responses out | export all invoices |
+| Client-streaming | Many requests in, one response out | upload 10,000 rows, get a summary |
+| Bidirectional | Both sides send many messages at once | live chat between services |
+| Keepalive | Small pings that keep a quiet stream from being cut | ping every 30 s |
+
 **Picture it**
 
 ```mermaid
@@ -105,6 +115,10 @@ The same shape, run in reverse, is **client-streaming**: an accountant uploading
 
 All three reuse the same HTTP/2 connection and the same deadline/metadata/interceptor machinery from [[gRPC Services in Go]] — streaming is a different method shape, not a different protocol.
 
+### A real-life example 🟢
+
+When Swiggy's backend loads all orders for a restaurant's end-of-day report, it does not build one giant reply. A server-streaming call sends the orders a few at a time, so memory stays small and the report starts filling in at once. In the other direction, a delivery app might stream rider GPS points to the server and get one "trip saved" reply at the end: that is client streaming.
+
 ## 2. Mental model 🟢
 
 A unary RPC is a function call: one argument in, one result out. A stream is a **channel bolted onto an RPC**: instead of `return value, err`, you get `Send(msg) error` and `Recv() (msg, error)`, called as many times as there are messages, on either side, independently.
@@ -129,9 +143,17 @@ The one invariant across all three: **closing your send side tells the other end
 
 ## 3. How it works 🟡
 
+🟢 → 🟡 You now know the three stream shapes and the `Send`/`Recv` loop. Next we open the box: the loop for each shape, how clients close streams, flow control, ordering, mid-stream errors, load balancing and when to use streaming at all.
+
 ### Server-streaming
 
 **In plain words:** the server's loop is just: produce a thing, Send it, repeat, return nil — returning is how the stream says 'done'.
+
+**Step by step:**
+1. The client calls `ListInvoices(ctx, req)` and gets a stream.
+2. The server loops over rows and calls `stream.Send(inv)` for each.
+3. When done it returns `nil`; the client's `Recv` then returns `io.EOF`.
+4. If the client cancels `ctx`, the server's next `Send` fails and it stops.
 
 ```go
 func (s *InvoiceServer) WatchInvoice(req *invoicev1.WatchInvoiceRequest, stream invoicev1.InvoiceService_WatchInvoiceServer) error {
@@ -167,6 +189,12 @@ sequenceDiagram
 
 **In plain words:** the server's loop is: Recv until the sender says they are finished, then send the one summary answer back.
 
+**Step by step:**
+1. The client calls `Send` once per row, say 10,000 times.
+2. The server loops on `Recv`, adding each row to a count.
+3. The client calls `CloseAndRecv`; the server's `Recv` returns `io.EOF`.
+4. The server replies once with `SendAndClose(summary)`.
+
 ```go
 func (s *InvoiceServer) ImportInvoices(stream invoicev1.InvoiceService_ImportInvoicesServer) error {
     var summary invoicev1.ImportInvoicesResponse
@@ -186,6 +214,12 @@ func (s *InvoiceServer) ImportInvoices(stream invoicev1.InvoiceService_ImportInv
 `Recv` returning `io.EOF` is not an error here — it is the client's `CloseSend()` arriving, the expected way this loop ends. `SendAndClose` is the client-streaming equivalent of a unary `return`: it sends the one response and closes the server's side of the stream in a single call.
 
 ### Bidirectional streaming
+
+**Step by step:**
+1. Both sides get a stream that can `Send` and `Recv`.
+2. One goroutine reads with `Recv` while another writes with `Send`.
+3. The client calls `CloseSend` when it has nothing more to send.
+4. Each side stops when it sees `io.EOF` or the context is cancelled.
 
 ```go
 func (s *InvoiceServer) Chat(stream invoicev1.InvoiceService_ChatServer) error {
@@ -252,6 +286,12 @@ Chat(grpc.BidiStreamingServer[ChatRequest, ChatResponse]) error
 
 **In plain words:** if the receiver is slow, Send simply waits — the network's way of saying 'slow down' arrives in your code as a blocked call.
 
+**Step by step:**
+1. The server sends rows faster than the client reads them.
+2. HTTP/2's buffer for that stream fills up.
+3. The next `Send` blocks until the client reads more.
+4. So a slow reader slows the writer instead of filling memory.
+
 HTTP/2 gives every stream a **flow-control window**: a budget of bytes the sender is allowed to have in flight before the receiver acknowledges them (a `WINDOW_UPDATE` frame).
 
 When `WatchInvoice` calls `stream.Send` faster than the client reads, the window fills up and `Send` **blocks** until the client catches up — this is backpressure, and it costs no extra code: a slow consumer simply makes the producer wait, the same way an unbuffered channel does between two goroutines.
@@ -267,6 +307,12 @@ gRPC guarantees messages on **one stream** arrive in the order they were sent. I
 ### Errors mid-stream
 
 **In plain words:** a stream fails by ending with an error status; messages already received stay received, so the client must know how to resume.
+
+**Step by step:**
+1. The server has sent 600 of 1,000 invoices, then the database fails.
+2. It returns `status.Error(codes.Unavailable, ...)`; the client's `Recv` returns that error.
+3. The client keeps the 600 it already has.
+4. It retries asking to start after the last ID it received.
 
 A streaming RPC's final outcome is still one `codes.Code`, delivered as a trailer after the last message — a stream that sent 500 events successfully and then hit a DB error ends with `codes.Internal` in the trailer, not a special "partial success" code.
 
@@ -670,7 +716,26 @@ All four streaming tests pass alongside the six unary tests from [[gRPC Services
 - Streaming RPCs don't reach browsers directly; a chat feature with web clients needs gRPC-Web, Connect, or a plain WebSocket, not raw gRPC streaming (see [[Serving REST and gRPC Together]]).
 - If the client just wants "page 2 of invoices," server-streaming is the wrong tool — pagination is simpler to implement, cache, and retry, with no held-open connection at all.
 
+### Streaming vs pagination 🟡
+
+| | gRPC stream | Paginated calls |
+| --- | --- | --- |
+| Calls | one long call | many short calls |
+| Resume after failure | client must track the last item | ask for the next page again |
+| Load balancing | stuck to one server for the whole stream | each page can go anywhere |
+| Best for | big internal transfers, live feeds | client-facing lists |
+
+### Common beginner mistakes 🟢
+
+- Not treating `io.EOF` as the normal end → a finished stream looks like an error → check `err == io.EOF` first.
+- Calling `Send` from two goroutines on one stream → not safe → keep one sender per stream.
+- Forgetting `CloseSend` on a client stream → the server waits forever → close when done sending.
+- Streams with no deadline or keepalive → dead streams hang → set deadlines and keepalive pings.
+- Using a stream where a page would do → harder to resume and balance → paginate client-facing lists.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now write all three kinds of streams correctly. The advanced part covers long streams in real clusters: load balancers that pin streams to one pod, idle timeouts, deploys that cut streams, and interceptors for streams.
 
 - **Real systems:** Kubernetes' `watch` semantics (not gRPC itself, but the same push-updates-until-cancelled shape) and etcd's `Watch` gRPC API both follow this pattern for "tell me when something changes." Envoy and Istio's xDS protocol is a long-lived bidirectional gRPC stream between a proxy and its control plane.
 - **Failure modes → fixes:**
@@ -719,6 +784,26 @@ All four streaming tests pass alongside the six unary tests from [[gRPC Services
 - Ordering holds within a stream only, never across streams.
 - `MaxConnectionAge`/`MaxConnectionAgeGrace` recycle long-lived stream connections so load balancing still works.
 - protoc-gen-go-grpc v1.5+ generates generic stream types (`grpc.ServerStreamingServer[T]` etc.) — same `Send`/`Recv` API, less generated boilerplate.
+
+## Self-check 🟢🟡
+
+> [!question]- What does `Recv` return when the other side has finished sending?
+> `io.EOF`.
+
+> [!question]- Which stream type uploads many messages and gets one reply?
+> Client-streaming.
+
+> [!question]- How does a server-streaming method signal "done"?
+> It returns `nil`.
+
+> [!question]- What happens when the receiver is slow?
+> `Send` blocks until there is room, which is backpressure.
+
+> [!question]- A stream fails after 600 messages. What does the client still have?
+> The 600 messages; it should resume from the last one.
+
+> [!question]- Why can long streams balance load badly?
+> The whole stream stays on one server, so new pods get no share of it.
 
 ## Links 🟢
 

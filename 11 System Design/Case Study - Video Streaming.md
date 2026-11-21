@@ -35,6 +35,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+> - [[Back-of-the-Envelope Estimation]]: turning viewers × minutes × bitrate into terabits per second.
+> - [[CDN and Edge]]: servers near viewers keep copies of files so they download fast.
+> - [[File Upload Architecture]]: big files go from the app straight to object storage using short-lived signed links.
+
 **From zero, in 60 seconds** 🟢
 
 A streaming site like YouTube does not send one big video file.
@@ -80,6 +86,10 @@ One big file sent from one computer cannot do that for millions of people.
 | Object storage | Cheap storage for big files, read by URL | Amazon S3 bucket |
 | ABR | Adaptive bitrate: the player picks quality per segment | Drops to 480p when the network slows |
 
+| Rendition | One encoded version of a video at one quality | 720p at 2.8 Mbps |
+| Keyframe | A frame that can be shown on its own, without earlier frames; segments must start with one | the first frame of each 6-second piece |
+| Codec | The method used to compress video | H.264, AV1 |
+
 **Picture it**
 
 ```mermaid
@@ -111,6 +121,13 @@ Where it breaks: a reader cannot switch edition halfway through a page, but a vi
 A video file is huge and viewers are everywhere. A 10-minute 1080p source upload at 10 Mbps is about 750 MB.
 
 If 1 million people press play in the same hour and every byte comes from one data centre, that data centre needs terabits per second of egress, and a viewer on a 2 Mbps mobile link cannot play a 5 Mbps file at all.
+
+### Real-life example: Netflix on a train 🟢
+
+You start a Netflix episode on your phone on a train. It starts within a couple of seconds, a little blurry, then gets sharp.
+When the train enters a tunnel and the signal weakens, the picture gets softer instead of freezing.
+At home on Wi-Fi, the same episode plays in full HD on the TV.
+Netflix serves most of this from cache servers placed inside internet providers' networks, close to you.
 
 **Terms used below:**
 - **Transcoding:** decoding the uploaded video and re-encoding it at other resolutions, bitrates or codecs.
@@ -150,7 +167,17 @@ flowchart LR
     ST --> R["Read path: playback<br/>(constant, from caches)"]
 ```
 
+## Common beginner mistakes 🟢
+
+- **Streaming one big video file from one server** → slow starts, freezes, and a melted data centre → cut into short segments at several qualities and serve them from a CDN.
+- **Uploading video through your API servers** → they carry gigabytes per upload → give the app presigned URLs to upload parts straight to storage.
+- **Encoding a long video on one machine from start to end** → a film takes hours → split at keyframes and encode chunks in parallel.
+- **Letting the server pick the quality** → it cannot see each viewer's network → let the player choose per segment from measured speed and buffer.
+- **Writing every "still watching" ping to a database** → about 400,000 writes a second → send pings to Kafka and count views in a stream job.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the plan: many qualities, short segments, CDN delivery, and a player that picks quality. **Next we open the box** and follow one video from upload, through transcoding, to playback and view counting.
 
 ```mermaid
 flowchart LR
@@ -172,11 +199,18 @@ flowchart LR
     end
 ```
 
-**Step by step:**
+**Step by step (plain):**
+1. Meera uploads a 10-minute travel video. Her app sends it in parts straight to storage.
+2. When the last part lands, a job starts converting it into 360p, 720p, 1080p and more, each cut into 6-second pieces.
+3. As soon as 360p and 720p are ready, the video is marked playable; bigger qualities follow later.
+4. Ravi presses play. His player downloads a small playlist, then the first low-quality piece from a nearby CDN server.
+5. Each piece downloads quickly, so the player steps up to a sharper quality; his phone also sends "still watching" pings for the view count.
+
+**Full detail:**
 1. The creator app asks the Upload API for an upload. The API writes a `videos` row in state `UPLOADING` and returns presigned URLs for the parts; see [[File Upload Architecture]].
 2. The app uploads parts directly to the raw bucket. A lost connection re-sends only the missing parts.
 3. Completing the multipart upload fires an object-created event. A consumer moves the video to `PROCESSING` and starts a transcode job.
-4. The orchestrator splits the source into chunks on keyframe boundaries, fans out one task per (chunk, rendition), then a packager writes segments and playlists. The video becomes `READY`.
+4. The orchestrator splits the source into chunks on keyframe boundaries, fans out one task per (chunk, rendition), then a packager (the step that cuts the encoded video into segments and writes playlists) writes segments and playlists. The video becomes `READY`.
 5. A viewer fetches metadata (title, a signed manifest URL) from the Metadata API, then fetches the manifest and segments through the CDN.
 6. The player sends heartbeats every few seconds; a stream pipeline turns them into view counts and watch history.
 
@@ -516,7 +550,7 @@ ok  	example.com/abr	1.151s
 ```
 
 Two design points the test pins down:
-- The **harmonic mean** of 4,000, 4,000 and 40,000 kbps is about 5,714 kbps, while the arithmetic mean would be 16,000 kbps. One lucky download from a warm cache would otherwise push the player to 1080p and cause a stall.
+- The **harmonic mean** (an average that leans towards the smaller values) of 4,000, 4,000 and 40,000 kbps is about 5,714 kbps, while the arithmetic mean would be 16,000 kbps. One lucky download from a warm cache would otherwise push the player to 1080p and cause a stall.
 - **Down fast, up slow.** A collapse in throughput drops straight to the rung that fits; climbing happens one rung per segment and only with a full buffer.
 
 ## 5. Variants 🟡
@@ -532,11 +566,19 @@ Two design points the test pins down:
 
 **HLS vs DASH vs CMAF:** HLS (RFC 8216) is the format Apple devices and Safari play natively; DASH is an ISO standard used widely on Android, smart TVs and browsers through Media Source Extensions. CMAF is a fragmented-MP4 segment format that both can reference, so one set of segment files can serve both manifest types: storage and CDN caches hold one copy of the media instead of two.
 
+### Things people confuse this with 🟡
+
+| System | What it delivers | How it differs from video streaming |
+| --- | --- | --- |
+| [[Case Study - Photo Sharing (Instagram)]] | Images in a few sizes | Few fixed sizes, no segments, no quality switching mid-way |
+| Live streaming (cricket on Hotstar) | Video as it happens | Segments must be made within seconds and playlists change constantly; covered briefly in Variants |
+| Video calls (Zoom, WhatsApp call) | Two-way video with under 0.3 s delay | Uses real-time protocols (WebRTC), not cached segments from a CDN |
+
 ## 6. Trade-offs 🟡
 
 - **Segment length.** Short segments (2 s) let ABR react faster and cut live latency, but multiply request count and per-request overhead. Apple's authoring spec recommends a 6-second target duration for HLS; VOD services commonly use 2–6 s.
 - **Encode ahead vs just-in-time.** Encoding every rendition at upload wastes CPU on the long tail of videos that get few views. Just-in-time packaging (store one mezzanine file per rendition, package into HLS or DASH on request) or encoding rare renditions lazily saves storage, but adds first-view latency and origin CPU.
-- **Codec choice.** Newer codecs (HEVC, VP9, AV1) cut bytes at the same quality but cost much more encode CPU and are not decoded by every device. A common answer: H.264 for universal reach, plus a newer codec for popular titles where egress savings repay the encode cost.
+- **Codec choice.** Newer codecs (HEVC, VP9, AV1: newer compression methods) cut bytes at the same quality but cost much more encode CPU and are not decoded by every device. A common answer: H.264 for universal reach, plus a newer codec for popular titles where egress savings repay the encode cost.
 - **Own CDN vs commercial CDN.** Building ISP-embedded caches (Netflix Open Connect) only pays at very large, predictable egress. Most companies should buy CDN capacity, often from more than one vendor.
 - **When not to build this:** for a few hundred internal videos, a managed video service or plain progressive MP4 download from a CDN is simpler. ABR and a transcode farm are worth it only when viewers have varied networks and the catalogue is large.
 
@@ -548,16 +590,18 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the upload, transcode and playback paths, the sizing, the playlists, the tables and the ABR code. **Next is the advanced part**: real systems and failures, the transcoding DAG, the playback timeline, CDN economics and counting views.
+
 - **Real systems:**
 	- Netflix runs its own CDN, Open Connect: appliances placed inside ISP networks and at internet exchanges, filled with predicted-popular content during off-peak hours (documented on the Open Connect site).
 	- Netflix described per-title encoding in 2015: each title gets its own bitrate ladder from trial encodes, instead of one fixed ladder (Netflix Technology Blog).
 	- Players such as hls.js, Shaka Player and ExoPlayer implement ABR on the client; the buffer-based approach comes from Huang et al., SIGCOMM 2014.
 - **Failure modes and fixes:**
-	- *Thundering herd on a new release:* millions of first requests miss the edge at once. Fix: pre-warm (push) popular titles to edges, and use an origin shield tier so each edge miss becomes at most one origin fetch. See [[Hot Keys and Hot Partitions]].
+	- *Thundering herd on a new release:* millions of first requests miss the edge at once. Fix: pre-warm (push) popular titles to edges, and use an origin shield tier (one extra cache layer that all edges ask before the origin) so each edge miss becomes at most one origin fetch. See [[Hot Keys and Hot Partitions]].
 	- *Poison video:* a corrupt upload crashes encoder workers repeatedly. Fix: cap attempts per task, mark the video `FAILED`, send the task to a dead letter queue; see [[Dead Letter Queues and Poison Messages]].
 	- *Worker dies mid-chunk:* the task lease expires and another worker re-runs it. Output keys are deterministic (`video/rendition/chunk`), so a rerun overwrites instead of duplicating.
 	- *Playlist cached too long:* for VOD, playlists and segments are immutable and can be cached for days. For live, the media playlist changes every segment, so it gets a short TTL (about one target duration) while segments stay long-lived; see [[HTTP Caching - Cache-Control, ETag, Conditional Requests]].
-	- *Hotlinking and piracy:* signed URLs or signed cookies with short expiry on manifests, and DRM (Widevine, FairPlay, PlayReady) for premium content.
+	- *Hotlinking (other sites embedding your video files) and piracy:* signed URLs or signed cookies with short expiry on manifests, and DRM (digital rights management, encryption that only licensed players can unlock: Widevine, FairPlay, PlayReady) for premium content.
 - **What to monitor:**
 	- Viewer side: start-up time, rebuffering ratio, average delivered bitrate, rendition switches per minute, playback failure rate.
 	- CDN: hit ratio per region, origin egress, 4xx/5xx by edge.
@@ -589,9 +633,9 @@ flowchart LR
 ```
 
 - **Keyframe alignment is mandatory.** A player can switch renditions only at a segment boundary, and each segment must start with a keyframe (an IDR frame) so it decodes on its own. All renditions are therefore encoded with the same fixed GOP (group of pictures) length, for example a keyframe every 2 s with 6 s segments, so segment `n` covers the same time range in every rendition.
-- **Chunk boundaries** must also fall on keyframes, or the joined output glitches. Encoders are run with closed GOPs so no frame references a frame in another chunk.
+- **Chunk boundaries** must also fall on keyframes, or the joined output glitches. Encoders are run with closed GOPs (a GOP, group of pictures, is a keyframe plus the frames that depend on it; "closed" means it does not borrow from its neighbours) so no frame references a frame in another chunk.
 - **Orchestration:** the DAG is a durable workflow: each task is idempotent, retried with backoff, and the join waits for all chunk tasks. This is a job for [[Workflow Engines and Durable Execution]] or the design in [[Case Study - Distributed Job Scheduler]]; the events that start it come from [[Kafka and Event Streaming]].
-- **Priority:** popular creators and short clips go to a fast queue; a 4K AV1 re-encode of an old video goes to a cheap batch queue (spot instances), because it can be interrupted and retried.
+- **Priority:** popular creators and short clips go to a fast queue; a 4K AV1 re-encode of an old video goes to a cheap batch queue (spot instances: spare cloud machines that are cheap but can be taken back), because it can be interrupted and retried.
 
 ### Playback timeline
 
@@ -635,6 +679,14 @@ Starting at a low rendition is deliberate: the first segment is small, so playba
 
 **In plain words:** the player sends small "still watching" pings; a stream job counts a view once per session.
 
+```mermaid
+flowchart LR
+    H["player pings every 10 s"] --> K["Kafka"]
+    K --> D["dedupe by session"]
+    D --> R["count after 30 s watched"]
+    R --> A["per-video totals, written in batches"]
+```
+
 Heartbeats flow into Kafka; a stream job deduplicates by `session_id`, applies a rule such as "a view counts after 30 s of playback" (an example rule), aggregates per video per minute and writes batched increments to `video_stats`.
 
 A real-time counter can be approximate, while billing-grade numbers (for creator payouts or ads) are reconciled by a batch job. This is the same pattern as [[Case Study - Ad Click Aggregation]].
@@ -661,6 +713,26 @@ A real-time counter can be approximate, while billing-grade numbers (for creator
 
 > [!question]- How do you count views without hammering the database?
 > Send heartbeats to a stream (Kafka), deduplicate per session, aggregate per video per minute in a stream processor, and write batched increments. Show an approximate live number; reconcile exact numbers in a batch job.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is transcoding?
+> Converting the uploaded video into other sizes and qualities, such as 360p, 720p and 1080p.
+
+> [!question]- Easy: why cut videos into segments of a few seconds?
+> So the player can switch quality between pieces and caches can store and serve small files.
+
+> [!question]- Easy: who chooses the video quality during playback?
+> The player, based on measured download speed and how much video is buffered.
+
+> [!question]- Medium: 100 million viewers watch 1 hour a day at 3 Mbps. What is the average egress?
+> About 12.5 Tbps (about 135 PB a day).
+
+> [!question]- Medium: why must every rendition's segments start at the same keyframes?
+> So the player can jump from one quality to another at any segment boundary without glitches.
+
+> [!question]- Medium: why use a harmonic mean of recent download speeds?
+> One lucky fast download barely moves it, so the player does not jump to a quality it cannot sustain.
 
 ## 10. Cheat sheet 🟢
 

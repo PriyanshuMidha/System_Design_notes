@@ -36,6 +36,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (the minute-by-minute transcript and decision points), 4 (deep dive spoken, wrap-up) and 5.
 > - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[HLD Round - Complete Step-by-Step Guide]]: the nine steps of the round, from requirements to wrap-up; this note runs them once on a real problem.
+> - [[System Design Interview Framework]]: questions first, then numbers, a simple design, deep dives and trade-offs said out loud.
+> - [[Geospatial Indexing]]: to find nearby riders fast, the map is cut into cells and you search your cell plus its neighbours.
+
 **From zero, in 60 seconds** 🟢
 
 This note is a full sample answer to "design a food delivery app", spoken minute by minute.
@@ -80,6 +85,15 @@ This note is a full sample answer, minute by minute.
 | Service | A separately deployed program owning one job | Order service, Courier service |
 | Cache | A fast copy of data that is read often | Menus kept in Redis |
 | Message broker | A system that carries events between services | Kafka topic `order-events` |
+| p99 | 99 out of 100 requests are faster than this | menu p99 under 300 ms |
+| Idempotency key | A unique ID sent with a request so a retry does not repeat it | the same "place order" sent twice makes one order |
+| Outbox | A table written in the same transaction as the order; a relay publishes its rows as events | no event lost if the process dies |
+| At-least-once | Every message arrives, but some may arrive twice | consumers must ignore repeats |
+| Saga | A business process split into local steps, each with an undo step | pay, then refund if no courier |
+| Cache-aside / TTL | Check the cache, on a miss read the DB and fill it / how long a cached copy lives | menus cached 5 minutes |
+| Soft state | Data you can lose and rebuild quickly, so it needs no durable storage | rider's latest position |
+| Shard key | The field that decides which machine holds the data | `city_id` for rider locations |
+| Two-phase commit | Making several databases commit together through a coordinator | rejected: payment providers do not support it |
 | Idempotent | Safe to repeat: doing it twice has the same effect as once | Retrying "create order" with the same key |
 | Saga | A multi-step process where each step can be undone if a later step fails | Refund the payment if no courier is found |
 | Geo index | A lookup that finds things near a location | "Couriers within 3 km" |
@@ -131,6 +145,23 @@ Treat the app as **three small systems sharing an order id**.
 
 Where the analogy breaks: a radio room has one operator; ours is a distributed fleet, so "one courier per order" needs an atomic check, not a convention.
 
+### Real-life example: your biryani order 🟢
+
+You open Swiggy at 8 pm and scroll restaurants: that is the browse system, served mostly from caches.
+You tap "Pay": the order system saves your order once, safely, and makes sure a double tap does not charge you twice.
+A rider 2 km away gets the job: the deliver system searched nearby riders and gave the order to exactly one of them.
+You watch the bike move on the map: the rider's phone sends its position every few seconds, and your screen gets pushed updates.
+Three different jobs, three different designs, one order ID tying them together.
+
+## Common beginner mistakes 🟢
+
+- **Writing every rider ping into the orders database** → 40,000 writes a second fight with real orders → keep only the latest position, in memory.
+- **One long synchronous chain from "pay" to "rider assigned"** → a slow rider search fails checkout → save the order, then continue with events.
+- **Saving the order and publishing the event as two separate steps** → a crash in between loses the event → use an outbox in the same transaction.
+- **Assigning riders without an atomic check** → two orders grab the same rider → use one conditional update ("only if the rider is still free").
+- **Charging from the cached menu price** → a stale price gets charged → show from cache, charge from the database.
+
+
 ```mermaid
 flowchart LR
     subgraph Browse
@@ -150,11 +181,20 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the app is three small systems (browse, order, deliver) sharing an order ID. **Next we play the round** minute by minute, then walk each design decision with its options, choice and cost.
+
 The transcript below is what you would say. Times assume a 60-minute round.
 
 ### Minutes 0-6: Requirements
 
 **In plain words:** Before drawing anything, agree on what the app must do and how big and fast it must be.
+
+**Step by step:**
+1. Name the actors: customers, restaurants, couriers.
+2. Pick the core flow: browse, order and pay, accept, assign courier, track.
+3. Get the numbers: 5 million orders a day, dinner peak 3 times average.
+4. Get the hard rules: no double charge, no lost order, never two couriers on one order.
+5. Say what is out of scope, then move on.
 
 **Say:** "Let me clarify scope before designing."
 
@@ -176,6 +216,12 @@ Questions asked and the answers assumed:
 ### Minutes 6-10: Estimates
 
 **In plain words:** Rough maths, rounded numbers. The goal is to find which part is heavy, not to be exact.
+
+**Step by step:**
+1. Orders: 5 million ÷ about 86,400 s ≈ 58 a second; peak ×3 ≈ 175. One SQL primary is fine.
+2. Menu views: about 3,500 a second at peak. Cache them.
+3. Courier pings: 200,000 couriers, one every 5 s = 40,000 writes a second. That is the surprise.
+4. Say it aloud: "the courier pings are the heavy part; I will come back to them in the deep dive".
 
 ```mermaid
 flowchart LR
@@ -199,6 +245,12 @@ flowchart LR
 ### Minutes 10-17: API and data model
 
 **In plain words:** List the few calls the app makes, and the main tables behind them.
+
+**Step by step:**
+1. `POST /orders` with an idempotency key; `GET /orders/{id}`; `GET /restaurants?near=...`.
+2. A WebSocket for live tracking.
+3. Main tables: `orders`, `order_items`, `payments`, `couriers`.
+4. Pick the order store with a reason: money needs transactions, so relational SQL.
 
 ```text
 GET  /v1/restaurants?lat=&lng=&q=&cursor=    -> list (cacheable)
@@ -398,7 +450,7 @@ sequenceDiagram
     end
 ```
 
-- Alternatives: two-phase commit across services (blocks, not supported by payment providers), saga with compensation (chosen).
+- Alternatives: two-phase commit across services (blocks, not supported by payment providers), saga with compensation (undo steps such as a refund) (chosen).
 - Reason: each step is a local transaction; failures are undone by compensating actions such as a refund.
 - Cost: intermediate states are visible (PLACED, PAID); every step must be idempotent.
 - Read: [[Saga Pattern]], [[Idempotency and Idempotency Keys]], [[Case Study - Payment System]], [[Two-Phase Commit]].
@@ -516,6 +568,8 @@ Alternative designs that are also acceptable:
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the full design and why each choice was made. **Next comes the senior view**: running it in production, then the hard details: matching is not just "nearest", ordering inside one order, refunds when a payment result is unknown, and the final data layout.
+
 - **Real practice:** companies in this space publish engineering posts on geo indexing and dispatch (for example Uber's H3 index, open source at h3geo.org); treat those as inspiration and cite when you use them.
 - **Failure modes and fixes:**
   - Duplicate OrderPlaced events: consumers dedupe on `event_id`.
@@ -601,6 +655,26 @@ flowchart LR
 - Dispatch: city shard, cell index, conditional UPDATE offer, timeout sweeper.
 - Show menu from cache, charge from the source of truth.
 - 10x: shard orders by customer, more partitions and geo shards.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What are the three small systems inside a food delivery app?
+> Browse (menus), order (payment and order state), deliver (courier matching and tracking).
+
+> [!question]- (easy) Why are menus cached?
+> They are read thousands of times a second and change rarely.
+
+> [!question]- (easy) Which number was the surprise in the estimates?
+> About 40,000 courier location writes a second.
+
+> [!question]- (medium) Why keep courier locations in memory instead of Postgres?
+> Only the latest position matters and old ones are worthless, so losing a few seconds is fine, and 40,000 writes a second would hurt the orders DB.
+
+> [!question]- (medium) How do you stop two orders taking the same courier?
+> One atomic conditional update that sets the courier busy only if they are still free.
+
+> [!question]- (medium) Why use an outbox for order events?
+> The order row and the event row are saved in one transaction, so an event is never lost if the process crashes.
 
 ## Links 🟢
 

@@ -35,6 +35,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Memory Hierarchy and CPU Caches]]: memory comes in layers, from tiny and fast near the CPU to big and slow further away. RAM forgets on power-off; this note is about the layer below it that does not.
+
 **From zero, in 60 seconds** 🟢
 
 Permanent storage comes in two main kinds. An **HDD** (hard disk drive) is a spinning magnetic platter with a moving arm — like a record player. Reading data means physically moving the arm and waiting for the platter to spin around, which takes milliseconds.
@@ -77,6 +80,12 @@ This note is about those disks: HDD, SSD and NVMe.
 | Page cache | RAM the OS uses to hold recent file data | A file you just read opens instantly |
 | `fsync` | System call: "make my writes truly durable now" | A database calling it on commit |
 | PCIe | The fast internal bus devices plug into | The slot an NVMe drive uses |
+| Seek / rotational latency | HDD: moving the arm to the right ring / waiting for the spot to spin under it | about 5 ms + 4 ms |
+| NAND flash | The chip type inside SSDs that stores bits as trapped charge | your phone's storage |
+| Erase block | The big group of flash pages that must be wiped together | hundreds of 4-16 KB pages |
+| FTL (flash translation layer) | SSD firmware that maps the OS's block numbers to real flash pages | hides "erase before write" |
+| Write amplification | The SSD writing more bytes inside than you asked it to | 1 GB asked, 3 GB written |
+| SATA vs NVMe | Old disk protocol with one queue / new flash protocol with thousands of queues | 32 vs 64K commands in flight |
 
 **Picture it**
 
@@ -119,6 +128,12 @@ Picking the wrong device class for the access pattern is one of the most common 
 > [!tip] Remember
 > Storage exists because RAM forgets. The device you choose is really a bet about your access pattern: sequential and cold data tolerates slow, cheap devices; random and hot data does not.
 
+### Real-life example 🟢
+
+A laptop that moved from a hard disk to an SSD starts up in seconds instead of a minute, because booting is thousands of small random reads, the thing HDDs are worst at.
+A UPI payment service running PostgreSQL waits for an `fsync` on every commit, so the disk's write latency becomes the payment's latency: about 0.1 ms on local NVMe, about 1 ms on a cloud network disk, about 10 ms on a hard disk.
+Meanwhile, old photo backups and years of logs often sit on cheap HDD-backed storage such as Amazon S3's colder tiers, because nobody reads them often.
+
 ## 2. Mental model 🟢
 
 ### The record player and the whiteboard
@@ -148,11 +163,28 @@ NVMe does not change either whiteboard or record player — it only changes how 
 > [!warning] Common mistake
 > Treating "SSD" and "NVMe" as synonyms. SSD describes the storage medium (NAND flash); NVMe describes the command protocol used to talk to it. A SATA SSD and an NVMe SSD can use identical flash chips — the difference is entirely in how many requests the CPU can have outstanding at once.
 
+## Common beginner mistakes 🟢
+
+- **Using "SSD" and "NVMe" as the same word** → SSD is the flash storage; NVMe is the protocol it talks over → a SATA SSD and an NVMe SSD can use the same chips but differ hugely in parallel requests.
+- **Running a busy database on HDD** → every random read or commit waits about 10 ms for the arm → put the database, or at least its WAL, on SSD/NVMe.
+- **Filling an SSD to 99%** → the garbage collector has no empty blocks, so writes slow down and the drive wears faster → keep it below about 80-90% full.
+- **Storing important data only on local instance NVMe** → it disappears when the cloud instance stops → keep the real copy on EBS, S3 or a replicated database.
+- **Treating RAID 0 as a backup** → it has no redundancy; one failed disk loses everything → use RAID 1/10 plus real backups.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that HDDs pay for moving parts, SSDs pay for erasing big blocks, and NVMe is a faster way to talk to an SSD. **Next we open the box:** the three costs of an HDD read, how flash pages and blocks work, cell types, the tricks that reduce extra writes, and why NVMe's many queues matter.
 
 ### HDD mechanics: three costs, paid every random access
 
 **In plain words:** A platter spins at a fixed rate. To read one sector, the head first moves to the right track, then waits for that exact sector to rotate underneath it, then transfers the bits. All three steps happen on every random read; only the last one happens on a sequential read that's already at the right track.
+
+**Step by step:**
+1. The database asks for one 4 KB sector (the smallest unit a disk reads) somewhere on the disk.
+2. Seek: the arm swings to the right track (one ring on the platter). About 5-10 ms.
+3. Rotate: the disk spins until that sector is under the head. On average half a turn, about 4 ms at 7,200 rpm (revolutions per minute).
+4. Transfer: the bits are read. Well under 1 ms.
+5. Total: about 10 ms for one random read, so only about 100 random reads per second. Reading the next sector on the same track skips steps 2 and 3.
 
 **Picture it:**
 
@@ -175,6 +207,13 @@ flowchart LR
 
 **In plain words:** NAND flash is organized into **pages** (4–16 KB, the smallest unit you can write) grouped into **erase blocks** (hundreds of pages, the smallest unit you can erase). You can write a blank page directly, but you can never rewrite a page in place — it has to be erased first, and erasing only happens a whole block at a time. The **Flash Translation Layer (FTL)** — firmware living inside the SSD — hides this limitation from the OS entirely.
 
+**Step by step:**
+1. The OS writes block 7. The FTL puts it in a free flash page and notes "block 7 → page A".
+2. The OS writes block 7 again. Flash cannot overwrite page A, so the FTL writes page B and marks A as stale (old, not needed).
+3. Over time, many pages are stale. Free pages run low.
+4. The garbage collector picks an erase block, copies its still-valid pages somewhere else, then wipes the whole block.
+5. Those copies are extra writes the OS never asked for: that is write amplification.
+
 **Picture it:**
 
 ```mermaid
@@ -194,6 +233,12 @@ stateDiagram-v2
 
 **In plain words:** A NAND cell can store more than one bit by distinguishing more voltage levels, but reading and writing more levels is slower and wears the cell out faster.
 
+**Step by step:**
+1. SLC stores 1 bit per cell: the cell is either "charged" or "empty". Easy to tell apart.
+2. MLC stores 2 bits: 4 charge levels per cell.
+3. TLC stores 3 bits: 8 levels. QLC stores 4 bits: 16 levels.
+4. More levels means more data per chip (cheaper), but the levels sit closer together, so reading is slower and the cell wears out after fewer erases.
+
 **Picture it:**
 
 ```mermaid
@@ -209,6 +254,12 @@ flowchart LR
 
 ### Wear leveling, TRIM, and over-provisioning: the three levers that fight write amplification
 
+**Step by step:**
+1. You delete a 1 GB file. The OS marks it free in its file system.
+2. With TRIM, the OS also tells the SSD "those blocks are dead". Without it, the SSD still thinks they are live and keeps copying them during garbage collection.
+3. Wear leveling makes sure new writes go to the least-worn blocks, so no single block dies early.
+4. Over-provisioning keeps hidden spare space, so the garbage collector usually finds a mostly empty block to wipe.
+
 - **Wear leveling** spreads writes evenly across blocks so no single block wears out first, since each block tolerates only a finite number of erases.
 - **TRIM** is the OS telling the SSD "these logical blocks are deleted, don't bother preserving their data on your next garbage-collection pass." Without TRIM, the FTL keeps copying dead data forever, because it has no way to know the host stopped caring about it.
 - **Over-provisioning** is spare physical capacity the FTL reserves beyond the drive's advertised logical size. More spare capacity means the garbage collector almost always finds blocks that are mostly empty to reclaim; less spare capacity (a nearly-full drive) forces it to reclaim blocks still full of live data, multiplying the number of physical writes per host write.
@@ -219,6 +270,13 @@ flowchart LR
 ### SATA/AHCI vs NVMe: one clerk versus thousands
 
 **In plain words:** SATA SSDs speak **AHCI**, a protocol designed in 2004 for spinning disks — one command queue, depth 32. **NVMe** is a protocol built from scratch for flash, running over PCIe instead of a SATA cable, with up to 64K queues of up to 64K commands each.
+
+**Step by step:**
+1. A busy database has 64 threads, each wanting to read from the SSD at the same time.
+2. With SATA/AHCI, all requests share one queue that holds at most 32. The rest wait.
+3. With NVMe, each CPU core can get its own queue, each holding thousands of requests.
+4. The flash chips inside work on many requests in parallel, so NVMe keeps them all busy.
+5. Same flash, far more work done per second.
 
 **Picture it:**
 
@@ -250,13 +308,13 @@ throughput = IOPS × block size
 
 A device rated at 100,000 random 4 KB IOPS can sustain about 400 MB/s of small random I/O — far below its sequential rating, because sequential transfers use much larger blocks per operation.
 
-When sizing storage for a service, always ask which number matters for the workload: a log shipper doing large sequential appends is **throughput-bound**; an OLTP database doing point lookups is **IOPS-bound**.
+When sizing storage for a service, always ask which number matters for the workload: a log shipper doing large sequential appends is **throughput-bound**; an OLTP (online transaction processing: many small reads and writes, like orders and payments) database doing point lookups is **IOPS-bound**.
 
 ### Tracing write amplification by hand
 
 Take a tiny toy drive: 10 erase blocks of 4 pages each (40 pages total). Walk a skewed random-write workload across it and watch the garbage collector work.
 
-1. The host writes to LBA 7. The FTL finds a free page, marks it **valid**, and records LBA 7 → that physical page.
+1. The host writes to LBA 7 (logical block address: the block number the OS uses). The FTL finds a free page, marks it **valid**, and records LBA 7 → that physical page.
 2. The host writes to LBA 7 again. The *old* physical page is marked **stale** (it still holds data, but nobody will read it again); a brand-new physical page becomes the current copy.
 3. Free pages run low (the toy FTL's threshold is "one block's worth of free pages remaining"). The garbage collector picks the block with the fewest **valid** pages — cheapest to reclaim — and copies those valid pages to fresh locations elsewhere.
 4. Only after every valid page is safely copied out does the collector erase the whole block, turning every page in it back to **free**.
@@ -313,12 +371,20 @@ flowchart TB
     end
 ```
 
-**Example:** RAID 5 computes parity across stripes, so every write requires reading the old data and the old parity, then writing the new data and new parity — the **RAID 5 write penalty**: roughly 4 physical I/Os per logical write. RAID 10 (striped mirrors) just writes to two disks directly, with no parity math at all, at the cost of needing twice the raw capacity instead of one extra parity disk.
+**Example:** RAID 5 computes parity (an extra check value from which any one lost disk's data can be rebuilt) across stripes, so every write requires reading the old data and the old parity, then writing the new data and new parity — the **RAID 5 write penalty**: roughly 4 physical I/Os per logical write. RAID 10 (striped mirrors) just writes to two disks directly, with no parity math at all, at the cost of needing twice the raw capacity instead of one extra parity disk.
 
 **Why it matters:** For a random-write-heavy workload like an OLTP database, that 4-I/O penalty on RAID 5 is a real, measurable latency and throughput cost — which is why production databases usually choose RAID 10 despite its lower usable capacity.
 
 > [!tip] Remember
 > RAID 0 has zero redundancy and is not a backup strategy; RAID 1/10 trade capacity for simple, fast redundancy; RAID 5/6 trade write latency for cheaper redundancy.
+
+### SSD vs NVMe vs SATA: people mix these up 🟡
+
+| Word | What it names | Example |
+| --- | --- | --- |
+| HDD / SSD | The storage medium: spinning platter / flash chips | a 4 TB HDD, a 1 TB SSD |
+| SATA (AHCI) | The old cable and protocol: one queue of 32 commands | a 2.5-inch SATA SSD, about 550 MB/s max |
+| NVMe | The new protocol over PCIe: up to 64K queues | an M.2 NVMe SSD, several GB/s |
 
 ## 6. Trade-offs and when not to use 🟡
 
@@ -327,6 +393,8 @@ flowchart TB
 - HDDs still win on raw $/GB for cold data accessed rarely and sequentially (backups, write-once logs, archival tiers like S3 Glacier's underlying media) — don't pay SSD prices for data nobody reads.
 - RAID 0 (striping) is not a backup: it has no redundancy, and a single disk failure loses everything. RAID 1 (mirroring) and RAID 10 (striped mirrors) add redundancy at the cost of usable capacity; RAID 5/6 use parity instead, trading a slower, CPU-heavier write path for less capacity overhead.
 - Choosing per data type: a database's primary data and WAL benefit most from low-latency NVMe; application logs are sequential and can tolerate HDD or object storage; backups want the cheapest durable tier (often object storage, not block storage at all).
+
+> 🟡 → 🔴 **You now know** how HDDs, SSDs and NVMe work, the IOPS × block size rule, write amplification and RAID. **Next comes the advanced part:** cloud block, file and object storage, how disks fail in production, and the deep details: the write-amplification formula, power-loss protection, and the full `fsync` path.
 
 ## 7. In production 🔴
 
@@ -339,12 +407,12 @@ flowchart TB
 	- A nearly-full SSD shows rising write latency under sustained random writes (write-amplification spiral) → keep utilization below ~80–90%, or increase over-provisioning.
 	- An HDD-backed database has high p99 commit latency → move the WAL to SSD/NVMe even if bulk data stays on HDD; or batch commits (`synchronous_commit` tuning) to amortize fsync cost.
 	- An EC2 instance using local NVMe loses its data on stop/terminate → replicate to durable storage (EBS, S3, a database's own replication) before relying on it.
-	- A drive degrades silently (rising uncorrectable error rate) → monitor SMART/NVMe health attributes, not just "is it responding".
+	- A drive degrades silently (rising uncorrectable error rate) → monitor SMART/NVMe health attributes (the drive's own self-reported health counters), not just "is it responding".
 - **What to monitor:**
 	- IOPS and throughput against the device's rated limits (and whether the workload is IOPS-bound or throughput-bound).
 	- p99/p999 I/O latency, not just average — tail latency is what users and SLAs actually feel.
 	- SSD wear indicators: percentage of rated write endurance used, and SMART/NVMe SMART-log attributes.
-	- Queue depth and `iostat`'s `%util` / `await` to see whether the device itself, not the application, is the bottleneck.
+	- Queue depth and `iostat`'s `%util` / `await` (how busy the device is / average time each request waited) to see whether the device itself, not the application, is the bottleneck.
 
 ## 8. Deep dive 🔴
 
@@ -373,7 +441,7 @@ An application `write()` typically lands in the OS page cache first (see [[Page 
 `fsync` forces that dirty data out through the block layer to the device, and a well-behaved device then flushes its own cache to persistent NAND/platter before acknowledging.
 
 Any layer that lies about having persisted data (a RAID controller with a non-battery-backed cache, a misconfigured cloud volume) breaks the durability guarantee a database relies on.
-- **Block vs. file vs. object storage** are different abstractions over the same physical devices: block storage (EBS) exposes raw addressable blocks that the OS formats with its own filesystem; file storage (EFS) exposes a shared hierarchical namespace over NFS; object storage (S3) exposes flat key → blob access over HTTP with no partial-update semantics — you replace a whole object, you don't seek into it and overwrite bytes.
+- **Block vs. file vs. object storage** are different abstractions over the same physical devices: block storage (EBS) exposes raw addressable blocks that the OS formats with its own filesystem; file storage (EFS) exposes a shared hierarchical namespace (folders and files) over NFS (a protocol for using files on another machine as if local); object storage (S3) exposes flat key → blob access over HTTP with no partial-update semantics — you replace a whole object, you don't seek into it and overwrite bytes.
 - **USB drives and SD cards** use the same NAND flash as SSDs but pair it with much simpler, cheaper controllers: thinner wear leveling, little or no over-provisioning, and no power-loss protection — which is why they are reliable for file transfer but a poor choice for a database or anything needing write durability guarantees under power loss.
 
 ## 9. Interview questions 🔴
@@ -423,6 +491,30 @@ Any layer that lies about having persisted data (a RAID controller with a non-ba
 - `fsync` durability depends on every layer in the path actually flushing to persistent media, including the device's own write cache (power-loss protection matters here).
 - Block (EBS) vs. file (EFS) vs. object (S3) storage are different data models, not just different price points.
 - RAID 0 has no redundancy; RAID 10 beats RAID 5 on random-write-heavy workloads because it avoids the parity read-modify-write penalty.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why is a random read on an HDD so slow?
+> The arm must move to the right track and wait for the disk to spin: about 10 ms of moving parts.
+
+> [!question]- Is NVMe a kind of storage chip?
+> No. It is a protocol for talking to an SSD over PCIe, with many deep queues.
+
+> [!question]- What does IOPS mean?
+> Input/output operations per second: how many reads or writes a device finishes each second.
+
+🟡 Medium
+
+> [!question]- 50,000 IOPS of 4 KB blocks: what throughput is that?
+> About 200 MB/s (50,000 × 4 KB).
+
+> [!question]- Why does a nearly full SSD get slower at writing?
+> The garbage collector must copy many still-valid pages before erasing each block, so write amplification rises.
+
+> [!question]- Why do databases prefer RAID 10 over RAID 5?
+> RAID 5 needs about 4 disk operations per small write (read and write data and parity); RAID 10 just writes two copies.
 
 ## Links
 

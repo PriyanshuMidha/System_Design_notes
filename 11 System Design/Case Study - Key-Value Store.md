@@ -34,6 +34,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Consistent Hashing]]: keys and machines are placed on a circle, and a key belongs to the next machine clockwise.
+> - [[Replication]]: keeping copies of data on several machines so one failure loses nothing.
+> - [[Quorums and Leaderless Replication]]: any copy can take a write, and a request waits for "enough" copies (like 2 of 3) to answer.
+> - [[Storage Engines - B-tree vs LSM and WAL]]: an LSM engine writes new data to memory and a log, then to sorted files, which makes writes cheap.
+
 **From zero, in 60 seconds** 🟢
 
 A key-value store is like a giant dictionary: give it a key, get back a value.
@@ -77,6 +83,11 @@ You still want `get` and `put` to work, and not lose data.
 | Quorum | The minimum number of replicas that must answer | 2 of 3 |
 | Consistency | Whether every reader sees the latest write | Read right after write shows it |
 
+| Coordinator | The node that receives a request and talks to the replicas for it | node B forwards `put` to A, B and C |
+| Vector clock | A small version stamp with one counter per node, used to spot concurrent writes | `{A:1, B:1}` |
+| Sibling | One of two versions written at the same time, both kept for the client to merge | cart `[book, pen]` and `[book, cup]` |
+| Tombstone | A "deleted" marker kept for a while instead of erasing the key at once | `cart:42` deleted at clock `{A:3}` |
+
 **Picture it**
 
 ```mermaid
@@ -116,9 +127,16 @@ A single Redis or PostgreSQL instance holds a few hundred GB and fails as a unit
 - **Scale:** 10 billion keys, average value 1 KB (interview assumptions).
 - **Throughput:** 100k reads/s and 50k writes/s, growing 2x per year.
 - **Latency:** p99 under 10 ms inside one region (a target).
-- **Availability:** writes keep succeeding when any one node, or one availability zone, is down.
+- **Availability:** writes keep succeeding when any one node, or one availability zone (one data centre building inside a cloud region), is down.
 - **Durability:** an acknowledged write survives the loss of any single node.
 - **Elasticity:** add nodes without downtime; data moves automatically.
+
+### Real-life example: a shopping cart 🟢
+
+Amazon built its original Dynamo store so the shopping cart would always accept "add to cart", even when some servers were down.
+Say you add a book on your phone and a pen on your laptop at nearly the same moment, and the two writes land on different servers.
+Instead of throwing one away, the store keeps both versions, and the next time you open the cart they are merged into "book + pen".
+That is the main idea of this note: stay writable, and fix disagreements afterwards.
 
 **Out of scope**: secondary indexes, range scans across keys, multi-key transactions, cross-region replication (mentioned at the end).
 
@@ -128,7 +146,7 @@ Picture a **library spread over many branch buildings**. Every book (key) has a 
 
 If one branch is closed, a neighbouring branch keeps a note "return this to branch C when it reopens" (hinted handoff). Every night, branches compare checklists to find copies that drifted apart (anti-entropy).
 
-The core decision is the **CAP and PACELC choice** ([[CAP and PACELC]]): during a network partition, keep accepting writes on both sides and reconcile later (AP, Dynamo, Cassandra, Riak), or refuse writes on the minority side to keep one true value (CP, etcd, DynamoDB's per-partition Paxos, TiKV). Even without a partition, quorum size trades latency for consistency.
+The core decision is the **CAP and PACELC choice** ([[CAP and PACELC]]): during a network partition (machines up but unable to reach each other), keep accepting writes on both sides and reconcile later (AP: available over consistent; Dynamo, Cassandra, Riak), or refuse writes on the minority side to keep one true value (CP: consistent over available; etcd, DynamoDB's per-partition Paxos, TiKV). Even without a partition, quorum size trades latency for consistency.
 
 ```mermaid
 flowchart LR
@@ -138,7 +156,24 @@ flowchart LR
     N -- "C reopens" --> S
 ```
 
+## Common beginner mistakes 🟢
+
+- **Placing keys with `hash mod N`** → adding a node moves almost every key → use consistent hashing with virtual nodes.
+- **Thinking `W + R > N` means always up to date** → sloppy quorums and failed writes can still return old data → use consensus (Raft) when you need one true value.
+- **Using "last write wins" for a shopping cart** → one of two concurrent adds silently disappears → keep vector clocks and merge siblings.
+- **Deleting a key by erasing it** → a replica that missed the delete brings it back → write a tombstone and run repair before it is purged.
+- **Putting all 3 copies in one rack** → one power cut loses every copy → pick replicas from different racks or zones.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the plan: hash keys to machines, keep 3 copies, wait for "enough" answers, and repair later. **Next we open the box**: where each key lives, and how a write and a read move through the replicas when one of them is down.
+
+**Step by step (plain):**
+1. The app calls `put("cart:42", ...)`. The key is hashed to a spot on the ring.
+2. The next 3 different machines clockwise, say A, B and C, are the key's copies.
+3. Whichever node got the request (the coordinator) sends the write to A, B and C.
+4. As soon as 2 of the 3 say "saved" (W = 2), the app gets "OK". If C is down, a stand-in keeps a note to pass on later.
+5. A read asks 2 copies (R = 2). If they disagree, the coordinator returns the newer one and quietly fixes the stale copy.
 
 ```mermaid
 flowchart TB
@@ -239,7 +274,7 @@ GET /v1/kv/{key}  -> value(s) + X-Context
 | --- | --- | --- |
 | Raw data | 10 × 10^9 keys × 1.1 KB | ≈ 11 TB |
 | Replicated | 11 TB × 3 | ≈ 33 TB |
-| With compaction headroom | 33 TB × 1.5 (size-tiered compaction can temporarily need extra space) | ≈ 50 TB |
+| With compaction headroom | 33 TB × 1.5 (size-tiered compaction, which merges similar-sized files into bigger ones, can temporarily need extra space) | ≈ 50 TB |
 | Nodes by disk | 50 TB / 2 TB used per node | 25 nodes, round to 32 for even vnode spread and growth |
 | Reads per node | 100,000 reads/s × R=2 / 32 nodes | ≈ 6,250 replica reads/s per node |
 | Writes per node | 50,000 writes/s × N=3 / 32 nodes | ≈ 4,700 replica writes/s per node |
@@ -276,7 +311,7 @@ Content-Type: application/octet-stream
 [book, pen, cup]
 ```
 
-- `X-Context` is an opaque, encoded vector clock. The client returns the context of the version it read, which tells the store which versions this write supersedes.
+- `X-Context` is an opaque (the client does not read it, only returns it), encoded vector clock. The client returns the context of the version it read, which tells the store which versions this write supersedes.
 - When the read finds **concurrent** versions, `values` holds all siblings; the client merges them and writes back with the combined context.
 - `consistency` can be `one`, `quorum` or `all` per request. `DELETE` writes a **tombstone** (a marker with a clock), never a physical delete, so replicas that missed the delete cannot resurrect the value.
 
@@ -456,7 +491,7 @@ func TestQuorumOverlaps(t *testing.T) {
 | --- | --- | --- | --- |
 | Leaderless, vector clocks (Dynamo paper, Riak) | Any replica accepts writes; siblings returned to the client | Writes must always succeed and the app can merge (carts, CRDT counters) | Clients must merge; clocks grow and need pruning |
 | Leaderless, last-write-wins (Cassandra) | Each cell carries a client or coordinator timestamp; highest wins | Overwrites of whole values where losing a concurrent write is acceptable | Silent lost updates under concurrency; clock skew decides winners |
-| Leader per partition, Raft or Paxos (etcd, TiKV, DynamoDB per partition) | One leader orders writes; a majority must persist each write | You need linearizable reads and compare-and-set | Minority side unavailable during partitions; leader elections pause writes for a short time |
+| Leader per partition, Raft or Paxos (etcd, TiKV, DynamoDB per partition) | One leader orders writes; a majority must persist each write | You need linearizable reads (every read sees the latest finished write) and compare-and-set | Minority side unavailable during partitions; leader elections pause writes for a short time |
 | Single-node in-memory (Redis) with async replicas | One primary, replicas copy asynchronously | Caches and data that fits one machine's RAM | Failover can lose acknowledged writes; scale by sharding (Redis Cluster) |
 
 **Quorum settings (N=3):**
@@ -468,11 +503,19 @@ func TestQuorumOverlaps(t *testing.T) {
 | 1 | 1 | Fastest and most available; reads may be stale (eventual consistency) |
 | 1 | 3 | Fast writes; reads block if any replica is down |
 
+### Things people confuse this with 🟡
+
+| System | What it is | How it differs from this key-value store |
+| --- | --- | --- |
+| [[Case Study - Distributed Cache]] | Memory-only copies of data that also lives elsewhere | It may forget anything; this store is the durable source of truth |
+| Relational database | Tables, joins, transactions | Supports queries across rows; a KV store only does get and put by key |
+| etcd / ZooKeeper | Small, strongly consistent key-value stores for config and locks | Refuse writes without a majority; hold gigabytes, not terabytes |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - **Leaderless over leader-based because** the requirement is "never reject a write". The price is conflict handling: siblings, read repair and anti-entropy. If the requirement is "never lose a concurrent update to a bank balance", pick a leader-based CP design instead (or no KV store at all).
 - **Sloppy quorum plus hinted handoff over strict quorum because** it keeps writes available when the preference list is unhealthy. The price: `W + R > N` no longer guarantees overlap, because W acks may come from stand-in nodes outside the preference list.
-- **LSM over B-tree because** writes are frequent and sequential appends are cheap; the price is read and space amplification, controlled by Bloom filters and compaction ([[Storage Engines - B-tree vs LSM and WAL]]).
+- **LSM over B-tree because** writes are frequent and sequential appends are cheap; the price is read and space amplification (a read may check several files, and old copies take disk until merged), controlled by Bloom filters and compaction ([[Storage Engines - B-tree vs LSM and WAL]]).
 - **When not to build one:** if data fits on one PostgreSQL 17 or Redis primary with a replica, use that. If you need range scans, secondary indexes or transactions, a KV store is the wrong tool; use a relational or [[Distributed SQL]] database. Managed services (DynamoDB, Cassandra-compatible clouds) usually beat running your own cluster.
 
 ```mermaid
@@ -485,16 +528,18 @@ flowchart TD
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the ring, quorums, the read and write paths, the API and the vector-clock code. **Next is the advanced part**: real systems, failures such as zombie data and clock skew, the three ways copies heal, adding nodes, and what quorums do not promise.
+
 - **Well-documented real systems:**
 	- *Amazon Dynamo (2007 paper):* consistent hashing with virtual nodes, N/R/W quorums with a common configuration of (3, 2, 2), vector clocks with client-side reconciliation for the shopping cart, sloppy quorum and hinted handoff, Merkle trees for anti-entropy, gossip-based membership.
-	- *Apache Cassandra:* Dynamo-style partitioning and replication with Bigtable-style storage (commit log, memtable, SSTables); per-request consistency levels (`ONE`, `QUORUM`, `LOCAL_QUORUM`, `ALL`); last-write-wins per cell; hinted handoff limited by `max_hint_window` (3 hours by default); `nodetool repair` for Merkle-tree anti-entropy.
-	- *Amazon DynamoDB (2022 paper):* despite the name, not leaderless. Each partition is replicated across three availability zones and uses Multi-Paxos with a leader; strongly consistent reads go to the leader.
+	- *Apache Cassandra:* Dynamo-style partitioning and replication with Bigtable-style storage (commit log, memtable: the in-memory table of recent writes, SSTables: sorted files on disk); per-request consistency levels (`ONE`, `QUORUM`, `LOCAL_QUORUM`, `ALL`); last-write-wins per cell; hinted handoff limited by `max_hint_window` (3 hours by default); `nodetool repair` for Merkle-tree anti-entropy.
+	- *Amazon DynamoDB (2022 paper):* despite the name, not leaderless. Each partition is replicated across three availability zones and uses Multi-Paxos (a consensus protocol, like Raft) with a leader; strongly consistent reads go to the leader.
 	- *etcd:* Raft-replicated, linearizable KV for small, critical data (Kubernetes state); its default storage quota is 2 GB with 8 GB as the suggested maximum, which shows this design is for metadata, not 10 TB.
 - **Failure modes → fixes:**
 	- *Node down for minutes* → hinted handoff replays on return. *Down for longer than the hint window* → hints are dropped; run repair (anti-entropy) on that node before trusting it.
 	- *Deleted data comes back ("zombie" data)* → a replica missed the tombstone and the tombstone was purged before repair ran. Run repair more often than the tombstone grace period.
 	- *Hot partition* → one key or token range gets most traffic; see [[Hot Keys and Hot Partitions]].
-	- *Clock skew under last-write-wins* → a node with a fast clock wins every conflict. Run NTP with monitoring, or use vector clocks or a CRDT ([[CRDTs and Conflict Resolution]]).
+	- *Clock skew under last-write-wins* → a node with a fast clock wins every conflict. Run NTP (the network time protocol that keeps clocks in sync) with monitoring, or use vector clocks or a CRDT ([[CRDTs and Conflict Resolution]]).
 	- *Compaction falling behind* → read latency rises with SSTable count, disk fills. Alert on pending compactions, keep disk below about 50% for size-tiered compaction.
 - **SLOs and monitoring (targets):** p99 read and write latency per consistency level; unavailable-quorum error rate; hints pending; repair age per token range; SSTables per read; pending compactions; disk usage per node; gossip "down" events.
 
@@ -507,7 +552,7 @@ flowchart TD
 Three mechanisms cover different time scales.
 1. **Hinted handoff (seconds to hours).** A stand-in node stores writes meant for a down replica and replays them when gossip reports it up again. It is fast but bounded by the hint window and lost if the stand-in dies.
 2. **Read repair (on access).** When a read sees replicas disagree, the coordinator writes the winner back to stale replicas. It only fixes keys someone reads.
-3. **Anti-entropy with Merkle trees (background).** Each replica builds a hash tree over a token range: leaves hash small key ranges, parents hash children.
+3. **Anti-entropy with Merkle trees (background).** Each replica builds a hash tree over a token range (a slice of the ring): leaves hash small key ranges, parents hash children.
    - Two replicas compare roots; if they match, the range is identical. Otherwise they descend only into differing branches.
    - For a range of 1 billion keys split into 2^15 leaves, a single differing key costs about 15 levels of hash comparisons plus streaming one leaf, instead of comparing a billion keys.
    - This is the only mechanism that fixes cold, never-read keys.
@@ -517,6 +562,14 @@ flowchart LR
     H["Hinted handoff"] --> T1["minutes"]
     RR["Read repair"] --> T2["on each read"]
     M["Merkle tree compare"] --> T3["hours / nightly"]
+```
+
+```mermaid
+flowchart TD
+    R["root hash differs?"] -- "no" --> SAME["range identical: stop"]
+    R -- "yes" --> L["compare left and right child"]
+    L --> D["descend only into the differing child"]
+    D --> LEAF["reach one leaf: stream those keys"]
 ```
 
 ### 8.2 Adding a node without downtime
@@ -563,6 +616,26 @@ For compare-and-set or "exactly one owner" semantics, use consensus ([[Consensus
 
 > [!question]- How is this different from DynamoDB?
 > The Dynamo paper describes a leaderless store with vector clocks. The DynamoDB service uses leader-based Multi-Paxos replication per partition across three availability zones, which is why it can offer strongly consistent reads and conditional writes.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what does a quorum of 2 of 3 mean?
+> A read or write counts once 2 of the key's 3 copies have answered.
+
+> [!question]- Easy: why keep 3 copies of each key?
+> So losing any one machine loses no acknowledged data.
+
+> [!question]- Easy: what is a tombstone?
+> A marker that says "this key was deleted", kept for a while so other copies learn about the delete.
+
+> [!question]- Medium: phone writes `{A:1, B:1}` and laptop writes `{A:1, C:1}`. Which wins?
+> Neither dominates, so they are concurrent; both are returned as siblings for the client to merge.
+
+> [!question]- Medium: 10 billion keys × 1.1 KB, 3 copies. Roughly how much disk?
+> About 11 TB raw, 33 TB with 3 copies, about 50 TB with compaction headroom.
+
+> [!question]- Medium: which healing method fixes keys nobody reads?
+> Anti-entropy with Merkle trees, run in the background.
 
 ## 10. Cheat sheet 🟢
 

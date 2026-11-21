@@ -32,6 +32,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Interfaces]]: the service declares a small interface, and both a map-backed fake and a PostgreSQL type can fit it.
+> - [[Error Handling]]: a function returns a named error such as `ErrNotFound`, and callers check it with `errors.Is`.
+> - [[Transactions and ACID]]: `BEGIN … COMMIT` makes several writes all happen or none happen; `ROLLBACK` throws them away.
+
 **From zero, in 60 seconds** 🟢
 
 Business code should not be full of SQL. A **repository** is an object that looks like a simple collection: `Get(id)`, `Save(order)`. It hides the database behind it. A **unit of work** groups several saves into one transaction, so either all of them happen or none. This note shows both in Go with PostgreSQL. Read the plain-words line above each code block first.
@@ -53,6 +58,10 @@ A repository hides *where* data lives; a unit of work makes the three saves succ
 | Commit / rollback | Make the writes permanent / throw them all away | Rollback after an error |
 | In-memory fake | A test version backed by a Go map instead of a DB | `map[int64]Order` |
 | Persistence | Storing data so it survives a restart | Rows in PostgreSQL |
+| Aggregate | A group of objects that are saved and changed together | An order and its line items |
+| Sentinel error | A fixed, named error value that callers compare against | `ErrNotFound`, `ErrInsufficientStock` |
+| Conditional update | An `UPDATE` whose `WHERE` checks the rule, so check and write are one step | `... WHERE available >= 1` |
+| Contract test | One test suite that every implementation must pass | Run on the fake and on PostgreSQL |
 
 **Picture it**
 
@@ -92,6 +101,10 @@ A checkout service places an order in two steps: reserve stock, then create the 
 
 The old in-memory version had its own bug: an unguarded map. Two goroutines writing to a Go map at once crash the process with `fatal error: concurrent map writes`, which cannot be recovered.
 
+### Real-life example 🟢
+
+Picture buying the last 5 units of a phone in a Flipkart flash sale while thousands of people tap "Buy" at the same second. The app must take one unit off the stock and create your order together: either both happen, or neither does. And it must never sell 6 units when only 5 exist. The checkout code should not care whether stock lives in PostgreSQL or in a test's memory; it just says "reserve 1" and "create order". The Repository hides the storage, and the Unit of Work makes the two writes all-or-nothing.
+
 ## 2. Mental model 🟢
 
 A **repository** is a librarian. You ask for "book 42" or "the next ten books by this author", and you hand books back. You never learn whether a book was on the shelf, in the basement or at another branch.
@@ -100,11 +113,13 @@ A **unit of work** is the checkout till. Everything in the basket is paid for to
 
 Three rules make the pattern work in Go:
 
-1. **One repository per aggregate**: orders, stock. Not one per table, and not one generic repository for everything.
+1. **One repository per aggregate** (a group of objects saved and changed together): orders, stock. Not one per table, and not one generic repository for everything.
 2. **The interface belongs to the consumer.** The checkout package declares the small `OrderRepository` it needs; the storage packages implement it ([[Interfaces]]).
 3. **Repositories store and fetch; services decide.** "Quantity must be 1 to 10" is a business rule and lives in the service. "Never let `available` go below zero" must be enforced atomically where the data lives, so the repository exposes it as a named operation, `Reserve`.
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the two ideas: a repository hides where data lives, and a unit of work makes several saves succeed or fail together. **Next we open the box**: the Go types involved, how errors and conditional updates are part of the contract, the steps of `WithTx`, and three ways to share one transaction.
 
 **In plain words: the business code talks to a collection-like interface; only the repository knows SQL.**
 
@@ -162,7 +177,7 @@ The pieces:
 
 - **Sentinel errors.** `ErrNotFound`, `ErrConflict` and `ErrInsufficientStock` are part of the interface's contract. Each implementation maps its own errors to them: PostgreSQL's `sql.ErrNoRows` (or `pgx.ErrNoRows`) becomes `ErrNotFound`, so callers use `errors.Is` whatever the storage ([[Error Handling]]).
 - **Conditional updates as methods.** `Reserve` is `UPDATE stock SET available = available - $2 WHERE sku = $1 AND available >= $2`. `CompareAndSetStatus` is `UPDATE … WHERE id = $1 AND status = $2`. The check and the write are one statement, so no other transaction can slip between them. Zero affected rows means the condition failed.
-- **`DBTX`.** An interface with `ExecContext`, `QueryContext` and `QueryRowContext` that both `*sql.DB` and `*sql.Tx` satisfy. The same `PgOrders` type runs inside or outside a transaction. sqlc generates the same interface (its `database/sql` version also lists `PrepareContext`; its pgx version uses `Exec`, `Query` and `QueryRow`).
+- **`DBTX`.** An interface with `ExecContext`, `QueryContext` and `QueryRowContext` that both `*sql.DB` and `*sql.Tx` satisfy. The same `PgOrders` type runs inside or outside a transaction. sqlc (a tool that generates typed Go code from SQL queries) generates the same interface (its `database/sql` version also lists `PrepareContext`; its pgx version uses `Exec`, `Query` and `QueryRow`).
 - **Keyset pagination.** `ListByUser(ctx, user, afterID, limit)` returns the next page after a known ID, which stays fast however deep the caller pages ([[Pagination, Filtering and Sorting]]).
 
 ### A unit of work, step by step
@@ -207,7 +222,7 @@ sequenceDiagram
 | Option | How it works | Strength | Weakness |
 | --- | --- | --- | --- |
 | `WithTx(ctx, func(Repos) error)` | A closure receives repositories bound to one transaction | Explicit: the signature shows what is transactional | One more parameter level in the service |
-| Unit of Work object | Repositories register new, changed and removed objects; `Commit` writes them all in one transaction | Batches writes; tracks changes (ORMs do this) | Change tracking is heavy machinery for Go services |
+| Unit of Work object | Repositories register new, changed and removed objects; `Commit` writes them all in one transaction | Batches writes; tracks changes (ORMs, libraries that map tables to objects and write the SQL for you, do this) | Change tracking is heavy machinery for Go services |
 | Transaction in `ctx` | `WithTx` stores the `*sql.Tx` in the context; repositories use it when present | No signature changes | Hidden: a repository call with the wrong `ctx` silently runs outside the transaction |
 
 `WithTx` with a closure is the usual Go choice. It is a unit of work without change tracking: the closure is the unit, and the transaction is its boundary.
@@ -291,6 +306,15 @@ CREATE INDEX orders_user_id_id ON orders (user_id, id);
 ```
 
 The code: interfaces owned by the service, the checkout service, the in-memory fake, and the PostgreSQL implementation.
+
+**Step by step:**
+
+1. `Order`, `Status` and the errors (`ErrNotFound`, `ErrConflict`, `ErrInsufficientStock`) are the shared words.
+2. `OrderRepository` and `StockRepository` are interfaces owned by the checkout code. `Repos` groups them, and `TxRunner.WithTx` runs a function as one transaction.
+3. `Checkout.PlaceOrder` checks the quantity, then inside `WithTx` calls `Reserve` and `Create`. Any error rolls both back.
+4. `MemStore` is the fake for tests: its `WithTx` holds a lock and restores a snapshot on error.
+5. `PgOrders`, `PgStock` and `PgStore` are the PostgreSQL versions; `Reserve` and `CompareAndSetStatus` each change a row only if a condition still holds.
+6. `main` tries three orders against a stock of 2 (the third gets `ErrInsufficientStock`), then shows `CompareAndSetStatus` refusing to cancel a `Pending` order as if it were `Paid`.
 
 ```go
 // main.go
@@ -754,7 +778,7 @@ var (
 )
 ```
 
-`go vet` is clean and `go test -race` passes (Go 1.24.4). The PostgreSQL implementation compiles and is vetted, but it was not run against a database in this vault; in a real project the same `contract` function runs against `PgStore` on a test database in CI. Output of `go run .`, measured:
+`go vet` is clean and `go test -race` passes (Go 1.24.4). The PostgreSQL implementation compiles and is vetted, but it was not run against a database in this vault; in a real project the same `contract` function runs against `PgStore` on a test database in CI (the server that runs tests on every push). Output of `go run .`, measured:
 
 ```text
 1 pending <nil>
@@ -765,6 +789,14 @@ cancel a pending order as if paid: conflict: state changed
 
 The stock holds 2 units, so the third order fails inside the transaction and is never created (its ID stays 0). The last line is the compare-and-set refusing to cancel order 1 "from paid", because the order is still pending.
 
+## Common beginner mistakes 🟢
+
+- **Mistake:** reading `available`, checking it in Go, then writing the new value. → **Why it's wrong:** 20 buyers all read 5 at once, and stock is oversold. → **Do this instead:** check and change in one step, as `PgStock.Reserve` does with `UPDATE ... WHERE available >= $2`.
+- **Mistake:** reserving stock and creating the order as two separate calls. → **Why it's wrong:** if `Create` fails, the stock is gone and no order exists. → **Do this instead:** run both inside one `WithTx`, as `Checkout.PlaceOrder` does.
+- **Mistake:** letting `sql.ErrNoRows` travel up to the HTTP handler. → **Why it's wrong:** every handler handles it differently, and a missing order becomes a 500. → **Do this instead:** return your own errors (`ErrNotFound`, `ErrConflict`, `ErrInsufficientStock`) from the repository.
+- **Mistake:** putting business rules such as "qty must be 1 to 10" inside the repository. → **Why it's wrong:** the fake and the Postgres version must both copy the rule, and they drift. → **Do this instead:** keep rules in `Checkout` and keep repositories to storage.
+- **Mistake:** a generic `Update(order)` method. → **Why it's wrong:** it hides what changed and lets two requests overwrite each other. → **Do this instead:** name the change, as `CompareAndSetStatus(id, from, to)` does.
+
 ## 5. Variants and comparison 🟡
 
 | Variant | How it works | Use when | Cost |
@@ -772,7 +804,7 @@ The stock holds 2 units, so the third order fails inside the transaction and is 
 | Repository per aggregate | Small interface with domain methods (`Reserve`, `ListByUser`) | Services with real business rules | One interface and two implementations per aggregate |
 | Generic `Repository[T]` with CRUD | `Get`, `Save`, `Delete`, `List` for every type | Rarely: admin tools over many similar tables | Invites read-modify-write races; hides intent; every query gets bolted on |
 | sqlc `Queries` used directly | Generated typed methods per SQL query, `DBTX`, `WithTx` | Thin services where SQL is the logic | The service depends on generated storage types |
-| ORM unit of work | The ORM tracks changed objects and flushes them in one transaction | Teams already on an ORM | Hidden queries, N+1 risk, less control of SQL |
+| ORM unit of work | The ORM tracks changed objects and flushes them in one transaction | Teams already on an ORM | Hidden queries, N+1 risk (one query per item in a loop), less control of SQL |
 | Active record | Objects save themselves (`order.Save()`) | Simple CRUD apps | Domain types depend on the database |
 
 ## 6. Trade-offs and when not to use 🟡
@@ -782,6 +814,8 @@ The stock holds 2 units, so the third order fails inside the transaction and is 
 - **The abstraction leaks at the edges, and that is fine.** Isolation levels, locks and the cost of a query still matter. Do not pretend an in-memory map and PostgreSQL behave the same under concurrency; that is what the contract tests are for.
 - **Do not put business rules in repositories.** A repository that decides who may cancel an order cannot be reused, and the rule cannot be tested without storage. Keep storage invariants (`available >= 0`) in the database and the repository, and policy in the service.
 - **Do not mock what you can fake.** A mock of `OrderRepository` checks that methods were called; a fake checks behaviour. A fake that passes the same contract tests as PostgreSQL is worth more than a hundred mock expectations ([[Testing LLD Code]]).
+
+> 🟡 → 🔴 **You now know** how to write a repository, a fake, a unit of work and contract tests, and when to skip the pattern. **Next comes the production view**: how sqlc and pgx shape real code, the overselling and open-transaction bugs, and why a conditional update stays correct under PostgreSQL's default isolation.
 
 ## 7. In production 🔴
 
@@ -794,18 +828,18 @@ The stock holds 2 units, so the third order fails inside the transaction and is 
 	- `fatal error: concurrent map writes` in the in-memory store → guard it with a `sync.Mutex`, and run tests with `-race`.
 	- `sql.ErrNoRows` surfaces as a 500 → map it to `ErrNotFound` in the repository, and map `ErrNotFound` to 404 at the HTTP edge.
 	- Overselling under load → conditional `UPDATE … WHERE available >= $2`, not read-check-write in the service.
-	- A transaction left open → `defer tx.Rollback()` right after `BeginTx`; an open transaction holds a pooled connection and its row locks.
-	- A remote call (payment provider) inside `WithTx` holds locks for its whole latency → do remote calls outside the transaction and use an outbox or a saga to tie them together.
+	- A transaction left open → `defer tx.Rollback()` right after `BeginTx`; an open transaction holds a pooled connection (one of a small shared set of database connections) and its row locks.
+	- A remote call (payment provider) inside `WithTx` holds locks for its whole latency → do remote calls outside the transaction and use an outbox (an event row written in the same transaction, sent later) or a saga (steps with undo actions) to tie them together.
 	- N+1 queries: a loop calling `Get` per ID → add a batch method (`GetMany(ids)`) to the repository.
 - **What to monitor:** `sql.DB.Stats()` (`InUse`, `WaitCount`, `WaitDuration`), transaction duration, rollback rate, and how often `ErrConflict` and `ErrInsufficientStock` are returned.
 
 ## 8. Deep dive 🔴
 
-**Why the conditional update is safe at Read Committed.** PostgreSQL's default isolation level is Read Committed. When two transactions run `UPDATE stock SET available = available - 1 WHERE sku = 'sku' AND available >= 1` at once, the second one waits for the first to commit, then re-checks its `WHERE` clause against the newly committed row before updating it. With 1 unit left, the second update finds `available = 0`, matches no row, and reports 0 rows affected. A plain `SELECT` followed by an `UPDATE` in the service has no such re-check and loses updates. Other fixes for read-modify-write are `SELECT … FOR UPDATE` or an optimistic `version` column ([[Locking - Optimistic vs Pessimistic]]).
+**Why the conditional update is safe at Read Committed.** PostgreSQL's default isolation level (how much one transaction sees of others running at the same time) is Read Committed. When two transactions run `UPDATE stock SET available = available - 1 WHERE sku = 'sku' AND available >= 1` at once, the second one waits for the first to commit, then re-checks its `WHERE` clause against the newly committed row before updating it. With 1 unit left, the second update finds `available = 0`, matches no row, and reports 0 rows affected. A plain `SELECT` followed by an `UPDATE` in the service has no such re-check and loses updates. Other fixes for read-modify-write are `SELECT … FOR UPDATE` or an optimistic `version` column ([[Locking - Optimistic vs Pessimistic]]).
 
 **Zero rows is ambiguous.** `RowsAffected() == 0` means "the row does not exist" or "the condition failed". `CompareAndSetStatus` runs one more query to tell them apart. Alternatives: `UPDATE … RETURNING status` combined with a lookup, or accept one error for both when callers react the same way. `Reserve` returns `ErrInsufficientStock` for an unknown SKU in both implementations, and the contract suite checks it: this is the kind of drift between a fake and PostgreSQL that the shared suite exists to catch.
 
-**Sequences are not transactional.** A rolled-back `INSERT` still consumes its identity value, so IDs have gaps. The fake mirrors this by never reusing `nextID`. Tests must not depend on consecutive IDs.
+**Sequences are not transactional.** A rolled-back `INSERT` still consumes its identity value (the auto-numbered ID), so IDs have gaps. The fake mirrors this by never reusing `nextID`. Tests must not depend on consecutive IDs.
 
 **What a fake can and cannot prove.** `MemStore.WithTx` holds one mutex for the whole unit, which behaves like `SERIALIZABLE` with no concurrency at all. It proves the service logic and the all-or-nothing contract. It cannot prove anything about deadlocks, lock waits or isolation anomalies; only the contract suite against real PostgreSQL can. It also skips the schema's `CHECK` and `REFERENCES` constraints, which is why the contract suite creates only rows the real schema accepts: an order with no SKU would pass against the fake and fail against PostgreSQL.
 
@@ -843,6 +877,26 @@ The stock holds 2 units, so the third order fails inside the transaction and is 
 - Keyset pagination in the method signature (`afterID`, `limit`).
 - Fake with a mutex + one contract suite for fake and PostgreSQL.
 - Avoid generic `Repository[T]` CRUD god-interfaces.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What does a repository hide from the business code?
+> Where and how data is stored; the service only calls methods like `Get` and `Reserve`.
+
+> [!question]- 🟢 What does a unit of work guarantee?
+> All the saves inside it happen together or none of them do.
+
+> [!question]- 🟢 Where does "quantity must be 1 to 10" belong: service or repository?
+> In the service; it is a business rule, not a storage rule.
+
+> [!question]- 🟡 How does `Reserve` stop 20 buyers from overselling a stock of 5?
+> It is one conditional `UPDATE ... WHERE available >= $2`, so the check and the write cannot be split; zero rows changed means out of stock.
+
+> [!question]- 🟡 Why should `sql.ErrNoRows` never reach the HTTP layer?
+> The repository should map it to `ErrNotFound`, so callers check one sentinel and the API can return 404 instead of 500.
+
+> [!question]- 🟡 Why is a generic `Repository[T]` with `Get` and `Save` risky?
+> It makes "read, change, save" the easy path, and two concurrent requests then overwrite each other.
 
 ## Links 🟢
 

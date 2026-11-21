@@ -23,6 +23,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add "Code", "Tests" and "Running it".
 > - 🔴 **Interview / SDE-3 prep?** Add "Design decisions", "Pitfalls" and the exercises. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[TCP - Handshake, Reliability, Flow and Congestion Control]]: HTTP requests travel over a connection; here `httptest` fakes that part so the tests stay fast.
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]] (theory twin): what "safe" and "idempotent" mean, and the three cookie safety switches.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on twin of the theory note. It builds a tiny toy web server in Go that stores items in a map, and uses it to *prove* the method promises with running code: `GET` never changes anything, repeating a `PUT` or `DELETE` is harmless, repeating a `POST` creates duplicates, and a login cookie gets its three safety switches set. Read top to bottom — each code block has a plain explanation right after it — and the tests at the end show each claim passing for real.
@@ -62,6 +66,8 @@ flowchart LR
 ```
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** what the toy server should prove: `GET` changes nothing, repeating `PUT` or `DELETE` is harmless, repeating `POST` makes duplicates. **Next we read the code**, one handler per method, then the cookie helper.
 
 ### Step 1: the store and its fingerprint helper
 
@@ -143,7 +149,7 @@ func (s *Store) HandleGet(w http.ResponseWriter, r *http.Request) {
 
 **How it works.**
 1. The lock is held only long enough to read `s.items[id]` into a local variable — `body` — and then released before any header writing or encoding happens, so a slow client doesn't hold the store's mutex hostage.
-2. `r.PathValue("id")` uses Go 1.22's method-and-pattern routing (`"GET /items/{id}"` registered on the mux in Step 5) instead of manually parsing `r.URL.Path`.
+2. `r.PathValue("id")` uses Go 1.22's method-and-pattern routing (`"GET /items/{id}"` registered on the mux, Go's request router that maps paths to handlers, in Step 5) instead of manually parsing `r.URL.Path`.
 3. The `If-None-Match` comparison and early `304` return happen before `Content-Type` is set or the body is encoded — exactly the "set headers, then decide whether to write a body" shape from [[HTTP Caching - Cache-Control, ETag, Conditional Requests - Go]].
 
 ### Step 3: `PUT` and `DELETE` — idempotent, but not safe
@@ -219,7 +225,7 @@ func (s *Store) HandlePost(w http.ResponseWriter, r *http.Request) {
 ```
 
 **How it works.**
-1. `s.nextID++` happens inside the same critical section as the map write, so two concurrent `POST`s can never be assigned the same ID — an alternative using a package-level `atomic.Int64` for IDs would work too, but would decouple ID assignment from the map write it has to stay in sync with.
+1. `s.nextID++` happens inside the same critical section (the lines run while holding the lock) as the map write, so two concurrent `POST`s can never be assigned the same ID — an alternative using a package-level `atomic.Int64` for IDs would work too, but would decouple ID assignment from the map write it has to stay in sync with.
 2. The `Location` header on the `201` response is the standard way a server tells the client where the newly created resource now lives, per RFC 9110.
 
 The cookie helper is unrelated to `Store` but belongs in the same package as a second demonstration of header semantics:
@@ -388,6 +394,8 @@ func newMux(s *Store) *http.ServeMux {
 
 The test itself:
 
+**What this code does, in plain words:** it sends the same `PUT /items/42` twice, checks the first answer is `201` and the second `200`, and checks the stored value is still `"v1"` after both.
+
 ```go
 func TestPUTIsIdempotent(t *testing.T) {
 	s := NewStore()
@@ -424,6 +432,8 @@ func TestPUTIsIdempotent(t *testing.T) {
 
 A failure (fewer than 3 created) would hide the exact bug idempotency keys exist to prevent: a client retry that should have created one resource silently collapsing into fewer.
 
+**What this code does, in plain words:** it sends the same `POST /items` three times in a loop and checks that three separate items were created.
+
 ```go
 func TestPOSTIsNotIdempotent(t *testing.T) {
 	s := NewStore()
@@ -451,6 +461,8 @@ func TestPOSTIsNotIdempotent(t *testing.T) {
 | Input | Expected output |
 | --- | --- |
 | `GET /items/1` then `GET /items/1` with the stored `ETag` | Second response: `304`, 0-byte body |
+
+**What this code does, in plain words:** it reads item 1 once to get its ETag, then reads it again sending that ETag back, and checks the second answer is `304` with an empty body.
 
 ```go
 func TestConditionalGETReturns304(t *testing.T) {
@@ -486,6 +498,8 @@ func TestConditionalGETReturns304(t *testing.T) {
 | --- | --- |
 | `SetSessionCookie(rec, "abc123")` | Resulting `Set-Cookie`: `Secure=true`, `HttpOnly=true`, `SameSite=Strict` |
 
+**What this code does, in plain words:** it calls `SetSessionCookie` on a fake response, reads back the cookie it wrote, and checks the `Secure`, `HttpOnly` and `SameSite=Strict` switches are on.
+
 ```go
 func TestSessionCookieAttributes(t *testing.T) {
 	rec := httptest.NewRecorder()
@@ -504,9 +518,11 @@ func TestSessionCookieAttributes(t *testing.T) {
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** how each handler behaves and what each test proves. **Next, the advanced part**: why the locking and status choices were made, the races a careless edit would introduce, and exercises.
+
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
-| One `sync.Mutex` guarding the whole `Store` | Per-key locking (e.g. `sync.Map` or a sharded lock) | Simpler to reason about correctness; serializes all access, which would matter at real concurrency but not for a teaching example |
+| One `sync.Mutex` guarding the whole `Store` | Per-key locking (e.g. `sync.Map` or a sharded lock: several locks, each guarding part of the keys) | Simpler to reason about correctness; serializes all access, which would matter at real concurrency but not for a teaching example |
 | Separate `atomic.Int64` counter for `created` | Recompute "how many created" from `len(s.items)` after the fact | Avoids coupling the test's assertion to deletions ever happening to the same store; the counter only ever goes up |
 | `DELETE` always returns `204` regardless of prior existence | Return `404` if the item didn't exist | Matches the idempotency contract exactly: "the resource is gone" is true either way, so the response shouldn't depend on which call happened to do the deleting |
 | Cookie built via `http.SetCookie` + `http.Cookie` struct | Hand-format the `Set-Cookie` header string | The standard library handles attribute ordering and escaping correctly; a hand-built string is an easy source of a malformed or silently-ignored attribute |
@@ -531,8 +547,8 @@ Reading it line by line: four `PASS` lines confirm each method-semantics claim i
 
 ## Pitfalls in the code 🔴
 
-- `HandlePost`'s `s.nextID++` and the map write happen under the same lock, but if a future change moved ID generation outside the lock (e.g. to reduce contention), two concurrent `POST`s could read the same `nextID` before either increments it, producing a duplicate ID — a classic check-then-act race.
-- `HandleGet` returns a generic `404` for "not found" without setting `Cache-Control` on the error path — a real service usually wants a short negative-cache `Cache-Control` on `404`s too, to avoid hammering the origin for a resource that doesn't exist.
+- `HandlePost`'s `s.nextID++` and the map write happen under the same lock, but if a future change moved ID generation outside the lock (e.g. to reduce contention), two concurrent `POST`s could read the same `nextID` before either increments it, producing a duplicate ID — a classic check-then-act race (two goroutines read the same value, then both act on it).
+- `HandleGet` returns a generic `404` for "not found" without setting `Cache-Control` on the error path — a real service usually wants a short negative-cache `Cache-Control` (letting caches remember "not found" briefly) on `404`s too, to avoid hammering the origin for a resource that doesn't exist.
 - `SetSessionCookie` hardcodes `MaxAge: 3600`; a production version would typically make this configurable rather than a literal constant.
 
 ## Exercises 🔴
@@ -540,6 +556,26 @@ Reading it line by line: four `PASS` lines confirm each method-semantics claim i
 1. Change `HandleDelete` to return `404` when the item didn't already exist, then predict (and run) whether `TestConditionalGETReturns304` or `TestPUTIsIdempotent` still pass unchanged — they should, since neither test exercises `DELETE` — and discuss why this change would still be a bad idea per the idempotency contract even though no test catches it.
 2. Move `s.nextID++` in `HandlePost` outside the `s.mu.Lock()`/`Unlock()` pair (keep the map write inside). Run `go test -race ./httpdemo/...` and read what the race detector reports.
 3. Add `SameSite: http.SameSiteLaxMode` as an alternative `SetSessionCookie` variant and write a test asserting it. Predict which real-world scenario (a user clicking a link from an email to your site while logged in) behaves differently between `Strict` and `Lax`.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 Which handler never changes the store?
+> `HandleGet`; it only reads, which is what makes `GET` safe.
+
+> [!question]- 🟢 What does `HandlePut` return on the first and second identical call?
+> `201 Created` the first time, `200 OK` the second; the stored value is the same both times.
+
+> [!question]- 🟢 How many items do three identical `POST`s create?
+> Three, each with a new ID. That is why `POST` is not idempotent.
+
+> [!question]- 🟡 Why does `HandleDelete` always return `204`, even if the item was not there?
+> The end state ("item is gone") is the same either way, which is what idempotent means.
+
+> [!question]- 🟡 Why must `s.nextID++` stay inside the lock?
+> Two concurrent `POST`s could otherwise read the same ID and create a duplicate.
+
+> [!question]- 🟡 Why use `http.SameSiteStrictMode` instead of the string `"strict"`?
+> A typed constant turns a typo into a compile error instead of a silently ignored setting.
 
 ## Links
 

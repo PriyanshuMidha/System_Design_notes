@@ -21,6 +21,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add the "Code" walkthrough and the "Tests" section.
 > - 🔴 **Interview / SDE-3 prep?** Add "Design decisions", "Pitfalls" and the "Exercises". Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[How Browsers Load and Render a Page]]: the browser reads CSS rules and decides which one styles each element. That is all you need from it.
+> - [[CSS Fundamentals - Cascade, Selectors, Box Model]] (the theory twin): a selector's score is three counters (IDs, classes, tag names) compared left to right. Read its "From zero" part first if that is new.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on twin of the CSS theory note. In plain words: when two CSS rules fight over the same element, the browser scores each selector with three counters (IDs, classes, tag names) and compares them left to right — it never adds them up. The Go code here builds that scorer: it reads a selector string like `#nav .item a`, counts what is in it, and compares two scores the same way a browser would. Read "Before the code" for the Go bits you need, skim the table of what maps to what, then walk the code top to bottom. All code stays runnable as-is.
@@ -28,11 +32,11 @@ This file is the hands-on twin of the CSS theory note. In plain words: when two 
 ## Before the code 🟢
 
 - **Structs** (`type Triple struct{ A, B, C int }`): a named group of fields, here the three specificity counters.
-- **Methods with a value receiver** (`func (t Triple) Less(...)`): a function attached to a type, called as `x.Less(y)`.
+- **Methods with a value receiver** (`func (t Triple) Less(...)`): a function attached to a type, called as `x.Less(y)`. The **receiver** is the `t` before the name: the value the method works on.
 - **`switch` with no value** (`switch { case ...: }`): a tidy chain of `if / else if` checks, top to bottom.
 - **`strings` package** (`Fields`, `HasPrefix`, `NewReplacer`): split on spaces, check how a string starts, and swap characters.
 - **Table-driven tests**: one test loops over a list of input/expected pairs, the usual Go testing style.
-- **What to run:** `go vet ./... && go test -race -v ./...` inside the module. No goroutines, interfaces or generics are needed here.
+- **What to run:** `go vet ./... && go test -race -v ./...` inside the **module** (a folder with a `go.mod` file, Go's unit of code). `go vet` checks for likely bugs; `-race` turns on the **race detector**, which catches two goroutines touching the same data at once. No goroutines, interfaces or generics are needed here.
 
 ## What this code shows 🟢
 
@@ -51,6 +55,8 @@ This file is the hands-on twin of the CSS theory note. In plain words: when two 
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** what the code is for: score a selector with three counters and compare scores left to right. **Next we open the box** and read the three small pieces that do it: the score type, the parser, and the token splitter.
+
 ### The specificity type and its comparison rule
 
 **In plain words:** this is the scoreboard. Three numbers, and a rule that says "compare the first number; only on a tie look at the second; only on another tie look at the third" — like comparing versions 2.1.9 vs 2.2.0.
@@ -58,6 +64,8 @@ This file is the hands-on twin of the CSS theory note. In plain words: when two 
 **Concept.** The theory note's whole point is that specificity is three separate counters compared in order, never added together. `Triple` is that triple, and `Less` is the comparison rule, written exactly as the "compare `a`, then `b`, then `c`" rule reads in prose.
 
 An alternative design would pack all three counts into one integer (e.g. `a*1000 + b*100 + c`), but that silently breaks the moment any counter reaches double digits — encoding each counter as its own field makes that bug impossible to write by accident.
+
+**What this code does, in plain words:** it defines a score with three numbers, A (IDs), B (classes) and C (tag names), and a `Less` function that says "is my score lower than yours?" by checking A first, then B, then C.
 
 ```go
 package specificity
@@ -82,17 +90,19 @@ func (t Triple) Less(other Triple) bool {
 ```
 
 **How it works.**
-1. `Triple` has three exported `int` fields — exported so test code and callers outside the package can read `A`, `B`, `C` directly for assertions or display.
-2. `Less` takes `other Triple` by value, not by pointer: a `Triple` is three small ints, cheap enough to copy, so a pointer would only add indirection for no benefit.
-3. The three `if`/`return` pairs are the lexicographic comparison: it only ever inspects `B` when `A` is exactly equal, and only inspects `C` when both `A` and `B` are equal — mirroring the cascade's own rule that a later round only runs after every earlier round tied.
+1. `Triple` has three **exported** (name starts with a capital letter, so code outside the package can use it) `int` fields — exported so test code and callers outside the package can read `A`, `B`, `C` directly for assertions or display.
+2. `Less` takes `other Triple` by value, not by pointer: a `Triple` is three small ints, cheap enough to copy, so a pointer would only add **indirection** (an extra hop to find the real value) for no benefit.
+3. The three `if`/`return` pairs are the **lexicographic** comparison (compare position by position, like words in a dictionary): it only ever inspects `B` when `A` is exactly equal, and only inspects `C` when both `A` and `B` are equal — mirroring the cascade's own rule that a later round only runs after every earlier round tied.
 
 ### Parsing a selector into a triple
 
 **In plain words:** this function reads a selector string character by character and sorts each piece into the right bucket — `#` things count as IDs, `.` things as classes, bare names as tags.
 
-**Concept.** `Of` is the piece that turns a raw selector string into a `Triple`, by walking each compound (the part between combinators) and classifying each token inside it.
+**Concept.** `Of` is the piece that turns a raw selector string into a `Triple`, by walking each compound (the part between **combinators**, the symbols `>`, `+`, `~` and space that join selectors) and classifying each **token** (one small piece, like `.item` or `#nav`) inside it.
 
 The design choice here is a simple character-prefix classifier rather than a full CSS selector grammar parser — a real browser engine's selector parser is considerably more complete (handling escaped characters, nested functional pseudo-classes like `:not()`'s argument, and more), but a prefix classifier is enough to demonstrate the specificity rule itself, which is this note's only goal.
+
+**What this code does, in plain words:** it turns combinators into spaces, splits the selector into compounds, cuts each compound into tokens, and adds 1 to the right counter for each token: `#` adds to IDs; `.`, `[` and `:` add to classes; `::` and bare tag names add to types.
 
 ```go
 // Of parses one compound selector like "#nav .item a" or "div.card:hover::before"
@@ -128,14 +138,16 @@ func Of(selector string) Triple {
 **How it works.**
 1. `strings.NewReplacer(">", " ", "+", " ", "~", " ")` turns every combinator into a space, so `.card > p` and `.card p` are treated identically — combinators themselves never add to specificity, only the compounds on either side of them do.
 2. `strings.Fields` then splits on any whitespace, giving one compound selector per loop iteration (e.g. `#nav`, `.item`, `a` from `#nav .item a`).
-3. The `switch` with no condition and `case tok == "*":` etc. is Go's idiomatic stand-in for an if/else-if chain; each `case` is checked top to bottom and the first match wins, which is why `"::"` is checked before the single-colon `":"` case — otherwise every pseudo-element would be miscounted as a pseudo-class.
+3. The `switch` with no condition and `case tok == "*":` etc. is Go's idiomatic stand-in for an if/else-if chain; each `case` is checked top to bottom and the first match wins, which is why `"::"` is checked before the single-colon `":"` case — otherwise every pseudo-element (two colons, a made-up part like `::before`) would be miscounted as a pseudo-class (one colon, a state like `:hover`).
 4. The comment on the `case tok != "":` branch flags that this is the fallback: anything left over (a bare tag name) is a type selector.
 
 ### Splitting a compound selector into tokens
 
 **In plain words:** before we can count the pieces, we have to cut a glued-together selector like `div.card:hover` into its separate pieces. This helper does the cutting.
 
-**Concept.** `splitCompound` is the helper that turns `div.card:hover::before` into `["div", ".card", ":hover", "::before"]`, so `Of` can classify each piece on its own. It is a hand-rolled scanner rather than a regular expression, chosen so the one subtle rule — don't split `::before`'s two colons apart — is a single, readable `s[i-1] != ':'` check instead of a harder-to-read regex lookbehind.
+**Concept.** `splitCompound` is the helper that turns `div.card:hover::before` into `["div", ".card", ":hover", "::before"]`, so `Of` can classify each piece on its own. It is a hand-rolled scanner rather than a regular expression, chosen so the one subtle rule — don't split `::before`'s two colons apart — is a single, readable `s[i-1] != ':'` check instead of a harder-to-read regex lookbehind (a regular-expression feature that checks what came just before a match).
+
+**What this code does, in plain words:** it walks the string one character at a time and starts a new piece whenever it sees `#`, `.`, `[` or `:`, except when the character before is also `:`, so `::before` stays in one piece.
 
 ```go
 // splitCompound breaks "div.card:hover::before" into ["div", ".card", ":hover", "::before"].
@@ -228,10 +240,12 @@ func splitCompound(s string) []string {
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** how each function works and what the tests prove. **Next is the advanced part**: why the code was built this way instead of other ways, where it is knowingly wrong (`:not()`), and exercises to stretch it.
+
 | Choice made | Alternative | Trade-off |
 | --- | --- | --- |
 | Three `int` fields on `Triple` | One packed integer (`a*1000+b*100+c`) | The packed form is faster to compare with a single `<`, but silently corrupts once a counter reaches double digits — three fields make that class of bug unrepresentable. |
-| Hand-rolled character scanner (`splitCompound`) | `regexp` with a lookbehind-style pattern | Go's `regexp` package (RE2) does not support lookbehind at all, so the hand-rolled scanner is not just a style choice here — it is the only straightforward option for the "don't split `::`" rule. |
+| Hand-rolled character scanner (`splitCompound`) | `regexp` with a lookbehind-style pattern | Go's `regexp` package (RE2, a regex engine built to always run in linear time) does not support lookbehind at all, so the hand-rolled scanner is not just a style choice here — it is the only straightforward option for the "don't split `::`" rule. |
 | Prefix classification (`#`, `.`, `[`, `:`, `::`) | A full CSS selector grammar parser | A real parser handles escaped characters and nested functional pseudo-classes like `:not(.a, .b)` correctly; the prefix classifier is far simpler and sufficient to teach the specificity rule, at the cost of the documented `:not()` inaccuracy below. |
 | `Triple` compared with plain `if` statements | `cmp.Compare` / a generic ordering helper | Three explicit `if`s read clearly as "round 1, round 2, round 3" to a reader coming from the theory note's tournament analogy; a generic comparator would be more reusable but less obviously tied to the cascade's own round structure. |
 
@@ -242,6 +256,8 @@ func splitCompound(s string) []string {
 **What it proves and why it matters.** That six representative selector shapes — a bare type, a class, an ID-plus-class-plus-type compound, a class-plus-pseudo-class-plus-pseudo-element compound, the universal selector, and a `:not()` compound — each parse to the triple the specificity table in the theory note claims.
 
 This is the test that would catch a classification bug (e.g. counting `::before` as a pseudo-class instead of a pseudo-element).
+
+**What this code does, in plain words:** it keeps a list of (selector, expected score) pairs, runs `Of` on each selector, and fails if any score is different from the expected one.
 
 | Input selector | Expected triple |
 | --- | --- |
@@ -339,6 +355,26 @@ The final `ok` line with a duration confirms the whole package built and ran cle
 1. **Change this:** add a `case` to `Of` that gives `:not(...)` the specificity of only its argument (matching the real CSS spec), rather than counting both the pseudo-class and its argument. Predict which existing test needs its expected value updated before you run it.
 2. **Change this:** add a new selector shape to `TestOf`'s table, `"a:is(#x, .y)"`, and predict its triple before running the test. (Hint: this simplified parser does not implement `:is()`'s "take the most specific argument" rule either — what does it actually compute instead?)
 3. **Predict the result:** without running it, what does `Of("#a#b")` return? Then run it and check whether the parser handles two IDs in one compound the way you expected.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what do the three fields A, B and C of `Triple` count?
+> A counts IDs, B counts classes, attributes and pseudo-classes, C counts tag names and pseudo-elements.
+
+> [!question]- Easy: what does `Of("#nav .item a")` return?
+> `(1, 1, 1)`: one ID, one class, one tag.
+
+> [!question]- Easy: why does `Of` turn `>`, `+` and `~` into spaces first?
+> Combinators add nothing to specificity, so the code only needs the pieces on either side of them.
+
+> [!question]- Medium: why is `"::"` checked before `":"` in the `switch`?
+> The first matching case wins. If `":"` came first, `::before` would match it and be counted as a class instead of a type.
+
+> [!question]- Medium: why not store the score as one number like `a*100 + b*10 + c`?
+> Once a counter reaches 10 or more it spills into the next digit and gives wrong answers. Three separate fields can never do that.
+
+> [!question]- Medium: this code says `a:not(.disabled)` is (0,2,1). What does a real browser say, and why the gap?
+> (0,1,1). A browser counts only what is inside `:not()`, while this simple parser also counts `:not` itself as a class.
 
 ## Links 🟢
 - **Theory:** [[CSS Fundamentals - Cascade, Selectors, Box Model]]

@@ -51,6 +51,11 @@ The whole playbook asks one question repeatedly: why is C smaller than P, and wh
 > - 🟡 **Know the basics?** Add section 3, then the on-call part (First 5 minutes, Diagnosis flowchart, Investigation steps, Fixes), then 4, 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Production Debugging Playbook]]: check "what changed" and scope the problem before digging into code.
+> - [[Incident Response]]: one person leads, you stop the damage first, and you post regular updates.
+> - [[Kafka and Event Streaming]]: producers append messages to a topic split into partitions, and consumer groups read them and remember their place with offsets.
+
 **From zero, in 60 seconds** 🟢
 
 Some work doesn't need to happen right away, like sending an email after an order.
@@ -96,6 +101,12 @@ The pile grows, and customers get their email 40 minutes late.
 | Consumer group | The set of consumers sharing the work of one topic | `order-emailer` |
 | Lag | How many messages are written but not yet processed | 10,000 - 8,200 = 1,800 |
 | Rebalance | The group pausing to reshuffle who reads which partition | A pod restarts, everyone stops briefly |
+| Log-end offset | The number of the newest message in a partition | 10,000 |
+| Committed offset | The last message number the group has said "done" for | 8,200 |
+| Broker | One Kafka server that stores partitions | broker 3 leads partitions 0-3 |
+| Retention | How long Kafka keeps messages before deleting them, read or not | 7 days |
+| Poison message | One message that always makes the handler fail or hang | a malformed order event |
+| Dead letter topic (DLQ) | A side topic where messages that keep failing are parked | `orders.dlq` |
 
 **Picture it**
 
@@ -129,7 +140,7 @@ The analogy breaks down in one place: a Kafka log is not emptied when you read i
 
 **Symptoms you will see:**
 
-- An alert on `consumer lag` or on `ApproximateAgeOfOldestMessage` (SQS) for a queue.
+- An alert on `consumer lag` or on `ApproximateAgeOfOldestMessage` (SQS's "age of the oldest waiting message" metric) for a queue.
 - Users report delayed effects: order confirmation emails arrive 40 minutes late, a balance update is stale, a search index misses new products, a "payment succeeded" webhook never reaches the merchant.
 - Metrics that depend on the stream (dashboards, fraud scores) go flat or stale.
 - Sometimes the consumer service looks completely healthy: CPU low, no errors, pods green. That is the dangerous version, because a stuck consumer produces no error logs.
@@ -146,6 +157,14 @@ The analogy breaks down in one place: a Kafka log is not emptied when you read i
 
 > [!tip] Remember
 > Lag is the gap between "written" and "done". Always ask what business action is waiting in that gap.
+
+### Real-life example: late order updates 🟢
+
+Think of a food app like Swiggy on a Friday night.
+Each order sends events like "order placed" and "rider assigned" into Kafka, and worker services read them to send push notifications.
+If one worker version suddenly takes 2 seconds per message instead of 50 ms, the pile grows by thousands a minute.
+Customers see "Rider assigned" 10 minutes late, even though nothing is "down".
+The lag graph, not the error graph, is what shows this problem.
 
 ## 2. Mental model 🟢
 
@@ -188,7 +207,17 @@ flowchart TD
 > [!tip] Remember
 > Consume rate = parallelism x (1 / time per message) minus time lost. Every cause of lag attacks one of those three terms.
 
+## Common beginner mistakes 🟢
+
+- **Alerting on lag size alone** → 100,000 can be 2 seconds or 3 hours depending on the rate → alert on lag growth and on the age of the oldest message.
+- **Adding more consumers than partitions** → the extra ones sit idle → check the partition count before scaling.
+- **Scaling consumers when the database they call is the bottleneck** → more consumers overload it further → fix or protect the dependency first.
+- **Resetting offsets to "latest" to clear lag** → every skipped message is lost for good → scale, fix, or divert bad messages; reset only for data that is safe to lose.
+- **Retrying a poison message forever** → its partition never moves → retry a few times, then send it to the dead letter topic.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that lag is the gap between "written" and "done", and that it grows when producers outrun consumers. **Next we open the box**: how lag is measured, where the consumer loop can stall, why rebalances pause everyone, the partition limit, and the checks for each cause.
 
 ### Step 1: how lag is measured
 
@@ -197,13 +226,20 @@ flowchart TD
 1. Each consumer group stores its **committed offset** per partition (in the `__consumer_offsets` topic for Kafka).
 2. The broker knows the **log-end offset** per partition.
 3. **Lag = log-end offset minus committed offset**, per partition. Group lag is the sum.
-4. Tools such as `kafka-consumer-groups.sh`, Burrow, or an exporter read both numbers and publish them.
+4. Tools such as `kafka-consumer-groups.sh`, Burrow (a lag-monitoring tool), or an exporter (a small program that turns these numbers into Prometheus metrics) read both numbers and publish them.
 
 Lag in messages is not lag in time. 100,000 messages of lag on a topic doing 50,000 per second is two seconds. The same lag on a topic doing 10 per second is nearly three hours. Always convert to time: `lag / consume_rate`.
 
 ### Step 2: the consumer poll loop and where it can stall
 
 **In plain words:** the worker repeats: grab a batch, handle it, say "done". If any step hangs, the pile grows.
+
+**Step by step:**
+1. The consumer calls `poll()` and gets up to `max.poll.records` messages, say 500.
+2. It handles them one by one, calling the database or other services.
+3. It commits the new offset ("done up to 8,700") and polls again.
+4. If handling 500 messages takes longer than `max.poll.interval.ms` (5 minutes by default), Kafka assumes it died and removes it.
+5. Separately, a background heartbeat (a regular "I'm alive" ping) must reach the broker within `session.timeout.ms`.
 
 ```mermaid
 stateDiagram-v2
@@ -216,11 +252,17 @@ stateDiagram-v2
     Rebalancing --> Polling: "partitions reassigned"
 ```
 
-A Kafka consumer must call `poll()` again within `max.poll.interval.ms` (default 300000 ms, five minutes). If processing a batch takes longer, the group coordinator assumes the consumer is dead, removes it, and triggers a **rebalance**. Separately, a background heartbeat thread must reach the broker within `session.timeout.ms`. These are two different failure clocks, and confusing them is a common diagnosis mistake.
+A Kafka consumer must call `poll()` again within `max.poll.interval.ms` (default 300000 ms, five minutes). If processing a batch takes longer, the group coordinator (the broker that manages this consumer group) assumes the consumer is dead, removes it, and triggers a **rebalance**. Separately, a background heartbeat thread must reach the broker within `session.timeout.ms`. These are two different failure clocks, and confusing them is a common diagnosis mistake.
 
 ### Step 3: why rebalances hurt
 
 **In plain words:** when a worker joins or leaves, Kafka pauses everyone to reshuffle who reads what. During the pause nothing is handled.
+
+**Step by step:**
+1. One consumer pod restarts, or is removed for being too slow.
+2. Kafka starts a rebalance: partitions are taken back and handed out again.
+3. With the classic eager protocol, every consumer stops reading until it finishes.
+4. If the slow pod keeps getting kicked out and rejoining, this repeats in a loop and nothing gets done.
 
 ```mermaid
 sequenceDiagram
@@ -237,11 +279,17 @@ sequenceDiagram
     B->>C1: "rebalance again"
 ```
 
-With the classic **eager** protocol, every rebalance revokes all partitions and nobody consumes until the group settles. If one slow consumer keeps getting evicted and rejoining, the group rebalances in a loop (a **rebalance storm**) and lag grows even though nothing is "down". The cooperative-sticky assignor (KIP-429) revokes only the partitions that move, which softens this.
+With the classic **eager** protocol, every rebalance revokes all partitions and nobody consumes until the group settles. If one slow consumer keeps getting evicted and rejoining, the group rebalances in a loop (a **rebalance storm**) and lag grows even though nothing is "down". The cooperative-sticky assignor (KIP-429; a smarter way of handing out partitions) revokes only the partitions that move, which softens this.
 
 ### Step 4: the parallelism ceiling
 
 **In plain words:** each part of a topic (a partition) can be read by only one worker. With 12 parts, worker 13 sits idle.
+
+**Step by step:**
+1. Check the partition count: `orders` has 12.
+2. Up to 12 consumers in one group each get one partition.
+3. A 13th consumer gets nothing and sits idle.
+4. To go faster beyond that, make each message cheaper, or carefully add partitions.
 
 ```mermaid
 flowchart LR
@@ -272,6 +320,14 @@ Within one consumer group, a partition is read by at most one consumer. A topic 
 
 ## Diagnosis flowchart 🟡
 
+**In plain words:** compare how fast messages come in and go out, then look at which partitions lag.
+
+**Step by step:**
+1. Did the produce rate jump? Then too much input: scale or shed.
+2. Did the consume rate drop? Then consumers got slower, stuck, or fewer.
+3. Is one partition frozen while others move? Poison message or stuck handler.
+4. Does the consume rate drop to zero in steps? Rebalances.
+
 ```mermaid
 flowchart TD
     S["Alert: consumer lag high or growing"] --> Q1{"Is lag growing<br/>on ALL partitions?"}
@@ -292,6 +348,12 @@ flowchart TD
 ### Step 0: look at the numbers (always do this first)
 
 **In plain words:** check the graphs first: how big is the pile, is it growing, and which parts of the topic have it.
+
+**Step by step:**
+1. Graph total lag and its slope (`deriv`): rising means an incident.
+2. Graph produce rate and consume rate side by side to see which one changed.
+3. Graph lag per partition: one partition far above the rest means skew.
+4. Run `kafka-consumer-groups.sh --describe` twice, 30 seconds apart, to see which offsets move.
 
 PromQL below assumes the common `kafka_exporter` (danielqsj) metric names: `kafka_consumergroup_lag`, `kafka_consumergroup_current_offset`, and `kafka_topic_partition_current_offset`. Other exporters name metrics differently, so adjust labels to your setup. These are label names from that exporter: `consumergroup`, `topic`, `partition`.
 
@@ -353,6 +415,12 @@ The `--describe` output has columns `GROUP TOPIC PARTITION CURRENT-OFFSET LOG-EN
 
 **In plain words:** each note takes longer than before, usually because something the worker calls got slow.
 
+**Step by step:**
+1. Check per-message processing time: did it jump (say from 50 ms to 1.8 s)?
+2. Check consumer CPU: high means the code is busy; low means it is waiting on something.
+3. If waiting, time the downstream calls and check database `wait_event` (what a session is waiting for).
+4. Look for timeout and retry lines in the logs.
+
 **Why it happens:** each message takes longer, usually because a dependency is slow (database lock, third party API, DNS) or the code changed (new synchronous call, bigger payload, N+1 query).
 
 **Check:**
@@ -389,6 +457,12 @@ psql -c "select state, wait_event_type, wait_event, count(*) from pg_stat_activi
 
 **In plain words:** one bad note makes the worker crash or hang. Everything behind it waits.
 
+**Step by step:**
+1. Find the partition whose committed offset does not move between two checks.
+2. Search logs for the same message key or offset failing again and again.
+3. Inspect that message: huge, malformed, or pointing to a missing record?
+4. Send it to the dead letter topic, commit past it, and the partition moves again.
+
 **Why it happens:** one message makes the handler panic, loop forever, or block on a lock. With ordered, single-threaded per-partition processing, everything behind it waits. If the consumer retries the same message forever, the offset never advances.
 
 **Check:**
@@ -413,6 +487,12 @@ If goroutines or threads are blocked rather than erroring, capture a dump: `curl
 
 **In plain words:** workers keep joining and leaving, so Kafka keeps pausing everyone to reshuffle.
 
+**Step by step:**
+1. Run `--describe --state`: does the group keep showing `PreparingRebalance`?
+2. Check pods: are they restarting (OOMKilled, failing probes) or is the autoscaler flapping?
+3. Check logs for `CommitFailedException` or "poll() called too late": batches are too slow.
+4. Stop the trigger first, then tune `max.poll.records` and use static membership (each pod keeps a fixed ID, so a quick restart doesn't trigger a rebalance).
+
 **Check:**
 
 ```bash
@@ -436,6 +516,12 @@ kubectl get events --sort-by=.lastTimestamp | grep -i order-emailer | tail
 
 **In plain words:** either more notes than usual are coming in, or not enough workers are running.
 
+**Step by step:**
+1. Compare consumer replicas with the partition count.
+2. Fewer replicas than partitions and CPU high? Scale out now.
+3. Replicas equal partitions and CPU high? You hit the ceiling: make each message cheaper or batch.
+4. Produce rate jumped? Find the source (deploy, campaign, backfill) and throttle it.
+
 **Check:**
 
 ```bash
@@ -457,6 +543,12 @@ A producer jump after a deploy, a campaign, a retry loop, or a backfill job poin
 
 **In plain words:** one part of the topic gets most of the notes, so one worker is swamped while the others are idle.
 
+**Step by step:**
+1. Use the skew query: one partition's lag far above the average?
+2. Read a few hundred messages from that partition and count keys.
+3. One key (a huge merchant, or an empty key) taking most of them means skew.
+4. Move that key to its own topic or consumer, or choose a better key.
+
 ```mermaid
 flowchart LR
     K["Most notes have<br/>the same key"] --> P3["Partition 3: huge pile"]
@@ -477,6 +569,11 @@ kafka-console-consumer.sh --bootstrap-server broker:9092 --topic orders --partit
 
 **In plain words:** the problem is in Kafka's own servers, not in your worker.
 
+**Step by step:**
+1. Check for under-replicated partitions (copies not in sync).
+2. Check broker disk and request latency dashboards.
+3. If lag sits only on partitions led by one broker, escalate to the platform team.
+
 Brokers under-replicated, a leader election, or a disk full on a broker makes fetches slow for some partitions. Check `kafka-topics.sh --describe --under-replicated-partitions`, broker disk and request latency dashboards, and `ss -tn state established '( dport = :9092 )' | wc -l` from the consumer host. If lag appears on partitions led by one broker, escalate to the platform team.
 
 ### Other brokers, same method
@@ -490,17 +587,17 @@ Brokers under-replicated, a leader election, or a disk full on a broker makes fe
 | RabbitMQ | `messages_ready`, `messages_unacknowledged` | `rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers` |
 | Redis Streams | pending entries | `XINFO GROUPS stream` and `XPENDING stream group` |
 
-For SQS, a rising `ApproximateNumberOfMessagesNotVisible` with a flat visible count means messages are being received but not deleted: your visibility timeout is shorter than your processing time, so messages reappear and get processed twice. For RabbitMQ, a high `messages_unacknowledged` with consumers present means consumers hold messages without acking (prefetch too high, or handlers stuck).
+For SQS, a rising `ApproximateNumberOfMessagesNotVisible` with a flat visible count means messages are being received but not deleted: your visibility timeout (how long SQS hides a message after a worker takes it) is shorter than your processing time, so messages reappear and get processed twice. For RabbitMQ, a high `messages_unacknowledged` with consumers present means consumers hold messages without acking (acknowledging them as done; prefetch, the number handed out in advance, too high, or handlers stuck).
 
 ## Fixes 🟡
 
 | Cause | Immediate fix | Proper fix | Prevention |
 |---|---|---|---|
 | A: slow downstream | Roll back a bad change, shed or pause non-critical work, do not scale into a struggling dependency | Fix the slow call, add timeouts, a circuit breaker, batching or bulk writes | Per-message latency histogram, alert on it before lag |
-| B: poison message | Send the message to a dead letter topic, commit past it | Validate on produce, bounded retries then DLQ, alert on DLQ depth | Schema registry, contract tests |
+| B: poison message | Send the message to a dead letter topic, commit past it | Validate on produce, bounded retries then DLQ, alert on DLQ depth | Schema registry (a central store of allowed message formats), contract tests |
 | C: rebalance storm | Stop the flapping cause (pin replicas, stop autoscaler, fix crashloop) | Lower `max.poll.records`, raise `max.poll.interval.ms` to a real upper bound, cooperative-sticky assignor, static membership (`group.instance.id`) | Alert on rebalance rate, keep handlers short |
-| D: too few consumers | Scale to partition count | Add partitions with a plan, or make handlers concurrent inside one consumer with ordered commit | Autoscale on lag (for example KEDA), capacity test |
-| E: hot key | Isolate the hot key to a separate topic or consumer | Better partition key, salting, or split heavy tenants | Track per-partition skew |
+| D: too few consumers | Scale to partition count | Add partitions with a plan, or make handlers concurrent inside one consumer with ordered commit | Autoscale on lag (for example KEDA, a Kubernetes autoscaler that can scale on queue lag), capacity test |
+| E: hot key | Isolate the hot key to a separate topic or consumer | Better partition key, salting (adding a random suffix to spread one key over several partitions), or split heavy tenants | Track per-partition skew |
 | F: broker | Escalate, move leaders, fix disk | Capacity plan, replication alerts | Broker SLOs |
 
 **Resetting offsets (last resort).** This changes data semantics, so decide it deliberately.
@@ -587,6 +684,9 @@ If the queue carries data where order across partitions does not matter and per-
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how lag is measured, where consumers stall, and the checks and fixes for each of the six causes. **Next is the advanced part**: alerts and SLOs that catch lag early, and the internals (adding partitions, the two timeout clocks, silent stuck consumers, batch commits) interviewers probe.
+
+
 - **Alert on lag trend and age, not only size.** Page on "oldest unprocessed message is older than X minutes" and on `deriv(lag) > 0` sustained for 10 minutes. A raw "lag > 100,000" alert is wrong for both high and low volume topics.
 - **Define an SLO in time.** For example, "95 percent of order events are processed within 60 seconds." See [[SLIs, SLOs, SLAs and Error Budgets]].
 - **Watch retention versus lag.** If lag in time approaches the topic retention, you are close to permanent loss. Add this as a separate alert.
@@ -667,6 +767,30 @@ Diagnose by reading the exception text, not by guessing.
 - [ ] Add a per-message latency histogram and downstream timeout if missing.
 - [ ] Review partition count and autoscaling against peak load.
 - [ ] Hold the blameless review. See [[Postmortems and Root Cause Analysis]].
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is consumer lag?
+> The number of messages written but not yet processed: log-end offset minus committed offset.
+
+> [!question]- Is a big lag always bad?
+> No. What matters is whether it is growing and how much time it represents.
+
+> [!question]- What is a poison message?
+> One message that always makes the handler fail or hang, blocking everything behind it in its partition.
+
+🟡 Medium
+
+> [!question]- Lag is 600,000, producers add 2,000/s, consumers do 5,000/s. How long to clear?
+> Net drain is 3,000/s, so 600,000 ÷ 3,000 = 200 seconds.
+
+> [!question]- 12 partitions, 30 consumers. How many do work?
+> 12. The other 18 sit idle.
+
+> [!question]- Why is resetting offsets to latest dangerous?
+> It skips every unprocessed message for good, so emails or payments are lost.
 
 ## Links
 

@@ -37,6 +37,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (memory, latency and security in detail), 4 (the settings block, measurements and the Go big-key scanner), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Redis Fundamentals]]: Redis keeps data in RAM and runs every command on one main thread, one at a time.
+> - [[Redis Data Structures and When to Use Each]]: small collections are packed compactly (listpack), and big ones use much more memory.
+> - [[Redis Persistence - RDB and AOF]]: saving to disk forks a child process, which can need extra memory while it runs.
+> - [[Redis Replication, Sentinel and Cluster]]: replicas keep copies and take over when the primary fails.
+
 **From zero, in 60 seconds** 🟢
 
 Running Redis for real traffic comes down to three things: memory, speed and safety.
@@ -82,6 +88,10 @@ This note is about running Redis safely once real traffic hits it.
 | Big key | One key holding a huge value or millions of members | A hash with 2 million fields |
 | ACL | Per-user rules for allowed commands and keys | App user cannot run `CONFIG` |
 | TLS | Encryption for network traffic | `rediss://` URL instead of `redis://` |
+| Swap | The OS moving memory pages to disk when RAM is short; very slow for Redis | Fragmentation ratio below 1 |
+| Fork | Redis copying itself into a child process to save data to disk | `BGSAVE` forks a child |
+| `SLOWLOG` | Redis's built-in list of commands that ran too long | `SLOWLOG GET 10` |
+| CVE | A public ID number for a known security bug | CVE-2025-49844 in Redis's Lua engine |
 
 **Picture it**
 
@@ -110,6 +120,8 @@ Where it breaks: a toll booth cannot throw cars out of a full lot, but Redis can
 
 ## 1. Why it exists 🟢
 
+🟢 **Plain version:** Three things went wrong in one week, and none was a bug in the app's code. Redis used more memory than the machine had and the operating system killed it. One cleanup command took a third of a second, and every other request waited behind it. And a test copy of Redis was open to the whole internet with no password. Each problem has a standard fix, which this note collects.
+
 The InvoiceOps Redis has been fine for a year. Then, in one week:
 
 - Monday: the instance hits the VM's 8 GB RAM during a nightly `BGSAVE` and the kernel's OOM killer terminates it. There was no `maxmemory`.
@@ -117,6 +129,8 @@ The InvoiceOps Redis has been fine for a year. Then, in one week:
 - Friday: a security scan finds the staging Redis reachable from the internet with no password. Exposed Redis servers are a well-known target: attackers have used `CONFIG SET dir` and `dbfilename` to write files such as SSH keys to the host.
 
 Each of these has a standard fix. This note collects them.
+
+**Real-life example.** During a big sale on a shopping app like Flipkart, the Redis that holds carts and sessions gets many times its usual traffic. If nobody set a memory limit, it can run out of RAM in the middle of the sale and be killed. If one background job deletes a huge key at the wrong moment, every shopper's page pauses. That is why teams set memory limits, ban slow commands and rehearse these failures before the sale, not during it.
 
 ## 2. Mental model 🟢
 
@@ -130,11 +144,28 @@ Terms:
 - **Fragmentation ratio**: `used_memory_rss / used_memory`. Above 1.5 means much memory is held but unused; below 1 usually means part of Redis is swapped out.
 - **Encoding**: Redis stores small collections in compact forms (listpack, intset) and converts them to full structures (hash table, skiplist) when they grow.
 
+## Common beginner mistakes 🟢
+
+- **Not setting `maxmemory`** → Redis grows until the OS kills it, often during a nightly save → set it to about 60-75% of the machine's RAM.
+- **Leaving a cache on the default `noeviction`** → once full, every write fails → use `allkeys-lru` or `allkeys-lfu` for caches.
+- **Running `KEYS *` or `MONITOR` on a busy server** → `KEYS` blocks everyone; `MONITOR` can halve throughput → use `SCAN`, and `MONITOR` only for seconds on a test box.
+- **Deleting a huge key with `DEL`** → it blocked Redis for 349 ms in the measurement below → use `UNLINK`, or turn on `lazyfree-lazy-user-del`.
+- **Exposing port 6379 or sharing one password across all apps** → strangers can read or wipe the data, and you cannot limit what each app does → keep Redis on a private network, use one ACL user per service, and turn on TLS.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the three jobs of running Redis: cap memory, keep the single lane free of slow commands, and lock the gate. **Next we open the box**: where each byte of memory goes, how to track down who blocked the main thread, and the layers of security from network to patches.
 
 ### Memory: where the bytes go
 
 **In plain words:** your data is not the only thing using RAM. Saving to disk, client buffers and wasted gaps all need room, so set the limit well below the machine's size.
+
+**Step by step:**
+1. The VM has 8 GB of RAM. You set `maxmemory 6gb`, so your keys may use at most 6 GB.
+2. On top of the keys, Redis needs memory for each connected client's buffers and for the replication backlog.
+3. At night Redis forks to save a snapshot. Every page changed during the save is copied, which can need a few extra GB.
+4. Over time, deleted values leave small gaps the allocator cannot hand back (fragmentation).
+5. The 2 GB you left free absorbs steps 2 to 4. Without it, the OS's OOM killer would stop Redis.
 
 ```mermaid
 flowchart TB
@@ -155,7 +186,7 @@ flowchart TB
 - **Compact encodings.** A hash with up to 512 fields of up to 64 bytes each (`hash-max-listpack-entries 512`, `hash-max-listpack-value 64`, measured defaults) is stored as a listpack.
 	- Measured on Redis 8.2: 512 fields used 6,160 bytes as a listpack and 36,992 bytes after the 513th field converted it to a hash table.
 	- Grouping many tiny keys into small hashes (`user:{id/1000}` with field `id%1000`) can save a lot of memory.
-- **Fragmentation.** After many deletes, the allocator holds freed memory in partly used pages. On Linux builds with jemalloc, `activedefrag yes` moves values to compact memory while running. (The macOS build measured here uses the libc allocator, `mem_allocator:libc`, where active defrag is unavailable.)
+- **Fragmentation.** After many deletes, the **allocator** (the library that hands out and takes back memory blocks) holds freed memory in partly used pages. On Linux builds with jemalloc (a memory allocator built for fewer gaps), `activedefrag yes` moves values to compact memory while running. (The macOS build measured here uses the libc allocator, `mem_allocator:libc`, where active defrag is unavailable.)
 - **Client buffers.** Each client has an output buffer. Defaults measured on Redis 8.2: `normal 0 0 0` (no limit), `replica 256mb 64mb 60`, `pubsub 32mb 8mb 60`. A slow Pub/Sub subscriber or a client running `HGETALL` on a huge hash can grow its buffer without bound if its class has no limit.
 
 **Where the RAM goes, as a picture.** Leave headroom; your data is only one slice.
@@ -171,6 +202,13 @@ flowchart LR
 ### Latency: who blocks the main thread
 
 **In plain words:** anything big or slow (a huge key, a scan of all keys, a disk save) holds up the single lane. Redis has built-in logs to show you who did it.
+
+**Step by step:**
+1. Your dashboards show p99 jumping to 350 ms every night around 02:00.
+2. Run `SLOWLOG GET`. It shows `DEL big1` took 348 ms. That is the culprit: a slow command.
+3. If `SLOWLOG` were empty, check `LATENCY LATEST` for `fork` or `aof-fsync` events: saving to disk is the culprit.
+4. If both are clean and Redis's CPU is low, the time is lost on the network: too many round trips, so batch them with pipelining.
+5. Fix the cause: here, `UNLINK` instead of `DEL`.
 
 ```mermaid
 flowchart TD
@@ -194,6 +232,13 @@ flowchart TD
 
 **In plain words:** several fences in a row: a private network, a password, users who can only touch their own keys, and dangerous commands switched off.
 
+**Step by step:**
+1. Put Redis in a private subnet with no public IP. Only the app servers' security group may connect.
+2. Turn on TLS so traffic between the app and Redis is encrypted.
+3. Create one ACL user per service, for example `invoiceops`, and switch off the shared `default` user.
+4. Give that user only its own keys (`~invoice:*`) and only read and write commands, never `@dangerous` ones like `FLUSHALL` or `CONFIG`.
+5. Keep Redis patched, because a bug in Redis itself can bypass all the fences above.
+
 ```mermaid
 flowchart LR
     NET["Network<br/>private subnet, security group,<br/>no public IP, bind to private IP"] --> TLS["TLS<br/>tls-port, certs,<br/>optional client certs"]
@@ -206,7 +251,7 @@ flowchart LR
 - **ACL** (Redis 6+): named users with passwords, allowed key patterns (`~invoice:*`), allowed channels (`&...`) and command categories (`+@read`, `-@dangerous`). Disable or password-protect the `default` user.
 - **TLS** (Redis 6+, built with TLS support): set `tls-port`, `tls-cert-file`, `tls-key-file`, and `port 0` to disable plaintext. Managed services expose this as "encryption in transit".
 - **Dangerous commands.** `FLUSHALL`, `CONFIG`, `DEBUG`, `KEYS`, `MONITOR`, `SHUTDOWN` belong to `@dangerous`/`@admin`. Since Redis 7.0, `enable-protected-configs no` and `enable-debug-command no` are the defaults, so `CONFIG SET dir` and `DEBUG` are refused from clients unless enabled in the config file. Prefer ACLs over the old `rename-command`.
-- **Patch.** Lua scripting runs inside the server; CVE-2025-49844, a use-after-free in the Lua engine disclosed in October 2025, allowed an authenticated user to run code on the host and was fixed in Redis 8.2.2 and backported releases. If you cannot patch at once, deny `EVAL`/`EVALSHA`/`FUNCTION` via ACL to users that do not need scripting.
+- **Patch.** Lua scripting runs inside the server; CVE-2025-49844, a **use-after-free** (code using memory that was already given back, which attackers can abuse) in the Lua engine disclosed in October 2025, allowed an authenticated user to run code on the host and was fixed in Redis 8.2.2 and backported releases. If you cannot patch at once, deny `EVAL`/`EVALSHA`/`FUNCTION` via ACL to users that do not need scripting.
 
 ## 4. Worked example 🟡
 
@@ -522,7 +567,7 @@ flowchart LR
 | Watch traffic | `MONITOR` | Streams every command | Can halve throughput; seconds only, never on a busy primary |
 | Access control | `requirepass` | One shared password | No per-service limits or audit |
 | Access control | ACL users | Per-user keys, commands, channels | Files or `ACL SAVE` to manage |
-| Transport | TLS | Encrypted, optional mTLS | CPU cost; I/O threads help |
+| Transport | TLS | Encrypted, optional mTLS (both sides show certificates, not just the server) | CPU cost; I/O threads help |
 
 ## 6. Trade-offs and when not to use 🟡
 
@@ -534,7 +579,9 @@ flowchart LR
 
 ## 7. In production 🔴
 
-- **Real systems:** Managed Redis/Valkey services enforce several of these defaults for you: ElastiCache keeps `reserved-memory-percent` at 25%, offers in-transit and at-rest encryption, and RBAC user groups; parameter groups set the eviction policy.
+> 🟡 → 🔴 **You now know** where Redis memory goes, how to find what blocks the main thread, and how to lock Redis down, with real measured numbers. **Next is the advanced part**: what managed services do for you, the full list of production failures and fixes, what to put on dashboards, and the deeper details.
+
+- **Real systems:** Managed Redis/Valkey services enforce several of these defaults for you: ElastiCache keeps `reserved-memory-percent` at 25%, offers in-transit and at-rest encryption, and **RBAC** (role-based access control: permissions given to roles, then roles to users) user groups; parameter groups set the eviction policy.
 - **Failure modes → fixes:**
 	- OOM kill during `BGSAVE` → set `maxmemory`, leave headroom, `vm.overcommit_memory=1`, consider snapshots only on replicas.
 	- `OOM command not allowed when used memory > 'maxmemory'` → either the policy is `noeviction` on purpose (add memory, shorten TTLs), or a cache was left on the default policy.
@@ -592,6 +639,30 @@ flowchart LR
 - Fragmentation: >1.5 wasted memory, <1 swapping.
 - Security: private network → TLS → per-service ACL users → no `@dangerous` → patch (CVE-2025-49844 fixed in 8.2.2).
 - Small hashes (listpack) are about 6× smaller than real hash tables (6,160 vs 36,992 bytes at 512 fields, measured).
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What happens if you never set `maxmemory`?
+> Redis grows until the machine runs out of RAM and the OS kills it.
+
+> [!question]- Why can one slow command hurt every user?
+> Redis runs commands one at a time, so everyone waits behind the slow one.
+
+> [!question]- What is the first layer of Redis security?
+> Network isolation: no public IP and only your app servers allowed to connect.
+
+🟡 Medium
+
+> [!question]- Why set `maxmemory` well below the machine's RAM?
+> Forks for saving, client buffers and fragmentation all need memory beyond your keys.
+
+> [!question]- p99 spikes but `SLOWLOG` is empty. What do you check next?
+> `LATENCY LATEST` for fork or fsync events, then the network and the number of round trips.
+
+> [!question]- What does a fragmentation ratio below 1 usually mean?
+> Part of Redis has been swapped to disk, so latency becomes slow and unpredictable.
 
 ## Links 🟢
 

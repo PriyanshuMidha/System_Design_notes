@@ -33,6 +33,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works, with the small whiteboard code), section 4 (the full worked example) and sections 5 and 6 (variants and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Interfaces]]: a command is anything with an `Execute(ctx) error` method, and Go matches that automatically.
+> - [[Chain of Responsibility and Pipelines]]: a request can be a value passed along to whoever handles it.
+> - [[Design Patterns Overview and Chooser]]: Command is the behavioural pattern for "actions to queue, retry or undo".
+
 **From zero, in 60 seconds** 🟢
 
 Normally, code just does things right away.
@@ -72,6 +77,10 @@ This note is about turning "do this" into a value you can keep.
 | Undo / redo | Reverse the last action / reapply it | Ctrl+Z / Ctrl+Y |
 | Snapshot (memento) | A saved copy of state at one moment | copy of the cart before a change |
 | Deep copy | A copy that also copies inner slices and maps | new slice, not shared one |
+| Worker | A background loop that picks jobs off a queue and runs them | Releases expired seat holds |
+| Idempotency key | A unique ID per job so a repeat delivery does nothing | `cancel:o-42` |
+| Dead-letter queue (DLQ) | A side queue for jobs that keep failing, for a human to look at | A job that failed 5 times |
+| Back-off | Waiting a little longer before each retry | Wait 1 s, then 2 s, then 4 s |
 
 **Picture it**
 
@@ -101,10 +110,14 @@ Where it breaks: you cannot "undo" a cooked meal, and some real commands (sendin
 
 Two problems that a direct function call cannot solve:
 
-- **"Do it later, somewhere else, maybe twice."** In a movie booking system, a user holds 2 seats for 10 minutes. If they do not pay, the hold must be released at 10:10. The request that created the hold cannot wait 10 minutes. It has to write down "release hold `h-91`" so that a worker runs it later, after a deploy if necessary, and the worker may receive that message twice because queues deliver at least once.
+- **"Do it later, somewhere else, maybe twice."** In a movie booking system, a user holds 2 seats for 10 minutes. If they do not pay, the hold must be released at 10:10. The request that created the hold cannot wait 10 minutes. It has to write down "release hold `h-91`" so that a worker (a background loop that runs queued jobs) runs it later, after a deploy if necessary, and the worker may receive that message twice because queues deliver at least once.
 - **"Take it back."** A text editor offers 100 levels of undo on a 1 MB document. Saving a full copy before every edit costs about 100 × 1 MB = 100 MB (a calculation, not a measurement). Recording only each change and how to reverse it costs a few bytes per keystroke.
 
 Command solves the first problem by making the request a value. Undo solves the second, either with commands that carry their own inverse or with Memento snapshots when no cheap inverse exists.
+
+### Real-life example 🟢
+
+Picture holding two seats on BookMyShow. The app gives you about 10 minutes to pay, and if you walk away, the seats quietly go back on sale. The tap that held the seats is long finished by then, so someone must have written a note like "release this hold at 10:10" for a background job to pick up later. Or picture typing in WhatsApp and pressing undo on a phone keyboard: each change is remembered so it can be taken back. A written-down request is a Command; taking changes back is Undo; saving a full copy to return to is a Memento.
 
 ## 2. Mental model 🟢
 
@@ -121,6 +134,8 @@ The cook picks it up when free. The ticket can wait in line, be read by anyone, 
 
 **Memento** is a save-game. Before the boss fight you save; if it goes badly you load the save. The game (the **originator**) writes the save file (the **memento**), and the menu that lists save slots (the **caretaker**) stores the files without reading them.
 
+> 🟢 → 🟡 **You now know** that a command is an action written down as a value, and that undo comes either from reversing each action or from a saved snapshot. **Next we open the box**: when a plain closure is enough, how queued commands are retried safely, how two stacks give undo and redo, and how to take a snapshot that cannot change behind your back.
+
 ## 3. How it works 🟡
 
 ### Object or closure
@@ -129,7 +144,7 @@ The cook picks it up when free. The ticket can wait in line, be read by anyone, 
 
 A closure is a command: it captures its data and its receiver, and it runs when called. `errgroup.Group.Go(func() error)` and `time.AfterFunc(d, f)` both take closure commands. Use a **struct** instead when the command must be:
 
-- **serialized** (a closure cannot be written to a queue or a database),
+- **serialized** (turned into bytes such as JSON; a closure cannot be written to a queue or a database),
 - **inspected** (logging the order ID, deduplicating on a key),
 - **undone** (it needs a second method, `Undo`).
 
@@ -164,10 +179,10 @@ sequenceDiagram
 Step by step:
 
 1. The client wraps the request in an **envelope**: an idempotency key, a type name and a JSON payload. This is the serializable form of a command.
-2. The worker **claims the key** atomically. A second delivery of the same envelope finds the key taken and does nothing.
-3. A **registry** maps the type name to a factory that rebuilds the command from its payload. Unknown types and payloads that fail to decode go straight to the dead-letter queue (DLQ), because retrying cannot fix them.
+2. The worker **claims the key** atomically (in one step nobody can cut into). A second delivery of the same envelope finds the key taken and does nothing.
+3. A **registry** (a map from name to code) maps the type name to a factory (a function that builds a value) that rebuilds the command from its payload. Unknown types and payloads that fail to decode go straight to the dead-letter queue (DLQ), because retrying cannot fix them.
 4. The worker **executes** the command. A temporary error (timeout, lock conflict) is retried with a growing back-off. A permanent error is not retried.
-5. After `MaxAttempts`, the envelope goes to the DLQ with its key released, so an operator can fix the cause and redrive it.
+5. After `MaxAttempts`, the envelope goes to the DLQ with its key released, so an operator can fix the cause and redrive it (put it back on the main queue).
 
 ```mermaid
 stateDiagram-v2
@@ -251,7 +266,7 @@ An inverse command must record, at `Do` time, everything its `Undo` needs. `Dele
 
 When an operation has no cheap inverse ("apply this template", "reformat the document"), save the state before it and restore it on undo. `Draft.Save` returns a `Snapshot` whose fields are unexported, so code outside the package can store it but not read or change it. The `Caretaker` keeps a capped stack of snapshots.
 
-The one rule that matters in Go: **a snapshot must not share storage with the live object.** Assigning a struct copies its slice headers and map references, not their contents. `Save` therefore clones the slice and the map; `slices.Clone` and `maps.Clone` are shallow, which is deep enough here only because the elements are strings.
+The one rule that matters in Go: **a snapshot must not share storage with the live object.** Assigning a struct copies its slice headers (the small "where and how long" part of a slice) and map references, not their contents. `Save` therefore clones the slice and the map; `slices.Clone` and `maps.Clone` are shallow (they copy one level, not things nested inside), which is deep enough here only because the elements are strings.
 
 ### Whiteboard version
 
@@ -324,6 +339,15 @@ func main() {
 **In plain words:** One program with a cancel-order command, a worker that retries it, an undo history, and a draft that can snapshot itself. Read it one type at a time.
 
 The code contains the `CancelOrder` command and the `Draft` memento, plus the worker, the undo history and the caretaker.
+
+**Step by step:**
+
+1. `Command` has one method, `Execute`. `CancelOrder` is a command object, and `CommandFunc` lets a plain function be a command too.
+2. An `Envelope` carries a command through a queue as text: a `Key`, a `Type` and a JSON `Payload`. The `Registry` maps each type to a `Factory` that rebuilds the command.
+3. `Worker.Process` claims the key (so duplicates are skipped), rebuilds the command, runs it, retries only `ErrTemporary` with a growing wait, and parks anything else in the `DLQ`.
+4. For undo, each `Edit` (`Insert`, `Delete`) knows how to `Do` and `Undo` itself, and `History` keeps two stacks, `undo` and `redo`.
+5. For snapshots, `Draft.Save` returns a deep-enough `Snapshot`, `Draft.Restore` puts it back, and `Caretaker` stores up to `Max` snapshots without looking inside.
+6. `main` runs each part and prints the results.
 
 ```go
 // main.go
@@ -817,17 +841,25 @@ The second `Process` call printed nothing because the key `cancel:o-42` was alre
 | Redo | Insert | Delete | `hello world` |
 | Redo | Insert, Delete | — | `hello` |
 
+## Common beginner mistakes 🟢
+
+- **Mistake:** forgetting to clear the redo stack when a new edit arrives. → **Why it's wrong:** Redo then replays an edit on top of text it was never meant for, and the document gets mixed up. → **Do this instead:** set `h.redo = nil` inside `History.Run`, as the code does.
+- **Mistake:** a snapshot that just copies the struct (`Snapshot{title: d.title, tags: d.tags, meta: d.meta}`). → **Why it's wrong:** the slice and map are still shared, so later edits change the "saved" copy too. → **Do this instead:** copy them, as `Draft.Save` does with `slices.Clone` and `maps.Clone`.
+- **Mistake:** running a queued command every time it is delivered. → **Why it's wrong:** queues can deliver the same message twice, so an order might be cancelled or refunded twice. → **Do this instead:** reserve the `Envelope.Key` first, as `Worker.claim` does, and skip duplicates.
+- **Mistake:** retrying every failure. → **Why it's wrong:** a bad payload or an unknown command type fails the same way every time, so retries only waste time. → **Do this instead:** retry only `ErrTemporary`, up to `MaxAttempts`, and send the rest to the dead-letter queue (`DLQ`, a parking list for failed jobs).
+- **Mistake:** keeping unlimited undo history. → **Why it's wrong:** memory grows with every keystroke for as long as the editor is open. → **Do this instead:** cap it, like `History.Max` and `Caretaker.Max`, and drop the oldest entry.
+
 ## 5. Variants and comparison 🟡
 
 | Variant | How it works | Use when | Cost |
 | --- | --- | --- | --- |
 | Closure `func(ctx) error` | Captures data and receiver | In-process work: `errgroup.Go`, `time.AfterFunc`, a worker pool | Cannot be serialized, inspected or undone |
 | Command struct | Data fields + receiver + `Execute` | You need to log, dedupe or undo it | One type per action |
-| Durable envelope | Key + type + JSON payload + registry | Jobs that survive restarts (queues, outbox) | Payload versioning, a registry to maintain |
+| Durable envelope | Key + type + JSON payload + registry | Jobs that survive restarts (queues, outbox: a table written in the same transaction, sent later by a worker) | Payload versioning, a registry to maintain |
 | Inverse-command undo | Each command stores what `Undo` needs | Small, reversible edits (text, moves) | Every command needs a correct inverse |
 | Memento undo | Snapshot the state before the change | No cheap inverse, or state is small | Memory per snapshot; deep-copy rules |
-| DB savepoint | `SAVEPOINT s1` … `ROLLBACK TO SAVEPOINT s1` | Undo part of a transaction | Only inside one open transaction |
-| Event-sourcing snapshot | Persist aggregate state every N events | Long event streams | Snapshot schema must evolve with the aggregate |
+| DB savepoint (a bookmark inside a transaction) | `SAVEPOINT s1` … `ROLLBACK TO SAVEPOINT s1` | Undo part of a transaction | Only inside one open transaction |
+| Event-sourcing snapshot (event sourcing stores every change as an event) | Persist aggregate (the object the events belong to) state every N events | Long event streams | Snapshot schema must evolve with the aggregate |
 
 **Command log.** Appending every executed envelope (who, when, type, payload) to an append-only table gives an audit trail for free. It records **intents**, which may have been rejected; [[Event Sourcing]] records **facts** that already happened. A [[CQRS]] command is the same idea at the architecture level: a named, serializable request to change state, handled by exactly one handler.
 
@@ -839,19 +871,21 @@ The second `Process` call printed nothing because the key `cancel:o-42` was alre
 - **Inverse commands vs Memento is memory vs complexity.** Inverses are cheap to store but every command needs a correct inverse, and a bug in one corrupts every later undo. Snapshots are trivially correct but cost the size of the state each time. Many editors mix them: inverses for keystrokes, snapshots for bulk operations.
 - **Undo across systems is not undo.** Once a command has sent an email or charged a card, the "inverse" is a new compensating action (a refund), with its own failure modes. That is the [[Saga Pattern]], not an undo stack.
 
+> 🟡 → 🔴 **You now know** how to write commands, queue and retry them, and build undo with inverses or snapshots. **Next comes the production view**: command objects in Go's own library and job queues, the bugs (double charges, poison messages, snapshots that change), and how to make "run exactly once" real across processes.
+
 ## 7. In production 🔴
 
 - **Real systems:**
 	- `os/exec.Cmd` is a command object: you configure `Path`, `Args`, `Env` and `Dir`, then call `Run` or `Start`. The docs say a `Cmd` cannot be reused after `Run`, `Output` or `CombinedOutput`.
 	- `errgroup.Group.Go(func() error)` runs each closure command in its own goroutine (blocking while a `SetLimit` cap is reached), and `Wait` returns the first non-nil error.
-	- Job libraries use the durable envelope: asynq builds a task from a type name and a payload, and River jobs declare a `Kind()` string that the worker registry maps to a handler.
+	- Job libraries (asynq and River are popular Go job queues) use the durable envelope: asynq builds a task from a type name and a payload, and River jobs declare a `Kind()` string that the worker registry maps to a handler.
 	- [[Movie Ticket Booking]]: a background sweeper runs `ReleaseExpiredLocks` (and `ProcessRefunds`) as scheduled jobs that are safe to run twice.
 	- [[Delivery Partner Assignment]]: an order nobody could take is parked and becomes a retry job that a 30–60 s ticker runs again, and the third-party booking carries an idempotency key.
 	- [[Elevator System]]: in the event-loop alternative, button presses are request commands sent on a channel to the one goroutine that owns the cars, which serves stops in LOOK order, not in arrival order.
 	- PostgreSQL savepoints are a database Memento; in pgx v5, calling `Begin` on an open `Tx` creates a savepoint.
 - **Failure modes → fixes:**
 	- Retried command charges twice → an idempotency key claimed in the same transaction as the side effect (see section 8 and [[Idempotency and Idempotency Keys]]).
-	- A poison message is retried forever and blocks the queue → `MaxAttempts`, then the DLQ ([[Dead Letter Queues and Poison Messages]]).
+	- A poison message (a job that fails every time, whatever you do) is retried forever and blocks the queue → `MaxAttempts`, then the DLQ ([[Dead Letter Queues and Poison Messages]]).
 	- Queued closures all see the last loop value → fixed by the language since Go 1.22 for modules whose `go.mod` declares `go 1.22` or later (each iteration has its own variable); with an older `go` line, copy the variable inside the loop.
 	- A snapshot changes after it was taken → it shared a slice or map with the live object; clone them in `Save` and again in `Restore`.
 	- Unbounded undo history eats memory in a long session → cap both stacks.
@@ -871,7 +905,7 @@ UPDATE orders SET status = 'cancelled' WHERE id = 'o-42' AND status <> 'cancelle
 COMMIT;
 ```
 
-If the side effect lives in another system (a payment provider), pass the same key to that system instead, because no local transaction can cover it. A claim that is taken before a long-running execution needs a lease (a `claimed_at` column and a timeout) so that a crashed worker's job can be picked up again.
+If the side effect lives in another system (a payment provider), pass the same key to that system instead, because no local transaction can cover it. A claim that is taken before a long-running execution needs a lease (a claim that expires on its own) (a `claimed_at` column and a timeout) so that a crashed worker's job can be picked up again.
 
 **Retrying only what can succeed.** `Process` retries only errors that wrap `ErrTemporary`. A "not found" or a validation error fails the same way every time; retrying it only delays the DLQ and adds load. The back-off grows with the attempt number and stops early when `ctx` is cancelled. The sketch dead-letters a job whose back-off is cut short by cancellation; on a graceful shutdown a production worker would rather release the key and leave the message unacknowledged, so the queue redelivers it to another worker. Production back-off adds jitter so that many failed jobs do not retry in lock-step ([[Timeouts, Retries and Backoff]]).
 
@@ -886,7 +920,7 @@ If the side effect lives in another system (a payment provider), pass the same k
 
 **Encapsulation in Go is per package.** Unexported `Snapshot` fields hide the state from other packages, but any code in the same package can read them. Keep the originator and its memento in a small package of their own if that boundary matters.
 
-**Undo assumes one writer.** Inverse commands replay against the state they were recorded on. With concurrent editors, an undo can reverse someone else's later change; collaborative editors transform operations against each other (operational transforms or CRDTs) instead of using a plain stack.
+**Undo assumes one writer.** Inverse commands replay against the state they were recorded on. With concurrent editors, an undo can reverse someone else's later change; collaborative editors transform operations against each other (operational transforms or CRDTs, algorithms that merge edits from many people safely) instead of using a plain stack.
 
 ## 9. Interview questions 🔴
 
@@ -918,6 +952,26 @@ If the side effect lives in another system (a payment provider), pass the same k
 - Inverse commands save memory; Memento saves complexity.
 - Snapshots must clone slices and maps; `slices.Clone` and `maps.Clone` are shallow.
 - Real Go: `exec.Cmd`, `errgroup.Go`, `time.AfterFunc`, asynq tasks, River jobs, PostgreSQL savepoints.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What is a command, in one line?
+> An action stored as a value, so it can be queued, retried, logged or undone.
+
+> [!question]- 🟢 In Go, when is a plain `func(ctx) error` enough?
+> When the work stays in the process and never needs to be saved, inspected or undone.
+
+> [!question]- 🟢 What is a memento?
+> A saved snapshot of an object's state, put back to undo a change.
+
+> [!question]- 🟡 Why does a brand-new edit clear the redo stack?
+> The redo entries were recorded for a history that no longer exists, so replaying them would corrupt the document.
+
+> [!question]- 🟡 How does the worker make sure a delivered-twice job runs only once?
+> It claims the job's idempotency key atomically and skips the job if the key is already taken.
+
+> [!question]- 🟡 Why is `snap := *d` a broken snapshot when `Draft` has a slice?
+> The copy shares the slice's storage, so later edits to the live draft show up in the snapshot; clone the slice and map.
 
 ## Links 🟢
 

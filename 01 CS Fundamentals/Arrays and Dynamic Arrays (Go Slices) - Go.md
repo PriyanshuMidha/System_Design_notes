@@ -22,6 +22,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Work through the Code steps 1-4 and the Tests.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Data Structures Overview and Big-O Cheat Sheet]]: `O(1)` means "same cost at any size" and `O(n)` means "cost grows with the input". Read [[Arrays and Dynamic Arrays (Go Slices)]] first too: a slice is a small card (`ptr`, `len`, `cap`) pointing at a row of boxes.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the runnable half of [[Arrays and Dynamic Arrays (Go Slices)]]. The theory note explains slices in words and pictures; this one proves the same ideas with real Go code and passing tests. Read it top to bottom: each "Step" shows a small piece of code, then explains it line by line. If a code block looks scary, read the bolded plain-words line above it and the numbered "How it works" list below it — the code is just those sentences written in Go.
@@ -51,6 +54,8 @@ This file is the runnable half of [[Arrays and Dynamic Arrays (Go Slices)]]. The
 - Run: `go vet ./... && go test -race -v ./...`
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** what the package contains and how to run it. **Next we read the code itself**, one small piece at a time: the growth rule, insert and delete, the aliasing proof, then five interview patterns. Each step has a plain-words line first, so you can follow even if Go syntax is new.
 
 ### Step 1: the growth formula
 
@@ -205,6 +210,8 @@ Alternative designs exist for some of them (e.g. a hash map for two-sum on an *u
 
 #### Two pointers
 
+**What this code does, in plain words:** in a sorted list, put one finger on the smallest number and one on the biggest; if their sum is too small move the left finger right, if too big move the right finger left, until they hit the target.
+
 **Concept.** `TwoSumSorted` exploits the fact the input is already sorted: instead of checking every pair (`O(n²)`), one pointer starts at each end and the sum's comparison to the target tells you unambiguously which pointer to move.
 
 The alternative — a hash map of seen values — works on *unsorted* input too, but costs `O(n)` extra space; here sortedness is given, so two pointers gets the same `O(n)` time for `O(1)` space.
@@ -240,6 +247,8 @@ func TwoSumSorted(sorted []int, target int) (int, int, bool) {
 
 #### Sliding window
 
+**What this code does, in plain words:** add up the first `k` numbers once, then slide the frame one step at a time, adding the new number that enters and subtracting the old one that leaves.
+
 **Concept.** `MaxWindowSum` answers "largest sum of any `k` consecutive elements." The naive approach re-sums all `k` elements at every position (`O(n*k)`); the sliding-window trick instead updates one running sum by removing the element that just left the window and adding the one that just entered it, turning the whole scan into `O(n)`.
 
 ```go
@@ -270,6 +279,8 @@ func MaxWindowSum(nums []int, k int) int {
 
 #### Prefix sums
 
+**What this code does, in plain words:** build a running total once (1, 3, 6, 10, ...), and then the sum of any stretch is just one total minus another.
+
 **Concept.** `PrefixSums` trades one `O(n)` pre-processing pass for `O(1)` range-sum queries afterward, via `RangeSum`. Without it, each "sum of `nums[l..r]`" query costs `O(r-l)`; with a prefix array, it costs one subtraction, which matters when there are many range queries over the same data.
 
 ```go
@@ -294,6 +305,8 @@ func RangeSum(prefix []int, l, r int) int { return prefix[r+1] - prefix[l] }
 3. `RangeSum(prefix, l, r)` answers "sum of `nums[l..r]`" as `prefix[r+1] - prefix[l]`: the total up to `r` minus the total up to (but not including) `l`.
 
 #### Kadane's algorithm
+
+**What this code does, in plain words:** walk the list keeping a running sum; whenever that sum drops below zero, throw it away and start fresh from the next number, and remember the best sum you ever saw.
 
 **Concept.** `MaxSubArray` finds the maximum sum of any contiguous subarray, including when some elements are negative. The key insight is local: at each position, decide whether extending the running subarray or restarting fresh here gives a better total — a running sum that has gone negative can only drag down whatever follows it, so it's never worth keeping.
 
@@ -327,7 +340,9 @@ func MaxSubArray(nums []int) int {
 
 #### Binary search on the answer
 
-**Concept.** `MinEatingSpeed` doesn't binary-search the input array at all — it binary-searches the *space of possible answers* (eating speeds from 1 up to the largest pile), using a predicate that is monotonic: once a speed is fast enough to finish in time, every faster speed is too.
+**What this code does, in plain words:** guess a speed, check "can I finish all piles in `h` hours at this speed?", and keep halving the range of guesses until you find the slowest speed that still works.
+
+**Concept.** `MinEatingSpeed` doesn't binary-search the input array at all — it binary-searches the *space of possible answers* (eating speeds from 1 up to the largest pile), using a predicate (a yes/no check) that is monotonic (once it flips from no to yes, it stays yes): once a speed is fast enough to finish in time, every faster speed is too.
 
 That monotonicity is exactly what licenses binary search here, the same shape used for rate-limit and capacity-planning searches.
 
@@ -373,9 +388,11 @@ func MinEatingSpeed(piles []int, h int) int {
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** what each function does and why it works. **Next comes the advanced part:** why the code was shaped this way, where it can break, and exercises to test yourself.
+
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
-| `Insert`/`Delete` generic over `[T any]` | One copy per concrete type | No code duplication, at the cost of boxing for non-comparable usage patterns (not relevant here: no comparisons are made on `T`) |
+| `Insert`/`Delete` generic over `[T any]` | One copy per concrete type | No code duplication, at the cost of boxing (wrapping a value in an extra hidden container) for non-comparable usage patterns (not relevant here: no comparisons are made on `T`) |
 | `NextCap` returns the raw formula output, not size-class-rounded | Replicate the allocator's size-class table too | Keeps the function focused on the growth *decision*; the measured table in the theory note shows the extra rounding separately |
 | Patterns kept in their own file (`patterns.go`) | Mixed into `slice.go` | Matches the theory note's own split: core slice mechanics vs. the interview-pattern catalogue that builds on them |
 | `TwoSumSorted` assumes sorted input | Hash-map two-sum for unsorted input | `O(1)` extra space instead of `O(n)`, but only valid because the precondition (sorted) holds |
@@ -393,6 +410,8 @@ func MinEatingSpeed(piles []int, h int) int {
 | 128 | 129 | 256 |
 | 256 | 257 | 512 |
 | 512 | 513 | 832 |
+
+**What this code does, in plain words:** it feeds each row of the table above into `NextCap` and complains if the answer does not match the `want` column.
 
 ```go
 func TestNextCap(t *testing.T) {
@@ -454,7 +473,7 @@ Measured with `go test -race ./...` on Go 1.24.4, darwin/arm64 (2026-11-09):
 ok  	rollscratch/arrdyn	1.474s
 ```
 
-**Reading the output.** `ok` means every test in the package passed, including under the race detector (relevant here because none of this code is concurrent — the race detector run is a cheap extra check that nothing in `copy`/`append` usage is doing anything unsafe).
+**Reading the output.** `ok` means every test in the package passed, including under the race detector (a Go tool, `-race`, that catches two goroutines touching the same memory at once) (relevant here because none of this code is concurrent — the race detector run is a cheap extra check that nothing in `copy`/`append` usage is doing anything unsafe).
 
 The elapsed time is dominated by compiling the test binary, not running the tests themselves, since none of them touch real I/O or sleep.
 
@@ -470,6 +489,26 @@ The elapsed time is dominated by compiling the test binary, not running the test
 1. Change `Insert`'s placeholder line to insert at `i = len(s)` (append at the very end) and predict whether `copy(s[i+1:], s[i:])` does anything. Then run it and check.
 2. In `NextCap`, change the threshold constant from `256` to `128` and predict which existing test case in `TestNextCap` would then fail. Run the test to confirm.
 3. Rewrite `TwoSumSorted` to work on an *unsorted* slice using a map instead of two pointers, and write one test case comparing its time complexity trade-off (space used) against the original.
+
+## Self-check 🟢🟡
+
+> [!question]- Why does `Insert` call `append(s, zero)` before shifting?
+> To grow the slice by one slot so there is room to shift everything right.
+
+> [!question]- What does `RowMajorIndex(1, 2, 4)` return, and why?
+> `6`: row 1 starts at index `1 × 4 = 4`, plus column 2.
+
+> [!question]- What does `go test -race` add to a normal test run?
+> It also watches for two goroutines touching the same memory at once (a data race).
+
+> [!question]- In `TestAliasing`, why does `append(c, 100)` not touch `backing[2]`?
+> `c := backing[0:2:2]` caps capacity at 2, so the append has no room and must build a new array.
+
+> [!question]- Why does `NextCap(512, 513)` return 832 while the real runtime gives 848?
+> `NextCap` returns the raw formula; the real allocator then rounds up to its nearest size class.
+
+> [!question]- Why does `Delete` set the last slot to the zero value?
+> So a pointer left there does not keep an object alive for the garbage collector.
 
 ## Links
 

@@ -33,6 +33,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (each failure and its fix), 4 (the Go code and measurements), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Caching Fundamentals]]: the database only sees the misses, so it is usually built for a small share of the traffic.
+> - [[Caching Patterns]]: in cache-aside, your code reads the database on a miss and saves the result with a TTL.
+> - [[Cache Invalidation, TTL and Consistency]]: every key gets a TTL, ideally with a little random jitter, and old copies can be served for a bounded time.
+
 **From zero, in 60 seconds** 🟢
 
 A cache sits in front of your database and answers most requests, so the database only sees a few.
@@ -80,6 +85,10 @@ The database was never sized for that, so it slows down or falls over.
 | Jitter | Random spread added to a time | TTL 300 s ± 10% |
 | Node | One server in the cache cluster | One Redis instance |
 | Bloom filter | Compact set that answers "definitely not" or "maybe" | Reject IDs that never existed |
+| Pod | One running copy of your service (the Kubernetes word) | 20 pods of the invoice API |
+| Hash slot | One of 16,384 buckets Redis Cluster uses to decide which node owns a key | `dashboard:{ws_123}` → slot 5,291 |
+| Replica | A read-only copy of a Redis node that follows the main one | Reads spread over 2 replicas |
+| Stale-while-revalidate | Serve the old copy now, refresh it in the background | Old dashboard shown for 1 s more |
 
 **Picture it**
 
@@ -123,6 +132,14 @@ flowchart LR
     D --> B
 ```
 
+### Real-life example: a big ticket sale 🟢
+
+Picture tickets for a big cricket final going on sale on BookMyShow at 12:00.
+Hundreds of thousands of people open the same match page in the same minute, and that page's cached data is one very hot key.
+If that cached copy happened to expire at 12:00, every one of those requests would miss and ask the database for the same thing at once: a stampede.
+Bots also try random seat or event IDs that do not exist, which never get cached (penetration).
+The fixes in this note (one rebuild at a time, serving the slightly old copy, caching "not found") are what keep such a page up.
+
 ## 2. Mental model 🟢
 
 Think of the cache as a dam and the database as the town below it. Normal misses are a controlled spillway. The failure modes are different ways the dam leaks:
@@ -133,7 +150,7 @@ Think of the cache as a dam and the database as the town below it. Normal misses
 | **Avalanche** | Many keys expire together, or the cache tier is down or cold | A flood of different queries |
 | **Penetration** | Requests for keys that do not exist in the database, so they are never cached | A steady stream of misses that never turn into hits |
 | **Hot key** | One key gets more requests than the node that owns it can serve | One cache node at 100% CPU while the rest idle |
-| **Big key** | One value is megabytes or has millions of elements | Slow commands, network spikes, a blocked event loop |
+| **Big key** | One value is megabytes or has millions of elements | Slow commands, network spikes, a blocked **event loop** (Redis's single thread that runs every command one after another) |
 
 Terms used below:
 - **TTL** (time to live): how long a cache entry lives before it expires.
@@ -141,11 +158,28 @@ Terms used below:
 - **Singleflight** (request coalescing): when several callers ask for the same key at the same time, only one runs the loader and the others wait for its result.
 - **Negative caching**: caching the answer "this key does not exist" for a short time.
 
+## Common beginner mistakes 🟢
+
+- **Giving all keys from a warm-up job the same TTL** → they all expire in the same second an hour later → add ±10% random jitter to every TTL.
+- **Caching "nothing" with the normal TTL by accident** → a record created a moment later stays invisible for minutes → store an explicit "not found" marker with its own short TTL, a few seconds.
+- **Deleting a huge key with `DEL`** → Redis runs one command at a time, so everyone waits (0.35 s for 2 million fields) → use `UNLINK`, which frees the memory in the background.
+- **Adding more Redis nodes to fix one hot key** → a key always lives on one node, so new nodes do not share its traffic → cache it inside the app for a second, or keep copies under different keys.
+- **Thinking jitter fixes every avalanche** → jitter does nothing when the whole cache restarts empty → also protect the database with limits and warm the cache first.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the five ways a cache stops shielding the database, and their one-line fixes. **Next we open the box**: what each failure looks like moment by moment, and exactly how each fix (one loader, stale copies, jitter, "not found" markers, key splitting) stops it.
 
 ### Stampede and its fixes
 
 **In plain words:** when a popular saved answer runs out, let one request rebuild it while the others wait or get the slightly old copy.
+
+**Step by step:**
+1. The dashboard key expires at 9:00:00. The rebuild query takes 200 ms.
+2. 10,000 requests a second arrive, so about 2,000 of them miss during those 200 ms.
+3. Without protection, all 2,000 run the same query. The database slows down, the rebuild takes longer, and even more requests miss.
+4. With singleflight, the first request in each pod runs the query and the rest in that pod wait for its answer. 20 pods means at most 20 queries.
+5. With a soft TTL, the old dashboard is still in the cache, so every request gets it at once while one caller refreshes it in the background.
 
 ```mermaid
 sequenceDiagram
@@ -200,9 +234,16 @@ The tools, from local to global:
 
 **In plain words:** lots of saved answers running out in the same second. Fix it by giving each a slightly different expiry time, and by warming the cache before traffic arrives.
 
+**Step by step:**
+1. A nightly job fills 500,000 keys at 02:00, each with a TTL of exactly 1 hour.
+2. At 03:00 all 500,000 expire in the same second, and the next requests for all of them go to the database together.
+3. With jitter, each TTL is somewhere between 54 and 66 minutes, so the expiries trickle out over 12 minutes.
+4. A different cause: the Redis server restarts empty. Now every key misses, and jitter cannot help.
+5. For that case, the app keeps a tiny local cache of the hottest keys and limits how many queries may hit the database at once.
+
 Two causes need two kinds of fix:
 - **Synchronised expiry.** A deploy or a nightly batch warms 500,000 keys with the same 1-hour TTL, so they all expire within the same second an hour later. Fix: add jitter (`TTL × (1 ± 10%)`), stagger warm-up, and use soft TTLs so expiry does not equal a miss.
-- **The cache tier is down or cold.** A Redis primary fails over, a cluster is flushed, or a new region starts empty. Jitter does nothing here. Fix: make the cache highly available ([[Redis Replication, Sentinel and Cluster]]), keep a small in-process L1 cache for the hottest keys, warm the cache before taking traffic, and protect the database with a concurrency limit, a [[Circuit Breaker]] and [[Load Shedding and Graceful Degradation]] so that during recovery some requests fail fast instead of all requests timing out.
+- **The cache tier is down or cold.** A Redis primary **fails over** (a replica takes over after the main node dies), a cluster is flushed, or a new region starts empty. Jitter does nothing here. Fix: make the cache highly available ([[Redis Replication, Sentinel and Cluster]]), keep a small in-process L1 cache for the hottest keys, warm the cache before taking traffic, and protect the database with a concurrency limit, a [[Circuit Breaker]] and [[Load Shedding and Graceful Degradation]] so that during recovery some requests fail fast instead of all requests timing out.
 
 **Avalanche fix, as a picture.**
 
@@ -215,6 +256,13 @@ flowchart LR
 ### Penetration
 
 **In plain words:** people (or bots) asking for things that do not exist. The cache never stores "nothing", so every request goes to the database. Fix: remember "not found" for a few seconds.
+
+**Step by step:**
+1. A bot asks for `invoice:abc-123`, which does not exist. Cache miss, database says "no row".
+2. Normal cache-aside stores nothing, so the next request for the same ID misses again, and so does every one after.
+3. Fix 1: check the ID's shape first. A badly formed ID gets a 400 error and never reaches the cache or the database.
+4. Fix 2: store a "NOT_FOUND" marker for 10 seconds. Repeats of the same ID now stop at the cache.
+5. Fix 3: for huge ID spaces, a Bloom filter that knows every real ID answers "definitely not here" from memory.
 
 ```mermaid
 flowchart TD
@@ -232,12 +280,19 @@ flowchart TD
 
 - **Validate first.** Reject IDs that cannot exist (wrong format, wrong tenant) at the edge.
 - **Negative caching.** Store an explicit "not found" marker with a short TTL (seconds, not minutes), so a record created a moment later appears quickly. Caching `nil` by accident with the normal TTL is a bug: a newly created invoice stays invisible for the whole TTL.
-- **Bloom filter.** A bit array that answers "definitely not present" or "maybe present". It has false positives but no false negatives, so a "no" can skip the database safely. Standard Bloom filters cannot delete items: rebuild them periodically, or use a cuckoo filter that supports deletes. Redis exposes them as `BF.RESERVE` / `BF.ADD` / `BF.EXISTS` through the RedisBloom module, which ships inside the Redis 8 distribution. The Homebrew build used for the measurements below did not include it (`ERR unknown command 'BF.MADD'`, measured on Redis 8.2), so check `MODULE LIST` on yours. Internals live in [[Bloom Filters and Probabilistic Data Structures]].
+- **Bloom filter.** A bit array that answers "definitely not present" or "maybe present". It has **false positives** (sometimes says "maybe" for a key that is not there) but no **false negatives** (never says "no" for a key that is there), so a "no" can skip the database safely. Standard Bloom filters cannot delete items: rebuild them periodically, or use a cuckoo filter that supports deletes. Redis exposes them as `BF.RESERVE` / `BF.ADD` / `BF.EXISTS` through the RedisBloom module, which ships inside the Redis 8 distribution. The Homebrew build used for the measurements below did not include it (`ERR unknown command 'BF.MADD'`, measured on Redis 8.2), so check `MODULE LIST` on yours. Internals live in [[Bloom Filters and Probabilistic Data Structures]].
 - **Rate-limit the source.** Random-ID scanning is often an attack; per-client limits ([[Rate Limiting - Algorithms and Distributed Design]]) cut it off.
 
 ### Hot keys and big keys
 
 **In plain words:** one key that everyone wants overloads the one server holding it; one huge key blocks Redis while it is read or deleted. Fix: keep a tiny local copy, and split big keys into smaller ones.
+
+**Step by step:**
+1. Hot key: `dashboard:{ws_123}:summary:v2` gets 50,000 reads a second. It lives on one node of a 6-node cluster, so that node hits 100% CPU.
+2. Keep the value inside each app instance for 1 second. Now most reads never leave the app.
+3. Or store 8 copies under keys with different hash tags. Each copy lands on a different node, and readers pick one at random.
+4. Big key: a hash with 2 million fields. `HGETALL` or `DEL` on it freezes Redis for everyone for a third of a second.
+5. Split it into many smaller hashes, read it page by page with `HSCAN`, and remove it with `UNLINK`.
 
 ```mermaid
 flowchart LR
@@ -263,7 +318,7 @@ flowchart LR
     M4 --> big
 ```
 
-- A **hot key** lives in one hash slot on one node, so adding nodes does not help ([[Consistent Hashing]] balances keys, not traffic). The cache-side fixes are a short in-process L1 cache (even 1 second absorbs most reads), several copies of the value under keys with different hash tags (`dashboard:{ws#3}:summary:v2` for copy 3, written together, read at random) so they land on different slots (a suffix outside the braces, as in `dashboard:{ws}:summary:v2#3`, keeps every copy in the same slot), and replica reads. The system-wide view, including hot database partitions, is in [[Hot Keys and Hot Partitions]].
+- A **hot key** lives in one hash slot on one node, so adding nodes does not help ([[Consistent Hashing]] balances keys, not traffic). The cache-side fixes are a short in-process L1 cache (even 1 second absorbs most reads), several copies of the value under keys with different **hash tags** (the part of a key inside `{}`; only that part decides the slot) (`dashboard:{ws#3}:summary:v2` for copy 3, written together, read at random) so they land on different slots (a suffix outside the braces, as in `dashboard:{ws}:summary:v2#3`, keeps every copy in the same slot), and replica reads. The system-wide view, including hot database partitions, is in [[Hot Keys and Hot Partitions]].
 - A **big key** is a single value with millions of elements or many megabytes. Redis executes commands on one thread, so `DEL`, `HGETALL`, `SMEMBERS` or a migration of that key blocks every other client. Split it, read it in pages, and free it in the background with `UNLINK`.
 
 ## 4. Worked example 🟡
@@ -666,7 +721,7 @@ Two hashes of 2,000,000 fields each (`field:N` → `value:N`), measured on Redis
 | `DEL big1` | 348,648 µs | every other client waits about 0.35 s |
 | `UNLINK big2` | 4 µs | memory is freed by a background thread |
 
-Encoding jumps also matter. A hash with 512 small fields uses the compact listpack encoding at 6,160 bytes; the 513th field converts it to a real hash table at 36,992 bytes, measured on Redis 8.2 with the default `hash-max-listpack-entries 512`.
+Encoding jumps also matter. A hash with 512 small fields uses the compact **listpack** encoding (all fields packed one after another in a single block of memory) at 6,160 bytes; the 513th field converts it to a real hash table at 36,992 bytes, measured on Redis 8.2 with the default `hash-max-listpack-entries 512`.
 
 ### Hot key, measured
 
@@ -701,15 +756,17 @@ With `maxmemory-policy allkeys-lfu`, Redis keeps a logarithmic access counter pe
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** each failure mode, its fixes, the Go code that defends against them, and measured numbers for big and hot keys. **Next is the advanced part**: how Facebook and Google tackled this, what breaks in real fleets, what to watch on dashboards, and the maths behind stampede size, XFetch and jitter.
+
 - **Real systems:**
 	- Facebook's memcache paper describes leases to stop stampedes and stale sets, and a "gutter" pool that absorbs load when a cache server fails.
 	- Go's `groupcache` and `singleflight` were written for this problem inside Google (singleflight is now `golang.org/x/sync/singleflight`).
 	- HTTP caches and CDNs implement `stale-while-revalidate` and `stale-if-error` (RFC 5861); see [[CDN and Edge]].
 - **Failure modes → fixes:**
-	- Rebuild query slows down under load and the stampede feeds itself → coalesce, serve stale, and cap DB concurrency with a semaphore.
+	- Rebuild query slows down under load and the stampede feeds itself → coalesce, serve stale, and cap DB concurrency with a **semaphore** (a counter that lets only N callers in at once).
 	- Redis failover leaves an empty replica as the new primary → treat it as an avalanche: L1 cache, DB rate limit, staged warm-up.
 	- `DEL` on a big key causes a latency spike for all clients → use `UNLINK`, or set `lazyfree-lazy-user-del yes` (default `no`, measured on Redis 8.2) so `DEL` behaves like `UNLINK`.
-	- A big key blocks a cluster reshard (moving a slot copies whole keys) → split before resharding.
+	- A big key blocks a cluster **reshard** (moving slots between nodes, which copies whole keys) → split before resharding.
 	- A cached `nil` makes new records invisible → use an explicit marker with its own short TTL.
 - **What to monitor:**
 	- Hit ratio and miss rate per key prefix, and DB queries caused by misses.
@@ -758,6 +815,30 @@ With `maxmemory-policy allkeys-lfu`, Redis keeps a logarithmic access counter pe
 - Hot key: L1 cache, copies under different hash tags, replica reads; find with LFU + `--hotkeys`.
 - Big key: split and page; `UNLINK` (4 µs) instead of `DEL` (349 ms for 2M fields, measured).
 - Stale is a product decision: bound it with a hard TTL.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is a cache stampede?
+> One popular key expires and many requests rebuild it from the database at the same time.
+
+> [!question]- What is the simplest fix for many keys expiring in the same second?
+> Add a small random jitter to each TTL so the expiries spread out.
+
+> [!question]- What is cache penetration?
+> Requests for keys that do not exist, so they are never cached and always reach the database.
+
+🟡 Medium
+
+> [!question]- A key gets 5,000 requests a second and takes 100 ms to rebuild. About how many queries hit the database when it expires, with no protection?
+> About 500 (5,000 × 0.1 s).
+
+> [!question]- Why doesn't adding nodes help a hot key?
+> A key lives in one hash slot on one node, so new nodes do not take any of its traffic.
+
+> [!question]- Why use `UNLINK` instead of `DEL` for a big key?
+> `DEL` frees the memory on Redis's single command thread and blocks everyone; `UNLINK` frees it in the background.
 
 ## Links 🟢
 

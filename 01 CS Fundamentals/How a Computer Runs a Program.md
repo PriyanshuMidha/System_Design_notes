@@ -29,6 +29,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - Nothing. This note starts from zero.
+
 **From zero, in 60 seconds** 🟢
 
 You write code in English-like words. The chip in your computer cannot read words at all — it only reads numbers.
@@ -73,6 +76,11 @@ This note is about that journey.
 | Compiler | A program that turns source code into lower-level instructions | `go build` |
 | Linker | A program that joins pieces of compiled code into one file | Connects your code to `fmt` |
 | Executable | The final file the operating system can run | `./main` |
+| Assembly | Human-readable names for CPU instructions | `MOVQ`, `CALL`, `RET` |
+| Object file | Machine code for one piece of the program, with some addresses still blank | `main.o` |
+| Symbol / relocation | A symbol is a named function or variable; a relocation is a "fill in this address later" note | `fmt.Println` address still unknown |
+| ELF | The file format Linux uses for programs | what `go build` makes on Linux |
+| Kernel / system call | The kernel is the core of the operating system; a system call is a program asking it for help | `write` asks the kernel to print "hi" |
 
 **Picture it**
 
@@ -114,7 +122,7 @@ Say you write a Go program with one line, `fmt.Println("hi")`, and run `go build
 
 It has no notion of a string, a function call, or what `Println` means.
 
-It understands exactly one thing: read a fixed-width number from a fixed address, treat it as an **instruction**, and change some fixed-size registers and memory locations accordingly.
+It understands exactly one thing: read a fixed-width (always the same number of bytes) number from a fixed address, treat it as an **instruction**, and change some fixed-size registers and memory locations accordingly.
 
 **Picture it:**
 
@@ -124,7 +132,7 @@ flowchart LR
     I["0x48 0x89 0xE5 ...\n(fixed-width binary instructions)"] -->|"a CPU can\nread this"| CPU["Fetch → Decode → Execute"]
 ```
 
-**Example:** the single word `Println` compiles down to dozens of individual machine instructions — loading register values, computing a memory address, triggering a system call — none of which look anything like a function name.
+**Example:** the single word `Println` compiles down to dozens of individual machine instructions — loading register values, computing a memory address, triggering a system call (asking the operating system's kernel to do something, like print) — none of which look anything like a function name.
 
 **Why it matters:** every step from here (compile, assemble, link, load) exists purely to close the gap between "an idea in source code" and "a sequence of fixed-width binary instructions at known addresses."
 
@@ -137,13 +145,13 @@ flowchart LR
 
 Two separate gaps need closing before "print hi" becomes electricity moving through transistors:
 
-1. **The language gap.** `fmt.Println("hi")` has to become a sequence of instructions the CPU's instruction set (on a typical cloud server, x86-64 or ARM64) actually defines — load an address into a register, write bytes to a buffer, trigger a system call to hand the bytes to the kernel.
+1. **The language gap.** `fmt.Println("hi")` has to become a sequence of instructions the CPU's instruction set (the fixed list of commands a chip family understands; on a typical cloud server, x86-64 or ARM64) actually defines — load an address into a register, write bytes to a buffer, trigger a system call to hand the bytes to the kernel.
 2. **The loading gap.** Those instructions have to end up at known addresses in memory, with the CPU's **program counter** pointed at the first one, before the fetch-decode-execute loop can start running them at all.
 
 The compile/assemble/link pipeline closes the first gap; the operating system's loader closes the second. Skip either step and there is no program to run — only text in a file.
 
 > [!warning] Common mistake
-> Thinking "compiling" alone is enough to produce a runnable program. A compiler alone only produces assembly or an incomplete object file — a program isn't runnable until a linker has resolved every address and an OS loader has mapped it into memory with the program counter pointed at the entry point.
+> Thinking "compiling" alone is enough to produce a runnable program. A compiler alone only produces assembly or an incomplete object file — a program isn't runnable until a linker has resolved every address and an OS loader has mapped it into memory with the program counter pointed at the entry point (the address of the very first instruction to run).
 
 ## 2. Mental model 🟢
 
@@ -176,7 +184,25 @@ Turning your source file into a stack of instructions for that reader, in the ri
 > [!tip] Remember
 > The CPU's "intelligence" is entirely in what the instructions say to do — the reader itself is mechanical and understands nothing.
 
+### Real-life example: shipping a Swiggy backend service 🟢
+
+A backend engineer writes a Go service and runs `go build`.
+Out comes one file, say `orders-api`, holding every instruction the service needs, including Go's own runtime.
+That one file is copied into a nearly empty container image and started on a cloud server.
+The kernel loads the file into memory and points the CPU at its first instruction; from then on the CPU just fetches, decodes and executes, billions of times a second.
+Because the file is self-contained, the same build runs on every server without installing extra libraries.
+
+## Common beginner mistakes 🟢
+
+- **"The CPU runs my Go code"** → the CPU only runs numeric machine instructions → think of Go code as the recipe that the compiler turns into those numbers.
+- **"Compiled means ready to run"** → an object file still has blank addresses → it must be linked, then loaded.
+- **Building on a Mac and copying the file to a Linux server** → a Mac binary is in a different format (Mach-O) for a different OS → set `GOOS=linux` (and `GOARCH`) when building for the server.
+- **Assuming every Go binary has no outside needs** → `cgo` links against the system's `libc` → use `CGO_ENABLED=0` when you want a fully static file.
+- **"Python has no compile step"** → Python still compiles to bytecode; it just skips making a native executable → know which step your language skips.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that the CPU only follows numeric instructions, one after another, and that your code has to be translated and placed in memory first. **Next we open the box:** the exact fetch-decode-execute steps, the four build stages (compile, assemble, link, load), and what sits inside the final ELF file.
 
 ### 3.1 The fetch-decode-execute cycle
 
@@ -197,11 +223,11 @@ flowchart LR
 3. **Execute.** Perform the operation — an arithmetic-logic-unit (ALU) computation, a memory load/store, or a branch.
 4. **Writeback.** Store the result in a register (or memory), and update the program counter: usually to the very next instruction, or to a jump/branch target if the instruction was a jump.
 
-**Example:** on a simple CPU this takes several clock cycles per instruction.
+**Example:** on a simple CPU this takes several clock cycles (ticks of the CPU's internal clock, billions per second) per instruction.
 
-A real superscalar CPU pipelines and reorders this across many instructions in flight at once (covered in [[CPU Scheduling]] for the OS-level analogue, and left as hardware-internals detail here).
+A real superscalar CPU (one that can start several instructions in the same clock tick) pipelines and reorders this across many instructions in flight at once (covered in [[CPU Scheduling]] for the OS-level analogue, and left as hardware-internals detail here).
 
-**Why it matters:** the architectural registers — general-purpose ones, the PC, and a stack pointer — are the only state the CPU can read or write directly; everything else is one load or store instruction away in the memory hierarchy (see [[Memory Hierarchy and CPU Caches]]).
+**Why it matters:** the architectural registers — general-purpose ones, the PC, and a stack pointer (a register holding the address of the top of the current function-call stack) — are the only state the CPU can read or write directly; everything else is one load or store instruction away in the memory hierarchy (see [[Memory Hierarchy and CPU Caches]]).
 
 > [!tip] Remember
 > Fetch-decode-execute never stops while the CPU is powered and running: there is no "idle" instruction, only a loop that keeps consuming whatever is at the program counter.
@@ -235,6 +261,13 @@ flowchart LR
 ### 3.3 Inside an ELF file
 
 **In plain words:** an ELF file isn't one undifferentiated blob of bytes — it's a header plus a list of named **sections**, each holding a different kind of data and mapped into memory with different permissions.
+
+**Step by step (what is inside the `./main` that prints "hi"):**
+1. The header says "this is a 64-bit x86 program; start running at address X".
+2. `.text` holds the machine code for `main`, `fmt` and the Go runtime.
+3. `.rodata` holds read-only data, such as the bytes of the string `"hi"`.
+4. `.data` holds global variables with starting values; `.bss` only records how many bytes of zeroed globals are needed.
+5. At load time each part gets its own permission: code can run but not be changed, data can change but not run.
 
 | Part | Holds | Loaded as |
 |---|---|---|
@@ -343,6 +376,14 @@ flowchart TD
     Q2 -- no --> D["Static Go runtime +\ndynamic link against libc"]
 ```
 
+**Compiled vs interpreted vs JIT (often confused):**
+
+| | Compiled ahead of time (Go, C) | Interpreted (CPython) | JIT (Java JVM) |
+| --- | --- | --- | --- |
+| When translation to machine code happens | Before running, once | Never fully; a program (the interpreter) reads bytecode step by step | While running, for the hot parts |
+| What you ship | One native executable | Source or bytecode, plus the interpreter | Bytecode, plus the JVM |
+| Startup | Fast | Fast, but runs slower | Slower start, fast once warmed up |
+
 ## 6. Trade-offs and when not to use 🟡
 
 ```mermaid
@@ -353,14 +394,16 @@ flowchart LR
 
 - Static binaries are simple to deploy (`scp` one file into a `FROM scratch` container) but every security patch to a dependency means rebuilding and redeploying every binary that linked it.
 - Dynamic linking saves disk and RAM when many processes share one library, but introduces a run-time dependency: the right shared library must exist on the target machine, which is exactly the class of bug ("works on my machine") static linking avoids.
-- None of this applies to interpreted or JIT-compiled languages in the same way: Python source is parsed into bytecode and interpreted by the CPython VM at run time, and the JVM both interprets bytecode and JIT-compiles hot methods to native code while running — there is no single ahead-of-time link step producing one native executable.
+- None of this applies to interpreted or JIT-compiled languages in the same way: Python source is parsed into bytecode and interpreted by the CPython VM at run time, and the JVM both interprets bytecode and JIT-compiles (Just-In-Time: translates to machine code while the program runs) hot methods to native code while running — there is no single ahead-of-time link step producing one native executable.
 
 > [!warning] Common mistake
 > Assuming "interpreted language" means "no compile step at all." Python and the JVM both still compile source into bytecode (a lower-level, uniform instruction format) before running it — they just skip the "produce one native-machine-code executable, ahead of time" step that compile/assemble/link does for Go or C.
 
 ## 7. In production 🔴
 
-- **Real systems:** Go's own toolchain (`go build`) runs exactly this pipeline (`compile` → `go tool asm` → `go tool link`), and its default output is a statically linked, single-file ELF (or Mach-O/PE) binary — the reason a `FROM scratch` Docker image containing nothing but a Go binary can run at all.
+> 🟡 → 🔴 **You now know** the fetch-decode-execute loop, the four build stages, the ELF sections, and static vs dynamic linking. **Next comes the advanced part:** how this bites in real builds and deploys, how relocations and PIE work, what the kernel loader does step by step, and interview questions.
+
+- **Real systems:** Go's own toolchain (`go build`) runs exactly this pipeline (`compile` → `go tool asm` → `go tool link`), and its default output is a statically linked, single-file ELF (or Mach-O/PE, the macOS and Windows formats) binary — the reason a `FROM scratch` Docker image containing nothing but a Go binary can run at all.
   - C and C++ build systems (`make`, `cmake`) expose the same four stages explicitly, often as separate `cc -c` (compile+assemble) and `cc` (link) invocations.
 - **Failure modes → fixes:**
   - `undefined reference to 'foo'` at link time → a symbol was declared but never defined, or its object file was never passed to the linker; fix the build graph.
@@ -398,7 +441,7 @@ flowchart LR
 
 **In plain words:** modern binaries can be loaded at a different random spot in memory each run, which makes certain attacks much harder.
 
-Most modern Linux distributions build executables as PIE by default so the kernel can load them at a randomized base address each run (ASLR), which means even a statically-resolved relocation is expressed relative to a base the loader only picks at `execve` time, not at link time.
+Most modern Linux distributions build executables as PIE by default so the kernel can load them at a randomized base address each run (ASLR, address space layout randomization: a random start address so attackers cannot guess where code lives), which means even a statically-resolved relocation is expressed relative to a base the loader only picks at `execve` time, not at link time.
 
 ### What the loader actually does, step by step
 
@@ -450,6 +493,26 @@ That hardware-scheduling layer, and the OS-level scheduling layer that decides w
 - ELF = Linux's executable format: header (entry point) + sections (`.text`, `.rodata`, `.data`, `.bss`) + symbol table.
 - Static linking copies library code in (one deployable file); dynamic linking defers it to load time (`.so`, shared across processes, but a run-time dependency).
 - Go defaults to fully static binaries; `cgo` forces dynamic linking against `libc` unless `CGO_ENABLED=0`.
+
+## Self-check 🟢🟡
+
+> [!question]- What three steps does the CPU repeat forever?
+> Fetch the next instruction, decode it, execute it.
+
+> [!question]- What does the program counter hold?
+> The address of the next instruction to run.
+
+> [!question]- Name the four stages from source code to a running process.
+> Compile, assemble, link, load.
+
+> [!question]- Why is an object file (`.o`) not runnable yet?
+> Calls to code in other files are still blank (relocations), and there is no fixed address or entry point until the linker fills them in.
+
+> [!question]- Why does a 1 GB zeroed global buffer not make a 1 GB executable?
+> It lives in `.bss`, which stores only a size; the kernel fills it with zeros at load time.
+
+> [!question]- Your Go binary works on the build box but fails on an older server with a `GLIBC` error. Why, and the fix?
+> `cgo` linked it dynamically against a newer `libc`; build with `CGO_ENABLED=0` (fully static) or match the server's OS version.
 
 ## Links 🟢
 

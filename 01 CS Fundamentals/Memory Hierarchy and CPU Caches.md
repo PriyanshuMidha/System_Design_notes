@@ -30,6 +30,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (the false-sharing worked example), plus 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[How a Computer Runs a Program]]: the CPU runs instructions one after another, and those instructions read and write data that lives in memory.
+
 **From zero, in 60 seconds** 🟢
 
 Your computer's brain (the **CPU**) is incredibly fast. But the data it works on lives in big, slow memory chips (the **RAM**). Fetching from RAM takes hundreds of times longer than doing the actual math.
@@ -72,6 +75,12 @@ Caches are the "counter": small shelves of recently used data kept right next to
 | Cache | A small, fast copy of recently used memory | L1 cache holding the array you are looping over |
 | Cache line | The fixed-size block a cache moves around (64 bytes) | Reading `a[0]` also brings in `a[1]..a[7]` for `int64`s |
 | Hit / miss | Hit: the data was in the cache. Miss: it had to be fetched from further away | Second read of a variable is usually a hit |
+| Locality | Programs reuse recent data (temporal) and nearby data (spatial) | a loop counter; `a[0]` then `a[1]` |
+| Prefetching | The CPU guessing the next line you will need and fetching it early | walking an array start to end |
+| Dirty line | A cached line that was changed but not yet written back to RAM | after `x++` in a write-back cache |
+| Coherence | Keeping each core's cached copy of the same data in agreement | core B must not read an old `x` |
+| MESI | The four-state rulebook (Modified, Exclusive, Shared, Invalid) cores use for coherence | a write turns other copies Invalid |
+| False sharing | Two cores fighting over one cache line while writing *different* variables | two counters side by side |
 
 **Picture it**
 
@@ -118,6 +127,22 @@ The exact ratio depends on the machine, so treat this as an illustration of the 
 > [!tip] Remember
 > The memory hierarchy exists because DRAM is roughly 300× slower than a CPU cycle, and real programs touch the same data and nearby addresses repeatedly — that repetition is what a cache exploits.
 
+### Real-life example 🟢
+
+Imagine the service that counts live ticket sales for a big BookMyShow concert launch. Eight goroutines each count sales for their own city.
+If the eight counters sit next to each other in one array, they share a 64-byte cache line, and every `+1` on one core forces the other cores to throw away their copy.
+The code is correct, but it scales badly as you add cores.
+Giving each counter its own cache line (padding) or summing per-core counters only when someone reads the total fixes it.
+The same "keep hot data close and separate" thinking is why a Go slice of 10 million numbers is summed far faster than a linked list of the same numbers.
+
+## Common beginner mistakes 🟢
+
+- **"The CPU is fast, so my loop is fast"** → if each step waits about 100 ns for RAM, the loop runs at RAM speed → keep hot data small and in one contiguous slice.
+- **Choosing a linked list or a map of pointers for a hot loop** → every hop can be a cache miss → use a slice of values when you mostly scan.
+- **Thinking separate variables can't slow each other down** → if they share one 64-byte line, two cores writing them fight anyway (false sharing) → pad or shard hot per-goroutine counters.
+- **Padding every struct "just in case"** → wastes memory and can spread related data over more lines → pad only measured, hot, independently written fields.
+- **Trusting one benchmark run** → cache effects are noisy and machine-specific → repeat runs (`-count=5`) on hardware like production.
+
 ## 2. Mental model 🟢
 
 Picture a programmer's workspace:
@@ -134,9 +159,18 @@ The analogy breaks down in one place: unlike a human archive, the hardware autom
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that the CPU keeps small, fast shelves (caches) of recent data so it does not wait on slow RAM. **Next we open the box:** the size and speed of each level, why caching works at all (locality), what happens on a hit and a miss, and how several cores keep their copies in agreement (MESI).
+
 ### The pyramid
 
 In plain words: each level of memory is about an order of magnitude bigger and an order of magnitude slower than the level above it.
+
+**Step by step:**
+1. The core needs the value `total`. It checks L1 (about 32 KB, about 1 ns). Found: done.
+2. Not in L1? It checks L2 (about 1 MB, about 4 ns).
+3. Not in L2? It checks L3 (tens of MB, shared by all cores, about 15 ns).
+4. Not in L3? It goes to RAM (gigabytes, about 100 ns).
+5. Each level is roughly 10× bigger and 10× slower than the one above, so a small fast level can catch most requests.
 
 That ratio is deliberate — a cache only has to be a small fraction of the size of the level below it to absorb most of the traffic, because of locality (next section).
 
@@ -152,7 +186,7 @@ flowchart TD
     REG --> L1 --> L2 --> L3 --> DRAM --> DISK
 ```
 
-Sizes and latencies above are documented, approximate figures for a 2025-era server core (Intel/AMD x86-64 and Apple silicon all follow the same shape; exact numbers vary by SKU and are set by each vendor's optimization manual, listed in `sources`).
+Sizes and latencies above are documented, approximate figures for a 2025-era server core (Intel/AMD x86-64 and Apple silicon all follow the same shape; exact numbers vary by SKU (the specific chip model) and are set by each vendor's optimization manual, listed in `sources`).
 
 **Example with numbers.** Summing 10 million `int64` values:
 
@@ -165,6 +199,13 @@ Sizes and latencies above are documented, approximate figures for a 2025-era ser
 ### Why caching works: locality
 
 In plain words: programs are not random. They tend to reuse things they just used, and they tend to reach for things sitting right next to what they just used.
+
+**Step by step:**
+1. A loop sums `prices[0..999]`, 8-byte numbers.
+2. Reading `prices[0]` misses and pulls in a 64-byte line: `prices[0]` to `prices[7]`.
+3. The next 7 reads are hits, because they came along for free (spatial locality).
+4. The loop variable `i` and `sum` are read on every step, so they stay in L1 the whole time (temporal locality).
+5. Result: about 1 miss per 8 numbers instead of 1 per number.
 
 - **Temporal locality**: if an address was accessed recently, it's likely to be accessed again soon (a loop counter, a hot function's local variables).
 - **Spatial locality**: if an address was accessed, nearby addresses are likely to be accessed soon after (the next element of an array, the next field of a struct).
@@ -189,6 +230,13 @@ A loop that walks `array[0], array[1], array[2], ...` is spatial locality: fetch
 ### Cache lines, hits, misses, associativity
 
 In plain words: when the CPU wants an address, it checks the fastest cache first and works its way down only on a miss, refilling each level it skips on the way back up.
+
+**Step by step:**
+1. The core asks for address X.
+2. The cache uses some middle bits of X to pick one "set" (a small group of slots, say 8).
+3. It checks those 8 slots for X's line. If found, that is a hit.
+4. If not, it fetches the 64-byte line from the next level down.
+5. If the set is full, it throws out the slot used longest ago, and puts the new line there. If the thrown-out line was changed (dirty), it is written down first.
 
 ```mermaid
 flowchart LR
@@ -247,7 +295,7 @@ stateDiagram-v2
 2. Core B then also reads `x` (both go Shared).
 3. Core A now writes `x` — this forces an invalidate broadcast to B before the write proceeds (Shared → Modified on A, Shared → Invalid on B).
 
-That broadcast is not free: it crosses the inter-core interconnect, and it happens on *every* such write, even if A and B were never logically sharing data — only a cache line.
+That broadcast is not free: it crosses the inter-core interconnect (the on-chip wiring the cores use to talk to each other), and it happens on *every* such write, even if A and B were never logically sharing data — only a cache line.
 
 > [!warning] Common mistake
 > Assuming cache coherence is "the hardware's problem, it's always free." MESI keeps caches *correct*, but the invalidate broadcast on a Shared→Modified transition has a real, measurable cost. When that transition happens far more often than the program logically needs, it is called false sharing (next).
@@ -298,7 +346,7 @@ The effect is real but modest on this machine, and noisy at this sample size —
 
 Treat "padded was reproducibly faster, by a double-digit-percent amount that itself varies" as the honest takeaway, not "padded is exactly 9% faster."
 
-The same experiment on a multi-socket x86-64 server, where invalidations cross a slower inter-socket interconnect, documents a much larger and more consistent gap — always re-measure on the target machine with enough samples to see the variance.
+The same experiment on a multi-socket x86-64 server (a machine with two or more separate CPU chips on one board), where invalidations cross a slower inter-socket interconnect, documents a much larger and more consistent gap — always re-measure on the target machine with enough samples to see the variance.
 
 > [!tip] Remember
 > False sharing is a performance bug, not a correctness bug: both layouts compute the right answer, but the packed one pays invisible coherence traffic for data that was never logically shared.
@@ -318,12 +366,14 @@ The same experiment on a multi-socket x86-64 server, where invalidations cross a
 - Padding data to avoid false sharing wastes memory (7 unused `int64`s per counter in the worked example) — only worth it for genuinely hot, independently-written counters; padding every struct "just in case" bloats memory and can itself hurt cache utilization by spreading related data across more lines.
 - Chasing cache-friendliness can fight readability (e.g. manually flattening a tree into an array). For code that isn't on a hot path, clarity wins; profile before restructuring data layout.
 
+> 🟡 → 🔴 **You now know** the cache levels, locality, hits and misses, MESI and false sharing with real Go numbers. **Next comes the advanced part:** how real systems pad and shard hot data, how cache problems show up in production, and deeper hardware details: prefetching, NUMA and associativity.
+
 ## 7. In production 🔴
 
-- **Real systems:** Go's own `runtime` pads per-P scheduler structures and some `sync` internals to avoid false sharing; high-throughput systems (databases, message brokers) commonly pad hot counters and shard per-CPU accumulators (`sync/atomic` counters per shard, summed on read) specifically to avoid cache-line contention under concurrency.
+- **Real systems:** Go's own `runtime` pads per-P scheduler structures (the per-processor bookkeeping the Go scheduler keeps) and some `sync` internals to avoid false sharing; high-throughput systems (databases, message brokers) commonly pad hot counters and shard per-CPU accumulators (`sync/atomic` counters per shard, summed on read) specifically to avoid cache-line contention under concurrency.
 - **Failure modes → fixes:**
   - Mysterious scaling cliffs under concurrency (throughput flattens or drops as goroutines increase, with CPU usage still high) → suspect false sharing on a shared counter or lock variable; pad or shard it.
-  - A workload that should be CPU-bound runs far below expected IPC (instructions per cycle) → suspect cache misses from poor data layout (e.g. array-of-structs accessed column-wise); consider struct-of-arrays.
+  - A workload that should be CPU-bound runs far below expected IPC (instructions per cycle) → suspect cache misses from poor data layout (e.g. array-of-structs accessed column-wise, meaning a slice of big structs where the loop reads only one field); consider struct-of-arrays (one slice per field, so the loop scans one tight slice).
   - Pointer-chasing data structures (linked lists, trees of individually-allocated nodes) are far slower than their Big-O suggests on real hardware → this is why Go slices usually beat linked lists in practice even for workloads where a list's O(1) insert looks better on paper: contiguous memory keeps the prefetcher and spatial locality working.
 - **What to monitor:** IPC and cache-miss rate (`perf stat -e cache-misses,cache-references,instructions,cycles ./binary` on Linux), L3 miss rate specifically (a proxy for "how often do we hit DRAM"), and, for Go specifically, `go test -bench` with `-cpu` swept across core counts to catch contention that only appears at concurrency.
 
@@ -331,7 +381,7 @@ The same experiment on a multi-socket x86-64 server, where invalidations cross a
 
 - **Cache lines and false sharing, precisely.** A cache line is the hardware's unit of coherence, not just of transfer: MESI tracks state per *line*, not per *variable*. Two `int64` variables 8 bytes apart that fall in the same 64-byte line are, as far as the coherence protocol is concerned, one unit — a write to either one invalidates the whole line everywhere else it's cached, per the Modified/Shared/Exclusive/Invalid transitions above.
 - **Hardware prefetching.** Modern cores detect simple access patterns (e.g. "address N, then N+64, then N+128…") and speculatively fetch the next expected line before it's requested, which is a large part of why sequential array access is faster than its raw cache-miss count alone would predict, and why spatial locality matters even within a single core's own traffic.
-- **NUMA.** On multi-socket servers, DRAM is physically attached to one socket and is slower to reach from a core on a different socket ("remote" access) than from a core on the same socket ("local" access) — often 1.5–2x the latency, documented in vendor NUMA whitepapers. The OS scheduler and memory allocator try to keep a process's threads and memory on the same NUMA node; `numactl` on Linux lets an operator pin both explicitly.
+- **NUMA** (non-uniform memory access: memory speed depends on which CPU chip asks). On multi-socket servers, DRAM is physically attached to one socket and is slower to reach from a core on a different socket ("remote" access) than from a core on the same socket ("local" access) — often 1.5–2x the latency, documented in vendor NUMA whitepapers. The OS scheduler and memory allocator try to keep a process's threads and memory on the same NUMA node; `numactl` on Linux lets an operator pin both explicitly.
 - **Associativity and thrashing.** A direct-mapped cache (1-way) can thrash badly if a program happens to access two hot addresses that map to the same set, even if the cache overall has plenty of free space; higher associativity (8-way, 12-way, common for modern L2/L3) makes that collision far less likely at the cost of more comparison hardware per lookup.
 - **Measuring instead of guessing.** `perf stat` on Linux and `go test -bench` with multiple `-cpu` values are the two tools that turn "this feels slow" into a number; always benchmark on hardware close to production, with enough repetitions to see the run-to-run spread, before and after a cache-layout change — effects like false sharing are both hardware-dependent and noisy at small sample counts.
 
@@ -369,6 +419,30 @@ The same experiment on a multi-socket x86-64 server, where invalidations cross a
 - Prefer contiguous data (slices) over pointer-chasing structures (linked lists, scattered trees) for hot paths.
 - Measure with `perf stat` or `go test -bench -cpu ...` before restructuring for cache behavior — effects are hardware-dependent.
 - Runnable Go version: [[Memory Hierarchy and CPU Caches - Go]].
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Roughly how much slower is a RAM read than an L1 cache hit?
+> About 100×: about 100 ns against about 1 ns.
+
+> [!question]- What is a cache line?
+> The 64-byte block the cache moves around; reading one byte brings its neighbours along.
+
+> [!question]- Temporal vs spatial locality in one line each?
+> Temporal: you will use the same data again soon. Spatial: you will use nearby data soon.
+
+🟡 Medium
+
+> [!question]- Why does summing a slice beat summing a linked list of the same numbers?
+> The slice is contiguous, so one miss brings 8 numbers and the prefetcher helps; list nodes are scattered, so almost every hop can miss to RAM.
+
+> [!question]- Two goroutines write two different `int64`s and it scales badly. What is the likely cause?
+> False sharing: both values share one 64-byte line, so every write invalidates the other core's copy.
+
+> [!question]- In MESI, what happens when core A writes a line that core B also holds as Shared?
+> A broadcasts an invalidate; B's copy becomes Invalid and A's becomes Modified.
 
 ## Links
 

@@ -32,6 +32,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add "Setup", the ten code steps and "Design decisions".
 > - 🔴 **Interview / SDE-3 prep?** Add "Tests", "Pitfalls in the code" and the exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Relational Schema Design]]: the theory half. Store each fact once, enforce rules with constraints, keep money in whole paise.
+> - [[SQL Essentials]]: you can read `CREATE TABLE`, `INSERT` and `UPDATE`.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on half of [[Relational Schema Design]]. That note explains the design choices; this one is the actual build. It has two halves. The SQL half (steps 1 to 8) creates every table of the invoicing app in order, with the rules baked in: tenant-safe keys, soft deletes, an audit log, gapless invoice numbers, a trigger and row-level security. The Go half (steps 9 and 10) is a tiny `money` package that counts money in whole paise, because floats slowly lose paise. Each step shows the idea first, then the code, then how it works line by line. Read it top to bottom alongside the theory note.
@@ -41,8 +45,8 @@ This file is the hands-on half of [[Relational Schema Design]]. That note explai
 - **Named integer type**: `type Amount int64` gives money its own type so it cannot be mixed up with a plain count.
 - **Integer arithmetic**: amounts stay in paise or cents, so adding and splitting never drifts like `float64` does.
 - **Slices**: `Split` returns a `[]Amount` whose parts always sum to the original.
-- **`reflect.DeepEqual`**: the tests compare whole slices in one call.
-- **SQL blocks**: the DDL is plain PostgreSQL 17 and runs in `psql`, not in Go.
+- **`reflect.DeepEqual`** (a standard-library check that two values are equal all the way down): the tests compare whole slices in one call.
+- **SQL blocks**: the DDL (the `CREATE TABLE` style statements that define tables) is plain PostgreSQL 17 and runs in `psql`, not in Go.
 - **Run**: `go vet ./... && go test -race ./...` inside the `money` module.
 
 ## What this code shows 🟢
@@ -81,6 +85,8 @@ The left half is a dependency order: a table can be created only after the table
 - The counter-row, reconciliation and trigger statements assume the tables below exist.
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** the plan: SQL tables first, then Go money helpers. **Next we open the box** table by table (users, clients, invoices, payments, audit log), then the counter row, the nightly check, the trigger and row-level security, and finally `Amount`, `Split` and `Percent` in Go.
 
 The code has two halves: SQL (steps 1 to 8) and Go (steps 9 and 10). Design decisions behind the schema are explained in [[Relational Schema Design]]: `workspace_id` on every tenant-owned table, composite foreign keys, indexes on every referencing column, and `paid_minor` as a deliberate copy.
 
@@ -548,6 +554,8 @@ flowchart LR
 
 ## Tests 🔴
 
+> 🟡 → 🔴 **You now know** every table and helper. **Next are the proofs and the traps**: tests that show floats drift and integers do not, that splits never lose a paisa and that rounding is symmetric, then the pitfalls (overflow, DDL order, RLS bypass).
+
 The tests live in `money_test.go`, which needs this header first:
 
 ```go
@@ -678,6 +686,8 @@ ok  	money	1.470s
 
 Ten payments of Rs 0.10 do not make Rs 1.00 in floating point. Pick one rounding rule, write it down, and apply it in one place.
 
+**What this code does, in plain words:** the whole `money.go` file in one place: the `Amount` type, `Split` (cut an amount into near-equal parts that add back exactly) and `Percent` (apply a rate in basis points with one rounding rule).
+
 > [!example]- Full file: money.go
 > ```go
 > package money
@@ -722,6 +732,8 @@ Ten payments of Rs 0.10 do not make Rs 1.00 in floating point. Pick one rounding
 > 	return Amount(q)
 > }
 > ```
+
+**What this code does, in plain words:** the whole test file: the float-versus-integer test, the split test over many amounts and part counts, and the rounding test for `Percent`.
 
 > [!example]- Full file: money_test.go
 > ```go
@@ -794,6 +806,30 @@ Ten payments of Rs 0.10 do not make Rs 1.00 in floating point. Pick one rounding
 1. Predict `Split(-100000, 3)` before running it, then confirm it with a test line. Which parts carry the extra unit?
 2. Change `Percent` to round half to even and predict which of the three rounding assertions fail.
 3. Remove `ON DELETE SET NULL (parent_id)` from `clients` and predict the error when you delete a parent client that has a subsidiary in the same workspace.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why does `Amount` use `int64` instead of `float64`?
+> Whole paise add up exactly; floats cannot hold values like 0.10 exactly, so sums drift.
+
+> [!question]- What does `Split(1000, 3)` return?
+> Three parts that differ by at most one paisa and add back to 1000: 334, 333, 333.
+
+> [!question]- Why does `payments` have `UNIQUE (provider, provider_ref)`?
+> So a retried payment webhook cannot insert the same payment twice.
+
+🟡 Medium
+
+> [!question]- Why must `app.workspace_id` be set with `is_local = true`?
+> A session-level setting would stay on the pooled connection and leak into the next request for another tenant.
+
+> [!question]- Why does `audit_logs` have no foreign keys?
+> The log must outlive the rows it describes; a foreign key would block deletes or cascade the history away.
+
+> [!question]- Why multiply before dividing in `Percent`?
+> Dividing first throws away precision; multiplying first keeps it, then one written-down rounding rule is applied.
 
 ## Links 🟢
 

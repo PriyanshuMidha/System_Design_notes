@@ -30,6 +30,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (routing, code splitting, the four strategies) and 4 (picking one for a real app).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[React Rendering - Virtual DOM, Reconciliation, Lifecycle]]: React turns components into a UI description and then updates the real page from it.
+> - [[React Fundamentals - Components, JSX, Props, State]]: a component is a function of props and state that returns JSX.
+> - [[React State Management - Props, Context, Redux]]: shared data (like "who is logged in") can be read by any component through Context or a store.
+
 **From zero, in 60 seconds** 🟢
 
 Two separate ideas live in this note. First, **routing**: which screen shows for which web address. A modern React app loads once, then swaps screens itself when you click, without asking the server again.
@@ -73,6 +78,12 @@ Routing decides which screen shows for a URL; rendering strategy decides where a
 | SPA | Single-page app: one load, then JS swaps screens | Gmail switching folders |
 | Hydration | JS attaching click handlers to server-made HTML | a static button becomes clickable |
 | Build time | When the app is compiled before deploy | `npm run build` |
+| CSR / SSR / SSG / ISR | HTML made in the browser / on the server per visit / once at build / at build then refreshed | see the table in section 3 |
+| SEO | Making pages easy for Google to read and rank | a product page showing up in search |
+| CDN | Servers spread around the world that keep copies of files close to users | a Mumbai user gets the page from a Mumbai server |
+| Code splitting | Cutting the app's JS into pieces that download only when needed | the Settings page code loads only on Settings |
+| Server Component | A component that runs only on the server; its code never reaches the browser | a product page reading the database |
+| Rewrite rule | A server setting that answers unknown paths with `index.html` | `/users/42` → `index.html` |
 
 **Picture it**
 
@@ -118,9 +129,33 @@ Before client-side routing, every link click meant: browser requests a whole new
 
 For an app with frequent navigation (a dashboard, a chat app), that full reload is wasted work: the header, sidebar and CSS rarely change between pages.
 
-Client-side routing keeps the JS app loaded and just swaps the part of the tree the URL maps to, using the browser's History API so the back/forward buttons and the URL bar still work correctly without a server round trip.
+Client-side routing keeps the JS app loaded and just swaps the part of the tree the URL maps to, using the browser's **History API** (built-in functions that change the address bar and the back-button list without loading a page) so the back/forward buttons and the URL bar still work correctly without a server round trip.
 
-That solves navigation cost, but creates a different cost: the **first** visit still has to download, parse, and execute the JS bundle before anything meaningful shows up. The following rendering strategies are different answers to "when and where should the initial HTML actually get produced," orthogonal to routing itself.
+That solves navigation cost, but creates a different cost: the **first** visit still has to download, parse, and execute the JS bundle before anything meaningful shows up. The following rendering strategies are different answers to "when and where should the initial HTML actually get produced," **orthogonal** to (independent of) routing itself.
+
+### Real-life example: BookMyShow's pages 🟢
+
+A movie page like "Kalki 2898 AD in Mumbai" must show up on Google, and showtimes change often, so it suits SSR: fresh HTML per visit that search engines can read.
+The "Help and FAQ" pages rarely change, so they can be SSG: built once and served fast from a CDN.
+The seat picker and payment steps are behind login and never need Google, so CSR is fine there.
+Moving from the seat map to the payment page is client-side routing: the header stays, only the middle part swaps, with no full reload.
+
+## Common beginner mistakes 🟢
+
+- **Thinking a single-page app loads faster on the first visit** → the browser must download the JS bundle before showing anything → use SSR or SSG for pages people land on first.
+- **Shipping a CSR-only page that must rank on Google** → crawlers may see an almost empty page → render it on the server (SSR, SSG or ISR).
+- **Deploying `createBrowserRouter` to a static host with no rewrite rule** → refreshing `/users/42` gives a 404 → make the host serve `index.html` for unknown paths.
+- **Passing a plain promise as a prop and expecting `<Suspense>` to wait** → nothing happens → use `lazy()`, the `use()` hook or a Suspense-aware library.
+- **Using `Date.now()` or `Math.random()` while rendering on the server** → server and browser HTML differ (hydration mismatch) → move such values into an effect.
+
+## Often confused 🟡
+
+| These two | First one | Second one |
+| --- | --- | --- |
+| Routing vs rendering strategy | Which screen shows for a URL | When and where that screen's HTML is made |
+| SSR vs Server Components | Whole page rendered on the server, but all its JS still ships for hydration | Some components never ship JS at all |
+| SSG vs ISR | Built once; stale until the next deploy | Built once, then quietly rebuilt every few minutes |
+| SPA vs MPA | One page load, then JS swaps screens | Every click loads a new HTML page from the server |
 
 ## 2. Mental model 🟢
 
@@ -131,9 +166,18 @@ That solves navigation cost, but creates a different cost: the **first** visit s
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the two separate choices: routing (which screen for which URL) and rendering strategy (when the HTML is made). **Next we open the box**: how a click becomes a screen swap, how to guard pages, how code is split, how the four strategies really differ, and what Server Components change.
+
 ### Client-side vs server-side routing
 
 **In plain words:** client-side routing means your app catches the click, changes the address bar itself, and swaps the screen — no trip to the server. Server-side routing is the classic way: every click fetches a whole new page.
+
+**Step by step:**
+1. You click a `<Link to="/users/42">`.
+2. React Router stops the browser's normal page load and calls `history.pushState("/users/42")`. The address bar changes; nothing is sent to the server.
+3. The router matches `/users/:id` and finds the `UserProfile` route, with `id = 42`.
+4. It runs that route's **loader** (a function that fetches the data the page needs), then swaps `UserProfile` into the page.
+5. The header and sidebar stay as they were. Pressing Back pops the history and swaps the old screen back in.
 
 ```mermaid
 flowchart TD
@@ -150,7 +194,7 @@ flowchart TD
     end
 ```
 
-**History API vs hash routing.** `createBrowserRouter` uses `pushState`/`popstate`, giving clean URLs (`/users/42`) — but the server must be configured to return the SPA's `index.html` for *any* path (a rewrite rule), since a direct request to `/users/42` would otherwise 404 on a static host that doesn't know that route.
+**History API vs hash routing.** `createBrowserRouter` uses `pushState`/`popstate` (the History API call that adds a URL, and the event fired when Back is pressed), giving clean URLs (`/users/42`) — but the server must be configured to return the SPA's `index.html` for *any* path (a rewrite rule), since a direct request to `/users/42` would otherwise 404 (the "not found" error) on a **static host** (a server that only hands out fixed files) that doesn't know that route. Classic server-side routing like this is called an **MPA** (multi-page app).
 
 `createHashRouter` keeps the route after a `#` (`/#/users/42`); the browser never sends the part after `#` to the server, so hash routing works on static hosting with zero server configuration, at the cost of an uglier URL and historically worse SEO.
 
@@ -184,6 +228,19 @@ function UserLayout() {
 
 **In plain words:** a protected route is a bouncer in front of a screen: if you are not logged in, it redirects you to the login page instead of rendering the screen.
 
+**Step by step:**
+1. You open `/account`. The route is wrapped in `<RequireAuth>`.
+2. `RequireAuth` reads the current user from shared state (Context or a store).
+3. No user? It returns `<Navigate to="/login" />`, which sends you to the login page and remembers where you were going.
+4. You log in. The login form calls `navigate("/account")` and you land where you started.
+
+```mermaid
+flowchart LR
+    V["visit /account"] --> Q{"logged in?"}
+    Q -- "yes" --> A["show Account"]
+    Q -- "no" --> L["redirect to /login"] --> A
+```
+
 ```jsx
 function RequireAuth({ children }) {
   const { user } = useAuth();
@@ -209,6 +266,13 @@ function LoginForm() {
 
 **In plain words:** instead of shipping all the JavaScript up front, `lazy()` downloads a screen's code only when the user first opens it, and `Suspense` shows a placeholder while it loads.
 
+**Step by step:**
+1. The build tool sees `lazy(() => import('./UserProfile'))` and puts `UserProfile` into its own small JS file.
+2. The first page load skips that file, so the starting download is smaller.
+3. You click through to a profile. React tries to render `UserProfile`, and the file starts downloading.
+4. Meanwhile, the nearest `<Suspense fallback={<Spinner />}>` shows the spinner.
+5. The file arrives and the real profile replaces the spinner. Next time it is already loaded.
+
 ```jsx
 const UserProfile = lazy(() => import('./UserProfile'));
 
@@ -221,7 +285,7 @@ function App() {
 }
 ```
 
-`lazy()` returns a special component type that, the first time it's rendered, triggers the dynamic `import()` and tells the nearest `<Suspense>` to show its `fallback` until the module arrives. Paired with route-based splitting, each route's JS only downloads when a user actually navigates there, instead of in the initial bundle.
+`lazy()` returns a special component type that, the first time it's rendered, triggers the **dynamic `import()`** (loading a JS file while the app is running, instead of at the start) and tells the nearest `<Suspense>` to show its `fallback` until the module arrives. Paired with route-based splitting, each route's JS only downloads when a user actually navigates there, instead of in the initial bundle.
 
 > [!warning] Suspense does not work on a bare Promise prop
 > Passing a plain `Promise` as a prop (`<UserProfile dataPromise={fetch('/user')} />`) does **not** make `<Suspense>` show a fallback while it resolves. `Suspense` only reacts to a component that actually *suspends* — by throwing a promise internally, which is what `lazy()` does for code, and what a Suspense-integrated data source does for data. As of React 19, the supported way to suspend on a promise for data is the `use()` hook, which must be called during render, or a Suspense-enabled library (a cache-based query library) — not a Promise sitting inertly in props.
@@ -239,6 +303,12 @@ The difference from the broken example above is that `use()` actively integrates
 ### CSR vs SSR vs SSG vs ISR
 
 **In plain words:** the four strategies differ only in when the HTML is cooked: on demand in the browser, fresh per visit on the server, once ahead of time, or ahead of time with scheduled reheating.
+
+**Step by step:**
+1. **CSR:** the server sends an almost empty HTML file plus `main.js`. The browser downloads and runs the JS, fetches data, then draws the page.
+2. **SSR:** for each visit, the server runs your React code, fetches data and sends finished HTML. You see the page at once; then the JS downloads and **hydrates** it so buttons work.
+3. **SSG:** during `npm run build`, every page is turned into an HTML file once. Visitors get that saved file, often from a CDN.
+4. **ISR:** like SSG, but a page is quietly rebuilt in the background, say every 5 minutes, so it does not stay stale forever.
 
 ```mermaid
 sequenceDiagram
@@ -261,13 +331,25 @@ sequenceDiagram
 | **CSR** (client-side rendering) | In the browser, after JS loads | Slowest meaningful paint; fast subsequent navigation | Always current (fetched on demand) | Internal dashboards, apps behind a login where SEO doesn't matter |
 | **SSR** (server-side rendering) | On the server, on every request | Fast first paint (HTML arrives ready); still waits to hydrate before fully interactive | Always current | Content that's personalized or changes often and needs SEO (e-commerce product pages, news) |
 | **SSG** (static site generation) | Once, at build time | Fastest possible (served from a CDN, no render step on request) | Stale until the next build/deploy | Marketing pages, docs, blogs — content that doesn't change per request |
-| **ISR** (incremental static regeneration) | At build time, then regenerated in the background on a timer or on demand | As fast as SSG for most requests | Eventually fresh, bounded by the revalidation interval | Large catalogs (product pages) too big to rebuild entirely on every deploy |
+| **ISR** (incremental static regeneration) | At build time, then regenerated in the background on a timer or on demand | As fast as SSG for most requests | Eventually fresh, bounded by the **revalidation** interval (how often a page is rebuilt) | Large catalogs (product pages) too big to rebuild entirely on every deploy |
 
 **Hydration** is the step after SSR/SSG where React attaches event handlers to the server-rendered DOM instead of rebuilding it: the page looks interactive before it actually is, and clicking too early can do nothing (or, in older setups, trigger a visible re-render if the client and server HTML don't match — a "hydration mismatch").
+
+```mermaid
+flowchart LR
+    S["server sends finished HTML"] --> V["page visible,<br/>buttons not working yet"]
+    V --> J["JS downloads"] --> H["hydrate: attach handlers"] --> I["page interactive"]
+```
 
 ### React Server Components (conceptual)
 
 **In plain words:** a Server Component runs only on the server and sends down its finished output; its code never travels to the browser at all. Great for pages that read a database but have nothing to click.
+
+**Step by step:**
+1. `ProductPage` is a Server Component. On the server it reads product 42 straight from the database.
+2. It renders the title, price and description, and includes `<AddToCartButton id={42} />`.
+3. `AddToCartButton` starts with `'use client'`, so it is a Client Component that needs `onClick`.
+4. The browser receives the finished product HTML plus only the `AddToCartButton` code. The database code never leaves the server.
 
 ```mermaid
 flowchart LR
@@ -285,7 +367,7 @@ In a framework that supports them (Next.js App Router), components are Server Co
 
 A Server Component can read a database or the filesystem directly and send only its rendered output (plus any Client Component "holes" it renders) to the browser.
 
-Its own imports (an ORM, a markdown parser) never appear in the client JS bundle at all. That is a stronger guarantee than "SSR renders this once, but all the code still ships for hydration."
+Its own imports (an **ORM**, a library that turns database rows into objects; a markdown parser) never appear in the client JS bundle at all. Props it passes to Client Components must be **serializable** (plain data that can be turned into text, so no functions). That is a stronger guarantee than "SSR renders this once, but all the code still ships for hydration."
 
 The trade-off is a stricter model: Server Components can't use `useState`, `useEffect`, or browser-only APIs, since they never run in the browser.
 
@@ -312,7 +394,7 @@ A storefront has: a marketing homepage, a product catalog of 50,000 items, a car
 
 - **Homepage** → SSG. Content changes maybe weekly; serve it from a CDN with no per-request render cost.
 - **Product catalog pages** → ISR. 50,000 pages are too many to rebuild on every price change, but they don't need per-request freshness either — regenerate each page in the background every few minutes, or on demand when a price updates.
-- **Cart and checkout** → SSR or CSR behind auth. Per-user, always fresh, not something a crawler needs to index — SSR for a fast first paint on checkout (where speed affects conversion), CSR is also defensible since it's never indexed.
+- **Cart and checkout** → SSR or CSR behind auth. Per-user, always fresh, not something a **crawler** (a search engine's page-reading robot) needs to index — SSR for a fast first paint on checkout (where speed affects **conversion**, the share of visitors who actually buy), CSR is also defensible since it's never indexed.
 - **Account dashboard** → CSR. Logged-in only, no SEO benefit, and the dashboard is visited repeatedly in one session, so the SPA navigation benefit (fast subsequent views) matters more than first-paint speed.
 
 ### Route-based code splitting end to end
@@ -351,14 +433,16 @@ A user who only ever visits `/` never downloads `Catalog` or `Account`'s JavaScr
 - CSR's "fast after the first load" only pays off for apps people stay in and navigate around; a one-off landing page visited once per session gets none of that benefit and all of the slow-first-paint cost.
 - SSR adds server compute cost (render React on every request) and server complexity (the component must run in a Node-like environment, not just the browser) — not worth it for content that's genuinely static.
 - ISR's staleness window is a real trade-off: a price change won't show up until the next regeneration unless you trigger on-demand revalidation for that specific change.
-- Server Components require a framework that implements the RSC protocol (Next.js App Router is the mainstream option); they are not a drop-in feature of plain `create-react-app`-style client-only React.
+- Server Components require a framework that implements the RSC protocol (the format the server uses to send Server Component output to the browser) (Next.js App Router is the mainstream option); they are not a drop-in feature of plain `create-react-app`-style client-only React.
 - Hash routing avoids server configuration entirely but costs SEO and a visibly uglier URL — only worth it for a genuinely static host with no rewrite-rule option.
 
 ## 7. In production 🔴
 
-- **Real systems:** Next.js (App Router: Server Components + streaming SSR; Pages Router: classic SSR/SSG/ISR), Remix (SSR-first, nested route loaders), Gatsby (SSG), Astro (mostly static with selective hydration — "islands").
+> 🟡 → 🔴 **You now know** how client routing works, how to split code, and what each rendering strategy trades away. **Next is the advanced part**: which frameworks use which strategy, the real failures (hydration mismatch, 404s, stale ISR pages), and streaming SSR.
+
+- **Real systems:** Next.js (App Router: Server Components + streaming SSR; Pages Router: classic SSR/SSG/ISR), Remix (SSR-first, nested route loaders), Gatsby (SSG), Astro (mostly static with selective hydration — "islands", small interactive parts in an otherwise plain HTML page).
 - **Failure modes → fixes:**
-  - Hydration mismatch (server HTML differs from the client's first render, often from `Date.now()` or `Math.random()` in render, or browser-only APIs touched during SSR) → make render deterministic between server and client, move non-deterministic reads into an effect.
+  - Hydration mismatch (server HTML differs from the client's first render, often from `Date.now()` or `Math.random()` in render, or browser-only APIs touched during SSR) → make render **deterministic** (same input, same output every time) between server and client, move non-deterministic reads into an effect.
   - A direct URL to a client-routed path 404s on a static host → add a server/CDN rewrite rule so unknown paths serve `index.html` (not needed with hash routing).
   - A `<Suspense>` boundary never resolves its fallback → check that the thing inside actually integrates with Suspense (lazy import, `use()`, a Suspense-enabled cache) rather than a bare unresolved Promise sitting in state or props.
   - Stale catalog pages after a price change under ISR → trigger on-demand revalidation for that specific page instead of waiting for the next timed regeneration.
@@ -393,7 +477,7 @@ sequenceDiagram
 
 Streaming SSR sends the main content chunk almost immediately — the browser paints it right away — then streams the sidebar's HTML in a second chunk once the recommendation service responds, with a small inline script that slots it into the already-painted page.
 
-**Why it matters:** Without streaming, that one slow sidebar call would delay *time to first byte* for the entire page, even though 95% of the page had nothing to do with it. Streaming isolates the slow part behind its own `<Suspense>` boundary so it can't block anything outside itself.
+**Why it matters:** Without streaming, that one slow sidebar call would delay *time to first byte* (how long until the first piece of the response reaches the browser) for the entire page, even though 95% of the page had nothing to do with it. Streaming isolates the slow part behind its own `<Suspense>` boundary so it can't block anything outside itself.
 
 > [!tip] Remember
 > Streaming SSR sends ready chunks immediately and back-fills slow ones later — a slow widget no longer holds the whole page hostage.
@@ -435,6 +519,26 @@ A framework can start sending HTML for the parts of a page that are ready, wrap 
 - Server Components run only on the server and never ship their code to the client; `'use client'` opts a subtree into client-side interactivity.
 - `createBrowserRouter`/`createHashRouter` are functions returning a router object, handed to `<RouterProvider>` — never used as JSX themselves.
 - Mix strategies per route: no single choice fits a whole app.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what does client-side routing avoid on each click?
+> A full page load from the server; JS swaps the screen instead.
+
+> [!question]- Easy: which strategy builds the HTML once at build time?
+> SSG.
+
+> [!question]- Easy: what does hydration do?
+> It attaches React's click handlers and state to HTML the server already sent, so the page becomes interactive.
+
+> [!question]- Medium: a blog with 200 posts that change once a month. Which strategy, and why?
+> SSG. It is fastest, can be served from a CDN, and rebuilding monthly is cheap.
+
+> [!question]- Medium: a store has 50,000 product pages whose prices change daily. SSG, SSR or ISR?
+> ISR. Rebuilding everything on each change is too slow, and per-request SSR is wasted work; ISR refreshes pages in the background.
+
+> [!question]- Medium: clicking a link to `/users/42` works, but refreshing that URL gives 404. Why?
+> The refresh asks the server for `/users/42`, and the static host has no such file. Add a rewrite rule that serves `index.html`.
 
 ## Links
 

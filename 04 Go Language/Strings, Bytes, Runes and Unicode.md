@@ -29,6 +29,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how decoding works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Syntax, Types and Control Flow]]: you can declare a variable, write a `for` loop and call a function. That is all you need.
+
 **From zero, in 60 seconds** 🟢
 
 A computer stores text as numbers. Each number slot is one **byte**. English letters fit in one byte each, but most of the world's letters do not: a Hindi or Japanese letter needs 3 bytes.
@@ -70,6 +73,12 @@ To handle text safely you need to know bytes, runes and characters apart.
 | UTF-8 | Encoding using 1-4 bytes per code point | `é` = 2 bytes, `製` = 3 bytes |
 | `[]byte` | A changeable slice of bytes | `b := []byte(s)` copies |
 | Grapheme | What a human sees as one character | An emoji with skin tone = several runes |
+| Immutable | Cannot be changed after it is made; you can only make a new one | `s[0] = 'x'` does not compile |
+| Allocate | Ask the runtime for a fresh piece of memory | each `+=` makes a new string |
+| Backing array | The block of memory a string or slice actually points at | `big[100:120]` points into `big`'s bytes |
+| O(n) | Work grows in step with the input size: 2× the bytes, 2× the time | counting runes walks every byte once |
+| Normalization (NFC) | Rewriting text so the same letter is always stored the same way | `e` + accent becomes one `é` |
+| Panic | Go stops the program with an error message (a crash you can see) | slicing past the end of a string |
 
 **Picture it**
 
@@ -102,11 +111,15 @@ name := "製造元：株式会社レビュー" // a vendor name, in Japanese
 short := name[:20]
 ```
 
-This panics at runtime with `panic: runtime error: slice bounds out of range`... no, worse: it doesn't panic, it silently cuts a multi-byte rune in half and produces invalid UTF-8 that will later fail JSON encoding or render as a `�` replacement box in the UI.
+This panics (crashes the program with an error message) at runtime with `panic: runtime error: slice bounds out of range`... no, worse: it doesn't panic, it silently cuts a multi-byte rune in half and produces invalid UTF-8 that will later fail JSON encoding (turning data into the text format APIs send) or render as a `�` replacement box in the UI.
 
-Every Han character here is 3 bytes in UTF-8, so byte index 20 lands in the middle of the 7th character.
+Every Han character (a Chinese-style character, used in Japanese as kanji) here is 3 bytes in UTF-8, so byte index 20 lands in the middle of the 7th character.
 
 The fix needs to know that Go strings are bytes, that slicing works on bytes, and that only `range` or `utf8.DecodeRuneInString` know where rune boundaries actually are. That distinction — bytes vs runes vs what a human perceives as one character — is this note.
+
+### Real-life example 🟢
+
+A food app like Swiggy shows restaurant names on small cards and in push notifications, cut to about 20 characters. The names come in English, Hindi, Tamil and with emoji. If the server cuts by bytes, "पराठा House" can end up as half a Hindi letter plus a `�` box on lakhs of phones. If it cuts by runes, every letter stays whole. If it must also keep emoji like 👍🏽 whole, it needs a grapheme-aware library. One wrong `name[:20]` is a visible bug for every Indian-language user.
 
 ## 2. Mental model 🟢
 
@@ -114,7 +127,7 @@ Think of a Go string as **a read-only `[]byte` with no attached encoding guarant
 
 - **Byte** — one unit of storage. `s[i]` is always a byte, `0`–`255`.
 - **Rune** — one Unicode code point, Go's name for `int32`. A code point can take 1 to 4 bytes in UTF-8.
-- **Grapheme cluster** — what a human calls one visible "character". A single grapheme can be *several* runes: `é` can be one rune (U+00E9) or two (`e` + a combining acute accent, U+0301), and a flag emoji is two runes that render as one glyph.
+- **Grapheme cluster** — what a human calls one visible "character". A single grapheme can be *several* runes: `é` can be one rune (U+00E9) or two (`e` + a combining acute accent, U+0301), and a flag emoji is two runes that render as one glyph (the single picture drawn on screen).
 
 A string is like a shipping container manifest written as raw bytes: `len()` tells you the container's total weight, not how many boxes are inside. You need to actually unpack it (`range`, or a Unicode-aware library) to count boxes, and unpacking it still won't tell you how the boxes look stacked together on a pallet (graphemes).
 
@@ -134,7 +147,17 @@ for i, r := range s {
 }
 ```
 
+## Common beginner mistakes 🟢
+
+- **Using `len(s)` as "number of letters"** → `len` counts bytes, so `len("भारत")` is 12, not 4 → use `utf8.RuneCountInString(s)` for code points.
+- **Cutting text with `s[:20]`** → 20 is a byte position and can land inside a 3-byte letter, giving a `�` box → walk with `range` and cut at a rune start (see `SafeTruncate` below).
+- **Building a long string with `+=` in a loop** → each `+=` copies everything built so far, so 2,000 pieces means about 2,000 copies → use `strings.Builder`.
+- **Reading `s[i]` as a letter** → it is one byte, and for non-English text it is only part of a letter → use `for i, r := range s` to get whole runes.
+- **Thinking `[]rune(s)` is free** → it decodes and copies the whole string, at 4 bytes per rune → use it only when you really need to jump to the 50th rune many times.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a string is a row of bytes, that `len` counts bytes, and that `range` hands you whole runes. **Next we open the box** and see how `range` actually finds where each letter starts, and why converting between `string`, `[]byte` and `[]rune` always costs a copy.
 
 ```mermaid
 flowchart LR
@@ -150,7 +173,7 @@ flowchart LR
 
 **Decoding, step by step.** `range` walks the string calling the equivalent of `utf8.DecodeRuneInString` at each byte offset:
 
-1. Look at the leading byte to work out how many continuation bytes follow (UTF-8's own encoding tells you this from the high bits).
+1. Look at the leading byte (the first byte of a letter) to work out how many continuation bytes (the extra bytes that finish the same letter) follow (UTF-8's own encoding tells you this from the high bits).
 2. Combine 1–4 bytes into one rune.
 3. Yield `(byteOffset, rune)` and advance by however many bytes were consumed — **not always 1**.
 4. If the bytes at the current offset are not valid UTF-8, yield `(byteOffset, utf8.RuneError)` — the replacement character `U+FFFD` — and advance by exactly 1 byte, so decoding can resynchronize.
@@ -175,10 +198,18 @@ stateDiagram-v2
 Converting changes representation and always copies:
 
 - `[]byte(s)` copies the string's bytes into a new, mutable byte slice.
-- `[]rune(s)` decodes the whole string and copies it into a new `[]rune`, one `int32` per code point — 4 bytes per rune regardless of how many bytes it took in UTF-8. A string that's mostly ASCII can grow 4× in memory as a `[]rune`.
+- `[]rune(s)` decodes the whole string and copies it into a new `[]rune`, one `int32` (a 4-byte whole number) per code point — 4 bytes per rune regardless of how many bytes it took in UTF-8. A string that's mostly ASCII can grow 4× in memory as a `[]rune`.
 - Converting back, `string(b)` or `string(r)`, copies again.
 
 None of these conversions are free, and Go never does them implicitly.
+
+```mermaid
+flowchart LR
+    S["string (read-only bytes)"] -- "[]byte(s): copy" --> B["[]byte (changeable)"]
+    S -- "[]rune(s): decode + copy" --> R["[]rune (4 bytes per letter)"]
+    B -- "string(b): copy" --> S
+    R -- "string(r): encode + copy" --> S
+```
 
 ## 4. Worked example 🟡
 
@@ -195,6 +226,8 @@ That's the whole trick: there is no O(1) way to count runes, because you must ac
 ### Full example: counting, truncating, and building safely
 
 **In plain words:** two helpers — one cuts text only at whole-letter boundaries (like cutting a necklace between beads, never through one), and one glues many strings fast by pouring them into a single growing bucket.
+
+**What this code does, in plain words:** `SafeTruncate` counts letters while `range` jumps from one letter start to the next; when it has counted enough, it cuts right at the start of the next letter, so no letter is ever split. `BuildJoined` first adds up the total size, reserves that much room once with `Grow`, then writes every piece into the same buffer.
 
 ```go
 // SafeTruncate returns the first maxRunes runes of s, never splitting a
@@ -272,7 +305,17 @@ func TestSafeTruncateNeverSplitsARune(t *testing.T) {
 | `s += part` in a loop     | 742,592 ns | 10.6 MB  | 1,999     |
 | `strings.Builder`         | 4,634 ns   | 10.2 KB  | 1         |
 
-`+=` is roughly 160× slower here and allocates a new copy of everything built so far on every iteration — classic quadratic behavior. `strings.Builder` writes into one growable buffer.
+`+=` is roughly 160× slower here and allocates a new copy of everything built so far on every iteration — classic quadratic behavior (double the pieces and the work grows about four times). `strings.Builder` writes into one growable buffer.
+
+```mermaid
+flowchart LR
+    subgraph plus["s += part (2,000 times)"]
+        P1["copy 5 bytes"] --> P2["copy 10 bytes"] --> P3["... copy 10,000 bytes"]
+    end
+    subgraph builder["strings.Builder"]
+        B1["reserve 10,000 bytes once"] --> B2["write each piece once"]
+    end
+```
 
 Invalid UTF-8 decodes safely instead of corrupting data:
 
@@ -298,18 +341,30 @@ func TestInvalidUTF8BecomesReplacementRune(t *testing.T) {
 | `[]rune(s)`                             | runes, materialized                | random access to individual code points, repeated indexing      | O(n) time and up to 4× memory |
 | `strings` package                      | bytes, ASCII-ish helpers           | search/replace/split on byte content (`Index`, `Split`, `Trim`)  | O(n) |
 | `bytes` package                        | `[]byte`, same API shape as `strings` | you already have a `[]byte` (from `io.Reader`, etc.) and want to avoid a string copy | O(n) |
-| `strings.EqualFold`                    | simple Unicode case folding        | case-insensitive comparisons (careful: not locale-aware)        | O(n) |
+| `strings.EqualFold`                    | simple Unicode case folding (treating `A` and `a` as the same) | case-insensitive comparisons (careful: not locale-aware)        | O(n) |
 | `golang.org/x/text/unicode/norm`       | normalization forms (NFC/NFD)      | comparing strings that may be composed differently (`é` as 1 vs 2 runes) | O(n) |
 | `github.com/rivo/uniseg`               | grapheme clusters                  | "how many characters does a human see" (emoji, combining marks, CJK) | O(n), extra dependency |
+
+**`string` vs `[]byte` vs `[]rune`: the three people mix up** 🟡
+
+| | `string` | `[]byte` | `[]rune` |
+| --- | --- | --- | --- |
+| Can you change it in place? | No | Yes | Yes |
+| One element is | (no element type; `s[i]` gives a byte) | one byte | one whole code point |
+| `len` gives | bytes | bytes | code points |
+| Memory for `"भारत"` | 12 bytes | 12 bytes | 16 bytes (4 × 4) |
 
 ## 6. Trade-offs and when not to use 🟡
 
 - Counting runes (`utf8.RuneCountInString`) is still **not** "number of characters a user sees." A flag emoji or `é` built from two runes counts as 2. If you need true grapheme counting (for a tweet-style character limit), you need `uniseg`, not the standard library.
 - `[]rune(s)` is convenient for random-access rune indexing, but converting a long string just to grab one character is wasteful — prefer `range` or `utf8.DecodeRuneInString` for a single pass.
 - `strings.Builder` beats `+=` only inside a loop. For a single concatenation of a few known strings, plain `+` or `fmt.Sprintf` is clearer and the difference is noise.
-- `strings.EqualFold` folds ASCII case correctly but is not a full Unicode collation — it will not treat `ß` as equal to `SS`, and the Turkish dotless-ı problem (`"I".ToLower() != "ı"` under Turkish rules) needs `golang.org/x/text/cases` with a locale.
+- `strings.EqualFold` folds ASCII case correctly but is not a full Unicode collation (language-aware sorting and matching rules) — it will not treat `ß` as equal to `SS`, and the Turkish dotless-ı problem (`"I".ToLower() != "ı"` under Turkish rules) needs `golang.org/x/text/cases` with a locale.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how decoding works, how to count and cut text safely, and when to reach for `strings.Builder`. **Next is the advanced part**: how bad text sneaks into real systems through JSON and logs, why a tiny substring can keep a huge string alive, and the questions interviewers ask about all of this.
+
 
 - **Real systems:**
   - HTTP routers and JSON encoders assume valid UTF-8; `encoding/json` replaces invalid bytes with `U+FFFD` rather than erroring, which can silently corrupt stored data if you don't validate on ingest.
@@ -319,15 +374,15 @@ func TestInvalidUTF8BecomesReplacementRune(t *testing.T) {
   - Byte-slicing user text for display or storage limits → silently invalid UTF-8 → use `SafeTruncate`-style rune-boundary-aware slicing, or a grapheme-aware truncation for user-facing limits.
   - `+=` in a request-handling hot loop → latency spikes under load from repeated allocation → `strings.Builder`.
   - Comparing names or emails with `==` after users typed accents differently → false "different" results → normalize (NFC) both sides before comparing.
-  - Logging raw user input directly → broken terminals, log-injection via newlines → `strconv.Quote` / `%q` before logging untrusted strings.
+  - Logging raw user input directly → broken terminals, log-injection (a user types a newline so their text looks like a fake extra log line) via newlines → `strconv.Quote` / `%q` before logging untrusted strings.
 - **What to monitor:** rate of invalid-UTF-8 rejections at your input validation layer; size of `[]rune` conversions in hot paths (via profiling, see [[Benchmarks, Profiling and Tracing]]).
 
 ## 8. Deep dive 🔴
 
-- **Substrings share memory.** `sub := big[100:120]` does not copy; `sub` points into `big`'s backing array. This is fast, but if `big` is a 10 MB string and `sub` is the only thing still referenced, the whole 10 MB stays alive. `strings.Clone(sub)` (Go 1.18+) copies `sub` into its own minimal backing array so `big` can be garbage collected.
+- **Substrings share memory.** `sub := big[100:120]` does not copy; `sub` points into `big`'s backing array. This is fast, but if `big` is a 10 MB string and `sub` is the only thing still referenced, the whole 10 MB stays alive. `strings.Clone(sub)` (Go 1.18+) copies `sub` into its own minimal backing array so `big` can be garbage collected (freed automatically by Go's runtime once nothing points at it).
 - **`strings` vs `bytes`.** The two packages mirror each other's API (`strings.Index` / `bytes.Index`, `strings.Split` / `bytes.Split`, and so on) because a string and a `[]byte` are both just byte sequences — the difference is mutability and where the data came from (a literal vs an `io.Reader`). Converting between them to use "the right package" copies; prefer the package matching the type you already have.
 - **Grapheme clusters.** Unicode's text-segmentation rules (UAX #29) define that a base letter plus its combining marks, or an emoji plus skin-tone and zero-width-joiner sequences, form one grapheme cluster that should never be split when truncating or counting "characters" for a UI. Neither `range` nor `utf8.RuneCountInString` knows this — only a library like `uniseg` or `x/text/unicode/norm` combined with segmentation does.
-- **Raw string literals and quoting.** Backtick-delimited raw literals (`` `C:\path\no\escapes` ``) take no escape sequences, which is why they're the default choice for regexes and Windows paths. `%q` (or `strconv.Quote`) renders a string with Go-syntax escaping — useful for logs, because it turns invisible or malicious bytes (newlines, ANSI escapes) into a visible, safe representation.
+- **Raw string literals and quoting.** Backtick-delimited raw literals (`` `C:\path\no\escapes` ``) take no escape sequences, which is why they're the default choice for regexes and Windows paths. `%q` (or `strconv.Quote`) renders a string with Go-syntax escaping — useful for logs, because it turns invisible or malicious bytes (newlines, ANSI escapes: hidden codes that change terminal colours or move the cursor) into a visible, safe representation.
 - **Why the compiler never validates UTF-8.** Go strings are defined purely as "an array of bytes" in the spec; this is what lets you store arbitrary binary data in a string type (for instance a `[]byte` converted once and never touched again) without a validation pass. The cost is that every boundary with the outside world (JSON, logs, databases) must validate or sanitize explicitly, typically with `utf8.ValidString`.
 
 ## 9. Interview questions 🔴
@@ -360,6 +415,30 @@ func TestInvalidUTF8BecomesReplacementRune(t *testing.T) {
 - Invalid UTF-8 decodes to `U+FFFD` (the replacement rune), it never panics.
 - Use `%q` / `strconv.Quote` before logging untrusted strings.
 - True "character" truncation for user-facing limits needs a grapheme-aware library (`uniseg`), not the standard library alone.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does `len("aé")` return?
+> 3. `a` is 1 byte and `é` is 2 bytes; `len` counts bytes.
+
+> [!question]- Which loop gives you whole letters (runes), `for i := 0; i < len(s); i++` or `for i, r := range s`?
+> `range`. The index loop hands you single bytes, which can be half a letter.
+
+> [!question]- What is the fast way to join 2,000 strings in a loop?
+> `strings.Builder` (optionally with `Grow` first), not `+=`.
+
+🟡 Medium
+
+> [!question]- `SafeTruncate("भारत", 2)` returns `"भा"`. How many bytes is that, and why is it safe?
+> 6 bytes. It cuts at the byte offset where the 3rd rune starts, so no letter is split.
+
+> [!question]- What does `range` give you for the invalid byte `0xff`?
+> The rune `U+FFFD` (`utf8.RuneError`), then it moves forward 1 byte and keeps going. No panic.
+
+> [!question]- Why can `sub := big[100:120]` waste memory?
+> `sub` shares `big`'s bytes, so all of `big` stays in memory while `sub` is alive. `strings.Clone(sub)` copies just the 20 bytes.
 
 ## Links 🟢
 

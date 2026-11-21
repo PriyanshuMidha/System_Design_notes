@@ -34,6 +34,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (wire format, compatibility modes, formats), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Kafka and Event Streaming]]: Kafka keeps messages for days, so consumers may read old messages long after they were written.
+> - [[Protocol Buffers and Schema Evolution]]: a binary format where each field has a number, and you must never reuse or change a field's number.
+> - [[Event-Driven Architecture Basics]]: one service publishes events that many other teams consume, each deploying on its own schedule.
+
 **From zero, in 60 seconds** 🟢
 
 One service sends messages, and many other services read them.
@@ -81,6 +86,10 @@ A schema registry is a gatekeeper that rejects that change before it ships.
 | Version | One saved edition of a schema | `orders-value` v3 |
 | Compatibility | Whether old and new code can read each other's data | BACKWARD, FORWARD, FULL |
 | Subject | The name a schema's versions are stored under | `orders-value` |
+| Schema ID | The number the registry gives a schema version; each message carries it | ID 7 |
+| CI | Continuous integration: automatic checks that run on every code change | Build fails if the schema is unsafe |
+| Transitive | Checked against every past version, not just the latest | `BACKWARD_TRANSITIVE` |
+| Expand and contract | Add the new field first, move everyone over, then remove the old one | `amount` → add `amount_paise`, later drop `amount` |
 
 **Picture it**
 
@@ -116,6 +125,8 @@ The order service publishes `OrderPlaced` as JSON to Kafka. Twelve services cons
 
 With a registry, the producer's CI (or its first `serialize` call) asks: "is this new schema compatible with the last one under subject `orders-value`?" A rename is a delete of `amount` plus an add of `amount_paise` with no default.
 
+**Real-life example.** A payments team at a company like Paytm publishes a "payment done" event that a dozen teams read: rewards, notifications, fraud, accounting. If the payments team renamed one field on a Friday, every one of those teams could break at once. A schema registry makes that rename fail in the payments team's build, before it ever reaches production, and forces a safe two-step change instead.
+
 The new schema cannot fill `amount_paise` from old messages, so the change fails the BACKWARD check and never ships.
 
 **One rename, many victims:**
@@ -140,6 +151,14 @@ Terms:
 - **Subject:** the name under which versions of one schema are grouped, such as `orders-value`.
 - **Serde:** serializer/deserializer, the client library that talks to the registry and encodes messages.
 
+## Common beginner mistakes 🟢
+
+- **Renaming a field in place** → every consumer reading the old name breaks → add the new field, keep the old one for a while, then remove it (expand and contract).
+- **Adding a required field with no default** → new consumers cannot read old messages that lack it → add fields with a default that is true for old data.
+- **Letting producers auto-register schemas in production** → any build can push a new version without review → register from CI and turn auto-registration off in production.
+- **Using plain BACKWARD on a topic people replay from the start** → a consumer may meet a version much older than the last one → use `BACKWARD_TRANSITIVE` or `FULL_TRANSITIVE`.
+- **Changing the meaning without changing the type (rupees to paise)** → the registry cannot see it, and data is silently wrong → put units in field names and treat meaning changes as breaking.
+
 **The library catalogue, drawn:** a message carries only the catalogue number, the reader looks it up once.
 
 ```mermaid
@@ -152,6 +171,8 @@ flowchart LR
 ```
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a schema is the agreed shape of a message, and that a registry stores every version and blocks unsafe changes. **Next we open the box**: the tiny header on every message, how schemas are named, the compatibility modes that decide who upgrades first, and how Avro, Protobuf and JSON Schema differ.
 
 ```mermaid
 sequenceDiagram
@@ -178,6 +199,13 @@ The registry is contacted once per new schema, not once per message. If it is do
 
 **In plain words:** each message starts with a tiny header: one zero byte and a 4-byte number. The number says "look up schema 7 to read me".
 
+**Step by step:**
+1. The producer's serializer has `OrderPlaced` schema version 3, which the registry gave ID 7.
+2. It writes byte `0`, then the number 7 in 4 bytes (big-endian: most significant byte first), then the encoded order.
+3. A consumer reads the first 5 bytes and sees "schema 7".
+4. If it has not seen 7 before, it asks the registry once and caches the answer.
+5. From then on it decodes every schema-7 message without calling the registry.
+
 | Bytes | Content |
 | --- | --- |
 | 0 | Magic byte, always `0` |
@@ -187,6 +215,12 @@ The registry is contacted once per new schema, not once per message. If it is do
 ### Subjects and naming strategies
 
 **In plain words:** a subject is the folder that holds all versions of one schema; the strategy decides how that folder is named, per topic or per event type.
+
+**Step by step:**
+1. By default the folder is named after the topic: messages on `orders` use subject `orders-value`.
+2. That means one schema shape per topic, and every new version is checked against the last one in that folder.
+3. If `orders` must carry `OrderPlaced`, `OrderPaid` and `OrderShipped`, switch to a record-name strategy.
+4. Now each event type has its own folder and its own history, while all of them share one topic and stay in order per key.
 
 | Strategy | Subject name | Effect |
 | --- | --- | --- |
@@ -199,6 +233,13 @@ Use a multi-type strategy when one topic must carry several event types for one 
 ### Compatibility modes
 
 **In plain words:** the mode is the house rule for changes. It answers one question: who upgrades first, the readers or the senders?
+
+**Step by step (BACKWARD, the default):**
+1. Version 1 has fields `id` and `amount`. You propose version 2, which adds `currency` with default `"INR"`.
+2. The registry asks: can a reader using v2 read data written with v1? Yes: missing `currency` is filled with the default.
+3. v2 is accepted. You deploy consumers with v2 first; they can still read v1 messages.
+4. Then producers switch to v2. Old consumers are already gone, so nothing breaks.
+5. A proposed v3 that renames `amount` fails the check: v3 readers could not find their new field in v2 data.
 
 ```mermaid
 flowchart TD
@@ -227,6 +268,11 @@ For a Kafka topic that consumers may replay from the beginning, the plain modes 
 ### Formats
 
 **In plain words:** Avro, Protobuf and JSON Schema all describe message shapes; they differ in size, speed and how they handle changes.
+
+**Step by step (how each finds a field):**
+1. Avro: bytes hold only values in order, so the reader needs the writer's exact schema and matches fields by name.
+2. Protobuf: each value is tagged with its field number, so the reader matches by number and keeps unknown numbers.
+3. JSON Schema: the message is plain JSON text with field names inside, so it is bigger but readable by eye.
 
 | Format | Schema in message? | Evolution rules | Strengths | Weaknesses |
 | --- | --- | --- | --- | --- |
@@ -556,7 +602,7 @@ For Protobuf contracts kept in Git, `buf breaking --against '.git#branch=main'` 
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
-| Confluent Schema Registry | REST service storing schemas in a compacted Kafka topic (`_schemas`); Avro, Protobuf, JSON Schema | Kafka-centric stacks, Confluent clients | Another service to run (or pay for); community licence terms |
+| Confluent Schema Registry | REST service storing schemas in a compacted Kafka topic (one that keeps only the latest record per key) (`_schemas`); Avro, Protobuf, JSON Schema | Kafka-centric stacks, Confluent clients | Another service to run (or pay for); community licence terms |
 | Apicurio Registry | Open-source registry (Red Hat); Confluent-compatible API plus its own; many artifact types (also OpenAPI, AsyncAPI) | Want an Apache-licensed registry or to store API specs too | Smaller ecosystem of serdes |
 | AWS Glue Schema Registry | Managed registry with its own serdes for MSK, Kinesis, Lambda | AWS-native streaming | Different wire format from Confluent's; AWS lock-in |
 | Schemas in Git only | `.proto` / `.avsc` in a shared repo, checked with `buf breaking` in CI | Small teams, gRPC-first shops | No runtime lookup; consumers need the code release to read new types |
@@ -565,15 +611,17 @@ For Protobuf contracts kept in Git, `buf breaking --against '.git#branch=main'` 
 ## 6. Trade-offs and when not to use 🟡
 
 - **Coupling to a central service and its clients.** Every producer and consumer needs a serde that speaks the registry protocol; non-JVM language support varies.
-- **Binary messages are opaque.** You cannot `kafkacat` a topic and read it without the registry. Tooling must be registry-aware.
+- **Binary messages are opaque.** You cannot `kafkacat` (a command-line tool that prints Kafka messages) a topic and read it without the registry. Tooling must be registry-aware.
 - **Compatibility rules cannot catch semantic breaks.** Changing `amount` from rupees to paise keeps the type `long` and passes every check. Field names with units, and documentation, are still needed.
 - **Defaults are a contract too.** Adding `currency` with default `"INR"` silently assigns INR to old events. Pick defaults that are true for old data, or use a nullable field.
 - **When not to use it:** two services owned by one team with a handful of event types and short retention may be fine with versioned JSON and contract tests ([[API Contract Design and OpenAPI]] for the HTTP equivalent).
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the wire format, subjects, compatibility modes and formats, plus a Go registry that refuses unsafe changes. **Next is the advanced part**: data contracts and ownership, production failures, and what to do when a breaking change is truly unavoidable.
+
 - **Real systems:** Confluent Schema Registry is the default in Kafka-centric stacks; Apicurio is common with Red Hat and Strimzi; AWS Glue Schema Registry with Amazon MSK and Kinesis.
-- **Data contracts and ownership:** the producing team owns the schema (it lives in their repo). A schema change is a code review that consumers can see. Some registries attach rules to schemas (for example, field-level validation or tags marking PII) so that the contract covers meaning as well as shape.
+- **Data contracts and ownership:** the producing team owns the schema (it lives in their repo). A schema change is a code review that consumers can see. Some registries attach rules to schemas (for example, field-level validation or tags marking PII, personally identifiable information such as phone numbers) so that the contract covers meaning as well as shape.
 - **Failure modes → fixes:**
 	- *Auto-registration in production* (`auto.register.schemas=true` by default in Confluent serializers): any producer build can register a new version. Fix: register from CI, set `auto.register.schemas=false` and `use.latest.version=true` in production.
 	- *Compatibility set to NONE "temporarily"* and never reset. Fix: manage subject configs as code; alert on NONE.
@@ -592,7 +640,7 @@ For Protobuf contracts kept in Git, `buf breaking --against '.git#branch=main'` 
 - **Protobuf traps.**
 	- Changing a field's type between compatible wire types (for example `int32` to `int64`) is allowed by the wire format, but values can be truncated when old readers parse new data.
 	- Renaming a field is safe on the wire (numbers matter, not names) but breaks JSON encodings of the message and generated code.
-	- Moving a field into or out of a `oneof` is unsafe.
+	- Moving a field into or out of a `oneof` (a group of fields where only one may be set) is unsafe.
 - **Key schemas.** The record key decides the partition. Changing the key's schema, or even its serialised bytes, changes the partition and breaks per-key ordering. Treat key schemas as frozen.
 - **Global vs per-subject IDs.** Confluent IDs are global across subjects: the same schema text registered in two subjects gets the same ID. Versions are per subject. The Go model above draws IDs from one global counter, but unlike Confluent it gives identical schema text in a second subject a new ID.
 - **CloudEvents.** A CNCF spec for event metadata (id, source, type, time, datacontenttype, dataschema). It standardises the envelope, not the payload schema, and pairs well with a registry.
@@ -638,6 +686,30 @@ flowchart LR
 - Safe: add or remove fields that have defaults. Unsafe: rename, type change, new required field, reused Protobuf number.
 - Registry is off the data path; disable auto-registration in production; check in CI.
 - Semantic changes (units, meaning) pass every check: name fields with units.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is a schema?
+> The agreed shape of a message: its fields and their types.
+
+> [!question]- What does each registry-encoded message carry instead of the whole schema?
+> A schema ID in a 5-byte header.
+
+> [!question]- Is renaming a field a safe change?
+> No. It is a delete plus an add, and readers of the old name break.
+
+🟡 Medium
+
+> [!question]- Under BACKWARD compatibility, who upgrades first?
+> Consumers, then producers.
+
+> [!question]- Why prefer a `_TRANSITIVE` mode for a topic with long retention?
+> Consumers may replay very old versions, so the new schema must work with every past version, not just the last.
+
+> [!question]- Does the registry stop a change from rupees to paise in the same `long` field?
+> No. The type is unchanged, so it passes; name fields with units and review meaning changes.
 
 ## Links
 

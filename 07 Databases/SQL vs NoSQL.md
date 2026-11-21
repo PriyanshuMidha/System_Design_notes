@@ -41,8 +41,11 @@ updated: 2026-11-13
 
 > [!info] How to read this note (pick your level)
 > - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
-> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5 (variants).
-> - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+> - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
+> - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+> [!note] Before this note
+> - [[SQL Essentials]]: you can read a `SELECT` with a `JOIN`, and you know a transaction makes several changes succeed or fail together.
 
 **From zero, in 60 seconds** 🟢
 
@@ -88,6 +91,10 @@ Relational (SQL) and NoSQL databases make this same trade.
 | Denormalize | Copy data so one read gets everything | Client name stored inside each invoice document |
 | Partition key | The value that decides which server holds a record | `client_id` |
 | Transaction | Several changes that succeed or fail together | Debit and credit in one step |
+| Replica | A live copy of the data on another server | a read-only copy in another region |
+| Eventually consistent | Copies catch up a moment later, so a read may be briefly old | a like count that updates a second late |
+| TTL | Time to live: a record deletes itself after a set time | a login session that expires in 30 minutes |
+| `jsonb` | A PostgreSQL column type that stores JSON in a fast binary form | custom fields on an invoice |
 
 **Picture it**
 
@@ -125,6 +132,22 @@ InvoiceOps shows why the choice is per access pattern, not per company:
 - **Recording a payment** must insert the payment, raise the invoice's paid amount and write an audit row together. Finance also asks new questions every month ("revenue by client country, by quarter"). That is relational work.
 - **An invoice activity timeline** (sent, opened, reminder, viewed) is append-only and read newest-first per invoice. At an estimated 1M invoices a month × 20 events, that is 20M rows a month: easy for a partitioned Postgres table. At 1,000 times that volume, a wide-column store partitioned by invoice becomes the natural home.
 
+### Real-life example 🟢
+
+A food delivery app usually uses both kinds.
+Your payment and order record live in a relational database, because money must be exact and finance asks new questions every month.
+Your login session and the "rider is 2 minutes away" location live in a fast key-value store like Redis, because they are read thousands of times a second by one key and expire on their own.
+Restaurant search runs on a search engine, fed copies of the menu from the main database.
+No single database does all of these jobs best.
+
+## Common beginner mistakes 🟢
+
+- **Picking NoSQL "because it scales"** → most apps fit easily on one PostgreSQL server with replicas, and you lose joins and constraints for nothing → start relational and measure.
+- **Thinking NoSQL has no schema** → the shape still exists; now every reader must handle every old shape → version your documents and test old shapes.
+- **Thinking NoSQL has no transactions** → MongoDB and DynamoDB both have them, with limits → check the actual limits instead of the label.
+- **Writing to two databases from the same request** → if the second write fails, the two disagree forever → write once, then copy out with an outbox or CDC.
+- **Choosing a store before listing the questions** → the data ends up in the wrong shape for the real queries → list access patterns with their rates first.
+
 ## 2. Mental model 🟢
 
 - **Relational:** model the *data* (entities and relationships), normalize it, then ask any question later. The schema protects the truth; queries adapt to it.
@@ -134,9 +157,18 @@ InvoiceOps shows why the choice is per access pattern, not per company:
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the core trade: tables answer any question, pre-packed records answer planned ones fast. **Next we open the box**: the main families of NoSQL, where the schema lives, joins versus bundles, ACID versus BASE, how each side scales, and how to choose. Each subsection starts with a short step-by-step walk.
+
 ### The families
 
 **In plain words:** there is no one "NoSQL database"; it is a shelf of different tools, each built to be great at one shape of question, like different knives in a kitchen.
+
+**Step by step (match the question to the family):**
+1. "Record a payment and update the invoice together" → relational.
+2. "Get this user's session by its token, a million times a minute" → key-value (Redis).
+3. "Store billions of chat messages, read the latest 50 per channel" → wide-column (Cassandra).
+4. "Find invoices whose description mentions 'logo'" → search engine.
+5. "Friends of friends" → graph; "most similar product" → vector store.
 
 | Family           | Data model                                       | Example                    | Reads well                                         | Struggles with                                                 |
 | ---------------- | ------------------------------------------------ | -------------------------- | -------------------------------------------------- | -------------------------------------------------------------- |
@@ -154,6 +186,12 @@ Deeper notes: [[NoSQL Data Modeling]], [[Wide-Column Stores and Cassandra]], [[S
 ### Schema-on-write vs schema-on-read
 
 **In plain words:** either the database checks the shape of your data when you save it (like a bouncer at the door), or it lets anything in and every reader has to cope with whatever is inside.
+
+**Step by step:**
+1. Version 1 invoices have no `currency` field. Version 2 adds it.
+2. **Postgres:** you run a migration that adds the column with a default; every row now has it, and the database refuses rows without it.
+3. **MongoDB:** old documents simply lack the field; new ones have it.
+4. So every reader of MongoDB data must handle "no currency" forever, or until a job rewrites the old documents.
 
 - **Schema-on-write** (Postgres): the database rejects a row with a missing column or a wrong type at insert time. Changing the shape takes a migration ([[Zero-Downtime Schema Migrations]]).
 - **Schema-on-read** (MongoDB, DynamoDB): the store accepts any document, and every reader must handle every shape ever written: v1 invoices without `currency`, v2 with it. The schema still exists; it moved into your code and your tests. MongoDB can enforce one with optional `$jsonSchema` validation.
@@ -176,6 +214,12 @@ Example with numbers: if 2 million v1 invoices exist and v2 adds `currency`, a r
 ### Normalized joins vs denormalized aggregates
 
 **In plain words:** store each fact once and assemble answers on the fly, or store ready-made bundles that read fast but must all be rewritten when a shared fact changes.
+
+**Step by step:**
+1. **Relational:** the client's name lives once in `clients`. Showing an invoice joins three tables at read time.
+2. **Document:** the client's name is copied into every invoice document. Showing an invoice is one fetch.
+3. The client renames itself. Relational: change one row. Document: rewrite every invoice holding the old name.
+4. A new question nobody planned ("all unpaid items mentioning 'logo'") is easy in SQL and hard in the document store.
 
 ```mermaid
 flowchart LR
@@ -201,6 +245,12 @@ The document wins the read; the relational model wins the update and every query
 
 **In plain words:** ACID means your changes land together and everyone sees them at once; BASE means copies catch up a moment later, like a scoreboard that updates a second behind the game.
 
+**Step by step:**
+1. You save a payment. With **ACID**, once you hear "saved", every reader sees the new balance.
+2. With **BASE**, the main copy has it, but some copies get it a moment later.
+3. A reader hitting a lagging copy sees the old balance for that moment.
+4. In practice each store lets you pick per request: stronger (slower) or eventual (faster).
+
 ```mermaid
 sequenceDiagram
     participant U as User
@@ -217,7 +267,7 @@ sequenceDiagram
 ```
 
 - **ACID** (atomicity, consistency, isolation, durability) is the relational default: [[Transactions and ACID]].
-- **BASE** (*basically available, soft state, eventually consistent*), named by Pritchett in 2008, accepts that replicas and derived copies are briefly out of date in exchange for availability and partition tolerance.
+- **BASE** (*basically available, soft state, eventually consistent*), named by Pritchett in 2008, accepts that replicas and derived copies are briefly out of date in exchange for availability and partition tolerance (staying up when the network between servers breaks).
 
 In practice both are per-operation settings, not product properties:
 
@@ -232,6 +282,12 @@ In practice both are per-operation settings, not product properties:
 ### Scaling paths
 
 **In plain words:** SQL grows step by step as you need it (bigger box, then copies, then splitting); partitioned NoSQL spreads over many boxes from day one, but every fast question must say which box to look in.
+
+**Step by step:**
+1. **SQL:** start with one server. Add indexes, then a cache, then read replicas, then a bigger machine.
+2. Only when writes outgrow one primary do you shard, and then every query must carry the shard key.
+3. **Partitioned NoSQL:** data is spread over many servers by a key from day one.
+4. Every fast query must include that key; a query without it asks every server.
 
 ```mermaid
 flowchart TB
@@ -256,6 +312,13 @@ A partitioned store scales writes from the start, but every hot query must carry
 ### Choosing
 
 **In plain words:** write down your real questions and their sizes first, then walk this flowchart; the label on the box matters far less than the questions you will ask it.
+
+**Step by step:**
+1. List every access pattern with its rate, like "record a payment, 50 per second".
+2. Mark which need multi-table rules or changing ad-hoc questions: keep those relational.
+3. Mark which are a single key at a huge rate, or need expiry: key-value.
+4. Mark special shapes: text search, graph, vectors, time series.
+5. Pick the fewest stores that cover the list; each extra store is extra work to run.
 
 ```mermaid
 flowchart TD
@@ -329,7 +392,7 @@ flowchart LR
 
 Storage is about 1M × (1 KB invoice + 5 items × 200 B) ≈ 2 GB a month. One Postgres primary with a replica handles this with large headroom, so the core stays relational.
 
-**Pattern 6 without a second database.** The custom fields live in one `jsonb` column; a GIN index serves containment queries on it.
+**Pattern 6 without a second database.** The custom fields live in one `jsonb` column; a GIN index (an index type that indexes every key inside the JSON, like a book's index) serves containment queries on it.
 
 ```sql
 ALTER TABLE invoices ADD COLUMN custom_fields jsonb NOT NULL DEFAULT '{}';
@@ -423,6 +486,8 @@ Use an outbox (a table written in the same transaction as the change, which a re
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to choose a store per access pattern and why copies need an outbox. **Next is the senior view**: how Discord, Uber, Instagram and Facebook actually moved or stayed, the failures at scale, and the deeper ideas (CAP, distributed SQL, `jsonb` internals).
+
 ```mermaid
 timeline
     title Discord message store
@@ -444,10 +509,10 @@ timeline
 	- Unbounded documents or partitions (a MongoDB document grows toward the 16 MB limit; a Cassandra partition per channel grows forever) → bucket by time or count.
 	- Denormalized copies drift → one owner per fact, CDC to the copies, a periodic reconciliation query.
 	- Eventual consistency surprises: a user saves, reloads and sees old data → strongly consistent reads on the paths that need read-your-writes.
-	- Delete-heavy wide-column tables pile up tombstones and slow reads → model deletes with TTLs and partitions you can drop.
+	- Delete-heavy wide-column tables pile up tombstones (markers that say "this was deleted") and slow reads → model deletes with TTLs and partitions you can drop.
 - **What to monitor:**
 	- Throughput and throttling per partition or shard (for example, DynamoDB throttled requests).
-	- p99 latency per access pattern, not per database.
+	- p99 latency (the time 99 in 100 requests finish within) per access pattern, not per database.
 	- Replication lag, and mismatches found by reconciliation jobs between stores.
 	- Size of the largest partition or document, and growth per tenant.
 
@@ -494,6 +559,9 @@ flowchart LR
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** Do not pick a database by its label. Write down the questions your app asks, how often, and how much data there is. Keep money and anything with cross-table rules in a relational database. Use a NoSQL store for a few huge, keyed questions, and copy data to it from the main store with an outbox or CDC, never by writing to both.
+
+
 - Choose by access patterns, relationships, consistency and scale, never by the label.
 - Relational: model the data, query freely, enforce invariants. NoSQL: model the queries, copy data per query.
 - Transactions exist on both sides (MongoDB 4.0+, DynamoDB up to 100 actions); scale-out exists on both sides (Vitess, Citus, distributed SQL).
@@ -502,6 +570,30 @@ flowchart LR
 - Schema-on-read moves the schema into every reader.
 - Each extra store costs operations and consistency work: one writer, outbox or CDC, reconciliation.
 - InvoiceOps: Postgres for the core, Redis for sessions, a search engine or wide-column store only when a measured pattern demands it.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does "schema-on-read" mean?
+> The store accepts any shape, and every reader must handle whatever shapes were written.
+
+> [!question]- Name one job where a key-value store like Redis fits better than Postgres.
+> Session lookup by token with automatic expiry, at thousands of reads per second.
+
+> [!question]- Do MongoDB and DynamoDB support transactions?
+> Yes, both do, with limits (for example DynamoDB allows up to 100 actions per transaction).
+
+🟡 Medium
+
+> [!question]- Why not write to Postgres and Elasticsearch from the same request?
+> If one write fails, the stores drift apart; write once and copy out with an outbox or CDC.
+
+> [!question]- InvoiceOps' timeline is 20 million rows a month. Does it need Cassandra?
+> No; a Postgres table partitioned by month handles it. Cassandra makes sense around 1,000 times that volume.
+
+> [!question]- What must every hot query carry in any partitioned store, SQL or NoSQL?
+> The partition (shard) key; without it the query asks every partition.
 
 ## Links
 

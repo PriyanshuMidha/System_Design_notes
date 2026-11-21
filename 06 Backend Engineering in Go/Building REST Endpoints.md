@@ -29,6 +29,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[HTTP Server Fundamentals (net-http)]]: a Go server registers handler functions, and each handler gets a request and a `ResponseWriter` to write the reply into.
+> - [[REST and HTTP API Design]]: URLs name things (`/invoices/42`), verbs say what to do (`GET` reads, `POST` creates), and status codes say how it went.
+
 **From zero, in 60 seconds** 🟢
 
 A **REST endpoint** is one URL plus one verb that your server answers, like `POST /invoices` meaning "create an invoice".
@@ -68,6 +72,12 @@ A REST endpoint is that counter for one URL.
 | Pagination | Returning a long list in pages | `?limit=50&after=inv_99` |
 | ETag | Version tag of a resource for safe updates | `If-Match: "v3"` |
 
+| Path wildcard | A named slot in a URL pattern | `{id}` in `/v1/invoices/{id}` |
+| Optimistic concurrency | Let edits run, but reject one if the data changed since it was read | stale `If-Match` gets 412 |
+| `problem+json` | A standard JSON shape for error replies (RFC 9457) | `{"type":..., "title":..., "status":422}` |
+| Cursor | An opaque token that marks "where the last page ended" | `?after=eyJjIjoi...` |
+| Sentinel error | A fixed, named error value you can test for | `ErrNotFound` |
+
 **Picture it**
 
 ```mermaid
@@ -97,9 +107,13 @@ Where it breaks: a real clerk can scribble two notes on one form; an HTTP respon
 
 Say InvoiceOps exposes `POST /v1/invoices` to create an invoice, and two clients retry on timeout. Without an idempotency key, a request that actually succeeded but whose *response* got lost over a flaky connection creates two invoices when the client retries — a real customer gets billed twice.
 
-Without a status-code policy, one engineer returns `400` for "invoice not found" and another returns `500`; client code ends up branching on response body text instead of the status line. Without pagination that scales, `GET /v1/invoices?page=400` on a 2-million-row table makes Postgres walk and discard 399 pages before it can return page 400, so an endpoint that was fast at launch gets slower every month even though query load per request never changed.
+Without a status-code policy, one engineer returns `400` for "invoice not found" and another returns `500`; client code ends up branching on response body text instead of the status line. Without pagination that scales, `GET /v1/invoices?page=400` on a 2-million-row table makes Postgres walk and discard 399 pages before it can return page 400 (that is offset pagination: "skip N rows, then give me 20"), so an endpoint that was fast at launch gets slower every month even though query load per request never changed.
 
 These are not abstract complaints: they are the concrete reasons a REST endpoint needs a routing convention, a status-code policy, a pagination strategy, and idempotency — before a single line of business logic is written.
+
+### A real-life example 🟢
+
+When you pay on a shaky phone network in Swiggy and tap "Place order" again, you should not get two orders. The app sends the same idempotency key both times, and the server replays the first answer instead of creating a second order. When you scroll your order history, the app asks for "the next 20 orders after this one" with a cursor, so the list stays fast even after years of orders. And when something is wrong, such as an empty address, you get a clear 422 error with the field name, not a vague 500.
 
 ## 2. Mental model 🟢
 
@@ -113,9 +127,17 @@ If the request clears every gate, the service produces a result and the last gat
 
 ## 3. How it works 🟡
 
+🟢 → 🟡 You now know the five handler steps: gate, decode, validate, call the service, encode. Next we open the box and see the rules behind each step: how the router picks a handler, how retries are made safe, how status codes and errors are chosen, and how lists and updates stay correct.
+
 ### Routing with Go 1.22's `ServeMux`
 
 **In plain words:** the router is a receptionist — it reads the verb and the URL and forwards the call to the right function, including grabbing names out of the path.
+
+**Step by step:**
+1. At startup you register `"GET /v1/invoices/{id}"` and `"POST /v1/invoices"`.
+2. A request `GET /v1/invoices/inv_42` arrives. The mux finds the most specific pattern that matches both the verb and the path.
+3. It puts `inv_42` into the `id` slot; the handler reads it with `r.PathValue("id")`.
+4. A `DELETE /v1/invoices/inv_42` matches no verb, so the mux answers `405` and lists the allowed verbs in the `Allow` header by itself.
 
 Since Go 1.22, `http.ServeMux` patterns can carry a method and wildcards:
 
@@ -126,7 +148,7 @@ mux.HandleFunc("GET /v1/invoices/{id}", a.getInvoice)
 mux.HandleFunc("PATCH /v1/invoices/{id}", a.patchInvoiceStatus)
 ```
 
-- `{$}` matches the path exactly, so `GET /v1/invoices/` does not fall through to the `{id}` pattern below it.
+- `{$}` (a special pattern ending meaning "nothing after this") matches the path exactly, so `GET /v1/invoices/` does not fall through to the `{id}` pattern below it.
 - The most specific pattern always wins, regardless of registration order; two patterns that could both match the same request and are equally specific cause a panic *at registration time*, not at request time.
 - A path registered for `GET` only still gets an automatic `405 Method Not Allowed` with an `Allow` header for any other method — the handler never writes `if r.Method != http.MethodPost`.
 - `r.PathValue("id")` reads a wildcard segment; the stdlib decodes it, so it is still untrusted input to validate (not raw SQL, not a filesystem path).
@@ -148,6 +170,14 @@ flowchart TD
 ```
 
 ### Idempotency keys on unsafe methods
+
+**In plain words:** "unsafe" methods like `POST` change data, so a retry must not change it twice.
+
+**Step by step:**
+1. The client sends `POST /v1/invoices` with header `Idempotency-Key: k1`.
+2. The wrapper checks its store: `k1` not seen. It runs the handler and saves `k1 -> (201, body)`.
+3. The response is lost on the network, so the client sends the same request again with `k1`.
+4. The wrapper finds `k1` and sends back the saved `201` and body. No second invoice is made.
 
 ```mermaid
 sequenceDiagram
@@ -171,6 +201,13 @@ sequenceDiagram
 
 **In plain words:** decide once, in a table, which situation maps to which number — then every endpoint answers the same way.
 
+**Step by step:**
+1. Did the request even make sense as JSON? No → 400.
+2. Was it valid JSON but broke a rule, like a negative amount? → 422.
+3. Does the thing exist? No → 404. Is it in the wrong state, like editing a paid invoice? → 409.
+4. Did a service we depend on fail? → 502, 503 or 504.
+5. Everything fine? → 200, or 201 for "created", or 204 for "done, nothing to send back".
+
 | Status | Meaning here | Who decides it |
 |---|---|---|
 | `200 OK` | successful GET/PATCH that returns a body | handler |
@@ -192,7 +229,13 @@ sequenceDiagram
 
 **In plain words:** all errors funnel through one translator, so a database error never leaks raw into a user's screen.
 
-The service layer returns plain Go errors — sentinel (`ErrNotFound`), typed (`*ValidationError`) or wrapped — and never imports `net/http`; see [[Error Handling]] and [[Interfaces]] for why that split holds up in Go. Exactly one function per API turns an error into a status:
+**Step by step:**
+1. The store returns `ErrNotFound` for invoice `inv_9`.
+2. The service wraps it: `fmt.Errorf("get invoice: %w", err)` and returns it.
+3. The handler passes the error to `mapErr`.
+4. `mapErr` uses `errors.Is(err, ErrNotFound)` and returns `404`. Any error it does not know becomes `500`.
+
+The service layer returns plain Go errors — sentinel (`ErrNotFound`), typed (`*ValidationError`, an error struct that carries extra fields) or wrapped — and never imports `net/http`; see [[Error Handling]] and [[Interfaces]] for why that split holds up in Go. Exactly one function per API turns an error into a status:
 
 ```go
 func mapErr(err error) (status int, problemType string) {
@@ -218,6 +261,12 @@ func mapErr(err error) (status int, problemType string) {
 
 ### Error envelope: RFC 9457 `problem+json`
 
+**Step by step:**
+1. Validation finds `amount` is missing and `due_date` is in the past.
+2. The handler sets `Content-Type: application/problem+json` and status `422`.
+3. The body has a `type` link, a short `title`, the `status`, and a list of field errors.
+4. The client app reads the field list and shows each message next to the right input box.
+
 A field-level validation failure is useless to a client as a bare string. `application/problem+json` gives it a stable shape:
 
 ```json
@@ -232,6 +281,12 @@ A field-level validation failure is useless to a client as a bare string. `appli
 ### Keyset pagination
 
 **In plain words:** instead of 'give me page 5', the client says 'give me the next 20 after this one' — which stays correct even while rows are being added.
+
+**Step by step:**
+1. The client asks `GET /v1/invoices?limit=20`. The server returns 20 invoices sorted by `(created_at, id)`.
+2. The server also returns a cursor: the last row's `(created_at, id)`, packed into a base64 string (letters and digits that safely carry any bytes).
+3. The client asks for the next page with `?after=<cursor>`.
+4. The server unpacks it and runs `WHERE (created_at, id) > (that time, that id) LIMIT 20`, which jumps straight to the right place in the index.
 
 Offset pagination (`?page=400&limit=20`) makes the database compute and throw away `(page-1) * limit` rows before it can return the page you asked for — the cost grows with the page number. A keyset (cursor) page asks instead for "the next 20 rows after this exact position":
 
@@ -248,6 +303,12 @@ LIMIT 20;
 The cursor sent back to the client is an opaque, base64-encoded `(created_at, id)` pair — opaque so the client can never construct or tamper with one, and so the server is free to change its internal shape later.
 
 ### PATCH and optimistic concurrency
+
+**Step by step:**
+1. Riya reads invoice `inv_42` and gets `ETag: "v3"`.
+2. Meanwhile Karan changes the same invoice; it becomes `"v4"`.
+3. Riya sends `PATCH` with `If-Match: "v3"` and `{"status":"sent"}`.
+4. The server sees the current version is `"v4"`, not `"v3"`, and answers `412`. Riya reloads and tries again, so Karan's change is not silently lost.
 
 A `PATCH` only changes the fields the client actually sent. A pointer field (`*string`) tells "the client didn't send `status`" (`nil`) apart from "the client wants to set it" — see [[Request Decoding, Validation and DTOs]] for the same absent-vs-null problem on the decode side.
 
@@ -291,6 +352,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 **Status mapping and the problem envelope:**
 
+**What this code does, in plain words:** `mapErr` turns each known error into a status code and a problem type, and `writeProblem` writes that as a `problem+json` reply, adding the list of bad fields for validation errors.
+
 ```go
 func writeProblem(w http.ResponseWriter, err error) {
     status, kind := mapErr(err)
@@ -319,6 +382,8 @@ func writeProblem(w http.ResponseWriter, err error) {
 ```
 
 **Keyset cursor, as an opaque token:**
+
+**What this code does, in plain words:** it packs the last row's time and ID into a base64 string for the client, and unpacks it again on the next request, returning an error for a cursor that does not decode.
 
 ```go
 type Cursor struct {
@@ -368,6 +433,8 @@ var allowedStatusFilter = map[string]bool{"": true, "draft": true, "sent": true,
 
 **Idempotency key wrapper, replaying a captured response:**
 
+**What this code does, in plain words:** it wraps a handler. On the first request with a key, it records the status and body the handler wrote. On a repeat with the same key, it skips the handler and sends the recorded answer.
+
 ```go
 func (s *idempotencyStore) withIdempotency(next http.HandlerFunc) http.HandlerFunc {
     return func(w http.ResponseWriter, r *http.Request) {
@@ -398,6 +465,8 @@ func (s *idempotencyStore) withIdempotency(next http.HandlerFunc) http.HandlerFu
 ```
 
 **PATCH with `If-Match` optimistic concurrency:**
+
+**What this code does, in plain words:** it requires an `If-Match` header, decodes only the fields the client sent (pointer fields stay `nil` if missing), and asks the store to update only if the version still matches. A mismatch becomes `412`, a missing invoice `404`.
 
 ```go
 func (a *api) patchInvoiceStatus(w http.ResponseWriter, r *http.Request) {
@@ -442,7 +511,9 @@ func (a *api) patchInvoiceStatus(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
-The handler tests, run with `httptest` through the real `ServeMux` (no handler is ever called directly, so routing bugs show up too):
+The handler tests, run with `httptest` through the real `ServeMux` (no handler is ever called directly, so routing bugs show up too).
+
+**What this code does, in plain words:** each test builds a fake request, sends it through the real router, and checks the reply: wrong verb gives 405 with `Allow`, a repeated idempotency key replays the same response, paging covers every row once in order, and a stale `If-Match` gives 412.
 
 ```go
 func TestServeMux_WrongMethod_Returns405WithAllow(t *testing.T) {
@@ -556,7 +627,27 @@ func TestList_KeysetPagination_CoversAllRowsOnceInOrder(t *testing.T) {
 - Keyset pagination needs a genuinely stable, indexed sort key. If the table is small (tens of thousands of rows) and rarely paged past page 2, offset pagination is simpler to reason about and the cost difference never shows up.
 - `ServeMux`'s router is deliberately plain: no regex patterns, no named route groups. A service with many deeply nested route families often reaches for `chi` specifically for that composition, not for raw performance.
 
+### 409 vs 412 vs 422 🟡
+
+These three are easy to mix up:
+
+| Code | Means | Example |
+| --- | --- | --- |
+| 422 | The body is valid JSON but breaks a field rule | `amount: -5` |
+| 409 | The request is fine, but the thing's current state forbids it | cancel an invoice that is already paid |
+| 412 | The client's `If-Match` version is out of date | sent `"v3"`, current is `"v4"` |
+
+### Common beginner mistakes 🟢
+
+- Checking `r.Method` inside the handler → duplicates the mux and often forgets the `Allow` header → put the verb in the route pattern.
+- Mapping errors to status codes inside each handler → the same error gets different codes in different places → use one `mapErr` function.
+- Using `?page=400` on a big table → each deeper page gets slower → use keyset (cursor) pagination.
+- Calling `Encode` before setting headers and `WriteHeader` → the status is already locked to 200 → set headers, then `WriteHeader`, then write the body.
+- Testing a handler by calling the function directly → routing bugs never show up → send requests through the real `ServeMux` with `httptest`.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now build a complete endpoint with routing, status codes, error replies, cursors, idempotency and safe updates. The advanced part is about what happens at scale: idempotency stores that grow forever, two retries racing each other, and version checks across many server copies.
 
 - **Real systems:** Stripe's and GitHub's public APIs both use idempotency keys on POST exactly this way (store key + response, replay on retry). Shopify, GitHub and Stripe all use keyset ("cursor") pagination on their list endpoints for the same reason this note gives: offset pagination doesn't scale past a few million rows.
 - **Failure modes → fixes:**
@@ -606,6 +697,26 @@ func TestList_KeysetPagination_CoversAllRowsOnceInOrder(t *testing.T) {
 - Idempotency keys: claim the key atomically, store the *whole* response, replay it byte-for-byte on retry.
 - `PATCH` + `If-Match`/`ETag` for optimistic concurrency; a stale `If-Match` is `412`, not a silent overwrite.
 - Test handlers through the real `ServeMux` with `httptest`, never by calling the handler function directly — routing bugs only show up through the mux.
+
+## Self-check 🟢🟡
+
+> [!question]- What are the handler's steps, in order?
+> Gate the body size, decode, validate, call the service, map the error, encode the reply.
+
+> [!question]- What status code means "created", and what header goes with it?
+> `201 Created`, with a `Location` header pointing to the new resource.
+
+> [!question]- How do you read `{id}` from the path in Go 1.22+?
+> `r.PathValue("id")`.
+
+> [!question]- Why is keyset pagination faster than offset pagination for deep pages?
+> It jumps straight to an index position instead of scanning and throwing away all earlier rows.
+
+> [!question]- Why must the idempotency key be claimed before the handler runs, not after?
+> Two retries arriving together would both see "not seen" and both create an invoice.
+
+> [!question]- Why is the cursor opaque instead of `?after_id=123`?
+> So clients cannot build or tamper with it, and the server can change the sort key later without breaking them.
 
 ## Links 🟢
 

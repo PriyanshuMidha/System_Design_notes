@@ -32,6 +32,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[sync Primitives and Atomics]]: a `sync.Mutex` makes goroutines take turns, and an atomic value can be read safely without a lock.
+> - [[Goroutines and Channels]]: many requests run at the same moment, each in its own goroutine.
+> - [[Factory and Abstract Factory]]: a `NewX` function builds a ready value; here we care about building it only once.
+
 **From zero, in 60 seconds** 🟢
 
 Sometimes you want exactly one of something, like one database pool or one config loader. A **singleton** gives you that one shared instance. In Go, the safe way to create it once, even when many goroutines ask at the same time, is `sync.Once`. But a global singleton makes tests harder, so often it is better to create the object once in `main()` and pass it around. Read the plain-words line above each code block first.
@@ -53,6 +58,9 @@ The hard part is when many requests arrive at the same instant and all try to cr
 | Data race | Two goroutines touch the same memory, one writes, no lock | Two goroutines set `cfg` at once |
 | Lazy initialisation | Build the thing only when first needed | Load config on first request |
 | Dependency injection | Pass what a function needs as a parameter | `NewServer(cfg, db)` |
+| Composition root | The one place, usually `main`, that builds everything and passes it down | `main` opens the pool and hands it to services |
+| Connection pool | A shared set of open database connections that requests borrow | `*sql.DB` with 10 connections |
+| Memory model | Go's rules for when one goroutine is guaranteed to see another's writes | Writes inside `once.Do` are visible after it returns |
 
 **Picture it**
 
@@ -90,6 +98,10 @@ The GoF Singleton answers both with a class that controls its own single instanc
 
 So the Go answer has two parts: **create once** with `sync.Once` when laziness is really needed, and **share by passing the instance** rather than by reaching for a global.
 
+### Real-life example 🟢
+
+Picture the moment you open the Zomato app after a fresh install while hundreds of things load at once. The app's server reads its settings and opens its database connections once, when the first request arrives, and every later request reuses them. If each of the first 200 requests opened its own set of connections, the database would run out of room in seconds. "Create it once, the first time someone needs it, and share it" is the job of a singleton, and in Go the tool is `sync.Once`.
+
 ## 2. Mental model 🟢
 
 A building has one main water tank. You could let every flat install a pipe to "the tank" hidden in the walls (a global): it works until someone needs to test a flat with a different tank, or replace the tank, and has to find every hidden pipe.
@@ -99,6 +111,8 @@ Or the plumber connects each flat to the tank at construction time with a visibl
 `sync.Once` is the rule "the first person to arrive fills the tank; everyone else waits at the door until it is full, then uses the same water". Nobody fills it twice, and nobody drinks from a half-filled tank.
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** why "exactly one" matters (no 200 pools, no race on first creation) and that passing the one instance in beats a hidden global. **Next we open the box**: the four Go ways to get one instance, what `sync.Once` does when three goroutines arrive together, and how to pick the right form.
 
 **In plain words: the ways to get one instance, and how sync.Once makes the first creation safe.**
 
@@ -117,7 +131,7 @@ And the option that usually wins: **build it in `main` and inject it** (the comp
 
 **In plain words: only one runs the setup; the others wait, then all get the same object.**
 
-`sync.Once` keeps an atomic "done" flag and a mutex. The fast path is a single atomic load; only callers that arrive before `f` has finished touch the mutex.
+`sync.Once` keeps an atomic "done" flag (a flag read and written in one uninterruptible step) and a mutex. The fast path is a single atomic load; only callers that arrive before `f` has finished touch the mutex.
 
 ```mermaid
 sequenceDiagram
@@ -196,6 +210,15 @@ func main() {
 **In plain words: a lazy config loader with sync.Once, and the same thing done by passing it in, with tests.**
 
 One `package main` with `GetConfig` on `sync.Once` (returning its error instead of a silent `nil`), `sync.OnceValues`, a retrying `Lazy[T]`, the panic rules, a mutable shared `Flags` with its own lock, and a composition-root service. Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
+
+**Step by step:**
+
+1. `loadConfig` reads `DB_URL` and returns a `Config`, or an error if it is missing.
+2. `GetConfig` is the classic singleton: `cfgOnce.Do` runs `loadConfig` once, and every caller gets the same `cfg` and `cfgErr`.
+3. `NewConfigLoader` does the same with `sync.OnceValues`, which keeps the value and the error together.
+4. `Lazy[T].Get` is for when a failed load should be retried: it caches only a success.
+5. `Flags` is a shared object that changes, so it has its own lock; `Checkout` receives the config and flags through `NewCheckout` instead of reading globals.
+6. `main` shows each form and prints the results.
 
 ```go
 package main
@@ -516,6 +539,14 @@ What to notice:
 - **`Once.Do ran f again after the panic: false`**: after a panic, `Once` counts `f` as done and later calls do nothing, so a value that `f` should have set stays at its zero value.
 - **`workers: 16`**: `Checkout` got its config and flags as parameters; nothing in it is global.
 
+## Common beginner mistakes 🟢
+
+- **Mistake:** `if cfg == nil { cfg = load() }`. → **Why it's wrong:** two goroutines can both see `nil` and both load (a data race that `go test -race` reports). → **Do this instead:** wrap the load in `cfgOnce.Do`, as `GetConfig` does, or use `sync.OnceValues`.
+- **Mistake:** ignoring the error from the one-time load. → **Why it's wrong:** every caller gets a silent `nil` config and crashes later, far from the cause. → **Do this instead:** keep the error next to the value, as `GetConfig` returns `cfg, cfgErr`.
+- **Mistake:** expecting `sync.Once` to try again after a failure. → **Why it's wrong:** `Once` runs exactly once, so a failed first load is failed forever. → **Do this instead:** when retries matter, use something like `Lazy[T].Get`, which caches only success.
+- **Mistake:** sharing a map like `Flags.on` without a lock. → **Why it's wrong:** "created once" does not mean "safe to change"; concurrent writes crash the process. → **Do this instead:** guard it, as `Flags` does with a `sync.RWMutex`.
+- **Mistake:** reaching for the global from deep inside code. → **Why it's wrong:** tests cannot swap in a different config. → **Do this instead:** build it once in `main` and pass it in, as `NewCheckout(cfg, flags)` does.
+
 ## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
@@ -524,7 +555,7 @@ What to notice:
 | `init()` | Runs once before `main`, after the package's variables | Registering plug-ins (`sql.Register`) | Hidden side effect of an import; no parameters, no error |
 | `sync.Once` + variables | `Do(f)` runs `f` once; results stored beside it | Lazy creation before Go 1.21, or when `f` sets several things | Easy to forget storing the error; no retry |
 | `sync.OnceValue(f)` | Returns a func that runs `f` once and caches its value | Lazy, cannot fail | If `f` panics, every call panics again |
-| `sync.OnceValues(f)` | Caches value and error together | Lazy, can fail, failure is final | A transient failure is cached for the process lifetime |
+| `sync.OnceValues(f)` | Caches value and error together | Lazy, can fail, failure is final | A transient (short-lived) failure is cached for the process lifetime |
 | Mutex + done flag (`Lazy`) | Locks, retries until the first success | Lazy, can fail, a retry may succeed | A lock on every call (add an atomic fast path if hot) |
 | Build in `main`, inject | Constructed once at startup, passed as a parameter | Almost always for services, pools, clients, config | Constructors take more parameters |
 
@@ -534,7 +565,7 @@ Use a single shared instance for : config loaded once, a shared logger, a metric
 
 Do **not** use a singleton for:
 
-- request-scoped data (user, tenant, trace ID): it belongs in the request or its `context.Context` (see [[Context Package]]);
+- request-scoped data (user, tenant, meaning the customer company in a shared app, trace ID): it belongs in the request or its `context.Context` (see [[Context Package]]);
 - database transactions: one transaction per unit of work, never shared;
 - business services that need testing: inject them;
 - anything that changes per tenant, user or request.
@@ -545,13 +576,15 @@ Do **not** use a singleton for:
 - **Tests cannot reset them.** A `sync.Once` cannot be reset, so the first test that triggers it fixes the value for every later test in the package, and `t.Parallel()` tests share it. `TestGetConfigGlobal` works only because it is the only test that touches `GetConfig`.
 - **Order coupling.** Code that reads a global during package initialization depends on initialization order across packages.
 
+> 🟡 → 🔴 **You now know** every way to create something once in Go, how each behaves on errors and panics, and why injecting beats globals. **Next comes the production view**: the risky globals inside Go's standard library, the bugs a cached failure or a panic in `Once` causes, and what the memory model really promises.
+
 ## 7. In production 🔴
 
 **Standard library singletons and their pitfalls:**
 
 - `http.DefaultClient` is `&http.Client{}`: its `Timeout` is zero, which means **no timeout**, so a stuck server can hang the caller indefinitely. Any package can also change `http.DefaultClient.Transport` and affect every other user. Build your own `*http.Client` with a timeout in `main` (see [[Calling External APIs]]).
 - `http.DefaultTransport` is shared by every client that does not set `Transport`. Its idle pool keeps `DefaultMaxIdleConnsPerHost` = 2 connections per host, which is low for a service that calls one backend heavily.
-- `http.DefaultServeMux`: importing `net/http/pprof` registers `/debug/pprof/` handlers on it from `init()`. Serving `DefaultServeMux` on a public port therefore exposes profiling endpoints. Use your own `http.NewServeMux()`.
+- `http.DefaultServeMux`: importing `net/http/pprof` (Go's profiler) registers `/debug/pprof/` handlers on it from `init()`. Serving `DefaultServeMux` on a public port therefore exposes profiling endpoints. Use your own `http.NewServeMux()`.
 - `slog.SetDefault(l)` replaces the process-wide default logger, and also routes the `log` package's default logger through `l`'s handler. A library that calls it hijacks the application's logging; only `main` should.
 
 **Where it shows up in LLD problems:**
@@ -576,7 +609,7 @@ Do **not** use a singleton for:
 
 **`OnceFunc`, `OnceValue`, `OnceValues` and panics.** The Go 1.21 helpers differ from `Once.Do` on panics: if `f` panics, the returned function panics with the same value **on every call** (the test `TestOnceValueRepanicsEveryCall` checks this, and that `f` ran only once). That is safer than `Once.Do`, where later callers silently see zero values.
 
-**Why "double-checked locking" by hand is wrong.** The pattern `if inst == nil { mu.Lock(); if inst == nil { inst = build() }; mu.Unlock() }` reads `inst` without synchronization on the fast path. That is a data race in Go's memory model, even if it "works" on your machine. `sync.Once` is the correct version of this pattern: it uses an atomic flag for the fast path.
+**Why "double-checked locking" (check without the lock, then lock and check again) by hand is wrong.** The pattern `if inst == nil { mu.Lock(); if inst == nil { inst = build() }; mu.Unlock() }` reads `inst` without synchronization on the fast path. That is a data race in Go's memory model, even if it "works" on your machine. `sync.Once` is the correct version of this pattern: it uses an atomic flag for the fast path.
 
 **Package initialization order.** Within a package, package-level variables are initialized in dependency order, then `init()` functions run in the order the files are presented to the compiler (the `go` tool sorts by file name). Across packages, a package is initialized after the packages it imports; since Go 1.21 the order among independent packages is specified exactly (by import path). Code that reads another package's global during initialization therefore depends on rules most readers do not know. Prefer explicit construction in `main`.
 
@@ -617,6 +650,26 @@ Do **not** use a singleton for:
 - Hand-written double-checked locking is a data race.
 - Stdlib globals to avoid in services: `http.DefaultClient` (no timeout), `DefaultServeMux` (pprof handlers), `slog.SetDefault` outside `main`.
 - Tests: inject fresh instances; a global `Once` cannot be reset.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 Why is `if cfg == nil { cfg = load() }` unsafe with many goroutines?
+> Two goroutines can both see `nil` and both load; it is a data race.
+
+> [!question]- 🟢 What does `once.Do(f)` guarantee?
+> `f` runs exactly once, and everyone else waits until it has finished.
+
+> [!question]- 🟢 What is usually better than a global singleton in a Go service?
+> Build the one instance in `main` and pass it into the code that needs it.
+
+> [!question]- 🟡 `sync.OnceValues` returned an error because the database was not ready. What happens on the next call?
+> The same error comes back forever; `Once` never retries, so use a retrying `Lazy` or build in `main` with a retry loop.
+
+> [!question]- 🟡 Why is `http.DefaultClient` risky in a service?
+> Its `Timeout` is zero, meaning no timeout, and any package can change its shared `Transport`.
+
+> [!question]- 🟡 Does `sync.Once` make a shared, changeable object safe to update?
+> No. It only protects creation; later updates need their own lock.
 
 ## Links 🟢
 

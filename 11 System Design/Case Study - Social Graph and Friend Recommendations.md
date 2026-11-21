@@ -36,6 +36,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+> - [[Back-of-the-Envelope Estimation]]: turning a billion users with 300 friends each into terabytes and reads per second.
+> - [[Graphs and Graph Algorithms]]: nodes joined by edges, and breadth-first search (BFS), which explores one hop at a time.
+> - [[Partitioning and Sharding]]: splitting data across many servers by a key such as user ID.
+
 **From zero, in 60 seconds** 🟢
 
 A social network is a big web of people and the links between them.
@@ -78,6 +84,10 @@ All three answers must come back fast for a billion users.
 | Friends-of-friends | People your friends know but you do not | Ravi's friend Kiran |
 | Set intersection | Items that appear in both of two lists | Mutual friends of A and B |
 | Outbox | A table of "events to send" written with the main change | "A and B are now friends" |
+
+| Supernode | A node with a huge number of edges, which becomes a hot spot | a celebrity with 100 million followers |
+| Projector | A worker that copies a change into read-friendly tables | writes B into A's list and A into B's list |
+| BFS | Breadth-first search: explore all friends, then all their friends, one layer at a time | "is Kiran within 3 hops of me?" |
 
 **Picture it**
 
@@ -125,6 +135,13 @@ The graph is also different from other data: reads follow edges (hop by hop), a 
 - Privacy is a correctness requirement: a block or an unfriend must take effect in every read path, including suggestions.
 - Suggestions can be hours old, but must never show blocked users or existing friends.
 - Handle celebrity accounts with tens of millions of edges without hurting other users.
+
+### Real-life example: LinkedIn connections 🟢
+
+On LinkedIn, a stranger's profile shows "2nd" next to their name and "14 mutual connections".
+The "People you may know" box often shows an old classmate, because many of your connections are also connected to them.
+When you accept a request, both of you see each other in your lists within a second or two.
+If you block someone, they must vanish from your suggestions and searches at once.
 
 **Out of scope:** feed ranking (see [[Case Study - News Feed]]), messaging, and people search (see [[Case Study - Search Autocomplete]]).
 
@@ -175,9 +192,25 @@ Terms:
 > [!tip] Remember
 > One person's neighbors live together. Everything cheap in this design is "read one person's list"; everything expensive is "read many people's lists".
 
+## Common beginner mistakes 🟢
+
+- **Computing "people you may know" live for every request** → about 90,000 candidates per user, tens of thousands of times a second → compute it in a nightly batch and store the top 100.
+- **Storing each friendship only once** → "list my friends" must search every shard → store a copy in each person's list, kept in sync by a projector.
+- **Writing both copies with two separate best-effort calls** → a crash leaves A friends with B but not B with A → write one canonical row plus an outbox event, and replay idempotently.
+- **Paging a 5,000-friend list with `OFFSET`** → re-reads thousands of rows per page → use a cursor on `(created_at, friend_id)`.
+- **Treating a celebrity like a normal user** → one shard holds 100 million follower rows → bucket supernode lists and avoid scanning them online.
+
 ## 3. How it works - high-level design 🟡
 
+> 🟢 → 🟡 **You now know** the phone-book idea: each person's friend list lives together, and suggestions are worked out offline. **Next we open the box**: the storage choices, and the services that turn one "Accept" into two friend-list updates.
+
 ### Storing the graph: the options
+
+**Step by step:**
+1. Small app: one SQL table `friendships(a, b)` with an index each way. Good up to about 100 million edges.
+2. Bigger: store each user's list together, keyed by `user_id`, in sharded SQL or a wide-column store. "My friends" is one read on one shard.
+3. Put a cache in front, because the same popular lists are read again and again.
+4. Use a native graph database only when deep multi-hop queries are the main job and the graph fits its sharding limits.
 
 **In plain words.** You can store edges as rows in a SQL table, as adjacency lists in a key-value or wide-column store, or inside a real graph database. The right choice depends on whether the graph fits one machine and how deep your traversals go.
 
@@ -195,13 +228,20 @@ flowchart TD
     Q4 -->|"no, must be live"| G2["Distributed graph engine<br/>(for example a sharded in-memory index)"]
 ```
 
-**Example.** Facebook's TAO (published 2013) keeps the social graph in MySQL, shards it by object id, and puts a write-through cache tier in front so that most reads never reach MySQL. TAO's data model has *objects* (users, posts) and *associations* (typed edges, such as friend or liked) with association lists ordered by time. Twitter's Who-To-Follow service (published 2013) loaded the whole follow graph into the memory of a single machine with the Cassovary library, because for a graph of that time, one big-memory machine was simpler than a distributed graph. LinkedIn has published a paper on LIquid, a graph database serving its connection graph from a sharded in-memory index. These show three real approaches: sharded storage plus a cache, one big in-memory server, and a purpose-built distributed graph engine.
+**Example.** Facebook's TAO (published 2013) keeps the social graph in MySQL, shards it by object id, and puts a write-through cache tier (writes go through the cache to the database, so the cache stays current) in front so that most reads never reach MySQL. TAO's data model has *objects* (users, posts) and *associations* (typed edges, such as friend or liked) with association lists ordered by time. Twitter's Who-To-Follow service (published 2013) loaded the whole follow graph into the memory of a single machine with the Cassovary library, because for a graph of that time, one big-memory machine was simpler than a distributed graph. LinkedIn has published a paper on LIquid, a graph database serving its connection graph from a sharded in-memory index. These show three real approaches: sharded storage plus a cache, one big in-memory server, and a purpose-built distributed graph engine.
 
 **Why it matters.** The graph database is rarely the right first answer at a billion users: you need sharding, caching and simple lookups first; native graph engines shine for deep traversals on data that fits their memory model.
 
 For the generic database decision see [[Choosing a Database - Decision Guide]].
 
 ### The architecture
+
+**Step by step (plain):**
+1. Ravi accepts Asha's request. The friendship service updates one row for the pair (Asha, Ravi) to FRIENDS and writes an outbox event in the same transaction.
+2. The event goes to Kafka.
+3. The projector adds Ravi to Asha's list and Asha to Ravi's list. Doing it twice changes nothing.
+4. The caches for both lists are cleared, so the next read shows the new friend.
+5. Tonight's batch job will also start suggesting Ravi's friends to Asha.
 
 **In plain words:** a graph service stores friend lists split by user; an offline job makes suggestions; caches serve the hot reads.
 
@@ -441,6 +481,14 @@ sequenceDiagram
 
 See [[Consistent Hashing]] and [[Partitioning and Sharding]] for resharding, and [[Choosing Consistency, Replication and Partitioning - Decision Guide]] for the consistency choice between the two sides of a friendship.
 
+### Things people confuse this with 🟡
+
+| System | What it stores | How it differs from a social graph |
+| --- | --- | --- |
+| [[Case Study - News Feed]] | Lists of posts to show each user | Uses the graph to know whom you follow, but stores posts, not relationships |
+| Graph database (Neo4j) | Any graph with fast multi-hop queries | A storage tool; at a billion users it is hard to shard, so big networks use sharded lists instead |
+| Contacts list on your phone | People you saved | One-sided and private; no mutual friends, suggestions or two-sided agreement |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - **Two copies vs one.** Storing both directions doubles storage but makes "list my friends" a single-shard range scan. One copy would force a scatter-gather to find all edges that point at you.
@@ -459,10 +507,12 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the storage choice, the architecture, the sizing, the API, the tables and one friendship traced. **Next is the advanced part**: failure stories, mutual friends at scale, the suggestions pipeline, bidirectional BFS, supernodes and keeping both sides in sync.
+
 - **Failure modes and fixes:**
 	- Projector crashes after writing A's list but before B's. Result: asymmetric edge. Fix: upserts are idempotent and the event is replayed; a repair job compares `relation` with both adjacency sides and fixes drift (TAO calls out inverse association repair as an eventual process).
 	- Hot shard because of a celebrity's follower list. Fix: bucket supernode lists (section 8.4), cache page 1, rate-limit follower-list reads.
-	- Cache stampede on a viral profile. Fix: single-flight cache refill, short stale-while-revalidate window. See [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
+	- Cache stampede on a viral profile. Fix: single-flight cache refill (only one request reloads, the rest wait for it), short stale-while-revalidate window (serve the old copy while it refreshes). See [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
 	- Blocked user still appears in suggestions. Fix: filter by block list at read time, and keep a Bloom filter or a small per-user block set in the suggestion service.
 	- Batch job late or failed. Fix: keep yesterday's suggestions, mark freshness, alert when older than 36 hours.
 	- Request spam: one account sends 5,000 requests. Fix: per-user daily limits, risk scoring, and requiring acceptance before an edge exists.
@@ -498,7 +548,7 @@ flowchart TD
 
 **Making it fast.**
 1. Cache each active user's friend list as a compact sorted array of ids (300 ids x 8 B = 2.4 KB).
-2. For larger sets, **Roaring bitmaps** (compressed bitsets over id space) make intersections extremely quick, at the cost of needing dense-ish ids.
+2. For larger sets, **Roaring bitmaps** (compressed bitsets over id space: one bit per possible user ID, packed tightly) make intersections extremely quick, at the cost of needing dense-ish ids.
 3. Return a **count and a sample** (first 20), not all mutual friends; most UIs show "14 mutual friends".
 4. For the "mutual" count on a suggestion card, precompute it in the batch job (it is the FoF count itself).
 
@@ -526,6 +576,14 @@ flowchart LR
 
 **Example, tiny graph.** Alice is friends with Bob, Carol, Dan. Bob is friends with Alice, Eve, Frank. Carol is friends with Alice, Eve. Dan is friends with Alice, Eve, Grace. Candidates for Alice: Eve (via Bob, Carol, Dan: 3 mutual), Frank (via Bob: 1), Grace (via Dan: 1). Eve ranks first, "3 mutual friends".
 
+```mermaid
+flowchart LR
+    S["daily snapshot of all lists"] --> J["friends of friends: join on the middle person"]
+    J --> P["prune: skip huge lists, sample 100"]
+    P --> C["count mutual friends per pair"]
+    C --> T["top 100 per user, stored"]
+```
+
 **Numbered steps.**
 1. Take a daily snapshot of the adjacency data (all edges, both directions).
 2. Join the edge set with itself on the middle node. Every friend `f` of `u` emits all of `f`'s other friends as candidates for `u`.
@@ -536,7 +594,7 @@ flowchart LR
 
 **Why pruning matters.** Without pruning the join emits about 9 x 10^13 pairs (a naive estimate: 1 B users x 300 x 300). With a cap of 100 sampled neighbors per middle node it falls by several times, and restricting to active users (500 M) cuts it further. Real systems also compute only for users who will open the page.
 
-**Alternatives.** Twitter's Who-To-Follow used a different approach: load the graph into one machine's memory and run personalized random walks (personalized PageRank and SALSA) from each user's neighborhood to rank candidates, rather than a pure mutual-friend count. Embedding methods (graph neural networks, or matrix factorization over the adjacency matrix) learn a vector per user and find nearest neighbors with an ANN index. They also catch relations that share no common friends, at higher cost and lower explainability.
+**Alternatives.** Twitter's Who-To-Follow used a different approach: load the graph into one machine's memory and run personalized random walks (start at you, hop to random neighbours many times, and count where you land; personalized PageRank and SALSA) from each user's neighborhood to rank candidates, rather than a pure mutual-friend count. Embedding methods (graph neural networks, or matrix factorization over the adjacency matrix) learn a vector per user and find nearest neighbors with an ANN index. They also catch relations that share no common friends, at higher cost and lower explainability.
 
 **Freshness.** After accepting a friendship, the new friend's friends are great candidates. A stream job reads graph-change events and updates the suggestions of the two users and their friends' lists within minutes; the daily batch re-bases everything.
 
@@ -665,6 +723,26 @@ flowchart TD
 
 > [!question]- Someone blocks a user. Where must that take effect?
 > Everywhere: friend lists, mutual friends, search, suggestions (read-time filter plus batch exclusion), degree results, notifications and feed. Store blocks as a small per-user set cached near each service, apply the filter at read time (batch results go stale), and test with a metric that must stay at zero for block leaks.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what are a node and an edge in a social graph?
+> A node is a person; an edge is a link between two people, such as a friendship.
+
+> [!question]- Easy: how do you find mutual friends?
+> Take both friend lists and keep the names that appear in both.
+
+> [!question]- Easy: why are suggestions computed offline?
+> Friends-of-friends for every user is far too much work to do live on each request.
+
+> [!question]- Medium: 1 billion users × 300 friends. How many adjacency entries?
+> 300 billion (150 billion friendships, stored once per side).
+
+> [!question]- Medium: the projector writes A's list, then crashes before B's. What fixes it?
+> The event is replayed and the upserts are idempotent; a repair job also compares the canonical rows with both lists.
+
+> [!question]- Medium: why does bidirectional BFS beat one-sided BFS?
+> Two small frontiers of about 300² each meet in the middle, instead of one frontier growing to 300⁴.
 
 ## 10. Cheat sheet 🟢
 

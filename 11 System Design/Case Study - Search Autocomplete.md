@@ -33,6 +33,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Tries, Suffix Trees and Suffix Arrays]]: a trie is a tree where each step down adds one letter, so all words with a prefix share a branch.
+> - [[Back-of-the-Envelope Estimation]]: turning users and key presses into requests per second and gigabytes.
+> - [[Caching Patterns]]: keep popular answers close to the user so most requests never reach the server.
+
 **From zero, in 60 seconds** 🟢
 
 When you type in a search box, suggestions show up after every letter.
@@ -75,6 +80,10 @@ There is no time to count every past search while you wait.
 | Latency | How long one request takes | 20 ms per keystroke |
 | Shard | One slice of the data on its own server | Prefixes "a"-"m" on server 1 |
 
+| Debounce | Waiting a moment after the last key press before sending a request | send only after 100 ms of no typing |
+| Snapshot | A finished, read-only copy of the trie, built offline and swapped in whole | version `v1234`, built at 21:00 |
+| CDN | Servers near users that cache responses | the "tr" list served from a Mumbai edge |
+
 **Picture it**
 
 ```mermaid
@@ -103,6 +112,13 @@ Where it breaks: real drawers are not rewritten every few minutes, and trends ca
 
 Typing "how to bo" and seeing "how to boil eggs" saves keystrokes, fixes spelling and steers users to queries that return good results. Users expect suggestions to keep up with typing, so the whole round trip must fit between keystrokes.
 
+### Real-life example: searching on Flipkart 🟢
+
+You type "iph" in Flipkart's search bar and, before you finish, it suggests "iphone 15", "iphone 15 cover", "iphone charger".
+Those suggestions were not computed while you typed; they were prepared earlier from what millions of other people searched.
+During a big launch, "iphone 16" can jump into the list within minutes because a fast side-path watches for sudden spikes.
+If a suggestion is offensive, it can be removed in seconds through a block list, without rebuilding everything.
+
 **Functional requirements**
 - Given a prefix, return the **top 10** completions ranked by popularity.
 - Prefix match only (no mid-word or typo-tolerant matching in the base design; covered in section 5).
@@ -125,7 +141,24 @@ Looking something up is opening the right drawer. The expensive work, counting b
 
 The data structure is a **trie** ([[Tries, Suffix Trees and Suffix Arrays]]): each node is a prefix, children extend it by one character. The design trick is to cache the answer, the top-K list, in every node, trading memory for constant-time reads.
 
+## Common beginner mistakes 🟢
+
+- **Searching all past queries on every key press** → millions of matches to sort in milliseconds → precompute the top 10 for every prefix.
+- **Sending a request for every single key press** → fast typists flood the servers → debounce for about 100 ms and cache short prefixes.
+- **Showing a late response for an old prefix** → the list flickers to "t" results after you typed "tre" → drop responses for prefixes the user has typed past.
+- **Logging every partial prefix as a query** → the counts fill with half-words → count only submitted searches.
+- **Ranking by all-time counts** → old queries stay on top forever → use recent windows or decayed scores, plus a trending overlay.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the trick: work out every prefix's top 10 ahead of time, so typing is just a lookup. **Next we open the box**: the fast read path for each key press, and the slow build path that makes a new tree every hour.
+
+**Step by step (plain):**
+1. You type "t", "r" quickly, then pause. The app waits 100 ms and sends only `q=tr`.
+2. "tr" is short and the same for everyone, so a nearby CDN server answers from its cache.
+3. You type "ee". `q=tree` reaches a suggest server, which walks 4 steps down its in-memory trie and reads the stored top 10.
+4. It mixes in any trending queries for "tree" and removes blocked ones, then replies in a few milliseconds.
+5. Separately, every hour a builder counts the submitted searches, builds a new trie, and the servers swap to it.
 
 ```mermaid
 flowchart LR
@@ -252,7 +285,7 @@ Content-Type: application/json
                  "train status", "translate", "trending news", "truecaller", "trivago"]}
 ```
 
-- The prefix is normalized on the server (lower case, Unicode NFC, collapsed spaces) so `Tr` and `tr` hit the same cache entry.
+- The prefix is normalized on the server (lower case, Unicode NFC, a standard way to write accented letters the same way, collapsed spaces) so `Tr` and `tr` hit the same cache entry.
 - Personalized requests (`&user=...`) must use `Cache-Control: private` and skip the CDN; a common split is "global list from the CDN plus up to 3 recent personal queries merged on the client".
 - Logging: the search service, not the suggest service, logs **submitted** queries. Logging every keystroke prefix would flood the pipeline with partial queries.
 
@@ -512,12 +545,20 @@ For 100M queries of 20 characters and K = 10 that is about 2 × 10^10 small oper
 | Exponential decay (half-life 7 days, as in the diagram) | Smooth, one number per query | Needs periodic re-scoring |
 | Click-through or result quality | Suggests queries that lead to good results | Needs a learning pipeline |
 
+### Things people confuse this with 🟡
+
+| System | What it answers | How it differs from autocomplete |
+| --- | --- | --- |
+| Full-text search ([[Search Engines and Inverted Indexes]]) | Documents that contain your words | Searches inside content after you press Enter; autocomplete only completes the query |
+| Spelling correction | "Did you mean ...?" | Fixes typos; the base autocomplete only matches exact prefixes |
+| [[Case Study - Leaderboard and Top-K]] | Top players or items overall | One global top list; autocomplete keeps a top list per prefix |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - **Precompute over compute-on-read because** finding the top 10 among millions of matching queries per keystroke is too slow at 70k requests/s; the price is staleness (up to one build interval) and memory.
 - **Immutable snapshots over in-place updates because** they make reads lock-free and rollback trivial (point back to the previous version); the price is a full rebuild per interval, softened by the trending overlay.
 - **CDN caching of short prefixes because** short prefixes are both the most frequent and the most shared; the price is up to 5 minutes of staleness for those prefixes and no personalization in cached responses.
-- **When not to use this design:** a catalogue of 50,000 products or city names fits in a PostgreSQL 17 table with a `text_pattern_ops` B-tree index or a `pg_trgm` index, or in a single Redis sorted set. Build the trie pipeline only when query logs, not a fixed list, define the suggestions.
+- **When not to use this design:** a catalogue of 50,000 products or city names fits in a PostgreSQL 17 table with a `text_pattern_ops` B-tree index (lets `LIKE 'tr%'` use an index) or a `pg_trgm` index (matches by three-letter chunks, so it tolerates typos), or in a single Redis sorted set. Build the trie pipeline only when query logs, not a fixed list, define the suggestions.
 
 ```mermaid
 flowchart TD
@@ -527,16 +568,18 @@ flowchart TD
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the read and build paths, the sizing, the API, the data and the trie code. **Next is the advanced part**: real building blocks, failure stories (bad snapshots, harmful or spammy suggestions, privacy leaks), trending queries within minutes, sharding the trie, and Unicode.
+
 - **Well-documented building blocks:**
-	- Elasticsearch's completion suggester stores suggestions in an in-memory finite-state transducer (FST) per segment and is built for fast prefix lookup with weights, documented as optimized for speed rather than flexibility.
+	- Elasticsearch's completion suggester stores suggestions in an in-memory finite-state transducer (FST, a very compact automaton that maps strings to values) per segment and is built for fast prefix lookup with weights, documented as optimized for speed rather than flexibility.
 	- Redis `ZRANGE key [prefix (prefix\xff BYLEX` (since Redis 6.2; `ZRANGEBYLEX` before) returns members in a lexicographic range, a common small-scale autocomplete building block.
 	- Google documents that it removes autocomplete predictions that violate its policies (for example violent, sexually explicit or hateful predictions) and offers a way to report them. Every public autocomplete needs the same filter.
 - **Failure modes → fixes:**
 	- *Bad snapshot (empty or corrupted)* → validate before publishing (node count, top queries for sample prefixes compared with the previous version within a tolerance); nodes verify checksums; keep the previous snapshot to roll back by moving the "latest" pointer.
 	- *Offensive or harmful suggestion goes live* → the block list is checked at serving time, so a removal takes effect in seconds without a rebuild; purge affected CDN paths.
 	- *Trending spam* (bots submit a query to push it into suggestions) → count distinct users or sessions instead of raw submissions, cap per-user contributions, and require a minimum number of distinct users.
-	- *Snapshot reload causes GC pauses or memory doubling* → two snapshots are briefly in memory during the swap; size nodes for 2x the snapshot, or use an off-heap or memory-mapped format.
-	- *Privacy leak* (a rare query with a phone number or name appears as a suggestion) → minimum distinct-user thresholds and PII filters in the aggregator.
+	- *Snapshot reload causes GC pauses (the program freezing while memory is cleaned up) or memory doubling* → two snapshots are briefly in memory during the swap; size nodes for 2x the snapshot, or use an off-heap or memory-mapped format.
+	- *Privacy leak* (a rare query with a phone number or name appears as a suggestion) → minimum distinct-user thresholds and PII (personally identifiable information) filters in the aggregator.
 - **SLOs and monitoring (targets):** server p99 under 10 ms; end-to-end p99 under 100 ms; availability 99.9% (search works without it); CDN hit ratio; snapshot age (alert if older than 3 build intervals); share of empty responses for common prefixes; block-list propagation time.
 
 ## 8. Deep dive 🔴
@@ -546,6 +589,14 @@ flowchart TD
 **In plain words:** a small fast side-path counts the last few minutes and mixes sudden hot queries into the normal list.
 
 A breaking news query must appear within minutes, but a full trie rebuild takes longer than that. A **fast lane** solves it:
+
+```mermaid
+flowchart LR
+    Q["submitted searches"] --> W["5-minute counts"]
+    W --> T{"5x above normal and 500+ users?"}
+    T -- "yes" --> O["small trending overlay on every node"]
+    O --> M["merged with the trie's top 10 at lookup"]
+```
 1. A stream job ([[Stream Processing Basics]]) keeps per-query counts in 5-minute tumbling windows for the last hour.
 2. It flags a query as trending when its current-window rate is well above its baseline (for example 5x its decayed hourly average and at least 500 distinct users, both product thresholds).
 3. Trending queries, at most a few thousand, are pushed to suggest nodes as a small overlay map from prefix to trending queries.
@@ -570,7 +621,7 @@ The top levels (prefixes of 1 to 2 characters) are the hottest and smallest; the
 
 Lower-casing is locale-sensitive (Turkish dotted and dotless i), accents may or may not matter ("café" vs "cafe"), and scripts like Hindi combine characters. Normalize queries the same way in the aggregator and at lookup: Unicode NFC, locale-aware lower-casing, optional accent folding per language.
 
-Store trie edges by rune (as the Go code does with `range` over a string), not by byte, so a multi-byte character is one edge. A mismatch between build-time and request-time normalization shows up as "no suggestions" for real users, so test it with sample inputs in every supported language.
+Store trie edges by rune (Go's name for one Unicode character; as the Go code does with `range` over a string), not by byte, so a multi-byte character is one edge. A mismatch between build-time and request-time normalization shows up as "no suggestions" for real users, so test it with sample inputs in every supported language.
 
 ## 9. Interview questions 🔴
 
@@ -594,6 +645,26 @@ Store trie edges by rune (as the Go code does with `range` over a string), not b
 
 > [!question]- Trie or a prefix → list table in Redis?
 > Both precompute. The trie keeps everything in process memory (fastest, no network hop, rebuilt per node). A Redis table is shared and simpler to update per prefix but adds a network hop and holds one key per prefix. Choose by snapshot size and how many serving nodes you run.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what does each trie node store in this design?
+> Its letter, links to children, and the precomputed top 10 queries for that prefix.
+
+> [!question]- Easy: why is the trie rebuilt offline instead of updated per search?
+> Counting and re-sorting while users type is too slow; an hourly rebuild keeps each lookup a simple walk.
+
+> [!question]- Easy: what does debounce do?
+> Waits about 100 ms after the last key press before sending, so fewer requests go out.
+
+> [!question]- Medium: 6 billion requests a day. What is the average rate?
+> About 69,000 requests a second.
+
+> [!question]- Medium: how does a breaking-news query appear within 15 minutes if the trie is rebuilt hourly?
+> A stream job spots spikes in 5-minute windows and pushes a small trending overlay that is merged at lookup.
+
+> [!question]- Medium: why use `Cache-Control: private` for personalized suggestions?
+> So a CDN never stores one user's personal list and serves it to someone else.
 
 ## 10. Cheat sheet 🟢
 

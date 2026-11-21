@@ -34,6 +34,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+> - [[Back-of-the-Envelope Estimation]]: turning a million drivers pinging every 4 seconds into writes per second.
+> - [[Geospatial Indexing]]: cutting the map into named cells (geohash, H3) so "who is near me?" is a quick lookup.
+
 **From zero, in 60 seconds** 🟢
 
 A ride app must find a free driver near you, in about a second.
@@ -74,6 +79,10 @@ If two riders get the same driver, one of them is left waiting on the kerb.
 | Shard | One slice of the data on its own server | All drivers in one city region |
 | Dispatch | Picking one driver and offering them the trip | Ring the closest free driver |
 | Lock / lease | A short claim that stops two people taking the same thing | Driver marked "offered" for 15 s |
+
+| Surge pricing | A higher fare when riders outnumber free drivers in an area | 1.5× near a stadium after a match |
+| Haversine distance | Straight-line distance on the round earth between two points | 1.3 km "as the crow flies" |
+| ETA | Estimated time for the driver to reach you by road | "Driver arrives in 4 min" |
 
 **Picture it**
 
@@ -120,6 +129,13 @@ Meanwhile one million drivers across the country are each sending a GPS fix ever
 - Availability over strict consistency for the location index (a stale dot on the map is fine; a double booking is not).
 - Out of scope: payments (see [[Case Study - Payment System]]), driver onboarding, ratings, pooled rides.
 
+### Real-life example: booking an auto on Ola or Uber 🟢
+
+You stand outside a Bengaluru metro station and open Ola. Little car and auto icons move around you on the map.
+You see a fare, maybe a bit higher because it is raining and many people are booking. You tap "Book".
+Within a few seconds one driver gets the offer on their phone; if they ignore it, the next closest driver is asked.
+Once someone accepts, you watch their icon drive towards you, updated every few seconds.
+
 **Glossary.** A **ping** is one location update from a driver. A **cell** is a small area of the map with an ID (a geohash string, an H3 index, an S2 cell). **Dispatch** is choosing a driver and sending them an **offer** that they accept or let expire. **ETA** is the estimated time for the driver to reach the pickup by road. **Surge** is a price multiplier applied when demand outruns supply in an area.
 
 ## 2. Mental model 🟢
@@ -138,7 +154,24 @@ flowchart LR
     T --> R["Ring closest free driver"]
 ```
 
+## Common beginner mistakes 🟢
+
+- **Saving every GPS ping as a database row** → 250,000 durable writes a second of data that is stale 4 s later → keep live positions in memory, grouped by cell.
+- **Searching only the rider's own cell** → a driver 20 m away across the cell edge is missed → always scan the 8 neighbouring cells too.
+- **Picking cells smaller than the search radius** → nearby drivers outside the 3 × 3 block are silently ignored → make a cell at least as wide as the radius, then filter by real distance.
+- **Offering one driver to two riders** → both riders wait for the same car → lock the driver with a conditional update before sending the offer.
+- **Ranking by straight-line distance only** → a driver across a river looks close but is 20 minutes away → shortlist by distance, then rank by road ETA.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the map-and-pins idea: drivers grouped by cell, search your cell plus neighbours, lock before offering. **Next we open the box**: the services behind it and the flow of one booking, from driver pings to an accepted ride.
+
+**Step by step (plain):**
+1. Every 4 seconds, driver Ravi's phone says "I am at (12.97, 77.59), free". The location service files him under that cell.
+2. Asha asks for a fare. Pricing checks how busy her cell is and gives her a quote that holds for a couple of minutes.
+3. She books. Dispatch asks for free drivers in her cell and the 8 around it, freshest pings only.
+4. It checks road ETAs for the top 10 and picks Ravi, then marks him `offered` for 15 seconds, only if he is still `available`.
+5. Ravi accepts. The ride becomes `driver_assigned` and both apps start showing live positions.
 
 ```mermaid
 flowchart LR
@@ -159,7 +192,7 @@ flowchart LR
 
 The flow of one booking:
 
-1. **Ping path.** The driver app keeps a long-lived connection to a gateway (see [[Scaling WebSockets]]). Each ping goes to the location service shard that owns the driver's city, which moves the driver to the right cell, and to Kafka for history, surge and analytics.
+1. **Ping path.** The driver app keeps a long-lived connection (one that stays open) to a gateway (see [[Scaling WebSockets]]). Each ping goes to the location service shard that owns the driver's city, which moves the driver to the right cell, and to Kafka for history, surge and analytics.
 2. **Quote.** The rider asks for a quote; pricing reads the current surge multiplier for the pickup cell and returns a `quote_id` valid for a couple of minutes, so the price the rider saw is the price they pay.
 3. **Request.** `POST /v1/rides` with an idempotency key creates a ride in `matching`.
 4. **Candidate search.** Dispatch asks the location service for the k nearest available drivers within a radius (cell plus neighbours, filtered by distance, fresh pings only).
@@ -725,7 +758,7 @@ func TestIndexConcurrentUpdates(t *testing.T) {
 | Choice | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- | --- |
 | Location index | Geohash buckets in RAM (above) | string cell → set of drivers | simple, any language | rectangular cells distort with latitude; edge effects |
-| | H3 hexagons | 16 resolutions; all 6 neighbours are equidistant | surge, supply/demand heat maps, ring searches (`gridDisk`) | library dependency; cells do not nest exactly |
+| | H3 hexagons (Uber's grid of six-sided cells) | 16 resolutions; all 6 neighbours are equidistant | surge, supply/demand heat maps, ring searches (`gridDisk`) | library dependency; cells do not nest exactly |
 | | S2 cells | Hilbert curve over cube faces, 31 levels | covering arbitrary regions with few cells | more complex API |
 | | Redis GEO (`GEOADD`, `GEOSEARCH`) | sorted set scored by a 52-bit geohash | small to mid scale, quick start | every update is a sorted-set write on one shard thread; cluster sharding by city is manual |
 | | PostGIS + GiST index | R-tree-like index on geometry | durable geo data (zones, geofences, places) | poor fit for 250k updates/s of throwaway points |
@@ -734,6 +767,14 @@ func TestIndexConcurrentUpdates(t *testing.T) {
 | | Broadcast offer | offer to several drivers, first accept wins | very low acceptance rates | needs the same conditional update; wastes driver attention |
 | Rider updates | Push over WebSocket | gateway pushes driver position | live map | connection state (see [[Scaling WebSockets]]) |
 | | Polling every 3-5 s | stateless GETs | simple clients | more requests, coarser updates |
+
+### Things people confuse this with 🟡
+
+| System | What it finds | How it differs from ride matching |
+| --- | --- | --- |
+| [[Case Study - Maps and Navigation]] | Routes and travel times on roads | Ride sharing uses its ETAs, but its core job is tracking moving drivers and locking one |
+| "Restaurants near me" search | Fixed places within a radius | Places do not move, so a normal geo index refreshed daily is enough |
+| Food-delivery assignment (Swiggy, Zomato) | A rider for an order | Similar matching, but also waits for food to be ready and can batch two orders |
 
 ## 6. Trade-offs 🟡
 
@@ -751,22 +792,34 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the booking flow, the sizing, the cell-size rule, the tables and the Go cell index. **Next is the advanced part**: real systems and failures, why soft state changes everything, exactly one driver per ride, surge pricing, ETA and the "cars nearby" fan-out.
+
 - **Real systems.** Uber developed and open-sourced H3 to analyse its marketplace data, such as setting dynamic prices (see the H3 introduction on h3geo.org). Redis GEO and PostGIS are the common off-the-shelf choices at smaller scale.
 - **Failure: a location shard restarts.** All its drivers vanish for one ping interval. Fix: dispatch treats "no candidates" as retryable for a few seconds; optionally run a hot replica fed from the same ping stream.
 - **Failure: gateway deploy drops 200,000 connections at once.** Reconnect storm. Fix: drain gradually and make clients reconnect with jittered backoff (see [[Timeouts, Retries and Backoff]]).
 - **Failure: GPS jitter.** Pings jump across a river or into a building. Fix: map-matching (snap to the road graph) and drop pings that imply impossible speed.
-- **Failure: hot cell.** An airport or a stadium after a concert concentrates thousands of drivers and requests in one cell. Fix: finer cells there, or a dedicated FIFO queue for the airport lot (see [[Hot Keys and Hot Partitions]]).
+- **Failure: hot cell.** An airport or a stadium after a concert concentrates thousands of drivers and requests in one cell. Fix: finer cells there, or a dedicated FIFO (first in, first out) queue for the airport lot (see [[Hot Keys and Hot Partitions]]).
 - **What to monitor:** ping ingest rate and lag per shard; percentage of stale drivers; match latency p50/p99; offer acceptance rate; `no_drivers` rate per cell; dispatch conflict rate (conditional update returning 0 rows); ETA error (predicted vs actual pickup time).
 
 ## 8. Deep dive 🔴
 
-**Why soft state changes everything.** A ping has a useful life of about 4 seconds. Replicating it synchronously, fsyncing it, or indexing it in a B-tree spends money protecting data that is about to be overwritten. The location service therefore keeps one copy in memory per shard and accepts losing a few seconds of positions on failure. History goes to Kafka asynchronously for things that need it later: trip traces for fare disputes, ETA model training and surge.
+**Why soft state changes everything.** A ping has a useful life of about 4 seconds. Replicating it synchronously, fsyncing it (forcing it onto disk), or indexing it in a B-tree (the sorted tree structure databases use for indexes) spends money protecting data that is about to be overwritten. The location service therefore keeps one copy in memory per shard and accepts losing a few seconds of positions on failure. History goes to Kafka asynchronously for things that need it later: trip traces for fare disputes, ETA model training and surge.
 
-**Exactly one driver per ride.** Two dispatchers can pick the same driver because both read the in-memory index, which is only a hint. Correctness comes from the conditional update on the durable driver row (`WHERE status = 'available'`), not from the index. That is a compare-and-set: the database's row lock serializes the two updates, and the loser sees zero rows. The same pattern works in Redis with `SET driver:42:offer <ride> NX PX 15000`. After winning, dispatch removes the driver from the in-memory index so the next search skips them. If dispatch crashes after the update but before sending the offer, the 15-second expiry and the sweeper return the driver to `available`. An accept that arrives after expiry fails the `offer_expires_at > now()` check and gets a 409.
+**Exactly one driver per ride.**
+
+```mermaid
+flowchart LR
+    D1["dispatcher 1 picks Ravi"] --> U{"UPDATE ... WHERE status = available"}
+    D2["dispatcher 2 picks Ravi"] --> U
+    U -- "1 row: first one" --> O["offer sent to Ravi"]
+    U -- "0 rows: second one" --> N["try next driver"]
+```
+
+Two dispatchers can pick the same driver because both read the in-memory index, which is only a hint. Correctness comes from the conditional update on the durable driver row (`WHERE status = 'available'`), not from the index. That is a compare-and-set: the database's row lock serializes the two updates, and the loser sees zero rows. The same pattern works in Redis with `SET driver:42:offer <ride> NX PX 15000`. After winning, dispatch removes the driver from the in-memory index so the next search skips them. If dispatch crashes after the update but before sending the offer, the 15-second expiry and the sweeper return the driver to `available`. An accept that arrives after expiry fails the `offer_expires_at > now()` check and gets a 409.
 
 **Surge pricing.** A streaming job reads the ping topic and the request events, and every minute computes, per H3 cell, `demand = requests + app opens` and `supply = available drivers`. The multiplier is a capped, smoothed function of the ratio, so it does not flicker between neighbouring minutes. The quote stores the multiplier with an expiry, so the rider pays what they were shown even if surge changes before booking.
 
-**ETA.** The routing service holds the road graph in memory and uses a speed-up technique such as Contraction Hierarchies so a point-to-point route takes milliseconds rather than a full Dijkstra over millions of nodes. Live traffic adjusts per-segment speeds, and a learned model corrects the remaining bias. Dispatch only calls it for the shortlist.
+**ETA.** The routing service holds the road graph in memory and uses a speed-up technique such as Contraction Hierarchies (shortcut roads computed ahead of time) so a point-to-point route takes milliseconds rather than a full Dijkstra over millions of nodes. Live traffic adjusts per-segment speeds, and a learned model corrects the remaining bias. Dispatch only calls it for the shortlist.
 
 **Cars-nearby fan-out.** 100,000 rider reads per second do not each run a query. Each location shard publishes a coarse snapshot per cell (positions rounded, only available drivers) every 1-2 seconds; rider requests read the snapshot for their cell and neighbours from a cache. Rounding positions also protects driver privacy.
 
@@ -794,6 +847,26 @@ flowchart LR
 
 > [!question]- How do you compute surge without hammering the dispatch path?
 > Off the hot path: a stream job aggregates requests and available drivers per H3 cell per minute from Kafka, smooths and caps the ratio, and writes multipliers to a cache read by pricing. Quotes lock the multiplier for a short time.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: why are driver positions kept in memory, not in a database?
+> They change every 4 seconds; losing one is fine because a fresh ping arrives soon.
+
+> [!question]- Easy: which cells do you search for nearby drivers?
+> The rider's cell and the 8 cells around it.
+
+> [!question]- Easy: what stops two riders getting the same driver?
+> A conditional update that marks the driver `offered` only if they are still `available`.
+
+> [!question]- Medium: 1 million drivers ping every 4 seconds. How many writes a second?
+> 250,000.
+
+> [!question]- Medium: the pickup radius is 2 km. Should you use geohash precision 5 or 7?
+> Precision 5 (about 4.9 km cells); 153 m cells would miss drivers outside the 3 × 3 block.
+
+> [!question]- Medium: a location shard restarts. What happens to its drivers?
+> They vanish for about one ping interval, then their next pings rebuild the index; dispatch retries briefly.
 
 ## 10. Cheat sheet 🟢
 

@@ -32,6 +32,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (first 5 minutes, flowchart and causes A to F), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Latency, Percentiles and Bottleneck Analysis]]: p99 is the time the slowest 1 in 100 requests take, and request time is real work plus waiting.
+> - [[Production Debugging Playbook]]: the fixed order: how bad, what changed, who is affected, then metrics, traces, logs; stop the pain before finding the cause.
+> - [[Metrics and Prometheus]]: Prometheus stores request counts and latency histograms you can query with PromQL.
+
 **From zero, in 60 seconds** 🟢
 
 **Latency** is how long a user waits for an answer.
@@ -80,6 +85,12 @@ You need to find which part of the request is waiting.
 | Timeout | Max time you wait before giving up | Client gives up after 2 s |
 | Trace / span | A record of one request's path; a span is one step | DB query span took 900 ms |
 | GC pause | Time the language runtime spends cleaning memory | Go GC assist slowing requests |
+| Blast radius | How much is affected: which routes, regions, customers | only `/checkout`, all regions |
+| Rollback | Going back to the previous working version | `kubectl rollout undo` |
+| Connection pool | The fixed set of open database connections the app shares | 20 connections, all busy |
+| CPU throttling | The container is paused because it used its CPU limit, even if the machine has spare CPU | limit 1 core, paused 30% of the time |
+| Circuit breaker | Code that stops calling a failing service for a while and fails fast instead | skip `pricing` for 30 s |
+| Retry storm | Retries piling extra load onto an already slow service | 1 click becomes 27 calls |
 
 **Picture it**
 
@@ -116,7 +127,7 @@ Symptoms you will see:
 
 - The alert says "p99 latency above 1 s for 10 minutes", or support says "checkout hangs".
 - Dashboards show request duration rising, often with a rising count of in-flight requests.
-- Users see spinners, timeouts (HTTP 504), mobile apps retry, and some users give up.
+- Users see spinners, timeouts (HTTP 504, "the gateway gave up waiting"), mobile apps retry, and some users give up.
 - Sometimes error rate rises too, because timeouts turn slow responses into failures.
 
 User impact: abandoned carts and sign-ups, support tickets, and a risk of a **retry storm** (clients retry slow requests, which adds load, which makes the system slower).
@@ -128,11 +139,19 @@ Only 1 request in 100 is slow, but a page that makes 20 API calls hits at least 
 > [!tip] Remember
 > A small slow tail becomes a large share of user-visible pain once one page makes many calls.
 
+### Real-life example: a slow seat page 🟢
+
+Think of BookMyShow on the morning a big film opens.
+Most people see the seat map in under a second, but some wait 5 seconds or more and close the app.
+The average load time still looks fine, because most requests are fast.
+The p99 graph shows the problem clearly, and a trace of one slow request shows the time stuck waiting on the seat-lock database.
+That is exactly the hunt this playbook walks through.
+
 ## 2. Mental model 🟢
 
 Think of a restaurant. A meal takes long if the kitchen is slow (CPU), if you wait for a table (queueing), if the kitchen waits for a supplier (a downstream service or database), or if the waiter walks far (network). Different problem, same complaint: "the food is slow."
 
-Analogy limit: a restaurant has a visible queue. In software the queue can be invisible (goroutines blocked on a pool, requests sitting in a kernel socket backlog), so you must measure it.
+Analogy limit: a restaurant has a visible queue. In software the queue can be invisible (goroutines blocked on a pool, requests sitting in a kernel socket backlog, the operating system's list of connections not yet picked up by the app), so you must measure it.
 
 ```mermaid
 flowchart LR
@@ -149,7 +168,17 @@ flowchart LR
 
 Each box adds time. The playbook's job is to find the box whose time grew.
 
+## Common beginner mistakes 🟢
+
+- **Reading code before checking "what changed"** → most slowdowns follow a deploy, config or flag change → check the change list first.
+- **Looking at average latency** → it hides the slow 1% that users complain about → look at p50, p95 and p99 together.
+- **Adding more servers when the database is the bottleneck** → more servers send more queries and make it slower → find the slow piece first.
+- **Raising the connection pool size during a DB overload** → more connections fight for the same CPU and disk → fix the slow query or lock instead.
+- **Calling other services with no timeout** → one slow service ties up every worker → give every outbound call a timeout shorter than your own.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that latency is a sum of steps and that p99 shows the slow tail. **Next we open the box**: the first five minutes, a flowchart for picking the cause, and the checks for each cause (CPU, database, blocked workers, cache, slow dependency, network).
 
 ### 3.1 First 5 minutes
 
@@ -171,7 +200,7 @@ In plain words: do these four things in order, fast. They are about safety, not 
    - One feature is heavy: turn off its feature flag.
    - One dependency is slow: open its circuit breaker, serve cached or degraded data, or fail over.
 4. **Communicate.**
-   - Open an incident channel, name an incident commander, post a first status update in 5 to 10 minutes: what users see, what you know, next update time.
+   - Open an incident channel, name an incident commander (the one person who coordinates and decides), post a first status update in 5 to 10 minutes: what users see, what you know, next update time.
    - Update on a fixed cadence, for example every 15 to 30 minutes, even if the update is "no change".
 
 ```mermaid
@@ -197,6 +226,12 @@ flowchart TD
 
 In plain words: ask which box in the request path grew, then follow the arrow to the likely causes.
 
+**Step by step:**
+1. Are in-flight requests piling up? If yes, something inside is saturated.
+2. Then: is CPU at its limit or throttled? That is cause A.
+3. If not CPU: is database or pool wait time up? Cause B. Neither? Cause C (something blocked inside the app).
+4. If requests are not piling up, open a trace: which outside call is slow? Database (B), cache (D), another service (E), or time spent before the app (F).
+
 ```mermaid
 flowchart TD
     S["Symptom: p99 up"] --> Q1{"In-flight requests and queue depth rising?"}
@@ -216,7 +251,14 @@ flowchart TD
 
 In plain words: split a slow request into labelled pieces. A trace does this automatically. Without tracing, compare metrics at each layer.
 
-**Dashboards and PromQL** (metric names assume common client-library conventions such as `http_request_duration_seconds`; adjust to what your service exports):
+**Step by step:**
+1. Run the p99-per-route query: is it one route or all of them?
+2. Compare p50 with p99: both up means everything is slower; only p99 means a slice.
+3. Check request rate: up means load-driven; flat means each request got slower.
+4. Run `curl -w` from outside to split DNS, connect, TLS and server wait.
+5. Open one slow trace and write one sentence: "the extra time is in X".
+
+**Dashboards and PromQL** (Prometheus's query language; metric names assume common client-library conventions such as `http_request_duration_seconds`; adjust to what your service exports):
 
 ```text
 # p99 latency per route over 5 minutes
@@ -245,7 +287,7 @@ What the results mean:
 | Rate flat or fell, latency rose | Something got slower per request: a deploy, a dependency, data growth |
 | One route only | A query, a code path, or a downstream used only by that route |
 
-**Measure from the outside with `curl -w`** (splits the time into DNS, TCP, TLS, wait for first byte, total):
+**Measure from the outside with `curl -w`** (splits the time into DNS, TCP, TLS, wait for first byte (TTFB, time to first byte), total):
 
 ```bash
 curl -s -o /dev/null -w \
@@ -265,6 +307,13 @@ If `ttfb` minus `tls` is large, the server is slow to respond (queue, CPU, datab
 ### 3.4 Cause A: CPU saturation, throttling and GC
 
 In plain words: if the CPU is full, every request waits its turn. In containers there is an extra trap: the kernel can **throttle** a container that hits its CPU limit, even if the node has idle CPU.
+
+**Step by step:**
+1. Run `kubectl top pod`: is CPU near the pod's limit?
+2. Check throttling: if more than a few percent of CPU periods are throttled, the pod is being paused. (CFS is the Linux scheduler that enforces the limit in 100 ms slices.)
+3. If CPU is high, take a 30-second CPU profile with pprof and look at the top function.
+4. If much time is in the garbage collector, the app allocates too much memory; see the memory playbook.
+5. Fix: scale out or raise the CPU limit now; optimize the hot code later.
 
 ```mermaid
 flowchart LR
@@ -304,7 +353,7 @@ For a Go service, take a CPU profile while it is slow (needs `net/http/pprof` en
 
 ```bash
 go tool pprof -top "http://localhost:6060/debug/pprof/profile?seconds=30"
-# interactive flame graph in the browser:
+# interactive flame graph (one bar per function, wider = more CPU) in the browser:
 go tool pprof -http=:8081 "http://localhost:6060/debug/pprof/profile?seconds=30"
 ```
 
@@ -327,6 +376,13 @@ What results mean:
 ### 3.5 Cause B: Database slow queries, locks and pool exhaustion
 
 In plain words: the database is the most common place where time hides. Three variants: one query got slow (a missing index or a plan change), queries wait on a lock, or the application waits for a free connection from its pool.
+
+**Step by step:**
+1. In the app, check pool wait (`WaitCount`, `WaitDuration` from `db.Stats()`). Rising means requests wait for a connection.
+2. In Postgres, list running queries with `pg_stat_activity`, longest first.
+3. Look for `idle in transaction` sessions or `wait_event_type = Lock`: someone holds a lock.
+4. Find the heaviest queries in `pg_stat_statements` and run `EXPLAIN (ANALYZE, BUFFERS)` on the worst one.
+5. A `Seq Scan` (reading the whole table) where you expected an index means a missing index or stale statistics.
 
 ```mermaid
 sequenceDiagram
@@ -388,7 +444,7 @@ What results mean:
 | Many sessions `idle in transaction` | Application opened a transaction and did not finish it, holding locks | Find and fix the code path, set `idle_in_transaction_session_timeout` |
 | `wait_event_type = Lock` with a blocker | Lock contention | Cancel the blocker (`SELECT pg_cancel_backend(pid)`) if safe, then fix the long transaction |
 | `EXPLAIN` shows `Seq Scan` on a large table where an index was expected | Missing index or a stale statistics or plan change | `ANALYZE table`, add an index (use `CREATE INDEX CONCURRENTLY`) |
-| Connections near `max_connections` | Too many clients | Use a pooler (PgBouncer), cap pool sizes per instance |
+| Connections near `max_connections` | Too many clients | Use a pooler (PgBouncer, a proxy that shares a few real DB connections among many clients), cap pool sizes per instance |
 | App pool wait high but DB looks idle | Pool too small or connections leaked | Check for missing `rows.Close()`, raise pool size carefully |
 | Many near-identical queries per request | N+1 query problem | Batch or join, see [[N+1 Query Problem]] |
 
@@ -400,6 +456,12 @@ Deeper: [[Debugging Database Performance]], [[Query Plans and EXPLAIN]], [[Conne
 ### 3.6 Cause C: Blocked workers, lock contention and goroutine buildup
 
 In plain words: the CPU is idle and the database is quiet, but requests still wait. Usually something inside the process blocks: a mutex held during I/O, a full worker pool, an unbuffered channel nobody reads, or goroutines piling up.
+
+**Step by step:**
+1. Check `go_goroutines`: is it climbing and never falling?
+2. Dump goroutines with pprof (`debug=1`) and look for thousands stuck on the same line.
+3. If they wait on `sync.(*Mutex).Lock`, a mutex (a lock only one goroutine can hold) is held too long, often during slow I/O.
+4. If they wait on `chan receive` or `chan send`, a channel has nobody on the other end.
 
 ```bash
 # Goroutine count and where they are blocked (Go with pprof)
@@ -422,6 +484,12 @@ What results mean: thousands of goroutines blocked on the same line (for example
 ### 3.7 Cause D: Cache problems
 
 In plain words: a cache hides slow work. If the cache is empty, cold, evicting too much, or one key is overloaded, the slow work returns all at once and latency jumps.
+
+**Step by step:**
+1. Check the hit ratio from `redis-cli INFO stats`. A sudden drop means many requests now go to the database.
+2. Check `evicted_keys`: rising means Redis is full and throwing keys out.
+3. Check `SLOWLOG GET 10`: a slow command blocks Redis, which handles one command at a time.
+4. Fix now: warm the cache and protect the database. Later: add TTL jitter (random extra seconds on expiry so keys don't all expire together) and request coalescing (one request refills a key while others wait).
 
 ```mermaid
 flowchart TD
@@ -457,6 +525,13 @@ Deeper: [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Ke
 
 In plain words: your service is only as fast as the slowest service it waits for. Without timeouts, one slow dependency ties up your workers until you run out. With careless retries, you triple the load on a service that is already struggling.
 
+**Step by step:**
+1. In a slow trace, find the long span and the service it calls.
+2. Compare outbound p99 per target: which dependency got slower?
+3. Compare outbound calls to inbound requests: if the ratio rose, retries or a loop are multiplying calls.
+4. Mitigate: open the circuit breaker, cut retries, serve cached or default data.
+5. Later: every outbound call gets a timeout, a few retries with backoff and jitter (random wait), and a bulkhead (its own limited pool of workers).
+
 ```mermaid
 sequenceDiagram
     participant C as Client
@@ -489,6 +564,12 @@ Mitigations: open the circuit breaker ([[Circuit Breaker]]), reduce or stop retr
 
 In plain words: the request spends its time before it even reaches your code, or between your pods.
 
+**Step by step:**
+1. `dig +stats`: is the DNS "Query time" hundreds of milliseconds?
+2. `curl -w`: is `connect` large (network or load balancer) or `tls` large (handshake)?
+3. `ss -ti`: are there many retransmits (packets sent again because they were lost)?
+4. `mtr`: which hop on the path adds the delay?
+
 ```bash
 # DNS resolution time and answer (look at "Query time")
 dig +stats api.example.com
@@ -508,10 +589,10 @@ What results mean:
 
 | Result | Meaning | Action |
 | --- | --- | --- |
-| `Query time` of hundreds of ms, or intermittent timeouts | DNS resolver problem | Check resolver health, caching, `ndots` setting in Kubernetes, CoreDNS load |
+| `Query time` of hundreds of ms, or intermittent timeouts | DNS resolver problem | Check resolver health, caching, `ndots` setting in Kubernetes (how many dots a name needs before it is tried as-is), CoreDNS (Kubernetes's DNS server) load |
 | Large `connect` in `curl -w` | Network path or LB overloaded | Check LB metrics (active connections, surge queue), cross-zone traffic |
-| Large `tls` portion | Handshake cost, no session reuse, or expired or odd certificate chain | Enable keep-alive and TLS session resumption |
-| High retransmits in `ss -ti` | Packet loss | Check node network, noisy neighbour, MTU |
+| Large `tls` portion | Handshake cost, no session reuse, or expired or odd certificate chain | Enable keep-alive (reuse open connections) and TLS session resumption (skip most of the handshake on reconnect) |
+| High retransmits in `ss -ti` | Packet loss | Check node network, noisy neighbour (another workload hogging the same machine), MTU (the largest packet size allowed) |
 | New connection per request | No keep-alive or connection reuse in the HTTP client | Reuse a shared `http.Client` |
 
 Deeper: [[Network Debugging Toolkit - dig, curl, ss, tcpdump]].
@@ -522,7 +603,7 @@ Deeper: [[Network Debugging Toolkit - dig, curl, ss, tcpdump]].
 
 | Cause | Immediate fix | Proper fix | Prevention |
 | --- | --- | --- | --- |
-| Bad deploy | Roll back | Fix and re-release with canary | Canary and automatic rollback on SLO burn, see [[Deployment Strategies - Rolling, Blue-Green, Canary]] |
+| Bad deploy | Roll back | Fix and re-release with canary (send the new version to a small share of traffic first) | Canary and automatic rollback on SLO burn, see [[Deployment Strategies - Rolling, Blue-Green, Canary]] |
 | CPU saturation or throttling | Scale out, raise or drop CPU limit | Profile and optimize the hot path | Autoscaling on CPU or request rate, load tests, see [[Autoscaling]] |
 | Slow query | Kill the long query, add index concurrently | Rewrite query, add right index, fix plan | Query review in CI, slow query log, `pg_stat_statements` alerts |
 | Lock or idle transaction | Cancel the blocker | Shorten transactions, set timeouts | `lock_timeout` and `idle_in_transaction_session_timeout`, see [[Locking - Optimistic vs Pessimistic]] |
@@ -536,7 +617,7 @@ Deeper: [[Network Debugging Toolkit - dig, curl, ss, tcpdump]].
 
 **Incident: checkout latency after a "small" release (an illustrative walkthrough, not a real company's log).**
 
-Setup: a Go `orders-api` behind an ALB, Postgres 17 with PgBouncer, Redis cache, and a call to a `pricing` service. Normal p99 is 300 ms.
+Setup: a Go `orders-api` behind an ALB (AWS's Application Load Balancer), Postgres 17 with PgBouncer, Redis cache, and a call to a `pricing` service. Normal p99 is 300 ms.
 
 | Time | Event |
 | --- | --- |
@@ -596,6 +677,14 @@ Say: "Latency is a sum, so I find which piece grew. I mitigate first, usually by
 
 Related playbooks in this folder cover the neighbouring problems: [[Playbook - Error Rate Spike (5xx)]], [[Playbook - Database Overload and Connection Exhaustion]], [[Playbook - CPU Saturation]], [[Playbook - Memory Leak and OOMKilled]], [[Playbook - Queue and Kafka Consumer Lag]], and [[Playbook - Cache Outage and Stampede]].
 
+### High latency vs error spike vs CPU saturation 🟡
+
+| | High latency (this playbook) | Error rate spike (5xx) | CPU saturation |
+| --- | --- | --- | --- |
+| Main symptom | Requests are slow | Requests fail | CPU near 100% or throttled |
+| First graph | p50 / p99 per route | 5xx rate per route and pod | CPU and throttling per pod |
+| Often caused by | Waiting: DB, locks, pools, slow dependencies | Bad deploy, crashing pods, failing dependency | Hot code, GC, too little capacity |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - **Rollback vs roll forward.** Rolling back is fastest, but not safe if the release included an irreversible database migration. Check migration compatibility first, see [[Rollback and Safe Migrations]].
@@ -609,6 +698,9 @@ Related playbooks in this folder cover the neighbouring problems: [[Playbook - E
 > The safest first action is the one you can undo in minutes: roll back, flip a flag, or scale out.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how to confirm a slowdown, find which step grew, and fix each cause from CPU to network. **Next is the advanced part**: dashboards and alerts that make this fast, and the theory behind the tail (histograms, queueing, coordinated omission, Little's Law, retries, Go GC) that interviewers ask about.
+
 
 Dashboards and alerts that make this playbook faster:
 
@@ -752,6 +844,30 @@ Remedies: reduce allocations (reuse buffers with `sync.Pool`, avoid needless con
 - [ ] Action items have owners and dates: alert improvements, timeouts, tests, runbook updates.
 - [ ] This playbook updated with anything that was missing or wrong.
 - [ ] Error budget impact recorded, see [[SLIs, SLOs, SLAs and Error Budgets]].
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why look at p99 instead of the average?
+> The average hides the slowest requests; p99 shows what the slowest 1 in 100 users feel.
+
+> [!question]- What is the first thing to check after confirming the slowdown?
+> What changed: deploys, config, flags, traffic, dependencies.
+
+> [!question]- A deploy 10 minutes ago lines up with the slowdown. What do you do?
+> Roll it back first, then investigate.
+
+🟡 Medium
+
+> [!question]- p50 is flat, p99 jumped. Everything slow, or a slice?
+> A slice: one route, tenant, shard, pod, GC pauses or retries on one dependency.
+
+> [!question]- Database CPU is low but DB calls take 2 s in the app. Where is the time?
+> Probably waiting for a connection from the app's pool, or waiting on a lock.
+
+> [!question]- 400 requests per second each hold a connection for 50 ms. How many connections are busy on average?
+> 400 × 0.05 = 20 (Little's Law), so a pool of 20 has no spare room.
 
 ## Links
 

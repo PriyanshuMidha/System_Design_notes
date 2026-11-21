@@ -33,6 +33,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5 (variants).
 > - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Load Balancing]]: a load balancer spreads requests over several copies of a service and skips the ones that fail health checks.
+> - [[DNS - Resolution, Records and Caching]]: DNS turns a name into an IP address, and answers are cached for a while (the TTL), so they can be out of date.
+
 **From zero, in 60 seconds** 🟢
 
 Big apps are made of many small programs (**services**) that call each other. Checkout calls payments, payments calls the bank, and so on.
@@ -81,6 +85,12 @@ Service discovery is that contacts app for services whose addresses keep changin
 | TTL / lease | Time after which an entry expires unless renewed | 10 s |
 | Health check | A test that the instance can serve | `GET /healthz` returns 200 |
 | Load balancer | Picks one instance for each call | Round robin |
+| Idempotent | Safe to repeat: doing it twice has the same effect as once | a charge with an idempotency key |
+| Sidecar | A small helper proxy running next to your app in the same pod | Envoy beside the checkout container |
+| Kubernetes Service / ClusterIP | A fixed name and virtual IP that always points at the ready pods | `payments` → `10.96.40.12` |
+| Readiness probe | Kubernetes's "can this pod take traffic now?" check | `GET /ready` every 10 s |
+| etcd / Consul / Eureka | Popular registry products | etcd also stores Kubernetes's own state |
+| Raft | A voting method that keeps several copies of a store in agreement | 3 etcd nodes, 2 must agree |
 
 **Picture it**
 
@@ -127,13 +137,39 @@ Think of a company's internal phone directory that updates itself.
 
 The directory is only as fresh as the last check-in. Someone may have left a minute ago and still be listed, which is why you need to hang up and try someone else when nobody answers.
 
+### Real-life example: placing an order on Swiggy 🟢
+
+When you tap "Place order", the order service must call the payment service, then the restaurant service, then the delivery service.
+Each of those runs as dozens of copies that come and go all evening as traffic rises and falls.
+The order service never stores their addresses. It asks "where is payments right now?" (in Kubernetes, it just calls the name `payments`), and gets a live answer.
+If a payment copy crashed a second ago, the call fails fast and is retried on another copy, so your order still goes through.
+
+## Common beginner mistakes 🟢
+
+- **Writing IP addresses in a config file** → they are dead after the next deploy → look up a service name at runtime.
+- **Retrying every failed call on another instance** → a charge may happen twice → retry only idempotent calls, or send an idempotency key.
+- **Shutting a pod down the instant it gets the stop signal** → some nodes still send it traffic for a moment → fail readiness, wait a few seconds, finish in-flight work, then exit.
+- **Adding Consul or Eureka inside Kubernetes "to be safe"** → you now run two phone books that can disagree → use Kubernetes Services unless you also span VMs or clusters.
+- **Treating "process is up" as "ready"** → a pod with a lost database still gets traffic → use a readiness check that covers what a request needs.
+
+### Service discovery vs things people confuse it with 🟡
+
+| Thing | What it answers | Example |
+| --- | --- | --- |
+| Service discovery | Which copies of `payments` are alive right now? | registry returns 3 pod IPs |
+| DNS | What address does this name point to? | `payments.prod.svc.cluster.local` → a ClusterIP |
+| Load balancer | Which one copy gets this request? | round robin over the 3 pods |
+| Config service | What settings should the app use? | `max_retries = 3` |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that services find each other through a live phone book kept fresh by heartbeats. **Next we open the box**: the four jobs of a registry, who does the lookup, what happens in the seconds after a crash, and how Kubernetes does it all for you. Most subsections start with a plain step-by-step walk; the full detail follows.
 
 ### The four jobs
 
 **In plain words:** a registry entry has a life: get added, keep proving you are alive, get looked up, get removed. Like signing in at a reception desk and signing out when you leave.
 
-1. **Register:** an instance tells the registry "service `payments`, instance `p-7`, at `10.0.1.5:8080`". Either the instance does it itself (**self-registration**, as with Eureka clients) or the platform does it for it (**third-party registration**, as when Kubernetes adds a ready pod to the Service's EndpointSlices).
+1. **Register:** an instance tells the registry "service `payments`, instance `p-7`, at `10.0.1.5:8080`". Either the instance does it itself (**self-registration**, as with Eureka clients) or the platform does it for it (**third-party registration**, as when Kubernetes adds a ready pod to the Service's EndpointSlices, which are Kubernetes's lists of pod addresses for a Service).
 2. **Stay healthy:** the entry stays only while it is proven alive. Either the instance renews a **lease** (heartbeat with a TTL), or the registry **actively probes** it (an HTTP `GET /ready`, a TCP connect).
 3. **Look up:** a caller asks for the healthy instances of `payments`, usually caching the answer and watching for changes.
 4. **Deregister:** on graceful shutdown the instance removes itself first, so callers stop sending it traffic before it stops listening. If it crashes, the lease or failed probe removes it later.
@@ -141,6 +177,13 @@ The directory is only as fresh as the last check-in. Someone may have left a min
 ### Client-side vs server-side discovery
 
 **In plain words:** either the caller reads the phone book itself and dials a copy directly (client-side), or the caller always dials one fixed number and a receptionist forwards the call (server-side).
+
+**Step by step:**
+1. Client-side: checkout asks the registry "who serves payments?" and gets 3 addresses.
+2. Checkout keeps the list, picks `10.0.1.6` itself (say round robin) and calls it directly.
+3. Server-side: checkout always calls one fixed address, `payments.prod.svc`.
+4. A proxy behind that address (kube-proxy, Envoy or an ALB) watches the registry and forwards the call to `10.0.2.9`.
+5. Client-side saves a hop but needs a smart library in every language; server-side keeps clients dumb but runs a proxy layer.
 
 ```mermaid
 flowchart LR
@@ -167,6 +210,13 @@ flowchart LR
 ### A lease-based registry, step by step
 
 **In plain words:** a **lease** is a short-term booking: "this address is valid for 10 more seconds." Every heartbeat extends the booking. The diagram below walks through a crash and shows the few seconds where callers still have the dead address.
+
+**Step by step:**
+1. Pod p-7 registers at time 0. Its lease ends at 10 s.
+2. Every 3 s it sends a heartbeat, and the end moves to "now + 10 s".
+3. At 30 s it sends its last heartbeat. At 31 s it crashes. The lease still runs to 40 s.
+4. At 35 s checkout still has p-7 in its list, calls it, and gets "connection refused".
+5. Checkout retries on p-8 (safe because the call is idempotent). At 40 s p-7 disappears from the list.
 
 ```mermaid
 sequenceDiagram
@@ -196,6 +246,13 @@ The timeline shows the unavoidable window: between the crash (31 s) and the leas
 
 **In plain words:** in Kubernetes you never build any of this yourself. The platform keeps the phone book (EndpointSlices), gives each service a fixed name and address, and quietly rewrites your connection to a healthy copy.
 
+**Step by step:**
+1. You create a Service called `payments`. It gets a fixed virtual IP, `10.96.40.12`, and a DNS name.
+2. Each payments pod that passes its readiness probe is added to the Service's address list.
+3. Checkout looks up `payments.prod.svc.cluster.local` and gets `10.96.40.12`.
+4. It connects. kube-proxy (a program on every node that writes the node's traffic rules) rewrites the connection to one ready pod's real IP.
+5. A pod fails readiness? It is dropped from the list and gets no new connections, but it is not restarted.
+
 ```mermaid
 flowchart TD
     D["Deployment payments<br/>(12 pods)"] --> P["Pods with label app=payments"]
@@ -210,7 +267,7 @@ flowchart TD
 
 - A **Service** selects pods by label and gets a stable virtual IP (ClusterIP) and DNS name `<service>.<namespace>.svc.cluster.local`.
 - The EndpointSlice controller keeps the list of matching pods' IPs, marking each one ready or not ready based on its **readiness probe**. Pods that fail readiness stay running but stop receiving traffic.
-- **kube-proxy** on each node programs iptables or IPVS rules so that a connection to the ClusterIP is sent to one of the ready pod IPs. This is server-side discovery, done in the kernel of the caller's own node.
+- **kube-proxy** on each node programs iptables or IPVS rules (Linux kernel features that rewrite where network packets go) so that a connection to the ClusterIP is sent to one of the ready pod IPs. This is server-side discovery, done in the kernel of the caller's own node.
 - A **headless Service** (`clusterIP: None`) skips the virtual IP: DNS returns the pod IPs directly, so clients can do client-side balancing. gRPC clients often need this (section 8).
 
 See [[Kubernetes Fundamentals]] for Services and probes in more depth.
@@ -482,7 +539,7 @@ Take a TTL of 10 s and a heartbeat every 3 s:
   Consul goes further and runs health checks on a local agent on each node, so only status changes reach the servers.
 - **Caller staleness:** if callers cache the list for 5 s, the worst case for sending to a crashed instance becomes 10 + 5 = **15 s**. Watching the registry for changes (etcd watch, Consul blocking queries, Kubernetes watches) brings the cache delay down to the push latency.
 
-Shorter TTLs detect failures faster but turn a 2-second GC pause or network blip into a false removal; a mass expiry during a network partition can drop most of a healthy fleet.
+Shorter TTLs detect failures faster but turn a 2-second GC pause (the program freezing while it frees unused memory) or network blip into a false removal; a mass expiry during a network partition (some machines can no longer reach the others) can drop most of a healthy fleet.
 
 Eureka's defaults (30 s renewals, 90 s expiry) sit at the slow and safe end; Kubernetes readiness probes default to every 10 s, with 3 failures before a pod is marked not ready.
 
@@ -491,20 +548,22 @@ Eureka's defaults (30 s renewals, 90 s expiry) sit at the slow and safe end; Kub
 | Option | How it works | Health | Consistency | Use when |
 | --- | --- | --- | --- | --- |
 | Static config / DNS A records | Fixed names or IPs, DNS TTL caching | None built in | Stale until TTL and client caches expire | Few, stable endpoints (databases, partners) |
-| DNS SRV records | DNS returns host + port + weight | Depends on what updates DNS | As stale as DNS caching | Clients can read SRV; ports vary |
+| DNS SRV records (a DNS record type that also carries the port) | DNS returns host + port + weight | Depends on what updates DNS | As stale as DNS caching | Clients can read SRV; ports vary |
 | Kubernetes Service + EndpointSlices | Platform registers pods; kube-proxy or DNS routes | Readiness probes | Watch-based, seconds | Everything already runs in Kubernetes |
 | Consul | Agents on every node; servers replicate with Raft; DNS (port 8600) and HTTP API | Agent-run checks (HTTP, TCP, TTL, script) | CP catalog, with stale reads allowed | Mixed VMs and containers, multiple data centres |
 | etcd | Keys under a prefix, attached to TTL leases; clients watch the prefix | Lease keep-alives | Linearizable (Raft) | You already run etcd; Go services |
-| ZooKeeper | Ephemeral znodes disappear when the session ends | Session heartbeats | Linearizable writes (ZAB) | JVM ecosystems already on ZooKeeper (Kafka before KRaft, HBase) |
+| ZooKeeper | Ephemeral znodes (entries in ZooKeeper's tree that vanish with their owner) disappear when the session ends | Session heartbeats | Linearizable writes (ZAB) | JVM ecosystems already on ZooKeeper (Kafka before KRaft, HBase) |
 | Eureka | Client-side registry, peers replicate asynchronously | Client renewals (30 s), expiry (90 s) | AP: prefers stale data to no data | Spring Cloud / Netflix-style stacks |
 | Service mesh (Envoy + xDS) | Control plane pushes endpoints (EDS) to sidecar proxies | Active and passive (outlier detection) | Eventually consistent push | Need mTLS, retries, zone-aware routing for many languages |
 | Cloud service registries (AWS Cloud Map, ALB target groups) | Managed registry or LB health checks | LB health checks | Managed | You are on one cloud and want no extra servers |
 
-**CP vs AP registries.** etcd, ZooKeeper and Consul's catalog use consensus (see [[Consensus - Raft and Paxos]]), so during a partition the minority side cannot register or renew. Eureka chose availability: each node keeps serving what it has, and its **self-preservation** mode stops expiring instances when renewals drop sharply, on the theory that the network, not the fleet, is broken.
+**CP vs AP registries** (CP = stay correct even if some callers get errors during a network split; AP = keep answering, maybe with old data). etcd, ZooKeeper and Consul's catalog use consensus (see [[Consensus - Raft and Paxos]]), so during a partition the minority side cannot register or renew. Eureka chose availability: each node keeps serving what it has, and its **self-preservation** mode stops expiring instances when renewals drop sharply, on the theory that the network, not the fleet, is broken.
 
 For discovery, slightly stale data is usually better than no data, because callers already retry on dead instances.
 
 ## 6. Trade-offs and when not to use 🔴
+
+> 🟡 → 🔴 **You now know** how a registry lives, how lookups work and how to pick TTLs. **Next comes the senior view**: what each style costs you, what breaks in real fleets (dying pods, gRPC pinning, registry outages), and how removals actually travel through Kubernetes.
 
 - **Client-side discovery puts logic in every client.** Balancing, retries and caching must be implemented (or a library maintained) for each language. Server-side discovery centralises that at the cost of a proxy layer and, without sidecars, an extra hop.
 - **DNS is a weak discovery protocol on its own.** Clients and libraries cache answers, some longer than the TTL, and DNS carries no health detail. It works when the name points to something stable (a ClusterIP or a load balancer) that handles changes behind it.
@@ -516,12 +575,12 @@ For discovery, slightly stale data is usually better than no data, because calle
 
 - **Real systems:**
 	- **Kubernetes** is the most common discovery system today: Services, EndpointSlices (by default at most 100 endpoints per slice, so large services have many slices and updates touch only one), CoreDNS, and kube-proxy.
-	- **Consul** runs an agent on every node that performs health checks locally and gossips membership (Serf), while a small set of servers keeps the catalog with Raft. Services are reachable through its DNS interface (`payments.service.consul`, port 8600) or the HTTP API on port 8500.
+	- **Consul** runs an agent on every node that performs health checks locally and gossips membership (Serf; gossip means each node passes news to a few random others until everyone knows), while a small set of servers keeps the catalog with Raft. Services are reachable through its DNS interface (`payments.service.consul`, port 8600) or the HTTP API on port 8500.
 	- **etcd** is often used directly by Go services: register as a key under `/services/payments/` attached to a lease, keep it alive, and have callers watch the prefix.
 	- **Netflix Eureka** popularised client-side discovery with Ribbon for balancing.
 	- **gRPC** has pluggable name resolvers and load-balancing policies. Its default policy is `pick_first`; `round_robin` must be enabled in the service config. It also supports xDS, so a control plane can push endpoints and policies to proxyless gRPC clients.
 - **Failure modes and fixes:**
-	- *Traffic to pods that are shutting down* → on SIGTERM, fail readiness first, keep serving in-flight requests, and stop only after endpoint removal has propagated; in Kubernetes a short `preStop` sleep covers the delay before kube-proxy rules update.
+	- *Traffic to pods that are shutting down* → on SIGTERM, fail readiness first, keep serving in-flight requests, and stop only after endpoint removal has propagated; in Kubernetes a short `preStop` sleep (a hook that runs before the stop signal reaches the app) covers the delay before kube-proxy rules update.
 	- *Long-lived connections ignore new instances* → HTTP/2 and gRPC keep one connection per backend open, so kube-proxy's per-connection balancing pins all traffic to the pods that existed when the connection opened. Use a headless Service with client-side `round_robin`, a mesh, or periodically recycle connections (gRPC servers can set a maximum connection age).
 	- *Registry outage* → callers keep their last known list and keep working; alert on stale caches.
 	- *Mass expiry during a network blip* → longer TTLs, Eureka-style self-preservation, or a floor on how many instances can be removed at once.
@@ -610,6 +669,26 @@ The risk is overloading a zone that has fewer instances, so these features only 
 - Shutdown order: fail readiness → wait for propagation → drain → exit.
 - gRPC over a ClusterIP pins to one pod: use headless + `round_robin`, xDS, or a mesh.
 - Cache the last good list; slightly stale beats unavailable.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) Why not write a service's IP address in a config file?
+> Pods get new IPs on every deploy, crash and scale-out, so the address goes stale fast.
+
+> [!question]- (easy) What is a heartbeat for?
+> It proves an instance is still alive; when heartbeats stop, its entry expires.
+
+> [!question]- (easy) What is the difference between client-side and server-side discovery?
+> Client-side: the caller looks up the list and picks. Server-side: the caller hits one fixed address and a proxy picks.
+
+> [!question]- (medium) TTL 10 s, heartbeat every 3 s, callers cache for 5 s. Worst case to stop calling a dead pod?
+> About 10 + 5 = 15 seconds.
+
+> [!question]- (medium) Why does a gRPC client behind a ClusterIP often hit only one pod?
+> It keeps one long connection, and kube-proxy balances connections, not requests.
+
+> [!question]- (medium) What should a pod do when it gets SIGTERM?
+> Fail readiness, keep serving a few seconds while removal spreads, finish in-flight work, then exit.
 
 ## Links
 

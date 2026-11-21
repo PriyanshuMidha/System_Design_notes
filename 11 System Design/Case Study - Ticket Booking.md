@@ -32,6 +32,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Transactions and ACID]]: a transaction saves several changes all together or not at all.
+> - [[Locking - Optimistic vs Pessimistic]]: two ways to stop two people changing the same row at once.
+> - [[Isolation Levels and MVCC]]: how much one running transaction can see of another's unfinished work; PostgreSQL's default is READ COMMITTED.
+> - [[Idempotency and Idempotency Keys]]: a unique key on a request makes a retry safe.
+
 **From zero, in 60 seconds** 🟢
 
 A ticket site like BookMyShow sells seats for a show, and each seat can be sold only once.
@@ -78,6 +84,10 @@ If someone picks a seat and then walks away, it must become free again.
 | Idempotency key | An id that makes a retried request safe to repeat | Same payment not charged twice |
 | Waiting room | A queue that lets buyers in at a safe rate | "You are number 4,512 in line" |
 
+| On-sale | The moment tickets for a big event go on sale | Coldplay tickets at 12:00 noon |
+| Webhook | The payment provider calling our server later with the result | "payment for hold H9 succeeded" |
+| Seat map hint | A cached, possibly few-seconds-old picture of free seats | F7 shows free but was just taken |
+
 **Picture it**
 
 ```mermaid
@@ -112,7 +122,7 @@ SELECT status FROM show_seats WHERE show_id = 501 AND seat_id = 'F7';  -- both s
 UPDATE show_seats SET status = 'BOOKED', user_id = $me WHERE show_id = 501 AND seat_id = 'F7';
 ```
 
-Both transactions pass the check and both write; the second write silently overwrites the first, and two people arrive at the cinema with tickets for F7. Wrapping this in a transaction does **not** fix it at PostgreSQL's default isolation level, READ COMMITTED: both transactions still read "AVAILABLE" before either writes.
+Both transactions pass the check and both write; the second write silently overwrites the first, and two people arrive at the cinema with tickets for F7. Wrapping this in a transaction does **not** fix it at PostgreSQL's default isolation level, READ COMMITTED (each statement sees only data committed before it started): both transactions still read "AVAILABLE" before either writes.
 
 The fix is to make the check and the write one atomic statement, or to lock the row before reading, as shown below. (See [[Isolation Levels and MVCC]] for why.)
 
@@ -132,6 +142,13 @@ A second problem appears when a popular concert opens: 1 million people arrive i
 - Holds expire reliably even if every background job is down.
 
 **Out of scope:** pricing rules, dynamic pricing, theatre-side box-office integration details.
+
+### Real-life example: booking a movie on BookMyShow 🟢
+
+You pick a 9 pm show on BookMyShow and tap seats F7 and F8. A timer starts: "complete payment in 10:00".
+If your friend, on another phone, taps F7 a second later, they see "seat not available".
+If you get distracted and the timer runs out, F7 and F8 turn free again for others.
+For a huge concert on-sale, you may first land in a queue: "You are number 4,512 in line".
 
 ## 2. Mental model 🟢
 
@@ -159,7 +176,24 @@ stateDiagram-v2
     BOOKED --> [*]: show starts
 ```
 
+## Common beginner mistakes 🟢
+
+- **Read the seat, then write "booked" in a second step** → two buyers both see F7 free and both book it → use one `UPDATE ... WHERE status = 'AVAILABLE'` and check the row count.
+- **Trusting the seat map** → it is a few seconds old → let the hold step decide and show "pick another seat" on a 409.
+- **Depending on a background job to free expired holds** → if the job is down, seats stay locked → make the hold statement treat an expired hold as free.
+- **Calling the payment provider inside the database transaction** → seat rows stay locked for seconds → hold, commit, then pay, then confirm.
+- **Letting a million buyers hit the booking service at once** → everything crashes for everyone → put a waiting room in front for big on-sales.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the core rule: one conditional update picks a single winner per seat, and holds expire by time. **Next we open the box**: the services, the hold-pay-confirm path, and how the seat map is read.
+
+**Step by step (plain):**
+1. Asha opens show 501. The seat layout comes from the CDN; which seats are free comes from a cache.
+2. She taps F7 and F8. The booking service runs one update: take both, only if each is free or its hold has expired. Both change, so she holds them until 21:10.
+3. She pays. The payment uses the hold ID as its idempotency key.
+4. The payment provider's webhook says "paid". The service turns F7 and F8 into a booking, only if her hold is still live.
+5. An event tells caches, ticketing and notifications. Asha gets a QR code.
 
 ```mermaid
 flowchart LR
@@ -179,11 +213,11 @@ flowchart LR
     EV --> TKT["Ticket and notification workers"]
 ```
 
-1. **Static seat layout** (rows, seat positions, categories) never changes per show, so it is served from the CDN. Only availability is dynamic.
+1. **Static seat layout** (rows, seat positions, categories) never changes per show, so it is served from the CDN (servers near users that cache files). Only availability is dynamic.
 2. **Seat map service** returns availability from a cache that is updated by booking events and expires after a few seconds; it is a hint, not the truth.
 3. **Booking service** owns the truth in PostgreSQL. A hold is a conditional update over the requested seats; a confirmation is a conditional update over the hold's seats.
 4. **Payment service** creates a payment with an idempotency key derived from the hold ID and handles the provider's webhook. See [[Case Study - Payment System]].
-5. **Events** leave through the outbox pattern ([[Transactional Outbox and CDC]]) to refresh caches, issue tickets and send notifications.
+5. **Events** leave through the outbox pattern (the event row is saved in the same transaction, then sent; [[Transactional Outbox and CDC]]) to refresh caches, issue tickets and send notifications.
 
 **Write path: hold, pay, confirm.**
 
@@ -626,6 +660,14 @@ func TestConfirmIsIdempotent(t *testing.T) {
 | Distributed lock per seat | Lock service grants a lease per seat | Rarely justified here | Extra system; needs fencing tokens to be safe, see [[Distributed Locks and Fencing Tokens]] |
 | General-admission counter | `UPDATE sections SET sold = sold + $n WHERE sold + $n <= capacity` | Standing areas, no seat numbers | One very hot row; split into sub-counters |
 
+### Things people confuse this with 🟡
+
+| System | What is sold | How it differs from ticket booking |
+| --- | --- | --- |
+| [[Case Study - Hotel Reservation]] | A room type over several nights | Counts per night instead of one named seat; a stay spans many rows |
+| [[Case Study - Flash Sale and E-commerce Checkout]] | Any unit of one product | One hot counter instead of many distinct seats |
+| [[Movie Ticket Booking]] (LLD) | The same domain as classes and objects | Object design in code; this note is about the distributed system and the database |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - **Hold duration is a business trade-off.** Long holds (15 minutes) give slow payers time but keep seats unsellable while abandoned. Short holds (5 minutes) cause more expired-hold refunds. Pick it from payment-time data; 8 to 10 minutes is common.
@@ -642,11 +684,13 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the hold, pay and confirm path, the sizing, the API, the SQL and the Go model. **Next is the advanced part**: failure stories, why no sweeper is needed (and why you still run one), hot shows, best-available seats, the waiting room, and Redis in front for huge on-sales.
+
 - **Failure modes → fixes:**
 	- Payment succeeds after the hold expired → confirmation fails the `held_until > now()` check; refund automatically and tell the user. Never extend a hold silently after another buyer may have taken the seat.
 	- Payment webhook delivered twice, or the user double-clicks "pay" → idempotency key per hold at the payment provider; `bookings.hold_id` is `UNIQUE`; confirmation looks up the existing booking first. See [[Idempotency and Idempotency Keys]].
 	- Payment outcome unknown (provider timed out) → keep the booking `PENDING_PAYMENT`, query the provider or wait for the webhook, and run a reconciliation job; the hold may be extended only while the outcome is unknown and only if the seat is still held by this hold.
-	- Deadlock between two multi-seat holds touching the same seats in different order → PostgreSQL detects it and aborts one with SQLSTATE 40P01; retry with backoff (see [[Timeouts, Retries and Backoff]]), and sort seat IDs to reduce the chance.
+	- Deadlock between two multi-seat holds touching the same seats in different order → PostgreSQL detects it and aborts one with SQLSTATE 40P01 (the deadlock error code); retry with backoff (see [[Timeouts, Retries and Backoff]]), and sort seat IDs to reduce the chance.
 	- On-sale overload → virtual waiting room with signed admission tokens, per-user rate limits at the gateway ([[Rate Limiting - Algorithms and Distributed Design]]), and shedding seat-map refreshes before booking requests ([[Load Shedding and Graceful Degradation]]).
 	- Bots buying out inventory → waiting-room tokens bound to a session, per-account seat limits, and bot detection, see [[API Abuse and Bot Protection]].
 - **What to monitor:**
@@ -664,9 +708,19 @@ flowchart LR
 
 **Best-available seat selection.** Many buyers do not pick seats; they ask for "2 best seats in Gold". Doing that in the database with a `SELECT ... FOR UPDATE SKIP LOCKED LIMIT 2` over free seats ordered by a quality score lets concurrent buyers pick different seats without waiting on each other. Contiguity (adjacent seats) needs a smarter query or an in-memory allocator per show.
 
-**The waiting room.** Buyers who arrive before the sale get a random position (so arriving at 09:59:59 does not beat arriving at 09:58); afterwards, arrivals are first come, first served. The waiting room issues a signed, short-lived admission token at a rate matched to the booking path's tested capacity, and the gateway rejects booking calls without a valid token. When inventory reaches zero, the waiting room tells everyone still queued, which removes the remaining load entirely.
+**The waiting room.**
 
-**Redis in front of the database for extreme on-sales.** A Lua script runs atomically, so it can first check that every requested seat key is absent and only then `SET` all of them with `EX 600` as the hold TTL; no other command can run between the check and the sets. Only buyers who win in Redis go on to the database `UPDATE`, which still enforces the rule. Because Redis Cluster runs a script only when all its keys are in one hash slot, name keys with a hash tag such as `seat:{501}:F7` so one show's seats share a slot.
+```mermaid
+flowchart LR
+    A["1 M buyers arrive"] --> Q["waiting room: random spot if early"]
+    Q --> T["admitted ~500 a second with a signed token"]
+    T --> G["gateway checks token + rate limit"]
+    G --> B["booking service"]
+```
+
+Buyers who arrive before the sale get a random position (so arriving at 09:59:59 does not beat arriving at 09:58); afterwards, arrivals are first come, first served. The waiting room issues a signed, short-lived admission token at a rate matched to the booking path's tested capacity, and the gateway rejects booking calls without a valid token. When inventory reaches zero, the waiting room tells everyone still queued, which removes the remaining load entirely.
+
+**Redis in front of the database for extreme on-sales.** A Lua script (a small program Redis runs as one step) runs atomically, so it can first check that every requested seat key is absent and only then `SET` all of them with `EX 600` as the hold TTL; no other command can run between the check and the sets. Only buyers who win in Redis go on to the database `UPDATE`, which still enforces the rule. Because Redis Cluster runs a script only when all its keys are in one hash slot, name keys with a hash tag such as `seat:{501}:F7` so one show's seats share a slot.
 
 **Twin at class level.** The object model (Show, Seat, SeatLock, Booking, strategies for pricing) is designed in [[Movie Ticket Booking]]; this note owns the distributed parts.
 
@@ -692,6 +746,26 @@ flowchart LR
 
 > [!question]- How is the booking flow kept consistent with the payment provider without 2PC?
 > As a saga: hold (local transaction) → pay (provider call with idempotency key = hold ID) → confirm (local transaction) or compensate (release the hold, refund). Events leave through an outbox.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is a hold?
+> A short claim on a seat, such as 10 minutes, that expires if you do not pay.
+
+> [!question]- Easy: two people tap F7 in the same millisecond. Who gets it?
+> Whichever conditional update runs first; the other changes 0 rows and is told the seat is gone.
+
+> [!question]- Easy: why can the seat map be slightly stale?
+> The hold step re-checks the database, so the map is only a hint.
+
+> [!question]- Medium: why does a plain transaction with SELECT then UPDATE not stop double booking at READ COMMITTED?
+> Both transactions read "AVAILABLE" before either writes, so both pass the check.
+
+> [!question]- Medium: the sweeper job is down. Do expired holds block seats?
+> No; the hold statement treats `held_until <= now()` as free, so expiry works without the sweeper.
+
+> [!question]- Medium: payment arrives after the hold expired and someone else took the seat. What happens?
+> Confirmation fails the `held_until > now()` check, so the payment is refunded and the user is told.
 
 ## 10. Cheat sheet 🟢
 

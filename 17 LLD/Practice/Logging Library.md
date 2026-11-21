@@ -34,6 +34,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code) and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs) and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Chain of Responsibility and Pipelines]]: a request passes through a line of small steps, and each step can stop it or pass it on.
+> - [[Strategy and Template Method]]: a rule behind an interface you can swap, here "text or JSON" and "console or file".
+> - [[Decorator and Middleware]]: a wrapper with the same interface that adds behaviour, here the async buffer.
+> - [[Concurrency for LLD]]: goroutines, mutexes and channels; many goroutines will log at the same time.
+
 **From zero, in 60 seconds** 🟢
 
 When your program runs, you want a written diary of what happened, like "payment failed for order o1". A logging library turns one call into one neat line. Each line has a **level**, such as info, warning or error, and low levels can be switched off. Each line can also carry key-value **fields**, like `order_id=o1`. The library then writes the line to one or more places: the screen, a file or a log server. Formats and places are plug-in parts, so you can swap them.
@@ -68,6 +74,11 @@ A logging library does that without slowing the request down.
 | Bounded buffer | A queue with a fixed size limit | Channel of 1024 entries |
 | `context.Context` | Go value passed down a request carrying deadlines and values | Holds the request ID |
 | Atomic load | Reading a shared number safely without a lock | Checking the current minimum level |
+| Facade | One simple front object that hides many parts | `logger.Info(...)` hides filter, format and outputs |
+| Sink | The final place log bytes land | A file, stdout or a log server |
+| Torn line | Two log lines mixed into each other because two writers wrote at once | `INFO paiERROR db...d` |
+| Backpressure | What happens when a slow output cannot keep up | Buffer full: drop and count, or wait |
+| Redaction | Hiding secret data before it is written | Card `4111...` becomes `****` |
 
 **Picture it**
 
@@ -115,13 +126,13 @@ It must be safe to call from many goroutines and must not slow the request path.
 
 What it really tests: splitting one call into small swappable steps (filter, format, write) behind clean interfaces, and handling concurrency and backpressure: torn lines, a slow sink, and flushing on shutdown.
 
-An example line for a payment webhook failure, as the text formatter below prints it: `2026-10-10T10:00:00Z ERROR webhook processing failed provider=razorpay event_id=evt_123 request_id=req_999`. The logger filters it by level, formats it once, and sends it to the console, a file and an observability sink.
+An example line for a payment webhook failure, as the text formatter below prints it: `2026-10-10T10:00:00Z ERROR webhook processing failed provider=razorpay event_id=evt_123 request_id=req_999`. The logger filters it by level, formats it once, and sends it to the console, a file and an observability sink (a tool that collects logs and metrics for searching).
 
 ## Step 1: Clarify requirements 🟢
 
 Questions to ask, with the assumptions this design makes:
 
-- A library in one process, or a central log service? *An in-process library like `log/slog` or zap; shipping to ELK or Loki is a sidecar agent's job.*
+- A library in one process, or a central log service? *An in-process library like `log/slog` or zap; shipping to ELK or Loki (log search systems) is a sidecar agent's job (a small helper program running next to the app).*
 - Which levels, changeable without a restart? *DEBUG < INFO < WARN < ERROR < FATAL; `SetLevel` works at runtime.*
 - Text, JSON or both? *Both, chosen per logger: JSON in production, text locally. JSON keys keep their order.*
 - Which destinations? *Console and file now, remote later through the same interface.*
@@ -151,9 +162,9 @@ The use case to code: **log from many goroutines through filter → format → a
 
 | Entity | Key fields | Why it exists |
 | --- | --- | --- |
-| `Level` | int32 enum | Ordering, so the filter is one comparison |
+| `Level` | int32 enum (a small fixed list of named values) | Ordering, so the filter is one comparison |
 | `Field` | Key, Value | Structured key/value; searchable, unlike `Sprintf` text |
-| `Entry` | Time, Level, Message, Fields | One immutable event moving through the chain |
+| `Entry` | Time, Level, Message, Fields | One immutable (never changed after creation) event moving through the chain |
 | `Formatter` (interface) | `Format(Entry) ([]byte, error)` | Text and JSON are strategies |
 | `Appender` (interface) | `Append([]byte)`, `Close()` | A destination; console, file and buffer wrap `io.Writer` |
 | `AsyncAppender` | inner Appender, channel, dropped counter | A decorator that moves slow writes to a goroutine |
@@ -163,6 +174,8 @@ The use case to code: **log from many goroutines through filter → format → a
 Modelling insight: **format once, write many.** `Formatter` and `Appender` are separate strategies, so the same JSON bytes go to a file and to the network, and a new destination never touches formatting. Weak answers put `fmt.Println` inside each appender.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know levels, fields, formatters and appenders, and the rule "filter first, format once, write many". Next we open the box: how the chain links up, the method set, the patterns, and the Go code with the async appender.
 
 ```mermaid
 classDiagram
@@ -274,7 +287,7 @@ logging/
 cmd/demo/main.go  -> builds the Logger from config, defers Close
 ```
 
-- `model.go` is data only, with no I/O.
+- `model.go` is data only, with no I/O (no reading or writing to files or network).
 - `formatter.go` and `appender.go` are the two strategy families; a `KafkaAppender` goes in `appender.go`.
 - `handler.go` holds the chain links; a `Sampler` or `Redactor` goes there.
 - `logger.go` and `context.go` are the only files application code touches.
@@ -288,7 +301,7 @@ cmd/demo/main.go  -> builds the Logger from config, defers Close
 | [[Decorator and Middleware]] | `AsyncAppender` wraps any `Appender` | Buffering and a worker without changing the sink |
 | [[Facade (vs Mediator)]] | `Logger` | The app calls `Info` and never sees the chain |
 | [[Factory and Abstract Factory]] | `New(cfg)`, `NewFileAppender` | One place builds the chain with defaults |
-| Bridge, see [[Rare GoF Patterns in Go]] | `slog.Logger` front end over a `slog.Handler` back end | The API and the implementation vary independently |
+| Bridge (front end and back end can be swapped separately), see [[Rare GoF Patterns in Go]] | `slog.Logger` front end over a `slog.Handler` back end | The API and the implementation vary independently |
 | [[Singleton and sync.Once]] (carefully) | not in the library | A global logger is convenient but hard to test |
 
 Not used: a global singleton inside the library (build it in `main` and inject it, so each test gets a buffer-backed logger), and Observer (appenders are a fixed fan-out list set at construction).
@@ -302,7 +315,7 @@ Not used: a global singleton inside the library (build it in `main` and inject i
 
 > [!warning] Four details in this code
 > - **JSON keeps field order.** A formatter that builds a `map` loses the order, because `encoding/json` sorts map keys, so `request_id` could land anywhere. Fields are encoded one by one: `time`, `level`, `msg`, then fields in the order they were added.
-> - **Context fields.** `ContextWithFields` stores fields in the context, and `InfoCtx` / `LogCtx` add them between the logger's `With` fields and the call's own fields. `slices.Clip` makes every append copy, so sibling contexts never share a backing array.
+> - **Context fields.** `ContextWithFields` stores fields in the context, and `InfoCtx` / `LogCtx` add them between the logger's `With` fields and the call's own fields. `slices.Clip` makes every append copy, so sibling contexts never share a backing array (the hidden array a Go slice points into).
 > - **`Enabled`.** `LogCtx` checks the level before building any slice; callers use it to skip expensive fields.
 > - **Shared level, documented.** `SetLevel` on a child changes the parent; the comment on `With` and a test document this.
 
@@ -720,7 +733,7 @@ stateDiagram-v2
 | `Logger` facade | `*slog.Logger` | Both are thin front ends |
 | `Handler` chain | `slog.Handler`: `Enabled`, `Handle`, `WithAttrs`, `WithGroup` | slog asks `Enabled` first, before building the record |
 | `Formatter` + `Appender` | `slog.TextHandler`, `slog.JSONHandler` writing to an `io.Writer` | slog fuses format and write in one handler |
-| `Field{Key, Value any}` | `slog.Attr{Key, Value slog.Value}` | `slog.Value` stores common kinds without allocating |
+| `Field{Key, Value any}` | `slog.Attr{Key, Value slog.Value}` | `slog.Value` stores common kinds without allocating (asking for new memory, which costs time and GC work) |
 | `Level` 0..4, with `Fatal` | `slog.Level`: Debug −4, Info 0, Warn 4, Error 8; no Fatal | The gaps leave room for custom levels |
 | `LevelFilter` with an atomic | `*slog.LevelVar` in `HandlerOptions.Level` | Handlers sharing one `LevelVar` share the level, as `With` children do here |
 | `With` copies fields | `Logger.With` calls `Handler.WithAttrs` | A handler can pre-format those attributes once |
@@ -994,12 +1007,14 @@ func TestFatalFlushesThenExits(t *testing.T) {
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working library and its tests. Next is interview depth: torn lines, slow sinks, a full buffer, shutdown with queued lines, reserved JSON keys and log injection.
+
 | Edge case | Risk | Handling |
 | --- | --- | --- |
 | 50 goroutines write to one file | Interleaved lines | `WriterAppender` mutex: one line is one `Write`; the test runs with `-race` |
 | Remote sink slow or down | Requests block on network I/O | `AsyncAppender`: bounded channel, non-blocking send |
 | Buffer full | More logs than the sink can take | Drop and count; export `Dropped()` as a metric. Alternatives: block, or drop DEBUG first |
-| Shutdown with buffered entries | Lost logs | `Close` drains before returning; `Fatal` calls `Close` before exit |
+| Shutdown with buffered entries | Lost logs | `Close` drains (writes out everything still queued) before returning; `Fatal` calls `Close` before exit |
 | `Append` after `Close` | Panic: send on a closed channel | `closed` flag under an `RWMutex`, returns `ErrClosed` |
 | One appender fails (disk full) | Others miss the line | Loop over all, `errors.Join` the errors |
 | Field named `level`, `msg` or `time` | JSON loses the real level | Reserved keys win; the user value becomes `fields.level` |
@@ -1017,9 +1032,9 @@ func TestFatalFlushesThenExits(t *testing.T) {
 | Kafka or HTTP sink | A new `Appender` wrapped in `AsyncAppender`; batch in the worker (every N lines or T ms) |
 | Rotation by size or day | A `RotatingFileAppender` decorator: rename and reopen past N bytes |
 | Different level per sink (DEBUG to a file, ERROR to the pager) | A fan-out handler with one `LevelFilter → FormatHandler` per branch |
-| Redact PII (phone, card) | A `Redactor` handler before the formatter |
+| Redact PII (personally identifiable information: phone, card) | A `Redactor` handler before the formatter |
 | Sampling (1 in 100 DEBUG) | A `Sampler` handler with an atomic counter |
-| Zero-allocation hot path | `sync.Pool` buffers and typed fields instead of `any` (the zap approach) |
+| Zero-allocation hot path | `sync.Pool` buffers and typed fields instead of `any` (the approach of zap, Uber's fast Go logger) |
 
 Tradeoffs chosen:
 
@@ -1084,6 +1099,26 @@ Redraw it from memory, then add the context fields joining at the `Logger`.
 - Context fields: `ContextWithFields` once, `InfoCtx` everywhere; order is With, ctx, call.
 - `With` children share the level; `Enabled` before expensive fields.
 - In production use `slog` with a wrapping handler for the extras.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 Minimum level is INFO. What happens to a DEBUG call?
+> It is dropped at the level filter, before any formatting, so it costs almost nothing.
+
+> [!question]- 🟢 What does a formatter do, and what does an appender do?
+> The formatter turns an entry into bytes (text or JSON); the appender sends those bytes to one place (console, file, network).
+
+> [!question]- 🟢 Why are structured fields better than one `Sprintf` string?
+> Each key/value pair can be searched and filtered, like `order_id=o1`, instead of being buried in free text.
+
+> [!question]- 🟡 The async buffer is full. What does `Append` do?
+> It does not wait: it drops the line, adds 1 to the drop counter and returns.
+
+> [!question]- 🟡 Why not build JSON from a `map` and call `json.Marshal`?
+> Go sorts map keys, so field order is lost, and a field named `level` could overwrite the real level.
+
+> [!question]- 🟡 Why must `Fatal` call `Close` before exiting?
+> `os.Exit` skips deferred calls, so queued lines (including the FATAL line) would be lost unless flushed first.
 
 ## Links 🟢
 

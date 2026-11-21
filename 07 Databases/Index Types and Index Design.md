@@ -36,6 +36,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked examples) and 5 (comparison table).
 > - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Indexing Fundamentals]]: an index is a sorted helper list that lets the database jump to matching rows instead of reading the whole table.
+> - [[Query Plans and EXPLAIN]]: `EXPLAIN ANALYZE` shows the steps the database took for a query and how long each one took.
+
 **From zero, in 60 seconds** 🟢
 
 You already know an index is a sorted helper list that finds rows fast (if not, read [[Indexing Fundamentals]] first). This note answers the next question: WHICH index do you build for a given query?
@@ -81,6 +85,12 @@ This note is about choosing the right kind of index and the right column order f
 | `EXPLAIN` | Shows the plan the planner picked | `EXPLAIN ANALYZE SELECT ...` |
 | Partial index | An index on only some rows | `WHERE deleted_at IS NULL` |
 | GIN / GiST / BRIN | Special index types for arrays and text, shapes and ranges, huge ordered tables | Tag search uses GIN |
+| Seq Scan | Reading every row of the table, start to end | Fine for 1,000 rows, slow for 10 M |
+| Heap | PostgreSQL's name for the table itself, where full rows live | The index points to row 5 on heap page 812 |
+| Page | The 8 kB block the database reads from disk at a time | About 90 small rows fit on one page |
+| Index-only scan | Answering a query from the index alone, never touching the table | All the columns you `SELECT` are inside the index |
+| Leftmost prefix | A multicolumn index can only seek using its first columns, in order | `(a, b, c)` helps `WHERE a = 1`, not `WHERE c = 1` |
+| Selectivity | What share of rows a filter keeps; few rows = selective | `id = 5` is very selective, `status = 'paid'` is not |
 
 **Picture it**
 
@@ -108,6 +118,8 @@ Where it breaks: a phone book has one fixed order; a database can keep several i
 
 ## 1. Why it exists 🟢
 
+🟢 **Plain version:** A list page needs 20 rows, but a badly shaped index makes the database read thousands of rows and then sort them. The right index, with its columns in the right order, lets the database read just those 20. Some questions, like "does this text contain X" or "do these two time slots overlap", cannot be answered by a normal sorted index at all, whatever the column order. For those there are special index types, shown in the table below.
+
 InvoiceOps keeps 10 million rows in `invoices` across 2,000 workspaces (a workspace is one customer company, the tenant). The most called endpoint lists one workspace's overdue invoices:
 
 ```sql
@@ -118,7 +130,7 @@ ORDER BY due_date DESC, id DESC
 LIMIT 20;
 ```
 
-With only a single-column index on `workspace_id`, PostgreSQL finds workspace 42's 5,000 invoices, fetches each from the table, throws away the 4,700 that are not overdue, sorts the remaining 300 and returns 20. That is about 5,000 random page reads to show 20 rows.
+With only a single-column index on `workspace_id`, PostgreSQL finds workspace 42's 5,000 invoices, fetches each from the table, throws away the 4,700 that are not overdue, sorts the remaining 300 and returns 20. That is about 5,000 random page reads (each a separate 8 kB block fetched from a different spot on disk) to show 20 rows.
 
 With the right composite index (one index over several columns) it reads about 4 index pages and 20 table rows.
 
@@ -128,7 +140,7 @@ Three other InvoiceOps questions cannot be helped by any B-tree, however the col
 | --- | --- | --- |
 | `WHERE metadata @> '{"channel":"stripe"}'` (JSON contains) | A B-tree compares whole values; it cannot look inside a document | GIN |
 | `WHERE number ILIKE '%2026-07%'` (substring) | A leading `%` means there is no sorted prefix to seek to | GIN with `pg_trgm` |
-| "No two bookings of meeting room 7 may overlap" | Overlap is not an ordering relation | GiST exclusion constraint |
+| "No two bookings of meeting room 7 may overlap" | Overlap is not an ordering relation | GiST exclusion constraint (a rule that rejects a new row if it clashes with an existing one) |
 | 2 billion rows of `audit_logs` queried by day | A B-tree on `created_at` would be tens of GB | BRIN, a few MB |
 
 ## 2. Mental model 🟢
@@ -136,15 +148,40 @@ Three other InvoiceOps questions cannot be helped by any B-tree, however the col
 A B-tree is a phone book: sorted by surname, then first name. It is perfect for "Sharma, Priya", fine for "all Sharmas", useless for "everyone called Priya" (that is the *leftmost-prefix rule*: you can only seek using a leading run of the sort columns).
 
 The other index types are other kinds of reference books:
-- **GIN** (Generalized Inverted Index) is the index at the back of a textbook: each *word* (a JSON key, an array element, a trigram) points to every page that contains it.
+- **GIN** (Generalized Inverted Index) is the index at the back of a textbook: each *word* (a JSON key, an array element, a trigram: a 3-letter piece of text such as `inv`) points to every page that contains it.
 - **GiST** (Generalized Search Tree) is a map with nested boxes: each box says "everything inside me lies within this area", so you skip boxes that cannot overlap your search area.
 - **BRIN** (Block Range INdex) is the spine labels of a shelf of diaries: "volume 1 covers January–March". It is tiny, and it works only if the diaries were filed in date order.
 
+### Real-life example: "My orders" in a food app 🟢
+
+Think of the "My orders" screen in an app like Swiggy, which shows your 20 newest orders.
+The query is roughly "orders where user = me, newest first, first 20".
+An index on `(user_id, created_at DESC)` matches that shape: it jumps to your orders, which are already in newest-first order, and stops after 20.
+An index on `(created_at, user_id)` has the same columns in the wrong order, so the database must dig through everyone's orders to find yours.
+A search box that finds orders "containing paneer" is a different question and needs a GIN text index instead.
+
+## Common beginner mistakes 🟢
+
+- **Getting the column order wrong** → `(due_date, workspace_id, status)` cannot jump to one workspace's rows → put exact-match columns first, then the sort column, then any range (ESR).
+- **Adding an index on every column "just in case"** → every insert and update must change every index, so writes slow down → index only for queries you actually run.
+- **Indexing a column with few values, like `status`, on its own** → a filter that keeps 20% of rows is cheaper as a full read → put `status` after a selective column, or use it as a partial-index condition.
+- **Wrapping the column in a function in the query** → `WHERE lower(email) = ...` cannot use a plain index on `email` → create the index on `lower(email)` as well.
+- **Building an index on a big live table without `CONCURRENTLY`** → writes are blocked for minutes → use `CREATE INDEX CONCURRENTLY` in migrations.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that the query's shape decides the index, and that a B-tree's column order matters. **Next we open the box**: how to pick the type, why the ESR order works, how an index-only scan skips the table, and how GIN, GiST and BRIN find rows. Each subsection starts with a short step-by-step walk.
 
 ### 3.1 Choosing the type from the query shape
 
 **In plain words:** look at what the WHERE clause asks and the right index type falls out. Exact matches and ranges mean B-tree; "contains" means GIN; "overlaps" means GiST; a giant append-only log means BRIN.
+
+**Step by step:**
+1. Read the `WHERE` clause and spot the operator.
+2. `workspace_id = 42`, `due_date > '2026-11-01'` or `ORDER BY due_date`: a B-tree.
+3. `metadata @> '{"channel":"stripe"}'` ("does this JSON contain...") or `ILIKE '%2026-07%'`: GIN.
+4. "Does this booking overlap 10:00-11:00?": GiST.
+5. "Rows from 12 January" on a 2-billion-row log that only ever grows in time order: BRIN.
 
 ```mermaid
 flowchart TD
@@ -163,6 +200,13 @@ flowchart TD
 ### 3.2 Multicolumn B-tree: the ESR rule
 
 **In plain words:** a multicolumn index is a phone book: pick the columns you match exactly as the first sort keys, then the column you sort by, then any range. Get the order wrong and the database must re-sort every time.
+
+**Step by step:**
+1. The query: `workspace_id = 42 AND status = 'overdue'`, newest `due_date` first, 20 rows.
+2. Exact matches first: `workspace_id`, then `status`. The index jumps to the one block of "42, overdue" entries.
+3. Sort column next: `due_date DESC`. Inside that block, entries are already newest-first.
+4. The database reads the first 20 entries and stops. No sorting step.
+5. If a range like `amount_minor > 100000` were placed before `due_date`, the block would be ordered by amount, and the database would have to sort all matches again.
 
 A multicolumn B-tree sorts entries by the first column, then by the second within equal firsts, and so on. Three consequences:
 
@@ -192,6 +236,13 @@ flowchart LR
 
 **In plain words:** a normal index scan finds the row's address in the index, then walks over to the table to fetch it. An index-only scan skips that walk because the answer is already inside the index.
 
+**Step by step:**
+1. The query asks for `id, number, due_date, amount_minor` of workspace 42's open invoices.
+2. Normal index scan: find 20 entries in the index, then fetch each full row from the table: 20 extra page reads.
+3. If the index also stores `number` and `amount_minor` (`INCLUDE`), every asked-for column is already in the index.
+4. PostgreSQL still checks a small "visibility map" to be sure each row is safe to show without looking.
+5. If the map says yes, the table is never touched. That is an index-only scan.
+
 ```mermaid
 flowchart LR
     subgraph IS[Index Scan]
@@ -206,25 +257,38 @@ flowchart LR
 
 An **index-only scan** answers the query from the index alone.
 
-In PostgreSQL the index does not store whether a row version is visible to your transaction (see [[Isolation Levels and MVCC]]), so it checks the **visibility map**, one bit per heap page that `VACUUM` sets when every row on the page is visible to everyone.
+In PostgreSQL the index does not store whether a row version is visible to your transaction (PostgreSQL keeps several versions of a row so readers and writers do not block each other; see [[Isolation Levels and MVCC]]), so it checks the **visibility map**, one bit per heap page that `VACUUM` (PostgreSQL's background cleaner of old row versions) sets when every row on the page is visible to everyone.
 
-Pages that are not all-visible still need a heap visit, shown as `Heap Fetches` in `EXPLAIN ANALYZE`. A table with heavy updates and lagging autovacuum gets few true index-only scans.
+Pages that are not all-visible still need a heap visit, shown as `Heap Fetches` in `EXPLAIN ANALYZE`. A table with heavy updates and lagging autovacuum (the automatic, scheduled `VACUUM`) gets few true index-only scans.
 
 ### 3.4 What each special type stores
 
 **In plain words:** each index type keeps a different kind of note per row: a B-tree keeps the sorted value, GIN keeps one entry per word inside the value, GiST keeps a bounding box, BRIN keeps only a min and max per big chunk of the table.
 
+**Step by step:**
+1. Take one invoice row: `due_date = 2026-10-30`, `metadata = {"channel":"stripe","retry":true}`.
+2. A B-tree on `due_date` stores one entry: "2026-10-30 → row 17".
+3. A GIN on `metadata` stores two entries: "channel=stripe → row 17" and "retry=true → row 17".
+4. A GiST on a booking's time range stores the range, grouped under bigger boxes that cover it.
+5. A BRIN on `created_at` stores nothing per row, only "pages 0-127: from 1 Jan to 9 Jan".
+
 | Type | One index entry is | Lookup |
 | --- | --- | --- |
 | B-tree | `(key columns, row pointer)` in sorted leaf pages | Descend 3–4 levels, walk leaves |
 | Hash | 32-bit hash of the key → row pointer, in buckets | Hash the value, read one bucket |
-| GIN | One element (JSON path/key, array item, lexeme, trigram) → sorted list of row pointers (*posting list*) | Look up each element, intersect posting lists, recheck rows |
+| GIN | One element (JSON path/key, array item, lexeme (a word reduced to its root, like `pay` for "paying"), trigram) → sorted list of row pointers (*posting list*) | Look up each element, intersect posting lists, recheck rows |
 | GiST | A bounding predicate (range, box) per subtree; leaves hold values | Descend every subtree whose bound matches; may visit several branches |
 | BRIN | For each range of 128 table pages (default `pages_per_range`): min and max value | Scan the whole small BRIN, read only page ranges whose min/max could match, recheck rows |
 
 ### 3.5 How GIN, GiST and BRIN find rows
 
 **In plain words:** three different reference books: GIN looks up words and intersects the page lists; GiST drills down through nested boxes; BRIN skips whole chunks whose min/max cannot match.
+
+**Step by step:**
+1. GIN, "channel is stripe AND retry is true": look up both words, get rows {3, 17, 42, 90} and {17, 42, 55}, keep the rows in both: 17 and 42.
+2. GiST, "book room 7 for 10:00-11:00": go down only into boxes that could hold room 7 near that time, and look for an overlap.
+3. If 10:30-11:30 is already booked, the insert is refused with error `23P01`.
+4. BRIN, "rows from 12 January": read the tiny list of page chunks, keep only chunks whose dates span 12 January, scan just those pages.
 
 #### GIN: element to posting list
 
@@ -338,6 +402,8 @@ Limit  (cost=0.56..21.40 rows=20 width=40) (actual time=0.031..0.074 rows=20 loo
 Planning Time: 0.160 ms
 Execution Time: 0.093 ms
 ```
+
+In the first plan, the Bitmap Heap Scan (find matching rows in the index, then fetch their pages from the table) read 4,890 table pages and threw away 4,712 rows, and the Sort step (top-N heapsort keeps only the best 20 while scanning) ordered the rest.
 
 The Sort node and the 4,712 discarded rows are gone; 20 rows are fetched.
 
@@ -529,7 +595,7 @@ Runnable Go version: [[Index Types and Index Design - Go]]
 
 | Index | Answers | Use when | Cost / limits |
 | --- | --- | --- | --- |
-| B-tree | `=`, `<`, `>`, `BETWEEN`, `IN`, `IS NULL`, `ORDER BY`, `LIKE 'abc%'` (with `text_pattern_ops` or C collation) | Default for nearly everything | Write cost per index; leftmost prefix |
+| B-tree | `=`, `<`, `>`, `BETWEEN`, `IN`, `IS NULL`, `ORDER BY`, `LIKE 'abc%'` (with `text_pattern_ops` or C collation, the plain byte-by-byte text order) | Default for nearly everything | Write cost per index; leftmost prefix |
 | Hash | `=` only | Very long keys (URLs, tokens) where a 4-byte hash is smaller than the key | No range, no sort, no uniqueness, no multicolumn; crash-safe only since PostgreSQL 10 |
 | GIN | Contains / has-key on `jsonb`, arrays, `tsvector`; `LIKE '%x%'` with `pg_trgm` | Many values per row, searched by element | Slow, heavy writes (one row → many entries); pending list (`fastupdate`, 4 MB default) makes inserts cheap but reads must scan it |
 | GiST | Overlap `&&`, containment, nearest neighbour `<->`, exclusion constraints | Ranges, geometry (PostGIS), "no double booking" | Lossy pages mean rechecks; slower than B-tree for plain equality |
@@ -548,9 +614,11 @@ Runnable Go version: [[Index Types and Index Design - Go]]
 
 ## 6. Trade-offs and when not to use 🔴
 
+> 🟡 → 🔴 **You now know** how to pick an index type and order its columns, with real plans to prove it. **Next comes the senior view**: what every index costs, how to design and clean up indexes on a live system, and the internals interviewers like to probe.
+
 - **Write amplification.** Every `INSERT` writes one entry (plus its WAL record) into every index on the table; a GIN on a document with 40 keys writes about 40. A table with 9 indexes does about 10 page modifications per inserted row.
 - **HOT updates lost.** PostgreSQL can update a row without touching any index (a *heap-only tuple* update) only if no indexed column changes and the page has free space. Indexing a frequently updated column like `last_seen_at` turns every update into index writes.
-- **RAM.** Indexes compete with table pages for `shared_buffers` and the OS cache. An index that does not fit in memory turns lookups into disk reads.
+- **RAM.** Indexes compete with table pages for `shared_buffers` (PostgreSQL's own memory cache of pages) and the OS cache. An index that does not fit in memory turns lookups into disk reads.
 - **Low selectivity alone.** An index on `status` alone (5 values) is rarely used: a query that matches 20% of the rows is cheaper as a Seq Scan. It is useful as a partial index predicate or after an equality column instead.
 - **Don't add GIN for rare queries.** A substring search run by an admin once a day is fine as a Seq Scan; a GIN index costs every insert, all day.
 - **Don't use BRIN on updated or randomly loaded data.** If `created_at` values are scattered across pages, every range's min/max covers everything and BRIN reads the whole table.
@@ -559,7 +627,7 @@ Runnable Go version: [[Index Types and Index Design - Go]]
 ## 7. In production 🔴
 
 **Design steps** (for each table):
-1. List the top queries by total time from `pg_stat_statements`.
+1. List the top queries by total time from `pg_stat_statements` (an extension that records every query's count and total time).
 2. Write each one's `WHERE`, `JOIN`, `ORDER BY` and `LIMIT`.
 3. Put the tenant key first on multi-tenant tables; then equality, sort, range.
 4. Add unique indexes for business rules (one webhook per `(provider, event_id)`, one payment per `(workspace_id, idempotency_key)`; see [[Idempotency and Idempotency Keys]]).
@@ -643,6 +711,8 @@ Fix with `REINDEX INDEX CONCURRENTLY` (PostgreSQL 12+), which builds a new copy 
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** Build each index for a real query, not for a column. Put exact-match columns first, then the column you sort by, then any range. Use the special types only when a normal index cannot answer: GIN for "contains", GiST for "overlaps", BRIN for giant logs in time order. Every index slows down writes, so delete the ones nobody uses.
+
 - Design from the query: `WHERE` + `ORDER BY` + `LIMIT`. Order key columns Equality → Sort → Range; tenant key first.
 - `INCLUDE` adds return-only columns (index-only scan); `WHERE` makes a partial index; both shrink work for the hot path.
 - Expression index = query must use the identical expression (`lower(email)`).
@@ -650,6 +720,30 @@ Fix with `REINDEX INDEX CONCURRENTLY` (PostgreSQL 12+), which builds a new copy 
 - Skip scan exists (PostgreSQL 18, MySQL 8.0.13+) but only helps when the skipped column has few distinct values.
 - Every index costs writes, WAL, RAM and HOT updates; drop unused ones (`idx_scan = 0`, all nodes, full cycle).
 - Build and rebuild with `CONCURRENTLY`; check for `INVALID` indexes afterwards.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does ESR stand for?
+> Equality columns first, then Sort columns, then the Range column.
+
+> [!question]- Which index type answers "does this JSON contain channel = stripe"?
+> GIN.
+
+> [!question]- Why is BRIN tiny?
+> It stores only one min and max per chunk of 128 table pages, not one entry per row.
+
+🟡 Medium
+
+> [!question]- Index `(workspace_id, status, due_date)`; query `WHERE workspace_id = 7 AND due_date > '2026-11-01'`. How many columns can it seek on?
+> One: `status` is skipped, so `due_date` becomes a filter over all of workspace 7's entries.
+
+> [!question]- An index-only scan shows `Heap Fetches: 17`. Why is it touching the table?
+> 17 pages were not marked all-visible in the visibility map, so PostgreSQL had to check those rows; `VACUUM` fixes it.
+
+> [!question]- A partial index has `WHERE status IN ('open','overdue')`, but the query `status = $1` ignores it. Why?
+> Under a generic plan the planner cannot prove `$1` is open or overdue; write the constant in the SQL.
 
 ## Links
 

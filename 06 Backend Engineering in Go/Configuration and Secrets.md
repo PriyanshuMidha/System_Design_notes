@@ -30,6 +30,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Service Project Layout and Wiring]]: `main` builds every part of the service (database, server, handlers) and passes each one what it needs through its constructor.
+
 **From zero, in 60 seconds** 🟢
 
 Your service runs in different places — your laptop, a test server, production. In each place the database address, the port and the passwords are different.
@@ -68,6 +71,12 @@ So the code reads these values from outside, once, when it starts.
 | Parse | Turn text into a typed value | `"5s"` → `5 * time.Second` |
 | Validate | Check every value is present and sensible | port must be a number |
 | Default | The value used when nothing is set | `:8080` if `HTTP_ADDR` is unset |
+
+| Flag | A setting typed on the command line when starting the program | `./invoiceops --http-addr=:9091` |
+| Fail fast | Stop at startup if something is wrong, instead of failing later mid-request | exit before the server listens |
+| `errors.Join` | Go function that bundles many errors into one | 3 missing variables, 1 error message |
+| Redact | Hide a value by printing a placeholder instead | `JWT_SECRET` prints as `REDACTED` |
+| Rotation | Replacing a secret with a new one on a schedule | new DB password every 30 days |
 
 **Picture it**
 
@@ -119,11 +128,15 @@ The rest of this note turns that one-variable shape into a typed struct that loa
 
 InvoiceOps runs the same binary in three environments: a developer's laptop, a staging cluster and production. The database address, the log verbosity and the JWT signing key are different in each one, but the code that uses them must not change.
 
-The [12-factor app](https://12factor.net/config) rule for this is strict: config is read from the environment, never baked into the binary and never read from a committed file alongside the code (a config file checked into git is still code, just worse code — it can't differ per environment without a new commit).
+The [12-factor app](https://12factor.net/config) rule (a well-known list of 12 habits for building cloud services) for this is strict: config is read from the environment, never baked into the binary and never read from a committed file alongside the code (a config file checked into git is still code, just worse code — it can't differ per environment without a new commit).
 
 Concretely, if `internal/repository` called `os.Getenv("DATABASE_URL")` directly, every package that needs a connection string would duplicate that call, nothing would catch a missing variable until the exact line that reads it executes — possibly minutes into a request — and no test could set a fake value without mutating real process state.
 
 A typed `Config`, loaded once in `main` and passed down as a constructor argument, fixes all three: one place reads the environment, `Load` fails before the server starts if anything is missing or malformed, and tests pass in a fake config instead of a real environment.
+
+### A real-life example 🟢
+
+Netflix runs the same app code in test and in production, but production talks to the real payment system and test talks to a fake one. The difference is not in the code; it is in settings handed to the app when it starts, such as `PAYMENT_URL` and `PAYMENT_API_KEY`. If someone forgets to set the API key in a new region, the app refuses to start and prints exactly which settings are missing, instead of failing on a customer's first payment. And the key never shows up in any log.
 
 ## 2. Mental model 🟢
 
@@ -137,9 +150,17 @@ A secret is a field on that form that gets covered with a strip of tape before a
 
 ## 3. How it works 🟡
 
+🟢 → 🟡 You now know the rule: read all settings once in `main`, check them all, refuse to start if any are wrong, and never print a secret. Next we open the box: where values come from and which source wins, how text becomes typed values, and how secrets are kept safe.
+
 ### Resolution order
 
 **In plain words:** when the same setting is set in two places, a fixed ranking decides which one wins — flags beat env vars beat files beat defaults.
+
+**Step by step:**
+1. Start with the built-in default: `HTTP_ADDR = ":8080"`.
+2. If a config file says `":8000"`, that replaces it.
+3. If the environment has `HTTP_ADDR=":9090"`, that replaces it.
+4. If you start with `--http-addr=:9091`, that wins. Then every field is checked once.
 
 ```mermaid
 flowchart LR
@@ -152,11 +173,21 @@ Each stage only overrides what the previous stage set; nothing re-reads a variab
 
 ### `LookupEnv` vs `Getenv`, and why it matters
 
+**Step by step:**
+1. `JWT_SECRET` was never set. `os.Getenv` returns `""`; `os.LookupEnv` returns `("", false)`.
+2. `JWT_SECRET` is set but empty. `os.Getenv` returns `""` again; `os.LookupEnv` returns `("", true)`.
+3. Only `LookupEnv` lets you tell these apart, so `Load` can say "JWT_SECRET is required" instead of signing tokens with an empty key.
+
 `os.Getenv(key)` returns `""` both when the variable is unset and when it's set to an empty string — the two are indistinguishable. `os.LookupEnv(key)` returns `(value, ok)`, so "not set, use the default" and "set to empty on purpose" are different cases.
 
 For a required field like `JWT_SECRET`, that distinction is the difference between "fail loudly because an operator forgot to set it" and "silently sign tokens with an empty-string key", which is a confirmed footgun, not a hypothetical one.
 
 ### Typed parsing
+
+**Step by step:**
+1. `SHUTDOWN_TIMEOUT` arrives as the text `"25s"`.
+2. `time.ParseDuration("25s")` turns it into 25 seconds as a `time.Duration`.
+3. If the text is `"25"` (no unit), the parse fails and the error is saved in a list, not returned yet.
 
 Every environment variable arrives as a `string`. `Load` converts each one with the standard-library function built for that type, not `fmt.Sscanf` or hand-rolled parsing:
 
@@ -171,6 +202,12 @@ Every environment variable arrives as a `string`. `Load` converts each one with 
 Every parse failure is collected, not returned immediately — see the next section.
 
 ### Startup sequence
+
+**Step by step:**
+1. `main` calls `config.Load`.
+2. `Load` reads, parses and checks every field.
+3. If anything is wrong, `main` prints every problem and exits with code 1. Nothing else has started.
+4. If all is fine, `main` opens the database and builds the server using fields from `cfg`.
 
 ```mermaid
 sequenceDiagram
@@ -197,6 +234,12 @@ Nothing downstream of `Load` ever reads an environment variable again; every dep
 
 **In plain words:** if 3 settings are wrong, say all 3 in one go — do not make the operator fix them one restart at a time.
 
+**Step by step:**
+1. Check `DATABASE_URL`: missing → add "DATABASE_URL is required" to a list, keep going.
+2. Check `JWT_SECRET`: missing → add it to the list, keep going.
+3. Check `SHUTDOWN_TIMEOUT`: `"abc"` → add "bad duration" to the list.
+4. At the end, `errors.Join(list...)` returns one error showing all three lines.
+
 A naive loader returns on the first error:
 
 ```go
@@ -212,6 +255,11 @@ An operator fixes `DATABASE_URL`, redeploys, and immediately hits the next missi
 
 ### Precedence and libraries
 
+**Step by step:**
+1. For a few settings, the standard `flag` package and `os.LookupEnv` are enough.
+2. With many flat env variables, a library like `caarlos0/env` fills struct fields from tags like `env:"HTTP_ADDR"`.
+3. If you also need a config file merged with env and flags, `koanf` does the layering without a global variable.
+
 Flags beat environment variables beat a config file beat defaults.
 
 The standard library's `flag` package is enough for a handful of overrides; past a dozen flags, or when documented, typed, prefix-based env binding is wanted, `github.com/caarlos0/env` and `github.com/kelseyhightower/envconfig` do the struct-tag-to-field mapping this note's `Load` does by hand, with no config-file support.
@@ -222,19 +270,32 @@ The standard library's `flag` package is enough for a handful of overrides; past
 
 **In plain words:** a password needs more than loading: it must live somewhere locked (a secret store), rotate, and never appear in a log line.
 
+**Step by step:**
+1. The secret is stored in a locked place, such as a Kubernetes Secret, AWS Secrets Manager or Vault (a dedicated secret store).
+2. At startup it is handed to the app as an env variable or a file.
+3. `Load` wraps it in a `Secret` type that prints as `REDACTED` everywhere.
+4. When the secret is rotated, the app restarts or re-reads the file to pick up the new value.
+
 `JWT_SECRET` and `RAZORPAY_WEBHOOK_SECRET` are config values, but they need more care than an address or a timeout:
 
-- **Source.** In Kubernetes, a `Secret` object is mounted either as environment variables (visible to anything that can read the pod spec or exec into the container) or as files under a volume mount (readable only by processes with filesystem access, and rotatable by updating the file without restarting the pod if the application watches it). AWS Secrets Manager, SSM Parameter Store and HashiCorp Vault serve the same purpose outside Kubernetes, typically fetched at startup through a sidecar (the CSI Secrets Store driver, External Secrets Operator) that still lands the value as a file or env var the typed loader reads the same way.
-- **Rotation.** A short-lived process picks up a new secret on its next restart. A long-running one needs either a signal handler that re-reads config on `SIGHUP`, or a dedicated poller that watches the mounted file and swaps the in-memory value — database credentials under Vault's dynamic-secrets engine expire on a schedule and need exactly this.
+- **Source.** In Kubernetes (the system that runs and restarts containers across many machines), a `Secret` object is mounted either as environment variables (visible to anything that can read the pod spec or exec into the container) or as files under a volume mount (readable only by processes with filesystem access, and rotatable by updating the file without restarting the pod if the application watches it). AWS Secrets Manager, SSM Parameter Store and HashiCorp Vault serve the same purpose outside Kubernetes, typically fetched at startup through a sidecar (the CSI Secrets Store driver, External Secrets Operator) that still lands the value as a file or env var the typed loader reads the same way.
+- **Rotation.** A short-lived process picks up a new secret on its next restart. A long-running one needs either a signal handler that re-reads config on `SIGHUP` (a "reload" signal sent to a running process), or a dedicated poller that watches the mounted file and swaps the in-memory value — database credentials under Vault's dynamic-secrets engine expire on a schedule and need exactly this.
 - **Never logged.** This is where the typed loader pays for itself: wrap every secret field in a type whose `String()`, `GoString()` and `slog.LogValuer.LogValue()` all return a fixed redacted string, so `fmt.Sprintf("%v", cfg)`, `%+v` on a struct that embeds it, and structured logging all redact it by construction — nobody has to remember to avoid logging `cfg.JWTSecret` by convention.
 
 ### Feature flags are not config
+
+**Step by step:**
+1. `DATABASE_URL` is config: set once at start, the same for every request.
+2. `new-checkout-flow` is a feature flag: on for 10% of users today, 50% tomorrow, without a deploy.
+3. So flags live in a flag service or table that is read at request time, not in the `Config` struct.
 
 A feature flag (`new-checkout-flow: true`) changes behavior per user, cohort or percentage rollout, and typically flips without a deploy through a dedicated service (LaunchDarkly, Unleash, a database-backed flag table). Startup config is read once and fixed for the process's lifetime.
 
 Treating a flag as a `Config` field means every flip needs a restart; treating config as a flag means a value that should never change per-request (`DATABASE_URL`) now has runtime-mutable state nothing guards. (Flag system design is [[Feature Flags]]'s job.)
 
 ## 4. Worked example 🟡
+
+**What this code does, in plain words:** it defines the `Config` struct and a `Secret` type that always prints `REDACTED`, then `Load` reads every variable, uses the default when one is missing and optional, parses each into the right Go type, applies flag overrides, and returns one joined error listing every problem.
 
 A `config` package that loads InvoiceOps' startup configuration: env vars with `os.LookupEnv`, typed parsing, `errors.Join` validation, flag overrides and a redacting `Secret` type. It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
 
@@ -405,6 +466,8 @@ func main() {
 }
 ```
 
+**What this code does, in plain words:** the tests feed in fake environment values through a small `source` interface (no real environment needed), then check a good load, that all errors show at once, that flags win, and that the secret never prints.
+
 Five tests covering the behavior that matters: valid load, every error collected at once (not just the first), required fields reported by name, flag precedence, and that a `Secret` never prints its real value through any formatting path (`go test -race`, all pass):
 
 ```go
@@ -569,7 +632,26 @@ func TestSecretNeverPrintsRealValue(t *testing.T) {
 - A config file adds a deploy artifact to manage (who packages it, where does it live, how does it get updated without a binary rebuild) — skip it until environment variables and flags together are no longer expressive enough (nested structures, arrays of backend targets).
 - Watching a mounted secret file for rotation adds a goroutine and a race to get right (swap the value atomically, don't read half-written bytes mid-update); a short-lived process that restarts on every deploy doesn't need it at all.
 
+### Config vs secret vs feature flag 🟡
+
+| | Config | Secret | Feature flag |
+| --- | --- | --- | --- |
+| Example | `HTTP_ADDR=:8080` | `JWT_SECRET` | `new-checkout-flow: on for 10%` |
+| Changes when | per environment, at start | on rotation | any time, per user or percent |
+| May be logged? | yes | never | yes |
+| Lives in | env vars, flags, a file | a secret store | a flag service or table |
+
+### Common beginner mistakes 🟢
+
+- Calling `os.Getenv` deep inside packages → missing values show up mid-request, and tests must change the real environment → read once in `main` and pass `cfg` down.
+- Using `os.Getenv` for a required secret → an unset variable silently becomes `""` → use `os.LookupEnv` and fail if it is not set.
+- Returning on the first bad value → operators fix one variable per deploy → collect all errors with `errors.Join`.
+- Logging the whole `cfg` with `%+v` → the database password ends up in logs → wrap secrets in a type that always prints `REDACTED`.
+- Committing a `.env` file with real keys to git → anyone with the repo has the keys → keep secrets in a secret store and out of the repo.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now load, check and protect every setting a service needs. The advanced part covers what goes wrong across real deploys: empty secrets, secrets leaking into dashboards, replicas running with old settings, and how to test config without touching the real environment.
 
 - **Real systems:** every 12-factor-style service (Heroku's own apps, most Go services at Uber, Stripe and similar companies per their public engineering blogs) load config this way: one typed struct, built once, in `main`. Kubernetes' own `ConfigMap`/`Secret` objects are designed around "inject as env vars or mount as files", matching the two Config-loading paths this note covers.
 - **Failure modes → fixes:**
@@ -619,6 +701,26 @@ func TestSecretNeverPrintsRealValue(t *testing.T) {
 - Wrap every secret in a type whose `String()`/`GoString()`/`LogValue()` all redact it.
 - Secrets come from K8s Secrets (env or mounted file), AWS Secrets Manager/SSM, or Vault — storage and rotation are a different concern from typed loading.
 - A feature flag is not config: config is fixed per process start, a flag flips at runtime through its own system.
+
+## Self-check 🟢🟡
+
+> [!question]- Where should environment variables be read?
+> Once, in `main`, by a `Load` function; everything else gets the typed `Config`.
+
+> [!question]- Which source wins: an env variable or a command-line flag?
+> The flag.
+
+> [!question]- What should a secret print as in logs?
+> A fixed placeholder like `REDACTED`, never its real value.
+
+> [!question]- Why `os.LookupEnv` instead of `os.Getenv` for required values?
+> It tells "not set" apart from "set to empty", so a missing secret fails loudly.
+
+> [!question]- Why use `errors.Join` in `Load`?
+> To report every bad or missing value in one run, not one per deploy.
+
+> [!question]- Why is a feature flag not a field in `Config`?
+> Config is fixed for the life of the process; a flag must change at runtime without a restart.
 
 ## Links 🟢
 

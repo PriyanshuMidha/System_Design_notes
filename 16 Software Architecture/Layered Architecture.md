@@ -38,6 +38,9 @@ A client-creation request: the handler checks the JSON is well-formed, the servi
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - Nothing. This note starts from zero. It helps if you have seen a Go HTTP handler and a SQL `INSERT`, but you don't need any earlier note.
+
 **From zero, in 60 seconds** 🟢
 
 Most backend services are built like a stack of floors in a building.
@@ -75,6 +78,12 @@ Layers give that rule one home that every caller goes through.
 | Persistence / repository | Saves and loads data | `ClientRepo.Insert` running SQL |
 | DTO | A struct shaped for transport, not for logic | `CreateClientRequest` JSON body |
 | Dependency direction | Which package imports which | handler imports service, never reverse |
+| Transaction | A group of database writes that all succeed or all fail together | Insert client + audit row |
+| Unit of work | An interface that runs several repository calls inside one transaction | `uow.Do(ctx, fn)` |
+| Logical layer vs physical tier | A folder of code inside one program vs a separate program or machine | `service/` package vs a separate DB server |
+| Strict vs relaxed layering | Only call the layer right below vs may skip layers | Handler → service only, vs handler → cache |
+| Cross-cutting concern | A need every layer shares, like logging or auth | Request logging middleware |
+| Sinkhole anti-pattern | A layer that only passes calls down, unchanged | `func (s) Get(id) { return repo.Get(id) }` everywhere |
 
 **Picture it**
 
@@ -103,7 +112,7 @@ Where it breaks: in a restaurant the storeroom clerk can shout back to the waite
 
 A small service starts as one `main.go` with a handler function that decodes JSON, runs a SQL query inline, and writes the response — fine for a prototype, unworkable once a second feature needs the same validation rule, or once you want to test the business rule without a running Postgres.
 
-Concretely: InvoiceOps's "create a client" operation needs the same duplicate-email check whether it's called from the REST handler, a CSV bulk-import job, or a test. Write that check inside an `http.HandlerFunc` and the bulk-import job either calls the HTTP endpoint over loopback (slow, fragile) or duplicates the check (now two places can disagree).
+Concretely: InvoiceOps's "create a client" operation needs the same duplicate-email check whether it's called from the REST handler, a CSV (spreadsheet-style text file) bulk-import job, or a test. Write that check inside an `http.HandlerFunc` and the bulk-import job either calls the HTTP endpoint over **loopback** (the server calling itself over the network: slow, fragile) or duplicates the check (now two places can disagree).
 
 Layered architecture's fix is to give that rule its own layer — a `service` package with no `net/http` import — so every caller goes through the same function and the business rule is tested once, with no database or HTTP server running at all.
 
@@ -125,7 +134,25 @@ Layered architecture is simpler to picture and build; hexagonal buys you the abi
 
 [[Clean Architecture]] takes the same inward-dependency rule and makes it stricter by naming each ring and requiring you to cross every ring boundary with an explicit DTO.
 
+### Real-life example 🟢
+
+Think of a movie-ticket app like BookMyShow. When you tap "Book", the top layer reads your request (show, seats D7 and D8).
+The service layer runs the steps: check the seats are free, hold them, start the payment.
+The domain layer holds the rule "one seat, one person per show".
+The repository layer saves the booking rows in the database.
+The same service is also called by the box-office counter app, so the "one seat, one person" rule lives in one place and both channels obey it.
+
+## Common beginner mistakes 🟢
+
+- **Putting business rules in the HTTP handler** → a background job or CSV import skips them → put them in the service or domain layer, which every caller uses.
+- **Letting the repository call the service** → arrows go both ways and Go refuses to build (import cycle) → only call downward.
+- **Using one struct for JSON, rules and the database row** → a column change breaks your public API → keep a request DTO, a domain type and a DB row, and map between them.
+- **Adding layers that only forward calls** → extra files that do nothing (the sinkhole) → delete a layer that never checks, changes or decides anything.
+- **Saving two related rows with two separate calls** → one can succeed while the other fails → wrap both in one transaction (a unit of work).
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the four floors and the "only call downward" rule. **Next we open the box**: how Go enforces the rule, how one request travels through the layers inside a transaction, whether a layer may skip floors, and where each kind of validation belongs.
 
 ```mermaid
 flowchart TD
@@ -156,9 +183,9 @@ The dashed "never calls" arrows are the whole rule. `handler` only knows `servic
 
 `service` declares the `ClientRepo` interface it needs (the consumer owns the interface, the same pattern [[Service Project Layout and Wiring]] uses for a whole service's package layout), and `repo` implements it without `service` importing `repo` back.
 
-That's what keeps this a layered architecture and not a tangle: the compiler enforces the one-way arrow, because `repo` importing `service` would be a Go import cycle if `service` ever imported `repo`'s concrete type.
+That's what keeps this a layered architecture and not a tangle: the compiler enforces the one-way arrow, because `repo` importing `service` would be a Go **import cycle** (two packages importing each other, which `go build` refuses) if `service` ever imported `repo`'s concrete type.
 
-A single create-client request traced through the layers, including the part most layered-architecture diagrams leave out — the transaction:
+A single create-client request traced through the layers, including the part most layered-architecture diagrams leave out — the **transaction** (a group of writes that all succeed or all fail together):
 
 ```mermaid
 sequenceDiagram
@@ -189,9 +216,15 @@ sequenceDiagram
 
 **In plain words: strict means you may only call the floor right below; relaxed lets you skip floors.**
 
+**Step by step:**
+1. Strict: `createClientHandler` calls `ClientService.Create`, which calls `ClientRepo.Insert`. The handler never touches the repo.
+2. A health-check endpoint only needs "can I reach the database?".
+3. Relaxed: you let that one handler ping the database directly, skipping the service.
+4. Keep it to cases like that. If ordinary handlers start doing it, business rules get skipped.
+
 **Strict layering** means a layer may only call the layer immediately below it — presentation can never call persistence directly, even to skip a trivial pass-through in the service.
 
-**Relaxed layering** allows a layer to call any layer below it, not just the next one, which is common for cross-cutting reads (a handler calling a read-only cache layer directly for a health check).
+**Relaxed layering** allows a layer to call any layer below it, not just the next one, which is common for **cross-cutting** reads (needs shared by every part of the app, like health checks and metrics) (a handler calling a read-only cache layer directly for a health check).
 
 Pick strict by default: it is what keeps the service layer the single place business rules live, and it is what makes the service layer testable without an HTTP server.
 
@@ -207,13 +240,36 @@ flowchart TB
 
 **In plain words: layers are folders in one program; tiers are separate machines.**
 
+**Step by step:**
+1. Your Go service has `handler/`, `service/`, `domain/`, `repo/`. That is four logical layers.
+2. It builds into one binary. That is one physical tier.
+3. Postgres runs on its own server. That is a second tier.
+4. Put a CDN in front of the app and you add a tier, but not a layer.
+
 The four rooms above are **logical layers**: a way of organizing code inside one process. A **physical tier** is a separate deployable — a separate binary, container, or machine, usually talking over the network. A monolith with a layered internal structure has four logical layers and one physical tier.
 
-A classic "three-tier" web app (web server, application server, database server) has physical tiers that happen to line up with layers, but the two ideas are independent: you can have logical layers with no tier boundaries (this note's whole example), and you can have tier boundaries that don't line up with the logical layers at all (a CDN in front of a monolith adds a tier, not a layer).
+A classic "three-tier" web app (web server, application server, database server) has physical tiers that happen to line up with layers, but the two ideas are independent: you can have logical layers with no tier boundaries (this note's whole example), and you can have tier boundaries that don't line up with the logical layers at all (a **CDN**, a network of servers that caches your pages close to users, in front of a monolith adds a tier, not a layer).
 
 ### Where validation lives
 
 **In plain words: "is this JSON shaped right?" goes at the top; "is this allowed by the business?" goes in the domain.**
+
+**Step by step:**
+1. Request body: `{"email": 42}`. The handler sees `email` is not text and answers 400. That is transport validation.
+2. Request body: `{"email": "asha@"}`. The JSON is fine, so it reaches the domain. `Client.Validate` says the email is badly formed. That is domain validation.
+3. The CSV import job sends the same bad email. It skips the handler but still hits `Client.Validate`, so it is caught too.
+
+```mermaid
+flowchart LR
+    R["HTTP request"] --> H{"Handler:<br/>valid JSON?"}
+    H -- "no" --> E400["400"]
+    H -- "yes" --> D{"Domain:<br/>allowed by rules?"}
+    CSV["CSV import"] --> D
+    D -- "no" --> ERR["error"]
+    D -- "yes" --> S["save"]
+```
+
+Full detail:
 
 Two different kinds of "is this valid" question get asked, and they belong in two different layers:
 
@@ -224,7 +280,7 @@ A validation rule that only exists in the handler is invisible to the bulk-impor
 
 ## 4. Worked example 🟡
 
-The Go code below implements exactly the diagram above: `handler` → `service` → `repo`, plus the one detail most layered-architecture write-ups skip — a transaction that spans two repositories (the client insert and its audit row). It compiles and passes `go vet` and `go test -race` on Go 1.24.
+The Go code below implements exactly the diagram above: `handler` → `service` → `repo`, plus the one detail most layered-architecture write-ups skip — a transaction that spans two repositories (the client insert and its audit row). It compiles and passes `go vet` and `go test -race` (tests run with Go's data-race detector on) on Go 1.24.
 
 **The domain layer** — one invariant, enforced once, usable by every caller:
 
@@ -269,6 +325,8 @@ func hasAt(s string) bool {
 ```
 
 **The service (application) layer** — it owns the `ClientRepo` and `AuditRepo` interfaces it needs, plus a `UnitOfWork` interface for the transaction:
+
+**What this code does, in plain words:** `Create` validates the client, checks the email is not already used, and then, inside one transaction, inserts the client and writes an audit row. If either write fails, neither is kept.
 
 ```go
 // Package service is the business layer. It owns the interfaces it needs
@@ -359,6 +417,8 @@ func (s *Service) GetClient(ctx context.Context, id int64) (domain.Client, error
 ```
 
 **The persistence layer** — an in-memory store standing in for Postgres. The comments show exactly what the real `*pgx.Pool` version would look like:
+
+**What this code does, in plain words:** maps stand in for the `clients` and `audit` tables. The unit of work takes one lock for the whole call and copies the data first, so if anything fails it can put the old copy back (a pretend rollback).
 
 ```go
 // Package repo is the persistence layer. It implements the interfaces the
@@ -696,6 +756,9 @@ func TestCreateClient_ConcurrentCallsDoNotCorruptState(t *testing.T) {
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how the layers, their separate types and a cross-repository transaction look in Go. **Next is the senior view**: how layered services rot in production, why three structs beat one, how to spot a sinkhole, and when to move on to hexagonal.
+
+
 - **Real systems:** nearly every Spring/Django/Rails-generation web framework scaffolds this shape by default (MVC's model/view/controller maps loosely onto domain/presentation), and it is still the default advice for a new Go service with one Postgres database and one HTTP API.
 - **Failure modes → fixes:**
   - Business rule duplicated between the HTTP handler and a background job → move it into the service layer; both callers call the same function.
@@ -757,6 +820,26 @@ The trigger is not line count; it's "do I now have more than one kind of adapter
 - A transaction spanning repositories needs a unit of work, not two independent calls.
 - A layer that never transforms, validates or decides anything is a sinkhole — delete it.
 - Evolve to hexagonal once you need to isolate more than one kind of external dependency.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) Name the four layers, top to bottom.
+> Presentation, application (service), domain, persistence.
+
+> [!question]- (easy) May the repository call the service?
+> No. Calls and imports only point downward.
+
+> [!question]- (easy) Where does "email must be unique" live?
+> In the service/domain layer, so every caller (HTTP, CSV import, tests) goes through it.
+
+> [!question]- (medium) Is "layered" the same as "three-tier"?
+> No. Layers are code folders inside one program; tiers are separately deployed programs or machines.
+
+> [!question]- (medium) Why use a `UnitOfWork` interface instead of passing `*sql.Tx` everywhere?
+> It keeps the service free of `database/sql` and lets tests use an in-memory version.
+
+> [!question]- (medium) How do you spot the sinkhole anti-pattern?
+> Most methods in a layer just call the same method one layer down, unchanged; that layer should go.
 
 ## Links 🟢
 - **Before this:** [[Monolith vs Microservices]]

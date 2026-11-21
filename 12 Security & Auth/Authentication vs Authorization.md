@@ -30,6 +30,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: a browser sends a request with headers (like `Authorization`), and the server answers with a status code such as 200, 401 or 403.
+
 **From zero, in 60 seconds** 🟢
 
 You walk up to an app and type your email and password.
@@ -74,6 +77,12 @@ Websites need the same two steps: who are you, and are you allowed to do this?
 | Role | A named bundle of permissions | `admin`, `viewer` |
 | HTTP 401 | "I do not know who you are" | Missing or expired token |
 | HTTP 403 | "I know who you are, but no" | Viewer tries to delete |
+| Token / JWT | A signed pass the server gives you after login; JWT (JSON Web Token) is the most common format | `Authorization: Bearer eyJ...` |
+| Tenant / workspace | One customer company inside a shared app; its data must stay walled off from others | Workspace `w3` = Acme Ltd |
+| BOLA / IDOR | Bug where a logged-in user reads someone else's object just by changing the ID in the URL | `/invoices/482` → `/invoices/483` |
+| API gateway | The front door server that every request passes through before it reaches your services | Checks the token, then forwards |
+| Policy engine | A separate program that answers "allow or deny?" from written rules | OPA, Casbin |
+| MFA | Logging in with two different kinds of proof | Password + a 6-digit code on your phone |
 
 **Picture it**
 
@@ -112,7 +121,7 @@ flowchart LR
     AuthZ -- "yes" --> OK["200: return invoice 482"]
 ```
 
-If the service skips the second gate and trusts "the token was valid" as "the request is allowed", any logged-in user can read `/invoices/1`, `/invoices/2`, … for every workspace. That single missing gate is OWASP's API1:2023, Broken Object Level Authorization (BOLA), consistently the most reported API vulnerability class.
+If the service skips the second gate and trusts "the token was valid" as "the request is allowed", any logged-in user can read `/invoices/1`, `/invoices/2`, … for every workspace. That single missing gate is OWASP's (OWASP: a non-profit that publishes the best-known lists of web security risks) API1:2023, Broken Object Level Authorization (BOLA), consistently the most reported API vulnerability class.
 
 ## 1. Why it exists 🟢
 
@@ -121,11 +130,23 @@ A public blogging API has two endpoints: `GET /posts/{id}` (anyone can read a pu
 1. **Authentication:** is there a valid session or token at all, and whose is it?
 2. **Authorization:** given that identity, is *this* action on *this* post allowed?
 
-Concretely: user `u9` is authenticated (their JWT is valid, not expired, correctly signed). They send `DELETE /posts/482`. Post 482 belongs to user `u77`. A server that only checks "is the token valid" returns 204 and deletes someone else's post.
+Concretely: user `u9` is authenticated (their JWT, the signed login pass, is valid, not expired, correctly signed). They send `DELETE /posts/482`. Post 482 belongs to user `u77`. A server that only checks "is the token valid" returns 204 and deletes someone else's post.
 
 A server with both checks runs the second gate — "does `u9` own post 482, or hold a role that may delete any post?" — and returns 403.
 
 This is not a hypothetical: unauthorized object access is the single most common API vulnerability reported in Postman and Salt Security's annual API security surveys, and it is OWASP's #1 API risk for two editions running.
+
+### Real-life example: your BookMyShow tickets 🟢
+
+When you open "My bookings" on BookMyShow, the app first checks your login (AuthN). Each booking has an ID in the request, say booking `88123`. Before showing it, the server must check that booking `88123` really belongs to you (AuthZ). If it only checked "is someone logged in?", you could change the number to `88124` and see a stranger's seats, phone number and venue. The same two steps guard a Swiggy order page or a WhatsApp group admin button: logged in is step one, "is this yours / are you an admin here?" is step two.
+
+```mermaid
+flowchart LR
+    U["You, logged in"] --> B["GET booking 88124"]
+    B --> Q{"Is 88124 yours?"}
+    Q -- "yes" --> S["Show booking"]
+    Q -- "no" --> N["404 / 403"]
+```
 
 ## 2. Mental model 🟢
 
@@ -141,16 +162,53 @@ A nightclub analogy makes the split concrete:
 
 The crucial corollary: checking ID at the front door once does not let you into every room. Every door (every object, every action) needs its own wristband check. That's the whole story behind BOLA — a system that checks ID once at login and then trusts every subsequent door.
 
+### AuthN vs AuthZ side by side 🟡
+
+People mix these two up all the time, often because both are loosely called "auth".
+
+| | Authentication (AuthN) | Authorization (AuthZ) |
+| --- | --- | --- |
+| Question | Who are you? | May you do this, to this thing? |
+| When it runs | Once, at login (then the token is re-checked) | On every request, for every object touched |
+| Input | Password, passkey, code, token | The verified identity + the action + the object |
+| Failure code | 401 | 403 (or 404 to hide the object) |
+
+## Common beginner mistakes 🟢
+
+- **"Logged in" treated as "allowed"** → any user can change the ID in the URL and read other people's data (BOLA) → check ownership of every object, on every request.
+- **Reading `role` or `workspace_id` from the request body** → the caller can just type `"role":"admin"` → take them only from the verified token or session on the server.
+- **Checking roles only at the gateway** → an inner service still serves the admin action to anyone who reaches it → re-check in the service that does the action.
+- **Mixing up 401 and 403** → clients log users out when they are only missing a permission → 401 for "who are you?", 403 for "known, but no".
+- **Defaulting to allow when no rule matches** → every new endpoint is open until someone remembers to add a rule → start from deny.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that there are two gates: "who are you?" and "may you do this?". **Next we open the box** and see how the identity is created, which error code each gate returns, and where in your system each check should run.
 
 ### Issuing an identity
 
 **In plain words:** after you log in, the server writes down "this is user u9 from workspace w3" and hands you a pass. Every later request shows that pass.
 
+**Step by step:**
+1. Priya types her email and password on the login page.
+2. The server checks the password against its stored hash. If MFA is on, it also asks for the 6-digit code from her phone.
+3. Both match, so the server builds a principal: `user=u9, workspace=w3, role=member`.
+4. It packs that principal into a session cookie or a signed token and sends it back.
+5. On every later click, Priya's browser sends that pass, and the server reads "u9 from w3" from it without asking for the password again.
+
+```mermaid
+flowchart LR
+    K["Something you know<br/>(password)"] --> L{"Login check"}
+    H["Something you have<br/>(phone code)"] --> L
+    L -- "both ok" --> P["Principal: u9, w3"]
+    P --> T["Session cookie or token"]
+```
+
+
 Authentication ends with the server minting a **principal**: a value that says who the caller is, derived from one of:
 
 - **Something you know** — password, PIN.
-- **Something you have** — a TOTP device, a hardware security key, a phone receiving an SMS/push.
+- **Something you have** — a TOTP device (TOTP: an app that shows a new 6-digit code every 30 seconds), a hardware security key, a phone receiving an SMS/push.
 - **Something you are** — biometrics (fingerprint, face), used almost always as a *local* unlock for a stored key, not transmitted to the server.
 
 Multi-factor authentication (MFA) combines two different categories — password (know) + TOTP code (have) — because compromising both at once is much harder than compromising one. See [[Password Storage and Login Security]] for how the password half is verified, and [[Sessions and Cookies]] / [[JWT - Structure, Validation and Pitfalls]] for how the resulting identity is carried on later requests.
@@ -158,6 +216,12 @@ Multi-factor authentication (MFA) combines two different categories — password
 ### Status codes: 401 vs 403 vs 404
 
 **In plain words:** 401 means "I don't know you", 403 means "I know you, but no", and 404 can be used to hide that the thing even exists.
+
+**Step by step:**
+1. A request arrives with no token at all → the server cannot tell who it is → **401**.
+2. A request arrives with a valid token for `u9`, who is a `member`, asking to delete an invoice. Members may not delete → **403**.
+3. A request from `u9` (workspace `w3`) asks for invoice 482, which lives in workspace `w5` → the server says **404**, as if 482 did not exist, so `u9` cannot even learn that it is there.
+4. A request from `u9` for invoice 400 in their own workspace, with the right role → **200** and the data.
 
 | Code | Means | Example |
 | --- | --- | --- |
@@ -170,6 +234,13 @@ The 403-vs-404 choice is itself an authorization decision: for a resource whose 
 ### Where the checks live
 
 **In plain words:** the front gate (gateway) does rough checks like "are you logged in at all". The service that owns the data does the fine check: "is this exact row yours?"
+
+**Step by step:**
+1. `GET /invoices/482` hits the API gateway first.
+2. The gateway checks that the token is real and not expired, and that this caller is not sending 1,000 requests a second. Bad token → 401 right here, cheaply.
+3. The request moves on to the invoice service, which reads the principal (`u9`, `w3`, `member`) from the token.
+4. The service checks the role: may a `member` read invoices? Yes.
+5. The service loads invoice 482 with `WHERE workspace_id = 'w3'`. If 482 belongs to another workspace, the query finds nothing → 404.
 
 ```mermaid
 flowchart LR
@@ -186,7 +257,7 @@ The gateway can reject a forged or expired token cheaply, before it reaches any 
 
 So coarse, identity-shaped checks (is the token valid? does this role exist?) belong at the edge; object-level checks belong in the service, scoped by a `WHERE workspace_id = $1` (or equivalent) on every query that touches tenant data.
 
-A policy engine like OPA (Rego policies evaluated as a sidecar or library call) or Casbin can centralize the *rule* while the *object lookup* still happens where the data lives.
+A policy engine like OPA (Open Policy Agent; its rules are written in a small language called Rego, and it runs as a sidecar, a helper process next to your service, or as a library call) or Casbin (a similar rules library) can centralize the *rule* while the *object lookup* still happens where the data lives.
 
 ## 4. Worked example 🟡
 
@@ -216,7 +287,7 @@ allow invoice:read if
 
 ABAC folds the object check and the time-window check into the same rule language, which is why policy engines like OPA express rules this way: one evaluation covers role, tenant, and context together.
 
-**ReBAC (relationship-based access control).** Google's Zanzibar model (used by Google Drive, and the open-source OpenFGA/SpiceDB) stores authorization as a graph of relationship tuples:
+**ReBAC (relationship-based access control).** Google's Zanzibar model (used by Google Drive, and the open-source OpenFGA/SpiceDB, which are free copies of the same idea) stores authorization as a graph of relationship tuples (small "who is linked to what, and how" facts):
 
 ```text
 (object: invoice:482, relation: viewer, user: workspace:w3#member)
@@ -332,7 +403,10 @@ Both tests pass under `go test -race` on Go 1.24 (no shared mutable state in thi
 
 ## 7. In production 🔴
 
-- **Real systems:** Google Drive and Google Cloud IAM run on Zanzibar-derived ReBAC internally. GitHub repo permissions (direct, team, organization) are a ReBAC-shaped graph. Most SaaS back ends run RBAC with an added per-row tenant filter, which is ABAC in miniature (`tenant_id = current_tenant`). OPA is widely used as a sidecar in Kubernetes admission control and as a library inside Go services for exactly this kind of decision.
+> 🟡 → 🔴 **You now know** the three ways to model permissions (RBAC, ABAC, ReBAC) and where each check runs. **Next we look at real systems**: how the checks fail in production, what to watch on dashboards, and the deeper design questions an SDE-3 interview will push on.
+
+
+- **Real systems:** Google Drive and Google Cloud IAM run on Zanzibar-derived ReBAC internally. GitHub repo permissions (direct, team, organization) are a ReBAC-shaped graph. Most SaaS back ends run RBAC with an added per-row tenant filter, which is ABAC in miniature (`tenant_id = current_tenant`). OPA is widely used as a sidecar in Kubernetes admission control (the step where Kubernetes decides whether a new deployment is allowed in) and as a library inside Go services for exactly this kind of decision.
 - **Failure modes → fixes:**
   - Missing object-level check (BOLA) → scope every query with the tenant/owner ID from the verified principal, never from a client-supplied field.
   - Trusting a client-supplied `role` or `tenant_id` field in the request body → derive both from the verified token/session server-side, never from request input.
@@ -343,9 +417,16 @@ Both tests pass under `go test -race` on Go 1.24 (no shared mutable state in thi
 ## 8. Deep dive 🔴
 
 - **Default deny.** The permission check should start from "deny" and require an explicit grant, never the reverse. A rule set that fails open (an unmatched case defaults to allow) is a standing vulnerability waiting for a new endpoint to be added without a matching rule.
-- **Row-level security as a second line of defense.** Postgres row-level security (RLS) policies tied to a session variable (`current_setting('app.workspace_id')`) enforce the tenant boundary inside the database itself, so an application bug that forgets the `WHERE workspace_id = $1` clause still cannot leak another tenant's rows. This is a backstop, not a substitute for the application-level check — RLS alone doesn't know about role-based action permissions like `invoice:delete`.
-- **Service identity vs user identity.** A background job or a service calling another service on a user's behalf needs its own principal shape: either the user's token propagated through (on-behalf-of), or a service identity (mTLS client certificate, signed service JWT) with its own, narrower permission set. Conflating "this call came from our billing service" with "this call came from user u9" produces privilege-escalation bugs when the service account's permissions are broader than any single user's.
-- **Caching authorization decisions.** A ReBAC graph walk or an ABAC rule evaluation is not free; high-traffic reads often cache "yes" decisions for a few seconds keyed by (principal, resource, action), but a permission *revocation* must still take effect promptly — Zanzibar's answer is a "zookie"/consistency token that ties a read to a known-fresh point in the permission graph, trading a little latency for correctness.
+- **Row-level security as a second line of defense.** Postgres row-level security (RLS: a database rule that silently hides rows from other tenants, even if the app forgets to filter) policies tied to a session variable (`current_setting('app.workspace_id')`) enforce the tenant boundary inside the database itself, so an application bug that forgets the `WHERE workspace_id = $1` clause still cannot leak another tenant's rows. This is a backstop, not a substitute for the application-level check — RLS alone doesn't know about role-based action permissions like `invoice:delete`.
+
+```mermaid
+flowchart LR
+    A["App query, forgot<br/>WHERE workspace_id"] --> R{"RLS policy:<br/>workspace = w3?"}
+    R -- "rows of w3" --> OK["returned"]
+    R -- "rows of w5" --> H["hidden"]
+```
+- **Service identity vs user identity.** A background job or a service calling another service on a user's behalf needs its own principal shape: either the user's token propagated through (on-behalf-of), or a service identity (mTLS client certificate, a certificate the calling service shows to prove which service it is, signed service JWT) with its own, narrower permission set. Conflating "this call came from our billing service" with "this call came from user u9" produces privilege-escalation bugs when the service account's permissions are broader than any single user's.
+- **Caching authorization decisions.** A ReBAC graph walk or an ABAC rule evaluation is not free; high-traffic reads often cache "yes" decisions for a few seconds keyed by (principal, resource, action), but a permission *revocation* must still take effect promptly — Zanzibar's answer is a "zookie"/consistency token (a small marker saying "answer using permissions at least as new as this moment") that ties a read to a known-fresh point in the permission graph, trading a little latency for correctness.
 - **Multi-tenant isolation beyond the row filter.** At higher assurance levels (regulated data, enterprise contracts), tenants get separate database schemas, separate encryption keys, or fully separate database instances, so a missing `WHERE` clause cannot cross a tenant boundary even in principle. That is a deployment-topology decision layered on top of the same authorization model, not a replacement for it.
 
 ## 9. Interview questions 🔴
@@ -380,6 +461,26 @@ Both tests pass under `go test -race` on Go 1.24 (no shared mutable state in thi
 - Coarse checks (token valid? role exists?) belong at the gateway; object-level checks belong in the service that owns the resource.
 - Default deny: an unmatched case in the policy must reject, never allow.
 - Service identity (mTLS, service JWT) is a separate principal shape from user identity — never let a broad service account stand in for a narrower user permission set.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) A request has no token. Which status code?
+> 401: the server does not know who you are.
+
+> [!question]- (easy) User `u9` is logged in but asks to delete an invoice and is only a `member`. Which code?
+> 403: identity is known, but this action is not allowed.
+
+> [!question]- (easy) Which runs on every request: AuthN or AuthZ?
+> AuthZ. AuthN happens at login; after that only the token is re-checked, while permissions are checked for every action and object.
+
+> [!question]- (medium) Why can't the API gateway alone stop BOLA?
+> The gateway does not have the invoice row, so it cannot know which workspace owns invoice 482; only the owning service can check that.
+
+> [!question]- (medium) In the Go `Can` function, why is the workspace checked before the role?
+> So that even an `admin` from another workspace is blocked; a correct role must never get past the tenant wall.
+
+> [!question]- (medium) When is ReBAC a better fit than RBAC?
+> When access follows sharing links (folder → file, team → sub-team), like Google Drive; for 3 roles and 5 permissions, plain RBAC is simpler.
 
 ## Links
 

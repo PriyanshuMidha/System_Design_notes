@@ -28,6 +28,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[JavaScript Core - Types, Scope, Hoisting, Closures, this]]: numbers and strings are copied when assigned, but objects and arrays are shared, so two names can point at the same array.
+
 **From zero, in 60 seconds** 🟢
 
 Programs need to group data. An **object** groups named fields that belong together, like one product with a name and a price. An **array** is an ordered list of things, like the items in a shopping cart.
@@ -69,6 +72,12 @@ Objects hold "one thing with fields"; arrays hold "a list of things"; loops and 
 | Mutate | Change the original data in place | `arr.push(5)` changes `arr` |
 | Iterate | Visit each item one at a time | `for (const x of arr) {...}` |
 | Prototype | A backup object JS checks when a key is missing | `arr.map` comes from `Array.prototype` |
+| Shallow copy | A copy of the top level only; nested objects are still shared | `{ ...user }` |
+| Iterable | Anything `for...of` can walk through | arrays, strings, `Map`, `Set` |
+| Accumulator | The running result `reduce` carries from item to item | the running total in a cart sum |
+| Reference equality | Two names count as "same" only if they point at the very same object | `a === b` for arrays |
+| Big-O, like O(1) / O(n) | How the work grows with list size: O(1) = same cost always, O(n) = grows with the number of items | `push` is O(1), `shift` is O(n) |
+| Symbol | A special unique value that can be used as a hidden object key | `Symbol("id")` |
 
 **Picture it**
 
@@ -107,6 +116,30 @@ A concrete case makes this real: a shopping cart is an array of `{ itemName, pri
 > [!tip] Remember
 > Reach for an object when you have a fixed set of named fields. Reach for an array when you have an ordered sequence you'll loop over, sort, or index by position.
 
+### Real-life example: a Flipkart cart 🟢
+
+In a Flipkart cart, each product is an object: `{ name: "Earbuds", price: 1499, inStock: true }`.
+The cart is an array of those objects, in the order you added them.
+"Remove" uses `splice` or `filter`; the price summary uses `reduce` to add up prices.
+The "Save for later" list is a separate array built with `filter`, so the original cart array is not touched.
+
+## Common beginner mistakes 🟢
+
+- **Calling `.sort()` on numbers with no comparator** → `[10, 2, 1]` becomes `[1, 10, 2]` because it compares as text → use `.sort((a, b) => a - b)`.
+- **Using `for...of` on a plain object** → it throws "is not iterable" → use `for (const [k, v] of Object.entries(obj))`.
+- **Using `forEach` when you want a new array** → `forEach` returns `undefined` → use `map`.
+- **Forgetting the start value in `reduce`** → an empty array throws an error, and objects add up as text → always pass one, like `reduce(fn, 0)`.
+- **Changing an array with `push` and expecting React to notice** → the array is the same object, so React thinks nothing changed → make a new array: `[...arr, x]`.
+
+## Often confused 🟡
+
+| These two | First one | Second one |
+| --- | --- | --- |
+| `for...of` vs `for...in` | Walks **values** of arrays, strings, `Map`, `Set` | Walks **keys** of an object, including inherited ones |
+| `map` vs `forEach` | Returns a new array of results | Returns nothing; only for side effects |
+| `slice` vs `splice` | Copies a part, original untouched | Cuts items out of the original |
+| Plain object vs `Map` | String keys, fixed set of fields | Any key type, many adds and removes, has `.size` |
+
 ## 2. Mental model 🟢
 
 An **object** is a labeled box of drawers: each drawer has a name (the key) and holds one value. You open a drawer by its label, not by its position.
@@ -140,9 +173,18 @@ Because an array *is* an object with numeric keys, every plain-object operation 
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that objects are named drawers, arrays are numbered drawers, and some methods change the original while others make a new one. **Next we open the box**: how to read and copy objects, which array methods change what, how `map`/`filter`/`reduce` work step by step, and how loops really walk a collection.
+
 ### Objects: literals, access, and iteration
 
 **In plain words:** An object literal is written with `{ }`. Inside, each entry is a key and a value, separated by `:`. Most of the time you read and write a key with `.dot` notation; a few key shapes force you to use `["bracket"]` notation instead.
+
+**Step by step:**
+1. `const user = { name: "Asha", "full name": "Asha Rao", age: 25 };` makes one object with three keys.
+2. `user.name` reads `"Asha"`. `user["full name"]` is needed because that key has a space.
+3. `user.city = "Pune";` adds a new key on the spot.
+4. `user.address?.city` safely gives `undefined` instead of crashing, because there is no `address`.
+5. `Object.entries(user)` gives `[["name","Asha"], ...]`, which you can loop over with `for...of`.
 
 ```js
 const mySym = Symbol("key1");
@@ -164,7 +206,7 @@ console.log(jsUser.greet());       // "Hello, Hitesh" — has a return, so it pr
 
 **Why it matters:** Picking the wrong notation for a given key either throws a syntax error (dot notation on a reserved shape) or silently reads `undefined` (dot notation on a key that doesn't exist under that exact spelling).
 
-Optional chaining and nullish coalescing guard against missing data without a manual `if`:
+**Optional chaining** (`?.`, "read this only if the thing on the left exists") and **nullish coalescing** (`??`, "use this fallback if the left side is `null` or `undefined`") guard against missing data without a manual `if`:
 
 ```js
 const city = jsUser.address?.city ?? "unknown"; // no address property: short-circuits to "unknown" instead of throwing
@@ -184,7 +226,7 @@ for (const [key, value] of Object.entries(jsUser)) {
 ```
 
 > [!warning] Common mistake
-> `for...in` walks **inherited** keys too (anything up the prototype chain), not just the object's own. Looping over a plain object without `Object.hasOwn` can silently pick up a method added to `Object.prototype` by a careless third-party library. `Object.entries`/`Object.keys`/`Object.values` only ever return **own** enumerable keys, which is why they're the usual safer default.
+> `for...in` walks **inherited** keys too (anything up the prototype chain), not just the object's own. Looping over a plain object without `Object.hasOwn` can silently pick up a method added to `Object.prototype` by a careless third-party library. `Object.entries`/`Object.keys`/`Object.values` only ever return **own** **enumerable** (shown in loops; most normal keys are) keys, which is why they're the usual safer default.
 
 Destructuring, spread and shallow copy:
 
@@ -226,7 +268,7 @@ const account = {
 };
 ```
 
-`class` is syntax sugar over the same prototype mechanism objects already use:
+`class` is **syntax sugar** (a nicer way to write something that already exists) over the same prototype mechanism objects already use:
 
 ```mermaid
 flowchart TD
@@ -241,7 +283,7 @@ flowchart TD
 
 The analogy breaks down because the chain is set once at creation (via the object's prototype), not re-negotiated every lookup.
 
-`Map` and `Set` exist alongside plain objects for cases a plain object handles badly: a `Map` accepts any key type (not just strings/symbols), preserves insertion order reliably, and has an O(1) `.size`; a plain object's keys are always coerced to strings, and `Object.keys(obj).length` is O(n) to compute.
+`Map` and `Set` exist alongside plain objects for cases a plain object handles badly: a `Map` accepts any key type (not just strings/symbols), preserves insertion order reliably, and has an O(1) `.size`; a plain object's keys are always **coerced** (quietly converted) to strings, and `Object.keys(obj).length` is O(n) to compute.
 
 > [!tip] Remember
 > Dot notation for ordinary names, brackets for anything computed, spaced, or symbol-keyed. Spread and `Object.assign` copy one level deep only — nested data is still shared.
@@ -249,6 +291,13 @@ The analogy breaks down because the chain is set once at creation (via the objec
 ### Arrays: creating, mutating vs non-mutating, and costs
 
 **In plain words:** some array methods change the array itself and give back something small (the new length, the removed item). Others leave the original array untouched and hand back a brand-new array. Mixing up which is which is the single most common array bug.
+
+**Step by step:**
+1. `const cart = ["tea", "bun"];`
+2. `cart.push("jam")` changes `cart` to `["tea", "bun", "jam"]` and returns 3, the new length.
+3. `const cheap = cart.slice(0, 2)` gives a **new** array `["tea", "bun"]`; `cart` still has 3 items.
+4. `cart.shift()` removes `"tea"` from the front, and every other item moves down one slot: slow on big arrays.
+5. `cart.toSorted()` (new in 2023) gives a sorted copy; `cart.sort()` sorts `cart` itself.
 
 ```js
 const empty = [];
@@ -297,7 +346,7 @@ const flat = nested.flat(Infinity);                    // [1,2,3,4,5,6] — flat
 > ```
 > Always pass `(a, b) => a - b` for a numeric ascending sort — never rely on the default.
 
-Searching: `indexOf`/`lastIndexOf` (strict equality, primitives only), `includes` (works with `NaN`, unlike `indexOf`), `find`/`findIndex` (first match by predicate), `at(-1)` (last element, no need for `arr[arr.length - 1]`).
+Searching: `indexOf`/`lastIndexOf` (strict equality, primitives only), `includes` (works with `NaN`, unlike `indexOf`), `find`/`findIndex` (first match by **predicate**, a function that returns true or false), `at(-1)` (last element, no need for `arr[arr.length - 1]`).
 
 Array destructuring pulls positional elements out by index, with its own defaults and a rest collector:
 
@@ -312,6 +361,18 @@ const [a = 1, b = 2] = [];                           // a=1, b=2 — defaults ap
 ### map / filter / reduce
 
 **In plain words:** these three methods are how you turn one array into another without writing a manual loop. `map` transforms every element one-for-one. `filter` keeps only the elements that pass a test. `reduce` folds the whole array down into a single value.
+
+**Step by step:**
+1. Start with prices `[100, 250, 40]`.
+2. `.map(p => p * 2)` calls the function on each item and returns `[200, 500, 80]`.
+3. `.filter(p => p > 100)` keeps only items where the function says true: `[200, 500]`.
+4. `.reduce((sum, p) => sum + p, 0)` starts `sum` at 0, then 0+200 = 200, then 200+500 = 700.
+5. The result is the single number 700. The starting array `[100, 250, 40]` is unchanged.
+
+```mermaid
+flowchart LR
+    S["sum = 0"] --> A["+200 → 200"] --> B["+500 → 700"] --> R["result: 700"]
+```
 
 **An analogy:** think of a factory conveyor belt. `map` is a machine that reshapes every item that passes by (every box gets a new label). `filter` is a sorting gate that only lets some boxes through.
 
@@ -347,7 +408,7 @@ flowchart LR
 
 Each arrow in the diagram allocates a brand-new array — a 3-stage chain over `n` items does 3×n work and holds 2 intermediate arrays in memory before they're freed.
 
-**Why it matters:** this is readable and safe (nothing is mutated), but it isn't free. For a one-off transform over a huge array on a hot path, a single hand-written `for` loop that does all three steps in one pass avoids the two throwaway intermediate arrays — see [[#6. Trade-offs and when not to use]].
+**Why it matters:** this is readable and safe (nothing is mutated), but it isn't free. For a one-off transform over a huge array on a **hot path** (code that runs very often, so its speed matters), a single hand-written `for` loop that does all three steps in one pass avoids the two throwaway intermediate arrays — see [[#6. Trade-offs and when not to use]].
 
 `reduce` needs an initial value or it throws on an empty array:
 
@@ -361,11 +422,11 @@ const total = shoppingCart.reduce((acc, item) => acc + item.price, 0); // 0 is t
 
 **What happens if** you omit the `0`?
 
-On a non-empty array, `reduce` quietly uses the *first element itself* as the starting accumulator instead of `0` — so `acc` starts as `{ itemName: "js course", price: 2999 }`, an object, and `acc + item.price` becomes nonsense string concatenation.
+On a non-empty array, `reduce` quietly uses the *first element itself* as the starting **accumulator** (the running result passed from step to step) instead of `0` — so `acc` starts as `{ itemName: "js course", price: 2999 }`, an object, and `acc + item.price` becomes nonsense string concatenation.
 
 On an **empty** array with no initial value, there is no first element to fall back to, so `reduce` throws `TypeError: Reduce of empty array with no initial value`.
 
-`map` differs from `forEach` in one way that trips people up: `map` **returns a new array** of the callback's results; `forEach` always returns `undefined` and exists only for its side effects. Related one-shot methods: `some`/`every` (boolean checks), `flatMap` (map then flatten one level).
+`map` differs from `forEach` in one way that trips people up: `map` **returns a new array** of the callback's results; `forEach` always returns `undefined` and exists only for its **side effects** (changes it makes outside itself, like logging or writing to the page). Related one-shot methods: `some`/`every` (boolean checks), `flatMap` (map then flatten one level).
 
 > [!tip] Remember
 > `map`/`filter`/`reduce` never mutate their input. Always give `reduce` an explicit initial value, even `0` or `[]`, so it's correct on an empty array too.
@@ -373,6 +434,12 @@ On an **empty** array with no initial value, there is no first element to fall b
 ### Iteration: loops, for...of vs for...in, and the iterator protocol
 
 **In plain words:** JavaScript has the usual counting loops (`for`, `while`, `do...while`), plus two loops specialized for going through a collection: `for...of` for values, `for...in` for keys.
+
+**Step by step:**
+1. `for (let i = 0; i < 3; i++)` counts 0, 1, 2. Use it when you need the position.
+2. `for (const fruit of ["apple", "mango"])` gives `"apple"`, then `"mango"`: the values.
+3. `for (const key in { a: 1, b: 2 })` gives `"a"`, then `"b"`: the keys of an object.
+4. `break` stops the loop early; `continue` skips to the next item. `forEach` supports neither.
 
 ```js
 for (let i = 0; i <= 10; i++) { /* classic counting loop */ }
@@ -407,7 +474,7 @@ outer: for (const row of grid) {
 }
 ```
 
-**Picture it:** every `for...of`, spread, and destructuring call works the same way under the hood, by repeatedly calling `next()` on an iterator object until it says it's done:
+**Picture it:** every `for...of`, spread, and destructuring call works the same way under the hood, by repeatedly calling `next()` on an **iterator** object (a helper that hands out one item per `next()` call) until it says it's done:
 
 ```mermaid
 flowchart LR
@@ -468,19 +535,21 @@ Runnable Go version: [[JavaScript Objects, Arrays and Iteration - Go]]
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how objects, arrays, the three big array methods and loops behave. **Next is the advanced part**: how UI frameworks depend on "make a new array, don't mutate", the production bugs that follow, and engine details like holes, hash tables and structural sharing.
+
 - **Real systems:** React and Redux rely on the "new array/object instead of mutate" pattern from `map`/`filter`/spread so they can detect changes by reference equality (`prevState === nextState` means "nothing changed") — see [[React State Management - Props, Context, Redux]].
 - **Failure modes → fixes:**
   - A re-render loop or a missed update in a UI framework → usually an accidental in-place mutation (`arr.push(x)` then re-assigning the same reference) where the framework expected a new reference from `map`/spread.
   - `[10, 2, 1].sort()` silently misordering numeric data in a report → always pass a comparator for anything but strings.
   - A `TypeError: X is not iterable` in production logs → something tried `for...of` or spread on a plain object; fix with `Object.entries`/`Object.keys`.
-- **What to monitor:** unexpected array growth from accidental closures retaining large arrays (see the Core note's closure section); JSON payload size when `Map`/`Set` get `JSON.stringify`'d (they serialize to `{}`, a frequent silent bug).
+- **What to monitor:** unexpected array growth from accidental closures retaining large arrays (see the Core note's closure section); JSON payload size when `Map`/`Set` get `JSON.stringify`'d (turned into JSON text) (they serialize to `{}`, a frequent silent bug).
 
 ## 8. Deep dive 🔴
 
 - **Prototype chain in practice.** `Object.keys`/`values`/`entries` only ever return **own** enumerable properties, never inherited ones — that's why they're usually safer than `for...in` for plain objects.
 - **Sparse arrays.** `new Array(5)` and `delete arr[2]` both create **holes**: `map`/`forEach` skip holes entirely (they don't call the callback for them), while a `for` loop sees `undefined` at that index. `Array.from({ length: 5 })` fills holes with `undefined` instead, which is why it's preferred over `new Array(n)` when you need real values to iterate.
-- **Map/Set vs object/array performance.** `Map` and `Set` are backed by hash tables with guaranteed insertion order and O(1) average add/lookup/delete, including when keys are added and removed repeatedly — a plain object used as a cache can degrade as V8 de-optimizes its internal representation after many shape changes.
-- **Structural sharing.** Spread (`{ ...obj }`, `[...arr]`) only copies one level; this is why immutable-update libraries for nested state (Immer, Redux Toolkit) exist — they handle the "copy every level you change, share every level you don't" bookkeeping for you.
+- **Map/Set vs object/array performance.** `Map` and `Set` are backed by **hash tables** (a structure that jumps straight to a key's slot using a computed number) with guaranteed insertion order and O(1) average add/lookup/delete, including when keys are added and removed repeatedly — a plain object used as a cache can degrade as V8 (Chrome's and Node's JS engine) de-optimizes its internal representation after many **shape** changes (adding or deleting keys changes the object's internal layout).
+- **Structural sharing.** (A new version that reuses the unchanged parts of the old one.) Spread (`{ ...obj }`, `[...arr]`) only copies one level; this is why immutable-update libraries for nested state (Immer, Redux Toolkit) exist — they handle the "copy every level you change, share every level you don't" bookkeeping for you.
 
 ## 9. Interview questions 🔴
 
@@ -511,6 +580,26 @@ Runnable Go version: [[JavaScript Objects, Arrays and Iteration - Go]]
 - A plain object is not iterable with `for...of`; convert first with `Object.entries`.
 - `reduce` needs an initial value; omitting it throws on an empty array.
 - Spread/`Object.assign`/`Object.freeze` are all shallow; use `structuredClone` for a deep copy.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: does `arr.map(x => x * 2)` change `arr`?
+> No. It returns a new array and leaves `arr` as it was.
+
+> [!question]- Easy: how do you read a key called `"full name"` from an object?
+> With brackets: `obj["full name"]`. Dot notation cannot hold a space.
+
+> [!question]- Easy: which loop gives you the values of an array: `for...of` or `for...in`?
+> `for...of`.
+
+> [!question]- Medium: what is `[1, 2, 3].filter(n => n > 1).reduce((s, n) => s + n, 0)`?
+> 5. `filter` keeps `[2, 3]`, then `reduce` adds them from 0.
+
+> [!question]- Medium: `const copy = { ...user }; copy.address.city = "Goa";` Does `user.address.city` change?
+> Yes. Spread is a shallow copy, so `address` is still shared. Use `structuredClone` for a deep copy.
+
+> [!question]- Medium: why is `shift()` slower than `pop()` on a big array?
+> `shift` removes the first item, so every other item must move down one slot: O(n). `pop` just drops the last: O(1).
 
 ## Links
 

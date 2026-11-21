@@ -22,6 +22,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
 > - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Page Cache, File Systems and fsync]]: the theory twin. Know that `write()` lands in RAM (the page cache) and only `fsync` makes it safe on disk.
+> - [[Storage Devices - HDD, SSD, NVMe]]: the disk is the slow, permanent layer that `fsync` waits for.
+> - [[Virtual Memory, Paging and the TLB]]: memory is handled in 4 KB pages. Not needed to read the code itself.
+
 **From zero** 🟢: this file is the hands-on side of [[Page Cache, File Systems and fsync]]. It is Go code that appends to a file in two ways — one calls fsync before returning, one does not — which is exactly the pattern databases use to make a commit survive a crash. Read the code steps with their notes, then run it.
 
 ## Before the code 🟢
@@ -29,7 +34,9 @@ updated: 2026-11-13
 - **`os.OpenFile` with flags**: opens a file with options combined by `|`, here append, create and write-only.
 - **`defer`**: schedules `f.Close()` to run when the function returns, on every path.
 - **Multiple return values and `error`**: Go functions return `(result, error)`; a non-nil `error` means it failed.
-- **`f.Sync()`**: Go's wrapper for the `fsync(2)` system call.
+- **`f.Sync()`**: Go's wrapper for the `fsync(2)` system call ("write this file's changes to the disk now, and wait").
+- **Page cache**: the kernel's copy of file data in RAM; `f.Write` stops there.
+- **WAL (write-ahead log)**: an append-only file a database saves before changing its tables; the pattern this code copies.
 - **`testing` package and `t.TempDir()`**: tests are functions named `TestXxx`; `t.TempDir()` gives a throwaway folder.
 - **What to run**: `go vet ./... && go test -race -v ./...` inside the module folder.
 
@@ -62,13 +69,17 @@ That is the entire point: durability is one explicit call away, and skipping it 
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** the one-line difference this module is about: `f.Sync()`. **Next we read the code:** the durable append first, then the same function without the sync.
+
 ### Step 1: the durable append
+
+**What this code does, in plain words:** open a log file for adding at the end, write one record, then wait until the disk confirms it is saved before returning.
 
 **Concept.** `WriteAppendSync` implements the durable-append pattern from [[Page Cache, File Systems and fsync#4. Worked example 🟡]]: open for append, write the record, then call `Sync()` before telling the caller it is safe to proceed.
 
 This is the same shape a database uses after appending a record to its write-ahead log.
 
-The alternative — opening with a flag that forces synchronous I/O on every write (`O_SYNC`) — was rejected here because explicit `Sync()` calls let the caller choose exactly when durability matters (e.g. once per batch, not once per byte written).
+The alternative — opening with a flag that forces synchronous I/O on every write (`O_SYNC`: every single `Write` waits for the disk) — was rejected here because explicit `Sync()` calls let the caller choose exactly when durability matters (e.g. once per batch, not once per byte written).
 
 ```go
 package pagecache
@@ -115,6 +126,8 @@ sequenceDiagram
 ```
 
 ### Step 2: the non-durable append, for contrast
+
+**What this code does, in plain words:** exactly the same as Step 1, but it returns right after writing, without waiting for the disk.
 
 **Concept.** `WriteAppendNoSync` is deliberately the "wrong" version, kept in the same package specifically so the two can be compared directly: it implements [[Page Cache, File Systems and fsync#1. Why it exists 🟢]]'s point that a successful `write()` only guarantees visibility to other readers, not survival across a crash.
 
@@ -255,6 +268,8 @@ The package-level `2.372s` reported by `go test` is dominated by test-binary bui
 
 In production, the same two calls on a loaded, network-backed volume could each cost several milliseconds instead — see the fsync cost tiers in the theory note.
 
+> 🟡 → 🔴 **You now know** the code and what the tests can and cannot prove. **Next comes the advanced part:** the gaps a unit test cannot see (real power loss), the missing `fdatasync` option, and the limits of `O_APPEND` with many writers.
+
 ## Pitfalls in the code 🔴
 
 - **`WriteAppendNoSync` is never tested for its actual behavior.** Its entire interesting property — that data can be lost on a crash — cannot be observed from inside a normal test process; its correctness here is "it behaves like `WriteAppendSync` minus the `Sync()` call," which can only be reasoned about, not measured in-process.
@@ -267,6 +282,30 @@ In production, the same two calls on a loaded, network-backed volume could each 
 1. Remove the `f.Sync()` call from a copy of `WriteAppendSync` (making it identical to `WriteAppendNoSync`) and run `TestWriteAppendSyncDurableAndReadable` against the modified copy. Predict whether the test still passes, and explain why passing it would not prove the removed call didn't matter.
 2. Add a `WriteAppendFdatasync` variant for Linux using `syscall.Fdatasync` behind a build tag. Predict what observable difference, if any, a test running on this machine could detect compared to `WriteAppendSync`.
 3. Write a benchmark that calls `WriteAppendSync` in a loop, appending a small record each time to the same file. Predict whether the measured time per call stays constant as the file grows, and explain your prediction using the journaling behavior described in [[Page Cache, File Systems and fsync#Inodes and journaling (ext4)]].
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is the only line that differs between the two functions?
+> `return f.Sync()`: the durable version waits for the disk, the other does not.
+
+> [!question]- Does `f.Close()` make the data durable?
+> No. Closing does not flush to disk; you still need `Sync()`.
+
+> [!question]- Why does the test use `t.TempDir()`?
+> Each run gets its own throwaway folder, so old `wal.log` files never get in the way.
+
+🟡 Medium
+
+> [!question]- Why can the test not prove durability?
+> Proving it needs a real power cut mid-write; a test can only read the bytes back, which the page cache serves anyway.
+
+> [!question]- Why call `Sync()` yourself instead of opening with `O_SYNC`?
+> You can write several records and sync once per batch; `O_SYNC` waits on every single write.
+
+> [!question]- Why use `O_APPEND` instead of seeking to the end?
+> The kernel places each write at the end atomically, so two appenders cannot overwrite each other in the gap between seek and write.
 
 ## Links
 

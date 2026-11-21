@@ -40,6 +40,11 @@ This note is about running WebSockets at scale. The protocol itself (handshake, 
 > - 🟡 **Know the basics?** Add section 3 (architecture, routing, lifecycle), 4 (capacity estimate and code) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Real-time APIs - WebSocket, SSE and Long Polling]]: a WebSocket is a connection that stays open so the server can push messages any time; SSE is a one-way version over plain HTTP.
+> - [[Load Balancing]]: a load balancer gives clients one address and spreads new connections over many servers.
+> - [[Scaling Basics]]: you grow by adding servers, which is easy when servers keep nothing about users, and harder when they do.
+
 **From zero, in 60 seconds** 🟢
 
 Normal web requests are like letters: you ask, you get one reply, done.
@@ -86,6 +91,12 @@ Alice's switchboard must find which one holds Bob's call, and nobody's messages 
 | Registry | A lookup table of who is where | `bob → gateway 142` |
 | Sequence number | A counter on each message | Message #57, so #56 came before |
 | Jitter | A small random delay | Reconnect after 1-5 s, not all at 0 s |
+| Heartbeat (ping/pong) | A tiny "still there?" message on an open connection | ping every 30 s |
+| Ack | A reply that says "I got message #57" | client acks seq 57 |
+| At-most-once | A message is sent once and may be lost, never duplicated | Redis Pub/Sub |
+| TLS handshake | The setup step that starts an encrypted connection; costs CPU | every reconnect pays it |
+| Goroutine | Go's very light thread | one per open socket |
+| SSE | Server-Sent Events: a one-way server-to-browser stream over HTTP | live score updates |
 
 **Picture it**
 
@@ -138,7 +149,33 @@ Terms used below:
 - **Presence:** whether a user is online, usually derived from connection heartbeats.
 - **Sticky session:** a load-balancer setting that keeps a client on one server. WebSockets are sticky by nature: the TCP connection itself pins the client.
 
+### Real-life example: WhatsApp Web and live cricket 🟢
+
+When WhatsApp Web shows "typing..." and new messages instantly, your browser has one open WebSocket to one of WhatsApp's many connection servers.
+Your friend's phone is connected to a different server, so a message from them must hop between servers to reach yours.
+If your laptop's Wi-Fi drops for a few seconds, the app reconnects and asks "what did I miss since message 41?", so nothing is lost.
+Live comments during a cricket match on Hotstar work the same way at a huge scale, with one message going out to millions of open connections.
+
+## Common beginner mistakes 🟢
+
+- **Treating socket servers like normal web servers** → adding a server does not move anyone's open connection to it → plan for rebalancing, and know the old servers stay busy until clients reconnect.
+- **Trusting the pub/sub bus to never lose a message** → Redis Pub/Sub drops messages for a server that blinked → save each message with a sequence number first, and let clients resume from the last one they got.
+- **Unlimited send queue per connection** → one slow phone keeps growing memory until the server crashes for all 50,000 users → cap the queue and close slow clients.
+- **All clients reconnecting at the same instant after a deploy** → a storm of 50,000 encrypted handshakes in one second → drain over 30-60 s and add random delay (jitter) on the client.
+- **Using WebSockets for one-way updates** → you run a stateful fleet for no reason → use SSE or push notifications when only the server talks.
+
+### WebSocket vs things people confuse it with 🟡
+
+| Option | Who talks | Good for |
+| --- | --- | --- |
+| WebSocket | Both sides, any time, one open connection | Chat, multiplayer, collaborative editing |
+| SSE | Server to browser only, over plain HTTP | Live scores, notifications, progress bars |
+| Long polling | Client asks and the server waits until it has news | Rare updates, very old clients |
+| Mobile push (FCM/APNs) | Server to a phone that may not have the app open | "You have a new message" when offline |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** each socket lives on one server, so you need a phone book (registry) to find it and a pipe (bus) between servers. **Next we open the box**: the full architecture, the two ways to route messages between servers, and the life of one connection. Each subsection starts with a plain walk-through; the full detail follows.
 
 ### 3.1 The architecture
 
@@ -185,6 +222,13 @@ If Bob is offline (no registry entry), step 4 is replaced by a mobile push notif
 
 **In plain words:** either send to "the server that has Bob" (good for 1-to-1 chat), or send to "everyone listening to room 7" (good for group chats and live scores).
 
+**Step by step:**
+1. Direct message to Bob: look up "Bob → gateway 142" in the registry.
+2. Publish on channel `gw:142`. Only gateway 142 is listening, and it pushes to Bob.
+3. Group message to room 7: no lookup. Every gateway that has at least one room-7 member listens on `room:7`.
+4. Publish once on `room:7`. Each listening gateway pushes to its own local members.
+5. Big apps use both: per-user for direct messages, per-room for groups and live events.
+
 ```mermaid
 flowchart LR
     M["Message"] --> U["Per-user: look up Bob's server,<br/>send to gw:142"]
@@ -201,6 +245,13 @@ Large systems mix them: per-user routing for direct messages, per-topic subscrip
 ### 3.3 The connection lifecycle
 
 **In plain words:** connect, prove who you are, register in the phone book, send pings to stay alive, and clean up when you leave.
+
+**Step by step:**
+1. Bob's app sends a normal HTTP request asking to "upgrade" to a WebSocket, with a short-lived login token.
+2. The gateway checks the token. If good, it answers `101 Switching Protocols` and the line is open.
+3. The gateway writes "Bob → gateway 142" in the registry, with a 60 s expiry.
+4. Every 30 s a ping and pong go back and forth, and the registry entry is refreshed.
+5. On a deploy, the gateway sends a polite "please reconnect" close; Bob's app waits a random moment, reconnects elsewhere, and resumes from his last message number.
 
 ```mermaid
 stateDiagram-v2
@@ -249,8 +300,8 @@ All figures below are **estimates** to show the method.
 
   A cheaper alternative is to write `user → gateway` only on connect and disconnect (about the connect rate, far lower), and treat "the gateway is alive" (one heartbeat key per gateway) as the presence signal.
 - **Reconnect storm:** draining one gateway's 50,000 clients over a **30 s jittered window** gives about 50,000 ÷ 30 ≈ **1,700 new handshakes per second**, spread over 249 other gateways (about 7 each per second). Without jitter, 50,000 handshakes land within a second or two.
-- **File descriptors:** 50,000 sockets need `ulimit -n` (`nofile`) well above 50,000; the common default soft limit of 1,024 fails at connection 1,021 or so.
-- **Ephemeral ports:** a proxy that opens its own connection to a backend uses one local port per connection for each (source IP, backend IP, backend port). With Linux's default `ip_local_port_range` of 32768-60999, that is **28,232 connections** per backend address per proxy IP.
+- **File descriptors** (the operating system's numbered handles for open files and sockets): 50,000 sockets need `ulimit -n` (`nofile`) well above 50,000; the common default soft limit of 1,024 fails at connection 1,021 or so.
+- **Ephemeral ports** (temporary local port numbers the OS hands out for outgoing connections): a proxy that opens its own connection to a backend uses one local port per connection for each (source IP, backend IP, backend port). With Linux's default `ip_local_port_range` of 32768-60999, that is **28,232 connections** per backend address per proxy IP.
 
   An L7 proxy holding 50,000 WebSockets to one backend address runs out. Fixes: more backend IPs or ports, more proxy source IPs, or L4 pass-through.
 
@@ -614,7 +665,7 @@ sequenceDiagram
 | Bus | Delivery | Use when | Cost |
 | --- | --- | --- | --- |
 | Redis Pub/Sub | At-most-once: a gateway that is disconnected misses messages | Low latency, small fleets; durability comes from the message store + resume | No replay; Redis Cluster broadcasts classic Pub/Sub to every node (sharded Pub/Sub, Redis 7.0+, avoids this) |
-| Redis Streams | Persisted log with consumer groups and IDs | You want replay from the bus itself for a short window | Memory; trimming (`MAXLEN`) policy |
+| Redis Streams | Persisted log with consumer groups (readers that share the work and remember their place) and IDs | You want replay from the bus itself for a short window | Memory; trimming (`MAXLEN`) policy |
 | NATS (core / JetStream) | Core: at-most-once; JetStream: persisted, acked | Large fan-out with subject wildcards (`room.*`) | Another system to run |
 | Kafka | Durable, partitioned log | Very high throughput and replay; message service already uses it | Higher latency than in-memory buses; partition-to-gateway mapping is awkward for per-user routing |
 
@@ -649,9 +700,11 @@ flowchart TD
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the architecture, how to size the fleet and how resume works. **Next comes the senior view**: login on long-lived sockets, heartbeats, slow clients, safe deploys, the failure modes, and the deeper tricks (epoll servers, ordering, multi-device, multi-region).
+
 - **Authentication:**
 	- Authenticate at the handshake with a **short-lived token** (for example a 60 s ticket fetched over REST), passed in a header or a subprotocol, or as a query parameter only if your logs redact it. Browsers cannot set arbitrary headers on WebSocket requests, which is why tickets in the URL are common.
-	- Check the `Origin` header to prevent cross-site WebSocket hijacking.
+	- Check the `Origin` header (the site the browser page came from) to prevent cross-site WebSocket hijacking, where a bad site opens a socket using your user's cookies.
 	- A socket can outlive the token. Re-check **authorization per message** (can this user post to this room?), and close sockets when a session is revoked.
 - **Heartbeats and presence:**
 	- Ping every 25-30 s so idle sockets are not killed by load-balancer idle timeouts (ALB 60 s by default; NLB 350 s for TCP).
@@ -661,7 +714,7 @@ flowchart TD
 - **Deploys and scale-in (graceful drain):**
 	1. Mark the gateway unhealthy so the load balancer sends no new connections.
 	2. Send close frames (1001 Going Away or 1012 Service Restart) to clients in batches spread over 30-60 s.
-	3. Clients reconnect with exponential backoff and **full jitter**, and resume from `last_seq`.
+	3. Clients reconnect with exponential backoff (each retry waits longer: 0.5 s, 1 s, 2 s, ...) and **full jitter** (a random wait between 0 and that limit), and resume from `last_seq`.
 	4. Exit after the last socket closes or a hard deadline passes. See [[Graceful Shutdown and Health Checks]].
 - **Failure modes → fixes:**
 	- A gateway crashes → 50,000 clients reconnect at once → client-side backoff with full jitter, and admission limits (reject with 1013 when the handshake rate is too high). See [[Timeouts, Retries and Backoff]].
@@ -672,7 +725,7 @@ flowchart TD
 
 ## 8. Deep dive 🔴
 
-- **Why epoll-based servers hold more sockets.** In the goroutine-per-connection design each socket owns at least one blocked goroutine and its read buffer even when idle.
+- **Why epoll-based servers hold more sockets** (epoll is the Linux call that tells one thread which of many sockets have data ready). In the goroutine-per-connection design each socket owns at least one blocked goroutine and its read buffer even when idle.
 
   The "A Million WebSockets and Go" design (gobwas/ws) registers sockets with epoll and only starts a goroutine and allocates a buffer when data actually arrives, so idle sockets cost little more than the kernel's socket structure.
 
@@ -716,6 +769,26 @@ flowchart TD
 - Ping every 25-30 s (below LB idle timeouts: ALB 60 s); presence by TTL.
 - Drain gradually (close 1001/1012) and reconnect with exponential backoff + full jitter.
 - Limits: `nofile`, about 28k ephemeral ports per proxy-to-backend address, memory per connection.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) Why are WebSocket servers called stateful?
+> Each open connection lives on one server until it closes; no other server can push to it.
+
+> [!question]- (easy) What two extra parts let any server reach any user?
+> A registry (user → server) and a pub/sub bus between servers.
+
+> [!question]- (easy) Why add jitter to reconnects?
+> So thousands of clients do not reconnect in the same second and overload the remaining servers.
+
+> [!question]- (medium) 10 million users, 50,000 sockets per gateway. How many gateways?
+> 200, plus spare, say about 250.
+
+> [!question]- (medium) Redis Pub/Sub is at-most-once. How do you still not lose messages?
+> Save each message with a sequence number before publishing; on reconnect the client asks for everything after its last number.
+
+> [!question]- (medium) You added 50 gateways but the old ones are still full. Why?
+> Existing sockets never move; only new connections go to new gateways. Ask some clients on busy gateways to reconnect.
 
 ## Links
 

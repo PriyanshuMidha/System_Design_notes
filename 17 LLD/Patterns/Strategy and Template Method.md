@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Interfaces]]: any type with the right methods fits an interface, so you can swap one rule type for another.
+> - [[Design Patterns Overview and Chooser]]: the first question is always "what varies here?"; for Strategy it is a rule or algorithm.
+
 **From zero, in 60 seconds** 🟢
 
 When one step can be done in different ways, like pricing by hour or by day, you hide that step behind an interface. That is the **strategy** pattern: swap the rule without changing the code that uses it. The **template method** is a cousin: the overall steps stay fixed, and only some steps are filled in by each variant. In Go, a strategy is often just an interface or a function value. Read the plain-words line above each code block first.
@@ -51,6 +55,9 @@ Template Method does the reverse: it fixes the order of the steps and lets you s
 | Inheritance | A class reusing a parent class's code (Java, not Go) | `class Car extends Vehicle` |
 | Struct embedding | Go putting one struct inside another to reuse its methods | `type B struct { A }` |
 | Workflow | A fixed sequence of steps | validate, price, save, notify |
+| Registry | A map from a name to an implementation | `{"nearest": NearestInStock{}, "least-loaded": LeastLoaded}` |
+| Dependency injection | Passing what a type needs into its constructor | `NewAssignmentService(NearestInStock{})` |
+| Skeleton | The fixed order of steps in Template Method | parse, then validate, then save |
 
 **Picture it**
 
@@ -81,7 +88,7 @@ Where it breaks: a drill bit cannot see the drill's state, while a Go strategy c
 
 ## 1. Why it exists 🟢
 
-A quick-commerce backend assigns each order to a dark store. Mumbai wants the **nearest store with stock**. Bengaluru, during the evening peak, wants the **least loaded store**. Product wants to try a third rule next month.
+A quick-commerce backend (10-minute grocery delivery) assigns each order to a dark store (a small warehouse that only packs app orders). Mumbai wants the **nearest store with stock**. Bengaluru, during the evening peak, wants the **least loaded store**. Product wants to try a third rule next month.
 
 Pricing for the parking feature has the same shape: an hourly base price, plus a weekend surcharge in some cities, plus a coupon in others.
 
@@ -93,6 +100,10 @@ Without Strategy, all of this becomes one function:
 
 Template Method fixes a different duplication. Three importers (CSV payments, JSON refunds, bank statements) each repeat "parse, then validate, then save, wrap each error with the step name". One importer forgets `Validate`, and bad rows reach the database. A single skeleton function that owns the order of the steps makes skipping a step impossible.
 
+### Real-life example 🟢
+
+Picture ordering on Zepto or Blinkit in two cities. In one city the app picks the nearest dark store with stock; in another, at 8 pm, it picks the least busy store so your order still arrives in 10 minutes. The checkout code is the same in both cities; only the "how do we choose a store" rule is swapped in. Picture a parking app that adds a weekend surcharge on top of the hourly price in some cities. Swappable rules like these are Strategy; a fixed series of steps with pluggable parts (parse, then check, then save) is Template Method.
+
 ## 2. Mental model 🟢
 
 - **Strategy is a pluggable decision.** A maps app offers "fastest", "shortest" and "avoid tolls". The trip, the map and the turn-by-turn screen stay the same; only the rule that picks the route is swapped. In Go the rule is a value: an interface with one method, or a function.
@@ -101,6 +112,8 @@ Template Method fixes a different duplication. Three importers (CSV payments, JS
 Both patterns separate **what stays fixed** from **what varies**. Strategy keeps the caller fixed and swaps the whole algorithm. Template Method keeps the algorithm's skeleton fixed and swaps individual steps.
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the split: Strategy swaps a whole rule, Template Method fixes the order of steps and swaps only the steps. **Next we open the box**: the five steps to build a strategy in Go, how to pick and stack strategies, and why Go writes Template Method as a function, not a base class.
 
 **In plain words: the part that changes goes behind an interface; the rest of the code stays the same.**
 
@@ -170,7 +183,7 @@ sequenceDiagram
 
 Classic object-oriented languages put the skeleton in an abstract base class and let subclasses override the steps. Go has no inheritance, so the skeleton becomes a **function** and the steps become an **interface** it receives:
 
-1. `Steps[T]` declares `Parse`, `Validate` and `Save`. The type parameter `T` carries the parsed value from step to step with full type safety (the old version passed `any` and type-asserted inside every step).
+1. `Steps[T]` declares `Parse`, `Validate` and `Save`. The type parameter `T` (a placeholder type filled in when used, here the parsed rows) carries the parsed value from step to step with full type safety (the old version passed `any` and type-asserted inside every step).
 2. `Import[T]` calls the steps in a fixed order, stops at the first error, and wraps it with the step name.
 3. Each importer (`CSVPayments`) implements only the steps.
 
@@ -239,6 +252,15 @@ func main() {
 **In plain words: pricing strategies and a fixed checkout flow with pluggable steps, with tests.**
 
 One `package main` with store-selection code, a function strategy, a per-call registry, a composed pricer, a generic Template Method and the embedding trap. Built with Go 1.24.4; `go vet` is clean and `go test -race` passes.
+
+**Step by step:**
+
+1. `StoreSelector` is the strategy interface with one method, `Select`. `NearestInStock` is a struct strategy, and `LeastLoaded` is a strategy written as a function (`SelectFunc`).
+2. `AssignmentService` receives one strategy when it is built and just calls it in `Assign`. `Router` picks a strategy by name for each call.
+3. For pricing, `Hourly` charges per hour and `Weekend` wraps another `Pricer` to add a surcharge on Saturday and Sunday; all inputs come in `PriceInput`.
+4. `Import` is the Template Method skeleton: always `Parse`, then `Validate`, then `Save`, with the step name added to any error. `CSVPayments` fills in the steps.
+5. `BaseJob` and `StrictJob` show the embedding trap on purpose.
+6. `main` runs both store rules on the same three stores, prices a weekend booking, imports CSV payments and prints each result.
 
 ```go
 package main
@@ -609,6 +631,14 @@ Reading the output:
 - `slices.SortFunc` takes a comparison function: that function is a strategy in one line.
 - `validated by base` is the embedding trap: `StrictJob.Validate` was never called.
 
+## Common beginner mistakes 🟢
+
+- **Mistake:** a growing `switch city { ... }` inside `Assign`. → **Why it's wrong:** every new rule edits the service and its tests. → **Do this instead:** pass a `StoreSelector` into `NewAssignmentService`, or pick one by name with `Router`.
+- **Mistake:** a strategy that calls `time.Now()` inside itself. → **Why it's wrong:** the weekend surcharge cannot be tested on a weekday. → **Do this instead:** pass everything in, as `PriceInput` carries `At`.
+- **Mistake:** one big pricing function for every mix of base, weekend and coupon rules. → **Why it's wrong:** the branches multiply (2 × 2 × 2 = 8). → **Do this instead:** stack small pricers, as `Weekend{Next: Hourly, ...}` does.
+- **Mistake:** faking Template Method with struct embedding, like `StrictJob` embedding `BaseJob`. → **Why it's wrong:** `BaseJob.Run` still calls `BaseJob.Validate`, never your "override". → **Do this instead:** write the skeleton as a function over an interface, like `Import` with `Steps[T]`.
+- **Mistake:** silently falling back to a default for an unknown strategy name. → **Why it's wrong:** a config typo quietly changes how orders are routed. → **Do this instead:** return an error, as `Router.Assign` does with `UnknownStrategyError`.
+
 ## 5. Variants and comparison 🟡
 
 | Option | How it works | Use when | Cost |
@@ -616,7 +646,7 @@ Reading the output:
 | Interface strategy | A one-method interface; each rule is a type | Rules carry config or state (weights, a cache) or need more than one method | One type per rule |
 | Function strategy | `type SelectFunc func(...)`, optionally with a method so it satisfies the interface | Stateless rules, closures, one-off rules in tests | Functions cannot be compared or used as map keys |
 | Chosen at construction | Constructor parameter | One rule per service instance, for example per deployment | Changing the rule means building a new service |
-| Chosen per call (registry) | `map[string]Strategy` looked up by name from config or request | Per city, per tenant, A/B tests | Unknown names must become a typed error; validate config at startup |
+| Chosen per call (registry) | `map[string]Strategy` looked up by name from config or request | Per city, per tenant (customer company in a shared app), A/B tests (two rules tried on different users to compare) | Unknown names must become a typed error; validate config at startup |
 | Composed strategy | A strategy that wraps another of the same interface | Surcharges, discounts, caching, logging around a rule | Order matters; deep stacks are harder to read |
 | Template Method (Go form) | Skeleton function + step interface, generic over the data type | Several variants share the order of steps, error wrapping, metrics or a transaction | One more interface; little gain with a single variant |
 | Template via embedding | Base struct method calls its own "hook" methods | Never for overriding: it silently calls the base hook | Bugs that look correct in review |
@@ -652,15 +682,17 @@ See [[State Machines in Go]] for State and [[Rare GoF Patterns in Go]] for the f
 - **Two fixed cases:** an `if` is clearer than two types and a registry.
 - **A strategy interface with four or five methods** is usually two decisions glued together. Split it, or it stops being swappable.
 - **Template Method with one variant** adds an interface and a generic function to save nothing. Introduce the skeleton when the second variant appears and the shared order of steps or error handling is real.
-- **Indirect calls:** an interface or function-value call usually cannot be inlined by the compiler. That costs nanoseconds per call (an estimate) and matters only in tight loops, such as a comparator called millions of times.
+- **Indirect calls:** an interface or function-value call usually cannot be inlined (copied into the caller to skip the call) by the compiler. That costs nanoseconds per call (an estimate) and matters only in tight loops, such as a comparator called millions of times.
 - **Hidden control flow:** a reader of `Assign` cannot see which rule runs without finding the wiring. Name strategies well and log the chosen name.
+
+> 🟡 → 🔴 **You now know** how to write, compose and test strategies, a generic Template Method, and how Strategy differs from State and Bridge. **Next comes the production view**: these patterns inside Go's standard library, the bugs from untestable or racy strategies, and why embedding never overrides.
 
 ## 7. In production 🔴
 
 **Real systems in the standard library:**
 
 - `slices.SortFunc(s, cmp)` (since Go 1.21): the comparison function is a strategy; the sorting algorithm stays fixed.
-- `sort.Sort(sort.Interface)`: the closest thing to Template Method in the standard library. `sort.Sort` owns the algorithm (pattern-defeating quicksort since Go 1.19) and calls your `Len`, `Less` and `Swap` steps.
+- `sort.Sort(sort.Interface)`: the closest thing to Template Method in the standard library. `sort.Sort` owns the algorithm (pattern-defeating quicksort, a fast general sorting method, since Go 1.19) and calls your `Len`, `Less` and `Swap` steps.
 - `bufio.Scanner.Split(bufio.SplitFunc)`: the tokenizing rule (`ScanLines`, `ScanWords`, `ScanRunes`, or your own) is a function strategy; the buffering loop is fixed.
 - `http.Client.CheckRedirect`: the redirect policy is a function field. When it is nil the client uses its default policy, which stops after 10 consecutive requests.
 - `http.Client.Transport` (`http.RoundTripper`): the strategy for actually sending a request. Tests swap in a fake transport; wrappers add retries or auth (see [[Decorator and Middleware]]).
@@ -682,7 +714,7 @@ See [[State Machines in Go]] for State and [[Rare GoF Patterns in Go]] for the f
 - Strategies disagree on errors (one returns `nil, nil` for "no match"). Fix: define sentinel errors such as `ErrNoStore` next to the interface and test each strategy against them.
 - A shared, stateful strategy (a round-robin selector with a counter) races when many goroutines call it. Fix: make it stateless, or protect the state with an atomic or a mutex, and run tests with `-race`.
 
-**What to monitor:** record the chosen strategy name as a log field or a low-cardinality metric label (for example `assign_strategy="least-loaded"`), count unknown-name errors, and compare outcome metrics (delivery time, price paid) per strategy when you A/B test rules.
+**What to monitor:** record the chosen strategy name as a log field or a low-cardinality metric label (a label with only a few possible values) (for example `assign_strategy="least-loaded"`), count unknown-name errors, and compare outcome metrics (delivery time, price paid) per strategy when you A/B test rules.
 
 ## 8. Deep dive 🔴
 
@@ -697,7 +729,7 @@ See [[State Machines in Go]] for State and [[Rare GoF Patterns in Go]] for the f
 
 **Generics and inference.** `Import[T]` keeps the parsed type through all three steps, so `Validate` receives `[]Payment`, not `any`. The call site needs no type argument: since Go 1.21, type inference also looks at methods when a value is passed to an interface-typed parameter, so `Import(r, &CSVPayments{})` infers `T = []Payment` from the result type of `CSVPayments.Parse`. With Go 1.20 or older you had to write `Import[[]Payment](r, imp)`. [[Generics and Iterators]] covers the inference rules.
 
-**Composition order changes results.** Composed strategies do not commute. Take an hourly total of ₹120, a 25% weekend surcharge and a ₹50 coupon:
+**Composition order changes results.** Composed strategies do not commute (swapping their order changes the answer). Take an hourly total of ₹120, a 25% weekend surcharge and a ₹50 coupon:
 
 - Surcharge first, then coupon: `120 × 1.25 − 50 = 100`.
 - Coupon first, then surcharge: `(120 − 50) × 1.25 = 87.5`.
@@ -742,6 +774,26 @@ The business must decide which one is right, and the wiring code must make the o
 - Embedding does not override: the base method calls the base hook.
 - Strategy (outside chooses) vs State (lifecycle chooses, states know the next) vs Bridge (two independent dimensions).
 - Standard library: `slices.SortFunc`, `sort.Sort`, `bufio.Scanner.Split`, `http.Client.CheckRedirect`, `http.RoundTripper`.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What does Strategy swap, and what does Template Method keep fixed?
+> Strategy swaps the whole rule; Template Method keeps the order of steps fixed and swaps single steps.
+
+> [!question]- 🟢 In Go, what is the lightest form of a strategy?
+> A function value, such as the comparison function passed to `slices.SortFunc`.
+
+> [!question]- 🟢 Why should a pricing strategy not call `time.Now()` itself?
+> Then you cannot test "a Saturday"; pass the time in through the input struct.
+
+> [!question]- 🟡 `StrictJob` embeds `BaseJob` and defines its own `Validate`. Which `Validate` does `Run` call?
+> `BaseJob.Validate`, because embedding is not overriding; pass the steps in as an interface instead.
+
+> [!question]- 🟡 Strategy or State: the order itself switches its pricing rule after payment?
+> State, because the object picks its next behaviour; with Strategy the caller or config picks it.
+
+> [!question]- 🟡 A weekend surcharge of 25% and a ₹50 coupon on ₹120: does the order of the two strategies matter?
+> Yes: surcharge first gives ₹100, coupon first gives ₹87.50, so the wiring must make the order explicit.
 
 ## Links 🟢
 

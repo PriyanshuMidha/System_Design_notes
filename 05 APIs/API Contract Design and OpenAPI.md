@@ -41,6 +41,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[REST and HTTP API Design]]: an HTTP API is a set of URLs and methods (`GET /orders/42`) that take and return JSON, with status codes like `200` and `404`.
+> - [[Choosing an API Style]]: REST, gRPC and GraphQL are different ways to shape an API; this note is mostly about REST.
+
 **From zero, in 60 seconds** 🟢
 
 Two teams build one product. One team builds the server, the other builds the app that talks to it.
@@ -86,6 +90,12 @@ A contract is the written promise both sides agree on before anyone writes code.
 | OpenAPI | A standard YAML/JSON file format that describes an HTTP API | `openapi.yaml` listing all endpoints |
 | Breaking change | A change that makes an existing client fail | Removing a field the app reads |
 | Code generation | Tools that write client or server code from the spec | A Go client built from `openapi.yaml` |
+| CI | Automatic checks that run on every code change before it merges | "build fails if a field was removed" |
+| Lint | An automatic style and mistake check over a file | "every string has a max length" |
+| Enum | A field that may hold only values from a fixed list | `status: CONFIRMED` |
+| Nullable | A field that may be present with the value `null` | `"note": null` |
+| Drift | The spec says one thing while the server does another | spec says `total`, server sends `amount` |
+| Tolerant reader | A client that ignores fields it does not know | an old app skipping `loyalty_points` |
 
 **Picture it**
 
@@ -120,11 +130,18 @@ App store releases are slow and users update late, so suppose 30% of users still
 
 Nothing told the developer that `total` was a promise to clients they cannot redeploy.
 
+### Real-life example: a payment gateway's API 🟢
+
+Payment gateways like Razorpay or Stripe publish one API that thousands of shops call: Swiggy, small online stores, ticket sites.
+They cannot ask every shop to update their code on the same day, so they publish an exact written contract of every request and response.
+New features arrive as new optional fields; old fields keep working for years.
+Many of their client libraries (SDKs) are generated from that contract, so the docs, the libraries and the server all agree.
+
 A contract makes the promise explicit and checkable:
 
 - the field list, types and limits are written down in one file;
 - a CI step compares the new file with the last released one and fails on `total` disappearing;
-- client SDKs, server stubs, docs and tests are generated from the same file, so they cannot quietly disagree.
+- client **SDKs** (ready-made libraries for calling the API), server **stubs** (empty handler shells to fill in), docs and tests are generated from the same file, so they cannot quietly disagree.
 
 ## 2. Mental model 🟢
 
@@ -132,11 +149,37 @@ A contract is an **electrical socket standard**. The plug maker and the socket m
 
 OpenAPI is the **technical drawing** of the socket: precise enough that a machine can check a plug against it.
 
+## Common beginner mistakes 🟢
+
+- **Renaming a response field because the new name reads better** → every installed app that reads the old name breaks → add the new field, keep the old one, deprecate it, remove it much later.
+- **Leaving strings and arrays without limits** → someone sends a 20 MB "note" → write `maxLength`, `maxItems` and a body size limit.
+- **Treating "missing" and `null` as the same** → a partial update wipes fields the client never touched → model absent, `null` and set as three states.
+- **Sending money as a float like `450.10`** → sums drift by tiny amounts → send integer minor units (`45010` paise) plus a currency code.
+- **Using a closed enum in responses** → adding one new status crashes old clients → document response enums as open and handle "unknown".
+
+## Often confused 🟡
+
+| These two | First one | Second one |
+| --- | --- | --- |
+| OpenAPI vs Swagger | The standard spec format (3.x) | The older name (2.0) and a family of tools (Swagger UI) |
+| Optional vs nullable | The key may be missing | The key is there but its value is `null` |
+| Contract-first vs code-first | Write the spec, then generate code | Write the code, then generate the spec |
+| Schema validation vs contract tests | Checks one response has the right shape | Checks real call sequences behave as promised |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a contract is a written promise between teams and that it may only grow. **Next we open the box**: two ways to produce the contract, what an OpenAPI file contains, house rules for names, money and dates, the three "maybe there" states, and exactly which changes break clients.
 
 ### Contract-first vs code-first
 
 **In plain words:** you can write the promise first and build code from it, or build code first and print the promise from it. Either works, as long as a machine keeps the two in sync.
+
+**Step by step:**
+1. **Contract-first:** a developer writes `POST /orders` in `openapi.yaml` and opens a pull request.
+2. The app team reviews the shape before any server code exists, and starts building against it.
+3. A generator turns the file into a Go interface; the server handler must match it or it will not compile.
+4. **Code-first:** a developer writes the Go handler first, and a tool prints `openapi.yaml` from it.
+5. Either way, CI checks that the file and the code still match and that nothing breaking slipped in.
 
 | Approach | How | Strength | Weakness |
 | --- | --- | --- | --- |
@@ -160,13 +203,20 @@ flowchart LR
 
 **In plain words:** an OpenAPI file is like a form with fixed sections: who the API is, its URLs, the shapes of data it moves, and how you log in. Skim the bullets, then the big example.
 
+**Step by step:**
+1. The top says `openapi: 3.1.0` and gives the API a title and version.
+2. Under `paths`, `/orders` has a `post` entry: what body it takes and what each status code returns.
+3. The body says "see `#/components/schemas/CreateOrderRequest`" instead of repeating the shape.
+4. Under `components`, `CreateOrderRequest` lists `show_id` and `seats`, with types and limits.
+5. Under `security`, it says every call needs a bearer token, except operations that opt out.
+
 An OpenAPI document has a few top-level parts:
 
 - `openapi`, `info`, `servers`: the version of the format, the API's own version, and base URLs.
 - `paths`: each URL and method, with `parameters` (path, query, header, cookie), `requestBody` and `responses` by status code.
-- `components`: reusable `schemas`, `parameters`, `responses`, `securitySchemes`, referenced with `$ref`.
+- `components`: reusable `schemas`, `parameters`, `responses`, `securitySchemes`, referenced with `$ref` (a pointer meaning "use the definition over there").
 - `security`: which scheme applies, globally or per operation. An operation can override it, for example `security: []` for a public health check.
-- `webhooks` (new in 3.1): requests your API sends to subscribers.
+- `webhooks` (new in 3.1): requests your API sends to subscribers (HTTP calls your server makes to their server when something happens).
 
 A complete contract for `POST /orders`:
 
@@ -345,8 +395,8 @@ Points the example makes on purpose:
 
 - **Every limit is written down**: `maxLength`, `maxItems: 10`, `pattern`. Unbounded strings and arrays are how a client sends a 50 MB body or a value longer than your database column.
 - **`additionalProperties: false` on the request** rejects typos such as `seat` instead of `seats` (but see the rollout trap in the deep dive).
-- **Errors are one shared response**, `application/problem+json`, so every endpoint fails the same way (see [[API Error Handling]]).
-- **The `Idempotency-Key` header is part of the contract**: required, bounded, with retention and reuse rules spelled out (see [[Idempotency and Idempotency Keys]]).
+- **Errors are one shared response**, `application/problem+json` (a standard JSON error format with `type`, `title`, `status` and `detail`), so every endpoint fails the same way (see [[API Error Handling]]).
+- **The `Idempotency-Key` header is part of the contract** (a unique key per request so a retry is not processed twice): required, bounded, with retention and reuse rules spelled out (see [[Idempotency and Idempotency Keys]]).
 - **`OrderStatus` is documented as an open set** instead of a closed `enum`, so a new status is not a breaking change.
 
 ```mermaid
@@ -393,11 +443,18 @@ classDiagram
 
 **In plain words:** these are house rules for naming, dates, money and IDs. Pick one style and never mix, the same way a kitchen keeps all labels in one language.
 
+**Step by step:**
+1. Pick one casing, say `snake_case`, so every field looks like `show_id`, never `showId`.
+2. Write times as `2026-11-02T08:15:00Z`: a standard text format, always in UTC.
+3. Write ₹450.00 as `{"amount_minor": 45000, "currency": "INR"}`: whole paise plus the currency code.
+4. Send IDs as strings like `"9007199254740993"`, because JavaScript rounds very big numbers.
+5. Return lists in pages with a maximum size, never "all rows at once".
+
 | Topic | Rule | Why |
 | --- | --- | --- |
 | Field casing | One style everywhere: `snake_case` (Stripe, Zalando) or `lowerCamelCase` (Google, Microsoft) | Mixed casing guarantees typos in clients |
-| Times | RFC 3339 strings in UTC: `2026-11-02T08:15:00Z` (`format: date-time`) | Unambiguous, sortable, parsed by every language |
-| Money | Integer minor units plus an ISO 4217 code: `{"amount_minor": 45000, "currency": "INR"}` | Floats cannot represent `0.10` exactly; minor-unit digits differ (JPY has 0, INR 2, KWD 3) |
+| Times | RFC 3339 (the internet standard for date-time text) strings in UTC: `2026-11-02T08:15:00Z` (`format: date-time`) | Unambiguous, sortable, parsed by every language |
+| Money | Integer **minor units** (the smallest coin: paise, cents) plus an ISO 4217 code (the three-letter currency code like INR): `{"amount_minor": 45000, "currency": "INR"}` | Floats cannot represent `0.10` exactly; minor-unit digits differ (JPY has 0, INR 2, KWD 3) |
 | IDs | Strings, even when the database uses integers | JavaScript loses precision above 2^53 − 1; strings let you change ID schemes later |
 | Enums | `UPPER_SNAKE` strings, documented as open in responses | Numbers are unreadable; closed enums make additions breaking |
 | Optional fields | Absent means "not set"; do not send `""` or `0` as "no value" | Empty values are real values to clients |
@@ -407,15 +464,36 @@ classDiagram
 
 **In plain words:** "must be there", "may be missing" and "may be there but empty (null)" are three different promises, like a form field that is mandatory, optional, or allowed to say "none".
 
+**Step by step:**
+1. An order has a `note`. The client sends a partial update.
+2. Body `{}`: `note` is absent, so the server leaves the note as it was.
+3. Body `{"note": null}`: `note` is present and null, so the server clears it.
+4. Body `{"note": "aisle seat"}`: the server sets it.
+5. If the server's code cannot tell step 2 from step 3, it wipes notes nobody asked to change.
+
+```mermaid
+flowchart LR
+    B["update body"] --> A["note absent → keep"]
+    B --> N["note: null → clear"]
+    B --> V["note: 'aisle' → set"]
+```
+
 - **Required**: the key must be present (`required: [show_id, seats]`).
 - **Optional**: the key may be absent.
 - **Nullable**: the key may be present with the value `null`. OpenAPI 3.0 wrote this as `nullable: true`; OpenAPI 3.1 uses JSON Schema's `type: [string, "null"]`.
 
-The difference matters most in partial updates. With JSON Merge Patch, an absent `note` means "leave it", `"note": null` means "clear it" and `"note": "aisle"` means "set it". A server that cannot tell absent from `null` will wipe fields the client never mentioned.
+The difference matters most in partial updates. With JSON Merge Patch (a standard where you send only the fields you want changed), an absent `note` means "leave it", `"note": null` means "clear it" and `"note": "aisle"` means "set it". A server that cannot tell absent from `null` will wipe fields the client never mentioned.
 
 ### What counts as a breaking change
 
 **In plain words:** breaking means some app that worked yesterday fails today. Which changes break depends on direction: rules for what clients *send* can only loosen safely, rules for what servers *return* can only grow safely.
+
+**Step by step:**
+1. You make `coupon_code` **required** in requests. Old apps never send it, so they now get `400`: breaking.
+2. You raise `seats` max from 10 to 20 in requests. Old apps still send 10 or fewer: safe.
+3. You add `loyalty_points` to responses. Old apps ignore it: safe.
+4. You remove `total` from responses. Old apps read it and get nothing: breaking.
+5. You add status `ON_HOLD`. Old apps that only know three statuses may crash: breaking unless they handle "unknown".
 
 ```mermaid
 flowchart TB
@@ -433,7 +511,7 @@ By contrast, making a required field optional or adding an enum value breaks res
 
 The safe path for a rename: add `total_amount`, keep sending `total`, mark `total` as `deprecated: true` in the spec, watch until no client reads it, then remove it in the next major version (see [[API Versioning and Backward Compatibility]]).
 
-**Tolerant reader.** Clients should read only the fields they need, ignore fields they do not know, and map unknown enum values to an "unknown" case. Servers can then add things freely. This is the half of the robustness principle that works well; being liberal in what a server *accepts* is riskier, because sloppy input becomes behaviour clients then depend on.
+**Tolerant reader.** Clients should read only the fields they need, ignore fields they do not know, and map unknown enum values to an "unknown" case. Servers can then add things freely. This is the half of the **robustness principle** ("be strict in what you send, liberal in what you accept") that works well; being liberal in what a server *accepts* is riskier, because sloppy input becomes behaviour clients then depend on.
 
 ## 4. Worked example 🟡
 
@@ -689,6 +767,8 @@ Go-specific setup (generation config, strict handlers, validation middleware) is
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to write, evolve and check a contract. **Next is the advanced part**: how Stripe, GitHub and Google publish theirs, the failures that slip past teams, OpenAPI 3.0 vs 3.1, rollout traps, big integers and polymorphic types.
+
 - **Real systems:**
 	- **Stripe** publishes the OpenAPI description of its API in the `stripe/openapi` repository, including an SDK variant of the spec with annotations for generating client libraries. Files in its official SDKs, such as stripe-go, carry the header "File generated from our OpenAPI spec".
 	- **GitHub** publishes the OpenAPI description of its REST API in `github/rest-api-description`.
@@ -709,9 +789,9 @@ Go-specific setup (generation config, strict handlers, validation middleware) is
 - **OpenAPI 3.0 vs 3.1.** 3.1 adopts JSON Schema Draft 2020-12 completely, while 3.0 used a modified subset. In practice: `nullable: true` becomes `type: [T, "null"]`, schema `example` becomes `examples` (a list), `exclusiveMinimum` takes a number instead of a boolean, `$ref` may sit beside `summary` and `description`, `paths` became optional, and `webhooks` is new.
 
   Check generator support before moving: oapi-codegen v2.8.2's README states support for 3.0 and 3.1 (3.1 support is recent), and older releases needed a 3.1 spec downgraded to 3.0.
-- **The `additionalProperties: false` rollout trap.** During a rolling deploy, new and old server instances serve traffic together. A new client that sends a new optional field to an old instance gets a `400`. Options: deploy the server before any client uses the field (usual), or let servers ignore unknown request fields and only lint for typos in client tests.
-- **Large integers.** JSON numbers have no size limit, but JavaScript parses them as doubles, exact only up to 2^53 − 1 (9,007,199,254,740,991). A 64-bit ID such as a Snowflake ID loses its last digits in a browser. Send IDs, and `int64` amounts that might grow that large, as strings.
-- **Polymorphism.** `oneOf` with a `discriminator` (`"type": "card"` vs `"type": "upi"`) models payment methods. Generators handle it unevenly, and adding a new variant is a breaking change for clients that switch exhaustively. Treat the variant list like an open enum.
+- **The `additionalProperties: false` rollout trap.** During a **rolling deploy** (servers are updated a few at a time, not all at once), new and old server instances serve traffic together. A new client that sends a new optional field to an old instance gets a `400`. Options: deploy the server before any client uses the field (usual), or let servers ignore unknown request fields and only lint for typos in client tests.
+- **Large integers.** JSON numbers have no size limit, but JavaScript parses them as doubles, exact only up to 2^53 − 1 (9,007,199,254,740,991). A 64-bit ID such as a Snowflake ID (Twitter's time-based 64-bit ID scheme) loses its last digits in a browser. Send IDs, and `int64` amounts that might grow that large, as strings.
+- **Polymorphism.** (One field that can hold one of several shapes.) `oneOf` with a `discriminator` (a field like `"type"` that says which shape it is: `"type": "card"` vs `"type": "upi"`) models payment methods. Generators handle it unevenly, and adding a new variant is a breaking change for clients that switch exhaustively. Treat the variant list like an open enum.
 - **Contract tests vs schema validation.** Schema validation proves a response has the right shape. It does not prove `POST /orders` then `GET /orders/{id}` returns the same order. Schemathesis can chain operations using OpenAPI links; Pact tests the exact interactions consumers use.
 - **The Idempotency-Key contract in detail.** Document scope (per API key or account), retention (Stripe: removable after 24 hours), the reuse error (`422` for a different body in the IETF draft), the in-flight error (`409`) and which operations accept it. Without these, clients cannot write correct retry logic.
 
@@ -748,6 +828,26 @@ Go-specific setup (generation config, strict handlers, validation middleware) is
 - Requests and responses evolve differently: new required input breaks, new response fields do not.
 - Clients are tolerant readers: ignore unknown fields, map unknown enum values to "unknown".
 - One error schema (problem details) and an explicit `Idempotency-Key` contract for every create.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is an API contract?
+> The written promise of what an API accepts and returns: URLs, fields, types, limits, errors.
+
+> [!question]- Easy: is adding a new optional field to a response usually safe?
+> Yes, as long as clients ignore fields they do not know (tolerant readers).
+
+> [!question]- Easy: how should ₹450.00 be sent?
+> As integer minor units plus a currency: `{"amount_minor": 45000, "currency": "INR"}`.
+
+> [!question]- Medium: is adding a required field to a request breaking? To a response?
+> To a request, yes: old clients do not send it. To a response, no: it only adds data.
+
+> [!question]- Medium: what is the safe way to rename `total` to `total_amount`?
+> Add `total_amount`, keep sending `total` marked deprecated, watch usage drop to zero, then remove it in a new major version.
+
+> [!question]- Medium: what does oasdiff do in CI?
+> It compares the new spec with the last released one and fails the build on breaking changes.
 
 ## Links 🟢
 

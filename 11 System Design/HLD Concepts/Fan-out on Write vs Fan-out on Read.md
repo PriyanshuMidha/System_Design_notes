@@ -38,6 +38,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (push, pull, hybrid), 4 (worked estimate) and 5.
 > - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Caching Patterns]]: you keep ready-made answers in fast memory (Redis) so reads skip the slow database.
+> - [[Partitioning and Sharding]]: big data is split across many machines by a key, such as user ID.
+
 **From zero, in 60 seconds** 🟢
 
 You post a photo. 500 people follow you. Each one should see it in their feed.
@@ -82,6 +86,12 @@ The only question is: do you do that work now, when you post, or later, when eac
 | Cache (Redis) | Fast in-memory store used to keep inboxes | `LPUSH inbox:bob p9` |
 | Read-to-write ratio | How many reads happen per write | 100 reads per post |
 | Celebrity / hot account | An account with a huge audience | 50 M followers |
+| Write amplification | How many writes one action causes | 1 post → 500 inbox writes |
+| Read amplification | How many lookups one read causes | 1 feed read → 200 lookups |
+| Asynchronous | Done later in the background, not while the user waits | fan-out after "posted!" is shown |
+| Hydrate | Turn a list of IDs into full items by fetching them | IDs [p9, p7] → two post cards |
+| Pub/sub | Publish to a topic; everyone subscribed gets it | viewers subscribed to `stream:42` |
+| Cursor | A bookmark for "where I stopped", used for the next page | "50 posts older than p7" |
 
 **Picture it**
 
@@ -143,6 +153,21 @@ Key terms:
 - **Read amplification:** reads caused per original read. Pull has amplification equal to the number of accounts followed.
 - **Hybrid:** push for most accounts, pull for a few very large ones, merged at read time.
 
+### Real-life example: Instagram and WhatsApp 🟢
+
+When your friend with 300 followers posts on Instagram, the app can quietly drop that post into each follower's feed list right away; when they open the app, the feed is already waiting.
+When a cricketer with 250 million followers posts, copying it 250 million times would take ages, so the app instead fetches celebrity posts when you open your feed and mixes them in.
+WhatsApp messages to a friend or a small group work like push: each message goes into each recipient's queue until their phone picks it up.
+A huge broadcast like live comments on a match works like pull: viewers just listen to one shared stream.
+
+## Common beginner mistakes 🟢
+
+- **"Just push everything"** → one celebrity post becomes 50 million writes and delays everyone's posts → use the hybrid: pull for very large accounts.
+- **Storing the whole post in every inbox** → edits and deletes must touch millions of copies → store only the post ID and fetch the body when reading.
+- **Pushing into inboxes of people who never open the app** → most of the work is wasted → push only to recently active users; rebuild a returning user's feed by pull.
+- **Paging the feed with "items 51 to 100"** → new posts shift everything and the user sees repeats → use a cursor: "50 items older than the last one I saw".
+- **Treating the inbox cache as the source of truth** → a lost Redis node loses feeds for good → keep posts in the post store and rebuild inboxes from it.
+
 ```mermaid
 flowchart LR
     subgraph push["Fan-out on write (push)"]
@@ -170,6 +195,8 @@ flowchart LR
 > Push = pay at write time, cheap reads. Pull = pay at read time, cheap writes.
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** push does the work when someone posts, pull does it when someone reads, and big apps mix both. **Next we open the box**: the exact steps of push and pull, how the hybrid treats celebrities, and how to avoid wasted work on inactive users. Each subsection starts with a plain walk-through; the full detail follows.
 
 ### 3.1 Fan-out on write (push)
 
@@ -250,7 +277,7 @@ Step by step:
 1. Post is stored once, indexed by `(author_id, time)`.
 2. At read time the API fetches Bob's followee list (cached).
 3. It queries each followee's recent posts, usually in parallel and batched per shard.
-4. It runs a k-way merge on the timestamps (or on a ranking score) and returns a page.
+4. It runs a k-way merge (combining k already-sorted lists into one sorted list) on the timestamps (or on a ranking score) and returns a page.
 5. A cache of the merged result for 30 to 60 seconds protects the store from repeated refreshes.
 
 > [!tip] Remember
@@ -259,6 +286,13 @@ Step by step:
 ### 3.3 The hybrid for celebrities
 
 **In plain words:** Treat accounts differently by size. For a normal account with 300 followers, push. For an account with 20 million followers, do **not** push. Instead, at read time, the reader's feed merges their pre-built inbox with the latest posts from the few big accounts they follow.
+
+**Step by step:**
+1. Set a threshold from maths, say 1 million followers.
+2. Alice (300 followers) posts: below the threshold, so her post ID is pushed into 300 inboxes.
+3. A star (20 million followers) posts: above the threshold, so the post is stored once and cached. No push.
+4. Bob opens the app. The system reads Bob's inbox (Alice's post is there) and the latest posts of the 4 stars Bob follows.
+5. It merges both lists by time, fetches the post bodies, and shows the page.
 
 **Picture it:**
 
@@ -287,6 +321,13 @@ flowchart TD
 ### 3.4 Inactive users and the cap
 
 **In plain words:** Most accounts on any app are not opened today. Pushing a post into inboxes of people who will not log in for a month is wasted work.
+
+**Step by step:**
+1. Alice posts. The fan-out worker checks each follower's "last seen".
+2. Bob opened the app yesterday, so Alice's post goes into his inbox.
+3. Carol has not opened the app in 2 months, so she is skipped.
+4. Each inbox keeps only the newest 800 IDs; older ones fall off the end.
+5. When Carol comes back, her feed is rebuilt once by pull, and she is switched back to push.
 
 Two standard fixes:
 
@@ -428,6 +469,8 @@ quadrantChart
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** push, pull, the hybrid and how to estimate each. **Next comes the senior view**: keeping the fan-out queue healthy, isolating big fan-outs, failure modes, and the deeper details of merging, paging, ordering, tiering and sharding inboxes.
+
 - **Fan-out queue health.** Metrics: queue depth, consumer lag per partition, age of the oldest unprocessed event, inbox writes per second, p99 time from post to "visible in the last follower's inbox". Alert on the last one.
 - **Isolation.** Put big fan-outs on a **separate queue or priority class** from normal ones, so one 5-million-follower post cannot delay everyone else's. See [[Hot Keys and Hot Partitions]] for the same idea with keys.
 - **Chunking.** Split a fan-out into pages of 500 to 1,000 followers, each an independent, idempotent task. If a worker dies, only that page is retried. Writing the same ID twice to an inbox must be harmless: use a sorted set keyed by post ID, or de-duplicate on read.
@@ -512,7 +555,7 @@ flowchart LR
 
 - Inbox order is by post time, but fan-out workers run in parallel, so two posts can arrive out of order. Sort by the post's own timestamp or ID at read time instead of trusting insertion order.
 - A user's own post should appear in their feed immediately, even if fan-out is delayed. Merge "my recent posts" into my feed at read time: this is the **read-your-writes** guarantee.
-- Fan-out is **at-least-once**, so duplicates are possible. Make the inbox write idempotent (sorted set by post ID, or de-dupe at read).
+- Fan-out is **at-least-once** (every delivery happens, but some may happen twice), so duplicates are possible. Make the inbox write idempotent (sorted set by post ID, or de-dupe at read).
 
 ### 8.5 Storage tiering for inboxes
 
@@ -570,6 +613,26 @@ flowchart LR
 - Isolate big fan-outs on their own queue. Chunk into idempotent pages. Watch the age of the oldest event.
 - Use cursors, not offsets. Merge own posts at read for read-your-writes.
 - Same pattern: feed, chat, notifications, live comments.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is fan-out on write?
+> Copy the new post's ID into every follower's inbox when it is posted, so reading is one quick lookup.
+
+> [!question]- (easy) What is fan-out on read?
+> Store the post once and build each reader's feed when they open the app, by fetching from everyone they follow.
+
+> [!question]- (easy) Why do real apps use a hybrid?
+> Push breaks for celebrities with millions of followers, and pull is too slow for normal read-heavy feeds.
+
+> [!question]- (medium) 100,000 inbox writes per second and a 10 s freshness goal. Rough celebrity threshold?
+> About 1 million followers: more than that cannot be pushed within 10 seconds.
+
+> [!question]- (medium) How do deletes work when IDs are copied into many inboxes?
+> Leave the IDs; at read time fetch the bodies and filter out deleted or hidden posts.
+
+> [!question]- (medium) How do you make sure a user sees their own new post right away?
+> Merge "my recent posts" into my feed at read time (read-your-writes), even if fan-out is still running.
 
 ## Links 🟢
 

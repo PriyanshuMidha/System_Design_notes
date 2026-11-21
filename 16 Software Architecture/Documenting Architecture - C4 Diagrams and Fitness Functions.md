@@ -58,6 +58,10 @@ Everything below is this same zoom-in repeated one more level (Container into Co
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Hexagonal Architecture (Ports and Adapters)]]: the core code owns interfaces and the database or web code plugs into them. The Component diagram and the import-rule test in this note draw and check exactly that.
+> - [[Clean Architecture]]: the rule "imports only point inward". A fitness function is how you make a test fail when someone breaks it.
+
 **From zero, in 60 seconds** 🟢
 
 Architecture diagrams are often one messy picture that nobody trusts.
@@ -95,6 +99,12 @@ C4 gives fixed zoom levels; fitness functions are tests that keep the code hones
 | CI | Automation that runs tests on every change | GitHub Actions on each PR |
 | Fitness function | An automated check of an architecture rule | "domain must not import `database/sql`" |
 | Import rule | A rule about which package may import which | Test fails on a forbidden import |
+| Structural fitness function | A test that checks how the code is wired together | "domain imports no adapter" |
+| Quality-attribute fitness function | A test that checks a quality like speed | "invoice total in under 2 ms" |
+| p95 | The time that 95 of every 100 calls finish within | p95 = 42 ns |
+| Fixture | A tiny fake project kept only so tests can check against it | `testdata/badapp/` |
+| ADR | A short, dated note saying why a decision was made | "domain must not import SQL, because…" |
+| Sequence diagram | A picture of messages between parts, in time order | Browser → API → Postgres |
 
 **Picture it**
 
@@ -121,9 +131,9 @@ Where it breaks: a map updates itself from satellites; diagrams only stay true i
 
 ## 1. Why it exists 🟢
 
-A team without a shared diagramming convention produces three "architecture diagrams" for the same system that disagree with each other and with the code: one slide shows boxes for "frontend", "backend", "database" with no indication of what "backend" actually deploys as; another shows every Go package as a box, so dense that nobody but its author can read it; a third is a sequence diagram mislabeled as "the architecture."
+A team without a shared diagramming convention produces three "architecture diagrams" for the same system that disagree with each other and with the code: one slide shows boxes for "frontend", "backend", "database" with no indication of what "backend" actually deploys as; another shows every Go package as a box, so dense that nobody but its author can read it; a third is a sequence diagram (a picture of messages between parts, in time order) mislabeled as "the architecture."
 
-None of them tell a new engineer which diagram to open for which question, and none of them are checked against the real codebase, so each one is accurate for about as long as it takes someone to merge the next refactor.
+None of them tell a new engineer which diagram to open for which question, and none of them are checked against the real codebase, so each one is accurate for about as long as it takes someone to merge the next **refactor** (a change to the code's structure that keeps its behaviour the same).
 
 C4 fixes the first problem (which diagram answers which question) by fixing exactly four levels, each a zoom into the one above, with one consistent notation. Fitness functions fix the second problem (diagrams going stale) by making the architectural *rules* — not the pictures — into something CI actually runs.
 
@@ -135,30 +145,61 @@ flowchart LR
     T["Fitness test in CI"] --> K["Rule stays true"]
 ```
 
+### Real-life example 🟢
+
+Imagine you join the payments team at a big app like Paytm on day one.
+Someone sends you a Context diagram: "Wallet" in the middle, talking to banks, UPI and the shopping app. You get the big picture in 2 minutes.
+Next, the Container diagram shows the wallet API, a worker, a Postgres database and a Redis cache. Now you know what actually runs.
+You open your first pull request, and a test fails: "ledger package must not import the HTTP client". That failing test is a fitness function. It stopped you from breaking a rule you did not know existed yet.
+
 ## 2. Mental model 🟢
 
-Think of C4 as **Google Maps for a system**: zoomed all the way out, you see a city on a map of the country (Context — InvoiceOps as one box, talking to a payment provider and an email service); zoom in once and you see the city's neighbourhoods (Container — the API service, the worker, Postgres, Redis, each a separately deployable or runnable thing); zoom in again and you see one neighbourhood's streets (Component — the groupings of code inside the API container: an HTTP layer, a service layer, a repository layer); zoom in once more and you'd see individual buildings (Code — classes and structs, usually better read straight from an IDE's "go to definition" than drawn by hand).
+🟢 **Plain version:** Think of a map app. Zoomed out, you see one city. Zoom in and you see neighbourhoods, then streets, then buildings. C4 is the same for software: the whole system, then its running parts, then the code groups in one part, then the code. Most teams only draw the first two or three. A fitness function is like an inspector who walks the real streets to check the map is still true.
+
+Think of C4 as **Google Maps for a system**: zoomed all the way out, you see a city on a map of the country (Context — InvoiceOps as one box, talking to a payment provider and an email service); zoom in once and you see the city's neighbourhoods (Container — the API service, the worker, Postgres, Redis, each a separately deployable or runnable thing); zoom in again and you see one neighbourhood's streets (Component — the groupings of code inside the API container: an HTTP layer, a service layer, a repository layer); zoom in once more and you'd see individual buildings (Code — classes and structs, usually better read straight from an **IDE**'s (code editor's) "go to definition" than drawn by hand).
 
 Nobody hand-draws every building in a city map; C4's own guidance is that most teams stop drawing after Container, sketch Component only for a container worth explaining, and skip Code diagrams entirely in favour of letting an IDE or a generator produce them on demand.
 
 A **fitness function**, in the same metaphor, is a zoning inspector that actually visits the buildings instead of trusting the zoning map: it runs against the real source tree and fails the build the moment a "residential" neighbourhood (the domain package) has an industrial building (a raw SQL import) in it.
 
+## Common beginner mistakes 🟢
+
+- **Thinking a C4 "container" means a Docker container** → you draw Docker details instead of what runs → a C4 container is any app or data store that runs on its own: a Go API, Postgres, a mobile app.
+- **Putting everything on one giant diagram** → nobody can read it → draw one diagram per zoom level, each zooming into one box of the level above.
+- **Hand-drawing Code diagrams** → they are wrong within days → skip them, or generate them from the code.
+- **Drawing a rule but never testing it** → the code quietly drifts away from the picture → turn the rule into a fitness function test that runs in CI.
+- **Writing a fitness function you never saw fail** → it may pass even when the rule is broken → also test it against a deliberately broken fixture.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that C4 is four zoom levels and that fitness functions are tests for architecture rules. **Next we open the box**: what each level may show, InvoiceOps drawn at each level, and how a Go test checks the arrows. Each subsection starts with a short step-by-step walk.
 
 ### 3.1 The four levels, what each one shows, and who reads it
 
 **In plain words: four zoom levels, each for a different reader.**
 
+**Step by step:**
+1. Level 1 (Context): one box, "InvoiceOps", with a freelancer, a client, a payment provider and an email service around it. A product manager can read it.
+2. Level 2 (Container): open the box. Inside: API service (Go), worker (Go), Postgres, Redis. Engineers and ops read this.
+3. Level 3 (Component): open the API box. Inside: HTTP handlers, invoice service, repository. Engineers in that service read this.
+4. Level 4 (Code): the actual structs. Usually you just open the code instead.
+
 | Level | Shows | Audience | Notation |
 | --- | --- | --- | --- |
 | 1. Context | The system as one box, the people and other systems around it | Anyone — including non-engineers | Actor shapes, one system box, labelled arrows |
-| 2. Container | The deployable/runnable units inside the system (services, databases, queues, SPAs) | Engineers and ops, onboarding | Boxes with a technology label, e.g. "Go, net/http" |
+| 2. Container | The deployable/runnable units inside the system (services, databases, queues, SPAs, i.e. single-page web apps) | Engineers and ops, onboarding | Boxes with a technology label, e.g. "Go, net/http" |
 | 3. Component | The major code groupings inside one container | Engineers working in that container | Boxes grouped inside the container's boundary |
-| 4. Code | Classes, structs, functions | Whoever is reading the source right now | Usually a generated UML/`classDiagram`, not hand-drawn |
+| 4. Code | Classes, structs, functions | Whoever is reading the source right now | Usually a generated UML (a standard diagram notation)/`classDiagram`, not hand-drawn |
 
 "Container" in C4 is Brown's specific term for an independently deployable or runnable unit — a Go service, a database, a React SPA, a mobile app — and has nothing to do with Docker; a Docker container is one possible way to run a C4 container, not what the word means here. This is the single most common C4 vocabulary mistake.
 
 ### 3.2 Context diagram: InvoiceOps and its world
+
+**Step by step:**
+1. Draw your system as one box: "InvoiceOps".
+2. Add the people who use it: the freelancer, the client who pays.
+3. Add the outside systems it talks to: payment provider, email service.
+4. Label each arrow with what flows: "pays an invoice - HTTPS". No Go, no databases yet.
 
 ```mermaid
 flowchart TB
@@ -173,11 +214,19 @@ flowchart TB
     InvoiceOps -->|sends reminders - SMTP API| Email
 ```
 
+(SMTP is the standard way computers send email.)
+
 A Context diagram never shows *how* InvoiceOps is built inside — no mention of Go, Postgres, or an API versus a worker. It answers exactly one question: what does this system do, and what does it talk to.
 
 This is the diagram a new hire, a security reviewer, or a product manager should be able to read without any Go experience.
 
 ### 3.3 Container diagram: zooming into InvoiceOps
+
+**Step by step:**
+1. Open the InvoiceOps box.
+2. Draw each thing that runs or stores data on its own: API service, worker, Postgres, Redis, WebSocket hub (a server that keeps a live connection open so it can push updates to the browser).
+3. Write the technology on each box: "Go, net/http + gRPC", not just "API".
+4. Draw who talks to whom: browser → API, API → Postgres, worker → Postgres.
 
 ```mermaid
 flowchart TB
@@ -198,11 +247,17 @@ flowchart TB
     Worker --> WS
 ```
 
-Each box now names a technology (the thing C4 calls out specifically: "Go, net/http + gRPC", not just "API") because a reader at this level — an engineer deciding where a change belongs, or an SRE deciding what to restart — needs to know what actually runs and how to operate it.
+Each box now names a technology (the thing C4 calls out specifically: "Go, net/http + gRPC", not just "API") because a reader at this level — an engineer deciding where a change belongs, or an **SRE** (site reliability engineer, who keeps systems running) deciding what to restart — needs to know what actually runs and how to operate it.
 
 This maps directly onto [[Capstone - InvoiceOps]]'s own component view: the API service, the worker, and the data stores it already draws, now in C4's specific vocabulary and audience framing rather than an ad hoc flowchart.
 
 ### 3.4 Component diagram: zooming into the API container
+
+**Step by step:**
+1. Open the API service box.
+2. Draw its main code groups: HTTP handlers, webhook handler, invoice service, repository interface, Postgres adapter.
+3. Draw calls: handlers → service → repository.
+4. Draw "implements" as a dashed arrow from the Postgres adapter to the repository interface, and label it, so nobody confuses "calls" with "implements".
 
 ```mermaid
 flowchart TB
@@ -225,6 +280,11 @@ This is the level [[Hexagonal Architecture (Ports and Adapters)]] and [[Clean Ar
 Only draw a Component diagram for a container complex enough to need the zoom-in — a thin container (a static file server, a managed queue) earns no Component diagram of its own.
 
 ### 3.5 Code diagrams: usually skipped, or generated
+
+**Step by step:**
+1. You want to see `InvoiceService`'s methods.
+2. Instead of drawing them, run `go doc` or use your editor's "go to definition".
+3. Only if you truly need a picture, generate one from the code so it can't drift.
 
 A Code diagram (a `classDiagram` of the actual structs and their methods) is the one level C4's own guidance says to generate rather than hand-draw, because source code changes far faster than a human can keep a hand-drawn diagram in sync with it.
 
@@ -255,10 +315,19 @@ classDiagram
 
 **In plain words: a normal test that fails the build when the code breaks an architecture rule.**
 
+**Step by step:**
+1. Pick a rule from the diagram: "`internal/domain` never imports `database/sql`".
+2. Write a Go test that reads every `.go` file under `internal/domain` and lists its imports.
+3. If any import is on the forbidden list, the test fails with the file name.
+4. CI runs this test on every pull request, so a bad import is blocked before merge.
+5. For speed rules, the test runs the code 2,000 times and fails if the slow end (p95) is over budget.
+
+Full detail:
+
 A **fitness function** (Ford, Parsons & Kua, *Building Evolutionary Architectures*, 2017) is any automated, objective check of an architectural characteristic, run the same way as a unit test — in Go, that means an ordinary `_test.go` file. Two concrete kinds, both shown fully in the worked example below:
 
 - **Structural fitness functions** parse the import graph and fail if a rule like "the domain package imports no infrastructure" is broken — the exact rule the Component diagram in 3.4 draws as an arrow direction, now enforced instead of merely illustrated.
-- **Quality-attribute fitness functions** measure a non-functional characteristic — a latency budget, an allocation count, a maximum dependency fan-out — and fail if it regresses, the same way a benchmark regression check would, but expressed as a pass/fail test rather than a chart someone has to read.
+- **Quality-attribute fitness functions** measure a non-functional characteristic (how well it runs, not what it does) — a latency budget, an allocation count, a maximum dependency fan-out — and fail if it regresses, the same way a benchmark regression check would, but expressed as a pass/fail test rather than a chart someone has to read.
 
 ```mermaid
 sequenceDiagram
@@ -281,6 +350,12 @@ sequenceDiagram
 ### 3.7 Where ADRs, C4 and fitness functions fit together
 
 **In plain words: the ADR says why, the diagram shows what, the test keeps it true.**
+
+**Step by step:**
+1. ADR-0004 says: "domain must not import SQL, because we want to test it without a database".
+2. The Component diagram draws that as an arrow from the Postgres adapter into the domain, never the reverse.
+3. The test `TestGoodAppPassesTheImportRule` checks it on every commit.
+4. Put the test name inside the ADR, so whoever sees it fail can find the reason.
 
 An [[Architecture Decision Records|ADR]] records *why* a rule exists ("the domain layer must not import `database/sql`, decided 2026-03-01, because X"); the Component diagram (3.4) draws the rule as a picture for a human to understand quickly; the fitness function (3.6) is the rule enforced every time CI runs.
 
@@ -341,7 +416,7 @@ flowchart TB
     importrules_pkg -->|parses, never imports| adapter["internal/adapter source files"]
 ```
 
-`importrules` depends on nothing from the project it checks — it parses source files as text with `go/parser`, so it never imports (and therefore never has to build) the domain or adapter packages it inspects.
+`importrules` depends on nothing from the project it checks — it parses source files as text with `go/parser` (Go's own library that reads source code into a tree you can inspect), so it never imports (and therefore never has to build) the domain or adapter packages it inspects.
 
 This keeps the fitness function fast (milliseconds, no compilation) and safe to run even while the codebase it checks is between commits and temporarily won't build.
 
@@ -438,7 +513,9 @@ func Check(root string, rules []Rule) ([]Violation, error) {
 }
 ```
 
-Fixture source trees the tests check against (not built — only parsed — so a non-existent import path like `invoiceops/domain` below is fine):
+**What the code above does, in plain words:** `Check` walks through every `.go` file under a folder, reads only its import lines, and for each rule that applies to that folder, reports any import on the forbidden list.
+
+**Fixture** source trees (tiny fake projects kept only for tests) the tests check against (not built — only parsed — so a non-existent import path like `invoiceops/domain` below is fine):
 
 ```go
 // testdata/goodapp/domain/invoice.go
@@ -546,7 +623,9 @@ func TestRuleOnlyAppliesToMatchingPackages(t *testing.T) {
 }
 ```
 
-The quality-attribute fitness function — a latency budget on InvoiceOps's invoice-total calculation, run as a `go test` assertion instead of a benchmark someone has to remember to read:
+**What the tests above do, in plain words:** one checks the clean fake project passes, one checks the broken fake project fails (so the checker really works), and one checks a rule only applies to the folders it names.
+
+The quality-attribute fitness function — a **latency budget** (the most time a call is allowed to take) on InvoiceOps's invoice-total calculation, run as a `go test` assertion instead of a benchmark someone has to remember to read:
 
 ```go
 // Package latency implements a second kind of fitness function: a quality
@@ -657,6 +736,18 @@ func TestBudgetP95CatchesARegression(t *testing.T) {
 }
 ```
 
+**What this code does, in plain words:** `BudgetP95` runs a function many times, timing each run, sorts the times, picks the one 95% of the way up (the p95), and says whether it is under the budget.
+
+```mermaid
+flowchart LR
+    R["Run total() 2,000 times"] --> T["Record each time"]
+    T --> S["Sort times"]
+    S --> P["Take the 95th percentile"]
+    P --> B{"Under 2 ms?"}
+    B -- "yes" --> OK["test passes"]
+    B -- "no" --> F["test fails"]
+```
+
 `go vet ./...` is clean on both packages, and `go test -race -v ./...` passes all 5 tests: the import-rule checker correctly passes a clean tree, correctly fails a tree with a planted violation (proving it isn't vacuously green) and correctly scopes a rule to only the packages it names; the latency budget correctly passes a fast real workload and correctly fails a deliberately slow one.
 
 ## 5. Variants and comparison 🟡
@@ -677,6 +768,9 @@ func TestBudgetP95CatchesARegression(t *testing.T) {
 - **For a small system (one container, a handful of packages)**, a Context diagram may be the only one worth drawing at all — Container, Component and fitness functions earn their cost only once there's enough structure for ambiguity to creep in.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how to draw each C4 level and write both kinds of fitness function in Go. **Next is the senior view**: how real teams keep diagrams alive, how fitness functions fail in practice, and why "parse only the imports" is a deliberate trade-off.
+
 
 - **Real systems:**
 	- Structurizr (Simon Brown's own tool) generates C4 diagrams from a DSL or from code, specifically to avoid the hand-maintained-diagram-rot problem described above.
@@ -724,6 +818,26 @@ func TestBudgetP95CatchesARegression(t *testing.T) {
 - Structural fitness functions parse the import graph (fast, no build needed); quality-attribute fitness functions measure something like latency and assert a budget.
 - Diagrams document intent, ADRs record why, fitness functions enforce it on every commit — a rule with only the first two is a suggestion.
 - A fitness function must be proven to actually fail on a violation (test it against a deliberately broken fixture), or it may be silently vacuous.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) Name the four C4 levels in order.
+> Context, Container, Component, Code.
+
+> [!question]- (easy) Is a C4 "container" a Docker container?
+> No. It is anything that runs or stores data on its own, like a Go API, Postgres or a mobile app.
+
+> [!question]- (easy) What is a fitness function?
+> An automated test, run in CI, that checks an architecture rule such as "domain never imports `database/sql`".
+
+> [!question]- (medium) Which C4 levels should most teams actually draw and keep current?
+> Context and Container; Component only for a container worth explaining; Code is skipped or generated.
+
+> [!question]- (medium) Why test the import checker against a deliberately broken fixture?
+> To prove it actually fails on a violation; otherwise it could pass on everything and you'd never know.
+
+> [!question]- (medium) How do an ADR, a C4 diagram and a fitness function split the work?
+> The ADR says why the rule exists, the diagram shows it, and the fitness function enforces it on every commit.
 
 ## Links 🟢
 

@@ -37,6 +37,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (where hot keys come from and the fix menu), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Partitioning and Sharding]]: big data is split into slices (shards), and a rule based on the key decides which slice holds each item.
+> - [[Consistent Hashing]]: a clever version of that rule that moves few keys when you add or remove machines; it still sends one key to one place.
+> - [[Caching Patterns]]: you keep a fast copy of popular data in memory (like Redis) so the database is asked less.
+
 **From zero, in 60 seconds** 🟢
 
 Big apps spread their data over many machines, so no single machine does all the work.
@@ -83,6 +88,13 @@ Buying more machines does not help, because the event still lives on just one of
 | Replica | An extra copy of the same data on another machine | A read replica of the database |
 | Throughput limit | The most work one machine or partition can do per second | 1,000 writes per second per DynamoDB partition |
 | Skew | Traffic piling up unevenly on a few keys | 1 key gets 40% of all reads |
+| TTL | How long a cached copy lives before it is thrown away | TTL 1 s: refresh every second |
+| Hash slot | Redis Cluster's 16,384 buckets; each key falls in one, each shard owns some | `event:8812` → slot 5061 |
+| WCU / RCU | DynamoDB's units for writes and reads per second | one small write = 1 WCU |
+| Kafka partition | One ordered lane of a Kafka topic, read by one consumer in a group | key `match:42` always goes to lane 3 |
+| Cardinality | How many different values a field has | `country` is low, `user_id` is high |
+| Commutative | Order does not matter for the result | +1 then +1 is the same either way |
+| Request coalescing | Many waiting requests for one key share one fetch | 500 misses become 1 database call |
 
 **Picture it**
 
@@ -108,6 +120,9 @@ Where it breaks: a supermarket can just let every lane sell tickets; with data, 
 > Sharding spreads keys, not traffic: a hot key must be copied (if read-hot) or split (if write-hot), not just given more machines.
 
 ## 1. Why it exists 🟢
+
+🟢 **Plain version:** One million fans refresh the same concert page every few seconds. That page's data lives under one key, and one key always lives on one cache machine. So one machine gets about 200,000 requests a second while the other 11 do nothing, and everything stored on that busy machine becomes slow. Adding a 13th machine changes nothing, because the key still lives in the same place. The table below shows that every kind of storage has this same "one key, one place, one limit" rule.
+
 
 A ticketing site opens sales for a stadium concert at 10:00. One million fans are waiting. At 10:00:00 each of them refreshes the event page, which reads the cache key `event:8812:availability`.
 
@@ -151,15 +166,48 @@ Key terms used below:
 - **Salting (key suffixing):** appending a small number (`#0` to `#N-1`) to a key so its traffic spreads over N physical keys.
 - **L1 cache:** a small cache inside each application process, in front of the shared (L2) cache such as Redis.
 
+### Real-life example: a cricket final on Hotstar 🟢
+
+During an India match final, tens of millions of people watch the live score at the same moment.
+The score for that one match is one key, so without care one cache machine would get all those reads.
+The fix is to copy it: each app server keeps the score in its own memory for about a second, and the public score is also cached at the CDN edge.
+Likes or reactions on a viral Instagram post are the write version of the same problem: one counter gets thousands of +1s a second, so it is split into many small counters that are added up when shown.
+
+## Common beginner mistakes 🟢
+
+- **"Just add more shards"** → the hot key still maps to one shard, so nothing changes → copy the key (reads) or split it (writes).
+- **"Use consistent hashing"** → it decides who owns a key, but one key still has one owner → same fix: copy or split.
+- **Splitting every counter into 64 pieces** → every read now costs 64 lookups → split only keys that are actually hot.
+- **Caching seat availability and selling from the cache** → two people can buy the same seat from a stale copy → show the cached count, but check the real row when buying.
+- **Salting a Kafka key that needs order** → messages for one match land in different lanes and arrive out of order → salt only when order does not matter.
+
+### Hot key vs things people confuse it with 🟡
+
+| Problem | What is wrong | Typical fix |
+| --- | --- | --- |
+| Hot key | One key gets far more traffic than others | Copy it (reads) or split it (writes) |
+| Hot partition | One shard holds too many busy keys, often from a bad key choice | Pick a better key, split the shard |
+| Big key | One value is huge (say 5 MB) | Split or compress the value |
+| Cluster too small | Every shard is busy, not just one | Add shards; hot-key tricks do not help |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that one popular key lands on one machine, and the fix is to copy it or split it. **Next we open the box**: where hot keys come from, why the partition rule can never spread one key, and the full menu of fixes. Each subsection starts with a plain step-by-step walk; the full detail follows.
 
 ### 3.1 Where skew comes from
 
 **In plain words:** "skew" just means traffic is uneven. Here are the usual reasons one key ends up far busier than the rest.
 
+**Step by step (how a normal key turns hot):**
+1. A cricket final starts. The live score lives at key `score:match:42`.
+2. The partitioner hashes that key to shard 5. Every reader of the score now goes to shard 5.
+3. 10 million viewers refresh every few seconds. Shard 5 gets millions of reads; the rest get their usual load.
+4. Shard 5 slows down, and every other key on shard 5 slows down with it.
+5. The causes below are just different ways step 1 can happen.
+
 1. **Celebrity or viral content:** a post by an account with 100 million followers, a trending video, a breaking-news article.
-2. **Flash events:** a flash-sale SKU, a concert on-sale, a cricket final's live score.
-3. **Monotonic keys:** a partition key or range key that only grows, such as a timestamp or an auto-increment ID. With **range** partitioning every new write lands in the last range. Bigtable's schema guide warns against row keys that start with a timestamp for exactly this reason.
+2. **Flash events:** a flash-sale SKU (one product code), a concert on-sale, a cricket final's live score.
+3. **Monotonic keys:** a partition key or range key that only grows, such as a timestamp or an auto-increment ID (1, 2, 3, ...). With **range** partitioning (shard A holds keys A-F, shard B holds G-M, and so on) every new write lands in the last range. Bigtable's schema guide warns against row keys that start with a timestamp for exactly this reason.
 4. **Low-cardinality keys:** partitioning by `country` or `status` gives a handful of partitions, and `country = 'IN'` or `status = 'PENDING'` takes most of the traffic.
 5. **Big tenants:** in a multi-tenant system keyed by `tenant_id`, the largest customer can be 1,000 times the median.
 6. **Default and null values:** every event without a user ID gets key `""` or `"anonymous"` and lands in one Kafka partition.
@@ -167,6 +215,13 @@ Key terms used below:
 ### 3.2 Why one key cannot be spread by the partitioner
 
 **In plain words:** the rule that picks a machine looks only at the key. Same key, same machine, every time. So adding machines never moves a hot key.
+
+**Step by step:**
+1. Redis Cluster computes `CRC16("event:8812") mod 16384` (a fixed checksum of the key's text) and gets slot 5061.
+2. Slot 5061 belongs to shard 3. So the key lives on shard 3.
+3. You add a 13th shard. The checksum of `event:8812` is still 5061, and that slot stays on one shard.
+4. So the key can only be spread by turning it into many keys (`event:8812#0` … `#7`), each with a different slot.
+5. Or by answering most reads before they reach Redis at all (an in-process cache).
 
 Every partitioner, whether `hash % N`, a [[Consistent Hashing]] ring, Redis Cluster's `CRC16(key) mod 16384` slots or a range map, is a **function of the key**. The same key always gives the same partition.
 
@@ -197,13 +252,20 @@ flowchart LR
 
 **In plain words:** for reads, keep copies so the hot machine is asked less. For writes, split one key into many and add them up later. For a bad key design, choose a better key.
 
+**Step by step:**
+1. Ask: is the key hot because of reads or writes?
+2. Reads: first give every app server a tiny cache that keeps the value for 1 second. 200 servers then ask Redis only about 200 times a second.
+3. Still too hot? Store 8 copies under 8 keys on different shards, and read a random one.
+4. Writes that can be added up (likes, views): split into 64 sub-counters, write to a random one, sum them when reading.
+5. Writes where each one depends on the last (seats left): send them all through one queue to one worker, in order.
+
 **Read-hot fixes:**
 
 - **In-process L1 cache with a short TTL** (0.5 to 5 s). Each app instance asks the shared cache at most once per TTL per key. This is usually the biggest single win.
-- **Key replication:** write the value to `key#0 … key#N-1` (hash tags must be *different* so the copies land in different Redis slots); readers pick one at random. Writes cost N times more, so use it for keys that are read far more than written.
+- **Key replication:** write the value to `key#0 … key#N-1` (hash tags, the `{...}` part of a Redis key that alone decides its slot, must be *different* so the copies land in different Redis slots); readers pick one at random. Writes cost N times more, so use it for keys that are read far more than written.
 - **Read replicas:** let a hot shard's replicas serve reads (Redis `READONLY` on cluster replicas, DynamoDB eventually consistent reads, database read replicas). It adds stale-read risk; see [[Replication]].
 - **CDN or edge cache:** for public, cacheable responses, the hot key never reaches your data centre.
-- **Request coalescing:** many concurrent misses on one key become one backend fetch (Go `singleflight`); covered with stampedes in [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
+- **Request coalescing:** many concurrent misses on one key become one backend fetch (Go `singleflight`, a small library that makes callers for the same key wait for one shared result); covered with stampedes in [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
 
 **Write-hot fixes:**
 
@@ -215,7 +277,7 @@ flowchart LR
 
 - **Better keys:** composite (`tenant_id + order_id`), hashed (`hash(user_id)` instead of a sequence), or a high-cardinality key instead of `country`. See [[Partitioning and Sharding]].
 - **Split the hot partition:** dedicate a shard to the big tenant, or let the store split it (DynamoDB's "split for heat", Bigtable and other range-partitioned stores split hot tablets).
-- **Managed burst absorption:** DynamoDB adaptive capacity moves throughput to a hot partition and can isolate a hot item, but it can never exceed the per-partition limit for one item.
+- **Managed burst absorption:** DynamoDB adaptive capacity (an automatic feature that lends spare capacity to busy partitions) moves throughput to a hot partition and can isolate a hot item, but it can never exceed the per-partition limit for one item.
 
 ```mermaid
 flowchart TD
@@ -595,6 +657,8 @@ sequenceDiagram
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the fix menu and the arithmetic for a sharded counter. **Next comes the senior view**: real cases at scale, how to detect a hot key before it hurts, the failure modes, and the deeper reasons skew never goes away.
+
 - **Real cases:**
 	- **Like and view counters:** sharded counters, or batching in a stream processor, then periodic writes.
 	- **Ticket on-sales:** the availability *display* is cached and approximate; the seat *hold* uses a single writer or row locks per seat, so contention is per seat, not per event. Links: [[Case Study - Ticket Booking]], LLD twin [[Movie Ticket Booking]].
@@ -602,11 +666,11 @@ sequenceDiagram
 	- **Leaderboards:** one Redis sorted set for a global leaderboard is a single key on a single shard; large systems split by region or score band and merge. See [[Case Study - Leaderboard and Top-K]].
 	- **DynamoDB:** AWS documents write sharding with random or calculated suffixes, and adaptive capacity that can isolate a frequently accessed item on its own partition.
 - **Detection:**
-	- `redis-cli --hotkeys` samples keys by LFU access frequency, so it only works when `maxmemory-policy` is an LFU policy (`allkeys-lfu` or `volatile-lfu`). `--bigkeys` and `--memkeys` find large keys, a related problem.
+	- `redis-cli --hotkeys` samples keys by LFU (least frequently used: Redis tracks how often each key is read) access frequency, so it only works when `maxmemory-policy` is an LFU policy (`allkeys-lfu` or `volatile-lfu`). `--bigkeys` and `--memkeys` find large keys, a related problem.
 	- Per-shard CPU, ops per second and latency: one shard far above the others is the signature of a hot key.
 	- DynamoDB CloudWatch Contributor Insights reports the most accessed and most throttled partition keys.
 	- Kafka: per-partition bytes in and consumer lag per partition. One partition with growing lag while others sit at zero means a skewed key.
-	- Application-side: sample 1% of requests into a counter or Count-Min Sketch and publish the top 20 keys per minute.
+	- Application-side: sample 1% of requests into a counter or Count-Min Sketch (a small, approximate counting table that uses little memory) and publish the top 20 keys per minute.
 	- Avoid `MONITOR` on a busy Redis in production; it streams every command and costs a lot of throughput.
 - **Failure modes → fixes:**
 	- One hot shard slows unrelated keys on that shard → L1 cache plus key replication; move other large keys off that shard.
@@ -671,6 +735,26 @@ sequenceDiagram
 - Bad keys: monotonic, low-cardinality, default or null values, giant tenants.
 - Salting a Kafka key costs per-key ordering.
 - Detect: `--hotkeys` (needs LFU), per-shard max/average, Contributor Insights, per-partition lag.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is a hot key?
+> One key that gets far more traffic than the others, so the one machine holding it is overloaded.
+
+> [!question]- (easy) Why does adding shards not fix a hot key?
+> The partition rule depends only on the key, so the key stays on one shard.
+
+> [!question]- (easy) Read-hot or write-hot: which one do you fix with a cache?
+> Read-hot. Write-hot keys need splitting or batching.
+
+> [!question]- (medium) A counter gets 50,000 writes/s and one partition takes 1,000. How many sub-keys?
+> At least 50; pick about 64 for room.
+
+> [!question]- (medium) What does a sharded counter cost on the read side?
+> Each exact read must fetch and sum all N sub-keys, so you cache the total for a second or so.
+
+> [!question]- (medium) Why must replicated copies of a Redis key use different hash tags?
+> Keys with the same hash tag land in the same slot, so all copies would sit on the same shard.
 
 ## Links
 

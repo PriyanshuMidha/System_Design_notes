@@ -40,6 +40,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: a request has a method (`GET`, `POST`…), a URL and headers; a response has a status code, headers and a body.
+> - [[Choosing an API Style]]: REST is the default style for public APIs; this note shows how to design one well.
+
 **From zero, in 60 seconds** 🟢
 
 REST is the standard way to shape a web API. The idea is simple: everything the API offers is a **resource** — a thing with its own web address, like `/orders/42`.
@@ -87,6 +91,12 @@ Then caches, retries, browsers and monitoring tools all work without extra effor
 | Header | Extra key-value info on a request or response | `Content-Type: application/json` |
 | Idempotent | Repeating it has the same effect as doing it once | Two identical `PUT`s leave one state |
 | Cache / CDN | Stored copies of responses close to the user | A CDN serves `GET /products` without hitting the server |
+| Safe | Only reads; asks for no change on the server | `GET`, `HEAD` |
+| Representation | The copy of a resource sent over the wire, in some format | the JSON of booking 42 |
+| Stateless | The server keeps no memory of you between requests; each one carries everything | the token is sent every time |
+| ETag | A version label on a response | `ETag: "v2"` |
+| Query parameter | Options added after `?` in the URL | `?status=paid&limit=25` |
+| Optimistic concurrency | "Save only if nobody changed it since I read it" | `If-Match: "v1"` → `412` if stale |
 
 **Picture it**
 
@@ -134,6 +144,13 @@ REST replaces those private conventions with shared ones that HTTP already defin
 - `404` means the same thing to every client, proxy and monitoring tool.
 - When two support agents edit the same booking, HTTP's conditional requests stop one from silently overwriting the other.
 
+### Real-life example: a movie booking app 🟢
+
+On an app like BookMyShow, opening a movie page is `GET /movies/{id}`: safe, so a CDN can serve it fast to millions of people.
+Booking seats is `POST /bookings`, which creates a new booking and answers `201 Created` with the new booking's address.
+Cancelling is `POST /bookings/{id}/cancel`; if the show already started, the server answers `409 Conflict` instead of pretending it worked.
+If the app's connection drops mid-booking, it retries with the same idempotency key, so you do not get two bookings.
+
 ## 2. Mental model 🟢
 
 A REST API is a **library catalogue**:
@@ -143,11 +160,36 @@ A REST API is a **library catalogue**:
 - What you carry away is a **copy** in some format (JSON, CSV): the **representation**, not the book itself.
 - The librarian keeps no memory of you between visits; you show your card every time (**statelessness**).
 
+## Common beginner mistakes 🟢
+
+- **Verbs in URLs** (`/createOrder`, `/getUsers`) → nothing is predictable or cacheable → nouns in URLs, verbs as HTTP methods: `POST /orders`.
+- **Returning `200` with an error inside** → dashboards and retry tools think it worked → use the honest `4xx` or `5xx` code.
+- **Using `PUT` with only the changed fields** → `PUT` replaces everything, so missing fields get wiped → use `PATCH` for partial changes.
+- **Retrying a `POST` blindly** → duplicate orders → add an `Idempotency-Key`.
+- **Letting two editors save without a version check** → the second silently overwrites the first → `ETag` + `If-Match`, answer `412` when stale.
+
+## Often confused 🟡
+
+| These two | First one | Second one |
+| --- | --- | --- |
+| `PUT` vs `PATCH` | Replace the whole resource | Change only some fields |
+| Safe vs idempotent | No change at all (`GET`) | Repeating has no extra effect (`PUT`, `DELETE`) |
+| `401` vs `403` | Who are you? No valid login | Known, but not allowed |
+| `If-None-Match` vs `If-Match` | "Send only if changed" → `304` | "Save only if unchanged" → `412` |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that REST means resources with URLs, standard verbs and honest status codes. **Next we open the box**: the official rules, how to name URLs, where each piece of data goes, what each method promises, which code fits which outcome, ETags, formats, slow jobs and bulk calls.
 
 ### The REST constraints
 
 **In plain words:** REST is officially a list of rules, and each rule buys you something concrete: statelessness buys easy scaling, cacheability buys cheap reads. Skim the table for the "what it buys" column.
+
+**Step by step:**
+1. **Stateless:** every request carries its own login token, so any of your 10 servers can answer it. Add an 11th server when traffic grows.
+2. **Cacheable:** `GET /products/7` says "cache for 60 s", so a CDN answers repeats without touching your servers.
+3. **Uniform interface:** everyone uses the same verbs and codes, so a generic tool like `curl` works on any REST API.
+4. **Layered:** a gateway or CDN can sit in front and the client cannot tell.
 
 Roy Fielding defined REST in his 2000 dissertation as a set of constraints. Each one buys a property:
 
@@ -156,7 +198,7 @@ Roy Fielding defined REST in his 2000 dissertation as a set of constraints. Each
 | Client-server | UI and data storage are separate | Each side evolves on its own |
 | Stateless | Each request carries everything needed, including credentials; the server keeps no session between requests | Any instance can serve any request, so you scale by adding instances |
 | Cacheable | Responses say whether and how long they may be cached | CDNs and browsers absorb read traffic |
-| Uniform interface | Resources have identifiers; clients change them through representations; messages are self-descriptive; hypermedia drives state (HATEOAS) | Generic clients, proxies and tools work with every API |
+| Uniform interface | Resources have identifiers; clients change them through representations; messages are self-descriptive; hypermedia drives state (HATEOAS: responses include links to the next allowed actions) | Generic clients, proxies and tools work with every API |
 | Layered system | A client cannot tell whether it talks to the origin or a gateway or CDN | You can insert caches, gateways and load balancers freely |
 | Code on demand (optional) | The server may send code to run, such as JavaScript | Rarely used in JSON APIs |
 
@@ -175,6 +217,12 @@ Most good public APIs sit at level 2 and borrow one idea from level 3: links for
 
 **In plain words:** URLs name things, never actions. Think street addresses: a house has one address, and what you do there is a separate question.
 
+**Step by step:**
+1. All products: `/products`. One product: `/products/981`.
+2. One user's addresses: `/users/42/addresses` (one level of nesting).
+3. Comments on a post: `/comments?post_id=7`, not three levels deep.
+4. Never `/getProduct` or `/products.json`.
+
 - **Plural nouns for collections, an ID for an item:** `/products` and `/products/{id}`. Never verbs: `/api/v3/products` is right, `/api/v3/getAllProducts` is wrong.
 - **Sub-resources show ownership, one level deep:** `/users/{id}/addresses`. Stop at one level, two at most.
 - **Prefer filters to deep nesting.** `/posts/{postId}/comments/{commentId}/likes` couples clients to a hierarchy. Give comments a top-level home and filter: `/comments?post_id=7`. Each resource gets **one canonical URL**.
@@ -183,6 +231,12 @@ Most good public APIs sit at level 2 and borrow one idea from level 3: links for
 ### Where each piece of data goes
 
 **In plain words:** every request has four pockets: the path says which thing, the query says how to view a list, the body carries the data, headers carry metadata. Put each item in its pocket.
+
+**Step by step:**
+1. "Which thing?" → path: `/users/42/orders`.
+2. "Only paid ones, newest first, 25 per page" → query: `?status=paid&sort=-created_at&limit=25`.
+3. "Change seats to 3" → body: `{"seats": 3}`.
+4. "Here is my login, I want JSON" → headers: `Authorization`, `Accept`.
 
 | Place | Carries | Example |
 | --- | --- | --- |
@@ -209,13 +263,19 @@ A body on `GET` has no generally defined meaning in HTTP (RFC 9110), and some se
 
 **In plain words:** "safe" = just looking; "idempotent" = repeating causes no extra effect. These two words decide what may be retried or cached automatically, so they are worth memorising.
 
-**Safe** means the client asks for no change on the server. **Idempotent** means sending the same request twice has the same effect on server state as sending it once (the response may differ). Both matter because clients, proxies and retry libraries may resend safe and idempotent requests after a timeout.
+**Step by step:**
+1. `GET /bookings/42` times out. Retrying is fine: it only reads.
+2. `PUT /bookings/42 {seats: 3}` times out. Retrying is fine: the booking ends with 3 seats either way.
+3. `POST /bookings` times out. Retrying may create a second booking, so it needs an idempotency key.
+4. `PATCH` with "add one seat" is not repeat-safe; with "set seats to 3" it happens to be.
+
+**Safe** means the client asks for no change on the server. **Idempotent** means sending the same request twice has the same effect on server state as sending it once (the response may differ). Both matter because clients, **proxies** (servers in the middle that forward traffic) and retry libraries may resend safe and idempotent requests after a timeout.
 
 | Method | Safe | Idempotent | Cacheable | Typical use |
 | --- | --- | --- | --- | --- |
 | `GET` | yes | yes | yes | Read |
 | `HEAD` | yes | yes | yes | Read headers only |
-| `OPTIONS` | yes | yes | no | Capabilities, CORS preflight |
+| `OPTIONS` | yes | yes | no | Capabilities, CORS preflight (the browser's "may I call you?" check before a cross-site request) |
 | `PUT` | no | **yes** | no | Replace the whole resource, or create at a known URL |
 | `DELETE` | no | **yes** | no | Remove |
 | `POST` | no | **no** | only with explicit freshness and `Content-Location`; almost never in practice | Create in a collection, actions |
@@ -229,6 +289,13 @@ A body on `GET` has no generally defined meaning in HTTP (RFC 9110), and some se
 ### Status codes that matter
 
 **In plain words:** the status code is the headline; pick the honest one. The "common mistake" column is the list of ways teams lie with codes.
+
+**Step by step:**
+1. Booking created → `201` with `Location: /bookings/981`.
+2. Booking deleted → `204`, no body.
+3. Seats `99` when the max is 10 → `422`. Broken JSON → `400`.
+4. Seat already taken → `409`. Too many requests → `429` with `Retry-After`.
+5. Your code crashed → `500`; the payment service is down → `503`.
 
 | Code | Use it when | Common mistake |
 | --- | --- | --- |
@@ -256,6 +323,12 @@ Errors carry a machine-readable body, normally `application/problem+json` (RFC 9
 ### Conditional requests
 
 **In plain words:** an **ETag** is a version sticker on the data. "Only send if changed" saves bandwidth; "only save if unchanged" stops two editors silently overwriting each other.
+
+**Step by step:**
+1. Alice and Bob both `GET /bookings/42` and get `ETag: "v1"`, seats 2.
+2. Alice saves seats 3 with `If-Match: "v1"`. It matches, so it saves; the tag becomes `"v2"`.
+3. Bob saves seats 5 with `If-Match: "v1"`. It no longer matches, so he gets `412`.
+4. Bob re-reads (seats 3, `"v2"`), re-applies his change and saves with `If-Match: "v2"`.
 
 An **ETag** is a version label for a representation, sent in a response header. Clients send it back in two ways:
 
@@ -295,6 +368,11 @@ RETURNING version;
 
 **In plain words:** the client says which formats and languages it accepts, and the server picks one and labels its choice, like a menu offered in two languages.
 
+**Step by step:**
+1. The client sends `Accept: text/csv`.
+2. The server can do CSV, so it sends CSV with `Content-Type: text/csv` and `Vary: Accept`.
+3. If it could only do JSON, it would answer `406 Not Acceptable`.
+
 The client says what it accepts, and the server picks:
 
 - `Accept: text/csv` on `GET /reports/77` gets CSV. `Accept-Language` and `Accept-Encoding` work the same way.
@@ -304,6 +382,12 @@ The client says what it accepts, and the server picks:
 ### Long-running operations
 
 **In plain words:** when the work takes minutes, do not keep the phone line open. Say "accepted, here is a tracking number" (202 + an operation URL) and let the client check back.
+
+**Step by step:**
+1. `POST /reports` → `202 Accepted`, `Location: /operations/op_81`, `Retry-After: 5`.
+2. The client waits 5 s and calls `GET /operations/op_81` → "running, 40%".
+3. Later → "succeeded", with a link to `/reports/77`.
+4. The client downloads `/reports/77`.
 
 Some requests take minutes: a report export, a bulk import, a refund across banks. Holding the HTTP request open for that long hits load balancer timeouts. Return `202 Accepted` with an **operation resource** instead:
 
@@ -328,6 +412,12 @@ Clients that cannot poll can register a webhook instead (see [[Webhooks - Sendin
 ### Bulk endpoints
 
 **In plain words:** creating 500 things one call at a time wastes 500 round trips; accept a capped list in one call, and decide upfront whether it is all-or-nothing or item-by-item.
+
+**Step by step:**
+1. The client sends 100 products in one `POST /products:batchCreate`.
+2. **Atomic** mode: if product 57 is invalid, none are saved and the client gets one error.
+3. **Partial** mode: 99 are saved, and the response lists item 57 as failed with its reason.
+4. Above the cap (say 101 items), the server refuses with `400` or `413`.
 
 Creating 500 items with 500 requests costs 500 round trips. A bulk endpoint takes a capped list:
 
@@ -690,6 +780,8 @@ The IETF draft for this header answers `409` while the first request with that k
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** naming, methods, status codes, ETags, long jobs and bulk calls. **Next is the advanced part**: how GitHub, Stripe, Kubernetes and Azure do it, production failures, strong vs weak ETags, caching details and HTTP edge cases.
+
 - **Real systems:**
 	- **GitHub's REST API** returns `ETag` headers; a conditional request that gets `304` does not count against the primary rate limit, provided it was sent with a valid `Authorization` header. It returns `404` instead of `403` for private repositories, so their existence does not leak.
 	- **Stripe** accepts an `Idempotency-Key` on `POST` requests and replays the saved result for retries; keys can be removed once they are at least 24 hours old.
@@ -756,6 +848,26 @@ The IETF draft for this header answers `409` while the first request with that k
 - Non-CRUD actions are `POST /resource/{id}/action`; long jobs are `202` + `/operations/{id}`.
 - Page with opaque cursors; avoid deep offsets and exact totals on big tables.
 - Additive changes need no new version; breaking ones do. Announce removals with `Deprecation` and `Sunset`.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: is `/getAllProducts` a good REST URL?
+> No. Use a noun, `/products`, with `GET`.
+
+> [!question]- Easy: which status code for a successful create?
+> `201 Created`, with a `Location` header pointing to the new resource.
+
+> [!question]- Easy: is `DELETE` idempotent?
+> Yes. After one or two calls the resource is gone either way.
+
+> [!question]- Medium: `PUT` vs `PATCH` when you only want to change `seats`?
+> `PATCH`. A `PUT` with only `seats` would reset every other field.
+
+> [!question]- Medium: what does `412 Precondition Failed` mean after a `PUT` with `If-Match`?
+> Someone changed the resource since you read it; re-read and re-apply.
+
+> [!question]- Medium: an export takes 3 minutes. What does the first response look like?
+> `202 Accepted` with a link to an operation resource the client can poll.
 
 ## Links 🟢
 

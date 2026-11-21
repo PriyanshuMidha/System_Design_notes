@@ -33,6 +33,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Syntax, Types and Control Flow]]: you can declare variables, write `if` and `for`, and write a basic `func add(a, b int) int`. That is all you need.
+
 **From zero, in 60 seconds** 🟢
 
 A function is a named block of work. In Go, functions are also values: you can store one in a variable and hand it around like a number.
@@ -81,6 +84,12 @@ Functions can also be passed around like values, remember variables (closures), 
 | `panic` | Stop normal flow and unwind the stack, for bugs | `panic("unreachable")` |
 | `recover` | Catch a panic inside a deferred function | `if r := recover(); r != nil` |
 | Goroutine | A lightweight thread run by the Go runtime | `go work()` |
+| Variadic | A function that takes any number of arguments of one type | `func Sum(nums ...int)` |
+| Named result | A return value given a name in the signature, so code (even a `defer`) can set it | `func f() (err error)` |
+| Stack frame | The scratch space one running function call gets; freed when it returns | `Counter`'s local variables |
+| Heap | Longer-lived memory for values that must outlive the function that made them | a closure's captured `n` |
+| Receiver | The value a method is called on | `v` in `v.Method()` |
+| Middleware | A wrapper that runs around every HTTP handler | a recover-and-log wrapper |
 
 **Picture it**
 
@@ -144,13 +153,13 @@ func writeReceipt(path string, data []byte) (err error) {
 }
 ```
 
-This is also where `panic` and `recover` earn their place: a bug deep in a request handler (a nil pointer dereference, say) must not take down every other in-flight request on the same server. `net/http` recovers panics per-request for exactly this reason — see [[Error Handling]] for where panic fits next to ordinary error values.
+This is also where `panic` and `recover` earn their place: a bug deep in a request handler (a nil pointer dereference, say: using a pointer that points at nothing) must not take down every other in-flight (started but not finished) request on the same server. `net/http` recovers panics per-request for exactly this reason — see [[Error Handling]] for where panic fits next to ordinary error values.
 
 ## 2. Mental model 🟢
 
 A function value is a box you can hand around like any other value — an `int` or a `string` — except that calling it runs code.
 
-A **closure** is that box with a few variables from its birthplace taped to the outside: every copy of the closure that shares those variables sees the same taped-on state, the same way two slices can share one backing array (see [[Arrays, Slices and Maps (with internals)]]).
+A **closure** is that box with a few variables from its birthplace taped to the outside: every copy of the closure that shares those variables sees the same taped-on state, the same way two slices can share one backing array (the block of memory a slice points at; see [[Arrays, Slices and Maps (with internals)]]).
 
 `defer` is a to-do list pinned to the function: each `defer` statement adds one item to the top of the list, evaluating that item's arguments right now, and the whole list runs from the top down.
 
@@ -163,6 +172,8 @@ A `panic` always unwinds the current goroutine's stack, running every deferred c
 There is no "catch nearby and keep going from the same line" — once a function has panicked, that function is already on its way out.
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that functions are values, closures remember variables, `defer` runs cleanup on the way out, and `panic`/`recover` are for bugs. **Next we open the box**: the exact rules for results, variadic slices, closures in loops, recursion depth, the two `defer` rules, and where `recover` does and does not work.
 
 ### Functions as values, multiple and named results
 
@@ -218,7 +229,7 @@ func Counter() func() int {
 }
 ```
 
-`n` is declared inside `Counter`, but the returned closure keeps a live reference to it, so `n` outlives `Counter`'s own call — the compiler's escape analysis puts it on the heap instead of `Counter`'s stack frame (see [[Pointers, Values and Escape Analysis]]).
+`n` is declared inside `Counter`, but the returned closure keeps a live reference to it, so `n` outlives `Counter`'s own call — the compiler's escape analysis (its check for which values must outlive the function that made them) puts it on the heap instead of `Counter`'s stack frame (see [[Pointers, Values and Escape Analysis]]).
 
 Every call to the same closure value shares that one `n`; a second call to `Counter()` creates a brand-new, independent `n`.
 
@@ -233,7 +244,7 @@ for i := 0; i < 3; i++ {
 // fns[0](), fns[1](), fns[2]() all returned 3 — the loop's final i.
 ```
 
-Since Go 1.22 (and unconditionally in this Go 1.24 module), each iteration gets its **own** `i`, so the closures capture 0, 1 and 2 as intended. The change is controlled by the module's `go` directive, so vendored code built with an older directive keeps the old behaviour — check `go.mod` before assuming which rule applies.
+Since Go 1.22 (and unconditionally in this Go 1.24 module), each iteration gets its **own** `i`, so the closures capture 0, 1 and 2 as intended. The change is controlled by the module's `go` directive (the `go 1.22` line in `go.mod`), so vendored code (third-party code copied into your repo) built with an older directive keeps the old behaviour — check `go.mod` before assuming which rule applies.
 
 A function value that is called repeatedly by a `for ... range` loop is exactly what Go 1.23's **range-over-func** feature standardised: `range` over a function of type `func(yield func(V) bool)` (or `func(yield func(K, V) bool)`) calls that function once per iteration, feeding each value through `yield`, and stops as soon as `yield` returns `false`.
 
@@ -252,9 +263,9 @@ func Factorial(n int) int {
 }
 ```
 
-Go does not perform tail-call optimisation, so every recursive call keeps its own stack frame alive until it returns — including genuine tail calls, which some other languages would collapse into a loop.
+Go does not perform tail-call optimisation (turning "call myself as the very last step" into a plain loop), so every recursive call keeps its own stack frame alive until it returns — including genuine tail calls, which some other languages would collapse into a loop.
 
-A goroutine's stack starts small and grows automatically (see [[Process Memory Layout - Stack vs Heap]]), so deep-but-finite recursion usually just works, but recursion with no bound that scales with untrusted input is a real way to exhaust memory; rewrite it as an explicit loop with a stack/slice if the depth is attacker-influenced.
+A goroutine's stack starts small and grows automatically (see [[Process Memory Layout - Stack vs Heap]]), so deep-but-finite recursion usually just works, but recursion with no bound that scales with untrusted input is a real way to exhaust memory; rewrite it as an explicit loop with a stack/slice if the depth is attacker-influenced (an outsider can choose how deep it goes, e.g. by sending deeply nested JSON).
 
 ### defer: LIFO order, and argument evaluation time
 
@@ -360,7 +371,7 @@ flowchart TD
     U -->|stack exhausted, never recovered| X["process crashes:<br/>panic message + stack trace, exit code 2"]
 ```
 
-A **runtime panic** happens on its own: indexing past a slice's length, dereferencing a nil pointer, a type assertion that doesn't hold, dividing an integer by zero, or writing to a nil map.
+A **runtime panic** happens on its own: indexing past a slice's length, dereferencing a nil pointer, a type assertion that doesn't hold (asking an `any` value for a type it is not, like `v.(string)` on an `int`), dividing an integer by zero, or writing to a nil map.
 
 An **explicit panic** is a deliberate `panic(v)` call for a condition the function's author decided the caller cannot reasonably recover from (a broken invariant, not a normal failure — normal, expected failures are `error` values; see [[Error Handling]]).
 
@@ -396,7 +407,7 @@ func RecoverTyped(f func()) (err error) {
 }
 ```
 
-The same idea applies to `http.ErrAbortHandler`: `net/http`'s own per-request recover treats this one sentinel specially and does **not** log it, because a handler panics with it on purpose to abort a response without noise (for example, after the client disconnected mid-stream).
+The same idea applies to `http.ErrAbortHandler`: `net/http`'s own per-request recover treats this one sentinel (a fixed, named error value) specially and does **not** log it, because a handler panics with it on purpose to abort a response without noise (for example, after the client disconnected mid-stream).
 
 Custom recover middleware should check `errors.Is(err, http.ErrAbortHandler)` (wrapped as an error, or compared directly if the raw value was a panic) and re-panic it rather than swallow it — see the recover middleware in [[Middleware]].
 
@@ -428,6 +439,8 @@ created by main.main.func1 in goroutine 1
 	.../cmd/goroutinepanic/main.go:12 +0x78
 exit status 2
 ```
+
+**What this code does, in plain words:** `main` sets up a `defer`+`recover` in its own goroutine, then starts a child goroutine that panics. The `recover` in `main`'s goroutine never sees that panic, so the whole program crashes anyway.
 
 ```go
 func main() {
@@ -497,6 +510,8 @@ Read top to bottom, `defer` statements execute in the order they are *written*, 
 
 Tested on Go 1.24.4 (darwin/arm64); `go vet` and `go test -race` both pass.
 
+**What this code does, in plain words:** five small functions, one per rule. `Sum` and `ZeroFirst` take a variadic list and show that `f(s...)` works on your real slice, not a copy. `Counter` returns a closure with its own private counter. `DeferOrder` registers a few defers and records the order they run in (newest first, with arguments frozen early). `SafeDivide` divides by zero on purpose and uses `recover` in a `defer` to turn the crash into a normal error.
+
 ```go
 // Sum takes a variadic slice. Calling Sum(nums...) with an existing slice
 // does NOT copy it: nums inside Sum is the exact same backing array as the
@@ -555,6 +570,8 @@ func SafeDivide(a, b int) (result int, err error) {
 
 The tests that prove the aliasing, ordering, argument-timing and recover claims:
 
+**What this code does, in plain words:** one test checks that `ZeroFirst(s...)` really changes the caller's `s[0]`, one checks the defer order, and one checks that `SafeDivide(1, 0)` returns an error instead of crashing.
+
 ```go
 func TestZeroFirstAliasesCallersSlice(t *testing.T) {
 	nums := []int{7, 8, 9}
@@ -603,10 +620,13 @@ The goroutine-panic and `os.Exit` behaviours from section 3 are process-level ef
 
 - `panic`/`recover` is not a general control-flow tool. Using it to return a value from deep in a call stack (instead of threading an `error` or a result through normal returns) makes the code harder to follow and easy to get wrong across goroutines.
 - A deferred closure allocates (historically; open-coded defers since Go 1.14 remove this cost for simple, non-loop defers in a function with at most 8 defer sites). A `defer` inside a hot loop that runs millions of times is still worth measuring with a benchmark before assuming it is free — see [[Go Toolchain, Tooling and Debugging]] for `pprof`.
-- `defer` runs at function-return time, not at the end of a block. `defer` inside a `for` loop or inside an `if` that is entered many times accumulates work (and holds resources, as in the file-descriptor example above) until the whole function returns — extract a helper function when a resource must be released per-iteration.
+- `defer` runs at function-return time, not at the end of a block. `defer` inside a `for` loop or inside an `if` that is entered many times accumulates work (and holds resources, as in the file-descriptor example above; a file descriptor is the number the OS gives each open file, and a process may only have a limited number open) until the whole function returns — extract a helper function when a resource must be released per-iteration.
 - Named results used only to avoid typing a type twice (not for a deferred mutation or documentation value) make a signature harder to read at a glance; use them when a defer needs to touch the result, not as a default style.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how results, variadics, closures, both `defer` rules, `panic` and `recover` behave, with tests for each. **Next is the advanced part**: how real servers recover panics per request, the production bugs around recover middleware and spawned goroutines, and compiler details like open-coded defers and `init()` order.
+
 
 - **Real systems:** `net/http`'s `Server` recovers a panicking handler per request by default (so one broken handler returns a 500-with-dropped-connection to that one client, not a crashed process).
 
@@ -615,14 +635,14 @@ The goroutine-panic and `os.Exit` behaviours from section 3 are process-level ef
   `database/sql`'s `Rows` and `*os.File` lean on the defer-named-result idiom internally to surface close errors without panicking.
 - **Failure modes → fixes:**
 	- A recover middleware that never logs the panic or its stack trace → always `log` or record `string(debug.Stack())` inside the recover branch; a silently swallowed panic is a production incident with no trail.
-	- A recover middleware that writes a response after the handler already wrote part of one → guard with `http.ResponseController` or a wrapping `ResponseWriter` that tracks whether headers were sent, and skip `WriteHeader` if so (writing twice logs "superfluous response.WriteHeader" and sends a mangled body).
+	- A recover middleware that writes a response after the handler already wrote part of one → guard with `http.ResponseController` or a wrapping `ResponseWriter` that tracks whether headers (the status line and metadata sent before the body) were sent, and skip `WriteHeader` if so (writing twice logs "superfluous response.WriteHeader" and sends a mangled body).
 	- A goroutine spawned per request panics with no recover of its own → the whole process dies, taking down every other in-flight request; always wrap goroutine bodies the handler spawns in their own `defer`+`recover`, or use `errgroup.Group` (recovers nothing by default, but centralises error handling — recover must still be explicit per goroutine).
 	- A library function calls `log.Fatal` on a recoverable error → it can never be recovered or tested by its caller, because the process exits before any caller's `defer` or `recover` runs; library code should return an `error` and let `main` decide whether a failure is fatal.
 - **What to monitor:** a panic-recovery counter and the recovered value/stack logged at `error` level per occurrence; a sudden rise points at a code path hitting a runtime fault (nil deref, index out of range) that `error` returns were not built to catch.
 
 ## 8. Deep dive 🔴
 
-- **Open-coded defers (Go 1.14+).** For a function with at most 8 `defer` statements, none of them inside a loop, the compiler inlines the deferred calls directly into the function's exit paths instead of pushing them onto a runtime-managed defer linked list.
+- **Open-coded defers (Go 1.14+).** For a function with at most 8 `defer` statements, none of them inside a loop, the compiler inlines the deferred calls directly into the function's exit paths instead of pushing them onto a runtime-managed defer linked list (a chain of records the runtime walks at return time).
 
   This made `defer` roughly as cheap as a direct call in the common case, removing the main historical reason to avoid `defer` on a hot path.
 
@@ -638,7 +658,7 @@ The goroutine-panic and `os.Exit` behaviours from section 3 are process-level ef
   The difference matters when passing a method somewhere that expects a plain function: a method value needs no receiver argument from the caller, a method expression does.
 - **`init()` ordering across files and packages.** Within one package, `init()` functions run in the order their files are compiled (alphabetical by filename for the same package, in practice — the spec guarantees only that each file's own inits run in the order they appear in that file).
 
-  Across packages, every imported package's `init()`s complete before the importing package's own run, transitively, following the import graph.
+  Across packages, every imported package's `init()`s complete before the importing package's own run, transitively (imports of imports too), following the import graph.
 
   A test suite or server that depends on side effects happening in a specific cross-file order is relying on an ordering the spec does not fully pin down — move that logic into an explicit, ordered setup function instead.
 
@@ -683,6 +703,30 @@ The goroutine-panic and `os.Exit` behaviours from section 3 are process-level ef
 - `panic` is for bugs and broken invariants; `error` is for expected failures. `recover()` only works called directly inside a deferred function, in the same goroutine that panicked.
 - A panic in a goroutine you spawned can only be recovered inside that same goroutine — give every spawned goroutine its own recover, or it takes the whole process down.
 - `os.Exit` and `log.Fatal` skip every pending `defer`; keep real cleanup out of code paths that call them.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- When does a deferred call run?
+> When the surrounding function returns, whether by `return`, reaching the end, or a panic.
+
+> [!question]- Three `defer` lines run in which order?
+> Reverse: the last one written runs first (LIFO).
+
+> [!question]- Should "user not found" use `panic` or return an `error`?
+> Return an `error`. `panic` is for bugs only.
+
+🟡 Medium
+
+> [!question]- `x := 1; defer fmt.Println(x); x = 10`. What prints?
+> `1`. The argument was frozen when the `defer` line ran.
+
+> [!question]- Your handler has `defer recover()` logic, but a goroutine it started panics. What happens?
+> The whole process crashes. `recover` only works in the same goroutine; the child needs its own `defer`+`recover`.
+
+> [!question]- Why does `defer f.Close()` inside a loop over 10,000 files cause trouble?
+> None of the closes run until the function ends, so up to 10,000 files stay open. Move the body into its own function so each file closes per turn.
 
 ## Links
 

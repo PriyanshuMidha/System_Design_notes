@@ -37,6 +37,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (keys, broker ordering, retries), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Queues vs Streams and Broker Comparison]]: a log is split into partitions, and each partition is read by one consumer per group.
+> - [[Delivery Semantics and Exactly-Once]]: brokers deliver at least once, so a message can arrive twice or late.
+> - [[Partitioning and Sharding]]: a hash of a key decides which bucket (partition) a piece of data goes to.
+
 **From zero, in 60 seconds** 🟢
 
 Events for one order happen in a set order: created, paid, shipped.
@@ -82,6 +87,10 @@ Usually only messages about the same thing (one account, one order) need to stay
 | Hash | A function turning a value into a number, same input same output | `hash("o-881") % 12 = 4` |
 | Consumer | A program reading and processing messages | The view updater |
 | Parallelism | Doing several things at the same time | 12 consumers, one per lane |
+| Projection | A read-only table a consumer builds from events | `orders_view` showing each order's status |
+| Version | A number on each event for one entity that goes up by 1 each change | `OrderPaid` is v2, `OrderShipped` is v3 |
+| Rebalance | A consumer group moving partitions between its members | A pod restarts, its partitions move |
+| DLQ | Dead letter queue: where messages that keep failing are parked | A broken `OrderPaid` waits there |
 
 **Picture it**
 
@@ -116,6 +125,8 @@ The topic has 12 partitions and the producer sends messages **without a key**, s
 - `OrderPaid` lands on partition 9, whose consumer is 2 seconds behind. It arrives later and sets the view back to "paid".
 - The customer now sees "paid" for an order that has already shipped, and nothing will ever correct it.
 
+**Real-life example.** On a food app like Swiggy, your order moves through "placed", "accepted", "picked up", "delivered". If the app's servers handled "picked up" after "delivered", your screen would jump backwards. Using the order id as the key keeps all four updates in one lane, in order, while millions of other orders flow through other lanes at the same time.
+
 The fix is to key by `order_id`: every event for `o-881` goes to one partition, is read by one consumer, in the order it was written. Twelve partitions still give twelve-way parallelism across different orders.
 
 **Why the view went wrong, step by step:**
@@ -147,6 +158,14 @@ Terms:
 - **Per-key ordering:** messages with the same key are processed in send order; messages with different keys have no defined order relative to each other.
 - **Sequence number / version:** a counter carried in each message so a consumer can detect gaps, duplicates and reordering.
 
+## Common beginner mistakes 🟢
+
+- **Sending messages without a key** → they are spread across partitions with no order between them → key by the entity whose order matters, such as `order_id`.
+- **Keying by something too broad, like `tenant_id`** → one big tenant becomes one overloaded partition → use the narrowest entity that needs order.
+- **Handing records to a shared worker pool after polling** → two goroutines can process v2 and v3 of one order at once → use per-key lanes: the same key always goes to the same goroutine.
+- **Adding partitions to a live keyed topic** → most keys move to a new partition and old events may be read after new ones → choose the count up front, or migrate to a new topic.
+- **Trusting timestamps from different machines for order** → clocks drift, so a later event can look earlier → use a version number from the owner of the entity.
+
 **The bank tellers, drawn:**
 
 ```mermaid
@@ -160,9 +179,18 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that order exists only inside one lane, and that a key keeps one entity's messages in one lane. **Next we open the box**: how a key becomes a lane number, which unit each broker orders by, and how retries quietly break order.
+
 ### Keys map entities to partitions, partitions map to consumers
 
 **In plain words:** a key is turned into a lane number, and each lane is read by one reader in a group. So one entity always goes to one reader.
+
+**Step by step:**
+1. The producer sends `OrderPaid` with key `o-881`.
+2. The key is hashed and divided by 12 partitions: `hash("o-881") % 12 = 4`. It goes to partition 4.
+3. Every later event for `o-881` also hashes to 4, so they line up behind it.
+4. In the consumer group, consumer A owns partition 4. It reads `o-881`'s events one after another, in offset order.
+5. Consumer B owns other partitions and handles `o-102` at the same time. Order per order, parallel across orders.
 
 ```mermaid
 flowchart LR
@@ -194,6 +222,12 @@ Within one consumer group, each partition is read by exactly one consumer, so `o
 
 **In plain words:** every broker keeps order only inside some small unit: a partition, a message group, or a single queue. The table names that unit for each one.
 
+**Step by step (reading the table for SQS FIFO):**
+1. The ordering unit is a message group. You pick it by setting `MessageGroupId`, say the account id.
+2. SQS hands out messages of account 42 one at a time: the next only after the previous is deleted.
+3. Account 43 is a different group, so its messages flow at the same time.
+4. So parallelism comes from having many groups. Read the other rows the same way: unit, how you choose it, limit.
+
 | Broker | Ordering unit | How you choose it | Parallelism limit |
 | --- | --- | --- | --- |
 | Kafka | Partition | Message key; `murmur2(key) % partitions` by default | At most one consumer per partition per group |
@@ -206,6 +240,13 @@ Within one consumer group, each partition is read by exactly one consumer, so `o
 ### How retries break order
 
 **In plain words:** if message 1 fails and goes off to be retried later, message 2 gets handled first. Order is gone unless you block or check versions.
+
+**Step by step:**
+1. `OrderPaid` (v2) fails because the database is briefly down. The consumer sends it to a retry topic to try again in 30 seconds.
+2. `OrderShipped` (v3) arrives next and succeeds. The view now says "shipped, v3".
+3. 30 seconds later v2 is retried. Without a check, it would set the view back to "paid".
+4. With a version check, the consumer sees v2 is older than the stored v3 and skips it.
+5. The other choice is to block: stop the whole partition until v2 succeeds, which keeps order but stalls everyone behind it.
 
 ```mermaid
 sequenceDiagram
@@ -422,17 +463,19 @@ WHERE orders_view.version < EXCLUDED.version;   -- stale or duplicate: 0 rows af
 | Per-key lanes inside a consumer | `hash(key) % N` goroutines per partition | Handler is slow (I/O) and one goroutine per partition is too few | Offset commits must wait for all lanes to finish up to that offset |
 | Order-tolerant consumer (versions) | Each event carries an entity version; apply only if newer | Always, as a second line of defence; required with retries | Producer must assign versions (row version, outbox sequence) |
 | Resequencing buffer | Consumer holds events until the gap is filled (v2 before v3) | Every event must be applied, in order (ledger deltas, not state snapshots) | Memory, a timeout for gaps that never fill |
-| Commutative design | Make operations order-independent (sets, counters, CRDTs) | You can redesign the data | Not every business rule commutes |
+| Commutative design | Make operations order-independent (sets, counters, CRDTs: data types built so updates in any order give the same result) | You can redesign the data | Not every business rule commutes |
 
 ## 6. Trade-offs and when not to use 🟡
 
 - **Order vs parallelism.** Parallelism is capped at the number of ordering units. A topic with 12 partitions cannot be processed by more than 12 consumers in one group. Choose the partition count for the peak throughput you expect, because changing it later remaps keys.
 - **Key choice decides load balance.** `customer_id` with one customer producing 30% of traffic puts 30% on one partition (see [[Hot Keys and Hot Partitions]]). Choose the narrowest key whose order you need: usually `order_id`, not `customer_id`, and never a constant.
 - **Adding partitions moves keys.** Going from 12 to 16 partitions changes `murmur2(key) % n` for most keys. Events for one order written before and after the change sit in different partitions, and the old ones may be read later. Drain or tolerate this with version checks, or create a new topic and migrate.
-- **Strict order means blocking on failure.** If one message for a key cannot be processed, either everything behind it waits (head-of-line blocking) or you skip it and break order. Decide per stream.
+- **Strict order means blocking on failure.** If one message for a key cannot be processed, either everything behind it waits (**head-of-line blocking**: one stuck message holding up all behind it) or you skip it and break order. Decide per stream.
 - **When not to care:** independent commands (send this email), idempotent snapshots where the latest wins anyway, and analytics aggregated by time windows. Using a key there only creates hot spots.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how keys map to lanes, how each broker orders, and how retries and worker pools break order, plus Go code for per-key lanes and version checks. **Next is the advanced part**: what real systems key by, the quiet ways order breaks in production, and how to handle versions, delta events and hot keys.
 
 - **Real systems:**
 	- Kafka topics keyed by entity ID (order, account, device), with consumers that check entity versions.
@@ -453,7 +496,7 @@ WHERE orders_view.version < EXCLUDED.version;   -- stale or duplicate: 0 rows af
 
 ## 8. Deep dive 🔴
 
-- **Where versions come from.** The best source is the database row that changed: a `version` column incremented on each update (also used for optimistic locking), or the outbox table's sequence per aggregate. Wall-clock timestamps from different machines are not safe for ordering because clocks drift (see [[Clocks and Ordering]]).
+- **Where versions come from.** The best source is the database row that changed: a `version` column incremented on each update (also used for **optimistic locking**: an update succeeds only if the version is still the one you read), or the outbox table's sequence per aggregate. Wall-clock timestamps from different machines are not safe for ordering because clocks drift (see [[Clocks and Ordering]]).
 - **State events vs delta events.** If each event carries the full new state ("status = shipped, version 3"), consumers can skip stale ones: the latest wins.
   If events carry changes ("add 500 to balance"), a skipped event is lost money.
   Delta streams need gap detection: if the last applied version is 7 and 9 arrives, hold 9 until 8 arrives (resequencing), or fetch the current state from the source.
@@ -494,7 +537,7 @@ flowchart LR
 > Clocks on different machines drift and can go backwards, so a later event can carry an earlier timestamp. Use a version or sequence assigned by the single owner of the entity, such as a row version or an outbox sequence.
 
 > [!question]- How do you pick a partition key?
-> The narrowest entity whose events must stay ordered (order ID, account ID), with high cardinality and no dominant value. Check the traffic share of the top keys; if one key is a large fraction of traffic, split it or isolate it.
+> The narrowest entity whose events must stay ordered (order ID, account ID), with high cardinality (many different values) and no dominant value. Check the traffic share of the top keys; if one key is a large fraction of traffic, split it or isolate it.
 
 ## 10. Cheat sheet 🟢
 
@@ -505,6 +548,30 @@ flowchart LR
 - Always version-check on write: `WHERE version < $new`.
 - State events tolerate skips; delta events need gap detection.
 - Hot key = hot partition; adding partitions does not fix it.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Does Kafka keep order across a whole topic?
+> No, only inside one partition.
+
+> [!question]- Why key messages by `order_id`?
+> So every event for one order goes to the same partition and is processed in order.
+
+> [!question]- With 12 partitions, at most how many consumers in one group do useful work?
+> 12.
+
+🟡 Medium
+
+> [!question]- v3 is applied, then a retried v2 arrives. What should the consumer do?
+> Skip it, because its version is older than the stored one.
+
+> [!question]- Why does going from 12 to 16 partitions break order?
+> `hash % 16` sends most keys to a different partition, so old and new events for one key sit in different lanes.
+
+> [!question]- Why do delta events ("add 500") need more care than state events?
+> A skipped delta loses data, so the consumer must detect gaps and wait for missing versions.
 
 ## Links
 

@@ -29,6 +29,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Document Ingestion and Chunking]]: documents are cut ahead of time into small labelled pieces (chunks) with source, page and tenant.
+> - [[Embeddings]]: each chunk and each question becomes a list of numbers, and similar meanings sit close together.
+> - [[Vector Databases and ANN Indexes]]: a vector store finds the closest chunks fast and can filter by fields like `tenant_id`.
+
 **From zero, in 60 seconds** 🟢
 
 An AI model only knows what it read during training. It does not know your company's refund policy or your latest docs.
@@ -73,6 +78,11 @@ RAG fixes this: first search your own documents for the right paragraph, then ha
 | Retrieve / top-k | Fetch the k most relevant chunks | The best 5 chunks |
 | Context window | How much text the model can read in one call | Many thousand tokens |
 | Citation | Naming the source the answer came from | "[policy.pdf, p. 3]" |
+| Grounded | Every claim in the answer is backed by a retrieved chunk | "30 days" appears in the policy chunk |
+| Reranker | A slower, more careful model that re-orders the top results | 20 candidates → best 5 |
+| Token budget | The most tokens you allow for the pasted chunks | 3,000 tokens of context |
+| Fine-tuning | Training the model more on your own examples | Teaching it a reply style |
+| Tenant | One customer company whose data must stay separate | acme vs globex |
 
 **Picture it**
 
@@ -101,7 +111,7 @@ Where it breaks: a student can flip through the whole book, while RAG only sees 
 
 An LLM's knowledge comes from training data with a cutoff date, and it knows nothing about your company's internal wiki, your customer's account history, or a product manual published last week.
 
-Fine-tuning a model on that data is slow to update and does not reliably teach it to cite specific facts. RAG instead keeps the model frozen and searches your data at answer time, so:
+Fine-tuning a model on that data is slow to update and does not reliably teach it to cite specific facts. RAG instead keeps the model frozen (unchanged; nobody retrains it) and searches your data at answer time, so:
 
 - Private and fast-changing data (an internal runbook updated this morning) is usable immediately — no retraining.
 - Answers can cite the exact source document and page, which fine-tuning cannot give you.
@@ -109,13 +119,39 @@ Fine-tuning a model on that data is slow to update and does not reliably teach i
 
 Concretely: a user asks "what's our refund policy for digital goods?" Without RAG, the model either refuses or invents a plausible-sounding but wrong policy. With RAG, the pipeline retrieves the actual refund-policy paragraph from the company's documents and the model answers from it, citing the source.
 
+### Real-life example 🟢
+
+Think of the help bot in a food delivery app like Zomato. A user asks "can I cancel after the restaurant accepts my order?".
+The model alone does not know Zomato's current cancellation rules, so it would guess.
+With RAG, the app searches the help-centre chunks, finds the "Cancellation policy" paragraph updated last week, pastes it into the prompt, and the model answers from it with a "Source: Cancellation policy" link.
+If no chunk matches well, the bot says it is not sure and offers a human agent.
+
+### Common beginner mistakes 🟢
+
+- **Blaming the model first** → most wrong answers come from the wrong chunks being fetched → log the retrieved chunks and check them before touching the prompt.
+- **Embedding the question with a different model than the documents** → the vectors do not line up, and results are nearly random → use the same model and version on both sides.
+- **Filtering by permission after the model answers** → the model already read the other customer's text → pass the tenant filter into the search itself.
+- **Always returning top-k, even weak matches** → noise in the prompt leads to made-up answers → set a score threshold and let the bot say "I don't know".
+- **Sending a follow-up like "what about last year?" as is** → it has no searchable meaning on its own → rewrite it with the chat history into a full question first.
+
 ## 2. Mental model 🟢
 
 RAG is an open-book exam instead of a closed-book one. A closed-book exam (asking the raw LLM) tests only what the model memorized. An open-book exam lets it look up the relevant page first — but only if it knows which page to open.
 
 The indexing pipeline is building the book's index ahead of time (see [[Document Ingestion and Chunking]]); the query pipeline is the "look up the index, read the matching pages, then answer" step done at question time.
 
+### RAG vs the things people confuse it with 🟡
+
+| Approach | How it adds knowledge | Best for |
+| --- | --- | --- |
+| RAG | Searches your documents per question and pastes the best chunks in | Private or fast-changing facts, with citations |
+| Fine-tuning | Changes the model's own learned numbers | A steady style or format; poor at fresh facts |
+| Long context | Pastes the whole (small) document set every time | A few small, stable documents |
+| Tool calling | The model asks your code to look up an exact value | Live structured data, like an order status |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that RAG is an open-book exam: search your own documents, then answer from what was found, with sources. **Next we open the box**: every step of the question-time pipeline, the dials that control what gets found, and what a good answer must contain. The numbered walk below is the plain version; the diagrams and knob lists are the full detail.
 
 **In plain words:** Clean up the question, search, sort the best results to the top, fit them into the prompt, then let the model answer and cite.
 
@@ -144,7 +180,7 @@ Walking the query pipeline:
 1. **Condense.** In a multi-turn chat, "what about last year?" only makes sense with the prior turns. Rewrite it into a standalone query ("what was the refund policy last year?") before embedding — otherwise the embedding captures none of the missing context and retrieval misses.
 2. **Embed the question** with the same model (and version) used to embed the documents (see [[Embeddings]]). A mismatched model puts the query vector in an incompatible space and retrieval returns near-random results.
 3. **Retrieve** the top-k nearest chunks from the vector store (see [[Vector Databases and ANN Indexes]]), filtered to the asking user's tenant and permissions at query time — never after.
-4. **Rerank and filter.** Apply a score threshold to drop weak matches, metadata filters (date range, document type), and optionally a cross-encoder reranker that re-scores the top candidates more precisely than the initial vector search.
+4. **Rerank and filter.** Apply a score threshold to drop weak matches, metadata filters (date range, document type), and optionally a cross-encoder reranker (a model that reads the question and one chunk together and scores how well they match) that re-scores the top candidates more precisely than the initial vector search.
 5. **Assemble the prompt**, ordering chunks by relevance, labelling each with its source, and stopping once the context token budget is used — not every candidate chunk fits.
 6. **Generate.** Call the LLM with an instruction to answer only from the given context and to say so when the context is insufficient.
 7. **Verify citations.** Check that cited source names actually appear among the retrieved chunks (a cheap guard against hallucinated citations) before returning the answer.
@@ -174,6 +210,15 @@ sequenceDiagram
 
 **In plain words:** These are the dials for search: how many results to fetch, how good a match must be, and who may see what.
 
+**Step by step:**
+1. Ask the vector store for the top 30 chunks (top-k = 30), already filtered to `tenant = acme`.
+2. Drop any chunk scoring under, say, 0.5 similarity. 22 are left.
+3. If 4 of them are near copies of the same paragraph, MMR keeps one and lets other topics in.
+4. Rerank the rest and keep the best 5.
+5. If nothing passes the threshold, return no chunks, so the model can say "I don't know".
+
+Full detail:
+
 - **top-k:** how many chunks the initial vector search returns before reranking — commonly 10–50, cut down to 3–8 after reranking.
 - **Score threshold:** drop chunks below a minimum similarity score rather than always returning k results, so a question with no good match returns nothing instead of noise.
 - **Metadata filters:** restrict by tenant, document type, date range, or permission — applied at the store, not after.
@@ -187,6 +232,15 @@ flowchart LR
 ### What a good answer includes
 
 **In plain words:** A good answer is like a good school essay: answers the question, shows sources, admits when it does not know.
+
+**Step by step:**
+1. Question: "What's the refund window for digital goods?"
+2. Answer the question directly first: "14 days from purchase."
+3. Add the source for that claim: "[refund-policy.pdf, p. 3]".
+4. If two chunks disagree (an old and a new policy), say so instead of picking one silently.
+5. Code checks that "refund-policy.pdf" really was one of the retrieved chunks before showing the answer.
+
+Full detail:
 
 - A direct answer to the question.
 - The source file, page, or URL for each claim.
@@ -472,7 +526,7 @@ func TestGenerator_CallsMessagesAPI(t *testing.T) {
 | Single-pass RAG (this note) | Embed query once, retrieve once, generate once | Straightforward factual Q&A over a stable corpus | One retrieval round-trip, one LLM call |
 | Conversational RAG | Condense chat history into a standalone query first | Multi-turn chat referring to earlier turns ("what about last year?") | One extra, cheap condensation call |
 | Query rewriting / HyDE | Rewrite or expand the query (or generate a hypothetical answer to embed) before retrieving | The raw question embeds poorly or is too short | Extra LLM/embedding call before retrieval |
-| Agentic / corrective RAG | The model decides whether to retrieve, re-retrieve, or try a different query if results look weak | Harder questions where one retrieval pass isn't reliable | More LLM calls, more latency, more control |
+| Agentic / corrective RAG (the model checks its own search results and tries again if they look weak) | The model decides whether to retrieve, re-retrieve, or try a different query if results look weak | Harder questions where one retrieval pass isn't reliable | More LLM calls, more latency, more control |
 | Long context, no retrieval | Put the whole (small) corpus directly in the prompt | A small, static document set that fits the model's context window | No pipeline, but no retrieval filtering either, and pays for the same tokens on every call |
 
 Query rewriting/HyDE, routing between corpora, self-query metadata filters, contextual retrieval, GraphRAG, and agentic/corrective RAG are covered in depth in [[Advanced RAG Patterns]].
@@ -492,6 +546,8 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** each step of the query pipeline, the search dials, and what a good answer contains. **Next comes the senior view**: how RAG fails in real systems and how to fix each failure, the latency of each stage, when long context beats retrieval, and why permission filters and untrusted documents are security issues.
+
 - **Real systems:** customer-support knowledge assistants (retrieve from a help-center corpus); internal company-wiki Q&A bots; code-search assistants that retrieve relevant source files before answering a question about a codebase.
 - **Failure modes → fixes:**
   - **Miss** (the right chunk exists but wasn't retrieved) → widen top-k, add hybrid keyword+vector search (see [[Keyword, Semantic and Hybrid Search]]), or fix chunking.
@@ -500,7 +556,7 @@ flowchart LR
   - **Context overflow** → tighten the token budget in prompt assembly, or summarize lower-priority chunks instead of dropping them outright.
   - **Ignored context** (LLM answers from memory instead of the given chunks) → make the system prompt's instruction explicit and verify citations against retrieved sources.
   - **Hallucinated citation** (cites a source that wasn't actually retrieved) → the citation-check step in this note's pipeline catches this before the answer reaches the user.
-- **What to monitor:** retrieval latency and end-to-end latency per stage, empty-result rate, citation-verification failure rate, and (from [[RAG Evaluation]]) recall@k and groundedness on a golden query set. Trace each stage with [[Distributed Tracing with OpenTelemetry]] so a slow answer can be attributed to retrieval vs. generation.
+- **What to monitor:** retrieval latency and end-to-end latency per stage, empty-result rate, citation-verification failure rate, and (from [[RAG Evaluation]]) recall@k (did the right chunk appear in the top k) and groundedness (is every claim backed by a chunk) on a golden query set (fixed test questions with known right answers). Trace each stage with [[Distributed Tracing with OpenTelemetry]] so a slow answer can be attributed to retrieval vs. generation.
 
 ## 8. Deep dive 🔴
 
@@ -556,6 +612,26 @@ flowchart LR
 - A good answer cites sources and says "I don't know" when context is thin.
 - Long context can replace RAG for a small, static corpus; it cannot replace it for a large or frequently-changing one.
 - RAG reduces hallucination; it does not eliminate it — verify citations.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: What does RAG stand for, in plain words?
+> Search your documents first, then let the model write the answer from what it found.
+
+> [!question]- Easy: Why can't the model alone answer questions about your refund policy?
+> It only knows its training text, which never included your private, current policy.
+
+> [!question]- Easy: What should a good RAG answer include?
+> A direct answer, a source for each claim, and "I don't know" when nothing matched.
+
+> [!question]- Medium: An answer is wrong. What do you check first?
+> The retrieved chunks for that question; bad retrieval gives bad answers even with a strong model.
+
+> [!question]- Medium: Why filter by tenant inside the search, not after?
+> After is too late: the model has already read the other tenant's text.
+
+> [!question]- Medium: When is long context better than RAG?
+> When the corpus is small, rarely changes, and fits easily in the context window.
 
 ## Links 🟢
 

@@ -43,6 +43,10 @@ The controller calls the use case; the use case calls the entity to enforce inva
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Layered Architecture]]: code split into handler, service and repository layers, where each layer calls the one below it. Clean Architecture keeps the idea of layers but changes which way they point.
+> - [[Hexagonal Architecture (Ports and Adapters)]]: the core declares interfaces (ports) and outside code (adapters) implements them. Clean Architecture is the same trick with more named rings.
+
 **From zero, in 60 seconds** 🟢
 
 Picture your code as rings, like an onion.
@@ -80,6 +84,13 @@ Clean Architecture puts the rules in the middle, where both can reach them.
 | Port | An interface the inner code declares for what it needs | `usecase.Repo` |
 | DTO | A plain data struct for crossing a boundary | `CreateInvoiceInput{Amount: 500}` |
 | Presenter | Code that turns a use case result into output | Writes JSON and a 201 status |
+| Dependency Rule | Imports may only point inward, toward the center | `usecase` imports `domain`, never `adapter/http` |
+| Interactor | Another name for a use case object with one `Execute` method | `usecase.CreateInvoice` |
+| Input port | The way into a use case: its `Execute` method and input struct | `Execute(ctx, CreateInvoiceInput, out)` |
+| Output port | An interface the use case calls to report its result | `CreateInvoicePresenter` |
+| Invariant | A rule about an object that must always be true | "amount is above zero" |
+| Sentinel error | A fixed, named error value other code compares against | `domain.ErrInvalidAmount` |
+| Composition root | The one place that builds every real object and plugs them together | `cmd.Wire()` |
 
 **Picture it**
 
@@ -107,13 +118,17 @@ Where it breaks: onion layers do not talk; here outer rings call inward and inne
 
 ## 1. Why it exists 🟢
 
-A `CreateInvoice` handler that builds a `*sql.Invoice` struct straight from `r.Body`, inserts it, and serializes the same struct back as JSON works fine until three things happen at once, which they eventually do: the API needs a field the database doesn't have yet (a computed due-date label), a second entry point (an internal gRPC call from the reminders worker) needs to create invoices too, and the business rule "an invoice amount must be positive" needs to be enforced regardless of which entry point created it.
+🟢 **Plain version:** At first one HTTP handler reads the request, saves it to the database and sends it back. Then a second way in appears, like a nightly worker that also creates invoices. Now the rule "amount must be above zero" must live in two places, or it gets forgotten in one. Clean Architecture gives that rule one home in the middle, and every way in (web, worker, test) calls the same code to reach it.
 
-Without a boundary, that rule either gets duplicated in both entry points or gets left in the database as a `CHECK` constraint that only produces a confusing SQL error instead of a clean validation message.
+A `CreateInvoice` handler that builds a `*sql.Invoice` struct straight from `r.Body`, inserts it, and **serializes** (turns into JSON text) the same struct back works fine until three things happen at once, which they eventually do: the API needs a field the database doesn't have yet (a computed due-date label), a second entry point (an internal **gRPC** call, a fast way for one service to call another over the network, from the reminders worker) needs to create invoices too, and the business rule "an invoice amount must be positive" needs to be enforced regardless of which entry point created it.
+
+Without a boundary, that rule either gets duplicated in both entry points or gets left in the database as a `CHECK` constraint (a rule the database itself checks on every row) that only produces a confusing SQL error instead of a clean validation message.
 
 Clean Architecture's answer is structural: put the rule inside an **entity** that cannot be constructed in an invalid state (`domain.NewInvoice` returns an error instead of letting a bad `Invoice` exist), put the operation inside a **use case** that any entry point can call the same way, and make every entry point (HTTP, gRPC, a test) talk to the use case through the same input and output boundary — never by reaching into the entity's internals or the database row's shape directly.
 
 ## 2. Mental model 🟢
+
+🟢 **Plain version:** Draw four circles inside each other. The middle circle knows nothing about the circles around it. Code in an outer circle may use code in an inner circle, never the other way. The two inner circles split the business rules in two: rules true for any invoice anywhere (the middle), and rules about how this one app works (the next ring).
 
 Four rings, drawn as circles, not a stack: **entities** in the center, **use cases** around them, **interface adapters** around that, **frameworks & drivers** on the outside. The rule is not "upper calls lower" (that's [[Layered Architecture]]'s mental model) — it's "nothing inside may know an outside ring exists."
 
@@ -134,7 +149,24 @@ flowchart TB
     end
 ```
 
+### Real-life example 🟢
+
+Think of a ticket app like BookMyShow. The rule "a seat can be booked by only one person per show" is true whether the booking comes from the phone app, the website, or a cinema's box-office counter.
+In Clean Architecture that rule sits in the middle as an entity rule. "Book seats" is a use case every channel calls.
+The phone app's API, the website and the counter system are just different adapters on the outside.
+If the company later adds booking via WhatsApp chat, it writes one new adapter. The seat rule and the "book seats" use case do not change.
+
+## Common beginner mistakes 🟢
+
+- **Returning the `domain.Invoice` straight to the HTTP layer** → the web code now depends on the entity's shape, and JSON leaks into the core → hand back a plain output struct (`InvoiceOutput`).
+- **Putting JSON tags or `http.Request` in the use case** → the use case now imports the web framework, which breaks the Dependency Rule → convert to a plain input struct in the controller.
+- **Choosing HTTP status codes inside the use case** → a gRPC or worker caller gets HTTP ideas it can't use → return a business error; let the presenter map it to 400 or 404.
+- **Using four rings for a two-endpoint tool** → lots of extra files for no gain → start with [[Layered Architecture]] and grow into rings when a second use case or adapter really appears.
+- **Adding a field to the entity because the database added a column** → the arrow now points the wrong way → map the column in the adapter; add it to the entity only if it is a real business rule.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the four rings and the one rule: imports only point inward. **Next we open the box**: how data and errors cross a ring without breaking that rule, and which Go folder each ring lives in. Each subsection starts with a short step-by-step walk.
 
 ```mermaid
 flowchart TD
@@ -173,6 +205,15 @@ The dashed "implements" arrows are the Dependency Rule made visible: `adapter/po
 
 **In plain words: the use case says what it needs as interfaces, and data crosses rings as plain structs.**
 
+**Step by step:**
+1. A request arrives: `POST /invoices` with `{"client_id": "c1", "amount": 500}`.
+2. The controller turns it into `CreateInvoiceInput{ClientID: "c1", Amount: 500}`. No JSON tags, no HTTP types.
+3. It calls `createInvoice.Execute(ctx, input, presenter)`. That is the **input port**.
+4. The use case builds the invoice, saves it through `Repo`, and then calls `presenter.PresentCreated(output)`. That is the **output port**.
+5. `output` is a plain `InvoiceOutput` struct, never the `domain.Invoice` itself.
+
+Full detail:
+
 A use case is called through an **input port** — in Go, simply its exported `Execute` method, taking a plain input struct with no JSON tags and no framework type in sight.
 
 It reports its result through an **output port** — an interface the use case declares (`CreateInvoicePresenter` below), implemented by whichever adapter actually needs the result (a JSON presenter, a template renderer, a test's recording fake).
@@ -183,13 +224,35 @@ The use case never returns a `domain.Invoice` directly to its caller, and never 
 
 **In plain words: inner rings return business errors; the outer ring turns them into HTTP codes.**
 
-A `domain.ErrInvalidAmount` means nothing to an HTTP client; it needs to become a 400. A `postgres.ErrNotFound` needs to become a 404. That translation happens in exactly one place — the presenter, in `adapter/http` — using `errors.Is` against the domain and adapter packages' exported sentinel errors.
+**Step by step:**
+1. Someone sends amount 0. `domain.NewInvoice` returns `ErrInvalidAmount`.
+2. The use case does not look at it. It just calls `out.PresentError(err)`.
+3. The HTTP presenter checks it: "is it `ErrInvalidAmount`?" Yes, so it writes status 400.
+4. A missing invoice gives `postgres.ErrNotFound`; the same presenter writes 404.
+
+```mermaid
+flowchart LR
+    D["domain: ErrInvalidAmount"] --> U["use case: PresentError(err)"]
+    U --> P{"HTTP presenter"}
+    P -- "invalid amount" --> S400["400 Bad Request"]
+    P -- "not found" --> S404["404 Not Found"]
+```
+
+Full detail:
+
+A `domain.ErrInvalidAmount` means nothing to an HTTP client; it needs to become a 400. A `postgres.ErrNotFound` needs to become a 404. That translation happens in exactly one place — the presenter, in `adapter/http` — using `errors.Is` (Go's check "is this error, or anything it wraps, that exact one?") against the domain and adapter packages' exported **sentinel errors** (fixed, named error values like `ErrNotFound`).
 
 The use case itself never imports `net/http`, so it cannot (and must not) decide what status code anything maps to; it only ever calls `PresentError(err)` and lets the ring outside it decide what that means in that ring's vocabulary.
 
 ### Go layout
 
 **In plain words: which folder each ring goes into.**
+
+**Step by step:**
+1. `domain/`: the `Invoice` type and its rules. Imports nothing from this project.
+2. `usecase/`: `CreateInvoice`, `PayInvoice` and the interfaces they need. Imports only `domain`.
+3. `adapter/http/` and `adapter/postgres/`: the web code and the storage code. They import `usecase`.
+4. `cmd/`: builds everything and plugs it together. The only place that imports all of the above.
 
 ```text
 clean/
@@ -378,7 +441,9 @@ func (uc *CreateInvoice) Execute(ctx context.Context, in CreateInvoiceInput, out
 }
 ```
 
-A second interactor, `PayInvoice`, sharing the same `Repo` port and demonstrating idempotent handling of a domain rule (`ErrAlreadyPaid`):
+A second interactor, `PayInvoice`, sharing the same `Repo` port and demonstrating **idempotent** handling (safe to run twice: the second call changes nothing and still reports success) of a domain rule (`ErrAlreadyPaid`):
+
+**What this code does, in plain words:** it loads the invoice, tries to mark it paid, and if it was already paid it just reports "paid" again instead of an error.
 
 ```go
 package usecase
@@ -478,6 +543,8 @@ func (r *Repo) ByID(ctx context.Context, id string) (domain.Invoice, error) {
 ```
 
 And the HTTP adapter — a controller that decodes requests into input DTOs, and a presenter that is the one place mapping domain/adapter errors onto HTTP status codes happens:
+
+**What this code does, in plain words:** the controller reads the JSON body, copies it into a plain input struct and calls the use case. The presenter receives the result and writes the JSON reply with the right status code (201, 400, 404 and so on).
 
 ```go
 // Package http is the interface-adapters ring's driving side: it translates
@@ -723,10 +790,10 @@ func TestCreateInvoice_Concurrent(t *testing.T) {
 
 ## 6. Trade-offs and when not to use 🟡
 
-- Mapping boilerplate compounds: an input DTO, a domain call, an output DTO, and a presenter implementation exist for every single use case, even a trivial one. A `GetInvoice` read-only lookup pays nearly the same ceremony tax as `PayInvoice`.
+- Mapping **boilerplate** (repeated, low-value glue code) compounds: an input DTO, a domain call, an output DTO, and a presenter implementation exist for every single use case, even a trivial one. A `GetInvoice` read-only lookup pays nearly the same ceremony tax as `PayInvoice`.
 - Over-engineering a small CRUD service is the single most common misuse: a two-endpoint internal tool rarely needs four named rings and a presenter interface per operation — [[Layered Architecture]] or even a flat package does the same job with far less code.
 - Go-idiom tension: Go favors small, locally-defined interfaces and direct returns (`(Invoice, error)`), while Clean Architecture as originally described (in a Java/C# world) favors an explicit presenter callback instead of a return value. Go code following this pattern often feels more ceremonial than idiomatic Go elsewhere in the same codebase — a deliberate trade for the isolation this buys, not a sign something's wrong.
-- Letting an ORM model or a request struct leak into `usecase` or `domain` — even "just this once," even just as a method parameter type — defeats the entire pattern. The Dependency Rule has no partial-credit version.
+- Letting an **ORM** model (a struct a database-mapping library generates for a table) or a request struct leak into `usecase` or `domain` — even "just this once," even just as a method parameter type — defeats the entire pattern. The Dependency Rule has no partial-credit version.
 
 ```mermaid
 flowchart TD
@@ -735,6 +802,9 @@ flowchart TD
 ```
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how data, errors and folders follow the inward rule in real Go code. **Next is the senior view**: how teams break the rule by accident, how to catch that with tools, whether the extra code is worth it in Go, and how it differs exactly from hexagonal and onion.
+
 
 - **Real systems:** this is the standard reference architecture cited across the Go, Java, and .NET ecosystems whenever a team wants to isolate business logic from a specific framework version or ORM; InvoiceOps uses the same ring structure for its payment and invoicing core (see [[Capstone - InvoiceOps]]).
 - **Failure modes → fixes:**
@@ -789,6 +859,26 @@ flowchart TD
 - Error mapping (domain error → HTTP status) happens in exactly one place: the adapter, via `errors.Is` against exported sentinel errors.
 - Same mechanics as hexagonal and onion; Clean Architecture is the most prescriptive about naming and boundary DTOs.
 - Don't reach for it below one or two use cases and one storage engine — start layered, grow into rings when a second use case or delivery mechanism actually shows up.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) Name the four rings, from the center out.
+> Entities, use cases, interface adapters, frameworks and drivers.
+
+> [!question]- (easy) May `usecase` import `adapter/postgres`?
+> No. Imports only point inward; the Postgres adapter imports `usecase`, not the other way.
+
+> [!question]- (easy) Where does "amount must be above zero" live?
+> In the entity: `domain.NewInvoice` refuses to build an invoice with amount 0 or less.
+
+> [!question]- (medium) Why does the use case hand back `InvoiceOutput` instead of `domain.Invoice`?
+> So outer code never depends on the entity's shape; only plain data crosses the ring.
+
+> [!question]- (medium) Where is `ErrInvalidAmount` turned into HTTP 400, and why there?
+> In the HTTP presenter. Only that ring knows what HTTP is; a gRPC adapter would map the same error its own way.
+
+> [!question]- (medium) How is Clean Architecture different from hexagonal?
+> Same inward-pointing idea, but Clean names two inner rings (entities, use cases) and requires DTOs and presenters at every use-case boundary.
 
 ## Links 🟢
 - **Before this:** [[Hexagonal Architecture (Ports and Adapters)]]

@@ -49,6 +49,9 @@ Billing stays free to add a `partially_paid` status tomorrow without Accounting'
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Architecture Fundamentals - Coupling, Cohesion and Dependency Direction]]: two packages are "coupled" when a change in one forces a change in the other, and imports should point one way only. Here the same idea is applied to whole business areas.
+
 **From zero, in 60 seconds** 🟢
 
 In a big business, the same word means different things to different teams.
@@ -86,6 +89,11 @@ Strategic DDD says: these are two models, give each its own boundary.
 | Ubiquitous language | Shared words used by experts and code alike | "overdue" means the same in chat and code |
 | Upstream / downstream | Who supplies data and who depends on it | Billing upstream, Accounting downstream |
 | Anticorruption layer (ACL) | A translator that protects one model from another | Paid invoice becomes a `LedgerEntry` |
+| Mutable / immutable | Can still be changed / can never be changed once written | Billing invoice / Accounting ledger entry |
+| Core / supporting / generic subdomain | Makes you win / needed but not special / every company has it | Invoicing / reports / login |
+| Context map | A drawing of how bounded contexts relate and who has the power | Billing → (ACL) → Accounting |
+| Domain event | A fact, in business words, that something happened | "Invoice Paid" |
+| EventStorming | A sticky-note workshop to list business events in order | Orange notes on a wall |
 
 **Picture it**
 
@@ -110,9 +118,11 @@ Where it breaks: countries rarely redraw borders; bounded contexts get split and
 
 ## 1. Why it exists 🟢
 
-A single shared `Invoice` type, used by every team and every context in a growing company, accumulates fields for every context's needs: a `discount_reason` field Sales needs, a `gl_account` field Accounting needs, a `dunning_level` field Collections needs.
+🟢 **Plain version:** When every team shares one `Invoice` type, each team adds its own fields to it. Soon nobody dares to change it, because some other team might break. Strategic DDD says: let each team keep its own version of "invoice", with only the fields and rules it needs. Where two teams' data meets, translate between them.
 
-Every team is afraid to change it because every other team also depends on it, so it grows forever and nobody owns it cleanly — the classic anemic, bloated domain model that forms around one "God object" shared by an entire company.
+A single shared `Invoice` type, used by every team and every context in a growing company, accumulates fields for every context's needs: a `discount_reason` field Sales needs, a `gl_account` field (which accounting bucket the money is filed under) Accounting needs, a `dunning_level` field (how far along the "chase the late payer" reminders are) Collections needs.
+
+Every team is afraid to change it because every other team also depends on it, so it grows forever and nobody owns it cleanly — the classic **anemic** (plain data, no rules inside), bloated domain model that forms around one **"God object"** (one type everybody uses for everything) shared by an entire company.
 
 Strategic DDD's answer is not "one correct model" but "as many models as there are genuinely distinct ways of thinking about the business, each kept inside its own boundary".
 
@@ -126,19 +136,43 @@ A context map is the diplomatic relations between those countries: who is upstre
 
 The key discipline: **the language changes at the boundary, and that's fine.** A word crossing a context boundary is expected to be translated, not preserved. Trying to keep one universal vocabulary company-wide is what produces the bloated shared model in the first place.
 
+### Real-life example 🟢
+
+Take a food-delivery app like Swiggy. To the restaurant team, an "order" is a list of dishes to cook and a pickup time.
+To the delivery team, the same "order" is a pickup address, a drop address and a rider.
+To the payments team, it is an amount, a payment method and a refund status.
+If all three teams shared one giant `Order` type, every change would need all three teams to agree. With bounded contexts, each team keeps its own `Order`, and a small translator passes only what the next team needs (say, "order 123 is ready for pickup at 7:40").
+
+## Common beginner mistakes 🟢
+
+- **Trying to make one perfect `Invoice` type for the whole company** → it bloats and nobody can change it safely → let each context have its own model and translate at the edges.
+- **Thinking "same word, different meaning" is a naming bug** → you rename things and still share one muddled type → accept it; each context's meaning is right inside its own boundary.
+- **Making every bounded context its own microservice on day one** → you pay network and deploy costs with no gain → start as packages in one program (a modular monolith).
+- **Drawing boundaries from the org chart alone** → teams end up fighting over one model → find the seams where the business words actually change, ideally in an EventStorming session.
+- **Putting domain types in a company-wide `shared` package** → every context is now tied to every other → share only a tiny, jointly owned piece (like `Money`), or nothing.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that one word can mean different things in different parts of a business, and that each part gets its own model. **Next we open the box**: how to rank parts of the business, how to draw a boundary, how to name the relationship between two boundaries, and how teams find them.
 
 ### 3.1 Subdomains: where to spend effort
 
 **In plain words: rank business areas: the core that makes you money, the support work, and the generic stuff you can buy.**
 
+**Step by step:**
+1. List the parts of InvoiceOps: invoices and payments, reminder emails, reports, login.
+2. Ask "is this why customers pay us?" Invoices and payments: yes. That is the **core**.
+3. Ask "is it ours, but not special?" Reminder templates and reports. That is **supporting**.
+4. Ask "does every company have this?" Login, file storage, email delivery. That is **generic**: buy or reuse it.
+5. Put your best people on the core.
+
 Before drawing any boundaries, DDD asks you to rank parts of the business by how much competitive value they create:
 
-- **Core domain** — what makes this company win. For InvoiceOps (an invoicing SaaS), that's the invoice lifecycle and payment reconciliation: the thing customers actually pay for. Gets your best engineers and the most careful modeling.
+- **Core domain** — what makes this company win. For InvoiceOps (an invoicing SaaS), that's the invoice lifecycle and **payment reconciliation** (matching money that arrived against the invoices it pays): the thing customers actually pay for. Gets your best engineers and the most careful modeling.
 - **Supporting subdomain** — necessary, specific to this business, but not the differentiator. Notification templating, report generation. Built well, but not over-invested in.
 - **Generic subdomain** — solved problems every company has: authentication, file storage, email delivery. Buy or use an off-the-shelf library/service; don't reinvent it.
 
-This ranking is a business judgment, not a technical one, and it changes over time — what's generic for one company can be core for another (identity is generic for InvoiceOps, but it's the entire core domain for an IdP vendor).
+This ranking is a business judgment, not a technical one, and it changes over time — what's generic for one company can be core for another (identity is generic for InvoiceOps, but it's the entire core domain for an **IdP** vendor, a company that sells login and identity as its product).
 
 ```mermaid
 flowchart LR
@@ -146,6 +180,12 @@ flowchart LR
 ```
 
 ### 3.2 Bounded context
+
+**Step by step:**
+1. Billing says: "an invoice can be edited or cancelled until it is paid".
+2. Accounting says: "an invoice entry is written once and never changed".
+3. Same word, two different sets of rules. So draw a line between them: two bounded contexts.
+4. Each side gets its own Go type: `billing.Invoice` and `accounting.LedgerEntry`.
 
 A bounded context is the boundary inside which a model's vocabulary is internally consistent: every term means one thing, every invariant holds everywhere inside it. Crossing the boundary, a term can mean something else entirely — that's expected, not a bug to be fixed by renaming.
 
@@ -168,11 +208,23 @@ flowchart TD
     Gen --> BC4
 ```
 
-Subdomains (problem space) and bounded contexts (solution space) are not forced into a 1:1 mapping: the core domain here split into two contexts (Billing and Accounting) because they genuinely need different models and different rates of change, even though both serve the one core subdomain.
+Subdomains (problem space: how the business itself is divided) and bounded contexts (solution space: how your code and models are divided) are not forced into a 1:1 mapping: the core domain here split into two contexts (Billing and Accounting) because they genuinely need different models and different rates of change, even though both serve the one core subdomain.
 
 ### 3.3 Ubiquitous language
 
 **In plain words: the team and the code use exactly the same words for the same things.**
+
+**Step by step:**
+1. The product manager says: "an invoice is **overdue** once the due date passes and nothing has been paid".
+2. The ticket says "mark overdue invoices".
+3. The code has a status literally named `Overdue`, not `status == 3`.
+4. Now a bug report in business words points straight at the right code.
+
+```mermaid
+flowchart LR
+    PM["Expert says 'overdue'"] --> T["Ticket says 'overdue'"]
+    T --> C["Code: StatusOverdue"]
+```
 
 Inside a bounded context, the team and the code use exactly the same words, with exactly the same meaning, in conversation, in the ticket tracker, and in the type names.
 
@@ -181,6 +233,13 @@ If a product manager says "an invoice is **overdue** once the due date passes an
 The language is "ubiquitous" because it crosses every artifact — conversation, docs, code — inside that one context; it is explicitly *not* meant to cross into another context unchanged.
 
 ### 3.4 Context map: naming the relationships
+
+**Step by step:**
+1. Draw each context as a box: Billing, Accounting, Payments, Identity, Notifications.
+2. Draw an arrow from the one that supplies data (upstream) to the one that uses it (downstream).
+3. Ask who has the power. Identity is a bought product that will not change for you, so Billing is **conformist** to it.
+4. Accounting does not want Billing's changes leaking in, so it puts a translator (an **ACL**) on its side.
+5. Write the pattern name on each arrow.
 
 A context map draws contexts as boxes and labels the *kind* of relationship between them, because "calls" or "depends on" hides who has the power to break whom.
 
@@ -216,6 +275,13 @@ If the "shared" surface grows past a handful of types, or one team starts changi
 
 **In plain words: a sticky-note workshop where experts list everything that happens in the business, in order.**
 
+**Step by step:**
+1. Get business experts and engineers in one room (or one online whiteboard).
+2. Everyone writes past-tense events on orange notes: "Invoice Sent", "Payment Received", "Invoice Overdue".
+3. Put them on the wall in time order.
+4. Add what triggers each one (blue: commands), who does it (yellow: people), and outside systems (pink).
+5. Look for clusters, and for spots where people say "wait, here 'invoice' means something else". Those spots are boundary candidates.
+
 EventStorming is a workshop format, not a diagram notation: domain experts and engineers stand at a wall covered in paper (physical or virtual) and populate it with orange sticky notes for **domain events** ("Invoice Sent", "Payment Received", "Invoice Overdue") in the order they happen, then add commands (blue), actors (yellow), and external systems (pink) around them.
 
 Clusters of events that share vocabulary and change together, with clear "but here the word means something else" seams between clusters, are where bounded-context boundaries get proposed — the technique turns "where should the boundary go?" from an architectural guess into something the whole room can see and argue about together, before any code exists.
@@ -243,6 +309,8 @@ flowchart TD
     aclpkg --> billing
     aclpkg --> accounting
 ```
+
+**What this code does, in plain words:** three Go packages. `billing` has its own editable `Invoice`. `accounting` has its own write-once `LedgerEntry`. `acl` is the only package that imports both, and it turns "invoice just became paid" into "post this ledger entry".
 
 ```go
 // package billing — the Billing bounded context. Its "Invoice" is the
@@ -341,7 +409,7 @@ func ToLedgerEntry(inv billing.Invoice) (accounting.LedgerEntry, error) {
 }
 ```
 
-Tests prove both sides of the translation, and the idempotence Accounting relies on when a duplicate event arrives (the same guarantee [[Receiving Webhooks Idempotently]] needs for the webhook that triggers this in the first place):
+Tests prove both sides of the translation, and the **idempotence** (posting the same event twice has the same effect as posting it once) Accounting relies on when a duplicate event arrives (the same guarantee [[Receiving Webhooks Idempotently]] needs for the webhook that triggers this in the first place):
 
 ```go
 func TestToLedgerEntryTranslatesAPaidInvoice(t *testing.T) {
@@ -390,11 +458,21 @@ func TestLedgerPostIsIdempotentPerRef(t *testing.T) {
 | --- | --- | --- |
 | Partnership | Shared, both teams co-design | Two teams ship a feature that spans both contexts together |
 | Shared kernel | Shared, but over a small fixed slice of model, not the whole interface | Two teams need one concept (a value type, an event schema) to be bit-for-bit identical, and are willing to review changes to it jointly |
-| Customer–supplier | Upstream, but plans around downstream's needs | A formal internal API contract with a committed SLA |
+| Customer–supplier | Upstream, but plans around downstream's needs | A formal internal API contract with a committed SLA (a promised level of service, like 99.9% uptime) |
 | Conformist | Fully upstream | The upstream is external/bought and won't change for you (an IdP, a payment processor) |
 | Anticorruption layer | Downstream insulates itself | Upstream's model is a poor fit, legacy, or genuinely a different concept (this note's example) |
 | Open host service / published language | Upstream, serving many consumers | One context has several downstream consumers who shouldn't each build their own integration |
 | Separate ways | Neither — no integration | The coordination cost exceeds the cost of a little duplicated logic |
+
+### Subdomain vs bounded context vs microservice 🟡
+
+These three get mixed up all the time. They are three separate decisions.
+
+| Idea | What it divides | Decided by | InvoiceOps example |
+| --- | --- | --- | --- |
+| Subdomain | The business, by how much value each part creates | Business judgment | Core: invoicing; generic: login |
+| Bounded context | The code and models, by where word meanings change | Modeling | Billing and Accounting (both inside the one core subdomain) |
+| Microservice | The running programs, by what deploys and scales on its own | Operations needs | Still one program today; contexts are packages |
 
 ## 6. Trade-offs and when not to use 🟡
 
@@ -404,6 +482,9 @@ func TestLedgerPostIsIdempotentPerRef(t *testing.T) {
 - EventStorming needs real domain experts in the room; run without them, it's just engineers guessing at boundaries with sticky notes, which defeats the point.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how to rank subdomains, draw contexts, name their relationships and code an ACL in Go. **Next is the senior view**: how real companies get boundaries wrong, how context, service and team boundaries differ, and which side the translator belongs on.
+
 
 - **Real systems:** Evans' original book (2003) and Vernon's *Implementing Domain-Driven Design* (2013) are the field's reference texts; most large e-commerce and fintech platforms that split into dozens of services (Amazon's internal service boundaries are the most cited example) describe arriving at those boundaries through something like subdomain/bounded-context analysis, whether or not they used DDD's vocabulary for it.
 - **Failure modes → fixes:**
@@ -455,6 +536,26 @@ func TestLedgerPostIsIdempotentPerRef(t *testing.T) {
 - EventStorming finds context boundaries by clustering domain events and watching where vocabulary clashes, with real domain experts in the room.
 - DDD boundaries ≠ service boundaries ≠ team boundaries — they often align, but each is a separate decision (modeling, deployment, ownership).
 - A shared "common domain types" package across contexts is almost always evidence the contexts weren't really separated.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is a bounded context?
+> A boundary inside which each word has one exact meaning and one model.
+
+> [!question]- (easy) Is login a core, supporting or generic subdomain for InvoiceOps?
+> Generic. Every company needs it, so buy or reuse it.
+
+> [!question]- (easy) What does an anticorruption layer do?
+> It translates another context's model into yours at the border, so their changes don't leak into your code.
+
+> [!question]- (medium) Must every bounded context be its own microservice?
+> No. A context is a modeling boundary; it can live as a package inside one program (a modular monolith).
+
+> [!question]- (medium) Billing and Accounting both serve the core subdomain. Why are they two contexts?
+> Their rules for "invoice" differ (editable vs write-once), so one shared model would fit neither.
+
+> [!question]- (medium) Customer–supplier vs conformist: what is the difference?
+> In customer–supplier the upstream team plans around your needs; in conformist you have no say and adapt to whatever it gives you.
 
 ## Links 🟢
 

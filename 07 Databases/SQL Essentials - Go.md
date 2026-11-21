@@ -26,6 +26,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 2 to 6 and the Tests.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[SQL Essentials]]: the theory half. Read it first; this note runs its queries and builds SQL safely from Go. No other note is needed.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on twin of [[SQL Essentials]]. The first half is plain SQL you can paste into Postgres: four small tables (clients, invoices, invoice items, payments) and a few bigger queries that group, total and rank them. The second half is a tiny Go package that builds a search query safely. The key safety idea is a **placeholder**: the SQL text says `$1`, and the real value travels separately, so a user can never sneak SQL in. A second guard is a **whitelist**: sort options come from a fixed list, never from raw user text. Read it top to bottom: each step is a short Concept, the code, then a numbered walkthrough.
@@ -47,7 +50,7 @@ flowchart LR
 ## Before the code 🟢
 
 - **Structs as input**: a `Filter` struct holds the user's choices (workspace, status, sort, limit).
-- **Maps as whitelists**: `orderBy` maps a sort key to a fixed SQL fragment, so unknown keys are rejected.
+- **Maps as whitelists** (a fixed list of allowed values; anything else is refused): `orderBy` maps a sort key to a fixed SQL fragment, so unknown keys are rejected.
 - **`strings.Builder` and `fmt`**: build the SQL text with `$1`, `$2`, ... placeholders.
 - **`[]any` arguments**: values travel separately from the SQL, so the driver sends them as parameters.
 - **Multiple return values**: `Build` returns SQL, args and an `error`.
@@ -86,6 +89,8 @@ The SQL parts of this note have no Go in them; they are the queries the theory n
 - The SQL runs on PostgreSQL 17. The outputs shown are representative output (PostgreSQL 17), computed by hand from the sample data in the theory note; they were not produced by a live server in this vault.
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** the two halves: SQL to paste into Postgres, and a small Go builder that keeps user values out of the SQL text. **Next we open the box**: the four tables, a grouping query, a recursive CTE, the collections report, then the Go `Filter` and `Build`.
 
 ### Step 1: the running schema
 
@@ -450,6 +455,8 @@ flowchart TD
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** what every query and the builder do. **Next is the senior view**: why the builder is shaped this way, the tests that prove it is injection-safe, and the traps (placeholders cannot be column names, unstable paging, mapping SQLSTATE codes).
+
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
 | Values as `$n` parameters | Quote values into the SQL string | Parameters make injection structurally impossible; quoting depends on every call site getting escaping right |
@@ -580,6 +587,8 @@ ok  	listquery	1.489s
 
 `go vet` printed nothing, which means it found no suspicious constructs. The `-race` flag adds no information for this single-threaded code, but it is a good habit to keep in CI.
 
+**What this code does, in plain words:** the whole builder in one file: the `Filter` input, the whitelist of sort orders, and `Build`, which checks the request and returns SQL text with `$1, $2...` plus a separate list of values.
+
 > [!example]- Full file: listquery.go
 > ```go
 > package listquery
@@ -628,6 +637,8 @@ ok  	listquery	1.489s
 > 	return sql.String(), args, nil
 > }
 > ```
+
+**What this code does, in plain words:** the three tests in one file: a hostile value stays a parameter, placeholders renumber when a filter is skipped, and bad sort keys or limits are refused.
 
 > [!example]- Full file: listquery_test.go
 > ```go
@@ -695,6 +706,30 @@ ok  	listquery	1.489s
 1. Add a sort key `"-number"` that orders by `number DESC, id DESC`. Predict which test breaks if you forget the `id` tie-breaker, then write a test for the new key.
 2. Run the grouping query after inserting a client with `parent_id = 13` and no invoices. Predict the new row's `joined_rows`, `invoices` and `open_minor` values before running it.
 3. Change the recursive CTE's anchor to `id = 11`. Predict `group_open_minor`, and explain why Acme Corp's invoice is not included.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why can't the sort column be passed as `$1`?
+> Placeholders only carry values; `ORDER BY $1` would sort by a constant string, not a column.
+
+> [!question]- Where does a hostile value like `'; DROP TABLE invoices` end up after `Build`?
+> In the argument list, never in the SQL text.
+
+> [!question]- What does `Build` do with an unknown sort key?
+> It returns an error before any SQL is written.
+
+🟡 Medium
+
+> [!question]- Why is the placeholder number taken from `len(args)`?
+> So numbering stays 1, 2, 3 with no gaps whether or not the optional status filter is present.
+
+> [!question]- Why does every `orderBy` fragment end with `id`?
+> A unique tie-breaker keeps rows with equal sort values in a fixed order across pages.
+
+> [!question]- Why is Cobalt's `open_minor` NULL in the grouping output?
+> `sum` over zero matching rows returns NULL, not 0; use `coalesce` if you need 0.
 
 ## Links 🟢
 

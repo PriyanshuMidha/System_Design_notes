@@ -42,6 +42,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: a client sends a request (method like `GET`, a URL, headers) and gets back a response with a status code.
+> - [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]: HTTP/2 can carry many requests at the same time over one connection; HTTP/1.1 cannot.
+
 **From zero, in 60 seconds** 🟢
 
 Programs talk to each other all day: your phone app asks a server for data, servers ask each other, partners get told when things happen.
@@ -90,6 +94,12 @@ Picking the right style for each caller saves a lot of slow, wasteful traffic.
 | Push | Server sends data without being asked again | Seat map updates live |
 | SSE / WebSocket | Long-lived connections for server push (one-way / two-way) | Live scores feed / chat |
 | Webhook | Your server calls a partner's URL when an event happens | `POST partner.com/hooks` on payment |
+| Long polling | The client asks, and the server holds the answer until there is news or a timeout | "wait up to 30 s for the next update" |
+| CRUD | Create, Read, Update, Delete: the four basic data actions | add, view, edit, remove a booking |
+| Protobuf | A compact binary data format defined in `.proto` files, used by gRPC | `message Booking { string id = 1; }` |
+| Message broker | A middleman that stores events so other services can read them later | Kafka |
+| Multiplexing | Sending many requests at once over one connection | HTTP/2 carries 100 calls on one link |
+| Request rate | How many requests arrive per second | 25,000 requests/s |
 
 **Picture it**
 
@@ -131,6 +141,14 @@ If partners must **poll** for cancellations, they either miss them or hammer you
 
 Each API style exists because it makes one of these shapes cheap. Choosing well means matching style to caller and data flow, and keeping the number of styles small.
 
+### Real-life example: tracking a Zomato order 🟢
+
+When you order food on Zomato, placing the order is a normal ask-and-answer call: send the order, get an order ID back (REST).
+The live "your rider is 2 km away" screen needs the server to keep sending updates, so it uses a push channel such as SSE or WebSocket.
+Inside Zomato, the order, payment and rider services call each other many times per second with fast typed calls (often gRPC).
+The restaurant's tablet is told "new order" by a push or callback, so it does not have to keep asking.
+One app, four styles, each picked by who calls and which way the data flows.
+
 ## 2. Mental model 🟢
 
 Think of the ways a restaurant talks to people:
@@ -147,15 +165,40 @@ Think of the ways a restaurant talks to people:
 
 Two questions decide most cases: **who is calling** and **who speaks first**.
 
+## Common beginner mistakes 🟢
+
+- **Picking gRPC for a public browser API "because it is fast"** → browsers cannot speak it directly, and partners cannot test with `curl` → REST at the edge, gRPC inside.
+- **Polling every 2 seconds for live data** → 50,000 viewers make 25,000 requests a second, mostly "nothing new" → use SSE or WebSocket.
+- **Using WebSocket when data only flows to the client** → you pay for two-way connections you do not need → use SSE.
+- **Adding GraphQL for one client and simple CRUD** → schema, limits and lost caching for no gain → plain REST.
+- **Making partners poll for events** → they miss events or hammer you → send webhooks.
+
+## Often confused 🟡
+
+| These two | First one | Second one |
+| --- | --- | --- |
+| SSE vs WebSocket | Server → client only, plain HTTP, auto-reconnect | Both directions, its own connection type |
+| Webhook vs polling | You call them when something happens | They keep asking you "anything new?" |
+| REST vs GraphQL | Many URLs, server decides the response shape | One URL, the client picks the fields |
+| gRPC vs REST | Binary, typed, needs HTTP/2, best inside | Text JSON, works everywhere, best at the edge |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that two questions (who calls, which way data flows) pick the style, and REST is the default. **Next we open the box**: the four basic conversation shapes, and the full decision tree that maps each caller to a style.
 
 ### The four communication patterns
 
 **In plain words:** every API conversation is one of four shapes: ask-and-answer, server pushes to you, a long two-way stream, or "I'll tell you later". Name the shape first and the style picks itself.
 
+**Step by step:**
+1. **Ask and answer:** the app sends `GET /orders/42` and gets `PREPARING` back once. Done.
+2. **Server push:** the app opens `GET /orders/42/stream` once; the server then sends `PICKED_UP`, later `DELIVERED`, on its own.
+3. **Streaming:** two services keep one call open and send many messages both ways, like a live chat line.
+4. **Async event:** your server sends `POST partner.com/hooks` saying "booking cancelled"; the partner says "got it" and deals with it later.
+
 Every style is one of four patterns, or a mix:
 
-1. **Request-response.** The client asks, the server answers once. REST, GraphQL queries and mutations, gRPC unary calls, SOAP.
+1. **Request-response.** The client asks, the server answers once. REST, GraphQL queries and mutations, gRPC **unary** calls (one request, one response), SOAP.
 2. **Server push.** The client opens a channel once, then the server sends whenever it has news. SSE, WebSocket, GraphQL subscriptions. Long polling fakes push with repeated requests.
 3. **Streaming.** Many messages flow over one call, in one or both directions. gRPC server, client and bidirectional streams; WebSocket.
 4. **Async events.** The producer does not wait for the consumer. Webhooks (across companies) and message brokers such as Kafka (inside a company, see [[Event-Driven Architecture Basics]]).
@@ -183,6 +226,13 @@ sequenceDiagram
 ### The decision
 
 **In plain words:** walk the tree top-down: first who is calling, then whether data must be pushed. Do not start with "is it CRUD?", because everything looks like CRUD.
+
+**Step by step:**
+1. Caller is a cinema partner's server. They need booking cancellations as they happen → REST for their calls plus webhooks for your events.
+2. Caller is your own booking service calling inventory and needing an answer now → gRPC.
+3. Caller is your own service, but many others should react later → put an event on a broker such as Kafka.
+4. Caller is the phone app, and the seat map must update live → SSE (data only flows down).
+5. Caller is the phone app, no live updates, simple screens → REST.
 
 Ask about the **caller first**, then the **direction of data**. The old "is it normal CRUD?" first question is the wrong root: almost everything looks like CRUD, so the push and internal branches never get asked.
 
@@ -293,7 +343,7 @@ func Pick(caller, flow string) string {
 - Long polling: about one request per change per client, 50,000 / 10 = **5,000 requests/s**, plus 50,000 held-open requests and one reconnect round trip after every change.
 
   Its cost grows with the update rate: if a hot show changed 5 times per second, each of its viewers could send up to 5 requests/s, which is worse than polling every 2 s unless the server batches events.
-- SSE: **50,000 open connections** and about **5,000 small messages/s** pushed, with no request per update. The cost moves from request rate to connection count, which is a memory and file-descriptor question (see [[Scaling WebSockets]]; the same scaling rules apply to SSE).
+- SSE: **50,000 open connections** and about **5,000 small messages/s** pushed, with no request per update. The cost moves from request rate to connection count, which is a memory and **file-descriptor** (the operating system's handle for each open connection) question (see [[Scaling WebSockets]]; the same scaling rules apply to SSE).
 
 Which to pick depends on what is scarce. With HTTP/2 at the edge, SSE avoids the browser limit of 6 HTTP/1.1 connections per domain, shared by all tabs of that browser, which hurts SSE over HTTP/1.1 (documented on MDN).
 
@@ -304,9 +354,9 @@ Which to pick depends on what is scarce. With HTTP/2 at the edge, SSE avoids the
 | Style | Transport | Payload | Contract | Browser support | HTTP caching | Streaming | Best fit |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | REST | HTTP/1.1, HTTP/2 or HTTP/3 | JSON usually; any media type | OpenAPI | Native (`fetch`) | Yes: `GET` + `Cache-Control`, `ETag` | No, one response per request | Public resource APIs, CRUD, partner APIs |
-| GraphQL | HTTP, one endpoint, usually `POST` | JSON | SDL schema | Native | Hard: `POST` bodies are not cached; persisted queries over `GET` make it possible | Subscriptions, usually over WebSocket | Many client shapes, aggregation across services |
+| GraphQL | HTTP, one endpoint, usually `POST` | JSON | SDL (Schema Definition Language) schema | Native | Hard: `POST` bodies are not cached; persisted queries over `GET` make it possible | Subscriptions, usually over WebSocket | Many client shapes, aggregation across services |
 | gRPC | HTTP/2 required | Protobuf (binary) | `.proto` | Not directly: needs gRPC-Web or Connect through a proxy | No | Server, client and bidirectional streams | Internal service-to-service calls |
-| WebSocket | HTTP/1.1 `Upgrade` (RFC 6455); HTTP/2 and HTTP/3 extended `CONNECT` (RFC 8441, RFC 9220) | Text or binary frames in your own format | None built in (AsyncAPI can describe it) | Native `WebSocket` | No | Full duplex | Chat, collaborative editing, games |
+| WebSocket | HTTP/1.1 `Upgrade` (RFC 6455); HTTP/2 and HTTP/3 extended `CONNECT` (RFC 8441, RFC 9220) | Text or binary frames in your own format | None built in (AsyncAPI can describe it) | Native `WebSocket` | No | Full duplex (both sides send at any time) | Chat, collaborative editing, games |
 | SSE | One long HTTP response, `text/event-stream` | UTF-8 text events | None built in | Native `EventSource` | No | Server to client only | Live feeds, notifications, job progress |
 | Long polling | Repeated HTTP requests held open | Any | Same as REST | Native | No | Simulated | Fallback when streams are blocked |
 | Webhooks | HTTPS `POST` from provider to consumer | JSON | Event catalogue; OpenAPI 3.1 `webhooks` | Not applicable (server to server) | No | No, one `POST` per event | Cross-company event notification |
@@ -316,14 +366,16 @@ Per-style details live in their own notes: [[REST and HTTP API Design]], [[Graph
 
 ## 6. Trade-offs and when not to use 🟡
 
-- **Do not expose gRPC directly to browsers.** Browsers cannot read HTTP/2 trailers through `fetch`, where gRPC puts its status, so you need gRPC-Web or Connect plus a proxy. Binary payloads are also harder for partners to debug with `curl`.
-- **Do not add GraphQL for one client and simple CRUD.** You pay for a schema, resolvers, N+1 batching (DataLoader), query cost limits and lost HTTP caching, and get nothing a few REST endpoints would not give you.
-- **Do not reach for WebSocket when data only flows down.** WebSocket connections are stateful: sticky routing, heartbeats, reconnect and resume logic, and a different scaling model. SSE runs over ordinary HTTP and reconnects by itself with `Last-Event-ID`.
+- **Do not expose gRPC directly to browsers.** Browsers cannot read HTTP/2 **trailers** (headers sent at the end of a response) through `fetch`, where gRPC puts its status, so you need gRPC-Web or Connect plus a proxy. Binary payloads are also harder for partners to debug with `curl`.
+- **Do not add GraphQL for one client and simple CRUD.** You pay for a schema, **resolvers** (functions that fetch each field), N+1 batching (DataLoader, which merges many small database lookups into one), query cost limits and lost HTTP caching, and get nothing a few REST endpoints would not give you.
+- **Do not reach for WebSocket when data only flows down.** WebSocket connections are **stateful** (the server remembers each connection): **sticky routing** (a client keeps going to the same server), **heartbeats** (small "still here" messages), reconnect and resume logic, and a different scaling model. SSE runs over ordinary HTTP and reconnects by itself with `Last-Event-ID`.
 - **Polling is fine when updates are rare.** A dashboard that refreshes every 60 s does not need a push channel; plain `GET` with an `ETag` returns a cheap `304` most of the time (see [[HTTP Caching - Cache-Control, ETag, Conditional Requests]]).
-- **Webhooks are at-least-once.** Receivers must deduplicate by event ID (see [[Delivery Semantics and Exactly-Once]]). If partners cannot host an HTTPS endpoint, offer an events list endpoint they can poll instead.
+- **Webhooks are at-least-once** (an event may arrive more than once, never zero times). Receivers must deduplicate by event ID (see [[Delivery Semantics and Exactly-Once]]). If partners cannot host an HTTPS endpoint, offer an events list endpoint they can poll instead.
 - **Every extra style has a fixed cost:** another contract format, code generator, auth integration, gateway rule, dashboard and on-call runbook.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the four patterns, the decision tree and what each style costs. **Next is the advanced part**: how Stripe, GitHub, Google, Slack and Kubernetes mix styles, the production failures each style brings, and the protocol details behind gRPC, caching and head-of-line blocking.
 
 - **Real systems:**
 	- **Stripe**'s main (v1) API is REST: resource URLs, form-encoded request bodies, JSON responses, and webhooks for events.
@@ -332,11 +384,11 @@ Per-style details live in their own notes: [[REST and HTTP API Design]], [[Graph
 	- **Slack** uses three styles: an RPC-over-HTTP Web API (`POST /api/chat.postMessage`), the Events API that `POST`s to your URL, and Socket Mode that delivers the same events over a WebSocket.
 	- **Kubernetes** serves REST and adds `?watch=true`, which streams change events over one long HTTP response. **etcd v3**, its datastore, exposes a gRPC API.
 - **Failure modes → fixes:**
-	- gRPC behind an L4 load balancer sends all of one client's calls to one backend, because HTTP/2 keeps one long-lived connection → balance per request at L7 (Envoy) or on the client (see [[Forward and Reverse Proxies - L4 vs L7]]).
+	- gRPC behind an L4 load balancer (one that only sees connections, not individual requests) sends all of one client's calls to one backend, because HTTP/2 keeps one long-lived connection → balance per request at L7 (Envoy) or on the client (see [[Forward and Reverse Proxies - L4 vs L7]]).
 	- A GraphQL query nests ten levels deep and takes the database down → enforce depth and cost limits, or allow only persisted queries.
 	- SSE events arrive in bursts → a proxy buffers the response; turn buffering off (in nginx, `proxy_buffering off` or the `X-Accel-Buffering: no` response header).
 	- WebSocket connections drop after a minute of silence → load balancers close idle connections (the AWS ALB default is 60 s); send heartbeats more often than the idle timeout.
-	- A partner's webhook endpoint is down for an hour → retry with exponential backoff, park failures in a dead-letter store and offer a replay endpoint.
+	- A partner's webhook endpoint is down for an hour → retry with exponential backoff, park failures in a **dead-letter** store (a holding area for messages that kept failing) and offer a replay endpoint.
 - **What to monitor:**
 	- Per style: request rate, error rate, p99 latency.
 	- For push channels: open connections, reconnects per minute, messages per second.
@@ -352,8 +404,8 @@ Per-style details live in their own notes: [[REST and HTTP API Design]], [[Graph
 - **Why REST caches and the others do not.** Shared caches store responses to `GET` (and `HEAD`). RFC 9110 allows caching a `POST` response only with explicit freshness and a matching `Content-Location`, and common caches do not do it.
 
   GraphQL sends queries as `POST`, so CDNs pass them through. Persisted queries fix this: the client sends a hash of a pre-registered query in a `GET` URL, which a CDN can cache.
-- **Message size limits are part of the style.** grpc-go rejects incoming messages over 4 MiB by default (`MaxRecvMsgSize`). Large files belong in object storage with a presigned URL, not in an RPC (see [[File Upload Architecture]]).
-- **Head-of-line blocking.** HTTP/2 removes blocking between requests at the HTTP layer, but one lost TCP packet still stalls every stream on the connection. HTTP/3 over QUIC removes that (see [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]). This matters for gRPC and SSE on lossy mobile networks.
+- **Message size limits are part of the style.** grpc-go rejects incoming messages over 4 MiB by default (`MaxRecvMsgSize`). Large files belong in object storage with a **presigned URL** (a time-limited upload link the storage service accepts without your password), not in an RPC (see [[File Upload Architecture]]).
+- **Head-of-line blocking.** (One stuck item holding up everything queued behind it.) HTTP/2 removes blocking between requests at the HTTP layer, but one lost TCP packet still stalls every stream on the connection. HTTP/3 over QUIC removes that (see [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]). This matters for gRPC and SSE on lossy mobile networks.
 - **GraphQL vs BFF.** Both solve "each client needs a different shape". GraphQL lets each client ask for its own shape from one shared schema. A BFF (backend for frontend) is a small server per client type that composes the calls in code.
 
   GraphQL scales to many clients; a BFF is simpler when there are two or three and each team owns its own (see [[API Gateway and BFF]]).
@@ -393,6 +445,26 @@ Per-style details live in their own notes: [[REST and HTTP API Design]], [[Graph
 - **SOAP** only when a partner's WSDL forces it; isolate it in one adapter.
 - Only `GET` is cacheable in practice: REST caches, GraphQL over `POST` and gRPC do not.
 - Mixed is normal: REST/GraphQL at the edge, gRPC inside, transcoding to avoid duplicate logic.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is the default style for a public API used by other companies?
+> REST with an OpenAPI contract.
+
+> [!question]- Easy: which style fits internal service-to-service calls?
+> gRPC.
+
+> [!question]- Easy: data only flows from server to browser, live. SSE or WebSocket?
+> SSE.
+
+> [!question]- Medium: 50,000 people poll every 2 seconds. How many requests per second is that?
+> 25,000 requests per second, most of them returning nothing new.
+
+> [!question]- Medium: why is REST easy to cache while GraphQL usually is not?
+> Caches store `GET` responses; GraphQL usually sends queries as `POST`, which caches pass through.
+
+> [!question]- Medium: how can one system offer gRPC inside and REST outside without writing the logic twice?
+> Write the service once in gRPC and transcode at the edge (grpc-gateway or Envoy) to REST/JSON.
 
 ## Links 🟢
 

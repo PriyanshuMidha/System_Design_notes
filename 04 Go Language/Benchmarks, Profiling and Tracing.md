@@ -37,6 +37,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how the tools work) and 4 (the full measured example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Go Toolchain, Tooling and Debugging]]: you can run `go test` and `go build`, and you know `go tool` runs extra helper programs that ship with Go.
+> - [[Runtime - Goroutine Scheduler (GMP)]]: Go runs many goroutines on a few OS threads, and the runtime has its own background workers (scheduler, garbage collector) that also use CPU.
+
 **From zero, in 60 seconds** 🟢
 
 Your program feels slow. The worst thing you can do is guess why.
@@ -79,6 +83,12 @@ Then you fix the real culprit and time it again to prove it helped.
 | Sampling | Checking "what is running now?" every few ms instead of timing everything | CPU profile samples 100 times/sec |
 | Trace | A full timeline of goroutine events | `go tool trace trace.out` |
 | p99 latency | The time 99% of requests finish under | p99 = 250 ms |
+| Heap | The memory area for values that must outlive one function call; the GC cleans it | a 4 MB string built in a loop |
+| Goroutine | A lightweight task in a Go program; thousands can run at once | `go handle(req)` |
+| Mux (ServeMux) | The router that maps a URL path to the code that handles it | `/debug/pprof/` → `pprof.Index` |
+| Contention | Many goroutines waiting in line for the same lock | 50 goroutines, one `sync.Mutex` |
+| Inlining | The compiler pastes a small function's body into its caller to skip the call cost | `add(a, b)` becomes `a + b` |
+| Statistically significant | A difference too big and steady to be random noise | `benchstat` prints `p=0.000` |
 
 **Picture it**
 
@@ -107,13 +117,17 @@ Where it breaks: a scan of a patient sleeping says little about running; a profi
 
 ## 1. Why it exists 🟢
 
-A service's p99 latency jumps after a deploy. The two wrong ways to respond are guessing ("it's probably the database") and reading the diff line by line hoping to spot the slow part.
+A service's p99 latency jumps after a deploy (pushing a new version of the code to the live servers). The two wrong ways to respond are guessing ("it's probably the database") and reading the diff line by line hoping to spot the slow part.
 
-The right way is to ask the running process itself: a CPU profile answers "which function is actually burning cycles right now," a heap profile answers "what is actually still on the heap, and who allocated it," and a trace answers "what was every goroutine doing in the exact second p99 spiked." None of that requires adding `time.Now()` calls everywhere or pattern-matching the code.
+The right way is to ask the running process itself: a CPU profile answers "which function is actually burning cycles (using the processor) right now," a heap profile answers "what is actually still on the heap, and who allocated it," and a trace answers "what was every goroutine doing in the exact second p99 spiked." None of that requires adding `time.Now()` calls everywhere or pattern-matching the code.
 
 `go tool pprof` and `go tool trace` read a profile the running Go process already knows how to produce.
 
-Benchmarks exist for the step before that: proving a change actually helps, with numbers, before it ships. "I rewrote this with a `sync.Pool` and it feels faster" is not evidence; `benchstat old.txt new.txt` showing a statistically significant delta is.
+Benchmarks exist for the step before that: proving a change actually helps, with numbers, before it ships. "I rewrote this with a `sync.Pool` (a shared stash of reusable objects) and it feels faster" is not evidence; `benchstat old.txt new.txt` showing a statistically significant delta is.
+
+### Real-life example 🟢
+
+Picture a food-delivery app like Swiggy at 8 pm on a Friday. The "show restaurants near me" API, which usually answers in 80 ms, starts taking 600 ms for 1 in 100 users right after a new release. An engineer pulls a 30-second CPU profile from one live server and sees that a new logging helper builds big strings with `+=` on every request. They write a benchmark for that helper, switch it to `strings.Builder`, and `benchstat` shows it is about 30× faster. After the next release the profile no longer shows the helper near the top, and the slow requests go back to normal. Profile found it, benchmark proved the fix, profile confirmed it in production.
 
 ## 2. Mental model 🟢
 
@@ -125,11 +139,28 @@ Think of three different instruments for three different questions, in increasin
 
 The optimization loop ties all three together, in order: form a hypothesis, benchmark the suspect in isolation, profile the whole program to confirm (or rule out) the hypothesis, change the code, benchmark again to prove it helped.
 
+## Common beginner mistakes 🟢
+
+- **Optimising a function because it "looks slow"** → it may use 1% of the real CPU time → take a profile first and fix what is at the top.
+- **Trusting one benchmark run** → run-to-run noise here was as large as 2× (330,000 vs 695,000 ns/op) → use `-count=10` and compare with `benchstat`.
+- **Reading `alloc_space` as "memory in use now"** → it is the total ever allocated, most of it long freed → use `inuse_space` to hunt leaks.
+- **Profiling an idle program** → the top entries are sleeping runtime threads, not your code → put real load on it while the profile runs.
+- **Importing `net/http/pprof` into a public server** → anyone on the internet can read your process and start 30-second profiles → serve it on a private admin port only.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the three tools: a benchmark times one function, a profile surveys the whole program, a trace records everything in order. **Next we open the box**: the exact loop engineers follow, the five kinds of pprof profile and when each is switched on, and then a full measured example that walks through every tool.
 
 ### The optimization loop
 
 **In plain words:** never trust a guess or a single number — measure, change, measure again, like a before/after photo for code.
+
+**Step by step:**
+1. Guess: "`ConcatPlus` is slow."
+2. Benchmark it alone: about 524,000 ns per call at `n=1000`.
+3. Profile the real program: confirm it (or its garbage) really is near the top.
+4. Change the code: use `strings.Builder`.
+5. Benchmark again 10 times and compare with `benchstat`: about 13,700 ns. Real win, so ship it.
 
 ```mermaid
 flowchart LR
@@ -150,6 +181,13 @@ Skipping the profile step is the most common mistake: a benchmark proves *a* fun
 
 **In plain words:** pprof is five different cameras: two always-on cheap ones (heap, goroutine) and three you switch on when needed because they cost something (CPU, block, mutex).
 
+**Step by step:**
+1. **heap**: "what memory is held, and who made it?" Always on; records about one allocation per 512 KB.
+2. **goroutine**: "what is every goroutine doing right now?" Always on; one stack trace (the chain of function calls) each.
+3. **cpu**: "which functions use the processor?" You start it; it checks about 100 times a second.
+4. **block**: "where do goroutines wait (channels, locks)?" Off until you call `runtime.SetBlockProfileRate`.
+5. **mutex**: "which locks have queues?" Off until you call `runtime.SetMutexProfileFraction`.
+
 ```mermaid
 flowchart TD
     subgraph Always["Always on (cheap)"]
@@ -165,7 +203,7 @@ flowchart TD
     OptIn --> Serve
 ```
 
-`heap` and `goroutine` cost almost nothing and are always available; `cpu`, `block` and `mutex` each add measurable overhead while active, which is why they are off until a handler or test explicitly turns them on.
+`heap` and `goroutine` cost almost nothing and are always available; `cpu`, `block` and `mutex` each add measurable overhead (extra work that slows the program a little) while active, which is why they are off until a handler or test explicitly turns them on.
 
 ## 4. Worked example 🟡
 
@@ -182,9 +220,11 @@ func BenchmarkConcat(b *testing.B) {
 }
 ```
 
+**What this code does, in plain words:** it calls `ConcatPlus(100)` over and over, as many times as Go's test runner needs for a steady average, and also counts how many memory allocations each call makes.
+
 `b.Loop()` runs the body until the benchmark framework has enough samples, the same job the classic `for i := 0; i < b.N; i++` loop did.
 
-But it also tells the compiler the loop count is not statically known, which blocks the compiler from proving the loop's result is unused and eliminating it, something a classic `b.N` loop occasionally allowed for a pure function whose result was only discarded with `_ =`.
+But it also tells the compiler the loop count is not statically known, which blocks the compiler from proving the loop's result is unused and eliminating it (deleting the code as "dead", so you time nothing), something a classic `b.N` loop occasionally allowed for a pure function whose result was only discarded with `_ =`.
 
 `b.Loop()` also folds in what `b.ResetTimer()` used to do by hand: any setup code placed before the `for b.Loop()` line — building a large input slice, opening a file — runs with the timer and allocation counters off, and they start only once the loop begins, with no explicit call needed.
 
@@ -195,6 +235,12 @@ The full version below adds sub-benchmarks, `-benchmem`, and the pprof/trace wor
 ### Three implementations, benchmarked with sub-benchmarks and `-benchmem`
 
 **In plain words:** three ways to build the same string — naive `+=`, a growable buffer, and a reused buffer — raced against each other with allocation counting on.
+
+**Step by step:**
+1. `ConcatPlus(1000)` builds `"0,1,2,...,999"` with `+=`. Each `+=` makes a brand-new string and copies everything so far.
+2. `ConcatBuilder(1000)` reserves about 4,000 bytes once with `Grow`, then writes each number into that one buffer.
+3. `ConcatPool(1000)` does the same, but borrows the builder from a `sync.Pool` and gives it back, so the builder object itself is reused.
+4. `b.Run` runs each one at sizes 10, 100 and 1,000, so you see how cost grows with size.
 
 ```go
 // ConcatPlus builds a comma-separated string of 0..n-1 with plain string
@@ -268,7 +314,7 @@ func BenchmarkConcatPlus(b *testing.B) {
 | `ConcatBuilder` | ≈13,729 | 6,976 | 901 |
 | `ConcatPool` | ≈13,095 | 6,978 | 901 |
 
-Three things jump out. First, `ConcatPlus` is roughly **38× slower** and allocates roughly **580× the bytes** of the other two at `n=1000`, because every `+=` reallocates and copies the whole string so far — O(n²) total work for n appends.
+Three things jump out. First, `ConcatPlus` is roughly **38× slower** and allocates roughly **580× the bytes** of the other two at `n=1000`, because every `+=` reallocates and copies the whole string so far — O(n²) total work for n appends (double `n` and the work grows about four times).
 
 Second, `ConcatBuilder` and `ConcatPool` tie here: the allocations left are from `strconv.Itoa` itself (one string per number, which `b.Grow` cannot prevent), not from the builder's backing array — `sync.Pool` only amortizes the one allocation it actually controls.
 
@@ -277,6 +323,12 @@ Third, `ConcatPlus`'s own run-to-run range (329,793 to 695,411 ns/op) is wide en
 ### `-count` and `benchstat`: why one run isn't enough
 
 **In plain words:** one timing is a coin flip; ten timings plus a statistics tool tell you whether the improvement is real or just noise.
+
+**Step by step:**
+1. Run the benchmarks 10 times on the old code and save the output in `new.txt`.
+2. Change the code and run them 10 times again into `new2.txt`.
+3. `benchstat new.txt new2.txt` lines up the two sets for each benchmark.
+4. It prints the change (here -97%) and a p-value: a small number like `0.000` means "almost surely not luck".
 
 ```bash
 go test -bench=. -benchmem -count=10 . > new.txt
@@ -293,11 +345,17 @@ benchstat new.txt new2.txt
 ConcatPlus-10   524.5µ ± 35%    13.7µ ± 8%   -97.39% (p=0.000 n=10)
 ```
 
-`benchstat` runs a Mann-Whitney U test across the `-count` runs of each file and reports whether the difference is statistically significant (the `p=0.000` above), not just "the second mean is lower" — a single run's ±35% spread on `ConcatPlus` shows why that distinction matters: a single pair of runs could show an improvement purely from noise.
+`benchstat` runs a Mann-Whitney U test (a standard statistics check that compares two groups of numbers without assuming they follow a bell curve) across the `-count` runs of each file and reports whether the difference is statistically significant (the `p=0.000` above), not just "the second mean is lower" — a single run's ±35% spread on `ConcatPlus` shows why that distinction matters: a single pair of runs could show an improvement purely from noise.
 
 ### Reading a CPU profile: `go tool pprof -top` and `-list`
 
 **In plain words:** `-top` is the leaderboard of who burned the CPU; `-list` zooms into one function and shows the cost line by line.
+
+**Step by step:**
+1. Run the benchmark for 2 seconds with `-cpuprofile=cpu.prof`; Go writes the samples to that file.
+2. `go tool pprof -top` lists the functions where samples landed most, biggest first.
+3. Here the top is runtime housekeeping (waking threads, returning memory), caused by all the garbage `ConcatPlus` makes.
+4. `go tool pprof -list=ConcatPlus` shows the cost per source line: the two `+=` lines take all 180 ms.
 
 ```bash
 go test -bench=BenchmarkConcatPlus/1000 -benchtime=2s -cpuprofile=cpu.prof -run=^$ .
@@ -318,7 +376,7 @@ Duration: 2.60s, Total samples = 3670ms (140.98%)
 
 This is a genuinely useful (and genuinely confusing, the first time you see it) real profile: the top five entries are **runtime scheduler and GC-worker overhead**, not `ConcatPlus` itself.
 
-`ConcatPlus` allocates ~4MB per call, so at `n=1000` the garbage collector runs constantly (`runtime.madvise`, `runtime.scanobject` return memory and scan live objects), and the Go runtime's background OS threads spend real wall-clock time parking and waking (`pthread_cond_signal`/`usleep`/`kevent`) — all of that is sampled right alongside the function under test, on a benchmark machine with cores to spare.
+`ConcatPlus` allocates ~4MB per call, so at `n=1000` the garbage collector runs constantly (`runtime.madvise`, `runtime.scanobject` return memory and scan live objects), and the Go runtime's background OS threads (the real threads the operating system schedules) spend real wall-clock time parking (going to sleep until there is work) and waking (`pthread_cond_signal`/`usleep`/`kevent`) — all of that is sampled right alongside the function under test, on a benchmark machine with cores to spare.
 
 `flat` is time charged to that exact function; `cum` adds in everything it called. Filtering down to the code itself:
 
@@ -345,6 +403,12 @@ The rest of the profile is GC and scheduler overhead this allocation pattern is 
 
 **In plain words:** `alloc` is everything you ever bought; `inuse` is what is still in your house right now. Mixing them up is the classic memory-profile mistake.
 
+**Step by step:**
+1. The benchmark calls `ConcatPlus` thousands of times; each call makes about 4 MB of strings, then drops them.
+2. `alloc_space` adds up every byte ever made: about 20 GB.
+3. The GC frees those strings soon after each call, so at any one moment very little is live.
+4. `inuse_space` shows only what is live at the moment of capture: about 1.5 MB, all runtime bookkeeping.
+
 ```bash
 go tool pprof -top -sample_index=alloc_space mem.prof   # total ever allocated
 go tool pprof -top -sample_index=inuse_space mem.prof   # still live right now
@@ -369,6 +433,12 @@ Reading `alloc_space` as "current memory usage" is the single most common heap-p
 ### `net/http/pprof` on a private admin mux
 
 **In plain words:** pprof over HTTP is a window into your live process — put it on a private door, never the public entrance.
+
+**Step by step:**
+1. `NewAdminMux` makes a fresh, empty router.
+2. It adds one route per pprof page: `/debug/pprof/heap`, `/debug/pprof/profile`, and so on.
+3. You serve this router on a private port, for example `localhost:6060`, that the internet cannot reach.
+4. An engineer runs `go tool pprof http://admin-host:6060/debug/pprof/profile?seconds=30` from inside the network to grab a live CPU profile.
 
 ```go
 // NewAdminMux returns a ServeMux carrying only pprof, meant to be served
@@ -407,11 +477,18 @@ func TestAdminMuxServesPprofNotDefaultMux(t *testing.T) {
 }
 ```
 
-**Measured:** PASS — the mux serves pprof and is provably not `http.DefaultServeMux`. In a real service this mux is served on a port that never leaves the cluster (a sidecar or a loopback-only listener); `go tool pprof http://admin-host:6060/debug/pprof/profile?seconds=30` pulls a live CPU profile over that connection exactly like the file-based workflow above.
+**Measured:** PASS — the mux serves pprof and is provably not `http.DefaultServeMux`. In a real service this mux is served on a port that never leaves the cluster (a sidecar: a helper process next to the app; or a loopback-only listener: one that accepts connections only from the same machine); `go tool pprof http://admin-host:6060/debug/pprof/profile?seconds=30` pulls a live CPU profile over that connection exactly like the file-based workflow above.
 
 ### Mutex and block profiling: proving contention is real
 
 **In plain words:** when goroutines queue up for the same lock, these profiles show the queue — but you must switch them on first.
+
+**Step by step:**
+1. `Counter.Add` takes a lock (`mu.Lock`), adds to `n`, and lets go.
+2. `HammerCounter(c, 50, 2000)` starts 50 goroutines that each call `Add` 2,000 times, so they keep bumping into each other at the lock.
+3. The test first sets both profile rates to `1` ("record every event").
+4. After the hammering, the mutex and block profiles are not empty: the queueing was caught.
+5. The rates go back to `0` (off) when the test ends.
 
 ```go
 type Counter struct {
@@ -465,6 +542,13 @@ func TestMutexAndBlockProfilesCaptureContention(t *testing.T) {
 
 **In plain words:** a trace is the CCTV footage of your program — every goroutine, every pause, in order — too heavy to run all day, perfect for a few seconds.
 
+**Step by step:**
+1. `trace.Start(f)` begins writing every runtime event to `trace.out`.
+2. `HammerCounter` runs; every goroutine start, wait and wake-up is recorded with a time.
+3. `trace.Stop()` closes the file.
+4. `go tool trace -pprof=sync trace.out` turns the waits into a profile: 87.59 ms waiting on `Mutex.Lock`.
+5. `go tool trace trace.out` opens the full timeline in a browser instead.
+
 ```go
 f, _ := os.Create("trace.out")
 trace.Start(f)
@@ -488,18 +572,24 @@ Type: delay
 
 `go tool trace -pprof=sync|net|syscall|sched` turns the complete event timeline into a pprof-style delay profile for one category — here confirming 87.59ms of total goroutine time spent waiting on `Counter.mu`, matching the contention `HammerCounter` was built to cause.
 
-The same `trace.out` opened as `go tool trace trace.out` (without `-pprof`) gives the full interactive timeline in a browser: a per-goroutine Gantt chart, GC phases overlaid, and network/syscall blocking — the view to reach for when a profile says "something is slow" and you need to see *when*, relative to everything else, not just *how much*.
+The same `trace.out` opened as `go tool trace trace.out` (without `-pprof`) gives the full interactive timeline in a browser: a per-goroutine Gantt chart (one horizontal bar per goroutine showing when it ran), GC phases overlaid, and network/syscall blocking — the view to reach for when a profile says "something is slow" and you need to see *when*, relative to everything else, not just *how much*.
 
 ### PGO (profile-guided optimization, Go 1.21+)
 
 **In plain words:** hand the compiler a profile from real traffic and it optimizes harder exactly where the profile says it matters.
+
+**Step by step:**
+1. Pull a CPU profile from a production server under real traffic.
+2. Save it as `default.pgo` in the folder of your `main` package.
+3. Run `go build` as usual; Go reads the file automatically.
+4. Functions called from hot spots get inlined more freely, so those calls get a little faster.
 
 ```bash
 cp cpu.prof default.pgo   # go build picks this up automatically from the main package's directory
 go build -pgo=auto ./...  # -pgo=auto is the default since Go 1.21
 ```
 
-**Documented** (Go 1.21 release notes): a `default.pgo` file in the main package's directory is used automatically; the compiler raises the inlining budget for functions that the profile shows are called from hot call sites, so a function just over the normal inlining cost limit can still be inlined at its hot call sites specifically.
+**Documented** (Go 1.21 release notes): a `default.pgo` file in the main package's directory is used automatically; the compiler raises the inlining budget (the size limit up to which it will paste a function into its caller) for functions that the profile shows are called from hot call sites (places in the code that run very often), so a function just over the normal inlining cost limit can still be inlined at its hot call sites specifically.
 
 A bigger binary in those spots, in exchange for skipping a call's overhead exactly where it is measured to matter.
 
@@ -534,21 +624,32 @@ Collect `default.pgo` from a CPU profile pulled from real production traffic (`g
 
 ## 7. In production 🔴
 
-- **Real systems:** Go's own `net/http/pprof` is how most Go services expose profiling; Pyroscope, Google Cloud Profiler and Parca all continuously pull CPU and heap profiles from fleets of instances (via `net/http/pprof` or an SDK) and let you diff "this deploy" against "last week" without reproducing anything locally.
+> 🟡 → 🔴 **You now know** how to write a trustworthy benchmark, read CPU and heap profiles, catch lock queues, take a trace and feed a profile to PGO. **Next is the advanced part**: how big companies profile all the time in production, what breaks, and how sampling and PGO really work inside.
+
+
+- **Real systems:** Go's own `net/http/pprof` is how most Go services expose profiling; Pyroscope, Google Cloud Profiler and Parca (continuous profilers: tools that collect profiles all day and store them) all continuously pull CPU and heap profiles from fleets of instances (via `net/http/pprof` or an SDK) and let you diff "this deploy" against "last week" without reproducing anything locally.
 
   `benchstat` is the standard tool behind most Go performance PRs that claim a measured improvement.
 - **Failure modes → fixes:**
   - `net/http/pprof` mounted on the same mux as the public API → anyone can pull a CPU profile (or worse, trigger a 30-second one) over the internet; serve it on a private listener only.
   - A heap profile read as "this is current memory usage" when it was `alloc_space`, not `inuse_space` → always check `-sample_index` before drawing a conclusion.
   - A benchmark's result silently optimized away because nothing observable used it → assign to a package-level variable, or rely on `for b.Loop()` (Go 1.24), which the compiler cannot prove is a fixed, eliminable iteration count.
-  - Shipping `-race` builds to production "to catch races in the wild" → the race detector's 5–10× overhead is for CI and canaries, not steady-state production traffic.
-- **What to monitor:** CPU and heap profile deltas between deploys in a continuous profiler; p99 latency alongside a block/mutex profile sampled at a low, always-on fraction, so contention is visible without waiting for an incident; goroutine count over time (a slow leak shows up in the goroutine profile's count long before it OOMs).
+  - Shipping `-race` builds to production "to catch races in the wild" → the race detector's 5–10× overhead is for CI (the automatic build-and-test pipeline) and canaries (a small slice of servers that get a new release first), not steady-state production traffic.
+- **What to monitor:** CPU and heap profile deltas between deploys in a continuous profiler; p99 latency alongside a block/mutex profile sampled at a low, always-on fraction, so contention is visible without waiting for an incident; goroutine count over time (a slow leak shows up in the goroutine profile's count long before it OOMs: runs out of memory and gets killed).
 
 ## 8. Deep dive 🔴
 
-**Why CPU profiling is sampling, not instrumentation.** `pprof.StartCPUProfile` arranges for the OS to deliver a `SIGPROF` signal to the process roughly 100 times per second; on each signal, the runtime records the stack of whatever goroutine the signal landed on.
+**Why CPU profiling is sampling, not instrumentation.** `pprof.StartCPUProfile` arranges for the OS to deliver a `SIGPROF` signal (a tiny interrupt the operating system sends to a running program) to the process roughly 100 times per second; on each signal, the runtime records the stack of whatever goroutine the signal landed on.
 
 Over thousands of samples, the fraction landing in a given function converges on the fraction of CPU time it actually used.
+
+```mermaid
+flowchart LR
+    OS["OS timer<br/>~100 times a second"] -- "SIGPROF" --> RT["Go runtime"]
+    RT --> ST["note the running<br/>function's stack"]
+    ST --> TL["tally per function"]
+    TL --> P["after 30 s: about 3,000 samples<br/>= CPU share per function"]
+```
 
 This is why a CPU profile needs the program to run for a meaningful duration (seconds, not milliseconds) to be statistically trustworthy, and why a profile of a mostly-idle program (like the noisy top-10 list above, dominated by sleeping scheduler threads) tells you about idle time, not hot code.
 
@@ -556,7 +657,7 @@ This is why a CPU profile needs the program to run for a meaningful duration (se
 
 Setting it to `1` records every allocation, at a real cost, useful for a short diagnostic run but not for production.
 
-**Why PGO's threshold is a CDF, not a flat count.** The compiler ranks call edges by sample count and only treats edges within a cumulative percentage of total samples (the "hot-callsite-thres-from-CDF" value printed above) as hot.
+**Why PGO's threshold is a CDF (cumulative distribution: "the top call edges that together make up X% of all samples"), not a flat count.** The compiler ranks call edges by sample count and only treats edges within a cumulative percentage of total samples (the "hot-callsite-thres-from-CDF" value printed above) as hot.
 
 A function called a million times but accounting for 0.1% of total CPU is not "hot" by this measure, while a function called rarely but accounting for 20% of CPU time is.
 
@@ -610,6 +711,30 @@ But measure first, since (as this note's own benchmark showed) pooling a `string
 - PGO (`default.pgo`, Go 1.21+, `-pgo=auto` by default) only helps call sites the profile shows as genuinely hot — collect it from real traffic, not a microbenchmark.
 - Typical fixes once a profile confirms the bottleneck: preallocate, `strings.Builder` over `+=`, `sync.Pool` for repeated same-shape allocations (measure — it isn't always the win), flatter structs to cut GC scan time.
 - `runtime/trace.FlightRecorder` (Go 1.25, documented) keeps a rolling trace window and dumps it only on demand, for always-on-capable incident tracing.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Which tool answers "is this one function fast?"
+> A benchmark (`testing.B`).
+
+> [!question]- What does `-benchmem` add to benchmark output?
+> Bytes allocated per call (B/op) and number of allocations per call (allocs/op).
+
+> [!question]- Where should `net/http/pprof` be served?
+> On a private admin port only, never on the public router or `http.DefaultServeMux`.
+
+🟡 Medium
+
+> [!question]- A heap profile shows 20 GB in `alloc_space` but 1.5 MB in `inuse_space`. Is there a leak?
+> No. 20 GB was made over the whole run and mostly freed; only 1.5 MB is live now. Watch `inuse_space` grow over time to spot a leak.
+
+> [!question]- Your benchmark got 10% faster in one run. Why is that not enough?
+> One run can swing 2× from noise. Run `-count=10` on both versions and let `benchstat` say whether the change is significant.
+
+> [!question]- Why do block and mutex profiles show nothing in a fresh program?
+> They are off by default. Turn them on with `runtime.SetBlockProfileRate` and `runtime.SetMutexProfileFraction`.
 
 ## Links
 

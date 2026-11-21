@@ -50,6 +50,11 @@ flowchart TD
 > - 🟡 **Know the basics?** Add section 3 (the five steps), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Production Debugging Playbook]]: check "what changed" first, and stop the damage before hunting the cause.
+> - [[Incident Response]]: one person leads, and you post short updates on a fixed schedule.
+> - [[Deployment Strategies - Rolling, Blue-Green, Canary]]: a new version can replace old pods a few at a time (rolling), switch all at once (blue-green), or go to a small share first (canary).
+
 **From zero, in 60 seconds** 🟢
 
 Your team ships new code to the live website. That is a **deploy**.
@@ -98,6 +103,11 @@ This playbook is about doing the second one safely.
 | Feature flag | A switch that turns code on or off without a deploy | `new_discount=false` |
 | Migration | A change to the database schema | Adding a column |
 | Mitigate | Stop the user pain, even before you know the cause | Roll back first |
+| CrashLoopBackOff | Kubernetes waiting longer and longer before restarting a pod that keeps crashing | new pods die on start |
+| ImagePullBackOff | Kubernetes cannot download the new container image | wrong image tag |
+| Ready | A pod has passed its readiness check and may get traffic | 0/3 Ready after a rollout |
+| Hotfix | A quick code fix shipped straight to production | `v43` fixes one null check |
+| Business metric | A number about the business, not the servers | orders per minute |
 
 **Picture it**
 
@@ -143,6 +153,13 @@ If detection takes 6 minutes and the rollback takes 4, the incident costs about 
 > [!tip] Remember
 > The cost of a bad deploy is (users affected) x (minutes until mitigation). Both factors shrink with canaries, fast alerts and one-command rollback.
 
+### Real-life example: a discount that breaks checkout 🟢
+
+Imagine a shopping app like Myntra releasing a new discount feature at noon.
+For carts without a discount code, the new code hits an empty value and checkout fails for 3 in 10 people.
+Servers look healthy and CPU is normal, but orders per minute drop sharply.
+The on-call sees the drop line up with the deploy, rolls back in three minutes, and orders recover; the bug is fixed calmly afterwards.
+
 ## 2. Mental model 🟢
 
 **Analogy: replacing a part in a running machine.** You swap one gear and the machine starts to rattle. The first response is to put the old gear back, not to study the rattle while the machine keeps running.
@@ -172,7 +189,17 @@ flowchart LR
 > [!tip] Remember
 > Ask "what state did v2 write?" before you press undo. Code undoes cleanly. State does not.
 
+## Common beginner mistakes 🟢
+
+- **Debugging the new code while users fail** → every minute costs orders → roll back or flip the flag first.
+- **Trusting "rollout complete"** → Kubernetes only checks pods started, not that answers are right → watch error rate and business metrics after every deploy.
+- **Rolling back past a database migration** → old code may not understand the new schema → keep migrations backward-compatible (expand first, remove later).
+- **Treating config changes as safe** → a setting change breaks things just like code → deploy config with the same care and a rollback plan.
+- **Graphs without a version label** → you cannot compare old vs new → tag metrics with a short version label.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a bad deploy's cost is users hurt times minutes until you undo it. **Next we open the box**: the first five minutes, how to prove the deploy is guilty, how to read the rollout and the new pods, the ways to mitigate, and how to confirm recovery.
 
 ### The first 5 minutes
 
@@ -193,6 +220,11 @@ Follow this checklist in order. Do not skip step 1 even if you "know" what it is
 
 **In plain words:** not every problem after a deploy is caused by the deploy. This map helps you tell "it was our new code" from "something else broke at the same time".
 
+**Step by step:**
+1. Did errors start within minutes of the rollout? Suspect the deploy.
+2. Are only new-version pods failing while old ones are fine? The deploy is guilty.
+3. Did something else change at the same time (dependency, traffic, config)? Check it before blaming the code.
+
 Not every post-deploy problem is the deploy. This flowchart separates "bad deploy" from look-alikes.
 
 ```mermaid
@@ -211,6 +243,11 @@ flowchart TD
 ### Step 1: Prove the deploy is guilty
 
 **In plain words:** if the new version fails and the old version, running at the same time, does not, the new version is guilty. The queries below just compare the two.
+
+**Step by step:**
+1. Split errors by `version` label: say `v42` 12% errors, `v41` 0.1%.
+2. Line up the error graph with the deploy marker.
+3. Same jump on both versions? It is not the deploy.
 
 ```mermaid
 flowchart LR
@@ -256,6 +293,11 @@ kubectl get pods -n prod -l app=orders-api \
 
 **In plain words:** sometimes the new code never even started properly. These commands show whether the new copies came up healthy.
 
+**Step by step:**
+1. `kubectl rollout status` and `kubectl get pods`: are new pods Ready?
+2. Look for `CrashLoopBackOff` or `ImagePullBackOff`.
+3. `kubectl get events` shows failed probes or scheduling problems.
+
 ```bash
 kubectl rollout status deployment/orders-api -n prod
 kubectl rollout history deployment/orders-api -n prod
@@ -281,6 +323,11 @@ increase(kube_pod_container_status_restarts_total{pod=~"orders-api-.*"}[10m]) > 
 ### Step 3: Read the new pod's evidence
 
 **In plain words:** look at the new copy's logs and crash reasons. They often name the bug directly.
+
+**Step by step:**
+1. `kubectl logs` on a new pod, and `--previous` if it restarted.
+2. `kubectl describe pod` for the crash reason (OOMKilled, exit code).
+3. Look for one error repeated, like a nil value or a missing config key.
 
 ```bash
 kubectl get pods -n prod -l app=orders-api
@@ -314,6 +361,12 @@ A ratio near 1.0 means the container is close to being killed. See [[Debugging M
 ### Step 4: Mitigate
 
 **In plain words:** pick the quickest safe way to stop the pain: undo the deploy, flip a switch off, or move traffic away.
+
+**Step by step:**
+1. Feature flag for the new code? Turn it off (seconds).
+2. Otherwise `kubectl rollout undo` (minutes).
+3. Canary still running? Send all traffic back to the old version.
+4. Post an update saying what you did.
 
 Pick the fastest option that is safe:
 
@@ -357,6 +410,11 @@ helm rollback orders-api 12 -n prod --wait
 ### Step 5: Confirm recovery
 
 **In plain words:** don't trust the undo button. Watch the graphs go back to normal before you say "fixed".
+
+**Step by step:**
+1. Watch error rate and p99 return to the pre-deploy level.
+2. Check business metrics too, like orders per minute.
+3. Keep watching for one full traffic cycle before saying "fixed".
 
 - The same error and latency graphs return to baseline (give them at least 2 to 3 full rate windows, so 10 to 15 minutes for a `[5m]` window).
 - Readiness is green: `kube_deployment_status_replicas_available == kube_deployment_spec_replicas`.
@@ -460,6 +518,9 @@ flowchart TD
 > Assuming "rollback" is always safe. It is safe for stateless code. It is dangerous when v2 has written messages, rows or cache entries that v1 cannot parse.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how to prove a deploy is guilty, undo it safely, and choose between rolling back and fixing forward. **Next is the advanced part**: being rollback-ready before you need it, how rollbacks themselves fail, and the internals (how `rollout undo` works, mixed-version windows, version labels).
+
 
 ### What to check for rollback readiness (before you need it)
 
@@ -584,6 +645,30 @@ This join works only if `build_info` carries a `pod` label matching the request 
 - Verify with the graphs that alerted, over 10 to 15 minutes, plus the business metric.
 - Freeze deploys during the incident.
 - Prevent: canary + SLO abort, expand/contract migrations, flags, `version` label.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Errors jumped two minutes after a deploy. What do you do first?
+> Roll back (or flip the feature flag off), then investigate.
+
+> [!question]- What is a canary release?
+> Sending the new version to a small share of traffic first, like 5%.
+
+> [!question]- Rollback or roll forward: which is usually the default?
+> Rollback; roll forward only when going back would break saved data.
+
+🟡 Medium
+
+> [!question]- Kubernetes says the rollout succeeded, but orders dropped. How?
+> It only checks pods started and passed probes, not that they give correct answers.
+
+> [!question]- Why can rolling back after a migration be dangerous?
+> The old code may not work with the new database schema.
+
+> [!question]- 400 orders/min, a bad deploy fails 25% of them for 10 minutes. How many orders lost?
+> 400 × 0.25 × 10 = 1,000.
 
 ## Links
 

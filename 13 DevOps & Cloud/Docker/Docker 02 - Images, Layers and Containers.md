@@ -41,6 +41,9 @@ Think of the image as a sealed stack of transparencies, each one adding or chang
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Docker 01 - Why Containers]]: a container is an isolated process started from an image, and the image carries the app plus everything it needs.
+
 **From zero, in 60 seconds** 🟢
 
 A Docker **image** is a read-only bundle of files plus a note saying how to start the app.
@@ -84,6 +87,11 @@ Docker images are built from stacked layers, so only the changed layer travels.
 | Tag | A human-friendly, movable name for an image | `myapi:latest` |
 | Digest | An exact content hash that never changes | `sha256:9f86d0...` |
 | Hash | A short fingerprint computed from content | Same bytes always give the same hash |
+| Base image | The ready-made image your Dockerfile starts `FROM` | `golang:1.24-alpine` |
+| Manifest | The small file that lists an image's layers and settings; its hash is the image's digest | One JSON file per image |
+| overlay2 (union filesystem) | The Docker feature that stacks layers so they look like one folder | Your app sees one `/` folder |
+| Copy-on-write | A file is copied into the writable layer only when someone changes it | Editing `/etc/hosts` copies it up first |
+| Multi-arch image | One tag that holds versions for different CPU types | Same tag works on Intel and Apple-silicon machines |
 
 **Picture it**
 
@@ -113,11 +121,19 @@ Where it breaks: you cannot truly erase a lower sheet; deleting a file in a late
 
 Without layering, every image rebuild would re-upload and re-store the entire filesystem, even when only one file changed. Teams pushing images several times a day would pay for and wait on gigabytes of redundant transfer and storage every time, and two images sharing the same base (say, `golang:1.24-alpine`) would duplicate that base entirely on every host that pulled both.
 
-Concretely: a Go service's image is roughly 350 MB total, but around 320 MB of that is the Alpine base and Go runtime layers shared by every other Go service's image on the same registry and the same host.
+Concretely: a Go service's image is roughly 350 MB total, but around 320 MB of that is the Alpine base (Alpine is a very small Linux) and Go runtime layers shared by every other Go service's image on the same registry and the same host.
 
 Docker stores and transfers each of those shared layers exactly once; only the remaining ~30 MB of application-specific layers differs per service.
 
 A CI pipeline redeploying the same service after a one-line code change re-pushes and re-pulls only the layer(s) that actually changed — typically a few megabytes, not the full 350 MB.
+
+### Real-life example: 100 new servers during a cricket final 🟢
+
+Think of a streaming app like Hotstar adding 100 extra servers just before a big cricket match.
+Each new server must pull the app's image before it can serve anyone.
+Most of that image is the same base OS and runtime layers that are already cached nearby, so only the small app layer is new.
+Servers come up in seconds instead of each downloading hundreds of megabytes from scratch.
+Layers are what make "add 100 servers right now" practical.
 
 ## 2. Mental model 🟢
 
@@ -127,11 +143,28 @@ A **container** is one specific cake you can still poke at: it has the full bake
 
 Throwing that cake away and baking a fresh one from the same recipe gets you back to the exact same starting stack — nothing you did to the plate persists.
 
+## Common beginner mistakes 🟢
+
+- **Deploying `:latest` to production** → it can point to a different image tomorrow, so two servers may run different code → deploy a version tag or, better, the digest.
+- **Deleting a big file in a later `RUN` line** → the earlier layer still holds it, so the image does not shrink → never add it, or add and delete it in the same `RUN`.
+- **Putting `COPY . .` before `RUN go mod download`** → every code change re-downloads all libraries → copy `go.mod`/`go.sum` first, download, then copy the rest.
+- **Saving important files inside the container** → they live in the writable layer and vanish on `docker rm` → use a volume.
+- **Thinking `docker rmi` frees space right away** → a stopped container or another image may still use those layers → remove old containers too, or run `docker system prune`.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that an image is a stack of read-only layers and a container adds one writable layer on top. **Next we open the box**: what files an image is really made of, how Docker makes the stack look like one folder, and why a tag is not a safe name for production.
 
 **In plain words:** an image is a list of layer files plus a small settings file. Docker stacks the layers so they look like one folder.
 
-A Docker image is, formally, an **OCI image**: a config JSON (entrypoint, environment, exposed ports, the ordered list of layer digests) plus the layers themselves, each a `tar` archive of filesystem changes (added, modified, or deleted files) relative to the layer below it.
+**Step by step:**
+1. `docker build` saves each file-changing step as one layer: a zip-like bundle of just the files that step added or changed.
+2. It also writes a small settings file: which program to start, which environment variables to set, and the list of layers in order.
+3. `docker run` asks overlay2 to stack those layers, lowest first, and add one empty writable layer on top.
+4. Your app reads `/app/server`. Docker finds it in a lower layer and serves it as is.
+5. Your app writes `/tmp/cache.txt`. Docker puts it only in the writable layer. The image stays untouched.
+
+A Docker image is, formally, an **OCI image** (built to the Open Container Initiative's shared format, so any tool can read it): a config JSON (entrypoint, which is the command that starts the app; environment, exposed ports, the ordered list of layer digests) plus the layers themselves, each a `tar` archive (one file that bundles many files, like a zip without compression) of filesystem changes (added, modified, or deleted files) relative to the layer below it.
 
 ```mermaid
 flowchart TB
@@ -170,10 +203,23 @@ The original in the image is never touched, which is exactly why many containers
 
 **In plain words:** a tag (like v3 or latest) is a sticky note that can be moved to another image. A digest is a fingerprint that always means the exact same image.
 
-A **tag** (`myapi:v3`, `node:20`, `latest`) is a human-friendly, *mutable* pointer that a registry maps to some digest at push time; pushing a new image to the same tag silently repoints it.  A **digest** (`myapi@sha256:3f2a9c…`) is the SHA-256 hash of the manifest itself — it can only ever refer to one specific, immutable set of layers and config.
+**Step by step:**
+1. Monday: you push an image and tag it `myapi:v3`. The registry notes "`v3` → `sha256:3f2a…`".
+2. Tuesday: someone pushes a different build with the same tag. Now "`v3` → `sha256:9b71…`".
+3. A server that pulls `myapi:v3` on Tuesday gets different code than one that pulled on Monday.
+4. A server that pulls `myapi@sha256:3f2a…` always gets Monday's exact image, forever.
+
+```mermaid
+flowchart LR
+    T["tag v3"] -->|"Monday"| A["sha256:3f2a…"]
+    T -.->|"Tuesday, repointed"| B["sha256:9b71…"]
+    D["digest @sha256:3f2a…"] --> A
+```
+
+A **tag** (`myapi:v3`, `node:20`, `latest`) is a human-friendly, *mutable* pointer that a registry maps to some digest at push time; pushing a new image to the same tag silently repoints it.  A **digest** (`myapi@sha256:3f2a9c…`) is the SHA-256 hash (a 64-character fingerprint of the content) of the manifest itself — it can only ever refer to one specific, immutable set of layers and config.
 
 > [!warning] The `latest` pitfall
-> `latest` is not "the newest version" in any enforced sense — it's just whatever tag happened to be pushed without an explicit tag, which is frequently an old build nobody bothered to re-tag. Pulling `myapi:latest` in production gives no guarantee about *which* image you get, and no two pulls are guaranteed to return the same bytes. Deploy pipelines should resolve a build to its digest and deploy that digest, falling back to a semantic or git-SHA tag only for human readability.
+> `latest` is not "the newest version" in any enforced sense — it's just whatever tag happened to be pushed without an explicit tag, which is frequently an old build nobody bothered to re-tag. Pulling `myapi:latest` in production gives no guarantee about *which* image you get, and no two pulls are guaranteed to return the same bytes. Deploy pipelines should resolve a build to its digest and deploy that digest, falling back to a semantic (like `v1.4.2`) or git-SHA (the commit ID, like `a1b2c3d`) tag only for human readability.
 
 ## 4. Worked example 🟡
 
@@ -191,7 +237,7 @@ RUN go build -o server .
 CMD ["./server"]
 ```
 
-Each instruction that touches the filesystem creates one layer. **Representative output (`docker history`, Docker Engine 27, image built 2026-11-07):**
+Each instruction that touches the filesystem creates one layer. **Representative output (`docker history`, which lists an image's layers and their sizes; Docker Engine 27, image built 2026-11-07):**
 
 ```text
 IMAGE          CREATED              CREATED BY                      SIZE
@@ -219,7 +265,7 @@ Running `docker run` three times against the same image produces three independe
 
 A container is not just storage — it is a **process**.
 
-Its main process (the image's `CMD`/`ENTRYPOINT`) becomes **PID 1** inside the container's own PID namespace, receives `SIGTERM` directly when the container is asked to stop (see [[Docker 03 - CLI Essentials]]), and its exit code becomes the container's own exit code, visible in `docker ps -a`.
+Its main process (the image's `CMD`/`ENTRYPOINT`, the start command written in the Dockerfile) becomes **PID 1** inside the container's own PID namespace, receives `SIGTERM` directly when the container is asked to stop (see [[Docker 03 - CLI Essentials]]), and its exit code becomes the container's own exit code, visible in `docker ps -a`.
 
 That exit code is what tells `web-1` apart from a container that's still alive: "container" names a running (or exited) process plus its writable layer, while "image" names only the inert bytes it was started from.
 
@@ -251,6 +297,9 @@ That exit code is what tells `web-1` apart from a container that's still alive: 
 - Deleting an image tag does not reclaim disk space if a container (even a stopped one) still references its layers, or if another image shares them; `docker system prune` is often needed afterward (see [[Docker 03 - CLI Essentials]]).
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how layers stack, how copy-on-write protects the image, and why digests beat tags. **Next is the advanced part**: the image problems real teams hit (repointed tags, ballooning size, slow pulls), and the deeper reasons digests matter for security, multi-arch builds and BuildKit.
+
 
 - **Real systems:** registries such as Docker Hub, AWS ECR, and GitHub Container Registry store and deduplicate layers by digest across every image pushed to them; tools like `dive` inspect a built image's exact layer-by-layer size breakdown to find waste.
 - **Failure modes → fixes:**
@@ -296,6 +345,30 @@ That exit code is what tells `web-1` apart from a container that's still alive: 
 - Pulling fetches only layers you don't already have locally, by digest.
 - Deleting a file in a later layer doesn't shrink the image; the earlier layer that added it is still stored.
 - A multi-arch tag is really a manifest list; the client's own architecture picks which underlying image it actually pulls.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is the difference between an image and a container?
+> An image is a read-only stack of layers; a container is that stack plus one writable layer, running as a process.
+
+> [!question]- Which Dockerfile lines create layers?
+> Lines that change files, mainly `RUN`, `COPY` and `ADD`.
+
+> [!question]- Can one image start many containers at once?
+> Yes. Each container gets its own writable layer and runs on its own.
+
+🟡 Medium
+
+> [!question]- You change one line of Go code and rebuild. Why is the push only a few MB?
+> Only the layers after the changed step are rebuilt; the base and dependency layers are reused.
+
+> [!question]- A container edits one byte of a 100 MB file. What does overlay2 do?
+> Copy-on-write: it copies the whole 100 MB file up into the writable layer, then changes it there.
+
+> [!question]- Why pin production deploys by digest instead of `myapi:v3`?
+> A tag can be repointed to other bytes; a digest always means the same exact image.
 
 ## Links
 

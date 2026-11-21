@@ -31,6 +31,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Processes, Threads and Context Switching]]: a process is a running program with its own memory, and a thread is the worker inside it that the CPU actually runs. A syscall is something one thread does.
+
 **From zero, in 60 seconds** 🟢
 
 Your program is not allowed to touch the hardware. It cannot read a disk, send a packet, or even print to the screen by itself. Only the **kernel** — the core of the operating system — may do those things.
@@ -73,6 +76,11 @@ That request is a system call, and the switch from "your code" to "OS code" is c
 | OS thread | A unit the OS schedules on a CPU core | Each `M` in Go's scheduler |
 | Goroutine | Go's lightweight task, run on OS threads | `go handle(conn)` |
 | vDSO | Kernel code mapped into your process to skip the trap | `time.Now()` without a syscall |
+| Privilege ring / level | The CPU's hardware-enforced "how much power" setting | ring 3 = user, ring 0 = kernel |
+| MMU | The CPU part that maps each process's addresses to real RAM and blocks forbidden access | stops your app reading kernel memory |
+| Syscall number | The integer that names which kernel service you want | 1 = `write` on x86-64 Linux |
+| File descriptor (fd) | A small number the kernel gives you for an open file or socket | fd 1 = standard output |
+| cgo | Go calling C code | `C.sqlite3_open(...)` |
 
 **Picture it**
 
@@ -99,7 +107,7 @@ Where it breaks: a teller serves many customers in parallel windows, while a sys
 
 ## 1. Why it exists 🟢
 
-If any program could write directly to the disk controller's registers, write to another process's memory, or mask interrupts, no multi-user, multi-process operating system could promise isolation or stability. Misbehaving code could read another user's files or freeze the whole machine.
+If any program could write directly to the disk controller's registers, write to another process's memory, or mask interrupts (switch off the hardware signals the OS uses to regain control), no multi-user, multi-process operating system could promise isolation or stability. Misbehaving code could read another user's files or freeze the whole machine.
 
 CPUs since the 1970s solve this by giving themselves at least two **privilege levels** — modes the hardware itself enforces, not something software can fake its way around.
 
@@ -115,12 +123,19 @@ flowchart TB
 
 Linux and Go-targeted platforms use exactly two of these levels: ring 3 / EL0 for every ordinary program (**user mode**), and ring 0 / EL1 for the kernel (**kernel mode**).
 
-A program in user mode cannot execute the privileged instructions that touch hardware or change CPU-wide state, and the MMU (see [[Virtual Memory, Paging and the TLB]]) stops it from reading or writing physical memory it doesn't own.
+A program in user mode cannot execute the privileged instructions that touch hardware or change CPU-wide state, and the MMU (memory management unit, the hardware that translates and guards memory addresses; see [[Virtual Memory, Paging and the TLB]]) stops it from reading or writing physical memory it doesn't own.
 
 So when `fmt.Println` needs to actually write bytes to a terminal, or an HTTP server needs to accept a TCP connection, that code cannot do the privileged part itself. It has to ask the kernel — the only code that runs in kernel mode — to do it. That ask is a **system call**.
 
 > [!tip] Remember
 > Two privilege levels, one gate between them. Everything about system calls below is really about how that one gate is designed to be narrow, audited, and unavoidable.
+
+### Real-life example 🟢
+
+When you upload a photo to Instagram, the server's code cannot touch the network card or the disk itself.
+It asks the kernel with syscalls: `accept` to take your connection, `read` to receive the photo bytes, `write` to save them to a file, and `write` again to send "uploaded" back.
+A busy server makes millions of these calls per second, so each one's cost (about 0.5 µs here) adds up.
+That is why servers buffer small writes, and why tools like Nginx and Go's netpoller work hard to make fewer, bigger calls.
 
 ## 2. Mental model 🟢
 
@@ -144,11 +159,28 @@ flowchart LR
 > [!warning] Common mistake
 > Thinking a system call is just "a function call that happens to be slow." It isn't a function call at all in the CPU's eyes — it's a hardware-enforced privilege-level change, with the CPU itself switching modes and jumping to one fixed address the kernel controls, not wherever the caller points it.
 
+## Common beginner mistakes 🟢
+
+- **Thinking a syscall is just a slow function call** → it is a hardware switch of privilege level through one fixed kernel entry point → count crossings, not just lines of code.
+- **Writing one log line per `write()`** → each call pays the full trap cost → wrap the file in `bufio.Writer` and flush in batches.
+- **Reading `os.Getpid()`'s few nanoseconds as "syscalls are cheap"** → the PID is cached, so most calls never trap → measure a real trap like `write` instead.
+- **Assuming one blocking syscall freezes a Go program** → Go hands the other goroutines to another OS thread → but many blocked calls at once do pile up OS threads; add timeouts.
+- **Calling C (cgo) in a hot loop to "go faster"** → each cgo call has fixed overhead and pins an OS thread → prefer pure Go on hot paths.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that your program runs in a restricted user mode and must ask the kernel, through a syscall, for anything involving hardware. **Next we open the box:** the exact round trip of one syscall, why it is requested by number, and the vDSO shortcut that lets a few calls skip the trap.
 
 ### The user → kernel → user round trip
 
 **In plain words:** Making a syscall is a five-step round trip: load the request into registers, trap, let the kernel do the privileged work, write the result back, and resume exactly where you left off.
+
+**Step by step (`write(1, "hi", 2)`):**
+1. Your code puts the syscall number for `write` (1) and the arguments (fd 1, the address of "hi", length 2) into CPU registers.
+2. It runs the trap instruction (`syscall` on x86-64). The CPU switches to kernel mode and jumps to the kernel's one fixed entry point.
+3. The kernel checks the request: is fd 1 open for this process, and does "hi" really live in this process's memory?
+4. The kernel copies the 2 bytes to the terminal or file.
+5. It puts the result (2 bytes written) in a register, switches back to user mode, and your code carries on from the next line.
 
 **Picture it:**
 
@@ -169,13 +201,19 @@ sequenceDiagram
     CPU-->>App: resume right after the trap instruction,<br/>with the return value in a register
 ```
 
-**Example:** Three things in that diagram each cost real, separate time: the trap/return instructions themselves (switching privilege level and often flushing speculative state — made significantly more expensive on Intel/AMD CPUs since the Spectre/Meltdown mitigations of 2018); the kernel's own bookkeeping (validating that every pointer argument actually points into memory the calling process is allowed to read/write, before touching it); and whatever the specific syscall does (a disk read can block for milliseconds; `getpid` just returns a number).
+**Example:** Three things in that diagram each cost real, separate time: the trap/return instructions themselves (switching privilege level and often flushing speculative state, meaning work the CPU did early on a guess — made significantly more expensive on Intel/AMD CPUs since the Spectre/Meltdown mitigations of 2018); the kernel's own bookkeeping (validating that every pointer argument actually points into memory the calling process is allowed to read/write, before touching it); and whatever the specific syscall does (a disk read can block for milliseconds; `getpid` just returns a number).
 
 **Why it matters:** None of these three costs is "the syscall's cost" on its own — all three stack up, which is why two syscalls that look identical in source code (`write()` to a pipe with room vs. `write()` to a full one) can have wildly different real latency.
 
 ### Why a raw number, not a function call
 
 **In plain words:** User code never calls kernel code by address. It hands over a plain integer — the **syscall number** — and the kernel decides what that number means.
+
+**Step by step:**
+1. At boot, the kernel builds a table: number 0 → `read` handler, 1 → `write` handler, and so on.
+2. Your program puts the number 1 in a register and traps.
+3. The kernel looks up entry 1 in its own table and runs the `write` handler.
+4. Your program never gives an address to jump to, so it can only pick from the kernel's menu.
 
 **Picture it:**
 
@@ -192,6 +230,12 @@ flowchart LR
 ### vDSO: skipping the trap for a few syscalls
 
 **In plain words:** A handful of syscalls are so cheap and so harmless (read-only, no privileged side effect) that Linux lets you make them without a trap at all, by mapping a tiny bit of kernel code straight into your own process.
+
+**Step by step (`time.Now()` on Linux):**
+1. When your program starts, the kernel maps a small page of its code (the vDSO) and a shared "current time" page into your process.
+2. The kernel keeps updating that time page in the background.
+3. `time.Now()` calls the vDSO's `clock_gettime`, which simply reads the shared page in user mode.
+4. No trap, no mode switch: about 20 ns instead of hundreds.
 
 **Picture it:**
 
@@ -252,11 +296,11 @@ syscall                ; trap into the kernel
 ; on return: rax holds bytes written, or a negative errno
 ```
 
-Go's standard library hides exactly this sequence behind `os.File.Write`, `syscall.Write`, or (per OS) a cgo-free assembly trampoline.
+Go's standard library hides exactly this sequence behind `os.File.Write`, `syscall.Write`, or (per OS) a cgo-free assembly trampoline (a tiny hand-written stub that sets the registers and runs the trap).
 
 ### Tracing the measurement by hand
 
-1. Open `/dev/null` and get its file descriptor — this needs its own syscall (`open`), done once, outside the timed loop.
+1. Open `/dev/null` (a special file that throws away everything written to it) and get its file descriptor — this needs its own syscall (`open`), done once, outside the timed loop.
 2. In a tight loop, call `syscall.Write(fd, buf)` with a 1-byte buffer. Every single call must trap into the kernel, because `write` is not vDSO-eligible — it has a real side effect (moving bytes).
 3. Separately, in a tight loop, call `os.Getpid()`. On many platforms the C library or runtime caches the PID after the first real call — a process's PID never changes after it starts — so this *looks* syscall-shaped but may not trap every time.
 4. Separately again, call a plain Go function that does a little arithmetic and returns — no kernel involvement at all. This is the "floor": the cost of a function call with zero crossings.
@@ -312,13 +356,15 @@ You don't choose to avoid syscalls for ordinary I/O — the alternative is "don'
 - Batching many small writes into fewer, larger `write()` calls (buffered I/O) amortizes the fixed per-call cost.
 - `io_uring` (see [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]]) goes further and lets you submit many I/O requests with a single trap.
 - A syscall that blocks ties up whatever is making it. In Go, a goroutine blocked in a syscall ties up its OS thread, not the whole scheduler — the runtime detects this and can spin up another OS thread so other goroutines keep running (see Deep dive) — but a C program with one thread blocked in `read()` is simply stuck until that read returns.
-- Checking "is this worth a syscall" matters at scale: a server doing one `write()` per log line instead of buffering can spend a surprising fraction of its CPU budget purely on trap overhead and kernel-side argument validation, invisible in a flame graph unless you look at `%system` time specifically.
+- Checking "is this worth a syscall" matters at scale: a server doing one `write()` per log line instead of buffering can spend a surprising fraction of its CPU budget purely on trap overhead and kernel-side argument validation, invisible in a flame graph (a chart of where CPU time is spent) unless you look at `%system` time (CPU time spent inside the kernel) specifically.
+
+> 🟡 → 🔴 **You now know** the syscall round trip, why requests go by number, the vDSO shortcut, and a measured trap cost. **Next comes the advanced part:** how syscall cost shows up in production Go services, how the Go runtime keeps running when a thread is stuck in the kernel, and why Meltdown made every syscall slower.
 
 ## 7. In production 🔴
 
 - **Real systems:** every blocking network read in `net/http`'s server goes through a real syscall (`read`/`recvfrom`) mediated by the Go netpoller's `epoll`/`kqueue` wait, not a busy loop; `bufio.Writer` exists specifically to turn many small `Write` calls into fewer syscalls; database drivers batch statements partly to reduce round trips at the network layer, which rests on the same "fewer crossings, more work per crossing" idea one level up.
 - **Failure modes → fixes:**
-  - Unexpectedly high `%system` CPU time with "nothing obviously systemic" running → suspect syscall-heavy code (unbuffered I/O, excessive `stat`/`open` calls); `strace -c` (Linux) sums syscalls by type and time, exactly as in the representative table above.
+  - Unexpectedly high `%system` CPU time with "nothing obviously systemic" running → suspect syscall-heavy code (unbuffered I/O, excessive `stat`/`open` calls); `strace -c` (Linux; `strace` is a tool that records every syscall a program makes) sums syscalls by type and time, exactly as in the representative table above.
   - A Go program with a huge thread count (`cat /proc/<pid>/status | grep Threads` on Linux) despite modest goroutine counts → many goroutines are blocked in syscalls simultaneously, each pinning an OS thread; check for missing timeouts or context cancellation on blocking calls.
   - cgo calls in a hot path cause unexpected latency → each cgo call has fixed overhead and can block a whole OS thread the same way a syscall can; avoid cgo in very hot paths where a pure-Go path exists.
 - **What to monitor:** `strace -c` (Linux) or equivalent per-syscall counts and time in staging; `/proc/<pid>/status`'s thread count next to `runtime.NumGoroutine()`; `runtime/trace`'s "syscall" goroutine state in a captured trace.
@@ -355,7 +401,7 @@ This is exactly why one blocking syscall does not stall an entire Go program, bu
 
 ### Fast-path vs slow-path syscalls in the Go runtime
 
-A handful of syscalls the Go runtime itself needs very frequently and knows cannot block long (e.g., futex waits used to implement mutexes) use a leaner internal path (`runtime.futex`) that skips the general `entersyscall`/`exitsyscall` machinery, because the runtime can prove the thread won't be stuck for long.
+A handful of syscalls the Go runtime itself needs very frequently and knows cannot block long (e.g., futex waits, the kernel's "sleep until this memory value changes" call, used to implement mutexes) use a leaner internal path (`runtime.futex`) that skips the general `entersyscall`/`exitsyscall` machinery, because the runtime can prove the thread won't be stuck for long.
 
 ### Kernel-side argument validation
 
@@ -425,6 +471,30 @@ Documented benchmarks after KPTI landed showed syscall-heavy workloads (e.g. hig
 - Measured on this machine: real trap (`write` to `/dev/null`) ≈ 420-550 ns; a cached "syscall-shaped" library call (`getpid`) ≈ 7-12 ns — don't mistake the second for typical syscall cost.
 - Go's `entersyscall`/`exitsyscall` free up a goroutine's scheduling context before a blocking syscall, so other goroutines keep running on other OS threads; each blocked syscall still pins one OS thread.
 - Batch small I/O operations (buffered writes, `io_uring`) to amortize per-call overhead when syscall rate, not syscall latency, is the bottleneck.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why can't your program read the disk directly?
+> It runs in user mode, which the CPU blocks from touching hardware; only the kernel in kernel mode can.
+
+> [!question]- What is a system call?
+> A request from your program to the kernel to do a privileged job, made through a trap instruction.
+
+> [!question]- Roughly how long did one real `write` trap take here?
+> About 0.4-0.5 µs (420-550 ns).
+
+🟡 Medium
+
+> [!question]- Why does `time.Now()` not need a real trap on Linux?
+> The vDSO maps kernel code and a live time page into your process, so it is read in user mode.
+
+> [!question]- Why does the kernel take a syscall number instead of an address to jump to?
+> So user code can only pick from the kernel's own menu and can never make the kernel run arbitrary code.
+
+> [!question]- What does Go do before a goroutine makes a blocking syscall?
+> `entersyscall` hands the thread's scheduler slot (P) to another OS thread so other goroutines keep running.
 
 ## Links
 

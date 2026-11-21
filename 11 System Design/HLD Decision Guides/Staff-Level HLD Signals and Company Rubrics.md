@@ -36,6 +36,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (the seven steps), 4 (worked example) and 5 (red flags, follow-ups).
 > - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the round goes requirements → numbers → simple design → deep dives → trade-offs.
+> - [[HLD Round - Complete Step-by-Step Guide]]: the nine steps and what to say at each; this note is about how the same steps are scored at each level.
+
 **From zero, in 60 seconds** 🟢
 
 Three people get the same design question and draw almost the same boxes.
@@ -74,6 +78,15 @@ This note lists what interviewers look for at each level.
 | --- | --- | --- |
 | HLD round | A design interview about the big boxes of a system | "Design a URL shortener" in 45 minutes |
 | Signal | Evidence the interviewer writes down about you | "Quantified load before picking a DB" |
+| SDE-2 / SDE-3 / Staff | Engineer levels: solid builder / owner of a system / leader across systems and teams | SDE-3 leads one service end to end |
+| Ambiguity | A vague prompt with missing details | "design a ride app" with no numbers |
+| Trade-off | Gaining one thing by giving up another | faster reads, slightly stale data |
+| SLA | A promise about uptime or speed | 99.9% a month |
+| Blast radius | How many users one failure or bad change can hurt | a canary limits it to 1% |
+| Dual write | Writing to the old and new system at once during a move | old DB stays the truth |
+| Shadow read | Reading from the new system too, comparing, but not showing it to users | diff job flags mismatches |
+| Reversible decision | A choice that is cheap to change later | a queue between services, unlike a primary key |
+| Leadership Principles | Amazon's published list of values its interviews probe with stories | "Customer Obsession" |
 | Rubric | The scoring guide interviewers use | Requirements, design, trade-offs, communication |
 | Ambiguity | A question with missing or unclear details | "Design chat" without saying how many users |
 | Trade-off | Gaining one thing by giving up another | Lower latency, higher cost |
@@ -123,6 +136,23 @@ The Staff engineer is the architect plus the project lead: they ask what the bui
 
 The analogy breaks because in an interview the interviewer is also the client who can change requirements mid-way; your job is to adapt, not to defend the first drawing.
 
+### Real-life example: the same food app, three levels 🟢
+
+Three candidates at a company like Swiggy or Flipkart get "design a food delivery app".
+The SDE-2 draws a clean, correct design once given the requirements.
+The SDE-3 asks for the numbers first, notices rider location updates are the heavy part, and goes deep there with options and costs.
+The Staff candidate also says what to build in v1, what number would trigger v2, how to migrate without downtime, and which team owns what.
+Same boxes; different reasoning and leadership.
+
+## Common beginner mistakes 🟢
+
+- **Drawing a bigger, fancier design to look senior** → unjustified boxes count against you → keep it simple and tie each box to a number.
+- **Asking 15 questions and never designing** → you show no decision-making → ask 5-6, write assumptions, move on.
+- **Sharding or multi-region on day one** → it reads as over-engineering → show a simple v1 and the trigger for v2.
+- **No answer to "how do you migrate?"** → the most common Staff follow-up goes unanswered → have backfill, dual write, verify, shift, rollback ready.
+- **Memorizing a "company rubric" from a forum** → rubrics change and vary by interviewer → prepare the shared core: clarify, quantify, decide, cost, failure.
+
+
 ```mermaid
 flowchart LR
     S2["SDE-2<br/>Works out a sound design<br/>given clear requirements"] --> S3["SDE-3<br/>Chooses between options<br/>with numbers and failure modes"]
@@ -134,9 +164,17 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the level is read from how you decide and lead, not from what you draw. **Next we open the box**: the signals per level, how to drive ambiguity, evolving v1 to v2, migration plans, company formats and Staff extras. Several steps start with a plain walk-through.
+
 ### Step 1: the signals by level
 
 **In plain words:** interviewers judge a few areas, and each level expects a higher bar in each. The table below is this note's own **study model** built from public interview guides and staffeng.com. It is not any company's official scorecard; those are not public.
+
+**Step by step (one prompt, "design notifications"):**
+1. SDE-2: draws a queue and workers, correct and clean.
+2. SDE-3: first asks volume, channels and priority, then picks a design and names its costs.
+3. Staff: also says which part is riskiest, goes deep there unasked, and plans how it grows and who owns it.
+4. Use the table to see the next level's behaviour and show it on purpose.
 
 ```mermaid
 flowchart TD
@@ -197,6 +235,12 @@ Rules of thumb:
 ### Step 3: evolving v1 to v2
 
 **In plain words:** real systems are built in stages. Show a **v1** that is boring and works, then say what number or event forces **v2**.
+
+**Step by step:**
+1. v1: one service, one database, a cache and a queue. Ship it.
+2. Name the trigger: "when the primary passes 60% CPU at peak".
+3. v2: shard or split the hot part, and say what that costs.
+4. v3: only if users are on other continents or a region outage hurt, add regions.
 
 ```mermaid
 flowchart LR
@@ -268,6 +312,12 @@ flowchart TD
 ### Step 6: Amazon-style overlay
 
 **In plain words:** with a behavioral overlay, the same design answer also needs stories. Public Amazon material lists the Leadership Principles (for example Customer Obsession, Ownership, Dive Deep, Bias for Action, Invent and Simplify). Map a few of them onto design behaviors.
+
+**Step by step:**
+1. Make a design choice: "managed queue and one database first".
+2. Give the reason in business terms: low cost per request, fast to ship.
+3. Link it to a principle (for example frugality) and, if asked, a real story from your work.
+4. The design answer and the leadership story become one answer.
 
 ```mermaid
 flowchart LR
@@ -405,6 +455,8 @@ flowchart TD
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** what each level looks like and how to show the next one. **Next comes the senior view**: how this maps to real promotion and design reviews, reading the interviewer's hints, making trade-offs reversible, and a 45-minute plan that shows every signal.
+
 - **Real design reviews** use the same signals: context, requirements, numbers, options, decision, rollout, risks, monitoring. See [[Architecture Decision Records]] and [[Production Readiness Review]].
 - **Real migrations** use the dual-write and shadow sequence above, with a diff job and a rollback flag.
 - **Real Staff work** is mostly alignment: writing the design doc, getting other teams to agree on contracts, and sequencing so something ships early.
@@ -493,6 +545,26 @@ flowchart LR
 - **Say it like this:** "I will ship v1 as X; I move to v2 when Y crosses Z; the migration is dual write, verify, shadow, ramp, with a rollback flag."
 - **Company advice:** use public prep material from the recruiter; do not trust forum rubrics.
 - **Always:** state assumptions, estimate, name the riskiest part, end with risks and monitoring.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) Does a bigger diagram score higher?
+> No. Unjustified boxes count against you; the level comes from reasoning.
+
+> [!question]- (easy) What does "driving ambiguity" mean?
+> Turning a vague prompt into a clear scope with a few questions and written assumptions.
+
+> [!question]- (easy) Why show a simple v1 first?
+> It works, and it lets you name the exact trigger for each later step.
+
+> [!question]- (medium) Name the migration steps in order.
+> Backfill, dual write, verify with a diff, shadow reads, gradual shift, keep a rollback path.
+
+> [!question]- (medium) What separates SDE-3 from SDE-2 in depth?
+> SDE-3 goes deep on two areas with options and costs, picking them from the numbers.
+
+> [!question]- (medium) What does "reversible decision" mean in an answer?
+> Spend time on choices that are hard to undo (keys, data model), move fast on cheap-to-change ones.
 
 ## Links 🟢
 

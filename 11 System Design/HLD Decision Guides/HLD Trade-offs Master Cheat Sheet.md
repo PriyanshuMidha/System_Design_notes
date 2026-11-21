@@ -34,6 +34,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add the rest of section 3 (the choice tables), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Fundamentals]]: systems are built from a standard set of blocks (load balancer, app servers, cache, database, queue), each fixing one pain.
+> - [[System Design Interview Framework]]: in the round you state requirements with numbers, then justify each box with a trade-off.
+
 **From zero, in 60 seconds** 🟢
 
 Designing a system is a long list of forks in the road. SQL or NoSQL? Queue or stream? Cache or not?
@@ -74,6 +78,14 @@ This note is a one-page map of those forks.
 | Throughput | How much work per second | 10,000 writes per second |
 | Consistency | Whether every reader sees the latest write | Bank balance must be exact |
 | Partitioning (sharding) | Splitting data across machines | Users A-M on node 1, N-Z on node 2 |
+| p99 | 99 out of 100 requests are faster than this | p99 = 200 ms |
+| QPS | Requests (queries) per second | 3,500 menu reads per second |
+| Staleness | How old a copy of the data may be | likes can be 5 s old |
+| Durability | Saved data survives crashes | a paid order is never lost |
+| Cache-aside | Check the cache, on a miss read the DB and fill the cache | menus in Redis |
+| Idempotency key | A unique ID so a retried request is not done twice | "pay" sent twice, charged once |
+| Outbox | Save the event in the same DB transaction as the data, publish it after | order row + event row together |
+| Saga | A multi-step process where each step has an undo | refund if no rider is found |
 | Async | The caller does not wait for the work to finish | Put "send email" on a queue |
 | Cache | A fast copy of data to avoid slow lookups | Redis in front of Postgres |
 
@@ -116,6 +128,23 @@ Think of a toolbox with labelled drawers. You do not invent a screwdriver each t
 
 The analogy breaks down in one place: tools in a toolbox are independent, but design choices interact. Choosing Kafka for the broker pushes you toward partition keys, which pushes you toward per-key ordering, which constrains how you scale consumers. A choice in one drawer changes the right answer in another.
 
+### Real-life example: Instagram's forks 🟢
+
+Instagram's posts and users started on PostgreSQL (relational), because they needed reliable data and joins.
+Photos live in object storage and reach you through a CDN.
+Your home feed mixes "pushed" posts from normal accounts with posts from huge accounts fetched when you open the app (a hybrid fan-out).
+Like counts can be a few seconds behind (eventual consistency), but a password change must apply at once.
+Each of those is one row in the tables below: a need, a pick, and a cost the team accepted.
+
+## Common beginner mistakes 🟢
+
+- **Naming a tool without the need** ("Kafka here") → the interviewer cannot tell why → say "I pick X because the system needs Y, and I accept Z".
+- **Choosing a distributed database for 50 GB** → you pay its complexity for nothing → one PostgreSQL with replicas handles far more.
+- **Treating each choice alone** → choices interact (sharding by user makes "all orders for a restaurant" hard) → check what one choice does to the others.
+- **Promising exactly-once delivery** → networks cannot guarantee it → say "at-least-once plus idempotent consumers".
+- **Strong consistency everywhere** → slower and less available for no reason → use it only for money, stock, seats and uniqueness.
+
+
 ```mermaid
 flowchart LR
     R["Requirements<br/>scale, latency, correctness"] --> Q["Key questions<br/>read/write ratio, staleness, loss"]
@@ -129,6 +158,8 @@ flowchart LR
 > Requirement, choice, cost. Say all three every time.
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** every choice is "requirement, choice, cost". **Next comes the map**: five questions behind most choices, then one table per family of decisions, and a master flowchart. A few sections start with a plain walk-through.
 
 ### 3.1 The five questions behind almost every choice
 
@@ -163,6 +194,13 @@ The thresholds (10k writes per second, 1 to 5 TB per node) are rough rules of th
 ### 3.2 Data store choices
 
 **In plain words:** Read each row as "if you see this need, pick this store, and watch out for this".
+
+**Step by step (reading one row):**
+1. Your system holds orders with payments and stock. Find the row whose "If you see" matches: money, orders, inventory.
+2. Read "Pick": relational, such as PostgreSQL.
+3. Read "Because": transactions and constraints keep money correct.
+4. Read "Watch out for" and say it aloud as the cost you accept.
+5. Follow the "Guide" link when the interviewer pushes deeper.
 
 | If you see | Pick | Because | Watch out for | Guide |
 | --- | --- | --- | --- | --- |
@@ -205,11 +243,17 @@ The honest summary: SQL is the default, NoSQL is a deliberate trade of query fle
 | On AWS, want zero broker ops | SQS (plus SNS for fan-out) | Fully managed, scales without capacity planning | Standard queue is at-least-once and unordered; FIFO has throughput caps | [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]] |
 | Need exactly-once effect | At-least-once plus idempotent consumer | True exactly-once delivery is not available end to end | Needs an idempotency key and a dedupe store | [[Delivery Semantics and Exactly-Once]] |
 | Write to DB and publish event atomically | Transactional outbox plus CDC | Avoids dual-write inconsistency | Extra table and relay process | [[Transactional Outbox and CDC]] |
-| Failing messages block the queue | Dead-letter queue | Isolates poison messages | Needs an alert and a replay path | [[Dead Letter Queues and Poison Messages]] |
+| Failing messages block the queue | Dead-letter queue (a side queue for messages that keep failing) | Isolates poison messages (messages that crash every consumer that reads them) | Needs an alert and a replay path | [[Dead Letter Queues and Poison Messages]] |
 
 ### 3.5 Sync versus async, push versus pull
 
 **In plain words:** Sync means wait for the answer; async means drop a note and move on. Push means do the work early; pull means do it when asked.
+
+**Step by step:**
+1. Ask: does the caller need the answer to continue? Price check, login: sync.
+2. Can the work be slow or retried later? Emails, reports: async through a queue.
+3. Must a few consumers react instantly? Push. Do consumers go offline or run at different speeds? Pull.
+4. For feeds: push to followers of normal accounts, pull for huge accounts.
 
 | Decision | Choose the first when | Choose the second when | Cost to name |
 | --- | --- | --- | --- |
@@ -268,7 +312,7 @@ sequenceDiagram
 | Write bursts, can lose a few seconds | Write-behind (write-back) | Batches writes to the DB | Data loss if cache dies before flush | [[Choosing a Caching Strategy - Decision Guide]] |
 | Static assets, public pages | CDN | Serves near the user, offloads origin | Purge delays; cache key mistakes | [[Choosing a Caching Strategy - Decision Guide]] |
 | One key gets huge traffic | Local in-process cache plus replicated key | Spreads the hot key | Per-node staleness | [[Hot Keys and Hot Partitions]] |
-| Memory bounded | LRU or LFU eviction plus TTL | Keeps useful items | LRU is hurt by scans; LFU adapts slowly | [[Cache Eviction Policies - LRU, LFU, TTL]] |
+| Memory bounded | LRU (drop the least recently used) or LFU (drop the least frequently used) eviction plus TTL | Keeps useful items | LRU is hurt by scans; LFU adapts slowly | [[Cache Eviction Policies - LRU, LFU, TTL]] |
 
 Read the failure modes before you commit: [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]] and [[Cache Invalidation, TTL and Consistency]].
 
@@ -298,7 +342,7 @@ Read the failure modes before you commit: [[Cache Failure Modes - Stampede, Aval
 | Even spread, easy resharding | Hash partitioning with consistent hashing | Moves little data when nodes change | Range queries become scatter-gather | [[Consistent Hashing]] |
 | Range scans by time or id | Range partitioning | Efficient scans | Hot recent range | [[Partitioning and Sharding]] |
 | Multi-service business transaction | Saga | Avoids distributed locks | Compensations are hard to write | [[Saga Pattern]] |
-| Multi-region active-active | Quorums or CRDTs, accept conflicts | Local writes everywhere | Conflict resolution logic | [[Multi-Region Architecture]] |
+| Multi-region active-active | Quorums or CRDTs (data types that merge concurrent edits on their own), accept conflicts | Local writes everywhere | Conflict resolution logic | [[Multi-Region Architecture]] |
 
 Why partition key choice matters most: the key decides the hot spot. Sharding orders by `user_id` spreads evenly; sharding by `created_date` sends all new writes to one shard. See [[CAP and PACELC]] for the theory behind the first two rows.
 
@@ -335,7 +379,7 @@ flowchart TD
 | Spiky or rare workload | Serverless functions | Pay per use, no idle cost | Cold starts, execution limits | [[Choosing Compute, Scaling and Deployment - Decision Guide]] |
 | Steady load, many services | Containers on Kubernetes | Bin packing, rollouts, self-healing | Operational complexity | [[Kubernetes Fundamentals]], [[Deployment Strategies - Rolling, Blue-Green, Canary]] |
 | Early product, small team | Modular monolith | One deploy, simple debugging | Needs discipline to keep modules separate | [[Choosing Compute, Scaling and Deployment - Decision Guide]] |
-| Safe releases | Rolling, blue-green or canary | Limit blast radius | Schema changes need expand-contract | [[Zero-Downtime Schema Migrations]] |
+| Safe releases | Rolling, blue-green or canary | Limit blast radius (how many users one failure can hurt) | Schema changes need expand-contract (add the new column first, remove the old one last) | [[Zero-Downtime Schema Migrations]] |
 | Long, multi-step, must survive crashes | Workflow engine | Durable state and retries | New programming model | [[Workflow Engines and Durable Execution]] |
 
 ### 3.11 Load balancers, gateways and mesh
@@ -355,6 +399,13 @@ flowchart TD
 ### 3.12 The master decision flowchart
 
 **In plain words:** One big "follow the arrows" chart. Start at the top with your new part, and it points you to the right family.
+
+**Step by step (a "seat booking" component):**
+1. What does it store? Seats with money attached, so correctness matters.
+2. The chart sends you to relational storage with strong consistency.
+3. Is it read-heavy? The seat map is, so add a cache for display only.
+4. Must booking be safe when retried? Yes, so add idempotency keys.
+5. Each exit names a guide to read next.
 
 Read this top to bottom for a new component. Each exit names a family and its guide.
 
@@ -456,6 +507,8 @@ Using a cheat sheet has its own failure modes.
 | Strong consistency everywhere | Latency and availability cost | Strong only where invariants need it |
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the standard pick for each common need and its cost. **Next comes the senior view**: how these choices play out in production, why choices interact, PACELC, the hidden cost of async, and back-pressure.
 
 Real systems show these trade-offs. Details are from public engineering material; treat specifics as summaries.
 
@@ -576,7 +629,27 @@ Say it as: "Because [requirement], I choose [X] over [Y]. The cost is [Z]. If [f
 - Strong consistency only where invariants demand it.
 - For 10 times traffic: measure, cache, scale out stateless, queue slow work, partition last.
 
-## 11. Links 🟢
+## Self-check 🟢🟡
+
+> [!question]- (easy) What three parts should every design choice you say out loud have?
+> The requirement, the choice, and the cost you accept.
+
+> [!question]- (easy) What is the default data store, and when do you leave it?
+> Relational (PostgreSQL or MySQL); leave when a number, not a feeling, says it cannot cope.
+
+> [!question]- (easy) Queue or stream (log)?
+> A queue hands each job to one worker; a log keeps history many readers can replay.
+
+> [!question]- (medium) How do you get an exactly-once effect?
+> At-least-once delivery plus idempotent consumers.
+
+> [!question]- (medium) Give one way two design choices interact.
+> Sharding orders by user makes "all orders for one restaurant" a query across every shard.
+
+> [!question]- (medium) Which data needs strong consistency, and which can be eventual?
+> Strong: balances, stock, seats. Eventual: likes, views, feeds.
+
+## Links 🟢
 
 Decision guides in this folder:
 
@@ -595,7 +668,7 @@ Foundations and next steps:
 - [[Queues vs Streams and Broker Comparison]], [[Choosing an API Style]], [[Caching Patterns]]
 - [[Case Study - News Feed]], [[Case Study - Chat System]], [[Case Study - Payment System]]
 
-## Links 🟢
+ 🟢
 
 ### Watch on YouTube
 

@@ -3,7 +3,7 @@ tags: [system-design, case-study, payments, idempotency, ledger]
 level: advanced
 status: reviewed
 prereqs: ["[[Idempotency and Idempotency Keys]]", "[[Transactions and ACID]]", "[[Webhooks - Sending and Receiving]]", "[[System Design Interview Framework]]"]
-related: ["[[Transactional Outbox and CDC]]", "[[Saga Pattern]]", "[[Timeouts, Retries and Backoff]]", "[[Delivery Semantics and Exactly-Once]]", "[[Digital Wallet and Ledger]]", "[[Case Study - Ticket Booking]]"]
+related: ["[[Transactional Outbox and CDC]]", "[[Saga Pattern]]", "[[Timeouts, Retries and Backoff]]", "[[Delivery Semantics and Exactly-Once]]", "[[Case Study - Digital Wallet and Ledger]]", "[[Case Study - Ticket Booking]]"]
 sources:
   - "Stripe API docs, Idempotent requests (keys can be pruned after they are at least 24 hours old)"
   - "Stripe docs, Check webhook signatures (Stripe-Signature header, HMAC-SHA256, default 5-minute timestamp tolerance)"
@@ -34,6 +34,12 @@ updated: 2026-11-13
 > - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+> [!note] Before this note
+> - [[Idempotency and Idempotency Keys]]: a unique key on a request lets a retry return the first result instead of acting twice.
+> - [[Transactions and ACID]]: a database transaction saves several writes all together or not at all.
+> - [[Webhooks - Sending and Receiving]]: another company's server calls your URL later to tell you something happened.
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
 
 **From zero, in 60 seconds** 🟢
 
@@ -74,6 +80,10 @@ It also keeps a permanent, balanced record of where every rupee went.
 | Double-entry | Every movement is a debit in one account and a credit in another | Customer -500, Merchant +500 |
 | Reconciliation | Comparing your records with the PSP's records | Daily settlement file check |
 
+| Minor units | Money as a whole number of the smallest unit | ₹499.00 stored as 49900 paise |
+| Settlement | The PSP actually paying out the collected money, with a report | "yesterday: 9,812 charges, fees ₹4,100" |
+| Outbox | A "to send" row saved in the same transaction, then published by a relay | `payment.succeeded` waiting to go to Kafka |
+
 **Picture it**
 
 ```mermaid
@@ -109,8 +119,15 @@ If the second attempt creates a new charge, the customer pays ₹998. If your se
 
 Both bugs come from the same root: the system did not write down what it was about to do before doing it.
 
+### Real-life example: paying for movie tickets 🟢
+
+You book two seats on BookMyShow and pay ₹500 by UPI. Your UPI app asks you to approve with your PIN.
+The ticket site cannot see your bank directly; its payment provider (for example Razorpay) does, and tells the site the result.
+If the site's screen times out while your bank actually took the money, you should not pay again; the site checks with the provider and confirms the ticket, or refunds you.
+Each night, the site matches its records against the provider's report so no rupee goes missing.
+
 **Functional requirements**
-- Pay-in: charge a card, UPI or wallet through a PSP for an order (`order_id`), including 3-D Secure or UPI approval steps where the customer must act.
+- Pay-in: charge a card, UPI or wallet through a PSP for an order (`order_id`), including 3-D Secure (the bank's extra check, such as an OTP page) or UPI approval steps where the customer must act.
 - Payment status: `GET /payments/{id}` for the client and the order service.
 - Refunds, full or partial, and chargebacks (disputes raised by the card holder's bank).
 - Receive PSP webhooks (asynchronous notifications) for final outcomes.
@@ -122,7 +139,7 @@ Both bugs come from the same root: the system did not write down what it was abo
 - **Exactly-once effect** for each payment, built from at-least-once delivery plus idempotency (see [[Delivery Semantics and Exactly-Once]]).
 - **Strong consistency** for payment state and ledger writes; eventual consistency is acceptable for analytics and notifications.
 - **Availability** around 99.95% for the payment API (an estimate of a typical target); during a PSP outage, fail over or fail clearly.
-- **PCI DSS scope kept minimal**: raw card numbers never touch our servers.
+- **PCI DSS scope kept minimal** (PCI DSS is the card industry's security rulebook; the less card data you touch, the fewer rules apply): raw card numbers never touch our servers.
 
 ## 2. Mental model 🟢
 
@@ -145,7 +162,24 @@ flowchart LR
     A --> L
 ```
 
+## Common beginner mistakes 🟢
+
+- **Calling the PSP before saving anything** → a crash leaves a charge with no record → save the payment row and key first, then call the PSP.
+- **Treating a timeout as "failed"** → the money may have moved, and the user pays twice → treat it as "unknown" and resolve it by lookup, webhook or reconciliation.
+- **Retrying with a new idempotency key** → the PSP sees a new payment and charges again → always resend the same key.
+- **Storing money as a float** → `0.1 + 0.2` is not exactly `0.3` → store integer paise with a currency code.
+- **Trusting any request to the webhook URL** → anyone can fake "payment succeeded" → verify the PSP's signature and check the timestamp.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the three rules: save the key first, treat a timeout as unknown, and never edit the ledger. **Next we open the box** and follow one payment from the card form to the PSP, the webhook, the event and the daily check.
+
+**Step by step (plain):**
+1. Asha pays ₹499 for order 42. Her card details go straight to the PSP, which returns a token; our server never sees the card.
+2. Our server saves "payment for order 42, key K1, status processing" and commits.
+3. It asks the PSP to charge, sending K1. The reply is lost in a timeout, so the row stays `processing`.
+4. A few seconds later the PSP's webhook says "K1 succeeded". Our server flips the row to `succeeded` and writes the two ledger lines.
+5. If Asha's app retried meanwhile, it sent K1 again and got the same payment back, not a second charge.
 
 ```mermaid
 flowchart LR
@@ -165,13 +199,13 @@ flowchart LR
 
 Step by step:
 
-1. **Tokenize on the client.** The card form is a PSP-hosted iframe or SDK. The browser sends the card number to the PSP and gets back a token (`pm_…`). Our servers only see the token, which keeps us in the smallest PCI DSS scope (SAQ A for a fully outsourced card page, per PCI SSC).
+1. **Tokenize on the client.** The card form is a PSP-hosted iframe (a small page from the PSP embedded in ours) or SDK. The browser sends the card number to the PSP and gets back a token (`pm_…`). Our servers only see the token, which keeps us in the smallest PCI DSS scope (SAQ A for a fully outsourced card page, per PCI SSC).
 2. **Create the intent.** `POST /payments` carries an `Idempotency-Key` header generated by the client once per checkout attempt. In one database transaction the API inserts the key (unique) and a `payments` row with status `processing`, plus a `payment_attempts` row. Only after this commits does anything leave the building.
 3. **Call the PSP with the same key.** The PSP deduplicates on it, so a retry after a timeout returns the original charge instead of creating a new one (Stripe documents this for its `Idempotency-Key` header).
 4. **Handle the reply.**
 	- Success: in one transaction, set `succeeded`, append two balanced ledger entries, and insert an outbox row.
 	- Decline: set `failed` with the decline code; no ledger entries.
-	- Timeout or 5xx: leave the row in `processing`. The answer is unknown.
+	- Timeout or 5xx (a server-side error code): leave the row in `processing`. The answer is unknown.
 	- `requires_action` (3-D Secure or UPI collect): return the action to the client; the final outcome arrives by webhook.
 5. **Webhook.** Verify the signature, insert the event id into `webhook_events` (a unique key turns duplicates into no-ops), then apply the state transition only if it is legal from the current state.
 6. **Publish.** An outbox relay ([[Transactional Outbox and CDC]]) puts `payment.succeeded` on Kafka, so the order service confirms the ticket even if the API process died right after commit.
@@ -258,7 +292,7 @@ Content-Type: application/json
 - `POST /v1/payments/{id}/refunds` with its own `Idempotency-Key`.
 - `POST /v1/psp/webhooks/{psp}` receives PSP events; it is not authenticated by session but by signature.
 
-Amounts are **integers in minor units** (paise, cents) with an ISO 4217 currency code. Floating-point is never used for money: `0.1 + 0.2` is not `0.3` in binary floating point. Note that not every currency has two decimal places (JPY has zero, KWD has three), so the exponent comes from the currency.
+Amounts are **integers in minor units** (paise, cents) with an ISO 4217 currency code (the standard three-letter code, such as `INR`). Floating-point is never used for money: `0.1 + 0.2` is not `0.3` in binary floating point. Note that not every currency has two decimal places (JPY has zero, KWD has three), so the exponent comes from the currency.
 
 ### Data model
 
@@ -749,13 +783,21 @@ Whichever resolver arrives second finds `status <> 'processing'`, updates zero r
 | Double-entry ledger | Immutable entries, balance = sum | Always for money | More rows; balance reads need caching or snapshots |
 | Event-sourced ledger | Ledger entries are the events; projections build balances | Wallets and complex flows ([[Event Sourcing]]) | Projection rebuilds and versioning |
 
-For the class-level design of a ledger (accounts, transfers, balance invariants in Go), compare with [[Digital Wallet and Ledger]].
+For the class-level design of a ledger (accounts, transfers, balance invariants in Go), compare with [[Case Study - Digital Wallet and Ledger]].
+
+### Things people confuse this with 🟡
+
+| System | What it does | How it differs from a payment system |
+| --- | --- | --- |
+| [[Case Study - Digital Wallet and Ledger]] | Holds money inside your own system and moves it between users | No outside PSP per transfer; the hard part is moving money between your own shards |
+| The PSP (Razorpay, Stripe) | Talks to card networks, banks and UPI | We call it; we do not build it |
+| Order service | Tracks what was bought | Waits for `payment.succeeded` before confirming; it does not move money |
 
 ## 6. Trade-offs and when not to use 🟡
 
 - **Synchronous vs asynchronous confirmation.** Returning the PSP result inline gives a fast happy path, but you still need the webhook path for 3-D Secure, UPI and timeouts. Designing only the inline path is the most common bug.
 - **Strong consistency costs availability.** Payment writes go to a single primary with a synchronous replica; during a failover the API may return 503 for tens of seconds. That is the right trade: an unavailable payment page is recoverable, a double charge is a support ticket and a chargeback.
-- **Sagas around the payment.** A checkout is a [[Saga Pattern]]: reserve the seat (compensatable), then capture payment (the pivot step), then issue the ticket (retriable until it succeeds). Ordering the steps this way means a stock-out never requires a refund.
+- **Sagas around the payment.** A checkout is a [[Saga Pattern]]: reserve the seat (compensatable: it can be undone), then capture payment (the pivot step: the point of no return), then issue the ticket (retriable until it succeeds). Ordering the steps this way means a stock-out never requires a refund.
 - **When not to build this.** If you sell a few products, use the PSP's hosted checkout and its dashboard as your ledger of record, and store only the PSP's payment id against your order. Build your own ledger when you hold customer balances, pay out to merchants, split payments, or must reconcile multiple PSPs.
 - **Do not cache payment status aggressively.** A stale `processing` causes clients to retry or users to pay again via a different method.
 
@@ -767,6 +809,8 @@ flowchart TD
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the full payment flow, the state machine, the tables and the Go code for the core rule. **Next is the advanced part**: real systems, failure stories, daily reconciliation, double-entry for one sale, hot merchant accounts, key details, refunds and chargebacks, and multi-region.
+
 - **Real systems.**
 	- Stripe exposes idempotency keys on every POST and documents that keys are pruned after they are at least 24 hours old.
 	- Brandur Leach's write-up of Stripe-like idempotency keys in PostgreSQL shows the "atomic phases with recovery points" pattern this note uses.
@@ -775,7 +819,7 @@ flowchart TD
 	- *PSP times out after charging.* The row stays `processing`; the webhook or the reconciler resolves it. Never retry with a new key.
 	- *Crash between commit and publishing the event.* The outbox row commits with the state change; the relay publishes later.
 	- *Duplicate or out-of-order webhooks.* Dedupe on `(psp, event_id)`; transitions are conditional updates guarded by the state machine.
-	- *Forged webhooks.* Verify the HMAC signature over the raw body and reject old timestamps (Stripe's default tolerance is 5 minutes) to stop replays; see [[Webhooks - Sending and Receiving]] and [[Service-to-Service Auth - API Keys, HMAC, mTLS]].
+	- *Forged webhooks.* Verify the HMAC signature (a code made from the message and a shared secret, so only the PSP can produce it) over the raw body and reject old timestamps (Stripe's default tolerance is 5 minutes) to stop replays; see [[Webhooks - Sending and Receiving]] and [[Service-to-Service Auth - API Keys, HMAC, mTLS]].
 	- *PSP outage.* A [[Circuit Breaker]] per PSP; new payments route to a backup PSP; payments with unknown outcomes stay pinned to the original PSP.
 	- *Retry storms.* Clients retry with jittered backoff ([[Timeouts, Retries and Backoff]]), and the idempotency key keeps every retry harmless.
 - **What to monitor.**
@@ -793,7 +837,7 @@ flowchart TD
 
 **In plain words:** every day, line up your records with the PSP's report and flag anything that does not match.
 
-Every day the PSP publishes a settlement report with each charge, refund, fee and payout. The reconciler loads it into a staging table and runs a full outer join against the ledger:
+Every day the PSP publishes a settlement report with each charge, refund, fee and payout. The reconciler loads it into a staging table and runs a full outer join (a join that keeps rows found on either side, so missing ones show up) against the ledger:
 
 ```sql
 SELECT coalesce(s.psp_charge_id, l.psp_charge_id) AS charge,
@@ -809,6 +853,15 @@ WHERE s.psp_charge_id IS NULL OR l.psp_charge_id IS NULL OR s.amount_minor <> l.
 - *Missing in the ledger* means a charge you never recorded: the exact bug the "persist first" rule prevents. It is fixed by posting the entry and alerting a person.
 - *Missing at the PSP* usually means a timing difference (a charge near midnight lands in tomorrow's file). It is re-checked the next day before escalating.
 - Fees appear only in settlement, so the reconciler posts them as ledger entries (`psp_fees` debit, `psp_clearing` credit). After that, `psp_clearing` should net to the payout amount the bank receives.
+
+```mermaid
+flowchart LR
+    S["PSP settlement file"] --> J["match by charge ID"]
+    L["our ledger"] --> J
+    J --> OK["both match: done"]
+    J --> ML["missing in ledger: post entry + alert"]
+    J --> MP["missing at PSP: re-check tomorrow"]
+```
 
 ### Double-entry accounts for one ticket sale
 
@@ -883,6 +936,26 @@ Payments need one writer per payment. A common pattern is to home each merchant 
 > [!question]- PSP A is down. Can you just retry the payment on PSP B?
 > Only for payments that never reached PSP A, or that PSP A confirms it did not charge. A payment with an unknown outcome at A must stay with A until resolved, because a charge on B would be a second, independent charge. Route new payments to B behind a circuit breaker.
 
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is a PSP?
+> The payment service provider, such as Razorpay or Stripe, that talks to banks and card networks for you.
+
+> [!question]- Easy: the PSP call times out. Did the payment fail?
+> Unknown. Leave it `processing` and find out by webhook, lookup or reconciliation.
+
+> [!question]- Easy: why store ₹499 as 49900?
+> Whole paise as integers avoid floating-point rounding errors.
+
+> [!question]- Medium: why must claiming the key be one `INSERT ... ON CONFLICT` and not "select, then insert"?
+> Two retries at the same moment could both see "missing" and both charge.
+
+> [!question]- Medium: the webhook and the reconciler both try to mark payment 42 succeeded. What stops a double update?
+> Each uses `UPDATE ... WHERE status = 'processing'`; the second finds nothing to change.
+
+> [!question]- Medium: 1 million payments a day. What is the average rate, and is it the hard part?
+> About 12 a second; no, correctness is the hard part, not load.
+
 ## 10. Cheat sheet 🟢
 
 - Load is tiny (1M/day ≈ 12 TPS). The design is about correctness.
@@ -892,13 +965,13 @@ Payments need one writer per payment. A common pattern is to home each merchant 
 - Webhooks: verify the HMAC over the raw body, check the timestamp, dedupe on `(psp, event_id)`, apply only legal transitions.
 - Ledger: append-only, double-entry, integer minor units with a currency, corrections by reversal.
 - Daily reconciliation against the settlement file; alert on missing-in-ledger.
-- Hosted fields keep you in SAQ A; multi-PSP routing only for payments not in flight elsewhere.
+- Hosted fields keep you in SAQ A (the shortest PCI self-check form); multi-PSP routing only for payments not in flight elsewhere.
 
 ## Links
 
 - **Before this:** [[Idempotency and Idempotency Keys]], [[Transactions and ACID]], [[Webhooks - Sending and Receiving]], [[Transactional Outbox and CDC]], [[System Design Interview Framework]]
 - **Next:** [[Case Study - File Storage and Sync]], [[Saga Pattern]], [[Case Study - Ticket Booking]]
-- **Compare with:** [[Digital Wallet and Ledger]] (class-level ledger in Go), [[Movie Ticket Booking]] (LLD checkout flow), [[Event Sourcing]]
+- **Compare with:** [[Case Study - Digital Wallet and Ledger]] (class-level ledger in Go), [[Movie Ticket Booking]] (LLD checkout flow), [[Event Sourcing]]
 
 ### Watch on YouTube
 

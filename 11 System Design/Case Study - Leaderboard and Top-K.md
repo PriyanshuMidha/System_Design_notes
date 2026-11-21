@@ -35,6 +35,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Redis Data Structures and When to Use Each]]: Redis keeps data in memory and has a sorted set type that stays ordered by score.
+> - [[Heaps and Priority Queues]]: a heap always keeps its smallest (or largest) item on top, so "drop the weakest" is cheap.
+> - [[Back-of-the-Envelope Estimation]]: turning players and matches into writes per second and gigabytes.
+> - [[Bloom Filters and Probabilistic Data Structures]]: small structures, like the Count-Min Sketch, that answer "how many?" roughly with tiny memory.
+
 **From zero, in 60 seconds** 🟢
 
 A leaderboard shows the top players and your own rank.
@@ -75,6 +81,10 @@ A music app has a similar job: "top 100 songs in the last hour" from billions of
 | Sketch | A small, approximate summary of a huge stream | Count-Min Sketch |
 | Shard | One slice of the data on one machine | Players A-M on node 1 |
 
+| Count-Min Sketch | A small grid of counters that estimates how often each item appeared; never too low | "song 7 played about 5,040 times" |
+| Heavy hitter | An item that takes a big share of the stream | the one song everyone is playing |
+| Tumbling window | Fixed time buckets that sit end to end | 10:00-10:01, 10:01-10:02 |
+
 **Picture it**
 
 ```mermaid
@@ -113,6 +123,13 @@ A sorted structure that keeps subtree counts, such as the skip list inside a Red
 
 The streaming variant is different: "top 100 songs in the last hour" over 50,000 plays per second across 10 million distinct songs. An exact hash map of counts per window would need memory for every distinct song, per window, per partition, and merging those maps is heavy. Approximate counting with a fixed-size sketch is good enough for "trending" lists.
 
+### Real-life example: a fantasy cricket contest 🟢
+
+In a fantasy cricket app like Dream11, lakhs of people join the same contest during an IPL match.
+Every time a player hits a four, everyone's points change, and the app shows "you are rank 12,450" and the top 100 within seconds.
+Nobody's phone re-sorts all the teams; the server keeps them in a structure that stays sorted as points change.
+A music app's "Top 50 this hour" is the cousin problem: billions of plays, so it is counted roughly.
+
 **Functional requirements**
 - Submit a score after a match (absolute best score, or increment).
 - Top N (N up to 100) globally, by region and among friends.
@@ -146,7 +163,24 @@ flowchart LR
     Q -- "no" --> D["Ignore"]
 ```
 
+## Common beginner mistakes 🟢
+
+- **Sorting the whole table on every request** → millions of rows read per page view → keep a sorted set that stays ordered as scores change.
+- **Letting the app or browser submit scores** → players forge high scores → only the game server sends scores, over an internal authenticated call.
+- **Applying `ZINCRBY` again after a retry** → points are counted twice → dedupe on `(match_id, player_id)` before adding.
+- **Resetting the weekly board at midnight** → a burst of writes on one key, and lost history → use a new key per week, such as `lb:week:2026-W45`.
+- **Counting a huge stream exactly in a hash map** → memory grows with every distinct item → use a Count-Min Sketch plus a heap of size K.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the two problems: exact ranks for players, and rough top-K for a huge stream. **Next we open the box**: how a score travels from the game server into the boards, and how a rank or top-100 read is answered.
+
+**Step by step (plain):**
+1. Asha finishes match 991 with 900 points. The game server (not her phone) sends `{match 991, asha, 900}` to Kafka.
+2. A worker checks "have I already applied match 991 for Asha?" No, so it saves her best score in PostgreSQL.
+3. It runs `ZADD lb:global GT 900 asha`, which updates only if 900 beats her old best.
+4. Asha opens the app. `ZREVRANK` returns her position, say 48,212 (0-based), shown as rank 48,213.
+5. The top 100 is read with one range call and cached for a second, because everyone asks for it.
 
 ```mermaid
 flowchart LR
@@ -165,7 +199,7 @@ flowchart LR
     API --> TOP
 ```
 
-**Leaderboard write path.** The game server, not the client, publishes the final score. A score worker writes the durable best score to PostgreSQL and updates every board the player belongs to. `ZADD key GT score member` updates only if the new score is greater, which implements "best score" boards atomically; `ZINCRBY` implements cumulative boards.
+**Leaderboard write path.** The game server, not the client, publishes the final score. A score worker writes the durable best score to PostgreSQL and updates every board the player belongs to. `ZADD key GT score member` (add a member with a score; `GT` means only if greater) updates only if the new score is greater, which implements "best score" boards atomically; `ZINCRBY` implements cumulative boards.
 
 ```mermaid
 sequenceDiagram
@@ -270,7 +304,7 @@ GET /v1/leaderboards/friends                  -> ranks among the caller's friend
 GET /v1/trending/songs?window=1h              -> [{"song_id": "s1", "plays_estimate": 182000}, ...]
 ```
 
-Clients never submit scores. The score endpoint is internal, authenticated with mTLS (see [[Service-to-Service Auth - API Keys, HMAC, mTLS]]).
+Clients never submit scores. The score endpoint is internal, authenticated with mTLS (mutual TLS: both sides show certificates; see [[Service-to-Service Auth - API Keys, HMAC, mTLS]]).
 
 ### Data model
 
@@ -306,7 +340,7 @@ Redis keys:
 | `lb:region:IN` | ZSET, packed score | `ZADD GT` | regional board |
 | `trending:songs:hour` | ZSET of 100 | merger, replaced each minute | trending list |
 
-**Ties.** Redis orders equal scores by member name (lexicographically), which is arbitrary for players. To rank "first to reach it" higher, pack points and time into one score. A score is a float64, which holds every integer up to 2^53 exactly, so the packed value must stay below that.
+**Ties.** Redis orders equal scores by member name (lexicographically, i.e. dictionary order), which is arbitrary for players. To rank "first to reach it" higher, pack points and time into one score. A score is a float64, which holds every integer up to 2^53 exactly, so the packed value must stay below that.
 
 ### Go: packed scores and stream top-K
 
@@ -540,10 +574,18 @@ Reading the packed score back: `points = uint64(score) >> 32`. With 200,000 play
 | Redis Stack `TOPK` (HeavyKeeper) | Server-side heavy-hitter structure (`TOPK.ADD`, `TOPK.LIST`) | You run Redis Stack and want top-K without custom code | Approximate; needs Redis Stack or Redis 8+, not available in Redis 7.x without the module |
 | Exact batch job | Spark or SQL `GROUP BY ... ORDER BY count DESC LIMIT K` over the day | Reports, billing, reconciliation of the streaming answer | Hours of delay |
 
+### Things people confuse this with 🟡
+
+| System | What it answers | How it differs from a leaderboard |
+| --- | --- | --- |
+| [[Case Study - Distributed Counter (Likes and Views)]] | "How many likes does this post have?" | One total per item; no ordering or rank |
+| [[Case Study - Search Autocomplete]] | "Top 10 queries that start with 'ipl'" | Top-K per prefix, mostly built offline |
+| Database `ORDER BY ... LIMIT` | Top rows of a table right now | Fine for small tables; rank of one player needs a count over millions of rows |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - **Do not shard before you need to.** One ZSET handles tens of millions of members and tens of thousands of operations per second; sharding turns a single `ZREVRANK` into a scatter-gather over every shard.
-- **Redis is a derived copy.** Keep scores durable in PostgreSQL (or Kafka with compaction) so a lost Redis node is rebuilt, not mourned. Redis persistence (AOF) helps but is not the source of truth.
+- **Redis is a derived copy.** Keep scores durable in PostgreSQL (or Kafka with compaction) so a lost Redis node is rebuilt, not mourned. Redis persistence (AOF, an append-only log of every write) helps but is not the source of truth.
 - **Increment boards need idempotent writers.** `ZINCRBY` applied twice double-counts; dedupe on `match_id` before applying. `ZADD GT` (best score) is naturally idempotent.
 - **Sketches are wrong for money and for small cardinalities.** If there are only 10,000 distinct items, an exact hash map is small and exact. Use sketches when distinct keys are in the millions and approximate answers are acceptable.
 - **Friends leaderboards are not slices of the global ZSET.** For 300 friends, fetch their scores with `ZMSCORE lb:global f1 f2 ...` and sort in the API; do not build a ZSET per user.
@@ -558,6 +600,8 @@ flowchart TD
 ```
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the write and read paths, the sizing, the tables and the Go code for packed scores and a sketch with a heap. **Next is the advanced part**: cheating, hot keys and resets in production, how a skip list gives a rank, rank across shards, merging top-K, sliding windows and float precision.
 
 - **Failure modes → fixes:**
 	- Cheating with forged scores → only game servers submit scores; validate against match records; flag outliers; never trust client values.
@@ -574,11 +618,20 @@ flowchart TD
 
 ## 8. Deep dive 🔴
 
-**Why a skip list can return a rank.** Each forward pointer in a Redis skip-list node stores a *span*: how many level-0 nodes it jumps over. Walking from the head to a member and adding the spans of the pointers taken gives the member's rank in `O(log N)` expected time, without visiting the members in between.
+**Why a skip list can return a rank.** A skip list is a sorted linked list with extra "express lane" pointers that skip ahead. Each forward pointer in a Redis skip-list node stores a *span*: how many level-0 nodes it jumps over. Walking from the head to a member and adding the spans of the pointers taken gives the member's rank in `O(log N)` expected time, without visiting the members in between.
 
 **Rank across shards.** With players hashed across `S` shards, a player's global rank is `1 + Σ ZCOUNT(shard_i, "(" + score, "+inf")` (the `(` makes the bound exclusive), one `O(log N)` call per shard, which is `S` round trips done in parallel.
 
 The global top 100 is the merge of each shard's top 100, because any global top-100 member is in its own shard's top 100.
+
+```mermaid
+flowchart LR
+    P1["partition 1: sketch + top 100"] --> M["merger"]
+    P2["partition 2: sketch + top 100"] --> M
+    M --> S["add sketches cell by cell"]
+    M --> C["re-check every candidate in merged sketch"]
+    C --> T["global top 100"]
+```
 
 **Merging stream top-K across partitions.** Count-Min Sketches with the same width, depth and hash functions merge by adding counters cell by cell, so per-partition sketches sum into a global one exactly as if one machine had seen every event.
 
@@ -596,7 +649,7 @@ This is a stream-processing job with tumbling windows; see [[Stream Processing B
 
 Heavy hitters are items above some share `φ` of the stream; choose `ε` well below `φ` (for example `φ = 1%`, `ε = 0.1%`) so overcounting cannot push a tail item above the threshold.
 
-**Precision of packed scores.** Redis stores sorted-set scores as IEEE 754 double-precision floats. With 21 bits of points and 32 bits of time, the packed integer stays below 2^53 and every value is exact. A design that packs 32-bit points and 32-bit time (64 bits) would silently lose the low bits, and ties would break incorrectly.
+**Precision of packed scores.** Redis stores sorted-set scores as IEEE 754 double-precision floats (standard 64-bit decimals that hold whole numbers exactly only up to 2^53). With 21 bits of points and 32 bits of time, the packed integer stays below 2^53 and every value is exact. A design that packs 32-bit points and 32-bit time (64 bits) would silently lose the low bits, and ties would break incorrectly.
 
 ## 9. Interview questions 🔴
 
@@ -620,6 +673,26 @@ Heavy hitters are items above some share `φ` of the stream; choose `ε` well be
 
 > [!question]- A worker replays score events after a crash. What goes wrong?
 > `ZINCRBY` double-counts. Dedupe first: insert `(match_id, player_id)` with `ON CONFLICT DO NOTHING` and update Redis only for new rows. `ZADD GT` for best-score boards is already idempotent.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what Redis type keeps players sorted by score?
+> A sorted set (ZSET).
+
+> [!question]- Easy: why must only the game server submit scores?
+> A phone or browser can be tampered with to send fake high scores.
+
+> [!question]- Easy: is the trending songs list exact?
+> No; it is approximate, from a Count-Min Sketch plus a heap, which is fine for trends but not for money.
+
+> [!question]- Medium: how do you break ties so the player who reached a score first ranks higher?
+> Pack points and time into one number, with points in the high bits and a reversed timestamp in the low bits.
+
+> [!question]- Medium: players are split across 4 shards. How do you get one player's global rank?
+> Add up, across all shards, how many players have a higher score, then add 1.
+
+> [!question]- Medium: why can't you just merge each partition's top 100 heap?
+> An item that is 101st everywhere can be first overall; send candidates and re-check them in the merged sketch.
 
 ## 10. Cheat sheet 🟢
 

@@ -28,6 +28,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Walk through Code steps 1-4; each has an "In plain words" line and a step-by-step explanation.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Tests, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Indexing Fundamentals]]: an index is a sorted list of column values that lets the database jump to rows instead of reading all of them.
+> - [[Query Plans and EXPLAIN]]: a Sort step in a plan means the database had to order rows itself because the index did not give them in order.
+> - The theory twin [[Index Types and Index Design]] explains the ESR rule and the leftmost-prefix rule in plain words; read its sections 1-3 first.
+
 **From zero, in 60 seconds** 🟢
 
 This file turns the index-design rules from the theory note into a tiny Go tool you could run in code review. You describe a query as plain data (which columns it matches exactly, which one it ranges over, what it sorts by). One function, `ESR`, proposes the best column order for an index. Another, `Analyze`, judges any index against the query: how many columns can it seek on, and is the sort free? The tests then prove the classic rules with exact answers, like "a gap in the prefix blocks the range column". Read the theory note first, then follow the four code steps top to bottom.
@@ -39,7 +44,7 @@ This file turns the index-design rules from the theory note into a tiny Go tool 
 - **Pure functions** (`ESR`, `Analyze`): no I/O and no state, so each one is easy to test in isolation.
 - **Table-driven tests**: a slice of cases, each with an index, a query and the expected result.
 - **`reflect.DeepEqual`**: compares whole slices and structs in the tests.
-- **What to run:** `go vet ./... && go test -race -v ./...` inside the `idx` module.
+- **What to run:** `go vet ./... && go test -race -v ./...` inside the `idx` module (`go vet` spots common mistakes; `-race` turns on Go's race detector).
 
 ## What this code shows 🟢
 
@@ -75,6 +80,8 @@ idx/
 - Run: `go vet ./... && go test -race -v ./...`
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** what the tool does: describe a query as data, propose a key with ESR, and grade any key against the query. **Next we open the code** in four small steps, each with a line-by-line walk.
 
 The code is one package of three small ideas: a vocabulary for describing a query, a function that proposes a key, and a function that judges a key. Each is shown in its own piece below. The pieces are one file, `idx.go`, in the order shown.
 
@@ -194,7 +201,7 @@ The walk stops at the first index column that is not in the equality set, and on
 
 The code deliberately has no skip scan, which PostgreSQL 18 and MySQL 8.0.13 added for some cases, because the rule without it is the one every engine guarantees.
 
-The alternative of modelling skip scan would need cardinality estimates, which a pure shape check does not have.
+The alternative of modelling skip scan would need cardinality estimates (guesses of how many different values a column holds), which a pure shape check does not have.
 
 ```go
 // Analyze applies the leftmost-prefix rule (no skip scan).
@@ -289,6 +296,8 @@ State of the two flags for three sorts against the index tail `due_date DESC, id
 | `due_date, id DESC` | same=false, flipped=true | same=false, flipped=false | false (mixed) |
 
 ## Design decisions 🔴
+
+> 🟡 → 🔴 **You now know** how `ESR`, `Analyze` and `sortMatches` work. **Next comes the review view**: the choices behind the design, the tests that pin each rule, and the cases the tool deliberately does not model.
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -432,6 +441,30 @@ Reading the output line by line:
 1. Add the case `Query{Equal: workspace_id, status; Range: amount_minor}` with no sort and run `Analyze` against the ESR key for it. Predict `SeekCols` before running.
 2. Change `listIdx` to `(status, workspace_id, due_date DESC, id DESC)` and rerun `TestAnalyze`. Predict which cases change and explain why from the leftmost-prefix rule.
 3. Add `Query{Equal: workspace_id; Sort: status, due_date DESC}` and then `Query{Equal: workspace_id; Sort: due_date DESC}`. Predict `SortOK` for each against `listIdx`, and explain why the second one needs a Sort even though `due_date` is in the index.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What three facts does a `Query` hold?
+> The columns matched with `=`, the one column with a range, and the `ORDER BY` list.
+
+> [!question]- What does `SeekCols` count?
+> How many leading index columns the query can jump on before it has to filter entry by entry.
+
+> [!question]- Why is `Query.Range` a single string, not a slice?
+> A B-tree can seek through at most one range; after it, entries are no longer in one block.
+
+🟡 Medium
+
+> [!question]- Against `(workspace_id, status, due_date DESC, id DESC)`, why is `ORDER BY due_date, id` still free?
+> Both directions are flipped, so the database reads the index backwards.
+
+> [!question]- Why does the ESR key in `TestESR` seek on 2 columns, not 3?
+> The range column `amount_minor` sits after the sort column `due_date`, so the prefix stops at the two equality columns.
+
+> [!question]- Equal `workspace_id`, range `due_date`, on `listIdx`. What does `Analyze` return?
+> `{1, true}`: `status` is a gap, so the range earns nothing, and there is no sort to serve.
 
 ## Links
 

@@ -34,6 +34,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3.3 to 3.5 (redis-cli, memory and security settings), section 4 (the OTP service in Go), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Redis Fundamentals]]: Redis is a shared in-memory store; you send commands like `SET key value EX 60` and `GET key`, and each command runs on its own, one at a time.
+
 **From zero, in 60 seconds** 🟢
 
 This note is the "set it up properly" guide for Redis with Go.
@@ -81,6 +84,10 @@ This note sets it up the safe way from the start.
 | `context` (Go) | A value that carries a deadline or cancel signal into a call | `ctx, cancel := context.WithTimeout(...)` |
 | ACL | Access control list: which user may run which commands | User `app` cannot run `FLUSHALL` |
 | OTP | One-time password, a short code valid for minutes | `482913`, expires in 5 min |
+| Failover | A backup Redis taking over when the main one dies; it can pause traffic for a few seconds | Main node crashes, replica becomes main |
+| p99 | The time 99 out of 100 requests finish within | p99 = 40 ms |
+| HMAC | A fingerprint of a value made with a secret key; without the key you cannot fake or reverse it | `HMAC(secret, "u1:482913")` |
+| Fail open / fail closed | When a check cannot run: let the request through / refuse it | Cache down: fail open; OTP check down: fail closed |
 
 **Picture it**
 
@@ -112,7 +119,7 @@ A new backend engineer adds Redis to a Go service. Three things usually go wrong
 1. The client has no read timeout. Redis stalls for 2 seconds during a failover, every request goroutine waits, and the service's p99 jumps from 40 ms to 2 s.
 2. Nobody set `maxmemory`. The cache grows until the container's 512 MB limit and the kernel kills Redis. Or `maxmemory` is set but the policy stays `noeviction`, and writes start failing (measured below: 13,741 of 30,000 writes rejected).
 3. Port 6379 is published to the internet without a password.
-	- Exposed Redis servers are a well-known target for attackers who write SSH keys or cron jobs through `CONFIG SET dir`.
+	- Exposed Redis servers are a well-known target for attackers who write **SSH keys** (files that let someone log in to the machine) or **cron jobs** (commands the machine runs on a schedule) through `CONFIG SET dir`.
 	- Since Redis 7.0, `enable-protected-configs` (default `no`, measured on Redis 8.2) blocks changing `dir` at runtime, but an open port still leaks or wipes all data.
 
 This note sets Redis up so none of these happen, and then builds one real feature end to end.
@@ -135,6 +142,8 @@ flowchart LR
 ```
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the three settings people skip (timeouts, a memory limit, a password on a private network) and why each one matters. **Next we open the box**: the pieces involved, how to start Redis on your laptop, the daily `redis-cli` commands, and the memory and security settings with measured results.
 
 ### 3.1 The pieces
 
@@ -170,11 +179,11 @@ docker run -d --name redis \
 docker exec -it redis redis-cli -a devpass ping   # PONG
 ```
 
-- `-p 127.0.0.1:6379:6379` publishes the port on loopback only, not on every interface.
-- The named volume keeps `dump.rdb` and the AOF across container restarts.
+- `-p 127.0.0.1:6379:6379` publishes the port on **loopback** only (the address `127.0.0.1`, which only your own machine can reach), not on every network interface.
+- The named volume keeps `dump.rdb` (Redis's snapshot file) and the AOF (append-only file: a log of every write) across container restarts.
 - Use `valkey/valkey:8` instead of `redis:8.2` for Valkey; the commands are the same for everything in this note.
 
-For a full Go API + Postgres + Redis stack, use Compose with a healthcheck so the API waits for Redis to be ready, not just started; see [[Docker 07 - Docker Compose for Local Development]].
+For a full Go API + Postgres + Redis stack, use Compose with a **healthcheck** (a small command Docker runs again and again to see if the service answers) so the API waits for Redis to be ready, not just started; see [[Docker 07 - Docker Compose for Local Development]].
 
 ```yaml
 services:
@@ -277,7 +286,7 @@ How the policies work is in [[Cache Eviction Policies - LRU, LFU, TTL]]; persist
 **In plain words:** keep Redis off the internet, set a password, and give each app its own login that can only touch its own keys.
 
 - **Protected mode** (on by default, measured `protected-mode yes`): if no password is set and Redis is bound to all interfaces, it refuses connections from non-loopback addresses.
-- **Never expose 6379** to the internet. Use a private subnet and security groups; publish to `127.0.0.1` only on a laptop.
+- **Never expose 6379** to the internet. Use a private subnet and **security groups** (cloud firewall rules that say who may connect); publish to `127.0.0.1` only on a laptop.
 - **ACL users** (since 6.0) instead of one shared password. Measured on Redis 8.2:
 
 ```text
@@ -293,12 +302,14 @@ $ redis-cli --user app --pass s3cret KEYS '*'
 NOPERM User app has no permissions to run the 'keys' command
 ```
 
-- **TLS** for traffic between hosts (`rediss://` URLs in go-redis); managed services offer in-transit encryption.
+- **TLS** (encryption of network traffic, the "S" in HTTPS) for traffic between hosts (`rediss://` URLs in go-redis); managed services offer in-transit encryption.
 - Disable the `default` user or give it a strong password once ACL users exist.
 
 More (renaming commands, audit, secrets rotation) is in [[Redis in Production - Memory, Latency, Security]].
 
 ## 4. Worked example 🟡
+
+**What this code does, in plain words:** it builds a login-by-code feature. When you ask for a code, the app makes 6 random digits, saves only a secret fingerprint of them in Redis for 5 minutes, and sends the digits by SMS. When you type the code, one small script in Redis checks it, counts your tries, and deletes the code on success or after 5 wrong tries, so a code can never be used twice.
 
 ### Whiteboard version
 
@@ -421,7 +432,7 @@ func Healthy(ctx context.Context, rdb *redis.Client) error {
 ```
 
 - Build one `*redis.Client` per process and share it; it is safe for concurrent use.
-- go-redis's default `PoolSize` is 10 connections per `GOMAXPROCS` (documented); setting it explicitly makes capacity planning visible: 30 pods × 20 connections = 600 server connections.
+- go-redis's default `PoolSize` is 10 connections per `GOMAXPROCS` (the number of CPU cores Go uses) (documented); setting it explicitly makes capacity planning visible: 30 pods × 20 connections = 600 server connections.
 - The `context` you pass to each command also bounds it; cancelling the HTTP request cancels the Redis call.
 
 ### The OTP service
@@ -537,7 +548,7 @@ func (o *OTP) Verify(ctx context.Context, id, code string) error {
 
 Why each choice:
 - `crypto/rand`: `math/rand` output is predictable; an attacker who sees a few codes could predict the next.
-- **HMAC with a server secret**, not a plain SHA-256: there are only 1,000,000 six-digit codes, so a plain hash leaked from Redis is reversed instantly by trying all of them.
+- **HMAC with a server secret** (sometimes called a **pepper**: a secret mixed into every hash and kept outside Redis), not a plain SHA-256: there are only 1,000,000 six-digit codes, so a plain hash leaked from Redis is reversed instantly by trying all of them.
 - **Attempt counter inside the script**: guessing a 6-digit code with 5 tries succeeds with probability 5 in 1,000,000. Without the counter an attacker can try all codes in minutes.
 - **Delete on success**: the same code cannot be replayed.
 - `redis.NewScript` runs `EVALSHA` and falls back to `EVAL` if the script is not cached yet.
@@ -682,7 +693,7 @@ Where to run Redis:
 | --- | --- | --- | --- |
 | Local binary or Docker | One process on your laptop | Development, tests | Nothing to manage; no HA |
 | Self-managed on VMs or Kubernetes | You run primaries, replicas, Sentinel or Cluster | Full control, special modules, cost at large scale | You own upgrades, failover, backups, security |
-| AWS ElastiCache (Valkey or Redis OSS engine), Google Memorystore, Azure Cache | Managed nodes in your VPC with failover, snapshots, encryption | Most production services on that cloud | Per-node pricing; some commands and configs restricted |
+| AWS ElastiCache (Valkey or Redis OSS engine), Google Memorystore, Azure Cache | Managed nodes in your **VPC** (your private network inside the cloud) with failover, snapshots, encryption | Most production services on that cloud | Per-node pricing; some commands and configs restricted |
 | ElastiCache Serverless | Capacity scales automatically; billed by data stored and requests | Spiky or unknown load | Can cost more at steady high load |
 | Upstash | Serverless Redis-compatible over TCP or HTTP, pay per request | Serverless/edge functions, low traffic | Per-request pricing; higher latency than in-VPC |
 
@@ -704,6 +715,8 @@ How a feature should behave when Redis is unavailable:
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to run Redis safely, connect from Go with timeouts and a bounded pool, and build an OTP feature that cannot be replayed or brute-forced. **Next is the advanced part**: production setups, the failures you will meet, and the fine print behind the OTP script, `SCAN` and database numbers.
+
 - **Real systems:** managed Redis/Valkey in a private subnet, one ACL user per service, TLS in transit, `REDIS_URL` from a secret manager.
 - **Failure modes and fixes:**
 	- Requests hang during a failover: set read/write timeouts and retries with backoff (go-redis retries some errors itself, `MaxRetries` default 3).
@@ -715,7 +728,7 @@ How a feature should behave when Redis is unavailable:
 ## 8. Deep dive 🔴
 
 - **Why OTP verification must be one script.** If the API did `GET`, compared in Go, then `DEL`, two requests carrying the right code could both pass the `GET` before either `DEL` ran, and the code would be used twice. The test `TestParallelCorrectVerifySucceedsOnce` runs 20 such requests and requires exactly one success.
-- **Comparing hashes in Lua.** Lua string equality is not constant-time, but the values compared are HMAC outputs keyed with a server secret, so timing reveals nothing useful about the code.
+- **Comparing hashes in Lua.** Lua string equality is not **constant-time** (it stops at the first differing character, so timing can leak how much matched), but the values compared are HMAC outputs keyed with a server secret, so timing reveals nothing useful about the code.
 - **`SET NX` vs a resend button.** With `NX`, the user cannot get a new code until the old one expires or is used up. Products that want "resend after 60 s" store a separate cooldown key (`SET otp:cooldown:<id> 1 EX 60 NX`) and overwrite the code key instead.
 - **`SCAN` guarantees.** A full iteration returns every key that existed for the whole scan at least once; keys may appear twice, and keys added or removed during the scan may or may not appear.
 - **Database numbers.** `SELECT 3` works on a single node, but Redis Cluster supports only database 0. Use key prefixes instead of database numbers from the start.
@@ -749,6 +762,30 @@ How a feature should behave when Redis is unavailable:
 - Go client: one instance, URL from secrets, timeouts, bounded pool, `context` on every call.
 - OTP: `crypto/rand`, store an HMAC, `EX 300 NX`, attempt counter in the same script, delete on success, never return the code.
 - Redis down: caches fail open, auth checks fail closed.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why should a Go Redis client always have a read timeout?
+> Without one, a Redis stall (for example a failover) makes every request wait as long as Redis does.
+
+> [!question]- Which command lists keys safely in production: `KEYS` or `SCAN`?
+> `SCAN`, which walks the keys in small steps; `KEYS` blocks the server.
+
+> [!question]- What is the default `maxmemory-policy`, and what does it do when memory is full?
+> `noeviction`: writes fail with an `OOM` error.
+
+🟡 Medium
+
+> [!question]- Why use `SET key v NX EX 300` instead of `SETNX` followed by `EXPIRE`?
+> If the app crashes between the two commands, the key lives forever with no TTL.
+
+> [!question]- Why is the OTP check one Lua script instead of GET, compare, DEL from Go?
+> Two requests with the right code could both pass the GET before either DEL, so the code would be used twice.
+
+> [!question]- When Redis is down, should a cache read and an OTP check behave the same?
+> No. The cache fails open and reads the database; the OTP check fails closed and refuses the login.
 
 ## Links 🟢
 

@@ -33,6 +33,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Composite]]: a container and a single item share one interface, so code can treat a folder and a file the same way.
+> - [[Strategy and Template Method]]: a rule behind an interface you can swap, here DFS or BFS order.
+
 **From zero, in 60 seconds** 🟢
 
 Your computer stores files inside folders, and folders inside folders. That shape is a tree. A search tool like `find` walks that tree and checks each file against your rules, like "ends in .go and is smaller than 1 MB". In the design, files and folders share one common type, which is called the **Composite** pattern. Your rules are also built as a small tree of checks joined by AND, OR and NOT. Then searching is just walking one tree and asking the other tree "does this file match?".
@@ -67,6 +71,11 @@ This note designs that walker and the rule language in Go.
 | BFS | Visit all items at one level before going deeper | Floor by floor |
 | Frontier | The list of items found but not visited yet | A to-do stack or queue |
 | Interface | A Go type that lists methods; many types can satisfy it | `Node` for file, dir, link |
+| Composite | One interface for both single items and containers of items | `Node` is a file, a folder or a link |
+| Specification | A small yes/no rule object you can combine with AND, OR, NOT | `And(ExtensionIs(".go"), Not(SizeGreaterThan(1MB)))` |
+| Glob | A filename pattern with wildcards | `*.md` matches `notes.md` |
+| Inode | The number a Unix disk uses to identify a file, whatever its path | Two links, same inode = same file |
+| Fuzzing | Feeding random inputs to code to find crashes | `FuzzParse` tries odd query strings |
 
 **Picture it**
 
@@ -112,13 +121,13 @@ depth, and do not loop forever on symlink cycles.
 6. Discuss the query parser, the real disk (`io/fs`) and parallel search.
 7. Test each filter, the combinators, DFS vs BFS order, depth and a symlink cycle.
 
-What it really tests: modeling a tree uniformly ([[Composite]]), modeling filter logic as composable objects (Specification and Interpreter) instead of a growing `if` chain, and safe traversal: cycles, depth limits, permission errors and cancellation. Time box: 10 minutes for requirements and entities, 10 for APIs, 25 to 40 for code, 10 for edge cases.
+What it really tests: modeling a tree uniformly ([[Composite]]), modeling filter logic as composable objects (Specification and Interpreter: Interpreter turns a query string into that tree of rule objects) instead of a growing `if` chain, and safe traversal: cycles, depth limits, permission errors and cancellation. Time box: 10 minutes for requirements and entities, 10 for APIs, 25 to 40 for code, 10 for edge cases.
 
 ## Step 1: Clarify requirements 🟢
 
 | Question to ask | Assumption |
 | --- | --- |
-| Real file system or an in-memory model? | An in-memory tree for deterministic tests. The real disk is an adapter over `io/fs.WalkDir` (shown in Step 8) |
+| Real file system or an in-memory model? | An in-memory tree for deterministic tests (same result every run). The real disk is an adapter (a thin wrapper that makes one interface look like another) over `io/fs.WalkDir` (shown in Step 8) |
 | Which filters? | Name glob, extension, size less than or greater than, combined with AND, OR, NOT |
 | A query language or only a Go API? | A Go API first. A small parser for `ext=.go AND size<1048576` is the bonus (no parentheses) |
 | Return directories too? | Only files, like `find -type f` |
@@ -155,6 +164,8 @@ The hardest use case, the one to code: **walk the tree with DFS or BFS, a max de
 The modeling insight: **there are two trees.** The data tree (Directory to children) is a Composite. The query tree (`And(Ext, Not(Size))`) is also a Composite, of filters, which is the Interpreter pattern. The walker joins them. A new filter never touches traversal code, and a new traversal never touches filters.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know the two trees (files and filters), DFS versus BFS, and why symlinks need a visited set. Next we open the box: how nodes and filters link, the API, where the data comes from, and the Go walk loop.
 
 ```mermaid
 classDiagram
@@ -206,7 +217,7 @@ classDiagram
 
 - **Composition** (`Directory *-- Node`): children belong to their directory.
 - **Association** (`Symlink --> Node`): a link points at a node it does not own, and that node can be an ancestor, which makes a cycle.
-- **Aggregation** (`And`, `Or`, `Not` over `Filter`): combinators hold sub-filters that could be reused. In Go every leaf and combinator is a `FilterFunc` closure, the idiomatic way to write small specifications.
+- **Aggregation** (`And`, `Or`, `Not` over `Filter`): combinators hold sub-filters that could be reused. In Go every leaf and combinator is a `FilterFunc` closure (a function value that remembers its settings, like the size limit), the idiomatic way to write small specifications.
 
 ## Step 5: APIs and public methods 🟡
 
@@ -235,7 +246,7 @@ If the interviewer pushes toward `locate`-style indexed search, that is a differ
 | [[Strategy and Template Method]] (light) | `Options.Order` | DFS and BFS differ only in which end of the frontier is popped |
 | [[Iterator and range-over-func]] (extension) | An `iter.Seq[Match]` instead of a slice (since Go 1.23) | Streams results on huge trees and lets the caller stop early |
 
-Not used, on purpose: a full Strategy interface with two traversal classes (DFS and BFS differ by one line; an enum keeps it simple until a third order appears), and Visitor (there is only one operation over the nodes; Visitor pays off with many, such as size totals, printing and deleting).
+Not used, on purpose: a full Strategy interface with two traversal classes (DFS and BFS differ by one line; an enum (a small fixed list of named values) keeps it simple until a third order appears), and Visitor (a pattern that adds new operations over a tree without changing the node types; there is only one operation over the nodes; Visitor pays off with many, such as size totals, printing and deleting).
 
 ## Folder structure 🟡
 
@@ -288,13 +299,13 @@ The walk in steps:
 
 1. `Search` rejects a nil root, defaults a nil filter to `MatchAll`, and seeds the frontier with `{path: "root", depth: 0}`.
 2. Each turn checks `ctx.Err()` first, so a huge walk can be cancelled. Then it pops: **DFS** from the end (a stack), **BFS** at `head` (a queue). That one line is the whole traversal strategy.
-3. **BFS memory fix.** A naive queue pops with `frontier = frontier[1:]`. The popped slots stay in the backing array, still holding path strings and node pointers, until `append` happens to reallocate.
+3. **BFS memory fix.** A naive queue pops with `frontier = frontier[1:]`. The popped slots stay in the backing array (the hidden array a Go slice points into), still holding path strings and node pointers, until `append` happens to reallocate.
 
    Here each popped slot is zeroed, and once the dead prefix is over half the slice the live part is copied to the front. Memory stays proportional to the tree's widest level.
 4. **Symlink:** skipped when `FollowSymlinks` is off (`find -P`); otherwise the node is swapped for its target and keeps the link's path.
-5. **File:** `filter.Match(file)`. `And` short-circuits on the first false, `Or` on the first true.
+5. **File:** `filter.Match(file)`. `And` short-circuits (stops checking early) on the first false, `Or` on the first true.
 6. **Directory:** three guards in order. Depth: a directory at `MaxDepth` is not expanded and **not** marked visited, because a shorter path may reach it later. Visited: breaks `loop -> root` and stops a second link to the same directory from producing duplicates. Denied: recorded in `Skipped`.
-7. `Parse` is recursive descent with precedence `NOT > AND > OR`. Terms are validated once at parse time (bad glob, bad size, unknown key give `ErrInvalidExpr`), so `Match` can never fail later.
+7. `Parse` is recursive descent (a parser written as functions that call each other, one per grammar rule) with precedence (which operator binds tighter) `NOT > AND > OR`. Terms are validated once at parse time (bad glob, bad size, unknown key give `ErrInvalidExpr`), so `Match` can never fail later.
 
 ```mermaid
 flowchart TD
@@ -604,11 +615,11 @@ func Search(ctx context.Context, root *Directory, filter Filter, opt Options) (R
 
 **Real disk, parallel walk.** `SearchFS` maps the same filters onto `io/fs.WalkDir`: each `fs.DirEntry` gives the type, and `d.Info()` returns an `fs.FileInfo` with `Size()` (and `ModTime()` for a future mtime filter).
 
-`WalkDir` does not follow symlinks inside the tree (only a symlinked root is resolved) and reads each directory in lexical order, so output is deterministic.
+`WalkDir` does not follow symlinks inside the tree (only a symlinked root is resolved) and reads each directory in lexical order (sorted by name, like a dictionary), so output is deterministic.
 
 A failed `ReadDir` (permission denied) reaches the callback as a second call with `err` set, which becomes a `Skipped` entry.
 
-`ParallelSearch` is a fork-join walk: a directory gives each child one result slot, runs child directories on a free worker if a token is available and inline if not (it never blocks, so a bounded pool cannot deadlock), then joins the slots in child order.
+`ParallelSearch` is a fork-join walk (split the work across goroutines, then wait and merge the results): a directory gives each child one result slot, runs child directories on a free worker if a token is available and inline if not (it never blocks, so a bounded pool cannot deadlock (freeze with every worker waiting for another)), then joins the slots in child order.
 
 On a tree, where no directory was added under two parents, the result equals the sequential DFS result exactly, whatever the scheduling.
 
@@ -1020,6 +1031,8 @@ Run in a scratch module with Go 1.24.4: `go vet` clean, `go test -race` passes a
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working search and its tests. Next is interview depth: symlink cycles, the DFS depth gap, files reached by two paths, hostile query strings, and making a huge walk fast.
+
 | Edge case | What happens | How the design handles it |
 | --- | --- | --- |
 | Symlink cycle (`loop -> root`) | A naive walk loops forever | `visited` set of directories (real disk: key by device and inode). Links are not followed by default |
@@ -1084,7 +1097,7 @@ Redraw it from memory: the interface and its three implementations (mark the one
 > Directory reads dominate, so read directories in parallel with a bounded pool. A fork-join walk gives each child a result slot and joins slots in child order, so the output stays deterministic. Try-acquire a worker token and walk inline when none is free; blocking would deadlock a bounded pool. For repeated searches, build an index instead.
 
 > [!question]- How do you make the parser safe against hostile input?
-> Validate every term at parse time (glob syntax, size integer, known key) and return a wrapped `ErrInvalidExpr`, so evaluation can never fail. Then fuzz it: `FuzzParse` checks that no input panics and every error wraps the sentinel.
+> Validate every term at parse time (glob syntax, size integer, known key) and return a wrapped `ErrInvalidExpr`, so evaluation can never fail. Then fuzz it: `FuzzParse` checks that no input panics and every error wraps the sentinel (a fixed, named error value such as `ErrInvalidExpr`).
 >
 > Seeds run on every `go test`; `-fuzz` explores new inputs. Behind an HTTP API, also cap the query length, because each `NOT` adds one level of recursion in the parser and in `Match`.
 
@@ -1103,6 +1116,26 @@ I model the file system as a Composite: File, Directory and Symlink all implemen
 - Real disk: `fs.WalkDir` plus `d.Info()` for `fs.FileInfo`; it does not follow links inside the tree and is lexically ordered.
 - Parallel: fork-join with one slot per child, try-acquire tokens, join in child order for deterministic output.
 - Parser: precedence NOT > AND > OR, validate terms up front, fuzz it.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 In one loop, what is the only difference between DFS and BFS?
+> Which end of the frontier you pop: DFS takes from the end (stack), BFS from the front (queue).
+
+> [!question]- 🟢 Why is a symlink the only node type that can make a loop?
+> Files and folders form a tree; only a link can point back up to an ancestor folder.
+
+> [!question]- 🟢 A folder says "permission denied". Does the search stop?
+> No. It is listed in `Skipped` and the walk continues, as `find` does.
+
+> [!question]- 🟡 What filter tree does `ext=.go AND NOT size>1048576 OR name=*.md` build?
+> OR at the root; its left side is AND(ext .go, NOT size>1 MB), its right side is the `*.md` glob.
+
+> [!question]- 🟡 Why is a folder cut by `MaxDepth` not marked visited?
+> It was never expanded; a shorter path may reach it later and must be allowed in.
+
+> [!question]- 🟡 Why does `ParallelSearch` walk inline when no worker token is free, instead of waiting?
+> Waiting could freeze a bounded pool where every worker waits for another; walking inline always makes progress.
 
 ## Links 🟢
 

@@ -33,6 +33,13 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+> - [[Kafka and Event Streaming]]: Kafka is a log of events, split into partitions, that many readers can replay.
+> - [[Stream Processing Basics]]: a program that reads events one by one and keeps running totals.
+> - [[Delivery Semantics and Exactly-Once]]: messages can arrive twice, so you need a way to count each one once.
+> - [[Case Study - Distributed Message Queue]]: how a queue stores events in order and lets readers resume where they stopped.
+
 **From zero, in 60 seconds** 🟢
 
 Every time someone clicks an ad, the advertiser owes the ad network a little money.
@@ -79,6 +86,11 @@ Counting a billion clicks a day, fast and exactly once, is the whole problem.
 | Idempotent | Doing it twice gives the same result as once | `SET count = 5`, not `count + 1` |
 | Batch job | A job that re-processes stored data in bulk later | Nightly recount from raw files |
 
+| Partition | One slice of a Kafka topic; one reader task owns it | all clicks for ad 42 go to partition 7 |
+| Offset | The position of an event inside a partition | "I have read up to event 10,532" |
+| Checkpoint | A saved snapshot of the counter program's totals plus its offsets | restart from the 9:05 snapshot after a crash |
+| OLAP store | A database built for fast sums and charts over huge tables | ClickHouse, Druid, Pinot |
+
 **Picture it**
 
 ```mermaid
@@ -115,10 +127,17 @@ If the system counts by arrival time, that click lands in the wrong minute. If i
 
 Over 1 billion clicks a day, small error rates are real money, and advertisers audit invoices.
 
+### Real-life example: ads on a video app 🟢
+
+Think of the ads you see on YouTube or Instagram. A sports-shoe brand pays a little each time someone taps its ad.
+The brand watches a live chart of taps per minute while a campaign runs, and later gets an invoice.
+If your phone loses signal and resends the tap, the system must still count you once.
+That is exactly this design: a fast live count for the chart, and a slower exact recount for the invoice.
+
 **Terms used below:**
 - **Event time:** when the click happened, stamped by the device or the click server.
 - **Processing time:** when the aggregation job sees the event.
-- **Tumbling window:** fixed, non-overlapping time buckets, such as 12:00–12:01 and 12:01–12:02.
+- **Tumbling window:** fixed, non-overlapping time buckets (they sit end to end and never share a click), such as 12:00–12:01 and 12:01–12:02.
 - **Watermark:** a timestamp carried through the stream that says "no more events older than this are expected".
 - **Allowed lateness:** extra time after the watermark during which a window still accepts updates.
 - **Checkpoint:** a consistent snapshot of the job's state and its input offsets, used to restart after a crash.
@@ -154,7 +173,17 @@ flowchart LR
     L --> A["Auditor's weekly recount"]
 ```
 
+## Common beginner mistakes 🟢
+
+- **Adding +1 to a database row per click** → retries and replays double-count, and one popular ad becomes a hot row → count in the stream job and overwrite the per-minute total.
+- **Counting by arrival time** → a late click lands in the wrong minute and a rerun gives different numbers → count by event time (when the tap happened).
+- **Trusting the phone's clock blindly** → a phone set to 2030 closes windows early → let the click server stamp the time, or reject times far in the future.
+- **Billing from the live stream** → the live count can miss late or duplicate clicks → bill from the nightly batch recount.
+- **Making the click server count** → the user waits on the redirect while it does slow work → log the click to Kafka and redirect at once.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the goal: count each click once, by the minute it happened, fast for charts and exact for bills. **Next we open the box** and follow one click through the click server, Kafka, the stream job and the stores.
 
 ```mermaid
 flowchart LR
@@ -173,13 +202,21 @@ flowchart LR
     OLAP --> QAPI[Query API] --> DASH[Advertiser dashboard]
 ```
 
-**Step by step:**
-1. The click server receives `GET /c/{token}`, decodes the ad and impression from the signed token, assigns a click ID, writes the event to Kafka and redirects the user to the advertiser's page. It does no counting; it must stay fast because the user is waiting.
+**Step by step (plain):**
+1. Priya taps the shoe ad (ad 42) at 9:01:13.
+2. The click server gives the tap an ID, `c-777`, drops it into Kafka, and sends Priya to the shoe shop's page.
+3. The counter program reads `c-777`, sees it happened at 9:01, and adds 1 to "ad 42, 9:01".
+4. Her phone retries and sends `c-777` again. The program has seen that ID, so it ignores it.
+5. Around 9:02 and a few seconds, the program decides the 9:01 bucket is complete and writes "ad 42, 9:01 = 1" to the chart store.
+6. That night, a batch job recounts all saved raw clicks and its total is what goes on the bill.
+
+**Full detail:**
+1. The click server receives `GET /c/{token}`, decodes the ad and impression (one showing of the ad to a user) from the signed token (a value with a secret signature, so it cannot be faked), assigns a click ID, writes the event to Kafka and redirects the user to the advertiser's page. It does no counting; it must stay fast because the user is waiting.
 2. Kafka's `raw-clicks` topic is partitioned by `ad_id`, so all clicks for one ad reach the same stream task. It is retained for days so the job can replay; see [[Case Study - Distributed Message Queue]].
-3. An archiver copies raw clicks to object storage in hourly Parquet files. This is the permanent record.
-4. The stream job (Apache Flink in this design) validates events, drops duplicates by click ID, assigns each click to a one-minute event-time window, and emits a window's counts when the watermark passes the window's end.
-5. Results go to a Kafka topic and then to an OLAP store through an idempotent sink: the row for `(ad_id, minute)` is overwritten with the window's total, so replaying a result is harmless.
-6. Late clicks go to a side topic. The daily batch job recounts everything from raw files (including late clicks), writes corrected rows and produces billing totals.
+3. An archiver copies raw clicks to object storage (cheap, huge file storage such as Amazon S3) in hourly Parquet files (a compressed file format that stores data column by column). This is the permanent record.
+4. The stream job (Apache Flink, a popular stream-processing engine, in this design) validates events, drops duplicates by click ID, assigns each click to a one-minute event-time window, and emits a window's counts when the watermark passes the window's end.
+5. Results go to a Kafka topic and then to an OLAP store through an idempotent sink (the final writer step, made safe to repeat): the row for `(ad_id, minute)` is overwritten with the window's total, so replaying a result is harmless.
+6. Late clicks go to a side topic (a separate Kafka topic just for stragglers). The daily batch job recounts everything from raw files (including late clicks), writes corrected rows and produces billing totals.
 
 ## 4. Worked example - estimates, API and data model 🟡
 
@@ -211,9 +248,9 @@ All inputs are **estimates** for the exercise.
 | Aggregated row | 50 bytes |
 
 - **Average rate:** 1,000,000,000 / 86,400 s ≈ 11,600 clicks/s. **Peak:** 5 × 11,600 ≈ 58,000 clicks/s.
-- **Raw bytes:** 1,000,000,000 × 200 B = 200 GB/day. Kafka with 7-day retention and RF 3: 200 GB × 7 × 3 = 4.2 TB. Object storage for a year (before compression): 200 GB × 365 = 73 TB.
+- **Raw bytes:** 1,000,000,000 × 200 B = 200 GB/day. Kafka with 7-day retention and RF 3 (replication factor 3: every event stored on 3 machines): 200 GB × 7 × 3 = 4.2 TB. Object storage for a year (before compression): 200 GB × 365 = 73 TB.
 - **Peak ingress:** 58,000 × 200 B ≈ 11.6 MB/s. Small for Kafka; the hard part is correctness, not bandwidth.
-- **Aggregated rows:** 200,000 ads × 5 slices × 1,440 minutes = 1.44 × 10^9 rows/day; × 50 B = 72 GB/day. This is why the store is a columnar OLAP database and why old minutes are rolled up to hours (24 × fewer rows).
+- **Aggregated rows:** 200,000 ads × 5 slices × 1,440 minutes = 1.44 × 10^9 rows/day; × 50 B = 72 GB/day. This is why the store is a columnar (stores each column together, so summing one column is fast) OLAP database and why old minutes are rolled up to hours (24 × fewer rows).
 - **Dedupe state:** clicks per minute at peak = 58,000 × 60 ≈ 3.5 million IDs. At about 40 bytes per stored ID (estimate including map overhead), one window's set is about 140 MB, spread across all parallel tasks. Windows close after a minute plus lateness, so only a few are open at once.
 
 ### API
@@ -222,7 +259,7 @@ All inputs are **estimates** for the exercise.
 
 | Call | Purpose |
 | --- | --- |
-| `GET /c/{signed_token}` | Click redirect; logs the click, returns `302 Location: <landing URL>` |
+| `GET /c/{signed_token}` | Click redirect; logs the click, returns `302 Location: <landing URL>` (a 302 tells the browser "go to this other address") |
 | `GET /v1/ads/{ad_id}/clicks?from=2026-11-04T12:00Z&to=2026-11-04T13:00Z&granularity=1m` | Time series of counts |
 | `GET /v1/ads/top?window=1m&n=100&country=IN` | Top N ads in the latest closed minute |
 | `GET /v1/advertisers/{id}/billing?date=2026-11-03` | Reconciled daily totals (from the batch job) |
@@ -308,7 +345,7 @@ The trap would be `SET clicks = ad_clicks_minute.clicks + EXCLUDED.clicks`: afte
 
 **In plain words:** the code keeps one bucket per ad per minute, drops repeated click IDs, and closes a bucket once it is fairly sure no more clicks for that minute are coming.
 
-A single-partition model of what the stream job does for one key range: tumbling windows by event time, a bounded-out-of-orderness watermark, per-window deduplication by click ID, and a side output for late clicks. Time comes only from the events, so the tests are deterministic without a clock.
+A single-partition model of what the stream job does for one key range: tumbling windows by event time, a bounded-out-of-orderness watermark (one that assumes clicks arrive at most a fixed time, here 10 s, out of order), per-window deduplication by click ID, and a side output for late clicks. Time comes only from the events, so the tests are deterministic without a clock.
 
 ```go
 // Package clicks counts ad clicks per ad in event-time tumbling windows,
@@ -521,10 +558,18 @@ flowchart TB
     end
 ```
 
+### Things people confuse this with 🟡
+
+| System | What it counts | How it differs |
+| --- | --- | --- |
+| [[Case Study - Distributed Counter (Likes and Views)]] | Likes and views on posts | Small errors are fine; no invoice depends on it, so no nightly recount |
+| [[Case Study - Metrics and Logging Platform]] | CPU, latency, errors from servers | Counts for engineers, not money; old data can be thrown away |
+| Web analytics (page views) | Visits to pages | Usually sampled or approximate; ad clicks must be exact for billing |
+
 ## 6. Trade-offs 🟡
 
 - **Watermark delay vs completeness.** A 10-second bound emits results quickly but sends more clicks to the late path; a 5-minute bound catches almost everything but delays every dashboard by 5 minutes. Allowed lateness is a middle path: emit at the watermark, then emit updated results for late clicks until the lateness expires, which the overwrite sink handles naturally.
-- **Exactly-once cost.** Flink's exactly-once Kafka sink commits a Kafka transaction per checkpoint, so downstream `read_committed` readers see results only after each checkpoint completes (every 10–60 s is common). At-least-once with an idempotent overwrite sink gives the same final numbers with lower latency, because duplicates overwrite instead of add.
+- **Exactly-once cost.** Flink's exactly-once Kafka sink commits a Kafka transaction per checkpoint, so downstream `read_committed` readers (readers set to see only finished transactions) see results only after each checkpoint completes (every 10–60 s is common). At-least-once with an idempotent overwrite sink gives the same final numbers with lower latency, because duplicates overwrite instead of add.
 - **Dedupe window.** Deduplicating within a window is cheap because the state is dropped when the window closes. A duplicate that arrives after its window closed is caught only by the batch job, which deduplicates over the whole day.
 - **Partitioning by `ad_id`.** It keeps one ad's clicks on one task (no cross-task merge) but makes a viral ad a hot partition. See Deep dive.
 - **When not to build this:** at a few thousand clicks per minute, a single PostgreSQL table of raw clicks with a unique constraint on `click_id` and a `GROUP BY date_trunc('minute', event_time)` query is enough, and exact by construction.
@@ -537,15 +582,17 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the full pipeline, the data model and the Go window code. **Next is the advanced part**: crashes, idle partitions, wrong clocks, viral ads, fraud, and how the live and batch numbers are checked against each other.
+
 - **Real systems:** stream processors such as Apache Flink, Kafka Streams, Spark Structured Streaming and Google Cloud Dataflow implement event-time windows and watermarks as described in the Dataflow Model paper. OLAP stores such as Apache Druid, Apache Pinot and ClickHouse serve the aggregated results.
 - **Failure modes and fixes:**
 	- *Job crash:* Flink restores state and Kafka offsets from the last completed checkpoint and re-reads from those offsets. Windows are recomputed and re-emitted; the overwrite sink makes that safe.
 	- *Idle partition stalls the watermark:* a task's watermark is the minimum over its inputs, so one Kafka partition with no traffic holds every window open. Fix: mark idle sources (Flink's `withIdleness`) so they stop holding the watermark back.
 	- *Device clocks wrong:* a phone set to 2030 pushes the max event time forward and closes windows early. Fix: let the click server stamp event time, or reject events too far ahead of server time.
 	- *Hot ad:* one ad gets 20% of all clicks during a campaign. Fix: two-stage aggregation (see Deep dive).
-	- *Click fraud and bots:* filtered before counting by rules (IP and device rates, known bad lists), with heavier ML scoring in the batch path; disputed clicks are removed from billing, not from the raw log.
+	- *Click fraud and bots:* filtered before counting by rules (IP and device rates, known bad lists), with heavier ML scoring (a machine-learning model that rates how likely a click is fake) in the batch path; disputed clicks are removed from billing, not from the raw log.
 	- *Stream and batch disagree:* the reconciliation job compares totals per ad per hour, raises an alert above a threshold (for example 0.1%), and batch values replace stream values.
-- **What to monitor:** consumer lag of the stream job, watermark lag (wall clock minus watermark), late-click rate, duplicate rate, checkpoint duration and failures, stream-versus-batch difference per day, end-to-end freshness of the dashboard.
+- **What to monitor:** consumer lag (how far behind the newest event the reader is) of the stream job, watermark lag (wall clock minus watermark), late-click rate, duplicate rate, checkpoint duration and failures, stream-versus-batch difference per day, end-to-end freshness of the dashboard.
 
 ## 8. Deep dive 🔴
 
@@ -587,8 +634,8 @@ sequenceDiagram
     Note over S,K: crash before checkpoint 42 completes: restore 41, abort T42, replay. Crash after it completes but before commit: restore 42 and commit T42 on recovery
 ```
 
-- **Barriers** flow with the data, so the snapshot of each task's state corresponds exactly to the input offsets recorded by the sources: every click before the barrier is in the state, none after it.
-- **Two-phase commit** at the sink: output written since the last checkpoint is in an open Kafka transaction, committed only when the checkpoint is globally complete. A crash aborts it and the replay produces it again.
+- **Barriers** (special marker records the JobManager, Flink's coordinator, injects into the stream) flow with the data, so the snapshot of each task's state corresponds exactly to the input offsets recorded by the sources: every click before the barrier is in the state, none after it.
+- **Two-phase commit** (first prepare the write, then make it visible only when everyone is ready) at the sink: output written since the last checkpoint is in an open Kafka transaction, committed only when the checkpoint is globally complete. A crash aborts it and the replay produces it again.
 - The result: each click affects the committed output exactly once, even though some clicks are processed twice internally. See [[Delivery Semantics and Exactly-Once]].
 
 ### Hot ads: two-stage aggregation
@@ -596,7 +643,7 @@ sequenceDiagram
 **In plain words:** one viral ad would overload one worker. So many workers each count a slice of it first, then one worker adds the slices together.
 
 Partitioning by `ad_id` puts a viral ad on one task. Instead:
-1. **Stage 1:** key by `(ad_id, salt)` where `salt = hash(click_id) mod 16`, and count per window. The load of one ad spreads across 16 tasks. Using the click ID for the salt keeps duplicates of the same click on the same task, so dedupe still works.
+1. **Stage 1:** key by `(ad_id, salt)` where the salt (a small extra number added to the key to spread it out) is `hash(click_id) mod 16`, and count per window. The load of one ad spreads across 16 tasks. Using the click ID for the salt keeps duplicates of the same click on the same task, so dedupe still works.
 2. **Stage 2:** key by `ad_id` and sum the 16 partial counts per window. Stage 2 receives at most 16 small records per ad per minute, not thousands of clicks.
 
 See [[Hot Keys and Hot Partitions]] for the general pattern.
@@ -610,6 +657,15 @@ After windows close, a second operator keeps a min-heap of size N over the per-a
 **In plain words:** every night the slow, exact recount is compared with the fast live count, and the recount wins.
 
 The nightly batch job reads the raw Parquet files and the late-click topic, deduplicates by `click_id` across the whole day, applies the full fraud rules, and writes hourly and daily totals with `source = 'batch'`.
+
+```mermaid
+flowchart LR
+    S["live stream totals"] --> C{"differ by more than 0.1%?"}
+    B["nightly batch totals"] --> C
+    C -- "yes" --> A["alert: look for a bug"]
+    C -- "no" --> OK["fine"]
+    B --> BILL["billing uses batch"]
+```
 
 Billing reads only batch totals. A difference above the alert threshold between stream and batch is a bug signal (a broken watermark, a lost partition), not something to average away.
 
@@ -646,6 +702,26 @@ Billing reads only batch totals. A difference above the alert threshold between 
 - Hot ad: salted two-stage aggregation.
 - Billing truth = nightly batch recount from raw Parquet; stream feeds dashboards; reconcile and alert on drift.
 - Estimate: 1 B clicks/day ≈ 11.6 k/s average, 58 k/s peak, 200 GB/day raw.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: why must a retried click not be counted twice?
+> The advertiser pays per click, so a double count means overcharging them.
+
+> [!question]- Easy: what is event time?
+> The moment the user actually tapped the ad, not when the server received it.
+
+> [!question]- Easy: which count goes on the invoice, live or nightly?
+> The nightly batch recount; the live stream is only for charts.
+
+> [!question]- Medium: why write `SET clicks = 5` instead of `clicks = clicks + 1`?
+> If a window is re-emitted after a crash, overwriting gives the same answer; adding would double it.
+
+> [!question]- Medium: what does a watermark of 12:01:01 let the job do?
+> Close and emit the 12:00-12:01 window, since no more clicks older than 12:01:01 are expected.
+
+> [!question]- Medium: one ad gets 30% of clicks. What do you do?
+> Split its key with a salt so 16 tasks each count a slice, then add the 16 partial counts in a second stage.
 
 ## Links
 

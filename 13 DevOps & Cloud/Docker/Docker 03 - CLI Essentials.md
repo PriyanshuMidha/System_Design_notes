@@ -43,6 +43,9 @@ Build or pull, run, look at it, poke at it if something's wrong, stop it, remove
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Docker 02 - Images, Layers and Containers]]: an image is a read-only stack of layers, and a container is that image running with its own thin writable layer.
+
 **From zero, in 60 seconds** 🟢
 
 You talk to Docker by typing `docker` commands in a terminal.
@@ -80,6 +83,12 @@ This note is the small set of commands you use every day.
 | Port mapping | Connecting a host port to a container port | `-p 8080:8080` |
 | Signal | A message the OS sends a process | `SIGTERM` = please shut down |
 | Exit code | A number a process returns when it ends | `0` = success, `137` = killed |
+| SIGTERM / SIGKILL | "Please shut down" (the app can clean up) vs "die now" (it cannot) | `docker stop` sends SIGTERM first |
+| Grace period | How long Docker waits after SIGTERM before sending SIGKILL | 10 seconds by default |
+| PID 1 | The first, main process inside a container; when it exits, the container stops | `./server` |
+| TTY / stdin | A terminal screen / the keyboard input stream of a process | `-it` gives a container both |
+| Dangling image | An old image layer set with no name left pointing to it | Left behind after rebuilding `myapi:dev` |
+| Prune | Delete everything unused of one kind, in one command | `docker system prune` |
 
 **Picture it**
 
@@ -113,6 +122,21 @@ Without a small, memorized set of commands, every container interaction becomes 
 
 Concretely: a container exits immediately after `docker run myapi` with no visible error, because the terminal that started it closed before the process finished logging. `docker ps -a` shows the container still exists, exited, with a non-zero code; `docker logs <id>` then prints the crash that already happened, in full, without needing to reproduce it.
 
+```mermaid
+flowchart LR
+    R["docker run myapi:<br/>exits, no error shown"] --> P["docker ps -a:<br/>Exited (1)"]
+    P --> L["docker logs id:<br/>the crash message"]
+    L --> F["fix and run again"]
+```
+
+### Real-life example: the order service will not start 🟢
+
+Say you work on a food-delivery app like Zomato and the order service you just built will not stay up on your laptop.
+`docker ps` shows nothing, so it looks like it never started.
+`docker ps -a` shows it did start, and exited with code 1 a minute ago.
+`docker logs` prints "cannot connect to database at localhost:5432", which is the real problem.
+Four commands, no guessing, and no laptop restart.
+
 ## 2. Mental model 🟢
 
 The CLI commands fall into five groups, matching the lifecycle diagram above:
@@ -125,11 +149,28 @@ The CLI commands fall into five groups, matching the lifecycle diagram above:
 
 Everything else in the CLI is a flag variation within one of these five groups.
 
+## Common beginner mistakes 🟢
+
+- **Thinking a stopped container is gone** → it stays on disk in the Exited state until `docker rm` → use `docker ps -a` to see it, and `--rm` for one-off runs.
+- **Using `docker kill` as the normal way to stop** → the app gets no chance to close connections or finish writes → use `docker stop`; keep `kill` for a container that is stuck.
+- **Pressing Ctrl-C inside `docker attach`** → that can stop the main app → use `docker exec -it <name> sh` to look around instead.
+- **Running `docker exec` on a crashed container** → `exec` only works on running containers → read `docker logs` first.
+- **Running `docker system prune` on a shared build server without thinking** → it wipes cache and stopped containers others may need → prune on a schedule, and know what it removes.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the five groups of commands and the build → run → look → stop → clean loop. **Next we open the box**: the exact states a container moves through, what `run` does that `pull` does not, and what happens inside the app when you stop it.
 
 ### Container lifecycle states
 
 **In plain words:** a container is like an app on your phone: installed (created), open (running), closed (stopped), and uninstalled (removed).
+
+**Step by step:**
+1. `docker create myapi:v1` makes the container `api`. It exists but nothing runs: **Created**.
+2. `docker start api` starts its main program: **Running**.
+3. The program crashes, or you run `docker stop api`: **Exited**. Its files and logs are still on disk.
+4. `docker start api` again brings the same container back to Running.
+5. `docker rm api` deletes it for good. Only now is it gone.
 
 ```mermaid
 stateDiagram-v2
@@ -150,6 +191,12 @@ A stopped container is not gone — it is in the `Exited` state, still occupying
 
 **In plain words:** pull only downloads. run does everything at once: download if needed, create, and start.
 
+**Step by step:**
+1. `docker pull myapi:v1` downloads the layers. Nothing runs.
+2. `docker create myapi:v1` makes a container from it, still not running.
+3. `docker start <id>` starts it.
+4. `docker run myapi:v1` does steps 1-3 in one go (and skips step 1 if the image is already on your machine).
+
 ```mermaid
 flowchart TD
     PULL["docker pull myapi"] --> LOCAL["Image stored locally.<br/>Nothing is running."]
@@ -165,6 +212,13 @@ flowchart TD
 ### `stop` vs. `kill`
 
 **In plain words:** stop politely asks the app to finish and gives it 10 seconds. kill ends it at once.
+
+**Step by step:**
+1. You type `docker stop api`.
+2. Docker sends SIGTERM to the app (PID 1). A well-written Go app stops taking new requests and finishes the current ones.
+3. If the app exits within 10 seconds, done: a clean stop.
+4. If it is still running at 10 seconds, Docker sends SIGKILL and the kernel ends it instantly.
+5. `docker kill api` skips straight to step 4.
 
 ```mermaid
 flowchart LR
@@ -263,7 +317,7 @@ docker inspect --format '{{.State.Health.Status}} {{.NetworkSettings.IPAddress}}
 healthy 172.17.0.2
 ```
 
-`--format` (Go template syntax) extracts one field instead of the full JSON dump, which is useful in scripts.
+`--format` (Go template syntax: `{{.Field}}` placeholders filled from the data) extracts one field instead of the full JSON dump, which is useful in scripts.
 
 ```bash
 docker cp api:/app/debug.log ./debug.log
@@ -300,7 +354,7 @@ docker volume prune -f
 Total reclaimed space: 1.47GB
 ```
 
-`system prune` removes stopped containers, unused networks, dangling images, and build cache; `image prune -a` additionally removes any image not referenced by a running container, not just dangling ones; `volume prune` removes volumes no container references — run this one deliberately, since an unreferenced volume may still hold data you meant to keep (see [[Docker 06 - Volumes and Bind Mounts]]).
+`system prune` removes stopped containers, unused networks, dangling images, and build cache (saved layers from earlier builds that make the next build faster); `image prune -a` additionally removes any image not referenced by a running container, not just dangling ones; `volume prune` removes volumes no container references — run this one deliberately, since an unreferenced volume may still hold data you meant to keep (see [[Docker 06 - Volumes and Bind Mounts]]).
 
 ### Registry commands
 
@@ -329,18 +383,21 @@ docker push myregistry.example.com/myapi:v1
 
 ## 6. Trade-offs and when not to use 🟡
 
-- `docker attach` connects directly to the container's main process input/output — pressing `Ctrl-C` there can send SIGINT to that process and stop it, whereas `docker exec -it <id> sh` opens an *additional*, independent process you can exit freely without affecting the main one. Default to `exec` for interactive debugging.
+- `docker attach` connects directly to the container's main process input/output — pressing `Ctrl-C` there can send SIGINT (the "interrupt" signal Ctrl-C sends) to that process and stop it, whereas `docker exec -it <id> sh` opens an *additional*, independent process you can exit freely without affecting the main one. Default to `exec` for interactive debugging.
 - `docker kill` is faster but skips any cleanup code (closing DB connections, flushing writes) the application would have run on SIGTERM; reserve it for containers that are already unresponsive to `stop`.
 - `docker system prune` is destructive to anything unreferenced — build cache, stopped containers, dangling images — and cannot be scoped finely; on a shared CI build host, pruning too eagerly can force every subsequent build to start from a cold cache.
-- `docker cp` does not resolve symlinks across the container boundary the way a bind mount would; for ongoing, live file access, a mounted volume (next note) is the better tool.
+- `docker cp` does not resolve symlinks (shortcut files that point to another file) across the container boundary the way a bind mount would; for ongoing, live file access, a mounted volume (next note) is the better tool.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the container states, `pull` vs `run`, `stop` vs `kill`, and a full build-run-debug-clean session. **Next is the advanced part**: how CI systems use these commands, the failures you will actually debug, and why some images have no shell to `exec` into at all.
+
 
 - **Real systems:** CI pipelines script this exact command sequence (`build` → `run` a temporary container to execute tests → `logs`/`exec` for debugging a failure → `rm` to clean up) on every pull request.
 - **Failure modes → fixes:**
   - Container exits immediately with no error visible → the terminal closed, or the main process needs a TTY/stdin it wasn't given; check `docker ps -a` for the exit code and `docker logs` for what the process printed before exiting, rather than assuming it never started.
   - App unreachable on the published port → the app is listening on `127.0.0.1` inside the container instead of `0.0.0.0`; `docker logs` usually shows the bind address, and `0.0.0.0:8080->8080/tcp` in `docker ps` confirms the port mapping exists even when the app itself is unreachable (see [[Docker 05 - Networking and Port Publishing]]).
-  - `docker stop` seems to "hang" for exactly 10 seconds every time → the process doesn't handle SIGTERM at all (common for shell-form `CMD`, which doesn't make the app PID 1); fix the Dockerfile's `CMD`/`ENTRYPOINT` form rather than reaching for `kill` as the routine fix.
+  - `docker stop` seems to "hang" for exactly 10 seconds every time → the process doesn't handle SIGTERM at all (common for shell-form `CMD`, written as plain text like `CMD ./server` instead of a JSON list, which runs a shell as PID 1 and the app as its child); fix the Dockerfile's `CMD`/`ENTRYPOINT` form rather than reaching for `kill` as the routine fix.
   - Disk silently fills up on a long-lived CI/build host → stopped containers, dangling images, and build cache accumulate; schedule `docker system prune` (or `image prune -a`) regularly, not only when the disk is already full.
 - **What to monitor:** `docker ps -a` count of exited-but-not-removed containers, `docker system df` for reclaimable space, and container restart counts (a `--restart unless-stopped` container restarting repeatedly is crash-looping, not recovering).
 
@@ -348,9 +405,9 @@ docker push myregistry.example.com/myapi:v1
 
 **Why `docker ps -a` matters more than it looks.** Every `docker run` that exits leaves a container record behind — logs, exit code, and its (now-empty-ish) writable layer all remain on disk. A host that runs many short-lived containers (one-off scripts, CI test runs) without ever removing them accumulates thousands of exited containers over weeks, each holding onto some disk even though none are "running." `docker run --rm` auto-removes the container the moment it exits, which is the right default for any container whose logs you don't need to inspect after the fact.
 
-**Why `docker exec` can run things the original `CMD` never imagined.** `exec` starts a brand-new process inside the container's existing namespaces — it doesn't re-run or interact with PID 1 at all. This means a container whose `CMD` is a single static binary with no shell (a `scratch`-based image, common for Go) will fail `docker exec -it <id> sh` with "executable file not found," not because `exec` is broken, but because there genuinely is no `sh` binary inside that image's filesystem to run. Debugging a distroless or `scratch` image typically means temporarily attaching an ephemeral debug container to the same namespaces (`docker run --rm -it --pid container:<id> --net container:<id> busybox sh`) rather than `exec`-ing into the image itself.
+**Why `docker exec` can run things the original `CMD` never imagined.** `exec` starts a brand-new process inside the container's existing namespaces — it doesn't re-run or interact with PID 1 at all. This means a container whose `CMD` is a single static binary with no shell (a `scratch`-based image, meaning one that starts from a completely empty filesystem, common for Go) will fail `docker exec -it <id> sh` with "executable file not found," not because `exec` is broken, but because there genuinely is no `sh` binary inside that image's filesystem to run. Debugging a distroless (a tiny image with your app and its few needed files, but no shell or package manager) or `scratch` image typically means temporarily attaching an ephemeral debug container to the same namespaces (`docker run --rm -it --pid container:<id> --net container:<id> busybox sh`) rather than `exec`-ing into the image itself.
 
-**`--format` as a scripting primitive.** `docker inspect` returns a large JSON document; `--format` applies a Go template to it, letting scripts extract one field (an IP address, a health status, a mount path) without a separate `jq` dependency. This is the same templating used across `docker ps --format`, `docker images --format`, and similar list commands, so learning the syntax once covers most CLI scripting needs.
+**`--format` as a scripting primitive.** `docker inspect` returns a large JSON document; `--format` applies a Go template to it, letting scripts extract one field (an IP address, a health status, a mount path) without a separate `jq` (a command-line JSON tool) dependency. This is the same templating used across `docker ps --format`, `docker images --format`, and similar list commands, so learning the syntax once covers most CLI scripting needs.
 
 ## 9. Interview questions 🔴
 
@@ -381,6 +438,30 @@ docker push myregistry.example.com/myapi:v1
 - `logs -f --tail N` for history plus live tail; `inspect --format` for scripting one field out of the JSON.
 - `docker run --rm` auto-removes the container on exit — good default for anything short-lived.
 - Clean up regularly: `system prune`, `image prune -a`, `volume prune` — each is destructive and unscoped, so run deliberately on shared hosts.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Which command shows stopped containers too?
+> `docker ps -a`. Plain `docker ps` shows only running ones.
+
+> [!question]- Which command opens a shell inside a running container named `api`?
+> `docker exec -it api sh`.
+
+> [!question]- What does `--rm` on `docker run` do?
+> It deletes the container automatically as soon as it exits.
+
+🟡 Medium
+
+> [!question]- `docker stop api` always takes exactly 10 seconds. What does that tell you?
+> The app ignores SIGTERM, so Docker waits the full grace period and then sends SIGKILL.
+
+> [!question]- `docker exec -it api sh` fails with "executable file not found", but `api` is running. Why?
+> The image has no shell in it (for example a `scratch` or distroless image), so there is nothing for `exec` to run.
+
+> [!question]- What is the difference between `docker exec -it api sh` and `docker attach api`?
+> `exec` starts a new, separate process you can leave freely; `attach` connects to the main process, so Ctrl-C can stop the app.
 
 ## Links
 

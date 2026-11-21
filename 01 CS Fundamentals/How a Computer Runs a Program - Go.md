@@ -22,6 +22,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Step 2 (the loop), the design decisions and the test.
 > - 🔴 **Interview / SDE-3 prep?** Add "Running it", the pitfalls and the exercises. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - Nothing. This note starts from zero. It helps to read [[How a Computer Runs a Program]] first: the CPU repeats fetch, decode, execute, using a program counter and a few registers.
+
 **From zero** 🟢 — This file is the hands-on twin of [[How a Computer Runs a Program]]. It builds a toy CPU in about 60 lines of Go: 8 registers, a program counter, and just 5 commands (load a number, add, subtract, jump, stop). You hand it a list of instructions, it runs the fetch-decode-execute loop for real, and a test proves a tiny countdown program sums 5+4+3+2+1 = 15. Read the theory note first if any word feels new; here, read each code block, then the numbered "How it works" list under it.
 
 ## Before the code 🟢
@@ -81,6 +84,8 @@ There is no assembler, no linker, no loader here — only the fetch-decode-execu
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** that this file is a toy CPU with 8 registers and 5 commands. **Next we read the code:** first the types for one instruction and the CPU's memory, then the single loop that fetches, decodes and executes. Each step starts with one plain-words line.
+
 ### Step 1: instructions and CPU state
 
 **In plain words:** first we define the nouns — what one instruction looks like, and what the CPU remembers between instructions (its 8 registers and the program counter).
@@ -89,7 +94,7 @@ There is no assembler, no linker, no loader here — only the fetch-decode-execu
 
 `CPU` holds exactly the state that survives between instructions — registers and the program counter — matching the note's claim that registers are the CPU's only directly-addressable storage.
 
-`Instr` is a fixed-shape value (an opcode plus up to three integer operands) rather than, say, a string to parse, because a real CPU's instructions are fixed-width binary, not text — parsing text at execution time would misrepresent the mechanism being taught.
+`Instr` is a fixed-shape value (an opcode, the number naming the command, plus up to three integer operands, the values or register numbers it works on) rather than, say, a string to parse, because a real CPU's instructions are fixed-width binary, not text — parsing text at execution time would misrepresent the mechanism being taught.
 
 ```go
 // Package fde is a minimal fetch-decode-execute loop: a tiny register machine
@@ -178,6 +183,8 @@ func Run(program []Instr) CPU {
 
 The remaining two cases close out the `switch` and the function:
 
+**What this code does, in plain words:** if the chosen register holds 0, set the program counter to the jump target, otherwise just move to the next instruction; on `OpHalt`, stop and hand back the CPU; on anything unknown, crash loudly.
+
 ```go
 		case OpJumpIfZero:
 			if c.Reg[instr.A] == 0 {
@@ -218,7 +225,7 @@ sequenceDiagram
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
-| `switch` on `Opcode` for decode+execute | A jump table of function pointers per opcode | The switch is simpler to read and trace for teaching; a function-pointer table is closer to how some real decoders dispatch, at the cost of extra indirection. |
+| `switch` on `Opcode` for decode+execute | A jump table of function pointers per opcode (a slice where entry N is the function that handles opcode N) | The switch is simpler to read and trace for teaching; a function-pointer table is closer to how some real decoders dispatch, at the cost of extra indirection. |
 | Fixed `[8]int` register file | A `[]int` slice sized at construction | Matches a real CPU's fixed, small register count; a slice would allow an unrealistic "unlimited registers" machine. |
 | `instr.A/B/C` reused per-opcode | A separate struct type per opcode | One struct keeps `Instr` a single, fixed-size value (closer to real fixed-width instruction encoding); separate types would need an interface or type switch to store in one `[]Instr` slice. |
 | Panic on an unknown opcode | Silently ignore and continue | A loud failure surfaces a bug in the program slice immediately, rather than masking it as a silently-wrong result. |
@@ -245,6 +252,8 @@ This directly exercises every opcode except nothing is skipped: `OpLoadConst` (t
 | --- | --- |
 | Run the 8-instruction countdown-sum program | `cpu.Reg[1] == 15` |
 | Same | `cpu.Cycles > 0` |
+
+**What this code does, in plain words:** write an 8-line program (set counter to 5, total to 0, step to 1; loop: if counter is 0 stop, add counter to total, subtract 1, jump back), run it, and check the total is 15.
 
 ```go
 func TestCountdownSumsFiveToOne(t *testing.T) {
@@ -296,6 +305,8 @@ Each loop iteration of `Run` is one fetch (`program[c.PC]`), one decode (the `sw
 
 ## Running it 🔴
 
+> 🟡 → 🔴 **You now know** how the loop fetches, decodes and executes, and how the countdown test proves it. **Next comes the advanced part:** reading the output, where this toy differs from a real CPU, and exercises that change it.
+
 ```text
 go vet ./... && go test -race -v ./...
 ```
@@ -319,7 +330,7 @@ ok  	fde	1.455s
 ## Pitfalls in the code 🔴
 
 - **No bounds checking on `program[c.PC]`.** A program whose jump targets go out of range (negative, or past the end of the slice) panics with an index-out-of-range error instead of a clean "invalid program" message — acceptable for a teaching VM, not for anything meant to run untrusted programs.
-- **No stack, no function calls.** This machine has no `CALL`/`RET` opcodes and no stack pointer — it can express loops (via `OpJumpIfZero`) but not subroutines. A real CPU's stack pointer and calling convention are covered conceptually in [[Process Memory Layout - Stack vs Heap]], not reproduced here.
+- **No stack, no function calls.** This machine has no `CALL`/`RET` opcodes and no stack pointer — it can express loops (via `OpJumpIfZero`) but not subroutines (functions you call and then return from). A real CPU's stack pointer and calling convention are covered conceptually in [[Process Memory Layout - Stack vs Heap]], not reproduced here.
 - **The "unconditional jump" trick relies on an always-zero register.** Using `r7` as an always-zero register for `OpJumpIfZero`-based unconditional jumps works only because nothing in the test program ever writes to `r7`. A larger program would need either a dedicated `OpJump` opcode or a register the programmer is careful never to touch.
 - **`Cycles` and other bookkeeping fields have no equivalent in the theory note's hardware description.** They exist purely to make this package testable in Go; don't mistake them for an architectural CPU feature.
 
@@ -328,6 +339,26 @@ ok  	fde	1.455s
 1. Add a new opcode, `OpMul` (register multiply), following the same pattern as `OpAdd`/`OpSub`. Predict which lines need to change (hint: the `const` block, and exactly one new `case`), then write a small test program that computes `3 * 4` and confirms the result.
 2. Remove the `c.Cycles++` line and re-run `TestCountdownSumsFiveToOne`. Predict which assertion fails, then confirm by running the test.
 3. Change instruction 6 in `TestCountdownSumsFiveToOne` from `{Op: OpJumpIfZero, A: 7, B: 3}` to jump to instruction 4 instead of instruction 3. Predict whether the program still halts, and if so, whether the final accumulator value changes — then run it to check (careful: consider adding a cycle limit first in case your prediction is wrong and the loop never terminates).
+
+## Self-check 🟢🟡
+
+> [!question]- What two pieces of state does `CPU` keep between instructions?
+> The registers (`Reg`) and the program counter (`PC`). `Cycles` is only for testing.
+
+> [!question]- Which line in `Run` is the "fetch"?
+> `instr := program[c.PC]`.
+
+> [!question]- What does `OpHalt` do?
+> Returns from `Run`, the only way out of the endless `for` loop.
+
+> [!question]- How does this machine make an unconditional jump with only `OpJumpIfZero`?
+> It tests `r7`, which is never set and so is always 0, so the jump always happens.
+
+> [!question]- Why does every arithmetic case end with `c.PC++`?
+> So the next loop turn fetches the next instruction; only jumps set `PC` differently.
+
+> [!question]- What happens if a bug puts an unknown opcode into the program?
+> The `default` case panics, so the bug shows up at once instead of giving a quietly wrong answer.
 
 ## Links 🟢
 

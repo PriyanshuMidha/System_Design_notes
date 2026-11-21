@@ -22,6 +22,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add "Code", "Tests" and "Running it".
 > - 🔴 **Interview / SDE-3 prep?** Add "Design decisions", "Pitfalls" and the exercises. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: a handler reads request headers and writes a status code, headers and a body.
+> - [[HTTP-1.1 vs HTTP-2 vs HTTP-3]]: every request costs a trip to the server, which is what a `304` makes cheaper.
+> - [[HTTP Caching - Cache-Control, ETag, Conditional Requests]] (theory twin): `max-age`, ETags and the "did it change?" question.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on twin of the theory note. It builds one small Go web handler that does real HTTP caching: it stamps each response with a fingerprint (**ETag**) and a "trust this for 60 seconds" rule, and when a client asks "did it change?" it answers with a tiny empty `304` instead of resending the file. Read the code top to bottom — each block has a plain explanation right after it — and the tests at the end prove the saving really happens (14 bytes down to 0).
@@ -31,7 +36,7 @@ This file is the hands-on twin of the theory note. It builds one small Go web ha
 - **`net/http` handlers**: a function `func(w http.ResponseWriter, req *http.Request)` that reads request headers and writes a response.
 - **Closures**: `Handler` returns a function that remembers `get` and `maxAge`, so each request sees the current resource.
 - **Struct methods**: `Resource.etag()` is a method on a value type that hashes the body with `crypto/sha256`.
-- **`httptest.NewServer`**: starts a real local HTTP server inside a test, so requests go over a real socket.
+- **`httptest.NewServer`**: starts a real local HTTP server inside a test, so requests go over a real socket (the operating system's handle for one network connection).
 - **What to run**: `go vet ./...` then `go test -race ./...` from the module root.
 
 ## What this code shows 🟢
@@ -51,11 +56,13 @@ This file is the hands-on twin of the theory note. It builds one small Go web ha
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** what the handler must do: label each answer, fingerprint it, and reply `304` when the caller already has it. **Next we read the code**: first the fingerprint, then the handler that checks it.
+
 ### Step 1: the resource and its fingerprint
 
 **In plain words:** we make a tiny "thing to serve" (some bytes plus a last-changed time) and teach it to produce its own fingerprint — like stamping a parcel with a code that changes whenever the contents change.
 
-**Concept.** The theory note's ETag is "an opaque fingerprint of the response body." Here that fingerprint is a truncated SHA-256 hash of the resource's bytes, computed fresh on every request rather than stored and trusted from write time.
+**Concept.** The theory note's ETag is "an opaque fingerprint of the response body." Here that fingerprint is a truncated SHA-256 hash (a standard function that turns any bytes into a fixed 32-byte code; change one byte and the code changes completely) of the resource's bytes, computed fresh on every request rather than stored and trusted from write time.
 
 Hashing on read, instead of caching a pre-computed tag, guarantees the ETag can never drift out of sync with the actual bytes being served.
 
@@ -86,8 +93,8 @@ func (r Resource) etag() string {
 ```
 
 **How it works.**
-1. `Resource` carries both a strong validator's raw material (`Body`, hashed on demand) and a weak validator's raw material (`LastModified`), so the handler can offer both and let the client's headers pick which one actually gets checked.
-2. `sha256.Sum256` returns a fixed-size `[32]byte` array value, not a slice — `sum[:8]` takes just the first 8 bytes, which is plenty of entropy to detect accidental collisions for this demo without hex-encoding a full 32-byte hash into every response header.
+1. `Resource` carries both a strong validator's raw material (`Body`, hashed on demand: exact to the byte) and a weak validator's raw material (`LastModified`: a time, only precise to one second), so the handler can offer both and let the client's headers pick which one actually gets checked.
+2. `sha256.Sum256` returns a fixed-size `[32]byte` array value, not a slice — `sum[:8]` takes just the first 8 bytes, which is plenty of entropy (randomness) to avoid accidental collisions (two different bodies getting the same code) for this demo without hex-encoding a full 32-byte hash into every response header.
 3. The ETag is wrapped in literal double quotes (`` `"` + ... + `"` ``) because RFC 9110 defines the ETag header's value as a quoted string — a server that forgets the quotes produces a header real clients will fail to match correctly.
 
 ### Step 2: the handler
@@ -318,6 +325,8 @@ The second part replays the stored ETag, then replays a deliberately wrong one, 
 
 A failure here would mean the fallback branch is unreachable or broken — clients or intermediaries that only send `If-Modified-Since` (common for older caches) would stop getting `304`s entirely, even though nothing changed.
 
+**What this code does, in plain words:** it sends one request carrying only `If-Modified-Since` set to the resource's own last-changed time, with no ETag, and checks that the answer is still `304`.
+
 ```go
 func TestLastModifiedFallback(t *testing.T) {
 	mod := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
@@ -342,6 +351,8 @@ func TestLastModifiedFallback(t *testing.T) {
 **Measured (Go 1.24.4, darwin/arm64, scratch module, 2026-11-09):** `go vet ./...` clean; `go test -race ./...` → `ok roll10/cachedemo`, both tests pass. The full response body was 14 bytes; the `304` response body was 0 bytes — the entire saving of a conditional request.
 
 ## Design decisions 🔴
+
+> 🟡 → 🔴 **You now know** how the handler sets headers, checks the ETag first and the date second, and what the tests prove. **Next, the advanced part**: why each design choice was made, the small changes that would silently stop `304`s, and exercises.
 
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
@@ -369,7 +380,7 @@ Both `PASS` lines confirm the handler branches correctly on both validator types
 
 ## Pitfalls in the code 🔴
 
-- `Resource.etag()` hashes `Body` only — if a real implementation hashed `Body` plus something that changes incidentally (a request-scoped timestamp, a random nonce), the ETag would change on every call and `304` would never fire again.
+- `Resource.etag()` hashes `Body` only — if a real implementation hashed `Body` plus something that changes incidentally (a request-scoped timestamp, a random nonce, a one-time random value), the ETag would change on every call and `304` would never fire again.
 - The `Cache-Control` value is built with `fmt.Sprintf` on every request; for a hot path, precomputing it once per `maxAge` value (there are usually few distinct values) avoids repeated string formatting.
 - `If-Modified-Since` parsing uses `http.ParseTime`, which accepts several legacy date formats for compatibility — a hand-rolled parser that only accepts one format will silently break interoperability with older clients.
 
@@ -378,6 +389,26 @@ Both `PASS` lines confirm the handler branches correctly on both validator types
 1. Change `sum[:8]` to `sum[:4]` and predict what happens to `TestConditionalRequestReturns304` (it still passes — the test does not check ETag length, only that one is present and that an exact match round-trips to `304`). Then add an assertion on the ETag's length to see the test actually constrain it.
 2. Remove the `else` in `} else if ims := ...` so both validators are always checked independently. Predict whether `TestConditionalRequestReturns304`'s third case (a stale `If-None-Match`) still correctly returns `200` — trace through why the precedence rule from the theory note stops mattering once both branches can independently trigger a `304`.
 3. Add a new field `Resource.Version int` and fold it into the ETag hash. Write a short test that changes only `Version` (not `Body`) and confirms a previously-stored `If-None-Match` now gets a `200` — this is the "what if the content changed in a way the body hash alone wouldn't catch" scenario.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What does the handler send when the client's `If-None-Match` matches the ETag?
+> `304 Not Modified` with an empty body.
+
+> [!question]- 🟢 How is the ETag made?
+> By hashing the body with SHA-256, keeping the first 8 bytes, and wrapping it in double quotes.
+
+> [!question]- 🟢 Which cache headers are set on every response?
+> `Cache-Control`, `ETag`, `Last-Modified` and `Vary`.
+
+> [!question]- 🟡 Why are headers set before checking the validators?
+> So the `304` and `200` paths always carry the same, correct headers, as a `304` must.
+
+> [!question]- 🟡 When does the `If-Modified-Since` branch run?
+> Only when the client sent no `If-None-Match` at all, because of the `else if`.
+
+> [!question]- 🟡 Why does the handler take `get func() Resource` instead of a fixed `Resource`?
+> So each request sees the current data; otherwise a change could never be detected.
 
 ## Links
 

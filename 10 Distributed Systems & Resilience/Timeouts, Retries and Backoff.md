@@ -35,6 +35,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Distributed Systems Fundamentals]]: a call that times out may still have worked on the other side; the outcome is "unknown".
+> - [[Context Package]]: in Go, a `context` carries a deadline and a cancel signal down through every call.
+> - [[Idempotency and Idempotency Keys]]: a unique key on a request lets the server skip a repeat, so retrying is safe.
+
 **From zero, in 60 seconds** 🟢
 
 Your service calls another service. Sometimes the answer never comes.
@@ -81,6 +86,11 @@ If a whole class calls the same friend at the same second, the line is jammed, s
 | Backoff | Waiting longer before each new try | 100 ms, 200 ms, 400 ms |
 | Jitter | Random part added to the wait | Wait a random time between 0 and 400 ms |
 | Retry storm | Many clients retrying at once and overloading a server | 1,000 clients all retry at the same instant |
+| Goroutine | A lightweight Go task; each waiting call holds one | 15,000 goroutines stuck on a hung API |
+| p99.9 | The time that 999 of 1,000 calls beat | p99.9 = 250 ms for payments |
+| Retry budget | A cap on retries as a share of all requests | Retries may add at most 10% extra calls |
+| DLQ | Dead letter queue: a parking spot for jobs that keep failing | After 3 failed tries, the email job goes to the DLQ |
+| Hedged request | Sending a second copy when the first is slow, and using whichever answers first | Ask replica B if replica A has not answered in 50 ms |
 
 **Picture it**
 
@@ -109,9 +119,11 @@ Where it breaks: a shop never charges you twice for knocking, but a non-idempote
 
 ## 1. Why it exists 🟢
 
-Most failures between services are short: a pod restarting, a dropped packet, a leader election that takes a second. Retrying a moment later usually succeeds. But two naive habits turn short failures into outages.
+🟢 **Plain version:** Short failures are common: a server restarts, a packet is lost. Trying again a moment later usually works. Two bad habits turn these small blips into big outages. First, waiting forever with no timeout, so stuck calls pile up. Second, retrying instantly and in every layer, so a weak server gets hit by waves of repeats.
 
-**No timeout.** Go's `http.DefaultClient` has no timeout. If a dependency accepts the connection and never answers, every goroutine that calls it waits forever. At 500 requests per second, 30 s of hanging means 15,000 stuck goroutines, each holding a connection and memory (Little's Law: in flight = rate × wait; see [[Bulkheads and Concurrency Limits]]).
+Most failures between services are short: a **pod** (one running copy of a service in Kubernetes) restarting, a dropped packet, a **leader election** (the servers picking a new boss) that takes a second. Retrying a moment later usually succeeds. But two naive habits turn short failures into outages.
+
+**No timeout.** Go's `http.DefaultClient` has no timeout. If a dependency accepts the connection and never answers, every goroutine that calls it waits forever. At 500 requests per second, 30 s of hanging means 15,000 stuck goroutines, each holding a connection and memory (**Little's Law**, a simple rule for queues: in flight = rate × wait; see [[Bulkheads and Concurrency Limits]]).
 
 **Naive retries.** Suppose a database blips for 2 s and 1,000 clients each make 3 attempts with no wait in between.
 
@@ -119,7 +131,22 @@ The database receives 1,000 requests, then another 1,000 at the same moment, the
 
 Now add layers. If the browser, the API gateway and the backend service each make 3 attempts, one user click becomes up to `3 × 3 × 3 = 27` calls to the bottom service.
 
-**Measured in this note's test** (`TestJitterSpreadsAStorm`, seeded PCG random, 1,000 clients, 3 retries each, 100 ms base): without jitter the busiest 10 ms window receives **1,000** retries; with full jitter the busiest window receives **158**.
+```mermaid
+flowchart LR
+    U["1 click"] --> B["Browser: 3 tries"]
+    B --> G["Gateway: 3 tries each"]
+    G --> S["Backend: 3 tries each"]
+    S --> DB["Bottom service: up to 27 calls"]
+```
+
+**Measured in this note's test** (`TestJitterSpreadsAStorm`, seeded PCG random, a random generator started from a fixed number so every run gives the same result, 1,000 clients, 3 retries each, 100 ms base): without jitter the busiest 10 ms window receives **1,000** retries; with full jitter the busiest window receives **158**.
+
+### Real-life example 🟢
+
+You order food on Swiggy and tap "Place order". Behind the button, the app calls the restaurant, payment and delivery services.
+If the payment service is restarting, the first call fails, the app waits a fraction of a second and tries again, and you never notice.
+If the app retried instantly, a million phones would hammer the payment service the moment it came back.
+So each phone waits a slightly different, growing time. And because the order carries a unique key, a retry never charges you twice.
 
 ## 2. Mental model 🟢
 
@@ -131,25 +158,42 @@ Think of a crowded shop whose door jams for a minute.
 - **Jitter:** each customer picks a random time within that wait, so they come back one by one, not as a crowd.
 - **Retry budget:** the shop lets only a few people re-try at once; the rest are told to come back later.
 
+## Common beginner mistakes 🟢
+
+- **Using Go's default HTTP client** → it has no timeout, so one hung server can freeze your service → create a client with `Timeout` set, and pass a context deadline.
+- **Retrying every error** → a 400 "bad request" or "card declined" will fail the same way every time → retry only temporary errors such as 503, resets and timeouts.
+- **Retrying a payment without an idempotency key** → the first try may have worked, so the retry charges twice → send one key per payment and let the server skip repeats.
+- **Waiting a fixed 100 ms with no randomness** → all clients that failed together retry together, in waves → use growing waits with full jitter.
+- **Retrying in every layer** → 3 layers × 3 tries = 27 calls on the weakest service → retry in one layer only; the others fail fast.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that you must stop waiting at some point, retry only safe and temporary failures, and spread retries out with growing random waits. **Next we open the box**: how a time budget flows down a chain of services, exactly which errors are retryable, the backoff formulas, and how to cap the total. Each step starts with a short walk-through.
 
 ### Step 1: timeouts everywhere, as a budget
 
 **In plain words:** the user's request has one total time limit, and each call down the chain gets only what is left of it.
 
-A timeout bounds one attempt. A **deadline** bounds the whole user request, and is passed down so that every hop knows how much time is left. In Go the deadline lives in the `context.Context`; in gRPC it travels in the `grpc-timeout` header, and the server's handler receives a context that expires at the same moment as the caller's.
+**Step by step:**
+1. The gateway gets a checkout request and sets a deadline: "finish within 1,000 ms".
+2. It passes that deadline to the checkout service inside the context. Checkout starts with 980 ms left.
+3. Checkout calls payments with a 300 ms limit for this one try. The try times out: 680 ms left.
+4. Checkout retries. Payments sees in the context that only about 600 ms remain, and stops work if that runs out.
+5. If time runs out anywhere, everyone below stops together instead of working for a user who has left.
+
+A timeout bounds one attempt. A **deadline** bounds the whole user request, and is passed down so that every hop knows how much time is left. In Go the deadline lives in the `context.Context`; in **gRPC** (a fast way for services to call each other) it travels in the `grpc-timeout` header, and the server's handler receives a context that expires at the same moment as the caller's.
 
 Layers of timeouts on a Go HTTP client:
 
 | Setting | Bounds | Typical value (estimate, tune per dependency) |
 | --- | --- | --- |
 | `net.Dialer.Timeout` | TCP connect | 100–500 ms inside a region |
-| `http.Transport.TLSHandshakeTimeout` | TLS handshake | 500 ms–1 s |
+| `http.Transport.TLSHandshakeTimeout` | TLS handshake (the step where both sides set up encryption) | 500 ms–1 s |
 | `http.Transport.ResponseHeaderTimeout` | Waiting for response headers after sending the request | about p99.9 of the dependency |
 | `http.Client.Timeout` | The whole exchange, including reading the body | per-attempt budget |
 | `context.WithTimeout` | Everything done with that context, across retries | the user-facing deadline |
 
-On the server side, `http.Server` has `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout` and `IdleTimeout`. All default to zero, which means no limit; a server without `ReadHeaderTimeout` can be held open by slow clients (Slowloris).
+On the server side, `http.Server` has `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout` and `IdleTimeout`. All default to zero, which means no limit; a server without `ReadHeaderTimeout` can be held open by slow clients (**Slowloris**, an attack that sends a request one byte at a time to tie up the server).
 
 ```mermaid
 flowchart LR
@@ -162,6 +206,12 @@ flowchart LR
 
 **In plain words:** retry short, temporary errors on calls that are safe to repeat. Never retry "bad request" or "card declined".
 
+**Step by step:**
+1. A call to the payment service fails.
+2. Ask: is the error temporary? A 503 "busy" or a reset connection: yes. A 400 "bad request" or "card declined": no, stop.
+3. Ask: is the call safe to repeat? A `GET /user/7`: yes. A `POST /pay` with key `pay-81`: yes. A `POST /pay` with no key: no, stop.
+4. Is there still time left before the deadline? If yes, retry with backoff. If not, return the error.
+
 Retry when the failure is **transient** and the operation is **idempotent** (repeating it has the same effect as doing it once). A non-idempotent POST is retryable only if it carries an idempotency key that the server deduplicates ([[Idempotency and Idempotency Keys]]).
 
 | Retry | Do not retry |
@@ -170,7 +220,7 @@ Retry when the failure is **transient** and the operation is **idempotent** (rep
 | 408 Request Timeout | 401 Unauthorized, 403 Forbidden |
 | 429 Too Many Requests: honour `Retry-After` | 404 Not Found, 409 Conflict (business conflict) |
 | 500, 502, 503, 504 on idempotent requests | 501 Not Implemented |
-| gRPC `UNAVAILABLE`, and `RESOURCE_EXHAUSTED` with pushback | Invalid password, card declined, insufficient funds |
+| gRPC `UNAVAILABLE`, and `RESOURCE_EXHAUSTED` with pushback (the server says how long to wait) | Invalid password, card declined, insufficient funds |
 | Per-attempt timeout, when the overall deadline still has room | The caller's own deadline expired (`DEADLINE_EXCEEDED` on the outer context) |
 
 Two subtleties:
@@ -191,7 +241,14 @@ flowchart TB
 
 **In plain words:** wait a bit longer after each failure, and pick a random time within that wait so clients spread out.
 
-Let `base` be the first wait and `cap` the longest. For retry number `n` (starting at 0) the **ceiling** is `min(cap, base × 2^n)`. Brooker's AWS article compares three ways to pick the actual wait:
+**Step by step:**
+1. Set `base` = 100 ms (first wait) and `cap` = 2 s (longest wait).
+2. After the 1st failure, the ceiling is 100 ms. Pick a random wait between 0 and 100 ms, say 64 ms.
+3. After the 2nd failure, the ceiling doubles to 200 ms. Pick a random wait between 0 and 200 ms, say 150 ms.
+4. Each later ceiling doubles again (400, 800 ms...) but never goes above 2 s.
+5. If the server sent `Retry-After: 2`, wait at least 2 seconds, whatever the random pick was.
+
+Let `base` be the first wait and `cap` the longest. For retry number `n` (starting at 0) the **ceiling** is `min(cap, base × 2^n)`. Marc Brooker's AWS article compares three ways to pick the actual wait:
 
 - **Full jitter:** `sleep = random(0, ceiling)`.
 - **Equal jitter:** `sleep = ceiling/2 + random(0, ceiling/2)`.
@@ -232,8 +289,14 @@ sequenceDiagram
 
 **In plain words:** cap the number of tries per request and the share of extra traffic retries may add.
 
+**Step by step:**
+1. Each request gets at most 3 tries, and never more than its deadline allows.
+2. Each client keeps a small "retry wallet". Every normal request adds 0.1 tokens; every retry costs 1 token.
+3. During a full outage, 1,000 requests earn about 100 tokens, so only about 100 retries happen, not 2,000.
+4. Only one layer (say, the checkout service) retries. The layers above and below fail fast and pass the error up.
+
 - **Per request:** a maximum number of attempts (3 is common; gRPC caps `maxAttempts` at 5) and the overall deadline.
-- **Per client:** a **retry budget**. The Google SRE book recommends keeping retries below about 10% of requests per client, so that a total outage adds at most 10% load rather than tripling it. gRPC's retry throttling does this with a token bucket.
+- **Per client:** a **retry budget**. The Google SRE book recommends keeping retries below about 10% of requests per client, so that a total outage adds at most 10% load rather than tripling it. gRPC's retry throttling does this with a **token bucket** (a counter that refills slowly; each retry must take a token).
 - **Per system:** retry at one layer only, usually the one closest to the failing dependency, or at the edge where the user can be told. Inner layers fail fast and return a clear error.
 
 ## 4. Worked example 🟡
@@ -745,6 +808,15 @@ idempotent_only: true    # or the request carries an idempotency key
 | Hedged request | Send a second copy if the first is slower than about p95; take the first answer | Idempotent reads with long tails | Extra load (a few percent if the hedge is delayed to p95) |
 | Queue-based retry | Message goes back to a queue with a delay (SQS visibility timeout, Kafka retry topics), then a DLQ | Async work that can wait minutes | Ordering is lost; needs idempotent consumers |
 
+### Retries versus things people confuse them with 🟡
+
+| Thing | What it does | How it differs from a retry |
+| --- | --- | --- |
+| Timeout | Stops waiting on one try | A retry decides whether to try again after a timeout or error |
+| Circuit breaker | Stops all calls to a failing service for a while | A retry repeats one call; a breaker blocks many calls to protect the service |
+| Rate limiting (429) | The server caps how fast you may call | A retry must wait for `Retry-After`, not fight the limit |
+| Hedged request | Sends a second copy before the first fails | A retry waits for failure first; hedging races two copies for speed |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - **Retries add load exactly when the dependency is weakest.** A retry budget or a [[10 Distributed Systems & Resilience/Circuit Breaker|Circuit Breaker]] must cap them.
@@ -757,11 +829,13 @@ idempotent_only: true    # or the request carries an idempotency key
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how a deadline flows down the chain, which errors to retry, how full jitter spreads retries, and how budgets cap them. **Next comes the advanced part**: how gRPC, AWS SDKs and service meshes do this in real life, what goes wrong in production, and the deeper reasons behind full jitter, budgets and hedging.
+
 - **Real systems:**
 	- gRPC's service config supports `retryPolicy` (maxAttempts, initialBackoff, maxBackoff, backoffMultiplier, retryableStatusCodes), `hedgingPolicy`, and retry throttling with a token bucket. Servers can push back with the `grpc-retry-pushback-ms` trailer.
 	- AWS SDKs in "standard" retry mode default to 3 attempts, use exponential backoff with jitter (maximum backoff 20 s), and stop retrying when a client-side retry quota runs out.
-	- Envoy and Istio retry policies (`retry_on: 5xx,reset,connect-failure`, `num_retries`, per-try timeout) move retries into the mesh. Then the application must not also retry.
-	- Message queues: SQS redelivers after the visibility timeout and moves a message to a DLQ after `maxReceiveCount`; Kafka consumers use delayed retry topics and a DLQ ([[Dead Letter Queues and Poison Messages]]).
+	- Envoy and Istio (a **service mesh**: proxies beside every service that handle retries, timeouts and routing for it) retry policies (`retry_on: 5xx,reset,connect-failure`, `num_retries`, per-try timeout) move retries into the mesh. Then the application must not also retry.
+	- Message queues: SQS redelivers after the **visibility timeout** (how long a taken message stays hidden before it reappears) and moves a message to a DLQ after `maxReceiveCount`; Kafka consumers use delayed retry topics and a DLQ ([[Dead Letter Queues and Poison Messages]]).
 - **Failure modes → fixes:**
 	- Retry storm after an outage → full jitter plus a retry budget.
 	- 27× amplification through layers → retry at one layer; inner services fail fast.
@@ -823,6 +897,30 @@ idempotent_only: true    # or the request carries an idempotency key
 - Max about 3 attempts, a retry budget of about 10%, retries at one layer only.
 - Never sleep past the deadline; stop when the breaker is open.
 - Monitor retry ratio, attempts per success and timeout rate per dependency.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why must every remote call have a timeout?
+> Without one, a server that never answers makes your code wait forever, and stuck calls pile up until your own service falls over.
+
+> [!question]- Should you retry a 400 Bad Request?
+> No. The request itself is wrong, so it will fail the same way every time.
+
+> [!question]- What does jitter add to backoff?
+> A random part to each wait, so clients that failed together do not all retry at the same moment.
+
+🟡 Medium
+
+> [!question]- With base 100 ms and cap 2 s, what is the ceiling for retry 0, 1 and 5?
+> 100 ms, 200 ms, and 2 s (100 × 32 = 3,200 ms, capped at 2,000 ms).
+
+> [!question]- Your deadline has 316 ms left; the next backoff could be 200 ms and a try takes up to 300 ms. Retry?
+> No. 200 + 300 = 500 ms does not fit in 316 ms, so return the error now.
+
+> [!question]- Why is "max 3 attempts" alone not enough during a full outage?
+> It still triples the load on the dead service. A retry budget (about 10% of requests) keeps extra load near 1.1×.
 
 ## Links
 

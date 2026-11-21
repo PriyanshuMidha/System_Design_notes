@@ -56,6 +56,11 @@ flowchart LR
 > - 🟡 **Know the basics?** Add section 3 (first 5 minutes, flowchart, investigation steps A to D, fixes), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[TLS and HTTPS]]: a server shows a signed certificate that proves its name, and the connection is encrypted after a handshake.
+> - [[DNS - Resolution, Records and Caching]]: DNS turns a name into an IP address, and answers are cached for their TTL.
+> - [[Incident Response]]: one person leads, you stop the damage first, and you post regular updates.
+
 **From zero, in 60 seconds** 🟢
 
 Before a browser can talk to a website, two checks must pass.
@@ -106,6 +111,11 @@ Another day, the address book (DNS) points the name at an old server, with the s
 | CA (Certificate Authority) | The trusted signer of certificates | Let's Encrypt |
 | Handshake | The opening exchange where client checks the certificate | `openssl s_client` shows it |
 | Intermediate / chain | The middle certificates linking yours to a trusted CA | Missing one breaks some clients |
+| Resolver | The helper server that looks up DNS names for you and caches answers | your cloud's DNS, or 8.8.8.8 |
+| NXDOMAIN / SERVFAIL | DNS replies meaning "no such name" / "lookup failed" | typo in a record vs broken delegation |
+| Delegation | The parent zone pointing to the servers that answer for your domain | `.com` → your nameservers |
+| ACME / cert-manager | The protocol and Kubernetes tool that renew certificates automatically | Let's Encrypt renewal every 60 days |
+| x509 | The standard certificate format; Go errors about certificates start with it | `x509: certificate has expired` |
 
 **Picture it**
 
@@ -148,6 +158,13 @@ The real-world scale of this class: in September 2021 the expiry of Let's Encryp
 > [!tip] Remember
 > If your servers look healthy but traffic fell off a cliff, check DNS and certificates before anything else.
 
+### Real-life example: a payment page that suddenly says "not secure" 🟢
+
+Imagine a bank or wallet app whose API certificate quietly expires at midnight on a Sunday.
+The website shows "Your connection is not private", and the mobile app just says "network error".
+Servers look calm because almost no requests get through.
+The on-call checks the certificate with `openssl`, sees it expired an hour ago, issues a new one and reloads the load balancer; then the team finds out why automatic renewal silently failed.
+
 ## 2. Mental model 🟢
 
 Think of a request as mailing a letter to a company. **DNS is the phone book**: it tells you the street address.
@@ -175,7 +192,17 @@ sequenceDiagram
 > [!tip] Remember
 > DNS decides where you connect. The certificate decides whether you trust what answered. Each has its own failure modes and its own clock.
 
+## Common beginner mistakes 🟢
+
+- **Trusting the browser when Go or curl fails** → browsers fetch missing intermediate certificates; your services don't → test with `openssl s_client` and serve the full chain.
+- **Changing many DNS records at once** → you can't tell which change helped or hurt, and caches keep old answers for the TTL → change one thing and wait.
+- **Assuming auto-renewal works** → it fails quietly (expired API key, blocked challenge) → monitor expiry dates from outside and alert 30 days ahead.
+- **Renewing the certificate but not reloading the server** → it keeps serving the old one → reload or restart the component that holds it.
+- **Ignoring machine clocks** → a wrong clock makes a valid certificate look expired → check NTP time sync.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that DNS and certificates fail suddenly and for everyone, while servers look calm. **Next we open the box**: the first five minutes, a flowchart, and four checks: DNS answers, the certificate the server shows, where the certificate lives, and monitoring and clocks.
 
 ### First 5 minutes
 
@@ -191,6 +218,12 @@ sequenceDiagram
 > Telling users to click "proceed anyway" or disabling certificate verification in clients as a quick fix. That turns an availability incident into a security incident. Fix the certificate; never ship `InsecureSkipVerify: true`.
 
 ### Diagnosis flowchart
+
+**Step by step:**
+1. Does the name resolve? If not, it is DNS (check A).
+2. Resolves, but to the wrong IP for some users? Stale cache or a bad record (A).
+3. Connects, but the handshake fails? It is the certificate (B), then find the stale copy (C).
+4. Certificate looks fine but clients disagree? Check clocks (D).
 
 ```mermaid
 flowchart TD
@@ -215,6 +248,12 @@ flowchart TD
 #### A. DNS: is the name resolving to the right answer?
 
 **In plain words:** ask several phone books (your own, a public one, the official one) what address they give. If they disagree, one is old or wrong.
+
+**Step by step:**
+1. `dig api.example.com` through your normal resolver.
+2. `dig @8.8.8.8 api.example.com` through a public one.
+3. `dig +trace api.example.com` to ask the official servers from the top.
+4. Different answers mean one is stale or wrong; NXDOMAIN or SERVFAIL point at the record or delegation.
 
 ```bash
 dig api.example.com A +noall +answer +comments   # answer, TTL, status
@@ -264,6 +303,12 @@ Symptoms such as a steady 5-second delay on some lookups often come from a connt
 
 **In plain words:** connect to the server and look at the ID card it shows: whose name, who signed it, and when it expires.
 
+**Step by step:**
+1. Run `openssl s_client -connect host:443 -servername host -showcerts`.
+2. Read the dates: expired?
+3. Read the names: does it cover this hostname?
+4. Count the chain: is the intermediate there?
+
 ```bash
 # Show the leaf certificate dates, subject, issuer and names (SNI matters!)
 echo | openssl s_client -connect api.example.com:443 -servername api.example.com 2>/dev/null \
@@ -308,6 +353,11 @@ curl --resolve api.example.com:443:203.0.113.10 -vI https://api.example.com
 
 **In plain words:** certificates sit on load balancers, CDNs, proxies and apps. Find which copy is old and why auto-renewal skipped it.
 
+**Step by step:**
+1. List every place that serves this name: CDN, load balancer, ingress, app.
+2. Check which one serves the old certificate.
+3. Read the renewal tool's logs (cert-manager, ACME client) for the failed step.
+
 ```bash
 # Kubernetes with cert-manager
 kubectl get certificate -A
@@ -344,6 +394,11 @@ Common renewal failures:
 #### D. Monitoring and the clock
 
 **In plain words:** watch expiry dates from the outside, and check machine clocks. A wrong clock makes a good certificate look expired.
+
+**Step by step:**
+1. Check that an outside probe alerts on days-to-expiry.
+2. Run `timedatectl` or check NTP on the failing machine.
+3. A clock off by hours makes good certificates look expired or not yet valid.
 
 ```promql
 # Days until the earliest certificate in the probe chain expires (blackbox_exporter)
@@ -452,6 +507,9 @@ sequenceDiagram
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to test DNS answers, read a certificate, find the stale copy and fix it. **Next is the advanced part**: monitoring and automation for real fleets, and the internals (the chain of trust, how resolution and caching work, how renewal pipelines fail).
+
+
 - **Inventory everything with an expiry:** public hosts, origin hops, internal services, mTLS client and server certificates, database and Kafka TLS, SAML signing certificates, code-signing and APNs certificates, partner-provided certificates. Record owner and renewal method.
 - **Automate.** ACM for AWS endpoints, cert-manager for Kubernetes, with the DNS-01 challenge where HTTP-01 is awkward. Make renewal hooks reload the process (cert-manager mounts update, but many servers need a reload or a restart; Go servers can use `GetCertificate` to reload without restart).
 - **Alert on days remaining at several thresholds:** 30 days (ticket), 14 days (page during working hours), 7 days (page). Alert on the **earliest** expiry in the chain, not only the leaf.
@@ -557,6 +615,30 @@ flowchart LR
 - Alert on `(probe_ssl_earliest_cert_expiry - time()) / 86400 < 14`; probe origins and internal hosts too.
 - Never disable verification as a fix. Host the status page on a different domain and DNS provider.
 - Registrar: auto-renew, lock, expiry alerts, 2FA recovery owners.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Servers look healthy but traffic fell to almost zero. What do you check early?
+> DNS and certificates, because requests may never reach you.
+
+> [!question]- What does DNS do?
+> Turns a name like `api.example.com` into an IP address.
+
+> [!question]- What command shows a server's certificate dates?
+> `openssl s_client -connect host:443 -servername host | openssl x509 -noout -dates`.
+
+🟡 Medium
+
+> [!question]- It works in the browser but Go says "certificate signed by unknown authority". Likely cause?
+> A missing intermediate certificate; serve the full chain.
+
+> [!question]- You fixed a DNS record with TTL 3600. Why do some users still see the old IP?
+> Resolvers cache the old answer for up to an hour.
+
+> [!question]- A valid certificate shows as "not yet valid" on one machine. Why?
+> That machine's clock is wrong; fix time sync.
 
 ## Links
 

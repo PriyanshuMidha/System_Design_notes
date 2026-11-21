@@ -42,6 +42,9 @@ One counter, three bounded labels. The full version below adds a histogram, an H
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Observability Fundamentals]]: metrics are cheap numbers over time, and a metric label must only take a small, fixed set of values.
+
 **From zero, in 60 seconds** 🟢
 
 A **metric** is a number your app keeps updating, like "requests served so far" or "how long each request took".
@@ -84,6 +87,12 @@ A tool called Prometheus collects those numbers every few seconds so you can gra
 | Gauge | A number that goes up or down | Requests in flight right now |
 | Histogram | Counts of values falling into ranges ("buckets") | How many requests took ≤ 100 ms, ≤ 500 ms... |
 | Cardinality | How many distinct time series exist | 5 routes × 3 statuses = 15 series |
+| Percentile (p99) | The value 99 out of 100 measurements are at or below | p99 latency 800 ms: 1 in 100 requests is slower |
+| Quantile | The same idea written as a fraction | 0.99 quantile = p99 |
+| Bucket and `le` | One range of a histogram; `le` means "less than or equal to" this limit | `le="0.5"` counts requests that took 0.5 s or less |
+| PromQL | Prometheus's query language | `rate(http_requests_total[5m])` |
+| Recording rule | A query Prometheus runs on a timer and saves as a new, cheap metric | save p99 every 30 s |
+| Instance / pod | One running copy of a service; most services run several | 5 pods of the invoice API |
 
 **Picture it**
 
@@ -114,9 +123,16 @@ Where it breaks: a car has a fixed handful of dials, but every new label value c
 
 A log line can tell you one request was slow. It cannot efficiently answer "what fraction of all requests in the last 5 minutes were slower than 500ms" — that requires scanning and aggregating every log line in the window, which is exactly what metrics are built to avoid.
 
-A Prometheus histogram pre-aggregates observations into buckets as they happen, so `histogram_quantile(0.99, ...)` over 5 minutes of traffic is a cheap query against pre-computed counters, not a scan over millions of log lines.
+A Prometheus histogram pre-aggregates observations into buckets as they happen, so `histogram_quantile(0.99, ...)` (the PromQL function that estimates p99 from bucket counts) over 5 minutes of traffic is a cheap query against pre-computed counters, not a scan over millions of log lines.
 
 The trade is specificity for cheapness: a metric knows "47 requests took between 100ms and 250ms" but not which 47 requests, or anything else about them. That's why metrics and logs are both needed — see [[Observability Fundamentals]].
+
+### Real-life example: a big movie's ticket sale 🟢
+
+Think of BookMyShow when bookings open for a huge film.
+Engineers do not read logs to see how it is going. They watch a few graphs: bookings per second, the share of failed payments, and how long the slowest 1 in 100 seat pages take.
+Each graph is a metric that Prometheus collected every few seconds.
+If the p99 line climbs from 0.5 s to 4 s, they know within a minute, long before anyone reads a single log line.
 
 ## 2. Mental model 🟢
 
@@ -126,9 +142,26 @@ Querying is asking "show me how board X's number changed over the last hour" or 
 
 The crucial constraint: **you only get as many boards as the label combinations you declared**. If a label can take a million different values, you get a million boards, and the wall runs out of room.
 
+## Common beginner mistakes 🟢
+
+- **Putting `user_id` or the raw URL in a label** → one new time series per user or ID, and Prometheus runs out of memory → use the route pattern (`/invoices/{id}`) and keep IDs in logs.
+- **Graphing a counter's raw value** → it only climbs, so the line tells you nothing about "now" → wrap it in `rate(...[5m])` to get "per second".
+- **Watching only the average latency** → a fine average can hide 1 in 100 users waiting seconds → look at p95 and p99 from a histogram.
+- **Using a summary, then averaging p99 across pods** → percentiles cannot be averaged, so the number is wrong → use a histogram and `histogram_quantile` over summed buckets.
+- **Keeping the default buckets when your requests take 15 s** → the top bucket is 10 s, so everything slow lands in one blur → set buckets that cover your real p99.
+
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** what a metric, a label and a scrape are, and why labels must stay small. **Next we open the box**: the path from one request to a graph, the four metric types, how a histogram's buckets fill up, and how to count series before they hurt you.
+
 **In plain words:** your Go code bumps counters in memory, exposes them on a page, Prometheus collects them, and Grafana draws them.
+
+**Step by step:**
+1. A request to `GET /invoices/42` finishes in 80 ms with status 200.
+2. Middleware adds 1 to `http_requests_total{route="/invoices/{id}", method="GET", status="2xx"}` and puts 0.08 s into the latency histogram. This is just memory in your app.
+3. Every 15 seconds Prometheus calls `GET /metrics` on each copy of the service and saves the numbers with a timestamp.
+4. Rules inside Prometheus check for trouble and pass firing alerts to Alertmanager (which sends the page or Slack message).
+5. Grafana runs PromQL queries and draws the lines you look at.
 
 The full path from one HTTP request in a Go process to a number in a Grafana panel:
 
@@ -149,11 +182,19 @@ flowchart LR
     LTS --> GRAF
 ```
 
-Prometheus **pulls**: it holds the list of targets (via static config, Kubernetes service discovery, etc.) and initiates every scrape itself. This makes "is this target even reachable" a scrape-failure metric for free (`up == 0`), and lets Prometheus control its own load instead of being flooded by targets pushing at arbitrary rates.
+Names in the diagram, in plain words: **TSDB** is Prometheus's own time-series database on local disk; **recording and alerting rules** are saved queries it runs on a timer; **Alertmanager** turns firing alerts into pages and messages; **`remote_write`** copies data out to **Thanos or Mimir**, which keep it for months or years.
+
+Prometheus **pulls**: it holds the list of targets (via static config, Kubernetes service discovery — Prometheus asks Kubernetes for the current list of running pods — etc.) and initiates every scrape itself. This makes "is this target even reachable" a scrape-failure metric for free (`up == 0`), and lets Prometheus control its own load instead of being flooded by targets pushing at arbitrary rates.
 
 ### The four metric types
 
 **In plain words:** counter only goes up, gauge goes up and down, histogram puts values into buckets, summary computes percentiles in the app.
+
+**Step by step:**
+1. Counting things that happen, like requests or errors? Use a **counter**: 1, 2, 3, never down (except back to 0 on restart).
+2. Measuring a level right now, like 7 jobs waiting in a queue? Use a **gauge**: it can go 7, 3, 12.
+3. Measuring how long or how big, like request time? Use a **histogram**: each value is counted into ranges.
+4. A **summary** also measures how long, but works out p99 inside each app copy. You cannot combine those across copies, so pick the histogram.
 
 | Type | Behavior | Example |
 | --- | --- | --- |
@@ -162,7 +203,7 @@ Prometheus **pulls**: it holds the list of targets (via static config, Kubernete
 | **Histogram** | Observations sorted into buckets, exposed as `_bucket{le="..."}`, `_sum`, `_count` | `http_request_duration_seconds` |
 | **Summary** | Client-side quantiles computed in-process, exposed as `_sum`, `_count`, and per-quantile values | Rarely the right choice — see below |
 
-A histogram exposes its raw bucket counts, so Prometheus can compute a quantile **across every instance of a service at query time** with `histogram_quantile()`. A summary computes its quantiles inside the client process, over only that one instance's observations, and those per-instance quantiles **cannot be averaged or combined across instances** — a p99 of five summaries from five pods is not the fleet's p99.
+A histogram exposes its raw bucket counts, so Prometheus can compute a quantile **across every instance of a service at query time** with `histogram_quantile()`. A summary computes its quantiles inside the client process, over only that one instance's observations, and those per-instance quantiles **cannot be averaged or combined across instances** — a p99 of five summaries from five pods (five running copies) is not the fleet's p99.
 
 Prefer histograms; reach for a summary only when you need an exact quantile from one process and don't need to aggregate across instances.
 
@@ -172,6 +213,13 @@ Prefer histograms; reach for a summary only when you need an exact quantile from
 ### A histogram's buckets, observation by observation
 
 **In plain words:** each request's time drops into every bucket it fits under. Counting buckets later lets you estimate p95 or p99.
+
+**Step by step:**
+1. The buckets are limits: 0.1 s, 0.25 s, 0.5 s, 1 s and "no limit" (`+Inf`).
+2. A request takes 0.08 s. It is under every limit, so all five buckets go up by 1.
+3. A request takes 0.6 s. Only the 1 s and `+Inf` buckets go up.
+4. `_count` adds 1 per request and `_sum` adds the seconds, so you also get the average.
+5. To find p99, Prometheus walks up the buckets until it reaches 99% of `_count`, then guesses (interpolates) a value inside that bucket.
 
 Three requests of 80ms, 220ms and 600ms, folded into `http_request_duration_seconds`'s buckets (each observation increments every bucket whose `le` it falls under or below, which is what makes `_bucket` values cumulative):
 
@@ -195,6 +243,20 @@ A 0.6s observation lands in the `le="1"` and `le="+Inf"` buckets (and every buck
 
 **In plain words:** multiply the number of values of each label. A few small labels are fine; one huge label ruins everything.
 
+**Step by step:**
+1. List each label and how many values it can take: `route` 20, `method` 4, `status` 5.
+2. Multiply: 20 × 4 × 5 = 100 series. That is small and fine.
+3. Now add `user_id` with 1 million users: 100 × 1,000,000 = 100 million series. Prometheus falls over.
+4. So every label must come from a short, fixed list you could write down today.
+
+```mermaid
+flowchart LR
+    R["route: 20"] --> X["20 × 4 × 5 = 100 series: fine"]
+    M["method: 4"] --> X
+    S["status: 5"] --> X
+    U["+ user_id: 1M"] --> Y["100 million series: crash"]
+```
+
 Series count for one metric = (number of values of label 1) × (number of values of label 2) × … For `http_requests_total{route, method, status}` with 20 routes, 4 methods and 5 status classes, that's `20 × 4 × 5 = 100` series — fine.
 
 Swap `route` for the raw request path with unique IDs in it, and that number is unbounded. **Bounded labels** (route template, method, a 5-value status class) are the rule; **unbounded labels** (user ID, order ID, raw path, email) never belong in a metric.
@@ -206,6 +268,8 @@ Swap `route` for the raw request path with unique IDs in it, and that number is 
 The Go code below instruments an HTTP handler with a request counter and a latency histogram, both labeled by a **route template** supplied by the caller — never the raw path — so the series count stays bounded regardless of how many distinct resources exist.
 
 It compiles and passes `go vet` and `go test -race` on Go 1.24, using `github.com/prometheus/client_golang` v1.20.5.
+
+**What this code does, in plain words:** `NewHTTPMetrics` creates two metrics, a request counter and a latency histogram, and registers them so they show up on `/metrics`. `statusClass` turns any status code like 404 into `"4xx"`, so that label has only 5 values. `Wrap` runs your handler, notes its status and time taken, and records both under the route pattern you gave it.
 
 ```go
 // Package metrics instruments an HTTP server with the three labels that make
@@ -321,6 +385,12 @@ func TestWrapRecordsBoundedLabels(t *testing.T) {
 
 **In plain words:** a handful of queries cover most needs: requests per second, error ratio, and p99 latency.
 
+**Step by step:**
+1. `rate(x[5m])` turns an ever-growing counter into "per second, averaged over the last 5 minutes".
+2. `sum by (status) (...)` adds up all pods and splits the result by status.
+3. Dividing 5xx rate by total rate gives the error share, like 0.02 = 2%.
+4. For p99, first add up each bucket across all pods (`sum by (le)`), then call `histogram_quantile(0.99, ...)`.
+
 | Query | Answers |
 | --- | --- |
 | `rate(http_requests_total{route="/invoices/{id}"}[5m])` | Requests/second to this route, averaged over the last 5 minutes |
@@ -357,18 +427,21 @@ func TestWrapRecordsBoundedLabels(t *testing.T) {
 
 ## 7. In production 🔴
 
-- **Real systems:** Prometheus is the de facto standard scrape format, including when the client is OpenTelemetry's metrics SDK exporting in Prometheus format; Kubernetes, etcd, and most CNCF projects expose a native `/metrics` endpoint; Thanos (SoundCloud-originated) and Grafana Mimir are the two common long-term-storage layers bolted onto Prometheus; `client_golang`'s `promhttp` handler is the standard way to expose `/metrics` in a Go service.
+> 🟡 → 🔴 **You now know** the four metric types, how buckets turn into p99, how to keep series counts small, and the core PromQL queries. **Next is the advanced part**: running Prometheus at real scale, what breaks, how to watch Prometheus itself, and the dashboard and recording-rule habits interviewers expect.
+
+
+- **Real systems:** Prometheus is the de facto standard scrape format, including when the client is OpenTelemetry's metrics SDK exporting in Prometheus format; Kubernetes, etcd (Kubernetes's settings database), and most CNCF projects (the Cloud Native Computing Foundation's open-source tools) expose a native `/metrics` endpoint; Thanos (SoundCloud-originated) and Grafana Mimir are the two common long-term-storage layers bolted onto Prometheus; `client_golang`'s `promhttp` handler is the standard way to expose `/metrics` in a Go service.
 - **Failure modes → fixes:**
   - Cardinality explosion from an unbounded label → remove the label or replace it with a bounded derivative (route template instead of path); Prometheus's own `prometheus_tsdb_symbol_table_size_bytes` and per-metric series count catch this before it pages anyone.
   - A summary used where a fleet-wide percentile was needed → switch to a histogram; it's the only type `histogram_quantile()` can aggregate across instances.
   - Expensive PromQL queries run on every dashboard load → precompute with a **recording rule** (a named, periodically-evaluated query stored as its own cheap-to-read metric).
   - Batch job's metrics never show up → it exited before Prometheus's next scrape; push to Pushgateway instead, and remember to delete its stale metric when the job is retired.
-- **What to monitor:** Prometheus's own `up` metric per target (a failed scrape is itself the first alert), total active series count (catches cardinality growth before it becomes an outage), scrape duration, and WAL/TSDB disk usage.
+- **What to monitor:** Prometheus's own `up` metric per target (a failed scrape is itself the first alert), total active series count (catches cardinality growth before it becomes an outage), scrape duration, and WAL/TSDB disk usage (the WAL is the write-ahead log, a file Prometheus writes new samples to first so they survive a crash).
 
 ## 8. Deep dive 🔴
 
 - **One dashboard per service, in three rows:** a RED row (request rate, error rate, p50/p95/p99 latency for this service's own endpoints), a USE row (DB pool utilization and saturation, queue depth, CPU/memory), and a dependencies row (latency and error rate of each downstream call this service makes). This structure repeats identically across services, which is exactly what makes it fast to onboard a new on-call engineer to an unfamiliar service.
-- **Detecting a slow leak from a gauge.** A connection-pool gauge (`db_pool_in_use`) that trends upward over hours without returning to baseline between traffic troughs is a leak signature — a healthy pool oscillates with load and returns near zero at low traffic. `deriv()` or a simple visual trend line over a long window (6–24h) surfaces this before the pool actually exhausts and starts failing requests.
+- **Detecting a slow leak from a gauge.** A connection-pool gauge (`db_pool_in_use`) that trends upward over hours without returning to baseline between traffic troughs is a leak signature — a healthy pool oscillates with load and returns near zero at low traffic. `deriv()` (a PromQL function giving the slope, how fast a gauge is rising) or a simple visual trend line over a long window (6–24h) surfaces this before the pool actually exhausts and starts failing requests.
 - **Recording rules.** A rule like `record: job:http_request_duration_seconds:p99` evaluated every 30s turns an expensive `histogram_quantile()` over raw buckets into a cheap, pre-computed series any dashboard can read instantly — essential once a query is expensive enough to slow down dashboard loads or alert evaluation.
 - **Business metrics alongside RED/USE.** A payment success rate (`payments_succeeded_total / payments_attempted_total`) answers "is the business working," which a healthy RED dashboard can mask entirely — a service can have 0% errors and perfect latency while silently declining every payment due to a logic bug, not an infrastructure failure.
 
@@ -402,6 +475,30 @@ func TestWrapRecordsBoundedLabels(t *testing.T) {
 - Thanos/Mimir for retention beyond local disk; recording rules for expensive, frequently-read queries.
 - One dashboard per service: RED row, USE row, dependencies row.
 - Business metrics (payment success rate) catch logic failures that a healthy RED dashboard would hide.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Which metric type fits "requests served so far"?
+> A counter, because it only goes up.
+
+> [!question]- Which metric type fits "jobs waiting in the queue right now"?
+> A gauge, because it goes up and down.
+
+> [!question]- Does Prometheus pull or push by default?
+> It pulls: it calls each service's `/metrics` page every 15 seconds or so.
+
+🟡 Medium
+
+> [!question]- A metric has labels with 10, 3 and 5 possible values. How many series?
+> 10 × 3 × 5 = 150.
+
+> [!question]- Why sum buckets `by (le)` before `histogram_quantile`?
+> So the buckets from all pods are added together first; then p99 is for the whole fleet, not one pod.
+
+> [!question]- When is Pushgateway the right tool?
+> For a short batch job that ends before Prometheus would ever scrape it.
 
 ## Links
 

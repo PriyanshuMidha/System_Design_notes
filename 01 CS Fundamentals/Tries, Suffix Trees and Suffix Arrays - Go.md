@@ -20,12 +20,17 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
 > - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Tries, Suffix Trees and Suffix Arrays]]: the theory twin. Know that a trie shares paths for shared prefixes, marks where words end, and that a suffix array is a sorted list of suffix start positions.
+> - [[Trees, BSTs and Balanced Trees]] and [[Arrays and Dynamic Arrays (Go Slices)]]: nodes with child pointers, and Go slices.
+
 **From zero** 🟢: this file is the hands-on side of [[Tries, Suffix Trees and Suffix Arrays]]. It builds a working trie (insert, lookup, prefix search — the autocomplete core) and a simple suffix array with substring search, both tested. Read each step's notes before the code.
 
 ## Before the code 🟢
 
 - **Structs and pointers** (`*node`): each trie node is a struct; children are pointers, and `nil` means "no child here".
-- **Fixed-size arrays** (`[26]*node`): one slot per lowercase letter, indexed by `byte - 'a'`.
+- **Fixed-size arrays** (`[26]*node`): one slot per lowercase letter, indexed by `byte - 'a'` (so `'a'` → 0, `'b'` → 1, … `'z'` → 25).
+- **End flag** (`end bool`): marks that a complete stored word stops at this node, not just a prefix.
 - **Methods on a pointer receiver** (`func (t *Trie) Insert`): functions attached to the `Trie` type.
 - **Closures** (`var dfs func(...)`): a function stored in a variable that can call itself and append to `out`.
 - **Standard library `index/suffixarray`**: a ready-made suffix array; `New` builds it, `Lookup` finds offsets.
@@ -53,7 +58,11 @@ flowchart LR
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** what the module builds: a trie with autocomplete, plus a check of Go's suffix array. **Next we read the code:** the node shape, insert, then search and autocomplete.
+
 ### Step 1: the node shape
+
+**What this code does, in plain words:** each trie node has 26 child slots (one per letter) and an `end` flag; `New` makes an empty root.
 
 **Concept.** The theory note's whiteboard sketch uses a `map[byte]*node` per node for clarity ([[Tries, Suffix Trees and Suffix Arrays#4. Worked example 🟡]]).
 
@@ -91,6 +100,8 @@ func New() *Trie {
 3. `New` allocates exactly one node (the root), which starts with no children and `end == false`, matching an empty trie.
 
 ### Step 2: insert and the shared walk helper
+
+**What this code does, in plain words:** `Insert` walks the word letter by letter, creating missing children, and marks the last node as a word end; `walk` does the same walk but stops with `nil` if a letter is missing.
 
 **Concept.** `Insert`, `Search` and `StartsWith` all do the same thing — walk from the root one character at a time — so the walk is factored into one private helper, `walk`, that the public methods differ only in how they interpret the result of.
 
@@ -130,6 +141,8 @@ func (t *Trie) walk(s string) *node {
 3. Marking `n.end = true` only after the loop finishes means a word is only ever "complete" at the node matching its exact full length, never partway through.
 
 ### Step 3: search, prefix check and autocomplete
+
+**What this code does, in plain words:** `Search` says yes only if the walk reaches a node marked as a word end; `StartsWith` says yes if the walk just doesn't fall off; `Autocomplete` walks to the prefix and then collects every word below it.
 
 **Concept.** `Search` and `StartsWith` both call `walk` and then look at a different thing:
 
@@ -188,7 +201,7 @@ func (t *Trie) Autocomplete(prefix string) []string {
 **How it works.**
 
 1. `dfs` is a closure capturing `out`, which is the idiomatic Go way to accumulate results across a recursive walk without passing an accumulator parameter through every call.
-2. `append(path, 'a'+c)` inside the recursive call looks safe but is a classic Go slice-aliasing trap if `path` ever had spare capacity shared across sibling calls; it works correctly here only because each call either appends within its own stack frame's slice header or the underlying array is small enough that growth reallocates — see "Pitfalls in the code" below for the general rule.
+2. `append(path, 'a'+c)` inside the recursive call looks safe but is a classic Go slice-aliasing trap (two slices accidentally sharing, and overwriting, the same underlying array) if `path` ever had spare capacity shared across sibling calls; it works correctly here only because each call either appends within its own stack frame's slice header or the underlying array is small enough that growth reallocates — see "Pitfalls in the code" below for the general rule.
 3. The traversal order is pre-order over indices `0..25`, so results come back alphabetically by the *suffix after the prefix*, not globally sorted — worth stating explicitly if an interviewer expects sorted output.
 
 ## Design decisions 🟡
@@ -307,6 +320,8 @@ Running the equivalent of this snippet directly (Go 1.24.4, darwin/arm64, 2026-1
 
 `FindAllIndex(re, n)` is the sibling method to reach for if a test ever needs a sorted, non-overlapping list instead.
 
+> 🟡 → 🔴 **You now know** the code and what each test checks. **Next comes the advanced part:** what breaks on non-lowercase input, the slice-aliasing trap in `dfs`, and why the suffix array's results come back unsorted.
+
 ## Pitfalls in the code 🔴
 
 - **`word[i] - 'a'` assumes lowercase ASCII input.** A byte outside `'a'..'z'` (uppercase, digits, punctuation, any non-ASCII rune) underflows or overflows the `0..25` range and indexes `children` out of bounds, which panics.
@@ -321,6 +336,30 @@ Running the equivalent of this snippet directly (Go 1.24.4, darwin/arm64, 2026-1
 1. Insert `"go"`, `"goa"`, `"gob"` (three single-letter-longer siblings) and call `Autocomplete("go")`. Predict the exact slice order `dfs` returns, then verify by printing it.
 2. Add a `Delete(word string) bool` method that unmarks `end` for an exact match (without removing now-orphaned nodes). Write a test where deleting `"go"` leaves `"gopher"` fully searchable.
 3. Change `Lookup([]byte("ana"), -1)` to `Lookup([]byte("ana"), 1)` (limit to 1 match). Predict which single offset comes back, then run it to check.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- After inserting "gopher", is `Search("gop")` true?
+> No. The path exists, but no word ends at `p`.
+
+> [!question]- And `StartsWith("gop")`?
+> Yes: the walk does not fall off the tree.
+
+> [!question]- What index does the letter `c` get in `children`?
+> 2, from `'c' - 'a'`.
+
+🟡 Medium
+
+> [!question]- Why use `[26]*node` instead of a map?
+> Array lookups are faster and allocation-free; the cost is 26 slots per node and lowercase-only input.
+
+> [!question]- Why does the suffix-array test check a count, not exact offsets?
+> `Lookup` documents that its results are unsorted; here it returned `[3 1]`.
+
+> [!question]- What happens if you `Insert("Go")` with a capital G?
+> `'G' - 'a'` falls outside 0..25 and the index is out of range: callers must lowercase input first.
 
 ## Links
 

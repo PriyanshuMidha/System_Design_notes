@@ -44,6 +44,12 @@ Everything below expands each branch with the exact flags and how to read the ou
 > - 🟡 **Know the basics?** Add section 3 (the playbook), 4 (each tool with real output) and 5.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[DNS - Resolution, Records and Caching]]: a name is turned into an IP address, and each answer is saved for TTL seconds.
+> - [[TCP - Handshake, Reliability, Flow and Congestion Control]]: a connection opens with three messages (SYN, SYN-ACK, ACK) and closes with FIN messages.
+> - [[TLS and HTTPS]]: after connecting, the server shows a certificate and both sides agree on encryption keys.
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: a request gets a response with a status code like 200 or 502.
+
 **From zero, in 60 seconds** 🟢
 
 Sometimes a website or app just will not load. The hard part is that the failure can happen at several different steps.
@@ -89,6 +95,11 @@ This note gives you one small tool per step so you can check each step and find 
 | Socket | The OS object a program uses for one connection | One row in `ss` output |
 | Packet | One small chunk of data sent over the network | A SYN packet starting a connection |
 | CLI flag | An option you pass to a command | `curl -v` turns on verbose output |
+| NXDOMAIN | DNS's answer "this name does not exist" | A typo like `exmaple.com` |
+| SYN / ACK / RST | TCP control messages: "let's connect", "got it", "no, go away" | A closed port answers SYN with RST |
+| Certificate | The server's signed ID card used by TLS | Issued for `example.com`, valid until a date |
+| Refused vs timeout | Refused = someone said no right away; timeout = no reply at all | Wrong port vs firewall dropping packets |
+| TTL (DNS) | Seconds a DNS answer may still be reused | `196` in `dig` output |
 
 **Picture it**
 
@@ -123,9 +134,22 @@ The "why" needs a tool that inspects that specific layer in isolation, instead o
 
 **Concrete scenario.** A deploy goes out and a service starts returning `502 Bad Gateway` for 1% of requests.
 
-The error alone doesn't say whether DNS is flapping, a backend pod is unreachable, TLS to the backend is failing, or the backend is just slow.
+The error alone doesn't say whether DNS is flapping (answers switching back and forth), a backend pod (one running copy of the service in Kubernetes) is unreachable, TLS to the backend is failing, or the backend is just slow.
 
 The playbook in this note turns "502 sometimes" into a 5-minute, layer-by-layer check instead of an open-ended investigation.
+
+### Real-life example: "Payment failed" on a UPI app 🟢
+
+A UPI app starts showing "payment failed" for a few users in one city.
+The on-call engineer runs `dig` on the bank's API name: it resolves fine.
+`nc -zv` to that host on port 443 times out, but only from one data center. So TCP never connects there: a firewall or routing problem, not app code.
+A `traceroute` from that data center shows replies stopping at the provider's edge. The team moves traffic to another region while the network team fixes the route.
+Ten minutes, four commands, no guessing.
+
+```mermaid
+flowchart LR
+    D["dig: OK"] --> N["nc: timeout"] --> T["traceroute: stops at edge"] --> F["fix: reroute"]
+```
 
 ## 2. Mental model 🟢
 
@@ -141,11 +165,28 @@ Treat the chain from [[What Happens When You Type a URL]] as a stack of layers, 
 
 When a symptom doesn't point clearly at one layer, work top-down through this table: DNS first (cheapest to check), then TCP, then TLS, then HTTP, and drop to `tcpdump` only when a tool's own report doesn't explain the behavior.
 
+## Common beginner mistakes 🟢
+
+- **Jumping straight to `tcpdump`** → it floods you with packets before you know which layer is broken → go DNS → TCP → TLS → HTTP first, and capture only if those don't explain it.
+- **Reading `curl -w` times as separate phases** → they are running totals from the start → subtract one from the next to get each phase.
+- **Treating "refused" and "timed out" as the same** → refused means the host answered "nothing here", timeout means no answer at all → check the port/service for refused, firewall/routing for timeout.
+- **Panicking at `* * *` on one traceroute hop** → many routers just don't answer traceroute → only loss at the final hop, or a steady trend, matters.
+- **Forgetting `-servername` with `openssl s_client`** → the server may send the wrong certificate → always pass the hostname.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a request goes through DNS, TCP, TLS and HTTP, and that each step has its own tool. **Next we open the box**: the decision tree from symptom to command, the connection states `ss` prints, and then each tool with real output and how to read it. Each subsection starts with a plain step-by-step walk; the full detail follows it.
 
 ### The debugging playbook
 
 **In plain words:** this is the full decision tree: start from what you see (the symptom) and follow the arrows to the one command to run next.
+
+**Step by step:**
+1. Does the request hang (time out)? Run `nc -zv host 443`.
+2. `nc` times out too → firewall or bad route, check with `traceroute`. `nc` says refused → nothing listens on that port. `nc` connects but curl still hangs → the app is stuck.
+3. Doesn't hang but fails? Name not found → `dig`. 502/504 from a proxy → `curl` the backend directly. Certificate error → `openssl s_client`.
+4. Works but slow → `curl -w` to see which phase is slow.
+5. Still unclear → `tcpdump` to see the real packets.
 
 ```mermaid
 flowchart TD
@@ -166,7 +207,14 @@ flowchart TD
 
 **In plain words:** every connection is always in exactly one named state, like a parcel being "shipped", "out for delivery" or "delivered" — and `ss` just prints that state.
 
-`ss`/`netstat` report a socket's state from this exact state machine (RFC 9293); reading the state tells you which side is stuck:
+**Step by step:**
+1. The server calls `listen()`: its socket shows `LISTEN`.
+2. Your app sends SYN: `SYN_SENT`. Server answers SYN-ACK, you answer ACK: both sides now show `ESTABLISHED`.
+3. The server finishes and closes first (sends FIN). Your side moves to `CLOSE_WAIT` until your code calls `close()`.
+4. The side that closed first waits a short while in `TIME_WAIT`, then the socket is gone.
+5. So: stuck in `SYN_SENT` = no reply from the server; many `CLOSE_WAIT` = your code forgot to close.
+
+`ss`/`netstat` report a socket's state from this exact state machine (a fixed set of states and the allowed moves between them; RFC 9293); reading the state tells you which side is stuck:
 
 ```mermaid
 stateDiagram-v2
@@ -185,13 +233,21 @@ stateDiagram-v2
     TIME_WAIT --> CLOSED: 2×MSL timeout elapses
 ```
 
-A socket stuck in `SYN_SENT` means the SYN or SYN-ACK never arrived (routing/firewall). A pile-up of connections in `CLOSE_WAIT` means the application accepted a close from the peer but never called `close()` itself — a resource leak. A large number in `TIME_WAIT` after a load test is normal cleanup, not a bug, unless it exhausts the ephemeral port range.
+A socket stuck in `SYN_SENT` means the SYN or SYN-ACK never arrived (routing/firewall). A pile-up of connections in `CLOSE_WAIT` means the application accepted a close from the peer but never called `close()` itself — a resource leak. A large number in `TIME_WAIT` (held for 2×MSL, twice the longest time a packet may live in the network) after a load test is normal cleanup, not a bug, unless it exhausts the ephemeral port range (the pool of temporary source ports the OS hands to outgoing connections).
 
 ## 4. Worked example 🟡
+
+Each tool below starts with a short step-by-step of how to run it and what to look at; the real output and full explanation follow.
 
 ### DNS: `dig` and `nslookup`
 
 **In plain words:** `dig` asks the internet's phone book a question and shows you the raw answer, including how long that answer may be reused.
+
+**Step by step:**
+1. Run `dig example.com A`.
+2. Find `status:`. `NOERROR` = good; `NXDOMAIN` = the name doesn't exist.
+3. Look in `ANSWER SECTION`: the IP addresses and the TTL (seconds left).
+4. If different machines get different answers, run `dig +trace example.com` to skip caches and ask each server yourself.
 
 **Measured** (`dig` 9.10.6, 2026-11-06, live query):
 
@@ -216,7 +272,7 @@ example.com.		196	IN	A	104.20.23.154
 ;; MSG SIZE  rcvd: 72
 ```
 
-Read it: `status: NOERROR` plus an `ANSWER SECTION` means the name resolved; `196` is the record's remaining TTL in seconds (how much longer this answer is cached before a client must ask again); `Query time: 30 msec` is this resolver's round trip, not the authoritative server's.
+Read it: `status: NOERROR` plus an `ANSWER SECTION` means the name resolved; `196` is the record's remaining TTL in seconds (how much longer this answer is cached before a client must ask again); `Query time: 30 msec` is this resolver's round trip, not the authoritative server's (the server that owns the domain's records).
 
 **Measured** (NXDOMAIN, same resolver):
 
@@ -278,6 +334,13 @@ Each hop is a separate query your own machine sends — your normal resolver nev
 
 **In plain words:** `curl -v` makes one web request and narrates every step out loud; `curl -w` adds a stopwatch to each step.
 
+**Step by step:**
+1. Run `curl -v -o /dev/null https://example.com`.
+2. `*` lines: curl telling you what it did (looked up the name, connected, set up TLS).
+3. `>` lines: what it sent. `<` lines: what came back, starting with the status like `HTTP/2 200`.
+4. No `>` lines at all? It failed before HTTP: DNS, TCP or TLS.
+5. Add `-w` with timing fields to see how many seconds each step took.
+
 **Measured** (`curl 8.x`, 2026-11-06, live request, TLS certificate details redacted since they depend on the network's TLS configuration — see [[TLS and HTTPS]] for what each handshake message means):
 
 ```bash
@@ -301,7 +364,7 @@ $ curl -v -s -o /dev/null https://example.com
 < server: cloudflare
 ```
 
-Read `curl -v` output in three blocks: lines starting with `*` are curl's own narration (DNS, connect, TLS, protocol negotiation), `>` lines are what curl sent, `<` lines are what it received. A connection failure never reaches the `>` lines at all — that alone tells you the problem is below HTTP.
+The `ALPN` lines are curl and the server agreeing which HTTP version to use inside TLS. Read `curl -v` output in three blocks: lines starting with `*` are curl's own narration (DNS, connect, TLS, protocol negotiation), `>` lines are what curl sent, `<` lines are what it received. A connection failure never reaches the `>` lines at all — that alone tells you the problem is below HTTP.
 
 **Measured** (`curl -w`, phase timing, the same mechanism as [[What Happens When You Type a URL]]'s httptrace example):
 
@@ -338,6 +401,13 @@ total:0.211868s code:200
 
 **In plain words:** this command does only the encryption handshake and shows you the server's ID card (its certificate), so you can see exactly why a browser would not trust it.
 
+**Step by step:**
+1. Run `echo | openssl s_client -connect example.com:443 -servername example.com`.
+2. Look at the certificate chain: `s:` is who the certificate is for, `i:` is who signed it.
+3. Check `subject` matches the host you asked for.
+4. Check `Verify return code: 0 (ok)`. Any other number means the chain can't be trusted.
+5. Check the dates to catch an expired certificate.
+
 ```bash
 $ echo | openssl s_client -connect example.com:443 -servername example.com
 CONNECTED(00000006)
@@ -363,13 +433,19 @@ Verify return code: 0 (ok)
 
 **Representative output (openssl 3.x against a public TLS 1.3 site)** — the cert content above is illustrative; what matters for debugging is always the same three facts:
 
-1. `-servername` must match what the server's certificate covers (an `s:` with the wrong CN, or `subjectAltName` not containing your host, means a hostname mismatch).
-2. `Verify return code: 0 (ok)` means the chain validated against the client's trust store (a non-zero code, such as `20` for "unable to get local issuer certificate," means the chain is incomplete or the CA isn't trusted).
+1. `-servername` must match what the server's certificate covers (an `s:` with the wrong CN, the certificate's main name, or `subjectAltName`, its list of extra allowed names, not containing your host, means a hostname mismatch).
+2. `Verify return code: 0 (ok)` means the chain validated against the client's trust store (the built-in list of certificate authorities this machine trusts) (a non-zero code, such as `20` for "unable to get local issuer certificate," means the chain is incomplete or the CA isn't trusted).
 3. The certificate's validity window (`openssl x509 -noout -dates`) catches an expired cert immediately.
 
 ### Sockets: `ss` / `netstat`
 
 **In plain words:** `ss` lists every connection your machine currently has, one per row, with its state — like a list of all phone calls in progress.
+
+**Step by step:**
+1. Run `ss -tan` (on macOS: `netstat -an`).
+2. Find `LISTEN` rows: these are your servers waiting for new connections.
+3. `ESTAB` rows are live connections. Note the local and peer address:port.
+4. Count `CLOSE-WAIT` rows. Many for one peer means your program is not closing connections.
 
 **Representative output** (`ss -tan`, Linux; macOS lacks `ss` and uses `netstat -an` instead, shown with equivalent columns):
 
@@ -382,7 +458,7 @@ CLOSE-WAIT  0       0        10.0.1.5:51400         10.0.2.9:443
 TIME-WAIT   0       0        10.0.1.5:51410         10.0.2.9:443
 ```
 
-A `LISTEN` row with `Recv-Q` climbing toward its `Send-Q` backlog limit means connections are queuing faster than `accept()` is being called.
+A `LISTEN` row with `Recv-Q` (connections waiting to be picked up) climbing toward its `Send-Q` backlog limit (the maximum queue length) means connections are queuing faster than `accept()` is being called.
 
 Once `Recv-Q` reaches that limit, the kernel drops or refuses further incoming SYNs until the application catches up — the application is falling behind.
 
@@ -392,7 +468,13 @@ Many `CLOSE-WAIT` rows for the same remote peer is the state diagram's leak: thi
 
 **In plain words:** `tcpdump` records the actual packets leaving and entering your machine — the ground truth when every other tool's story does not add up.
 
-**Representative output** (`tcpdump` 4.x, capturing a TCP handshake and HTTPS request; requires elevated privileges to open a raw socket):
+**Step by step:**
+1. Run `sudo tcpdump -i en0 -n 'host 172.66.147.243 and port 443' -c 6` (a tight filter so you only see one conversation).
+2. First three lines: `[S]` SYN, `[S.]` SYN-ACK, `[.]` ACK. That is the TCP handshake.
+3. `[P.]` lines carry data. Here line 4 is the TLS hello going out.
+4. Compare timestamps between lines to see where time went on the wire.
+
+**Representative output** (`tcpdump` 4.x, capturing a TCP handshake and HTTPS request; requires elevated privileges to open a raw socket, which lets a program see every packet, not just its own):
 
 ```text
 $ sudo tcpdump -i en0 -n 'host 172.66.147.243 and port 443' -c 6
@@ -408,11 +490,17 @@ Read the `Flags`: `[S]` is a SYN, `[S.]` is SYN-ACK, `[.]` is a bare ACK, `[P.]`
 
 The three-way handshake is the first three lines; line 4 is the TLS ClientHello leaving the client, and the 181 ms gap before line 5 is the time the TLS handshake + first byte actually took on the wire — the same number `curl -w`'s `time_appconnect` would report, but captured independently of curl's own instrumentation.
 
-The filter expression (`host ... and port 443`) is Berkeley Packet Filter (BPF) syntax; narrowing it is essential on a busy interface.
+The filter expression (`host ... and port 443`) is Berkeley Packet Filter (BPF) syntax (a tiny filter language the kernel runs on each packet); narrowing it is essential on a busy interface.
 
 ### Reachability: `traceroute`, `mtr`, `nc`
 
 **In plain words:** `traceroute` shows every router your packets pass through on the way, and `nc` asks one simple question: is this door (port) open at all?
+
+**Step by step:**
+1. Run `nc -vz -w3 example.com 443`. "succeeded" = TCP works. "refused" = nothing listening. Hang until `-w3` runs out = no reply, likely a firewall.
+2. If it hangs, run `traceroute example.com` to see each router on the way.
+3. Each row is one hop with its reply time. `*` = that hop didn't answer.
+4. Use `mtr` to watch the same path live with a loss % per hop.
 
 **Measured** (`traceroute`, 2026-11-06, live, 5 hops):
 
@@ -426,11 +514,11 @@ traceroute to example.com (172.66.147.243), 5 hops max, 40 byte packets
  5  182.79.205.103 (182.79.205.103)  87.549 ms
 ```
 
-Each row is one more hop's TTL expiring and sending back an ICMP "time exceeded".
+Each row is one more hop's TTL (here, the IP hop counter, not the DNS one) expiring and sending back an ICMP "time exceeded" (ICMP is the protocol for network error messages).
 
 A `*` means that hop didn't reply (often a router that drops ICMP, not necessarily a failure — only a trend of timeouts at the *same* hop across repeated runs indicates a real problem there).
 
-`mtr` runs the same idea continuously and adds a live loss percentage and jitter per hop, which is what separates "one slow hop" from "this hop drops 20% of packets."
+`mtr` runs the same idea continuously and adds a live loss percentage and jitter (how much the delay jumps around) per hop, which is what separates "one slow hop" from "this hop drops 20% of packets."
 
 **Measured** (`nc`, port reachability — the fastest way to answer "is TCP even possible" before touching HTTP or TLS at all):
 
@@ -444,7 +532,7 @@ nc: connectx to 127.0.0.1 port 1 (tcp) failed: Connection refused
 
 ### Writing the same check as a Go health probe
 
-**In plain words:** `nc -zv` is a manual, one-shot version of the TCP health check a load balancer or orchestrator runs continuously. A small Go program turns the three outcomes `nc` shows informally — open, refused, timed out — into typed values a program can branch on, log, or alert on.
+**In plain words:** `nc -zv` is a manual, one-shot version of the TCP health check a load balancer or orchestrator (a system like Kubernetes that starts, stops and watches services) runs continuously. A small Go program turns the three outcomes `nc` shows informally — open, refused, timed out — into typed values a program can branch on, log, or alert on.
 
 **Picture it — one dial, classified into the outcomes a human reads off `nc`/`ss`/`tcpdump`:**
 
@@ -480,12 +568,14 @@ Runnable Go version, including the full `classify`/`CheckTCP`/`Report` implement
 
 ## 6. Trade-offs and when not to use 🟡
 
-- `dig`/`curl`/`openssl` are read-only and safe to run against production; `tcpdump` requires elevated privileges (`CAP_NET_RAW` or root) and can capture sensitive payloads — never run it without a tight filter and awareness of what it will capture (see [[CSRF, XSS and Security Headers]] for why capturing plaintext credentials is a real risk on an unencrypted hop).
+- `dig`/`curl`/`openssl` are read-only and safe to run against production; `tcpdump` requires elevated privileges (`CAP_NET_RAW`, a Linux permission for raw packet access, or root) and can capture sensitive payloads — never run it without a tight filter and awareness of what it will capture (see [[CSRF, XSS and Security Headers]] for why capturing plaintext credentials is a real risk on an unencrypted hop).
 - `traceroute` and `mtr` measure the *path*, not the application; a clean traceroute does not rule out an application-level problem, and a path with packet loss doesn't always explain an application timeout (TCP retransmits and often recovers invisibly).
 - `curl --resolve` and DNS overrides are for testing; relying on them as a permanent fix instead of correcting the actual DNS record just hides the problem from everyone else who hits the real record.
-- Reading `tcpdump` output live is slow for complex problems; capture to a file (`-w capture.pcap`) and inspect it with a GUI tool (Wireshark) when the question is more than "did the SYN arrive."
+- Reading `tcpdump` output live is slow for complex problems; capture to a file (`-w capture.pcap`, the standard packet-capture file format) and inspect it with a GUI tool (Wireshark) when the question is more than "did the SYN arrive."
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the playbook and how to read each tool's output. **Next comes the advanced part**: how on-call engineers use this during real incidents, what to put on dashboards, and the finer points (dig flags, BPF filters, noisy `mtr` hops, `CLOSE_WAIT` leaks in Go).
 
 - **Real systems:** this exact toolkit is what an on-call engineer runs during an incident, in roughly the order DNS → TCP → TLS → HTTP → packet capture; load balancer and Kubernetes health checks are the automated version of the `nc`/`CheckTCP` step, run continuously instead of once.
 - **Failure modes → fixes:**
@@ -538,6 +628,8 @@ Runnable Go version, including the full `classify`/`CheckTCP`/`Report` implement
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** Check one step at a time. `dig` for the name lookup, `nc` for "can I connect at all", `openssl s_client` for the certificate, `curl -v` for the HTTP answer, and `tcpdump` only when nothing else explains it. Refused means nothing is listening; a timeout means no reply came back. The dense list follows.
+
 - Order of attack: DNS (`dig`) → TCP reachability (`nc`, `ss`) → TLS (`openssl s_client`) → HTTP (`curl -v`/`-w`) → raw packets (`tcpdump`) only if the above don't explain it.
 - `dig name TYPE`: no `ANSWER SECTION` + an `AUTHORITY SECTION` SOA means NXDOMAIN; a timeout with neither means the resolver itself is unreachable.
 - `curl -w` timing fields are cumulative — subtract consecutive fields to get each phase's own cost.
@@ -546,6 +638,26 @@ Runnable Go version, including the full `classify`/`CheckTCP`/`Report` implement
 - `ss`/`netstat`: `LISTEN` backlog growing means the app isn't accepting fast enough; many `CLOSE_WAIT` rows means the app leaks unclosed connections.
 - `tcpdump` needs a tight BPF filter (`host`, `port`, `tcp[tcpflags]`) and root; capture to a file for anything beyond a one-line check.
 - `traceroute`/`mtr` measure the path, not the app — loss at one middle hop with clean hops around it is usually that router's ICMP policy, not a real problem.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 Which tool checks DNS?
+> `dig` (or `nslookup`).
+
+> [!question]- 🟢 What is the quickest check for "can I even open a TCP connection to this port"?
+> `nc -zv host port`.
+
+> [!question]- 🟢 In `curl -v` output, what do `>` and `<` lines mean?
+> `>` is what curl sent, `<` is what it received.
+
+> [!question]- 🟡 `curl -w` shows `connect:0.003s tls:0.180s`. How long did TLS take?
+> About 177 ms: the fields are running totals, so subtract connect from tls.
+
+> [!question]- 🟡 `ss` shows hundreds of `CLOSE-WAIT` sockets in one process. Network problem or code problem?
+> Code: the peer closed, but the program never called `close()` (in Go, often a missing `resp.Body.Close()`).
+
+> [!question]- 🟡 Why pass `-servername` to `openssl s_client`?
+> It sends SNI, so the server picks the right certificate, just as a browser would.
 
 ## Links 🟢
 

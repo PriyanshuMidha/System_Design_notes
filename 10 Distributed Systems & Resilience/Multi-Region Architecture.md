@@ -38,6 +38,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[High Availability and Failover]]: keep spare copies in separate zones and switch to them automatically; RTO is how long you are down, RPO is how much data you lose.
+> - [[Replication]]: a primary copies writes to replicas, either before saying OK (sync) or a moment later (async).
+> - [[CAP and PACELC]]: when copies cannot talk, you pick correct or available; even on good days, correctness costs latency.
+> - [[DNS - Resolution, Records and Caching]]: DNS turns a name into an IP address, and answers are cached for a while (the TTL).
+
 **From zero, in 60 seconds** 🟢
 
 Cloud providers group their data centers into **regions**, like Mumbai or Singapore.
@@ -85,6 +91,10 @@ Running in more than one region fixes all three, but now your data lives in seve
 | DNS | The internet's name-to-address phone book | `api.shop.com` resolves to an IP |
 | Failover | Moving traffic to another copy when one fails | Users sent to Singapore after Mumbai dies |
 | Data residency | A rule that data must stay in a country | Indian payment data stored only in India |
+| RPO / RTO | How much recent data you may lose / how long until service is back | RPO 1 s, RTO 5 min |
+| Home region | The one region that owns writes for a user or tenant | acme's writes always go to Mumbai |
+| Anycast | One IP address announced from many places; the network picks the nearest | Cloudflare's edge IPs |
+| Fencing | Stopping the old primary from writing after a new one takes over | Bump the epoch, revoke its write credentials |
 
 **Picture it**
 
@@ -111,13 +121,20 @@ Where it breaks: a photocopy is never written to by mistake, but two regions can
 
 ## 1. Why it exists 🟢
 
-A billing SaaS runs in one AWS region, `ap-south-1` (Mumbai), spread over three availability zones (AZs: separate data centres within a region). That already survives a single data-centre failure (see [[High Availability and Failover]]). It does not survive:
+A billing SaaS (software sold as an online service) runs in one AWS region, `ap-south-1` (Mumbai), spread over three availability zones (AZs: separate data centres within a region). That already survives a single data-centre failure (see [[High Availability and Failover]]). It does not survive:
 
-- **A regional outage.** A control-plane or networking failure that affects every AZ in the region at once. Cloud providers have had such region-wide incidents.
+- **A regional outage.** A control-plane (the cloud's management systems that create and configure resources) or networking failure that affects every AZ in the region at once. Cloud providers have had such region-wide incidents.
 - **Distance.** A customer in Frankfurt pays an inter-continental round trip on every request. Mumbai–Frankfurt round-trip time is roughly 110–130 ms (an estimate; measure your own regions), so a page that makes 5 sequential API calls spends over half a second on the wire alone.
-- **Law.** An EU customer's contract or a regulator may require personal data to stay in the EU; RBI's 2018 circular requires payment system data for Indian payments to be stored only in India.
+- **Law.** An EU customer's contract or a regulator may require personal data to stay in the EU; RBI's (Reserve Bank of India's) 2018 circular requires payment system data for Indian payments to be stored only in India.
 
 Each reason leads to a different design. DR alone can be a cold copy in a second region. Latency needs active serving close to users. Residency needs data to be partitioned by geography, which is the opposite of "replicate everything everywhere".
+
+### Real-life example 🟢
+
+Netflix runs its service in several AWS regions and has publicly described practising "evacuating" a region: moving all its users' traffic to the other regions on purpose.
+If one region has a bad day, viewers there are quietly served from another region, maybe with slightly slower page loads.
+Your watch history is copied between regions, so the "continue watching" row is still there, perhaps missing the last few seconds of progress.
+That is multi-region: run everywhere you might need to, and decide in advance what may be lost when a region goes away.
 
 ## 2. Mental model 🟢
 
@@ -136,11 +153,28 @@ Terms used below:
 - **Home region:** the one region that owns writes for a given user, tenant or record.
 - **Blast radius:** how much of the system a single failure can take down.
 
+## Common beginner mistakes 🟢
+
+- **Expecting DNS failover in "TTL seconds"** → detection, cached answers and long-lived connections stretch it to minutes → plan for minutes, or use anycast.
+- **Letting two regions write the same record** → concurrent writes conflict and one is lost → give each user or tenant one home region for writes.
+- **Promoting the standby without fencing the old primary** → if the old one comes back, both take writes → fence first, then promote.
+- **Checking "is this username free?" on a local replica** → two regions both say yes and both insert → send uniqueness checks to one authority.
+- **Going multi-region before it is needed** → double cost and complexity for little gain → multi-AZ plus cross-region backups and a CDN is often enough.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** why teams go multi-region (outages, distance, law) and that the hard part is deciding where each write lives. **Next we open the box**: the four disaster-recovery patterns, how users are routed to a region, how active-active works with home regions, and what a regional failover really involves.
 
 ### Disaster recovery patterns
 
 **In plain words:** four levels of spare region, from "just backups" (cheap, slow to recover) to "both regions live" (costly, nearly instant).
+
+**Step by step:**
+1. Backup and restore: copy nightly database snapshots to Singapore. If Mumbai dies, build everything there from scratch: hours, and you lose up to a day.
+2. Pilot light: keep the Singapore database copying live, but run almost no servers. Start them on failure: tens of minutes.
+3. Warm standby: run a small version of the whole app in Singapore. Scale it up on failure: minutes.
+4. Active-active: both regions serve real users all the time. A failure just shifts traffic: close to zero downtime.
+5. Each step up cuts recovery time and raises the monthly bill.
 
 The AWS DR whitepaper describes four patterns, ordered by cost and recovery speed:
 
@@ -165,11 +199,18 @@ flowchart LR
 
 **In plain words:** DNS, a shared IP (anycast) or your own gateway decides which region a user talks to.
 
+**Step by step:**
+1. A user in Berlin opens `api.shop.com`.
+2. With latency-based DNS, the DNS answer is Frankfurt's IP, because it is closest to the user's resolver (the DNS server their network uses).
+3. With anycast, there is one IP for everyone; the network carries the request to the nearest edge, which forwards it to a healthy region.
+4. With app routing, any region can receive the request; a gateway looks up the user's home region and forwards it there.
+5. If Frankfurt fails, DNS moves users only as caches expire; anycast moves them at the edge, usually faster.
+
 - **DNS-based routing** (Amazon Route 53 and similar): latency-based routing answers with the region that has the lowest measured latency for the resolver; geolocation routing answers by the user's country; failover routing answers with a secondary when the primary's health check fails. Route 53 health checkers probe every 30 s (or 10 s for fast checks) and declare an endpoint unhealthy after 3 failures by default.
-- **Anycast** (AWS Global Accelerator, Cloudflare): one static IP is announced from many edge locations; the network routes each user to the nearest edge, which forwards to a healthy region. Failover happens at the edge once its own health checks fail, typically within tens of seconds, without waiting for DNS caches.
+- **Anycast** (AWS Global Accelerator, Cloudflare, both networks with many edge locations): one static IP is announced from many edge locations; the network routes each user to the nearest edge, which forwards to a healthy region. Failover happens at the edge once its own health checks fail, typically within tens of seconds, without waiting for DNS caches.
 - **Application routing:** an edge or gateway looks up the user's home region and forwards the request there, regardless of which region received it.
 
-**DNS TTL caveats:** a TTL (time to live) of 60 s does not mean clients move in 60 s. Some resolvers and client runtimes cache longer than the TTL, and long-lived connections (HTTP keep-alive, gRPC, WebSockets) keep talking to the old region until they reconnect. Plan for a long tail of minutes.
+**DNS TTL caveats:** a TTL (time to live) of 60 s does not mean clients move in 60 s. Some resolvers and client runtimes cache longer than the TTL, and long-lived connections (HTTP keep-alive, gRPC, WebSockets: connections that stay open for many requests) keep talking to the old region until they reconnect. Plan for a long tail of minutes.
 
 ```mermaid
 flowchart LR
@@ -184,6 +225,13 @@ flowchart LR
 ### Active-active with home regions
 
 **In plain words:** both regions serve traffic, but each customer has one home region where their writes go.
+
+**Step by step:**
+1. Tenant acme's home is Mumbai; tenant globex's home is Frankfurt.
+2. A Berlin user from acme reaches Frankfurt, the nearest region.
+3. They open a dashboard: Frankfurt answers from its local copy of acme's data, which may be a second old.
+4. They save an invoice: Frankfurt forwards the write to Mumbai, acme's home. Only Mumbai ever writes acme's data.
+5. Mumbai copies the change back to Frankfurt a moment later. No region ever has to merge two versions.
 
 ```mermaid
 flowchart LR
@@ -202,6 +250,13 @@ The Berlin user hits Frankfurt (nearest). Reads that tolerate a little staleness
 ### Regional failover
 
 **In plain words:** when the main region fails health checks for long enough, traffic and writes move to the standby.
+
+**Step by step:**
+1. Health checks hit Mumbai every 30 s. Three in a row fail (about 90 s).
+2. DNS starts answering with Singapore's address instead.
+3. Before promoting Singapore, the team fences Mumbai: its epoch is bumped and its write access revoked, so it cannot take writes if it wakes up.
+4. Singapore's database is promoted to primary, accepting that the last second or so of Mumbai's writes did not arrive. The API fleet scales up.
+5. Later, Mumbai is rebuilt as a replica of Singapore, and its unreplicated writes are checked and reconciled.
 
 ```mermaid
 sequenceDiagram
@@ -251,14 +306,14 @@ func WriteRegion(tenant string, home, standby map[string]string, down map[string
 
 **In plain words:** real numbers for a Mumbai to Singapore setup: how many seconds of data you may lose and how many minutes the switch takes.
 
-Mumbai primary, Singapore warm standby, Route 53 failover routing, Aurora Global Database replicating asynchronously:
+Mumbai primary, Singapore warm standby, Route 53 failover routing, Aurora Global Database (AWS's managed database that copies one region's data to others) replicating asynchronously:
 
 | Stage | Time | Basis |
 | --- | --- | --- |
 | Detect: 3 failed probes at a 30 s interval | ≈ 90 s | Route 53 defaults (documented) |
 | DNS answers change, resolvers expire 60 s TTL | ≈ 60 s, long tail longer | TTL you set; tail is an estimate |
 | Promote secondary database | About a minute | AWS states a typical RTO under a minute for Aurora Global Database cross-Region failover; measure in drills |
-| Scale API fleet from 25% to 100% | 3–5 min | Estimate for an autoscaling group; pre-warm to shorten |
+| Scale API fleet from 25% to 100% | 3–5 min | Estimate for an autoscaling group (a set of servers the cloud grows and shrinks automatically); pre-warm to shorten |
 | **RTO** | **roughly 5–8 minutes** | Estimate; drills give the real number |
 
 RPO: replication lag at the moment of failure. Aurora documents typical lag under 1 second. At 2,000 writes per second, 1 s of lag means up to about 2,000 committed writes exist only in Mumbai when it fails (an estimate from those two numbers).
@@ -271,7 +326,7 @@ If that loss is unacceptable for some data (payments), that data needs synchrono
 
 **In plain words:** a working router that waits for several bad health checks before failing over, and blocks the old region from writing.
 
-The router sends writes to the tenant's home region, fails over to the paired standby only after a threshold of consecutive failed health checks (and fails back only after the same number of good ones, to avoid flapping), serves stale-tolerant reads from the caller's own region, and hands out an **epoch** per tenant.
+The router sends writes to the tenant's home region, fails over to the paired standby only after a threshold of consecutive failed health checks (and fails back only after the same number of good ones, to avoid flapping), serves stale-tolerant reads from the caller's own region, and hands out an **epoch** (a number that goes up every time ownership moves) per tenant.
 
 Each shard rejects writes with an older epoch, so a delayed request routed to the old home cannot overwrite data after ownership moved. It passes `go vet` and `go test -race` on Go 1.24.
 
@@ -583,6 +638,14 @@ Distributed SQL databases build this in: CockroachDB's `REGIONAL BY ROW` tables 
 | Active-active, write-anywhere | Every region | Nothing to promote | Social features, carts, counters with merge rules |
 | Geo-partitioned | Each region owns its jurisdiction's data | Per-region DR inside the jurisdiction | Residency-constrained data |
 
+### Multi-region versus things people confuse it with 🟡
+
+| Thing | What it protects against | How it differs from multi-region |
+| --- | --- | --- |
+| Multi-AZ (one region) | One data centre failing | Zones are a few ms apart, so sync replication is cheap; it does not survive a region-wide outage |
+| CDN | Slow delivery of static or cacheable content far away | Copies files and cached pages to the edge; your database and writes still live in one region |
+| Cross-region backups | Losing all data | Lets you rebuild elsewhere in hours; multi-region keeps a live copy ready |
+
 ## 6. Trade-offs and when not to use 🟡
 
 The hard problems, roughly in the order they bite:
@@ -604,6 +667,8 @@ Cost and judgement:
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the DR ladder, how users are routed, how home regions avoid write conflicts, and the real minutes and seconds of a regional failover. **Next comes the advanced part**: Aurora, DynamoDB global tables, Spanner and cell-based architecture in production, the failure modes, evacuation drills, and deeper issues such as sync latency, global uniqueness, residency law and caches across regions.
+
 - **Real systems:**
 	- Aurora Global Database: one write region, up to several read-only secondary regions, with managed switchover (planned, no data loss) and failover (unplanned, may lose the replication lag).
 	- DynamoDB global tables: in the default multi-Region eventual consistency mode, every replica region accepts writes and conflicts are resolved by last writer wins. DynamoDB itself is leader-based within a region (Multi-Paxos per partition), not Dynamo-style leaderless.
@@ -617,7 +682,7 @@ Cost and judgement:
 	- Failover by flapping health checks → require several failures in a row and several successes before failing back; make the final promotion a human decision for databases if the RPO cost is high.
 	- Split brain: old primary returns and keeps taking writes → fence with epochs or by revoking its write credentials before promotion.
 	- Standby region cannot take full load → keep it at a known capacity, pre-warm, and test with real traffic.
-	- Shared global dependency fails (one region's IAM, one DNS provider, one config service) → map every dependency's region; avoid control-plane calls on the failover path.
+	- Shared global dependency fails (one region's IAM, the cloud's login and permissions service, one DNS provider, one config service) → map every dependency's region; avoid control-plane calls on the failover path.
 	- Lost writes after failover never reconciled → keep a log of unreplicated changes from the old primary and run a reconciliation job when it returns.
 - **What to monitor:**
 	- Cross-region replication lag (seconds and bytes), with an alert well below your RPO.
@@ -651,9 +716,9 @@ A username must be unique across all regions. Options: route all signups to one 
 
 ### Data residency in practice
 
-- **GDPR** allows transfers outside the EU only under conditions (adequacy decisions, standard contractual clauses and others), so EU personal data is often kept in EU regions to stay simple.
-- **India's DPDP Act, 2023** allows transfer outside India except to countries the central government restricts by notification; sector rules can be stricter, such as RBI's requirement that payment system data be stored only in India.
-- Design: geo-partition personal data by jurisdiction; keep a global, non-personal directory; keep analytics on aggregated or pseudonymized data. Check logs, backups, caches and support tools too: a CDN log or a crash dump can carry personal data across borders.
+- **GDPR** (the EU's data protection law) allows transfers outside the EU only under conditions (adequacy decisions, standard contractual clauses and others), so EU personal data is often kept in EU regions to stay simple.
+- **India's DPDP Act, 2023** (Digital Personal Data Protection Act) allows transfer outside India except to countries the central government restricts by notification; sector rules can be stricter, such as RBI's requirement that payment system data be stored only in India.
+- Design: geo-partition personal data by jurisdiction; keep a global, non-personal directory; keep analytics on aggregated or pseudonymized (names replaced with codes) data. Check logs, backups, caches and support tools too: a CDN log or a crash dump can carry personal data across borders.
 
 ### Caches and sessions across regions
 
@@ -694,6 +759,30 @@ Invalidate from the replication stream in each region (after the replica applied
 - DNS failover is minutes, not TTL seconds; anycast is faster.
 - Fence the old primary; reconcile its unreplicated writes.
 - Cells limit blast radius; evacuation drills prove RTO.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Name the three reasons to go multi-region.
+> Surviving a region outage (DR), lower latency for far-away users, and data-residency rules.
+
+> [!question]- Which DR pattern is cheapest, and which recovers fastest?
+> Backup and restore is cheapest; active-active recovers fastest.
+
+> [!question]- What is a home region?
+> The single region that owns writes for a given user or tenant; others forward writes to it.
+
+🟡 Medium
+
+> [!question]- DNS TTL is 60 s. Why can failover still take several minutes?
+> Detection takes time (about 90 s with default checks), some clients cache past the TTL, open connections stay put, and the database must be promoted and servers scaled.
+
+> [!question]- Async replication lag is 1 s at 2,000 writes per second. Roughly how many writes may be stranded on failover?
+> About 2,000, unreachable until the old region returns and they are reconciled.
+
+> [!question]- Why fence the old primary before promoting the standby?
+> So that if it comes back, it cannot keep accepting writes alongside the new primary (split brain).
 
 ## Links
 

@@ -34,6 +34,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[HTTP Server Fundamentals (net-http)]]: a Go handler gets a request and writes a response; each connection runs on its own goroutine.
+> - [[Middleware]]: auth and logging wrap handlers before they run, including the WebSocket upgrade handler.
+> - [[Real-time APIs - WebSocket, SSE and Long Polling]]: the three ways a server can push updates, and when each fits.
+
 **From zero, in 60 seconds** 🟢
 
 Normal HTTP is ask-then-answer: the server can never speak first. But a chat app or a live dashboard needs the server to push.
@@ -74,6 +79,11 @@ WebSockets and SSE keep a connection open so the server can push updates.
 | Ping/pong | Tiny "are you alive?" messages | Close if no pong in 60s |
 | Hub | One goroutine that tracks all connected clients | Broadcasts to everyone watching invoice 42 |
 
+| Upgrade | Turning one HTTP request into a WebSocket connection | `101 Switching Protocols` |
+| Origin check | Making sure the page opening the socket is from your own site | reject `evil.example` |
+| Slow consumer | A client that reads too slowly to keep up | its mailbox fills, so it is dropped |
+| Fan-out | Sending one event to many listeners, even across servers | Redis Pub/Sub to every pod |
+
 **Picture it**
 
 ```mermaid
@@ -109,6 +119,10 @@ A WebSocket (or SSE) connection flips this: the server pushes exactly one messag
 
 The cost is holding one long-lived connection open per client instead of reusing a connection pool for one request at a time — which is precisely the cost that makes a naive implementation fall over past a few thousand concurrent users if nothing manages the connections deliberately.
 
+### A real-life example 🟢
+
+On Zomato's order-tracking screen, the rider's position and "order picked up" appear without you refreshing. The app keeps one connection open, and the server pushes each update down it. If your phone goes into a tunnel, the connection drops and the app reconnects, asking for anything it missed. Since only the server talks in that screen, a one-way stream like SSE is enough; a chat with the rider needs two-way WebSockets.
+
 ## 2. Mental model 🟢
 
 An HTTP request/response is a brief conversation: ask, answer, hang up. A WebSocket is a phone call that stays open: after the initial handshake, either side can speak at any time, and the line stays connected until someone hangs up.
@@ -141,6 +155,8 @@ sequenceDiagram
 
 ## 3. How it works 🟡
 
+🟢 → 🟡 You now know the shapes: an open two-way pipe (WebSocket) or a never-ending response (SSE), with a hub that knows who is listening. Next we open the box: the upgrade and auth, the two pump goroutines, per-client mailboxes, keep-alive pings, the hub, scaling across servers, shutdown and SSE.
+
 ### Handshake, upgrade and auth
 
 The browser's `new WebSocket(url)` sends a `GET` with `Connection: Upgrade`, `Upgrade: websocket`, and a `Sec-WebSocket-Key`; a successful server responds `101 Switching Protocols` with the matching `Sec-WebSocket-Accept`, and the TCP connection is now a WebSocket, not HTTP.
@@ -163,6 +179,12 @@ Without an origin check, any page on any origin can run `new WebSocket("wss://ap
 
 **In plain words:** two workers per phone line — one only listens, one only speaks — because the connection breaks if two goroutines write at once.
 
+**Step by step:**
+1. After the upgrade, start `readPump` and `writePump` goroutines for this client.
+2. `readPump` only reads messages and pongs; on error it unregisters the client.
+3. `writePump` is the only goroutine that writes: it sends messages from the client's `send` channel and pings on a timer.
+4. Nobody else writes to the connection, so two writes never collide.
+
 Every WebSocket library — `coder/websocket` and `gorilla/websocket` alike — allows **exactly one goroutine to read and one to write at a time** per connection. Two goroutines calling `Write` concurrently corrupt the frame stream (interleaved bytes from two messages look like one malformed message to the other side). The standard shape is two goroutines per connection:
 
 ```mermaid
@@ -181,6 +203,12 @@ flowchart LR
 ### A buffered send channel per client; a slow-consumer policy
 
 **In plain words:** each client gets a small mailbox; if the mailbox is full the client is too slow, and you drop them rather than let them stall the hub.
+
+**Step by step:**
+1. Each client has `send := make(chan []byte, 16)`.
+2. The hub tries to put an event in it without waiting.
+3. If the mailbox is full, the client is too slow: close it and remove it.
+4. Everyone else keeps getting updates on time.
 
 The hub never calls `conn.Write` itself — it hands an event to the client's buffered `chan Event`, and only that client's `writePump` goroutine reads from it and writes to the socket.
 
@@ -201,6 +229,12 @@ Also note that when the context passed to `Read` or `Write` expires, `coder/webs
 ### Hub pattern (register/unregister/broadcast) vs a mutex-protected map
 
 **In plain words:** the hub is a switchboard goroutine that owns the client list, so joins, leaves and broadcasts never race.
+
+**Step by step:**
+1. A new client sends itself on the `register` channel; the hub adds it to its map.
+2. A closing client sends itself on `unregister`; the hub removes it.
+3. "invoice 42 paid" arrives on `broadcast`; the hub sends it to clients watching invoice 42.
+4. Only the hub goroutine touches the map, so there are no races.
 
 A `sync.Mutex`-guarded `map[string]*Client` works, but every register, unregister and broadcast then competes for the same lock, and it's easy to hold the lock while writing to a socket (blocking every other map access on a slow network write).
 
@@ -259,6 +293,12 @@ Raise the file-descriptor limit (`ulimit -n`, the container `nofile` limit) well
 ### SSE for one-way updates
 
 **In plain words:** when the server only pushes and never listens, a never-ending plain HTTP response does the job and the browser even reconnects by itself.
+
+**Step by step:**
+1. The handler sets `Content-Type: text/event-stream` and keeps the response open.
+2. For each event it writes `id: 17` and `data: {...}` lines, then flushes.
+3. If the connection drops, the browser reconnects and sends `Last-Event-ID: 17`.
+4. The server replays events after 17, then continues live.
 
 SSE is `Content-Type: text/event-stream`, a response that's flushed after every event instead of ending, and a wire format the browser's `EventSource` parses itself:
 
@@ -926,7 +966,26 @@ func TestSSEHandler_RepliesMissedEventsThenLive(t *testing.T) {
 - Neither works well for data where losing an update is unacceptable and the client might be offline for a long time — reach for a durable queue and a sync-on-reconnect protocol instead of either.
 - A WebSocket connection pinned to one pod means that pod's death briefly drops every connection it held; the client's reconnect-with-backoff absorbs this, but it is a real, user-visible blip, unlike a stateless REST request that a load balancer can retry transparently.
 
+### WebSocket vs SSE 🟡
+
+| | WebSocket | SSE |
+| --- | --- | --- |
+| Direction | both ways | server to browser only |
+| Transport | upgraded connection, its own frames | a normal long HTTP response |
+| Reconnect | you write it | built into the browser |
+| Good for | chat, collaborative editing | live status, dashboards, feeds |
+
+### Common beginner mistakes 🟢
+
+- Writing to one connection from several goroutines → corrupted frames or panics → let only `writePump` write.
+- Blocking the hub on a slow client → everyone stalls → drop clients whose mailbox is full.
+- Skipping the origin check → another site can open sockets with the user's cookies → check `Origin`.
+- No pings or read deadlines → dead connections pile up → ping regularly and set deadlines.
+- Using WebSockets for one-way updates → extra code for nothing → use SSE.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now build a live-update server with WebSockets or SSE. The advanced part covers running many thousands of connections: load balancer timeouts, file limits, cross-server fan-out, deploys that drop every socket, and goroutine leaks.
 
 - **Real systems:** Slack and Discord's real-time message delivery is WebSocket-based with a presence and fan-out layer much like the hub here, scaled out. Dashboards and status pages commonly use SSE for one-way status ticks because it is plain HTTP and passes through more corporate proxies than raw WebSockets do.
 - **Failure modes → fixes:**
@@ -981,6 +1040,26 @@ func TestSSEHandler_RepliesMissedEventsThenLive(t *testing.T) {
 - `http.Server.Shutdown` does not close hijacked WebSocket connections — close them yourself with a 1001 close frame.
 - SSE = `http.ResponseController.Flush()` per event, `id:` + `Last-Event-ID` for resumable replay, `EventSource` handles reconnection.
 - Multi-pod fan-out needs a shared bus (Redis Pub/Sub, NATS) — a hub only knows about its own pod's connections.
+
+## Self-check 🟢🟡
+
+> [!question]- What is the main difference between WebSocket and SSE?
+> WebSocket is two-way; SSE is one-way from server to browser.
+
+> [!question]- Why is there exactly one writer goroutine per connection?
+> Concurrent writes to one WebSocket connection are not safe.
+
+> [!question]- What does the hub own?
+> The set of connected clients; only it changes that set.
+
+> [!question]- What happens to a client whose send channel is full?
+> It is dropped so it cannot slow everyone else.
+
+> [!question]- How does an SSE client catch up after reconnecting?
+> The browser sends `Last-Event-ID`, and the server replays events after it.
+
+> [!question]- Why does a second server need Redis Pub/Sub or NATS?
+> A user's socket lives on one pod; the event may happen on another, so it must be fanned out to all pods.
 
 ## Links 🟢
 

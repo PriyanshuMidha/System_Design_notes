@@ -44,6 +44,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (both models, the flowchart), 4 (worked example), 5, 6 and 9 (drills).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 10 and 11. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Queues vs Streams and Broker Comparison]]: a queue hands each job to one worker and forgets it; a stream (log) keeps events so many readers can replay them.
+> - [[Event-Driven Architecture Basics]]: services publish "this happened" events and others react later, instead of calling each other directly.
+
 **From zero, in 60 seconds** 🟢
 
 Checkout must tell email, the warehouse and analytics that an order happened.
@@ -88,6 +92,12 @@ The question is which broker, and that depends on whether the message is a task 
 | Ack (acknowledge) | The consumer saying "done, you can forget it" | Worker acks after sending the email |
 | At-least-once | A message may arrive more than once, never zero times | Email sent twice after a retry |
 | Idempotent | Processing the same message twice has the same effect as once | Skip if `order_id` already handled |
+| Offset | A reader's bookmark: the position of the next record to read in a partition | consumer at offset 1,204 |
+| Consumer group | A set of readers that share a topic's partitions | 4 email workers share 12 partitions |
+| Visibility timeout | How long an SQS message is hidden after one worker takes it | 30 s; if not deleted, it comes back |
+| Dead letter queue (DLQ) | A side queue for messages that keep failing | after 5 failed tries |
+| Retention | How long a log keeps records before deleting them | Kafka keeps 7 days |
+| Consumer lag | How far a reader is behind the newest record | 50,000 records behind |
 
 **Picture it**
 
@@ -136,6 +146,21 @@ This note gives you a fast way to choose, with the reasons.
 
 The analogy breaks in one place: a real archive has one shelf, while Kafka splits it into **partitions**, and order only holds within one partition.
 
+### Real-life example: one order, two kinds of broker 🟢
+
+When you place an order on a food app, an `OrderPlaced` event goes into a Kafka log: payments, the restaurant system, delivery and analytics each read it at their own pace, and analytics can replay last week if it had a bug.
+The "send receipt email" job goes into a simple queue like SQS: one worker takes it, sends the email, and it is gone.
+LinkedIn built Kafka for exactly this "many readers, keep history" case; queues like SQS and RabbitMQ are built for "do this job once".
+
+## Common beginner mistakes 🟢
+
+- **Picking Kafka for a few hundred jobs a minute** → you inherit partitions, rebalances and a cluster to run → use SQS or a jobs table.
+- **Using a queue when you may need to re-read history** → processed messages are gone → use a log with retention.
+- **Expecting order across a whole Kafka topic** → order holds only inside one partition → key by order or user ID so related events share a partition.
+- **Non-idempotent consumers** → every broker can redeliver, so emails or charges happen twice → dedupe by message or entity ID.
+- **No dead letter queue** → one bad message is retried forever and blocks others → move it aside after a few tries, and alert.
+
+
 ```mermaid
 flowchart LR
     subgraph Q["Queue model (SQS, RabbitMQ classic)"]
@@ -152,6 +177,8 @@ flowchart LR
 ```
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** a queue forgets a job once done and a log remembers everything. **Next we open the box**: both models step by step, a decision flowchart, and what ordering and delivery guarantees really mean.
 
 ### The two models, step by step
 
@@ -231,6 +258,13 @@ flowchart TD
 ### Guarantees and ordering in plain words
 
 **In plain words:** Order is kept only inside one lane. Put all messages for the same order or user in the same lane.
+
+**Step by step:**
+1. Order 42 produces three events: placed, paid, delivered. All use key `order:42`.
+2. The key hash sends all three to partition 3, so they stay in order.
+3. The consumer handles "placed" and "paid", then crashes before saving its offset.
+4. After restart it reads "paid" again (at-least-once). It sees order 42 is already paid and skips it (idempotent).
+5. Events of different orders in other partitions may be read in any order, which is fine.
 
 **Ordering.** Kafka guarantees order within a partition, so use the entity id (order id, user id) as the key and all events for that entity stay in order. SQS FIFO guarantees order per **message group id**.
 
@@ -376,6 +410,8 @@ flowchart LR
 > Choosing Kafka for a few hundred jobs a minute because "it is the standard". You inherit partitions, consumer-group rebalances and head-of-line blocking (one slow message holds up the rest of its partition) for no benefit.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** which broker fits which need and what each costs. **Next comes the senior view**: real company choices, failure modes, metrics, why partitions cap parallelism, ordering with retries, honest exactly-once, schemas and operations.
 
 ### Real company examples
 
@@ -564,7 +600,27 @@ Phrases to avoid: "exactly-once, no problem", "Kafka is always faster", "just us
 - Everything is at-least-once: idempotent consumers and an outbox.
 - Say: shape, needs, pick, guarantee, cost.
 
-## 13. Links 🟢
+## Self-check 🟢🟡
+
+> [!question]- (easy) Queue vs log in one line?
+> A queue hands each message to one worker and deletes it; a log keeps messages so many readers can replay.
+
+> [!question]- (easy) What is a dead letter queue for?
+> Holding messages that keep failing so they do not block the rest.
+
+> [!question]- (easy) Why must consumers be idempotent?
+> Brokers deliver at least once, so a message can arrive twice.
+
+> [!question]- (medium) How do you keep all events for one order in order in Kafka?
+> Use the order ID as the key so they all land in one partition.
+
+> [!question]- (medium) A topic has 6 partitions. How many consumers in one group can do useful work?
+> At most 6; extra consumers sit idle.
+
+> [!question]- (medium) When is no broker the right answer?
+> When the caller needs the answer now, or volume is tiny and a Postgres jobs table is enough.
+
+## Links 🟢
 
 - Before this: [[Queues vs Streams and Broker Comparison]], [[Event-Driven Architecture Basics]], [[System Design Interview Framework]]
 - Brokers: [[Kafka and Event Streaming]], [[AWS SQS, SNS and EventBridge]], [[Redis as a Queue - Lists, Streams and Pub-Sub]]
@@ -574,7 +630,7 @@ Phrases to avoid: "exactly-once, no problem", "Kafka is always faster", "just us
 - Compare with: [[Choosing a Database - Decision Guide]]
 - Map: [[09 Messaging & Async MOC]]
 
-## Links 🟢
+ 🟢
 
 ### Watch on YouTube
 

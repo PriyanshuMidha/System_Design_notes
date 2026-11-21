@@ -23,6 +23,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 1-3 of the code, the design decisions and the tests.
 > - 🔴 **Interview / SDE-3 prep?** Add the benchmarks, "Running it" and the pitfalls. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Arrays and Dynamic Arrays (Go Slices)]]: jumping to slot `i` of a slice is instant. Our table is a slice of buckets.
+> - [[Complexity Analysis - Big-O and Amortized Cost]]: "amortized `O(1)`" means cheap on average even though one resize now and then is slow.
+> - Read [[Hash Tables and Go Maps]] first too: hash → slot, collisions, load factor.
+
 **From zero** 🟢 — This file is the hands-on twin of [[Hash Tables and Go Maps]]. It builds a small hash table in plain Go, about 90 lines: put a key in, get it back, delete it, and watch the table grow itself when it gets full. Then it races that toy against Go's real built-in `map` and reads the numbers honestly. Read the theory note first if any word here feels new; here, read the code blocks top to bottom and the "How it works" list after each one.
 
 ## Before the code 🟢
@@ -75,6 +80,8 @@ The type is small on purpose: one slice of bucket heads, one linked-list node ty
 - Benchmarks: `go test -bench=. -benchmem -run=^$ ./...`
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** what the package does and how to run it. **Next we read the code:** a tiny whiteboard table, then the real `Table` with `Put`, `Get`, `Delete` and `resize`. Each step starts with one plain-words line.
 
 ### Whiteboard version
 
@@ -155,6 +162,8 @@ func New(startBuckets int) *Table {
 	return &Table{buckets: make([]*entry, startBuckets)}
 }
 ```
+
+**What this code does, in plain words:** hash the key string with FNV-1a into a big number, then take the remainder by the bucket count to get a slot; the load factor is just entries divided by buckets.
 
 ```go
 // hashKey maps a key to a bucket index using FNV-1a, the same family of
@@ -240,6 +249,8 @@ func (t *Table) Buckets() int { return len(t.buckets) }
 2. `Get` costs `O(chain length)`, which averages to `O(1)` under a bounded load factor — the same guarantee `Put` relies on.
 3. `Len` and `Buckets` just read the maintained fields — no bucket walk, `O(1)`.
 
+**What this code does, in plain words:** go to the key's bucket, walk its chain while remembering the node before, and when the key is found, link the previous node straight to the next one so the found node drops out.
+
 ```go
 // Delete removes key if present.
 func (t *Table) Delete(key string) bool {
@@ -316,7 +327,7 @@ sequenceDiagram
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
-| Separate chaining | Open addressing (linear probing) | Simpler delete (no tombstones needed); open addressing would be more cache-friendly but needs tombstone handling on delete. |
+| Separate chaining | Open addressing (linear probing) | Simpler delete (no tombstones needed — a tombstone is a "deleted here" marker that open addressing must leave so later lookups keep probing); open addressing would be more cache-friendly but needs tombstone handling on delete. |
 | FNV-1a, no random seed | A keyed/seeded hash (e.g. Go runtime's AES-based hash) | Simpler to read and test deterministically; unsafe against hash-flooding if ever exposed to attacker-controlled keys. |
 | Resize check after insert | Resize check before insert (pre-emptive) | The triggering key is naturally included in the rehash with no special case; costs one extra `LoadFactor()` call per `Put`. |
 | Double the bucket count on resize | Grow by a fixed increment | Doubling amortizes resize cost to O(1) per insert; a fixed increment would resize far more often as the table grows. |
@@ -337,6 +348,8 @@ This is the core safety property behind the amortized-O(1) claim: if a resize ev
 | Insert | 1,000 keys `"key:0"..."key:999"` into a table starting at 4 buckets | `Len()` reports exactly 1,000 |
 | Check | Load factor after all inserts | `<= 0.75` |
 | Verify | `Get` every one of the 1,000 keys | Each returns its original value, `ok == true` |
+
+**What this code does, in plain words:** put 1,000 keys into a table that starts with only 4 buckets, then check the count is 1,000, the table is not over-full, and every key still gives back its own value.
 
 ```go
 package hashtable
@@ -387,6 +400,8 @@ func TestResizeKeepsAllKeys(t *testing.T) {
 | --- | --- |
 | `BenchmarkTablePut` / `BenchmarkGoMapPut` | Cost of inserting/overwriting into 10,000 pre-sized keys |
 | `BenchmarkTableGet` / `BenchmarkGoMapGet` | Cost of looking up an existing key out of 10,000 |
+
+**What this code does, in plain words:** make 10,000 key strings once, then time how long `Put` takes on our table and on Go's map, cycling through the same keys.
 
 ```go
 // benchKeys precomputes the key strings once, outside the timed loop, so
@@ -454,6 +469,8 @@ func BenchmarkGoMapGet(b *testing.B) {
 
 ## Running it 🔴
 
+> 🟡 → 🔴 **You now know** how every method works and how the resize test proves nothing is lost. **Next comes the advanced part:** reading real benchmark numbers honestly against Go's Swiss Tables map, the pitfalls of this toy, and exercises.
+
 ```text
 go vet ./... && go test -race -v ./...
 ```
@@ -503,6 +520,26 @@ Treat any single benchmark like this as a starting point for your own measuremen
 1. Change `maxLoad` from `0.75` to `0.5` and re-run `TestResizeKeepsAllKeys`. Predict how many total resizes happen on the way to 1,000 keys (more or fewer than before), then add a counter to `resize` and check.
 2. `Delete` a key, then `Put` a different key that hashes to the same bucket. Predict whether the deleted node's memory is reused, then trace through the code to confirm (hint: look at what `prev.next = e.next` actually frees).
 3. Modify `BenchmarkTablePut` to insert 10,000 *brand-new* keys per iteration instead of overwriting the same 10,000 repeatedly (so every `Put` is a true insert, not an update). Predict whether the chaining table or Go's map comes out ahead now, then measure it.
+
+## Self-check 🟢🟡
+
+> [!question]- Why does the whiteboard `put` create duplicates?
+> It always prepends a new node and never checks whether the key is already in the chain.
+
+> [!question]- What does `Get` return for a key that is not there?
+> `(0, false)`: the zero value and "not found".
+
+> [!question]- When does `Put` call `resize`?
+> After an insert pushes the load factor above `0.75`.
+
+> [!question]- Why does `resize` save `next := e.next` before relinking?
+> Relinking overwrites `e.next`; without saving it first, the rest of the old chain is lost.
+
+> [!question]- Why does `hashKey` take `nBuckets` as an argument?
+> So the same function can compute slots for both the old and the new bucket count during a resize.
+
+> [!question]- Why is this table unsafe to expose to attacker-chosen keys?
+> It has no random seed, so an attacker can find keys that all land in one bucket (hash flooding).
 
 ## Links 🟢
 

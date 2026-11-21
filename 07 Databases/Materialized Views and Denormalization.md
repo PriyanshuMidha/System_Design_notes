@@ -31,6 +31,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6 (variants and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Relational Schema Design]]: data is split into tables like `invoices` and `payments`, and each fact is stored once.
+> - [[SQL Essentials]]: you can read `SELECT ... GROUP BY` with `count` and `sum`.
+> - [[Indexing Fundamentals]]: an index lets the database jump to the rows it needs instead of reading the whole table.
+> - [[Query Plans and EXPLAIN]]: `EXPLAIN ANALYZE` shows how the database ran a query and how long each step took.
+
 **From zero, in 60 seconds** 🟢
 
 A dashboard asks the database the same hard question again and again: "add up all my invoices".
@@ -75,6 +81,11 @@ So you compute the answer ahead of time, store it, and read the stored answer in
 | Normalized | Each fact is stored in exactly one place | Customer name only in `customers` |
 | Denormalized | A deliberate copy or summary kept for fast reads | `invoice_count` on `workspaces` |
 | Stale | The copy no longer matches the source | Total shows yesterday's number |
+| Trigger | Code the database runs by itself when a row is inserted, updated or deleted | "after insert on invoices, add 1 to the count" |
+| Lock | A marker that makes other queries wait before touching a table or row | a refresh can make readers wait |
+| Idempotent | Doing it twice gives the same result as doing it once | skip an event whose ID you already applied |
+| Drift | The copy slowly disagrees with the source because some update was missed | rollup says 500, real total is 800 |
+| Staleness budget | How old a number is allowed to be, agreed with the product owner | "the chart may lag 5 minutes" |
 
 **Picture it**
 
@@ -131,6 +142,21 @@ flowchart LR
     end
 ```
 
+### Real-life example 🟢
+
+On a food app like Swiggy, every restaurant card shows "4.3 stars, 10K+ ratings".
+Working that out live would mean averaging every rating ever given, for every card, on every scroll.
+So the app keeps a stored rating and count per restaurant, and updates it from time to time.
+That is why a rating you just gave may not change the number straight away: you are looking at a stored answer, not a live one.
+
+## Common beginner mistakes 🟢
+
+- **Making a materialized view and never refreshing it** → PostgreSQL does not refresh it by itself, so it shows the same old numbers forever → schedule a `REFRESH` (for example with `pg_cron`) and watch the time since the last refresh.
+- **Using plain `REFRESH` on a busy view** → it blocks every reader until it finishes, so dashboards hang → add a unique index and use `REFRESH ... CONCURRENTLY`.
+- **Using a stored total for money decisions** → between refreshes it is wrong, so you could allow a refund that should be refused → read exact values from the source table, or update the copy in the same transaction.
+- **Adding an event's change twice** → messages can be delivered again after a crash, so totals grow too big → save each event ID and skip repeats.
+- **Precomputing before trying an index** → you add staleness and extra work for nothing → first check whether a better index makes the live query fast enough.
+
 ## 2. Mental model 🟢
 
 - A **view** (`CREATE VIEW`) is a named query. Reading it runs the query every time. It is never stale and never faster.
@@ -154,9 +180,17 @@ A summary table is a running tally that the cashier updates with every sale: alw
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the idea: compute a slow answer once, store it, and accept that it goes stale. **Next we open the box**: how PostgreSQL stores and refreshes the answer, which locks a refresh takes, and the three ways to keep a copy fresh. Each subsection starts with a short step-by-step walk; the full detail follows.
+
 ### 3.1 View vs materialized view vs summary table
 
 **In plain words:** three ways to answer the same question — re-ask it every time (view), read yesterday's written answer (materialized view), or keep a tally you update as you go (summary table). The table compares them.
+
+**Step by step:**
+1. The question is "how many invoices does workspace 42 have?".
+2. With a **view**, every read re-counts all 400,000 rows. Always right, always slow.
+3. With a **materialized view**, a refresh counts once and stores "400,000". Reads are instant, but the number is old until the next refresh.
+4. With a **summary table**, each new invoice adds 1 to a stored count. Reads are instant and fresh, but every write path must remember to add the 1.
 
 | | View | Materialized view (PostgreSQL 17) | Summary table |
 | --- | --- | --- | --- |
@@ -170,6 +204,13 @@ A summary table is a running tally that the cashier updates with every sale: alw
 ### 3.2 Creating and refreshing a materialized view in PostgreSQL 17
 
 **In plain words:** you make the stored answer once, then re-make it on a schedule. The only real decision is whether readers are allowed to keep reading while you re-make it.
+
+**Step by step:**
+1. `CREATE MATERIALIZED VIEW workspace_dashboard AS SELECT ... GROUP BY workspace_id, status` runs the slow query once and stores about 6 rows per workspace.
+2. Dashboards read those stored rows. They are fast, and they stay the same while invoices change.
+3. Every few minutes a job runs `REFRESH`. A plain refresh rebuilds the whole thing and makes readers wait until it is done.
+4. `REFRESH ... CONCURRENTLY` builds the new answer on the side, then swaps in only the rows that changed. Readers keep seeing the old answer meanwhile.
+5. For step 4 the view needs a unique index, so PostgreSQL can match each old row to its new row.
 
 The view groups invoices by `(workspace_id, status)` and stores `invoice_count`, `total_minor` and `outstanding_minor`, created `WITH DATA` so it is readable at once (`WITH NO DATA` leaves it unreadable until the first `REFRESH`).
 
@@ -189,6 +230,8 @@ There are two ways to refresh it:
 | Requires | nothing | a `UNIQUE` index on plain column names with no `WHERE` clause, covering all rows; the view must already be populated |
 | Leaves dead rows | no (new file) | yes, the updated and deleted rows need vacuum, like any table |
 | Speed | faster when most rows change | slower overall, but invisible to readers; best when few rows change |
+
+Two words from the table: **dead rows** are old row copies left behind after an update or delete, and **vacuum** is the PostgreSQL clean-up process that frees their space later. `ACCESS EXCLUSIVE` and `EXCLUSIVE` are lock strengths: the first stops even plain reads, the second only stops other writers and refreshes.
 
 The *lock* is what matters for users. With a plain refresh that takes 40 seconds, every dashboard request waits up to 40 seconds. With `CONCURRENTLY`, dashboards keep reading the old rows until the new ones are applied.
 
@@ -228,6 +271,13 @@ Because the whole refresh is one transaction, a reader sees either all of the ol
 
 ### 3.3 Three ways to keep a precomputed result fresh
 
+**In plain words:** you can redo the whole sum on a timer, adjust it a little with every write, or let a separate worker adjust it from a stream of change messages.
+
+**Step by step (one new ₹2,500 invoice in workspace 42):**
+1. **Timer:** nothing happens now. At the next refresh, the whole `GROUP BY` re-runs and the total includes ₹2,500.
+2. **Same database:** the same transaction that inserts the invoice also runs "count + 1, total + 250000" on the summary row.
+3. **Change stream:** the insert is written as a change message; a separate consumer reads it a moment later and adds 250000 in another store.
+
 ```mermaid
 flowchart LR
     subgraph A["1. Scheduled full refresh"]
@@ -243,11 +293,17 @@ flowchart LR
 
 1. **Scheduled full refresh.** Simple, correct by construction (it recomputes from the source), and the staleness is at most the interval plus the refresh time. The cost is proportional to the *whole* base data, not to how much changed.
 2. **Incremental in the same database.** Each write also adjusts the summary: `+1 invoice, +250000 total_minor`. Freshness is immediate when it runs in the same transaction ([[Transactions and ACID]]). Postgres has no built-in incremental materialized views; the `pg_ivm` extension adds them (`create_immv`) using triggers, for a restricted set of queries.
-3. **Change stream outside the database.** Changes leave the database through an outbox table or change data capture (CDC: reading the database's write-ahead log as a stream of row changes), and a consumer updates a separate read store. This is a **projection** or **read model** in [[CQRS]] terms: a materialized view that lives outside the database. Details of the pipeline are in [[Transactional Outbox and CDC]].
+3. **Change stream outside the database.** Changes leave the database through an outbox table (a table where each write also records a "this changed" message in the same transaction) or change data capture (CDC: reading the database's write-ahead log as a stream of row changes), and a consumer updates a separate read store. This is a **projection** or **read model** in [[CQRS]] terms: a materialized view that lives outside the database. Details of the pipeline are in [[Transactional Outbox and CDC]].
 
 ### 3.4 The staleness budget is a product decision
 
 Before choosing a mechanism, ask: *how old may this number be?*
+
+**Step by step:**
+1. List every number on the screen, for example "outstanding balance" and "revenue by month".
+2. Ask the product owner how old each one may be: "exact", "5 minutes" or "a day".
+3. Pick the cheapest method that meets it: exact means same transaction, minutes means a scheduled refresh, a day means a nightly rebuild.
+4. Write the budget down and alert when the real lag goes past it.
 
 - "Outstanding balance on the invoice page" must be exact after a payment: keep `paid_minor` in the same transaction as the payment insert.
 - "Revenue by month chart" can lag 5 minutes: a scheduled `REFRESH ... CONCURRENTLY` every 5 minutes is enough.
@@ -295,7 +351,7 @@ HashAggregate  (actual time=381.902..381.905 rows=6 loops=1)
 Execution Time: 382.011 ms
 ```
 
-Reading the plan ([[Query Plans and EXPLAIN]] covers this in detail): 400,112 rows are fetched from 54,301 table pages, of which 24,120 came from disk, only to be grouped into 6 output rows.
+Reading the plan ([[Query Plans and EXPLAIN]] covers this in detail; "heap" means the table's own pages, a "Bitmap Heap Scan" first collects matching row addresses from the index and then reads those pages, and `HashAggregate` groups rows using an in-memory hash table): 400,112 rows are fetched from 54,301 table pages, of which 24,120 came from disk, only to be grouped into 6 output rows.
 
 ### 4.2 After: read the materialized view
 
@@ -329,7 +385,7 @@ The refresh re-runs the `GROUP BY` over all 20 million invoices. Estimate: a par
 
 The concurrent variant then diffs about 300,000 rows. Measure it on your own data with `\timing` in `psql` before choosing the interval.
 
-With a 5-minute budget, schedule the refresh every 4 minutes, and alert if a refresh takes more than 1 minute (budget minus interval). Run it from one place, for example a `pg_cron` job or one scheduled worker, so two refreshes never queue behind the `EXCLUSIVE` lock.
+With a 5-minute budget, schedule the refresh every 4 minutes, and alert if a refresh takes more than 1 minute (budget minus interval). Run it from one place, for example a `pg_cron` job (`pg_cron` is a PostgreSQL extension that runs SQL on a cron-style timer) or one scheduled worker, so two refreshes never queue behind the `EXCLUSIVE` lock.
 
 ```sql
 -- pg_cron extension: run every 4 minutes
@@ -367,7 +423,7 @@ HAVING i.paid_minor <> coalesce(sum(p.amount_minor), 0);
 
 **In plain words:** when updates arrive as messages, the same message can arrive twice. If you add it twice, your total is wrong — so you note down each message's ID and skip repeats.
 
-When the rollup lives outside Postgres (for example a dashboard store fed by CDC), each change arrives as an event. Delivery is **at-least-once**: after a consumer crash, the same event can arrive again. Applying it twice is the classic double-counting bug.
+When the rollup lives outside Postgres (for example a dashboard store fed by CDC), each change arrives as an event. Delivery is **at-least-once** (every event arrives, but some may arrive more than once): after a consumer crash, the same event can arrive again. Applying it twice is the classic double-counting bug.
 
 The fix is to remember which event IDs were applied; in SQL, that is a `processed_events` table written in the same transaction as the rollup update.
 
@@ -412,7 +468,7 @@ The Go rollup (`Rollup.Apply`, `Rollup.Get`, `Rollup.Drift`), its four tests inc
 | Streaming database (Materialize, RisingWave) | SQL views kept incrementally up to date from Kafka or Postgres CDC | complex joins that must be fresh within seconds | another system to run; memory for join state |
 | Cache (Redis) | store the query result with a TTL | a hot, small result where a few seconds of staleness is fine | invalidation and stampedes ([[Cache Invalidation, TTL and Consistency]]) |
 
-**Cache or materialized view?** A cache holds results for *keys that are asked for*, expires them, and lives outside the database. A materialized view holds results for *every key*, can be indexed and joined in SQL, and is refreshed as a whole.
+**Cache or materialized view?** A cache (a fast key-value store in memory, such as Redis) holds results for *keys that are asked for*, expires them, and lives outside the database; **TTL** (time to live) is how long a cached entry is kept before it expires. A materialized view holds results for *every key*, can be indexed and joined in SQL, and is refreshed as a whole.
 
 Use a cache when a small fraction of keys is hot and recomputing one key is cheap. Use a materialized view when computing any single key requires scanning a lot of data, or when other queries want to join and filter the precomputed rows.
 
@@ -420,13 +476,15 @@ Use a cache when a small fraction of keys is hot and recomputing one key is chea
 
 - **Staleness.** A refreshed view is wrong between refreshes. Never use one for a balance that drives a decision (allowing a refund, blocking an overdraft).
 - **Refresh cost grows with total data, not with change.** A full refresh of 20 million rows every 4 minutes costs the same whether 10 invoices changed or 10,000. When the view grows, either refresh less often, move to incremental maintenance, or partition the source.
-- **Write amplification and contention.** A same-transaction counter turns every invoice insert in workspace 42 into an `UPDATE` of one row. Concurrent transactions queue on that row lock ([[Locking - Optimistic vs Pessimistic]]).
+- **Write amplification and contention.** A same-transaction counter turns every invoice insert in workspace 42 into an `UPDATE` of one row. Concurrent transactions queue on that row lock (this waiting is called **contention**) ([[Locking - Optimistic vs Pessimistic]]).
 - **Every write path must cooperate.** A bulk import that writes `invoices` with `COPY` and forgets the summary silently creates drift.
-- **More storage and more vacuum.** Concurrent refreshes and hot summary rows create dead tuples.
+- **More storage and more vacuum.** Concurrent refreshes and hot summary rows create dead tuples (old row copies that vacuum must clean up).
 - **When not to use:** if the right index makes the live query fast enough, stop there ([[Indexing Fundamentals]], [[Index Types and Index Design]]). For example, a covering index on `(workspace_id, status) INCLUDE (total_minor, paid_minor)` might turn the 380 ms query into an index-only scan. Precompute only when the remaining cost is the aggregation itself.
 - **When not to use:** heavy analytics across all tenants. A column store ([[Time-Series and Columnar Storage]]) aggregates billions of rows faster than any row-store view refresh.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how to build, refresh and maintain a stored answer, and when not to. **Next is the senior view**: what breaks in real systems (blocked readers, piled-up refreshes, double counting, hot rows), how to rebuild a copy safely, and what interviewers ask about it.
 
 **Real systems.**
 - PostgreSQL materialized views have no automatic refresh; teams pair them with `pg_cron` or an application scheduler.
@@ -513,6 +571,9 @@ That is why incremental view engines restrict which aggregates they support, and
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** A view re-asks the question every time. A materialized view stores the answer and must be refreshed by you. Refresh with `CONCURRENTLY` so readers are not blocked. Decide how old each number may be; anything that must be exact is updated in the same transaction. Count each event only once, and check now and then that the copy still matches the source.
+
+
 - View = saved query; materialized view = saved answer; summary table = answer you maintain row by row.
 - PostgreSQL 17: no automatic refresh. `REFRESH` blocks readers (`ACCESS EXCLUSIVE`); `REFRESH ... CONCURRENTLY` does not, needs a unique index on plain columns with no `WHERE`, and is slower.
 - Incremental views are not built into Postgres; `pg_ivm` is an extension.
@@ -521,6 +582,30 @@ That is why incremental view engines restrict which aggregates they support, and
 - Hot summary rows: split into slots and sum on read.
 - Have a rebuild procedure: build new copy, replay, compare, switch.
 - Try indexes first; reach for a column store for heavy analytics.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is the difference between a view and a materialized view?
+> A view re-runs its query on every read; a materialized view stores the result and serves it until the next refresh.
+
+> [!question]- Does PostgreSQL refresh a materialized view on its own?
+> No. You must run `REFRESH MATERIALIZED VIEW`, usually from a scheduled job such as `pg_cron`.
+
+> [!question]- What does "stale" mean here?
+> The stored answer no longer matches the source tables because something changed after the last refresh.
+
+🟡 Medium
+
+> [!question]- Why does `REFRESH ... CONCURRENTLY` need a unique index?
+> It diffs the old and new results row by row, and the unique index lets it match each old row to its new one and guarantees there are no duplicates.
+
+> [!question]- The invoice page must show the exact `paid_minor` right after a payment. Which method do you use?
+> Update `paid_minor` in the same transaction as the payment insert, so both commit together.
+
+> [!question]- An async rollup shows ₹3,500 for an invoice of ₹3,000 after a consumer restart. What went wrong?
+> An event was redelivered and applied twice; store processed event IDs in the same transaction as the change and skip repeats.
 
 ## Links
 

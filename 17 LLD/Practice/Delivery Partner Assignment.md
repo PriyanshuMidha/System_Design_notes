@@ -36,6 +36,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code) and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs) and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Concurrency for LLD]]: goroutines run at the same time; a mutex makes "is the rider free? take him" one step, and slow calls must happen outside it.
+> - [[State Machines in Go]]: a rider, an offer and an order each sit in one named state, and only allowed moves happen.
+> - [[Adapter]]: a thin wrapper that hides an outside company's API (the 3PL) behind our own small interface.
+
 **From zero, in 60 seconds** 🟢
 
 A shop has packed your order and needs a rider to carry it. The system looks for free riders near the shop. It picks the best one and marks them busy at once, so no other order can grab the same rider. Then it sends them an **offer** that they must accept within about 20 seconds. If they say no or stay silent, the system frees them and tries the next rider. The "mark busy only if still free" step is called a **compare-and-set**. If no rider is found in time, it can book an outside courier instead.
@@ -71,6 +76,11 @@ The tricky part: two orders must never grab the same rider at the same moment.
 | Mutex / lock | Only one goroutine at a time may touch the protected data | `sync.Mutex` |
 | Injected clock | Code asks an interface for the time, so tests can fake it | Tests jump 20 s instantly |
 | Retry queue | A list of orders to try again later | Every 30-60 s |
+| Atomic claim | Check "rider free?" and mark him busy in one step | Two orders, one rider: only one wins |
+| Haversine distance | Straight-line distance on the Earth's curved surface | Store to rider = 650 m |
+| Stale location | A GPS point too old to trust | Last ping 60 s ago: skip this rider |
+| Circuit breaker | A guard that stops calling a failing service for a while | 3PL failing: stop calling it for 30 s |
+| Greedy dispatch | Give each order the nearest free rider right away, one order at a time | Order 1 takes rider A at 300 m |
 
 **Picture it**
 
@@ -90,9 +100,9 @@ Where it breaks: the radio dispatcher is one person, so two calls never collide;
 **How the rest of this note builds up**
 
 - First, the problem statement and Steps 1-4: requirements, actors, entities (offer versus assignment) and the state machines.
-- Then Steps 5-7: the APIs, storage (Postgres conditional updates, Redis GEO for live positions) and patterns.
+- Then Steps 5-7: the APIs, storage (Postgres conditional updates, Redis GEO, Redis's built-in store for map points, for live positions) and patterns.
 - Then Step 8 and the test cases: the Go code for claim, offer, reject, expiry and fallback, with no lock held during network calls.
-- Finally the SDE-3 depth: edge cases, cancel races, batched assignment with the Hungarian algorithm and the live location pipeline.
+- Finally the SDE-3 depth: edge cases, cancel races, batched assignment with the Hungarian algorithm (a classic method that pairs many orders with many riders at the lowest total cost) and the live location pipeline.
 
 > [!tip] Remember
 > Claim the rider atomically, offer with a deadline, and never hold a lock across a network call.
@@ -125,7 +135,7 @@ What it really tests: a **race on a shared resource** (two orders must never get
 Questions to ask, with the assumptions this design makes:
 
 - 1 km from the store or from the customer? *From the store: the rider must reach the store first.*
-- Straight-line or road distance? *Straight-line (Haversine) in v1; ETA ranking is a later strategy.*
+- Straight-line or road distance? *Straight-line (Haversine) in v1; ETA (estimated time of arrival by road) ranking is a later strategy.*
 - Assign directly or **offer** and wait? *Offer with a 20 s deadline, one rider at a time. Direct assign is also coded.*
 - One active order per rider? *Yes in v1; batching is an extension.*
 - Location rate and fleet size? *Every 3–5 s, about 10k riders in a big city (an estimate for sizing).*
@@ -145,13 +155,13 @@ Questions to ask, with the assumptions this design makes:
 **Non-functional:**
 
 - Never two orders on one rider
-- Assignment under 1–2 s excluding think time
-- Location writes are the hot path (estimate: 10k riders × 1 ping per 4 s = 2.5k writes/s per city)
+- Assignment under 1–2 s excluding think time (the seconds the rider takes to decide)
+- Location writes are the hot path (the code that runs most often) (estimate: 10k riders × 1 ping per 4 s = 2.5k writes/s per city)
 - Skip riders whose last ping is older than 30 s
 - 3PL calls have a timeout, an idempotency key and a circuit breaker
 - Timeouts testable with an injected clock
 
-**Out of scope:** route optimisation, payouts, ratings, serviceability (checked at checkout), maps internals.
+**Out of scope:** route optimisation, payouts, ratings, serviceability ("do we deliver to this address at all?", checked at checkout), maps internals.
 
 ## Step 2: Actors and use cases 🟢
 
@@ -171,7 +181,7 @@ The use case to code: **Start → offer → Accept / Reject / expire**, ending i
 | Entity | Key fields | Why it exists |
 | --- | --- | --- |
 | `Partner` | ID, Status, Loc, LocatedAt, ActiveOrder | The rider and their live state |
-| `Location` | Lat, Lng | Value object for store, customer and rider |
+| `Location` | Lat, Lng | Value object (a small value with no identity of its own, compared by its fields) for store, customer and rider |
 | `Order` | ID, Pickup, Drop | What to deliver, from where to where |
 | `Candidate` | PartnerID, DistanceM | A search result before ranking |
 | `Offer` | ID, OrderID, PartnerID, Status, ExpiresAt | One "will you take this order?" with a deadline |
@@ -186,6 +196,8 @@ Two modelling insights.
 **The order has a phase**: only the goroutine that moved an order to `searching` may advance it, so a reject and the expiry sweeper can never run two searches for one order.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know riders, offers, the 1 km search and the fallback chain. Next we open the box: the state machines, the API, the tables and Redis GEO, and the Go code for claim, offer and fallback.
 
 ```mermaid
 classDiagram
@@ -238,7 +250,7 @@ classDiagram
 
 - **Aggregation:** `Fleet` tracks `Partner`s that exist on their own; `OfferService` keeps `Offer`s and one `dispatchState` per order.
 - **Dependency on interfaces:** `Assigner` depends on `RankingStrategy` and `ThirdPartyProvider`, so the ranking rule and the vendor can change without touching the claim loop.
-- **Realization:** `NearestFirst` implements `RankingStrategy`; `PorterAdapter` implements `ThirdPartyProvider` by calling the vendor SDK.
+- **Realization:** `NearestFirst` implements `RankingStrategy`; `PorterAdapter` implements `ThirdPartyProvider` by calling the vendor SDK (the vendor's own client library).
 
 Partner and offer lifecycles. The offer deadline is the timeout; the expiry sweeper and a late accept both end in `Expired`:
 
@@ -375,7 +387,7 @@ CREATE TABLE third_party_requests (
 );
 ```
 
-The claim and the accept are both conditional updates. The command tag `UPDATE 0` means someone else won, and the code moves on:
+The claim and the accept are both conditional updates. The command tag (the row count Postgres reports) `UPDATE 0` means someone else won, and the code moves on:
 
 ```sql
 -- claim: two orders can never both hold one rider
@@ -396,7 +408,7 @@ GEOSEARCH riders:available:blr FROMLONLAT 77.5946 12.9716 BYRADIUS 1 km ASC COUN
 
 A Redis sorted set holds no per-member TTL, so staleness needs its own record: a `rider:last_seen` sorted set scored by timestamp, trimmed by a sweeper that reads members older than 30 s with `ZRANGE ... BYSCORE` and `ZREM`s them from both sets.
 
-Alternatives are PostGIS `ST_DWithin` on a GiST index, or geohash or H3 cells where the search reads the store's cell plus its neighbours (see [[Geospatial Indexing]]).
+Alternatives are PostGIS (Postgres's map extension) `ST_DWithin` on a GiST index (an index type for shapes and ranges), or geohash or H3 cells (standard ways to cut the map into cells) where the search reads the store's cell plus its neighbours (see [[Geospatial Indexing]]).
 
 In the code below, `Fleet` plays both the partner repository and the location index in memory, and `OfferService` keeps offers in maps, the way [[Repository and Unit of Work]] swaps storage in tests.
 
@@ -437,7 +449,7 @@ cmd/demo/main.go    -> wiring: Fleet (30 s stale), radii 1/2/3 km, PorterAdapter
 ```
 
 - `fleet.go` is the only place that changes partner status, always under its lock (production: the conditional `UPDATE`).
-- `assigner.go` knows the order of the fallback chain; `offer.go` adds the human-in-the-loop part.
+- `assigner.go` knows the order of the fallback chain; `offer.go` adds the human-in-the-loop part (waiting for a person, the rider, to say yes or no).
 - `thirdparty.go` is the only file that knows the vendor's API shape.
 
 ## Step 7: Patterns 🟡
@@ -1069,7 +1081,7 @@ sequenceDiagram
 | `TestNoLockHeldDuring3PLCall` | an `Accept` completes while another order is stuck inside a slow 3PL call (lock scope) |
 | `TestCancelDuring3PLCallUndoesBooking` | a cancel that lands during the 3PL call ends in `ErrOrderCancelled` and a `CancelTrip` |
 
-All pass with `go vet` and `go test -race` on Go 1.24.4 (measured: 88.8% statement coverage).
+All pass with `go vet` and `go test -race` (Go's race detector, which flags unsafe shared access) on Go 1.24.4 (measured: 88.8% statement coverage).
 
 **In plain words:** Fake riders and a fake outside courier so the tests can force declines, timeouts and two orders racing for one rider.
 
@@ -1392,6 +1404,8 @@ func TestCancelDuring3PLCallUndoesBooking(t *testing.T) {
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working dispatcher and its tests. Next is interview depth: races on one rider, reject versus expiry, slow 3PLs, late accepts, stale GPS, and batched matching.
+
 | Edge case | Risk | Handling |
 | --- | --- | --- |
 | Two orders pick the same nearest rider | Both see "available" | Atomic `TryClaim` (conditional `UPDATE`); the loser tries the next candidate |
@@ -1403,9 +1417,9 @@ func TestCancelDuring3PLCallUndoesBooking(t *testing.T) {
 | Rider app answers twice (double tap) | The second answer changes state | Only `pending` offers take answers; the second gets `ErrOfferClosed` (409) |
 | Rider rejects, then gets the same order again | Wasted time | `tried` set; `UNIQUE (delivery_id, partner_id)` |
 | Stale GPS | Offline riders keep getting offers | Pings older than 30 s are excluded from search |
-| Rider goes offline mid-delivery | Order stuck | Heartbeat timeout → back to `searching`, ops alert |
+| Rider goes offline mid-delivery | Order stuck | Heartbeat timeout (no "I am alive" ping for too long) → back to `searching`, ops alert |
 | 3PL booked twice on retry | Double cost | The order ID is the idempotency key |
-| 3PL webhook spoofed or out of order | Wrong status shown | Verify the signature; apply only forward transitions |
+| 3PL webhook spoofed (faked by someone else) or out of order | Wrong status shown | Verify the signature; apply only forward transitions |
 | Nobody anywhere | Order waits forever | Parked with `next_retry_at`, ops dashboard, surge incentive |
 | Customer far from the store | A very long trip | Serviceability is validated at checkout, not at dispatch |
 
@@ -1416,8 +1430,8 @@ func TestCancelDuring3PLCallUndoesBooking(t *testing.T) {
 | Broadcast to 3 riders, first accept wins | Hold nobody; `Accept` does the atomic claim; losers see "taken" |
 | ETA instead of straight distance | A `RankingStrategy` that calls the maps service, ETAs cached per cell |
 | Batching (one rider, two orders) | Capacity per rider; claim is `active_orders < capacity`; route-aware ranking |
-| Many dispatcher instances | Offers in the DB; the sweeper uses `SELECT ... FOR UPDATE SKIP LOCKED` or a delay queue per offer |
-| 100k riders | Shard Redis GEO by city or zone; the location service is stateless; Kafka keyed by rider ID |
+| Many dispatcher instances | Offers in the DB; the sweeper uses `SELECT ... FOR UPDATE SKIP LOCKED` or a delay queue (a queue that hands out each item only after its due time) per offer |
+| 100k riders | Shard Redis GEO by city or zone; the location service is stateless (keeps no data of its own, so any copy can serve any request); Kafka keyed by rider ID |
 | Several 3PL vendors | A list of adapters tried in cost order, with health-based routing |
 | Fairness between riders | Ranking adds idle time and earnings so far today |
 | Search latency | Precomputed geohash or H3 cells; query only the store's cell and its neighbours |
@@ -1451,7 +1465,7 @@ flowchart LR
   Sweep[Stale sweeper, 30 s] -->|ZREM from both sets| Geo
 ```
 
-- The rider app sends pings over an HTTP batch, a WebSocket or MQTT. Drop a ping older than the last one stored, because mobile networks deliver out of order.
+- The rider app sends pings over an HTTP batch, a WebSocket (a connection that stays open both ways) or MQTT (a light messaging protocol for phones and devices). Drop a ping older than the last one stored, because mobile networks deliver out of order.
 - Redis holds only the **latest** point, for fast geo queries; Kafka fans the stream out to history and to the live tracker.
 - The customer gets a push every few seconds, and the app smooths movement between points.
 - No ping for 30 s: the rider is stale, excluded from search, and ops is alerted if they are mid-delivery.
@@ -1520,6 +1534,26 @@ Redraw it from memory, then add the one thing it predates: the decide, call, re-
 - One phase per order; only the goroutine that set `searching` advances it.
 - Redis GEO for the latest point, a last-seen set for staleness, Kafka for history.
 - Extensions: broadcast offers, ETA ranking, batching, Hungarian matching per round.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What is the fallback order when no rider is found?
+> 1 km, then 2 km, then 3 km, then a 3PL courier, then a retry queue with an ops alert.
+
+> [!question]- 🟢 Why is an offer separate from an assignment?
+> An order can get many offers (rejected, expired, accepted) but only one assignment; offers keep the "who said no" history.
+
+> [!question]- 🟢 A rider's last GPS ping was 60 s ago. Does he get offers?
+> No. Pings older than 30 s are skipped until he sends a new one.
+
+> [!question]- 🟡 Two orders choose the same nearest rider. How does only one get him?
+> `TryClaim` changes `available → busy` only if he is still available; the loser gets 0 rows and tries his next candidate.
+
+> [!question]- 🟡 Why not call the 3PL while holding the service mutex?
+> A 3-second vendor call would freeze every accept and reject in the city; decide under the lock, call outside it, then re-check.
+
+> [!question]- 🟡 A rider accepts 1 second after the deadline. What happens?
+> The offer is expired, the rider is freed, the order moves to the next rider, and the late accept gets `ErrOfferExpired` (410).
 
 ## Links 🟢
 

@@ -25,6 +25,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add the full "Code" walkthrough, "Design decisions" and "Tests".
 > - 🔴 **Interview / SDE-3 prep?** Add "Pitfalls in the code" and do the "Exercises". Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Hash Tables and Go Maps]]: a hash turns a string into a number, and a Go map looks a value up by its key.
+> - [[Partitioning and Sharding]]: data is split across several servers, and every request needs a rule for which server to ask.
+> - The theory twin [[Consistent Hashing]] explains the ring, virtual nodes and the `% N` trap in plain words; read its sections 1-3 first.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on twin of [[Consistent Hashing]]. It builds a working hash ring in about 80 lines of Go: you can add servers, remove servers, and ask "which server owns this key?". Read the theory note first if the ring idea is new. Here, start with the tiny whiteboard version, then read the full version step by step; each code block is followed by a plain "How it works" list. The tests at the end are the proof: they show that adding a server moves only about one fifth of the keys, while the naive `%` rule moves 80%.
@@ -35,8 +40,8 @@ This file is the hands-on twin of [[Consistent Hashing]]. It builds a working ha
 - **Maps** (`map[uint64]string`): from a point on the ring back to the physical node that owns it.
 - **`sync.RWMutex`**: many readers (lookups) can run together; writers (`Add`, `Remove`) get exclusive access.
 - **`crypto/sha256`**: a well-mixing hash so similar names like `a#1` and `a#2` land far apart.
-- **Multiple return values** (`(string, bool)`): `Get` reports "no node" with `false` instead of panicking.
-- **What to run:** `go vet ./... && go test -race -v ./...` inside the module (includes the `wb/` sub-package).
+- **Multiple return values** (`(string, bool)`): `Get` reports "no node" with `false` instead of panicking (crashing the program with a runtime error).
+- **What to run:** `go vet ./... && go test -race -v ./...` inside the module (`-race` turns on Go's race detector, which flags unsafe use of shared data from several goroutines) (includes the `wb/` sub-package).
 
 ## What this code shows 🟢
 
@@ -80,6 +85,8 @@ The code is small because the idea is small: two data structures (a sorted slice
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** what the ring promises: a new server takes only about one fifth of the keys. **Next we open the code**: first a 20-line whiteboard ring, then the full version with virtual nodes, removal, replica lookup and locking, each followed by a line-by-line walk.
+
 ### Whiteboard version
 
 **In plain words: the smallest ring that works — one sorted list, one map, one binary search.**
@@ -90,7 +97,7 @@ A server is placed by hashing its name; a key is placed by hashing the key; the 
 
 The alternative, `hash(key) % N`, is simpler but remaps about 80% of keys when N goes from 4 to 5. The ring costs a sort on every change and a binary search per lookup, which is cheap.
 
-The whiteboard version assumes at least one server was added, and `NewRing` initialises the map so `Add` does not write to a nil map.
+The whiteboard version assumes at least one server was added, and `NewRing` initialises the map so `Add` does not write to a nil map (a map variable that was declared but never created; writing to it panics).
 
 ```go
 package wb
@@ -339,7 +346,7 @@ flowchart LR
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
-| Sorted `[]uint64` plus binary search | A balanced tree or skip list | Lookups are fast and the code is tiny. Each `Add` re-sorts, which costs `O(P log P)`. |
+| Sorted `[]uint64` plus binary search | A balanced tree or skip list (a sorted linked list with "express lanes" for faster search) | Lookups are fast and the code is tiny. Each `Add` re-sorts, which costs `O(P log P)`. |
 | 200 vnodes per node in tests | 1 vnode, or thousands | More vnodes smooth the load (about `1/√V` variation) but cost memory and slower changes. |
 | SHA-256, first 8 bytes | CRC32, FNV, xxHash, Murmur3 | Excellent mixing and stable output. It is slower than non-cryptographic hashes. |
 | Skip vnode collisions | Re-hash with a salt | Simple. A node ends up with one vnode fewer in the rare case it happens. |
@@ -589,8 +596,10 @@ The measured table in [[Consistent Hashing#4. Worked example 🟡]] compares sev
 
 ## Pitfalls in the code 🔴
 
+> 🟡 → 🔴 **You now know** how every function works and what each test proves. **Next come the sharp edges**: costs that grow with ring size, stale replica lists, silent collisions and the whiteboard version's crash on an empty ring.
+
 - **Sort on every `Add`.** `Add` re-sorts all points, which is `O(P log P)` while holding the write lock. Fine for a few hundred vnodes; for large rings, merge the new sorted points instead.
-- **`Remove` leaves no tombstones.** After removal, any cached `GetN` result may still name the node. Callers must refresh.
+- **`Remove` leaves no tombstones** (markers that say "this node used to be here"). After removal, any cached `GetN` result may still name the node. Callers must refresh.
 - **Collisions are skipped silently.** A vnode whose position is already taken is dropped, so that node gets one vnode fewer. With 64-bit positions this is astronomically rare, but a 32-bit hash would hit it.
 - **`GetN` can return fewer than `n` nodes** when the ring has fewer distinct physical nodes. Check `len(out)`.
 - **The whiteboard `Get` panics on an empty ring**, because `r.points[0]` does not exist. The full `Get` returns `false` instead.
@@ -601,6 +610,30 @@ The measured table in [[Consistent Hashing#4. Worked example 🟡]] compares sev
 1. Change `New(200)` to `New(1)` in `TestAddingNodeOnlyMovesKeysToIt`. Predict whether the `moved` bound still passes and how the busiest node's share changes. Then run it.
 2. Replace `position` with `crc32.ChecksumIEEE` widened to `uint64`. Predict what happens to the balance with 200 vnodes, then measure it with the logging test.
 3. Write a test that removes node `b` and counts how many different nodes received its keys. Predict the answer for 200 vnodes (hint: nearly every survivor).
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What two data structures make up the ring?
+> A sorted slice of positions and a map from each position to the server that owns it.
+
+> [!question]- What does `Get` do when the key's hash is past the last point?
+> It wraps around to index 0, the first point on the circle.
+
+> [!question]- Why is the lock a `sync.RWMutex`?
+> Lookups are frequent and can run together; `Add` and `Remove` are rare and need the ring to themselves.
+
+🟡 Medium
+
+> [!question]- Why does `Remove` need no code to hand keys to other servers?
+> Once its points are deleted, `Get` simply finds the next point clockwise, which belongs to a surviving server.
+
+> [!question]- Why does `GetN` keep a `seen` set?
+> Several nearby points can belong to the same server; skipping them makes every copy land on a different machine.
+
+> [!question]- What does `TestAddingNodeOnlyMovesKeysToIt` check besides the count?
+> That every key that changed owner moved to the new node `e`, never between two old nodes.
 
 ## Links 🟢
 

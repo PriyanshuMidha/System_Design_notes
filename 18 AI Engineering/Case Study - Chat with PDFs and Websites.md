@@ -29,6 +29,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[RAG Pipeline]]: answer a question by fetching the user's best chunks, pasting them into the prompt, and citing sources, with permission filters inside the search.
+> - [[Document Ingestion and Chunking]]: a file is parsed, cleaned, cut into labelled chunks, embedded and stored, ideally as a background job.
+
 **From zero, in 60 seconds** 🟢
 
 This note designs one real product: users upload a PDF, or paste a website link, and then ask questions about it.
@@ -75,6 +79,11 @@ This case study builds the chat app while handling slow work and untrusted input
 | SSRF | Tricking your server into fetching an internal URL | `http://169.254.169.254/` |
 | Tenant | One customer whose data must stay separate | User 42 sees only their PDFs |
 | SSE | Server sends the reply in pieces as it is made | Answer appears word by word |
+| Presigned URL | A short-lived link that lets the browser upload one file straight to storage | Valid 5 minutes, one file only |
+| Object storage | Cloud storage for whole files | Amazon S3 |
+| Private IP range | Addresses used only inside a company network | `10.x.x.x`, `192.168.x.x`, `127.0.0.1` |
+| DNS rebinding | A domain that points to a safe address when checked, then to an internal one when fetched | Safe at submit, `10.0.0.5` at fetch |
+| OCR | Reading text out of a picture of a page | A scanned bill becomes text |
 
 **Picture it**
 
@@ -108,11 +117,26 @@ A generic internal-knowledge RAG system (see [[RAG Pipeline]]) ingests a corpus 
 That shape creates two problems a curated internal corpus doesn't:
 
 - **Ingestion is slow and must not block the request.** Parsing a 200-page PDF (text extraction, OCR fallback for scanned pages, chunking, embedding every chunk) can take tens of seconds to minutes. A user hitting "upload" and staring at a spinner for two minutes, on a request that can also time out at a load balancer or API gateway, is a bad product and a fragile backend.
-- **The inputs are untrusted, by definition.** An internal corpus was written and reviewed by your own team. A user-uploaded "PDF" could be a renamed executable; a user-submitted "website URL" could point at `http://169.254.169.254/` (a cloud metadata endpoint) or `http://localhost:6379/` (your own Redis instance) instead of a real public website — and if your ingestion worker blindly fetches whatever URL it's given, it becomes an attacker's proxy into your own network.
+- **The inputs are untrusted, by definition.** An internal corpus was written and reviewed by your own team. A user-uploaded "PDF" could be a renamed executable; a user-submitted "website URL" could point at `http://169.254.169.254/` (a cloud metadata endpoint: a special internal address that hands out the server's own cloud credentials) or `http://localhost:6379/` (your own Redis instance) instead of a real public website — and if your ingestion worker blindly fetches whatever URL it's given, it becomes an attacker's proxy (a go-between that makes requests on their behalf) into your own network.
 
 Concretely: a user uploads a 40 MB file named `report.pdf` that is actually a shell script, and a second user submits the URL `http://169.254.169.254/latest/meta-data/iam/security-credentials/` hoping the ingestion worker's response leaks cloud credentials back to them.
 
 Both of these are the backend problems this case study exists to solve — the RAG pipeline that answers questions about the *legitimate* uploads is otherwise the same system already covered in [[RAG Pipeline]].
+
+### Real-life example 🟢
+
+Think of a "chat with your documents" feature in a tool like Notion AI, Adobe Acrobat's AI assistant or ChatPDF. A student uploads a 300-page textbook PDF and asks "explain chapter 7 in simple words".
+The upload returns at once with "processing"; a background worker reads the PDF, runs OCR on scanned pages, cuts it into chunks and stores them tagged with the student's ID.
+A minute later the status is "ready", and answers stream in with "page 214" links.
+Another user pastes a link that secretly points at the company's internal server; the URL check sees a private address and refuses to fetch it.
+
+### Common beginner mistakes 🟢
+
+- **Trusting the file name or `Content-Type`** → `report.pdf` may be a script → check the first bytes for `%PDF-` and cap the size.
+- **Parsing the upload inside the HTTP request** → a 200-page PDF takes minutes and the request times out → return a job ID with `202` and do the work in a background worker.
+- **Fetching any URL a user sends** → it can point at `169.254.169.254` or your Redis and leak secrets → allow only http/https, block private addresses, and check again at fetch time.
+- **Filtering other users' chunks after the search** → the model has already seen them → pass the user ID as a filter inside the vector search.
+- **Crawling a whole site with no limits** → one link turns into hours of crawling and a big bill → cap pages, depth and time per job.
 
 ## 2. Mental model 🟢
 
@@ -122,11 +146,31 @@ Anyone can drop off a package (upload a PDF) or hand over an address to go fetch
 
 The chat step, once a document is verified and indexed, is ordinary RAG: embed the question, retrieve the user's own chunks, generate a cited answer.
 
+### This product vs a normal internal RAG bot 🟡
+
+| Question | Internal knowledge bot | Chat with PDFs and websites |
+| --- | --- | --- |
+| Who adds documents? | Your own team, ahead of time | Any user, at any moment |
+| Can inputs be trusted? | Mostly yes | No: files and links come from strangers |
+| How fast must new docs be ready? | Hours is fine | Seconds to minutes, in the background |
+| Who may see a document? | Often the whole company | Only the user (or tenant) who uploaded it |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that this is a normal RAG bot with two hard extras: slow ingestion and untrusted files and links. **Next we open the box**: the background job flow, the API routes, file checks, safe URL fetching, crawling limits, OCR fallback, keeping users apart, and streamed answers. Each subsection starts with a plain step-by-step walk.
 
 ### Whiteboard version
 
 **In plain words:** Upload gets a ticket number right away. The real work happens in the background, and the user checks back until it's ready.
+
+**Step by step:**
+1. The user sends `POST /documents` with a file or a URL.
+2. The API runs quick safety checks, puts a job on the queue and replies `202 Accepted` (meaning "got it, working on it") with `job_id = j-123`.
+3. A worker picks up `j-123`: parse, chunk, embed, store.
+4. The worker marks the job `ready` (or `failed`).
+5. The app polls `GET /documents/{id}/status` until it says `ready`, then the user can chat.
+
+Full detail:
 
 The request/response shape: upload returns a job ID immediately; a worker processes in the background; status is polled (or streamed) until the document is ready to chat with.
 
@@ -152,19 +196,36 @@ sequenceDiagram
 
 **In plain words:** A handful of endpoints: upload a file, submit a link, check status, and chat.
 
+**Step by step:**
+1. Upload a PDF with `POST /documents/upload`, or a link with `POST /documents/url`. Both return `{id, status: "queued"}`.
+2. Check progress with `GET /documents/{id}/status`: queued → processing → ready (or failed).
+3. Ask questions with `POST /chat`; only your own documents are searched.
+4. Remove everything with `DELETE /documents/{id}`.
+
+Full detail:
+
 One route list, covering both upload paths and chat:
 
 | Route | Purpose |
 | --- | --- |
-| `POST /documents/upload` | Upload a PDF (multipart body); returns `{id, status: "queued"}` |
+| `POST /documents/upload` | Upload a PDF (multipart body, the standard HTML form format for sending files); returns `{id, status: "queued"}` |
 | `POST /documents/url` | Submit a website URL to crawl and ingest; same response shape |
 | `GET /documents/{id}/status` | Poll ingestion status: `queued`, `processing`, `ready`, `failed` |
 | `POST /chat` | Ask a question, scoped to the caller's documents (or one `document_id`) |
-| `DELETE /documents/{id}` | Delete a document and its chunks (also the GDPR-deletion path) |
+| `DELETE /documents/{id}` | Delete a document and its chunks (also the GDPR-deletion path; GDPR is the EU privacy law that gives users the right to have their data erased) |
 
 ### Upload validation
 
 **In plain words:** Don't trust the file name or the label the browser sends. Look at the first bytes of the file to see what it really is.
+
+**Step by step:**
+1. A file named `report.pdf` arrives, labelled `application/pdf`. Ignore both; the sender chose them.
+2. Check the size: over the limit, say 50 MB? Reply `413` (too large).
+3. Read the first bytes. Not `%PDF-`? Reply `422` (not a PDF).
+4. For big files, the browser uploads straight to object storage with a presigned URL, so the API never holds the whole file.
+5. Only then create the queued ingestion job.
+
+Full detail:
 
 The upload handler never trusts the client-supplied filename or `Content-Type` header — both are attacker-controlled strings, not evidence of what the bytes actually are. It instead checks the file's **magic bytes** (a real PDF starts with the literal bytes `%PDF-`) and enforces a size cap before anything is handed to a worker:
 
@@ -190,10 +251,19 @@ The API server never buffers the whole file in memory.
 
 **In plain words:** Fetching a user's link means your server visits it. Make sure the link can't point back at your own private network.
 
+**Step by step:**
+1. A user submits `http://docs.example.com/guide`.
+2. Scheme check: only `http` or `https`. `file://` or `ftp://` → reject.
+3. Look up the name's IP address. `127.0.0.1` (this machine), `10.x.x.x` (private), or `169.254.169.254` (cloud metadata) → reject.
+4. When the worker fetches later, look up and check the IP again, and connect to that same checked IP. The domain could have switched to an internal address in between.
+5. Only a public address gets fetched.
+
+Full detail:
+
 Submitting a URL instead of a file is structurally a request asking *your own infrastructure* to fetch an address the user chose — this is a textbook **Server-Side Request Forgery (SSRF)** setup, not merely an input-validation nuisance. Three defenses, applied together:
 
 1. **Scheme allowlist.** Accept only `http` and `https`; reject `file://`, `ftp://`, `gopher://`, and anything else outright.
-2. **Resolve and block private ranges.** Resolve the hostname's DNS and reject it if any resolved address is loopback, private (RFC 1918), link-local, or the cloud metadata address `169.254.169.254` — before ever opening a connection to it.
+2. **Resolve and block private ranges.** Resolve the hostname's DNS and reject it if any resolved address is loopback (the machine itself, `127.0.0.1`), private (RFC 1918: the `10.x`, `172.16-31.x` and `192.168.x` ranges), link-local (`169.254.x.x`, only reachable on the local network segment), or the cloud metadata address `169.254.169.254` — before ever opening a connection to it.
 3. **Re-check at fetch time, not only at submit time.** A hostname can legitimately resolve to a public IP when the user submits the URL and to an internal one by the time the worker actually fetches it (DNS rebinding) — most HTTP clients re-resolve DNS themselves on `Dial`, so the validation needs to run again (or be enforced via a custom dialer) at the moment of the real fetch, not only once up front.
 
 ```mermaid
@@ -217,6 +287,15 @@ flowchart LR
 
 **In plain words:** When given a website, follow its links, but with firm limits on how many pages and how deep.
 
+**Step by step:**
+1. Read the site's `robots.txt` (the file where a site says which pages bots may visit) and its sitemap (its list of pages).
+2. Fetch the first page; if it is empty because it needs JavaScript, render it in a headless browser.
+3. Follow links, at most, say, 2 requests per second to that site.
+4. Skip pages whose content hash was already seen.
+5. Stop at the caps: say 200 pages, depth 3, or 10 minutes.
+
+Full detail:
+
 A submitted URL may be a single page or a whole site.
 
 The crawler:
@@ -230,6 +309,15 @@ The crawler:
 ### Parsing and OCR fallback
 
 **In plain words:** Some PDFs are just photos of pages. If no text comes out, read the image with OCR (text recognition).
+
+**Step by step:**
+1. Extract text from page 1: 2,000 characters. Fine, chunk it.
+2. Page 2 gives 5 characters, but the page clearly has content: it is a scan.
+3. Run OCR on page 2's image to get its text.
+4. Handle tables with a layout-aware parser so rows stay readable.
+5. Never store an empty chunk silently; that page would be invisible to every question.
+
+Full detail:
 
 A digital PDF's text layer extracts directly; a **scanned** PDF (an image of a page, no text layer) needs OCR before chunking has anything to work with.
 
@@ -248,6 +336,14 @@ flowchart LR
 
 **In plain words:** Every piece of every document is labelled with its owner, and every search only looks at the asker's label.
 
+**Step by step:**
+1. User 42 uploads a PDF. Every chunk is stored with `owner = 42`.
+2. User 42 asks a question. The vector search runs with filter `owner = 42`.
+3. User 77's chunks are never even considered, so they can never reach the model.
+4. A test checks that user 77's text never appears in user 42's results.
+
+Full detail:
+
 Every chunk stored from a user's document is tagged with that user's (or tenant's) ID at ingestion time.
 
 Every retrieval at chat time filters by that same ID as a query-time parameter on the vector search itself — not as a check applied to results afterward, which would already have let the wrong user's content reach the LLM's context.
@@ -262,6 +358,15 @@ flowchart LR
 ### Chat: streamed answers with citations
 
 **In plain words:** Answers appear word by word, with links to the exact page they came from.
+
+**Step by step:**
+1. Rewrite a follow-up like "what about chapter 8?" into a full question using the chat history.
+2. Search only this user's chunks.
+3. Build the prompt with the best chunks, each labelled with document and page.
+4. Stream the answer over SSE as it is written.
+5. Each claim carries its source, like "[textbook.pdf, p. 214]".
+
+Full detail:
 
 A chat request runs the ordinary RAG query pipeline — condense, retrieve (filtered to the caller's documents), assemble, generate.
 
@@ -774,7 +879,7 @@ ok  	chatpdf	1.48s
 
 | Decision | Options | Use when | Cost |
 | --- | --- | --- | --- |
-| Ingestion queue | asynq / River (Postgres-backed) / SQS | asynq: simple, Redis-backed. River: transactional enqueue alongside your Postgres writes. SQS: already on AWS, managed | River avoids the dual-write problem (job enqueued but DB write failed, or vice versa); asynq and SQS need an outbox pattern for the same guarantee |
+| Ingestion queue | asynq / River (Postgres-backed) / SQS | asynq: simple, Redis-backed. River: transactional enqueue alongside your Postgres writes. SQS: already on AWS, managed | River avoids the dual-write problem (two separate writes where one can succeed and the other fail) (job enqueued but DB write failed, or vice versa); asynq and SQS need an outbox pattern for the same guarantee |
 | Status delivery | Polling `GET .../status` vs SSE push | Polling: simpler, works everywhere. SSE: instant updates, fewer wasted requests for a slow ingestion | SSE needs a long-lived connection per in-progress job |
 | Scanned PDF handling | Skip OCR vs automatic OCR fallback | Skip: faster, fine if users only upload digital PDFs. OCR fallback: handles scanned documents, photos of pages | OCR adds latency and cost per page, and errors compound into chunking |
 | Website ingestion scope | Single page vs full-site crawl | Single page: simpler, predictable cost. Crawl: more complete, needed for multi-page docs/sites | Crawl needs robots.txt/politeness/dedup/page caps to stay bounded |
@@ -785,9 +890,11 @@ ok  	chatpdf	1.48s
 - The ingestion pipeline is real infrastructure (queue, worker pool, object storage, OCR, crawler) — for a tool with a handful of static, pre-approved documents, a simpler synchronous "load these files at startup" approach may not need any of it.
 - Crawling arbitrary user-submitted websites is open-ended scope creep risk: without page caps, depth limits, and a clear policy on what counts as "the site," one submitted URL can balloon into an unbounded, slow, expensive ingestion job.
 - OCR fallback adds real latency and cost on every scanned page; if your users realistically only ever upload born-digital PDFs, skipping it is a reasonable, cheaper default until evidence says otherwise.
-- SSRF defense has an ongoing cost: it must be re-verified any time the ingestion worker's network egress rules, DNS setup, or hosting environment changes, not configured once and forgotten.
+- SSRF defense has an ongoing cost: it must be re-verified any time the ingestion worker's network egress rules (rules for what outbound connections are allowed), DNS setup, or hosting environment changes, not configured once and forgotten.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the background job flow, file and URL checks, crawling limits, OCR fallback, per-user filters and streamed cited answers. **Next comes the senior view**: real products of this shape, how they fail, what to monitor, how to scale ingestion, and the deeper details of magic bytes, DNS rebinding and cost control.
 
 - **Real systems:** consumer "chat with your PDF" products; internal tools letting employees upload a contract, report, or spec and ask questions about it; browser-extension-style "summarize and chat with this webpage" tools, which hit the exact same URL-ingestion SSRF surface.
 - **Failure modes → fixes:**
@@ -839,6 +946,26 @@ ok  	chatpdf	1.48s
 - Detect empty-text extraction on a scanned PDF and fall back to OCR automatically.
 - Chat is ordinary RAG once ingestion is trusted: stream the answer, cite source and page.
 - `DELETE` must actually remove stored chunks and the source file, not just hide the document from the UI.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: Why does upload return a job ID right away?
+> Ingestion can take minutes; doing it inside the request would time out and block the user.
+
+> [!question]- Easy: How do you know a file is really a PDF?
+> Its first bytes are `%PDF-`; the file name and `Content-Type` can be faked.
+
+> [!question]- Easy: What is SSRF?
+> Tricking your server into fetching an internal address, like the cloud metadata service.
+
+> [!question]- Medium: You checked the URL's IP at submit time. Why check again at fetch time?
+> DNS rebinding: the domain can switch to an internal IP between the check and the fetch.
+
+> [!question]- Medium: A page extracts almost no text but clearly has content. What do you do?
+> Treat it as a scan and run OCR before chunking.
+
+> [!question]- Medium: User A sees a line from user B's PDF. Where is the bug?
+> The owner filter ran after the search, or not at all; it must be a filter inside the vector search.
 
 ## Links 🟢
 

@@ -36,6 +36,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example with the sizing math).
 > - 🔴 **Interview / SDE-3 prep?** Add 5, 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Transactions and ACID]]: a transaction groups several statements into one unit, and it must run on one connection from `BEGIN` to `COMMIT`.
+> - [[Processes, Threads and Context Switching]]: a process is a running program with its own memory, and a CPU core wastes time when it keeps switching between too many of them.
+
 **From zero, in 60 seconds** 🟢
 
 Your app needs to talk to the database. Setting up one fresh line to the database is slow — a greeting, a login, a new worker on the other side.
@@ -76,6 +80,11 @@ A pool keeps a few connections open and lends them out, like library books.
 | Timeout | How long a request waits before giving up | Wait at most 2 s for a free connection |
 | Throughput | Requests handled per second | 500 req/s |
 | Little's Law | Busy items = arrival rate x time each one is busy | 500 req/s x 0.02 s = 10 busy connections |
+| Backend process | The worker program PostgreSQL starts on the server for each connection | 100 connections = 100 backend processes |
+| `max_connections` | The most connections PostgreSQL will accept at once | Usually 100; the 101st gets an error |
+| Pod | One running copy of your app (in Kubernetes); each copy has its own pool | 10 pods x pool 5 = up to 50 connections |
+| Context deadline | A Go timer attached to a request; when it runs out, the work stops | `context.WithTimeout(ctx, 2*time.Second)` |
+| PgBouncer | A separate program that sits in front of PostgreSQL and shares a few real connections among many apps | 300 app connections in, 40 real ones out |
 
 **Picture it**
 
@@ -103,10 +112,12 @@ Where it breaks: a taxi that never returns is noticed; a leaked connection silen
 
 ## 1. Why it exists 🟢
 
+🟢 **Plain version:** Opening a new database connection means several back-and-forth messages over the network, a login, and a brand-new worker program on the database server. That takes a few milliseconds, while borrowing an already-open one takes a tiny fraction of that. The database also allows only about 100 connections in total. If many copies of your app each open too many, the database starts refusing them, and even before that it slows down from juggling too many workers. The details below show each cost; you can skim them on a first read.
+
 Opening a PostgreSQL connection is expensive on both sides:
 
-- **Network:** around half a dozen round trips, for the TCP handshake, the TLS handshake, the startup message and SCRAM authentication. Since PostgreSQL 17, `sslnegotiation=direct` saves one of them.
-- **Server:** the postmaster **forks a new backend process** for every connection. Each backend builds its own catalog caches and has private memory, plus `work_mem` for each sort or hash while a query runs.
+- **Network:** around half a dozen round trips (one message out and its reply back), for the TCP handshake (setting up the network line), the TLS handshake (agreeing on encryption), the startup message and SCRAM authentication (PostgreSQL's password check that never sends the password itself). Since PostgreSQL 17, `sslnegotiation=direct` saves one of them.
+- **Server:** the postmaster (PostgreSQL's main process, which listens for new connections) **forks a new backend process** (makes a fresh copy of itself to serve this one connection) for every connection. Each backend builds its own catalog caches (its private memory of table and column definitions) and has private memory, plus `work_mem` (memory allowed for each sort or hash step) for each sort or hash while a query runs.
 
 ```mermaid
 sequenceDiagram
@@ -127,9 +138,9 @@ Borrowing an idle pooled connection costs microseconds; opening one costs millis
 
 The limit matters as much as the cost. `max_connections` is typically 100, and changing it needs a restart.
 
-A classic outage: 10 containers each set their pool to 50. That allows 500 connections against a limit of 100, so new connections fail with `FATAL: sorry, too many clients already` (SQLSTATE 53300).
+A classic outage: 10 containers each set their pool to 50. That allows 500 connections against a limit of 100, so new connections fail with `FATAL: sorry, too many clients already` (SQLSTATE 53300, PostgreSQL's five-character error code for this case).
 
-Even below the limit, hundreds of *active* backends on 8 cores spend their time on context switches and lock contention instead of queries.
+Even below the limit, hundreds of *active* backends on 8 cores spend their time on context switches (the CPU stopping one process to run another) and lock contention (processes waiting for each other's locks) instead of queries.
 
 ```mermaid
 flowchart LR
@@ -151,7 +162,7 @@ A pool is a **taxi rank**: a fixed fleet of cars (connections) and a queue of pa
 
 So a pool does two jobs:
 1. **Reuse:** pay the connection setup cost once.
-2. **Limit:** cap concurrent work on the database. The pool is a bulkhead, see [[Bulkheads and Concurrency Limits]].
+2. **Limit:** cap concurrent work on the database. The pool is a bulkhead (a wall that stops one overloaded part from sinking the rest, named after the walls inside a ship), see [[Bulkheads and Concurrency Limits]].
 
 ```mermaid
 flowchart LR
@@ -160,11 +171,44 @@ flowchart LR
     Q -. "the other 190 wait in the app" .-> P
 ```
 
+### Real-life example: a ticket sale opens 🟢
+
+Think of BookMyShow at 10:00 when tickets for a big concert go on sale.
+Thousands of people tap "book" in the same second, and each tap needs a few quick database reads and writes.
+If every tap opened its own connection, the database would hit its limit of about 100 and start refusing everyone.
+With a pool, each app server keeps maybe 5 connections open, and extra taps wait a few milliseconds for a free one.
+The queue lives in the app servers, so the database keeps working at full speed instead of drowning.
+
+## Common beginner mistakes 🟢
+
+- **Forgetting `rows.Close()`** → the connection is never given back, and the pool shrinks by one each time → write `defer rows.Close()` right after checking the query error.
+- **Setting a big pool on every pod** → 10 pods x 50 = 500 connections against a limit of 100, so the database refuses new ones → divide the database limit by the most pods you will ever run.
+- **Calling an outside API while holding a connection or transaction** → the connection sits idle for the whole call, so other requests wait → finish the database work first, then make the call.
+- **Raising the pool size when the app is slow** → if the database is already busy, more connections only make it slower → first check the database CPU and `pg_stat_activity` (the view of every current connection).
+- **No timeout on waiting** → requests queue forever when the pool is empty → pass a context with a deadline to every query.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** why a pool exists: reuse slow connections and cap the load on the database. **Next we open the box**: exactly when a connection is borrowed and returned, what happens when none is free, how a connection ages out, and the four dials that control it all.
 
 ### Borrowing and returning
 
 **In plain words:** every query call borrows a connection, and giving it back happens when you finish reading or close things — the table below says exactly when.
+
+**Step by step:**
+1. Your handler calls `db.QueryContext(ctx, "SELECT * FROM invoices WHERE workspace_id = 42")`.
+2. The pool lends it connection #3. Connection #3 is now "in use".
+3. You loop over the rows with `rows.Next()`. Connection #3 stays busy the whole time.
+4. When the loop ends or you call `rows.Close()`, connection #3 goes back to the pool.
+5. The next request can now borrow connection #3 without opening a new one.
+
+```mermaid
+flowchart LR
+    Q["QueryContext"] --> B["borrow conn #3"]
+    B --> R["read rows"]
+    R --> C["rows.Close()"]
+    C --> P["conn #3 back in pool"]
+```
 
 Every `QueryContext`, `ExecContext` or `BeginTx` borrows a connection and gives it back when the work ends:
 
@@ -179,6 +223,13 @@ Every `QueryContext`, `ExecContext` or `BeginTx` borrows a connection and gives 
 ### Waiting for a connection
 
 **In plain words:** ask the pool for a line; if one is free you get it, if not you either open a new one (under the cap) or stand in a queue with a timer.
+
+**Step by step:**
+1. The pool has a cap of 4. A request arrives with a 50 ms deadline.
+2. If a connection is sitting idle, the request gets it at once.
+3. If none is idle but only 3 are open, the pool opens a 4th one (a few milliseconds).
+4. If all 4 are busy, the request waits in line, and the pool adds 1 to `WaitCount`.
+5. If a connection comes back within 50 ms, the waiting request gets it. Otherwise it gives up with `context.DeadlineExceeded`.
 
 When a request asks for a connection and none is idle, the pool either opens one (below the cap) or parks the request until a connection comes back:
 
@@ -210,6 +261,13 @@ sequenceDiagram
 
 **In plain words:** a connection is born, gets lent out, rests, and is retired when it is too old, too idle, or broken.
 
+**Step by step:**
+1. A request arrives and the pool is under its cap, so a new connection is opened.
+2. It is lent out ("in use") while the query runs.
+3. When the query finishes, it goes back and rests ("idle").
+4. If it rests longer than `ConnMaxIdleTime`, say 5 minutes, the pool closes it.
+5. If it is older than `ConnMaxLifetime`, say 30 minutes, the pool closes it before the next use, even if it is healthy.
+
 A pooled connection's life, with the `database/sql` knobs that end it:
 
 ```mermaid
@@ -228,6 +286,13 @@ stateDiagram-v2
 ### The knobs
 
 **In plain words:** four dials control the pool — how many lines at most, how many to keep warm, how old a line may get, and how long one may sit unused.
+
+**Step by step:**
+1. `SetMaxOpenConns(5)`: never more than 5 connections from this pod.
+2. `SetMaxIdleConns(5)`: keep all 5 open between bursts, so you do not keep reopening them.
+3. `SetConnMaxLifetime(30 * time.Minute)`: replace each connection after 30 minutes, so a moved database is found again.
+4. `SetConnMaxIdleTime(5 * time.Minute)`: close connections nobody has used for 5 minutes.
+5. Go's defaults are "unlimited, keep 2, forever, forever", so set all four yourself.
 
 The settings (Go 1.24 `database/sql` and pgx v5.8 `pgxpool`):
 
@@ -302,14 +367,14 @@ flowchart TD
 - Peak load: 1,200 requests/s across the fleet (an estimate for this example).
 - Each request holds a connection for about 5 ms in total: 3 queries plus the gaps between them inside its transaction (an estimate; measure yours with `AcquireDuration` and query timings).
 - So `L = 1,200 × 0.005 = 6` connections busy on average across the **whole fleet**.
-- Bursts and p99 need headroom. With 3× headroom you need about 18 for the fleet, or 3 per pod at 6 pods. Round up to `MaxOpenConns = 5`, which leaves extra slack for one slow pod or a dependency stall.
+- Bursts and p99 (the slowest 1 in 100 requests) need headroom. With 3× headroom you need about 18 for the fleet, or 3 per pod at 6 pods. Round up to `MaxOpenConns = 5`, which leaves extra slack for one slow pod or a dependency stall.
 
 Now check both limits:
 
 | Check | Numbers | Result |
 | --- | --- | --- |
 | Connection budget | `max_connections` 100 − 3 superuser-reserved − 7 for migrations, `psql` and the metrics exporter = 90 | 90 for app pools |
-| Worst-case fleet | autoscaler max 12 pods × 1.25 rolling-deploy surge = 15 pods × 5 | 75 ≤ 90, so it fits |
+| Worst-case fleet | autoscaler (the system that adds pods under load) max 12 pods × 1.25 rolling-deploy surge (extra new pods that run alongside old ones during a deploy) = 15 pods × 5 | 75 ≤ 90, so it fits |
 | Database CPU | 8 physical cores, hot data cached: `(8 × 2) + 0 = 16` active connections is the PostgreSQL wiki's starting point | 6 busy on average, so there is room |
 
 The old mistake fails both checks: 10 pods × 50 = 500 possible connections against a limit of 100.
@@ -396,10 +461,10 @@ Runnable Go version: [[Connection Pooling - Go]]
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
 | In-app pool (`database/sql`, `pgxpool`) | Each process keeps its own connections | Always; it is the first layer | Fleet total grows with pod count |
-| PgBouncer, session mode | A server connection is tied to a client until it disconnects | Many short-lived clients that need session features | Little multiplexing: one server connection per connected client |
+| PgBouncer, session mode | A server connection is tied to a client until it disconnects | Many short-lived clients that need session features | Little multiplexing (sharing one real connection among many clients): one server connection per connected client |
 | PgBouncer, transaction mode | A server connection is lent per transaction | Many pods or serverless functions; the usual choice | Session state breaks (next section); one more hop |
 | PgBouncer, statement mode | Lent per statement; multi-statement transactions are refused | Autocommit-only workloads | No transactions at all |
-| RDS Proxy | Managed transaction-level multiplexing; IAM auth; smoother failovers | AWS, especially Lambda | Sessions get **pinned** on `SET`, SQL `PREPARE`, temp tables, session advisory locks, `LISTEN`; extra latency and cost |
+| RDS Proxy | Managed transaction-level multiplexing; IAM auth (log in with AWS identity instead of a password); smoother failovers | AWS, especially Lambda | Sessions get **pinned** (stuck to one real connection, so no sharing) on `SET`, SQL `PREPARE`, temp tables, session advisory locks, `LISTEN`; extra latency and cost |
 | PgCat, Supavisor, Odyssey | Newer poolers; multi-threaded, some add sharding or load balancing | Very high client counts | Younger tools, fewer operators know them |
 
 PostgreSQL 17 has no built-in pooler, so external poolers fill that gap.
@@ -429,7 +494,7 @@ sequenceDiagram
 | --- | --- |
 | `SET` / `RESET` (e.g. `SET statement_timeout`) | `SET LOCAL` inside the transaction, or set it per role or database |
 | `LISTEN` | A direct or session-mode connection for listeners |
-| Session advisory locks (`pg_advisory_lock`) | `pg_advisory_xact_lock` inside a transaction |
+| Session advisory locks (`pg_advisory_lock`, a lock on a number your app picks, held until the session ends) | `pg_advisory_xact_lock` inside a transaction |
 | `WITH HOLD` cursors; temp tables with `PRESERVE`/`DELETE ROWS` | Keep them inside one transaction; temp tables with `ON COMMIT DROP` |
 | SQL-level `PREPARE` / `DEALLOCATE` | Protocol-level prepared statements instead |
 | Protocol-level prepared statements | Supported since PgBouncer 1.21.0 when `max_prepared_statements` > 0; default 200 since 1.24.0 |
@@ -461,6 +526,8 @@ flowchart TD
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how a pool lends, queues and sizes connections, and what an external pooler changes. **Next comes the senior view**: how real teams run poolers, how to spot exhaustion from the outside, which query finds the culprit, and the less obvious Go internals interviewers probe.
+
 - **Real systems:**
 	- PgBouncer is the common choice in front of self-managed Postgres; GitLab's reference architectures include it.
 	- Supabase built Supavisor for very many client connections.
@@ -489,7 +556,7 @@ Representative output (PostgreSQL 17):
  idle in transaction |     6 | 00:12:41.070226
 ```
 
-Six sessions have sat inside an open transaction for up to 12 minutes. That is a missing `Rollback` on an error path, or an HTTP call made while a transaction was open. They hold their connections and any locks they took, and an open transaction can keep VACUUM from removing dead rows.
+Six sessions have sat inside an open transaction for up to 12 minutes. That is a missing `Rollback` on an error path, or an HTTP call made while a transaction was open. They hold their connections and any locks they took, and an open transaction can keep VACUUM (PostgreSQL's background cleaner of old row versions) from removing dead rows.
 
 - **Failure modes → fixes:**
 	- Leaked `rows` or `tx` → `defer rows.Close()`; `defer tx.Rollback()` right after `BeginTx` (it is a no-op after `Commit`); an `InUse == 0` assertion in tests.
@@ -558,6 +625,30 @@ flowchart LR
 - Leaks: `defer rows.Close()`, `defer tx.Rollback()`, no network calls inside transactions, `idle_in_transaction_session_timeout`.
 - PgBouncer transaction mode: no session `SET`, `LISTEN`, session advisory locks or SQL `PREPARE`; protocol prepared statements OK on 1.21+.
 - Lifetime with jitter handles failover and DNS changes.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why not open a new connection for every request?
+> Each one needs several network round trips, a login and a new server process, which costs milliseconds; borrowing an open one costs microseconds.
+
+> [!question]- What happens when all connections in the pool are busy?
+> The new request waits in the app until one comes back or its deadline runs out.
+
+> [!question]- What is a connection leak?
+> A borrowed connection that is never returned, for example because `rows.Close()` was never called.
+
+🟡 Medium
+
+> [!question]- 600 requests/s, each holding a connection for 10 ms. How many are busy on average?
+> Little's Law: 600 x 0.01 = 6 busy connections, before headroom.
+
+> [!question]- The pool is exhausted but database CPU is 10%. Where do you look first?
+> `pg_stat_activity` for `idle in transaction` sessions: something holds connections without running queries, like a leak or a network call inside a transaction.
+
+> [!question]- Why does `SET statement_timeout` silently stop working behind PgBouncer in transaction mode?
+> The next transaction may run on a different real connection that never saw the `SET`; use `SET LOCAL` or set it per role.
 
 ## Links
 

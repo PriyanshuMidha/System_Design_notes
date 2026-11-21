@@ -38,6 +38,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (anomalies and how MVCC works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Transactions and ACID]]: a transaction is a group of statements between `BEGIN` and `COMMIT` that all happen or none happen.
+> - [[Storage Engines - B-tree vs LSM and WAL]]: a table is stored in fixed-size pages on disk, and changes are logged before they are applied.
+
 **From zero, in 60 seconds** 🟢
 
 A database is used by many people at the same time. Each person's work is grouped into a **transaction**: a bundle of reads and writes that succeed or fail together.
@@ -85,6 +89,11 @@ The database must decide how much each cashier sees of the other's unfinished wo
 | Snapshot | A frozen view of committed data at one moment | What `SELECT` sees under REPEATABLE READ |
 | Row version | One copy of a row; an update makes a new copy | Old balance 100, new balance 80 |
 | VACUUM | PostgreSQL's cleanup of versions nobody can see any more | Run by autovacuum |
+| Transaction ID (xid) | A number PostgreSQL gives each transaction that writes, counting up | Transaction 734 |
+| Lost update | Two read-then-write cycles on one row; the second write erases the first | Two payments, only one counted |
+| Write skew | Two transactions check the same rule and each write a different row, together breaking it | Two invoices that together pass a credit limit |
+| `40001` | The error code meaning "could not serialize, retry the whole transaction" | Returned at REPEATABLE READ or SERIALIZABLE |
+| Row lock | A marker on a row that makes other writers wait | `SELECT ... FOR UPDATE` |
 
 **Picture it**
 
@@ -166,7 +175,25 @@ A snapshot shows you a consistent past, but your decision is applied to the pres
 
 Analogy: everyone works from their own printout of a shared spreadsheet. Printouts never change under you, but two people can each check "total < limit" on their printout and each add a row.
 
+### Real-life example: two payments from one wallet 🟢
+
+Think of a wallet app like Paytm with ₹500 in it, and two payments of ₹300 and ₹400 that arrive at the same moment.
+If each payment reads "balance 500", checks "enough money", and writes back its own new balance, both succeed and one write erases the other (a lost update).
+The wallet ends at ₹200 or ₹100 instead of refusing one payment, so ₹700 left a ₹500 wallet.
+The fix is to let the database do the check and the write in one step, such as `UPDATE ... SET balance = balance - 300 WHERE balance >= 300`, or to use a stricter isolation level and retry.
+Isolation levels are the rules that decide which of these clashes the database catches for you.
+
+## Common beginner mistakes 🟢
+
+- **Reading a value into code, changing it, and writing it back** → at READ COMMITTED two requests both read the old value, and one update is lost → write `SET x = x + 1` in SQL, or lock the row with `FOR UPDATE`.
+- **Thinking REPEATABLE READ stops every bug** → write skew still gets through, because the two transactions write different rows → use SERIALIZABLE with retries, or lock a shared parent row.
+- **Using SERIALIZABLE without a retry loop** → users see random `40001` errors under load → wrap the whole transaction in a retry with a short random wait.
+- **Leaving a transaction open while calling an outside service** → its snapshot stops VACUUM from cleaning any table, and tables bloat → finish the transaction first, and set `idle_in_transaction_session_timeout`.
+- **Assuming MySQL and PostgreSQL behave the same at "REPEATABLE READ"** → PostgreSQL turns a lost update into a `40001` error; MySQL silently lets it happen → check the engine's own rules.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that each transaction reads from its own frozen view, and that two views can still lead to a wrong decision together. **Next we open the box**: the six named bugs, which level stops which, how PostgreSQL stores and picks row versions, how SERIALIZABLE catches write skew, and how old versions get cleaned up.
 
 ### The six anomalies
 
@@ -287,6 +314,13 @@ flowchart LR
 
 **In plain words:** this table is the scorecard: pick a level in a column, read down to see which bugs it stops and which still get through.
 
+**Step by step:**
+1. Pick your database and level, say PostgreSQL REPEATABLE READ (the second column).
+2. Read down: dirty, non-repeatable and phantom reads and read skew are all prevented, because you keep one snapshot.
+3. Lost update is prevented too: the second writer of the same row gets error `40001`.
+4. Write skew is still "possible", because the two writers touch different rows.
+5. Only the SERIALIZABLE column says "prevented" on every line.
+
 | Anomaly | PG READ COMMITTED (default) | PG REPEATABLE READ | PG SERIALIZABLE | MySQL InnoDB REPEATABLE READ (default) |
 | --- | --- | --- | --- | --- |
 | Dirty read | prevented | prevented | prevented | prevented |
@@ -308,8 +342,8 @@ The SQL standard defines four levels by which phenomena they rule out. What engi
 | Level | SQL standard rules out | PostgreSQL 17 | MySQL 8.0 / 8.4 InnoDB |
 | --- | --- | --- | --- |
 | READ UNCOMMITTED | nothing | Same as READ COMMITTED | Dirty reads really happen |
-| READ COMMITTED | dirty reads | Default. New snapshot per statement. An `UPDATE` that meets a row changed by a concurrent transaction waits for it, then re-checks its `WHERE` on the newest version | New snapshot per consistent read; no gap locks except for foreign-key and duplicate-key checks |
-| REPEATABLE READ | + non-repeatable reads | **Snapshot isolation**: one snapshot, taken at the first statement (not at `BEGIN`). Updating a row that changed after your snapshot fails with SQLSTATE 40001 | Default. Plain `SELECT` reads one snapshot. `UPDATE`, `DELETE` and locking reads use the *latest* committed rows and take next-key locks |
+| READ COMMITTED | dirty reads | Default. New snapshot per statement. An `UPDATE` that meets a row changed by a concurrent transaction waits for it, then re-checks its `WHERE` on the newest version | New snapshot per consistent read; no gap locks (locks on the empty space between index entries, which block inserts there) except for foreign-key and duplicate-key checks |
+| REPEATABLE READ | + non-repeatable reads | **Snapshot isolation**: one snapshot, taken at the first statement (not at `BEGIN`). Updating a row that changed after your snapshot fails with SQLSTATE 40001 | Default. Plain `SELECT` reads one snapshot. `UPDATE`, `DELETE` and locking reads use the *latest* committed rows and take next-key locks (a row lock plus a gap lock on the space before it) |
 | SERIALIZABLE | + phantoms, and the result must equal some serial order | **Serializable snapshot isolation (SSI)**: snapshot isolation plus dependency tracking; aborts a transaction with 40001 instead of blocking | Like REPEATABLE READ, but plain `SELECT` becomes `SELECT … FOR SHARE` when autocommit is off: it blocks on locks instead of aborting |
 
 > [!warning] Interview trap
@@ -319,13 +353,20 @@ The SQL standard defines four levels by which phenomena they rule out. What engi
 
 **In plain words:** PostgreSQL never edits a row in place; it keeps old and new copies side by side in the table, each stamped with who created it and who replaced it, like dated drafts in one folder.
 
-Every row version (tuple) carries hidden system columns:
+**Step by step:**
+1. Transaction 731 inserts invoice 42 with status `sent`. The row copy is stamped "created by 731".
+2. Transaction 734 runs `UPDATE invoices SET status = 'paid' WHERE id = 42`.
+3. PostgreSQL does not overwrite. It writes a second copy with `paid`, stamped "created by 734".
+4. It stamps the old copy "replaced by 734" and points it at the new copy.
+5. A reader whose snapshot is older than 734 still finds the `sent` copy; a newer reader finds `paid`.
+
+Every row version (tuple, PostgreSQL's word for one physical copy of a row) carries hidden system columns:
 
 - `xmin`: the transaction ID (xid) that created this version.
 - `xmax`: the xid that deleted or replaced it, or 0. It is also set by row locks, with a flag that marks it as "lock only".
 - `ctid`: the physical location `(page, slot)`. For a replaced version, it points to the next version in the chain.
 
-An `UPDATE` therefore writes a new tuple and stamps `xmax` on the old one. With the `pageinspect` extension you can see both versions on the page. A demo table, after transaction 731 inserted invoice 42 and transaction 734 set it to `paid`:
+An `UPDATE` therefore writes a new tuple and stamps `xmax` on the old one. With the `pageinspect` extension (a tool that shows the raw contents of a table page) you can see both versions on the page. A demo table, after transaction 731 inserted invoice 42 and transaction 734 set it to `paid`:
 
 ```sql
 SELECT lp, t_xmin, t_xmax, t_ctid
@@ -356,11 +397,18 @@ flowchart LR
 
 **In plain words:** a snapshot is just a short note saying "these transactions were finished when I started"; a separate ledger (the commit log) says whether each finished one succeeded or was thrown away.
 
+**Step by step:**
+1. Your transaction starts while 736 is still running. Every xid below 735 has finished; 737 has finished too.
+2. PostgreSQL writes your snapshot as `735:738:736`: "below 735 done, 738 and up not started, 736 still running".
+3. Later you meet a row copy made by 737. 737 is under 738 and not in the "running" list, so it had finished.
+4. PostgreSQL checks the commit log, `pg_xact`, to see whether 737 committed or rolled back.
+5. It saves that answer on the row copy as a hint, so the next reader does not have to ask again.
+
 A **snapshot** records which transactions count as finished. `SELECT pg_current_snapshot();` prints it as `xmin:xmax:xip_list`, for example `735:738:736`: every xid below 735 had finished, none at or above 738 had started, and 736 was still running.
 
 Whether a finished xid committed or aborted is kept in `pg_xact`, two bits per transaction.
 
-The first reader to look a status up caches it in the tuple as **hint bits**, which is why a plain `SELECT` can dirty pages (and, with data checksums or `wal_log_hints` on, write WAL).
+The first reader to look a status up caches it in the tuple as **hint bits**, which is why a plain `SELECT` can dirty pages, meaning mark them as changed in memory so they must be written back to disk (and, with data checksums or `wal_log_hints` on, write WAL).
 
 ```mermaid
 flowchart LR
@@ -372,6 +420,13 @@ flowchart LR
 ### The visibility rule
 
 **In plain words:** for each row copy the database asks two questions: "was its creator done before I started?" and "was its deleter done before I started?". Yes then no means you see it.
+
+**Step by step:**
+1. Take row copy A: created by 731, replaced by 736. Your snapshot is `735:738:736`.
+2. Question 1: did 731 commit before my snapshot? Yes (below 735, committed).
+3. Question 2: did 736 commit before my snapshot? No, 736 is in the "still running" list.
+4. So the replacement does not count for you, and you see copy A.
+5. Copy B, created by 736, fails question 1, so you do not see it.
 
 ```mermaid
 flowchart TD
@@ -395,6 +450,13 @@ flowchart TD
 ### READ COMMITTED vs REPEATABLE READ in PostgreSQL
 
 **In plain words:** the only difference is how often you take a fresh photo of the data: every statement (READ COMMITTED) or once for the whole transaction (REPEATABLE READ), plus what happens when your update hits a row someone else just changed.
+
+**Step by step:**
+1. Transaction A runs `UPDATE invoices SET paid_minor = paid_minor + 10000 WHERE id = 42` and holds the row lock.
+2. Transaction B runs the same with `+ 20000` and has to wait for A.
+3. A commits. `paid_minor` is now 10,000.
+4. At READ COMMITTED, B re-reads the newest copy and adds 20,000 to it: 30,000. Nothing lost.
+5. At REPEATABLE READ, B's snapshot is older than A's change, so B gets error `40001` and must retry from `BEGIN`.
 
 This is only a question of when the snapshot is taken, plus one rule for writes:
 
@@ -421,13 +483,20 @@ sequenceDiagram
 
 **In plain words:** SERIALIZABLE keeps a diary of who read what, and when two transactions' reads and writes could form a loop that no one-at-a-time order explains, it cancels one of them and tells you to retry.
 
+**Step by step:**
+1. A and B both start SERIALIZABLE and both read customer 7's open balance: 70,000. PostgreSQL notes "A read these rows" and "B read these rows".
+2. A inserts a 25,000 invoice into the range B read. PostgreSQL notes "B read something A wrote".
+3. B inserts a 20,000 invoice into the range A read. Now "A read something B wrote" too: a loop.
+4. No one-at-a-time order can explain both seeing 70,000, so one of them must go.
+5. A commits first. B's commit gets `40001`; B retries, sees 95,000, and rejects its invoice.
+
 Since 9.1, PostgreSQL's SERIALIZABLE runs transactions exactly like REPEATABLE READ and additionally tracks **read-write dependencies**. "T1 →rw T2" means T1 read something that the concurrent T2 then wrote: a row version, or a gap T2 inserted into.
 
 Readers record what they read as **SIRead locks** (shown as `SIReadLock` in `pg_locks`). These never block anyone; they only let the database notice conflicts.
 
 Every anomaly under snapshot isolation needs a "dangerous structure": two rw-dependencies in a row, T1 →rw T2 →rw T3, where T3 commits first (T1 and T3 may be the same transaction).
 
-PostgreSQL watches for that pattern and aborts one participant with 40001. That is cheap, but it also catches some harmless patterns (false positives), so retries are part of using SERIALIZABLE.
+PostgreSQL watches for that pattern and aborts one participant with 40001. That is cheap, but it also catches some harmless patterns (false positives: aborts where no real bug would have happened), so retries are part of using SERIALIZABLE.
 
 ```mermaid
 flowchart LR
@@ -465,6 +534,13 @@ At REPEATABLE READ the same two sessions both commit and the balance ends at 115
 
 **In plain words:** old row copies are litter; VACUUM is the cleaner. It may only sweep what no open transaction could still need, so one long-open transaction stops cleaning everywhere.
 
+**Step by step:**
+1. Every `UPDATE` leaves an old copy behind. After a busy day, a 1-million-row table may hold 200,000 dead copies.
+2. VACUUM looks for the oldest snapshot still in use anywhere, say from transaction 150.
+3. It removes dead copies replaced before 150, because no one can need them any more.
+4. Copies replaced after 150 must stay, in every table, until that old transaction ends.
+5. VACUUM also "freezes" very old copies, so the 32-bit transaction counter can safely wrap around.
+
 Old versions stay in the table until VACUUM removes them, and VACUUM may only remove a version once no running snapshot could still need it. The oldest snapshot still in use (the **xmin horizon**) decides that.
 
 ```mermaid
@@ -483,13 +559,13 @@ stateDiagram-v2
 
 Dead tuples, and the index entries pointing at them, take space and slow scans until VACUUM runs. Autovacuum starts when dead tuples exceed `autovacuum_vacuum_threshold` (50) + `autovacuum_vacuum_scale_factor` (0.2) × rows, and since PostgreSQL 13 also after many inserts.
 
-Plain VACUUM makes space reusable inside the table but rarely shrinks the file; `VACUUM FULL` rewrites the table under an ACCESS EXCLUSIVE lock.
+Plain VACUUM makes space reusable inside the table but rarely shrinks the file; `VACUUM FULL` rewrites the table under an ACCESS EXCLUSIVE lock (a lock that blocks every read and write on the table).
 
 Example: a table with 1,000,000 rows triggers autovacuum after 50 + 0.2 × 1,000,000 = 200,050 dead tuples.
 
 #### The xmin horizon
 
-One transaction left open for hours ("idle in transaction"), a stale replication slot, or a replica with `hot_standby_feedback = on` running a long query holds the horizon back. Then no table in the database can be cleaned, however often VACUUM runs.
+One transaction left open for hours ("idle in transaction"), a stale replication slot (a bookmark that makes the server keep changes for a replica or consumer that has not read them yet), or a replica with `hot_standby_feedback = on` (the replica tells the primary which old versions its queries still need) running a long query holds the horizon back. Then no table in the database can be cleaned, however often VACUUM runs.
 
 ```mermaid
 flowchart LR
@@ -521,7 +597,14 @@ flowchart LR
 
 **In plain words:** MySQL's InnoDB does MVCC the other way round: it edits the row in place and files the old value in a side notebook (the undo log), so readers who need the past walk back through that notebook.
 
-InnoDB updates the row in place in the clustered index and copies the old version into the **undo log**. Each row has hidden `DB_TRX_ID` (last writer) and `DB_ROLL_PTR` (pointer into undo) columns.
+**Step by step:**
+1. Transaction 734 sets invoice 42 from `sent` to `paid`.
+2. InnoDB writes `paid` straight into the row and copies `sent` into the undo log.
+3. The row keeps a pointer back to that undo record.
+4. A reader with an older view sees the row says "changed by 734", which it cannot see yet, so it follows the pointer and reads `sent`.
+5. When no reader needs `sent` any more, a purge thread deletes the undo record.
+
+InnoDB updates the row in place in the clustered index (InnoDB stores the table itself inside its primary-key tree) and copies the old version into the **undo log**. Each row has hidden `DB_TRX_ID` (last writer) and `DB_ROLL_PTR` (pointer into undo) columns.
 
 ```mermaid
 flowchart LR
@@ -587,12 +670,21 @@ Runnable Go version: [[Isolation Levels and MVCC - Go]]
 
 ## 5. Variants and comparison 🟡
 
+**Do not confuse these** 🟡
+
+| Term | What it is about | Example promise |
+| --- | --- | --- |
+| Snapshot isolation | One frozen view per transaction | Your report's totals and line items always match |
+| Serializable | Many transactions, any rows | The result equals running them one at a time |
+| Linearizable | One object in a distributed system ([[Consistency Models]]) | Every read sees the latest finished write |
+| Consistency in ACID | Your own rules, like `CHECK` constraints | The balance never goes below 0 |
+
 Ways to stop the anomalies that the default level allows:
 
 | Option | How it works | Use when | Cost |
 | --- | --- | --- | --- |
 | Atomic single statement | `UPDATE … SET x = x + $1 WHERE … AND x + $1 <= limit`, check rows affected | The rule fits in one row | Only works for one-row rules |
-| Lock the parent row | `SELECT … FROM customers WHERE id = $1 FOR UPDATE` before the check: every writer for that customer queues | A rule over many rows that share a parent ("materialise the conflict") | Serialises writers per parent; deadlock risk if you lock in different orders |
+| Lock the parent row | `SELECT … FROM customers WHERE id = $1 FOR UPDATE` before the check: every writer for that customer queues | A rule over many rows that share a parent ("materialise the conflict") | Serialises writers per parent; deadlock (two transactions each waiting for the other's lock) risk if you lock in different orders |
 | REPEATABLE READ | One snapshot; the second writer of a row gets 40001 | Consistent reports, lost-update protection on single rows | Retries; still allows write skew |
 | SERIALIZABLE (SSI) | Snapshot + dependency tracking, 40001 on danger | Invariants across rows or tables; many code paths you cannot audit | Retries, false positives, SIRead-lock memory |
 | Constraint | `UNIQUE`, `CHECK`, `EXCLUDE USING gist` | The rule can be declared | Only for rules the schema can express |
@@ -623,7 +715,7 @@ flowchart TD
 
 - **READ COMMITTED is fine for most single-statement work**, provided you write conditional updates instead of read-then-write in application code.
 - **REPEATABLE READ** gives a stable view for reports and exports and turns lost updates into errors. A long-running REPEATABLE READ report also holds the xmin horizon for its whole duration.
-- **SERIALIZABLE** costs retries and some throughput: predicate-lock bookkeeping, false-positive aborts, and wasted work on every retry. It is only guaranteed for transactions that *all* run SERIALIZABLE; one READ COMMITTED writer in the mix can still create an anomaly.
+- **SERIALIZABLE** costs retries and some throughput: predicate-lock bookkeeping (tracking which rows and ranges each transaction read), false-positive aborts, and wasted work on every retry. It is only guaranteed for transactions that *all* run SERIALIZABLE; one READ COMMITTED writer in the mix can still create an anomaly.
 - **Do not reach for SERIALIZABLE** when a single atomic `UPDATE`, a unique constraint or one row lock expresses the rule more cheaply and more visibly.
 - **Never put non-repeatable side effects inside a retried transaction**: charging a card, sending an email. Record the intent in the transaction and act after commit (see [[Transactional Outbox and CDC]]).
 
@@ -634,6 +726,8 @@ flowchart TD
 | SERIALIZABLE | yes, on 40001, including false positives | no | no | SIRead lock memory, wasted retries |
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the anomalies, how MVCC picks versions, and which tool stops which bug. **Next comes the senior view**: what breaks in production (long transactions, stuck cleanup, retry storms), what to monitor, and the internals interviewers probe.
 
 - **Real systems:** InvoiceOps-style services typically run READ COMMITTED with conditional updates and row locks, and use SERIALIZABLE for the few invariants that span rows (credit limits, ledger balances), wrapped in the retry helper in [[Isolation Levels and MVCC - Go]].
 - **Failure modes → fixes:**
@@ -662,6 +756,8 @@ flowchart TD
 ```
 
 ## Whiteboard version 🟢
+
+🟢 **Plain version:** READ COMMITTED takes a fresh view for every statement and still lets two transactions overwrite each other's read-then-write. REPEATABLE READ keeps one view for the whole transaction and turns a same-row clash into a "retry" error, but two transactions writing different rows can still break a shared rule. SERIALIZABLE catches that too, as long as you retry. A row copy is visible if the transaction that made it had committed before your view, and the one that replaced it had not.
 
 ```text
 Level      snapshot       PostgreSQL gives            still possible
@@ -720,6 +816,8 @@ flowchart LR
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** Isolation levels decide how much one transaction sees of others running at the same time. PostgreSQL keeps old and new copies of each row, and every transaction reads the copies that match its own frozen view. Stronger levels stop more bugs but send "retry" errors you must handle. Old copies are cleaned by VACUUM, and one transaction left open for hours blocks that cleaning everywhere.
+
 - Anomalies: dirty read, non-repeatable read, phantom, read skew, lost update, write skew.
 - PostgreSQL: RU = RC (default, snapshot per statement); RR = snapshot isolation (40001 on concurrent update); SERIALIZABLE = SSI (40001 on dangerous structures). Retry the whole transaction.
 - InnoDB: RR default; plain reads use a snapshot, writes and locking reads use the latest rows with next-key locks; no lost-update protection.
@@ -727,6 +825,30 @@ flowchart LR
 - PostgreSQL MVCC: `xmin`/`xmax` per version, snapshot `xmin:xmax:xip`, status in `pg_xact`.
 - VACUUM removes versions behind the xmin horizon and freezes old xids; long transactions and stale slots block both.
 - Wraparound: 32-bit xids; forced autovacuum at 200 million; monitor `age(datfrozenxid)`.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does MVCC do on an `UPDATE`?
+> It writes a new copy of the row and keeps the old copy for readers whose snapshot is older.
+
+> [!question]- What is PostgreSQL's default isolation level?
+> READ COMMITTED, which takes a fresh snapshot for every statement.
+
+> [!question]- What must your code do when it gets error `40001`?
+> Roll back and run the whole transaction again from `BEGIN`.
+
+🟡 Medium
+
+> [!question]- Why does REPEATABLE READ not stop the credit-limit bug?
+> The two transactions insert different rows, so there is no same-row clash to detect; that is write skew.
+
+> [!question]- Snapshot `735:738:736`. Is a row copy created by 736 visible?
+> No: 736 is in the "still running" list of the snapshot.
+
+> [!question]- Why does one session left "idle in transaction" bloat every table?
+> Its old snapshot holds back the xmin horizon, so VACUUM cannot remove any dead copy newer than it, anywhere in the database.
 
 ## Links 🟢
 

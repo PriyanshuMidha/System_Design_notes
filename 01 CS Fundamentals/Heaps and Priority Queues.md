@@ -29,6 +29,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Arrays and Dynamic Arrays (Go Slices)]]: a slice is a row of numbered boxes, and jumping to box `i` is instant. A heap is stored in exactly such a row.
+> - [[Trees, BSTs and Balanced Trees]]: a tree has a root at the top, and each item (parent) can have children below it. A heap is a tree drawn on top of that row.
+
 **From zero, in 60 seconds** 🟢
 
 Imagine a hospital waiting room. People do not get seen in arrival order; the sickest person goes first. New patients keep walking in, so "who is next?" must always be a quick answer.
@@ -74,6 +78,10 @@ New patients keep arriving all day, so the "who is next" answer must stay cheap 
 | Min-heap / max-heap | Smallest (or largest) value always sits at the root | Min-heap of `[40,10,20]` shows 10 on top |
 | O(log n) | Work grows with the number of halvings of n | 1,000,000 items: about 20 steps |
 | Priority queue | "Give me the most urgent item next" container | Job scheduler picking the nearest deadline |
+| Heap property | The one rule: every parent is smaller than (or equal to) its children, in a min-heap | 10 above 20 and 40 |
+| Sift up / sift down | Swap an item up (or down) the tree until the heap property holds again | a new 5 climbs past 80, 20, 10 |
+| Heapify | Turn an unordered slice into a heap in one pass | `[40,10,20]` → `[10,40,20]` |
+| Complete binary tree | Every level full except the last, which fills left to right | 7 items fill 3 levels exactly |
 
 **Picture it**
 
@@ -128,12 +136,20 @@ flowchart LR
 
 ### 1.2 What a priority queue promises
 
-A heap gives up full sorting and keeps only the single invariant the scheduler actually needs — "the root is always the most urgent" — which is far cheaper to maintain: `O(log n)` to insert a new task, `O(log n)` to remove the most urgent one, `O(1)` to peek at it.
+A heap gives up full sorting and keeps only the single invariant (a rule that must always stay true) the scheduler actually needs — "the root is always the most urgent" — which is far cheaper to maintain: `O(log n)` to insert a new task, `O(log n)` to remove the most urgent one, `O(1)` to peek at it.
 
 This is also exactly the data structure behind Dijkstra's and A\*'s "always process the closest/cheapest frontier node next" (see [[Graphs and Graph Algorithms]]).
 
 > [!tip] Remember
 > A **priority queue** is the abstract promise ("give me the most urgent item"); a **heap** is the concrete array-based structure that delivers on it cheaply.
+
+### 1.3 Real-life example: Netflix "Top 10 in India today" 🟢
+
+Netflix counts views for thousands of shows and wants only the 10 most watched.
+Sorting all the shows every few minutes would waste work, because nobody looks at rank 3,000.
+Instead it can keep a small heap of 10 "current winners", with the weakest winner on top.
+Each new show's count is compared with that weakest winner; if it is bigger, it kicks the weakest out.
+The same idea runs a food app's delivery queue: the order with the nearest promised time is always handled next.
 
 ## 2. Mental model 🟢
 
@@ -159,9 +175,25 @@ flowchart TD
 > [!tip] Remember
 > A heap only constrains parent vs. its own children. Two "cousin" nodes can be in any order relative to each other.
 
+## Common beginner mistakes 🟢
+
+- **Expecting the heap's slice to be sorted** → only the top item is guaranteed; the rest is loosely ordered → pop items one by one if you need sorted output.
+- **Using a max-heap for "top K largest"** → you then cannot quickly find which kept item to throw out → use a size-K **min**-heap, so the weakest keeper is on top.
+- **Calling `h.Push(x)` instead of `heap.Push(h, x)` with `container/heap`** → your method only appends, so the heap rule breaks → always call the package functions `heap.Push`, `heap.Pop`, `heap.Fix`.
+- **Searching a heap for "is X in here?"** → that is `O(n)`, like an unsorted list → keep a map next to it for lookups.
+- **Building a heap with `n` pushes from a known slice** → `O(n log n)` → call `heap.Init` (heapify) once, `O(n)`.
+
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that a heap keeps only one promise (the top is the most urgent) and that this is why it is cheap. **Next we open the box:** how a plain array behaves like a tree, how push and pop restore the promise, how to build a heap in one pass, and how heapsort reuses it. Each subsection starts with a plain walk-through.
+
 ### 3.1 Array layout of a complete binary tree
+
+**Step by step (the array `[10, 20, 40, 80, 60, 85, 99]`):**
+1. Index 0 (10) is the root, the top of the tree.
+2. Its children are at `2·0+1 = 1` (20) and `2·0+2 = 2` (40).
+3. Index 1's children are at 3 (80) and 4 (60); index 2's are at 5 (85) and 6 (99).
+4. Going up: the parent of index 4 is `(4-1)/2 = 1` (20). No pointers anywhere, just this math.
 
 **In plain words:** a heap is a **complete binary tree**: every level is full except possibly the last, which fills left to right with no gaps. That completeness — no holes anywhere except possibly at the very end — is what lets it live in a plain array with no pointers at all.
 
@@ -189,10 +221,10 @@ flowchart TD
 
 **Example:** `[1]`'s children are at `2·1+1=3` (`80`) and `2·1+2=4` (`60`) — exactly matching the tree picture. No pointer was followed to find them; it's pure arithmetic on the index.
 
-**Why it matters:** no pointers means no per-node allocation and excellent cache locality — a heap of a million ints is one contiguous slice, not a million scattered allocations the way a pointer-based tree would be.
+**Why it matters:** no pointers means no per-node allocation and excellent cache locality (items sit side by side, so the CPU reads them in fast chunks) — a heap of a million ints is one contiguous slice, not a million scattered allocations the way a pointer-based tree would be.
 
 > [!warning] Common mistake
-> Assuming a heap is a binary search tree because both are "trees." A BST is ordered left-to-right (left subtree < node < right subtree); a heap only orders parent vs. child, with no left/right ordering promise at all. You cannot do an in-order traversal of a heap and get sorted output.
+> Assuming a heap is a binary search tree because both are "trees." A BST is ordered left-to-right (left subtree < node < right subtree); a heap only orders parent vs. child, with no left/right ordering promise at all. You cannot do an in-order traversal (visit left subtree, then node, then right subtree) of a heap and get sorted output.
 
 ### 3.2 Push: append, then sift up
 
@@ -255,6 +287,12 @@ sequenceDiagram
 
 ### 3.4 Heapify: building a heap in O(n), not O(n log n)
 
+**Step by step (heapify `[40, 99, 10, 80, 60]`):**
+1. 5 items, so the last non-leaf is index `5/2 - 1 = 1` (99). Start there.
+2. Sift 99 down: its children are 80 and 60; the smaller is 60, so swap. Now `[40, 60, 10, 80, 99]`.
+3. Move left to index 0 (40). Its children are 60 and 10; the smaller is 10, so swap. Now `[10, 60, 40, 80, 99]`.
+4. 40 now sits at index 2 with no children, so stop. The array is a valid min-heap, built in one backward pass.
+
 **In plain words:** naively calling push `n` times costs `O(n log n)`. Instead, **heapify** starts from the last *non-leaf* node (`index = n/2 - 1`) and sifts each one down, working backward toward the root.
 
 **Why this is cheaper:** most nodes in a complete binary tree are near the bottom, where sift-down does almost no work (a leaf needs zero sift-down steps; a node one level up needs at most one).
@@ -274,6 +312,12 @@ flowchart TD
 > Building from a known slice: always prefer heapify (`O(n)`) over `n` individual pushes (`O(n log n)`).
 
 ### 3.5 Heapsort
+
+**Step by step (sort `[3, 1, 2]` ascending):**
+1. Heapify into a max-heap: `[3, 1, 2]` already has the biggest (3) on top.
+2. Swap the top with the last item: `[2, 1, 3]`. 3 is now in its final place; the heap is just `[2, 1]`.
+3. The heap `[2, 1]` still has its biggest on top. Swap top with the last heap item: `[1, 2, 3]`.
+4. One item left, so stop. Sorted, using no extra array.
 
 **In plain words:** build a max-heap in place (`O(n)`), then repeatedly swap the root (the current maximum) with the last unsorted element and sift down the shrunken heap.
 
@@ -374,11 +418,13 @@ flowchart TD
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the array layout, push with sift-up, pop with sift-down, heapify, heapsort and the top-K pattern. **Next comes the advanced part:** where heaps run inside Go and real systems, why heapify is really `O(n)`, how decrease-key works in Go, and interview patterns.
+
 - **Real systems:**
 	- Go's own runtime keeps each P's (processor's) pending timers in a **4-ary heap** (`runtime/time.go`), not binary — fewer tree levels for the same number of timers means fewer cache-line jumps per sift, at the cost of comparing up to 4 children instead of 2 per step. `time.Timer`, `time.After`, and context deadlines all ultimately sit in this structure.
 	- Dijkstra's algorithm and A\* use a min-heap as the "frontier": always expand the closest/cheapest unvisited node next (see [[Graphs and Graph Algorithms]]).
 	- OS process schedulers and job queues (delayed and recurring job systems) use a priority queue keyed by next-run time — see [[Scheduled Jobs - Cron to Durable Schedulers]] and [[CPU Scheduling]].
-	- `heapsort` is used inside some standard-library sort implementations as the fallback when quicksort's recursion depth exceeds a threshold (introspective sort), to guarantee worst-case `O(n log n)` instead of quicksort's `O(n²)`.
+	- `heapsort` is used inside some standard-library sort implementations as the fallback when quicksort's recursion depth exceeds a threshold (introspective sort, a hybrid that starts as quicksort and switches to heapsort when things go badly), to guarantee worst-case `O(n log n)` instead of quicksort's `O(n²)`.
 - **Failure modes → fixes:**
 	- "Heap" the data structure confused with **heap memory** (the region the garbage collector manages) — these are unrelated concepts that happen to share a name; see [[Process Memory Layout - Stack vs Heap]] for the memory one.
 	- Stale entries in a priority queue (a task was canceled but its heap entry wasn't removed) → lazy deletion: check validity when popped and skip/discard stale entries, or maintain an index map for `O(log n)` true removal.
@@ -436,7 +482,7 @@ These names collide by historical accident, not by design: "heap" the data struc
 
 **In plain words:** most heap interview questions are "keep only the k currently-relevant candidates" in some costume.
 
-- **Kth largest element** (a size-k min-heap, same pattern as the top-K trace above, or `quickselect` for O(n) average without a heap)
+- **Kth largest element** (a size-k min-heap, same pattern as the top-K trace above, or `quickselect`, a quicksort-like partition that only recurses into one side, for O(n) average without a heap)
 - **top-K frequent elements** (hash map to count frequencies, then a size-k min-heap keyed by count)
 - **meeting rooms II** (minimum rooms needed for overlapping intervals: a min-heap of end times — push a new meeting's end time, and if the earliest end time is ≤ the new meeting's start, pop it first, reusing that room)
 - **task scheduler** (CPU task scheduling with a cooldown between identical tasks: a max-heap of remaining counts per task type, greedily running the most frequent task available each cycle)
@@ -478,6 +524,26 @@ These names collide by historical accident, not by design: "heap" the data struc
 - Running median: two heaps (max-heap for the lower half, min-heap for the upper half), kept balanced within one element.
 - Go's runtime timer heap is 4-ary, not binary — fewer levels, more children per comparison.
 - "Heap" the data structure and "heap memory" are unrelated ideas that share a name.
+
+## Self-check 🟢🟡
+
+> [!question]- In a min-heap, where is the smallest item?
+> At the root, index 0 of the array.
+
+> [!question]- What are the children of index 2?
+> Indexes 5 and 6 (`2i+1` and `2i+2`).
+
+> [!question]- What do peek, push and pop cost?
+> Peek `O(1)`; push and pop `O(log n)`.
+
+> [!question]- Why is a heap cheaper to maintain than a sorted array?
+> It only keeps "parent ≤ children", not full order, so an insert needs at most one swap per level instead of shifting many items.
+
+> [!question]- To keep the 100 largest values from a stream of 10 million, which heap and how big?
+> A min-heap of size 100; total cost about `O(n log 100)`.
+
+> [!question]- Why does heapify start at index `n/2 - 1`?
+> Everything after it is a leaf, and a leaf is already a valid one-item heap.
 
 ## Links 🟢
 

@@ -35,6 +35,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[gRPC]]: services call each other with typed methods defined in `.proto` files, and the messages they send are protobuf.
+> - [[Number Representation and Text Encoding]]: numbers and text are stored as bytes, and a byte holds 8 bits (values 0 to 255).
+
 **From zero, in 60 seconds** 🟢
 
 When one program sends data to another, the data must become bytes. JSON does this with readable text that repeats every field name in every message.
@@ -82,6 +86,12 @@ Protocol Buffers is a message format designed so that changes like this are safe
 | Producer / consumer | The service that writes a message / the one that reads it | Billing writes, ledger reads |
 | Backward / forward compatible | New code reads old data / old code reads new data | The ledger reads Monday's new field safely |
 | Code generation | A tool turns the schema into typed code | `protoc` writes `invoice.pb.go` |
+| Tag | The small header before each field's value: field number + kind of value | `0x0A` = field 1, length-prefixed |
+| Wire type | Which kind of value follows the tag (number, fixed bytes, length + bytes) | VARINT, LEN |
+| Varint | A number squeezed into as few bytes as it needs | 1500 takes 2 bytes |
+| `reserved` | Marks a deleted field's number and name as never to be reused | `reserved 4; reserved "client_name";` |
+| Presence | Whether the reader can tell "set to zero" from "never set" | `optional` gives presence |
+| Unknown field | A field number the reader's schema does not know; kept, not dropped | an old reader meets field 3 |
 
 **Picture it**
 
@@ -118,6 +128,13 @@ Size matters too. **Measured** in section 4: `Invoice{id: "inv_1", total_cents: 
 
 In the section 4 benchmark (Go, one small message), binary parsing was about 8 times faster than protojson parsing.
 
+### Real-life example: Google's own services 🟢
+
+Google designs its public Cloud APIs as protobuf services, and gRPC (used inside many large apps) sends protobuf by default.
+Think of a food app where the order service tells ten other services "order placed" thousands of times a second.
+Sending field numbers instead of names makes each message several times smaller, and parsing is faster.
+More importantly, the order team can add a "tip amount" field on Monday while the other ten services update whenever they like, and nobody crashes.
+
 ## 2. Mental model 🟢
 
 A protobuf message is a **form with numbered boxes**. The `.proto` file says "box 1 holds the invoice ID, box 2 holds the total in cents". The encoded message is just a list of "box number, value" pairs.
@@ -126,11 +143,37 @@ A protobuf message is a **form with numbered boxes**. The `.proto` file says "bo
 - A reader that expects box 4 but finds nothing uses the default (0, empty string, false).
 - Box **numbers are forever**. Labels (field names) are for humans and for JSON, so changing them is not free either.
 
+## Common beginner mistakes 🟢
+
+- **Reusing a deleted field's number** → old data decodes the new field's bytes as the old one, silently → mark deleted numbers and names `reserved`.
+- **Renaming a field and assuming it is free** → binary is fine, but JSON and generated code break → add a new field, deprecate the old one.
+- **Changing a field's type** (`string` → `int64`) → old readers decode garbage → add a new field with the new type.
+- **Using `int32` for values that are often negative** → `-1` costs 10 bytes → use `sint32`.
+- **Comparing encoded bytes to test equality** → field order can differ between runs → use `proto.Equal`.
+
+## Often confused 🟡
+
+| These two | First one | Second one |
+| --- | --- | --- |
+| Field name vs field number | For humans, JSON and code; not on the binary wire | What actually travels; must never change |
+| Backward vs forward compatible | New code reads old data | Old code reads new data |
+| Implicit vs explicit presence | Zero is not sent; "unset" looks like zero | `optional`: the reader can ask "was it set?" |
+| Protobuf binary vs protojson | Compact bytes, needs the schema to read | Readable JSON, uses names, bigger |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that protobuf sends numbered boxes, readers skip boxes they do not know, and numbers are forever. **Next we open the box**: how a schema is written, the exact bytes on the wire, how presence works, what happens to unknown fields and enums, the built-in helper types, and the JSON form.
 
 ### Messages and field numbers
 
 **In plain words:** this is what a schema file looks like. Every field gets a permanent number, deleted fields are fenced off with `reserved`, and money is an integer, never a float.
+
+**Step by step:**
+1. You write `message Invoice { string id = 1; int64 total_cents = 2; }`.
+2. `id` is box 1 and `total_cents` is box 2, forever.
+3. Later you delete a field that used number 4; you add `reserved 4; reserved "client_name";` so nobody reuses them.
+4. You add `enum InvoiceStatus { INVOICE_STATUS_UNSPECIFIED = 0; INVOICE_STATUS_PAID = 1; }`; zero means "not set".
+5. A code generator turns the file into a Go struct with `Id` and `TotalCents`.
 
 ```protobuf
 syntax = "proto3";
@@ -182,18 +225,25 @@ This file was compiled with `protocompile` v0.14.1 (a pure-Go compiler) to check
 
 **In plain words:** each field travels as a tiny tag (which box, what kind of value) followed by the value. Small numbers squeeze into one or two bytes.
 
+**Step by step:**
+1. Encode `id = "inv_1"`: field 1, a length-prefixed value, so the tag is `1 << 3 | 2` = `0x0A`.
+2. Then the length `0x05`, then the 5 letters of `inv_1`. That is 7 bytes.
+3. Encode `total_cents = 1500`: field 2, a varint, so the tag is `2 << 3 | 0` = `0x10`.
+4. 1500 does not fit in 7 bits, so it takes 2 bytes: `0xDC 0x0B`. That is 3 bytes.
+5. Whole message: 10 bytes. The same data as JSON is 34 bytes.
+
 Each field is encoded as a **tag**, then a value. The tag is a varint (a variable-length integer: 7 bits per byte, high bit means "more bytes follow") holding `field_number << 3 | wire_type`.
 
 | Wire type | ID | Used for | Value layout |
 | --- | --- | --- | --- |
 | VARINT | 0 | `int32`, `int64`, `uint32`, `uint64`, `sint32`, `sint64`, `bool`, `enum` | varint |
-| I64 | 1 | `fixed64`, `sfixed64`, `double` | 8 bytes, little-endian |
+| I64 | 1 | `fixed64`, `sfixed64`, `double` | 8 bytes, **little-endian** (lowest byte first) |
 | LEN | 2 | `string`, `bytes`, embedded messages, packed repeated fields | varint length, then that many bytes |
 | SGROUP, EGROUP | 3, 4 | groups (deprecated): proto2 groups, or messages with the Editions feature `message_encoding = DELIMITED` | start tag, the fields, end tag |
 | I32 | 5 | `fixed32`, `sfixed32`, `float` | 4 bytes, little-endian |
 
 - **Varint:** 7 bits of the number per byte, least significant group first, and the top bit set on every byte except the last. 1 to 127 take 1 byte; 1500 takes 2.
-- **Negative numbers in `int32`/`int64`** are sign-extended to 64 bits, so `-1` costs **10 bytes**. **`sint32`/`sint64` use ZigZag** encoding first (0 → 0, −1 → 1, 1 → 2, −2 → 3), so small negative numbers stay small. Use `sint*` for fields that are often negative, such as deltas.
+- **Negative numbers in `int32`/`int64`** are **sign-extended** (padded with 1-bits) to 64 bits, so `-1` costs **10 bytes**. **`sint32`/`sint64` use ZigZag** encoding first (0 → 0, −1 → 1, 1 → 2, −2 → 3), so small negative numbers stay small. Use `sint*` for fields that are often negative, such as deltas.
 - `fixed32` (always 4 bytes) beats `uint32` when values are often above 2^28, and `fixed64` (always 8 bytes) beats `uint64` above 2^56, for example hashes and random IDs.
 - **Packed repeated:** in proto3, `repeated int64 line_ids = 7` with values `[1, 2, 3]` is one tag (`0x3a`), one length (`0x03`), then `01 02 03`. Parsers accept both packed and unpacked forms.
 - A **map** is encoded as a repeated entry message with key as field 1 and value as field 2. Map order is not preserved.
@@ -214,6 +264,18 @@ flowchart LR
 
 **In plain words:** plain proto3 fields cannot tell "set to zero" from "never set" — zero just is not sent. Mark a field `optional` when that difference matters.
 
+**Step by step:**
+1. `int32 discount_percent = 5;` and the writer sets it to 0. Zero is not sent at all.
+2. The reader sees nothing for field 5 and reads 0. It cannot tell "0% discount" from "no discount chosen".
+3. Change it to `optional int32 discount_percent = 5;`. Now 0 is sent when set.
+4. The reader can ask `HasDiscountPercent()`: true means "set to 0%", false means "not chosen".
+
+```mermaid
+flowchart LR
+    P["plain field = 0"] --> N["nothing on the wire<br/>reader: 0 or unset?"]
+    O["optional field = 0"] --> Y["0 is sent<br/>reader: Has() = true"]
+```
+
 - **proto3 implicit presence** (plain `string po_number = 6;`): zero values are not sent. A reader cannot tell "set to empty" from "never set". Section 4's test shows a zero-valued invoice encodes to 0 bytes.
 - **`optional` (explicit presence)** generates a `HasPoNumber`-style check (in Go, a pointer field in the classic API). Use it when "unset" and "zero" mean different things, for example in partial updates or `0%` vs "no discount".
 - **Wrapper types** (`google.protobuf.Int64Value`, `StringValue`) were the way to get presence in proto3 before protoc 3.15 (2021) enabled proto3 `optional` by default. Prefer `optional` in new schemas.
@@ -223,14 +285,25 @@ flowchart LR
 
 **In plain words:** old readers do not drop what they do not understand: unknown fields ride along, and unknown enum values are kept as their number.
 
+**Step by step:**
+1. Billing adds field 3, `currency`, and sends a message with fields 1, 2 and 3.
+2. A forwarding service built on the old schema reads fields 1 and 2, and stores field 3 as raw unknown bytes.
+3. It re-sends the message; field 3 goes out unchanged, so the next reader still gets the currency.
+4. Billing adds `INVOICE_STATUS_REFUNDED = 4`. An old reader sees status 4, keeps the number 4, and its `default:` branch handles it.
+
 - A parser keeps fields it does not know as **unknown fields** and writes them back when it re-encodes. A proxy built against an old schema therefore does not drop data added by newer producers (tested in section 4). proto3 runtimes before protobuf 3.5 (2017) dropped unknown fields, so very old binaries are the exception.
 - proto3 enums are **open**: an unrecognized number (a new `INVOICE_STATUS_REFUNDED = 4` read by old code) is kept in the field as that number. In Go, `String()` prints the number. Code must have a `default:` branch for unknown values.
 
 ### Well-known types
 
+**Step by step:**
+1. Need a time? Use `google.protobuf.Timestamp` instead of inventing a `created_at_ms` number.
+2. Need "update only these fields"? Send a `FieldMask` listing the paths, like `["total_cents"]`.
+3. Need "no fields at all" for a request? Use `Empty`.
+
 | Type | Use it for |
 | --- | --- |
-| `Timestamp` | A point in time: seconds and nanos since the Unix epoch, UTC. JSON: RFC 3339 string |
+| `Timestamp` | A point in time: seconds and nanos since the Unix epoch (1 January 1970), UTC. JSON: RFC 3339 string |
 | `Duration` | A span of time. JSON: `"1.5s"` |
 | `FieldMask` | Partial updates: `update_mask` lists the paths to change (Google AIP-134) |
 | `Struct`, `Value` | Arbitrary JSON-like data, when the shape is truly unknown |
@@ -241,9 +314,15 @@ flowchart LR
 
 **In plain words:** protobuf has an official JSON costume for debugging and web clients: names go camelCase and 64-bit numbers become strings so JavaScript cannot mangle them.
 
+**Step by step:**
+1. The binary invoice has field 1 `"inv_1"` and field 2 `1500`.
+2. protojson looks up the names: `id` stays `id`, `total_cents` becomes `totalCents`.
+3. `1500` is an `int64`, so it is written as the string `"1500"`.
+4. Result: `{"id":"inv_1","totalCents":"1500"}`, easy to read in logs.
+
 - Field names become **lowerCamelCase** (`total_cents` → `totalCents`). Parsers accept both the camelCase and the original name.
 - **64-bit integers become JSON strings** (`"1500"`), because JavaScript numbers lose precision above 2^53. Parsers accept both strings and numbers.
-- Enums become their names (`"INVOICE_STATUS_PAID"`), and bytes become base64.
+- Enums become their names (`"INVOICE_STATUS_PAID"`), and bytes become base64 (bytes written as plain letters and digits).
 - Fields with zero values are omitted unless you set `EmitUnpopulated`.
 - Go's `protojson` deliberately adds random whitespace in some builds, so nobody can depend on byte-exact output. Compare parsed values, not strings.
 
@@ -282,7 +361,7 @@ func main() {
 
 **In plain words:** real code with the real library, proving the exact bytes, the "zero is not sent" rule, unknown-field survival, and an 8x speed gap vs JSON.
 
-The code builds the `Invoice` message (fields 1 and 2 only) at runtime from a descriptor, the same structure `protoc` produces, so the real `google.golang.org/protobuf` v1.36.10 library encodes it without code generation. It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
+The code builds the `Invoice` message (fields 1 and 2 only) at runtime from a **descriptor** (a machine-readable description of the schema), the same structure `protoc` produces, so the real `google.golang.org/protobuf` v1.36.10 library encodes it without code generation. It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
 
 ```go
 // Package invoicepb builds the note's Invoice message at runtime, so the real
@@ -507,9 +586,9 @@ These are numbers for one small message on one machine. Measure your own message
 | --- | --- | --- | --- | --- |
 | JSON | Field names | No | Convention only (ignore unknown keys) | Public APIs, browsers, debugging by eye |
 | Protobuf | Field numbers + wire types | To skip or pass on fields, no; to interpret them, yes (a LEN field may be a string, bytes or a message) | Numbered fields, `reserved`, `buf breaking` | gRPC, internal events, mobile clients |
-| Apache Avro | Nothing: fields are written in schema order | Yes: the writer's schema, usually from a schema registry | Reader and writer schemas resolved by field name, with defaults | Kafka pipelines with a registry, Hadoop files |
+| Apache Avro | Nothing: fields are written in schema order | Yes: the writer's schema, usually from a **schema registry** (a shared server that stores every version of every schema) | Reader and writer schemas resolved by field name, with defaults | Kafka pipelines with a registry, Hadoop files |
 | Apache Thrift | Field IDs, like protobuf | Like protobuf: to skip, no; to interpret, yes | Like protobuf | Systems already on Thrift RPC |
-| FlatBuffers | Offsets into a buffer | Yes | Add fields at the end, deprecate, never remove | Games, mobile: read without parsing (zero-copy) |
+| FlatBuffers | Offsets into a buffer | Yes | Add fields at the end, deprecate, never remove | Games, mobile: read without parsing (**zero-copy**: read straight from the received bytes) |
 
 For how events carry schemas across teams, see [[Event Schemas and Schema Registry]].
 
@@ -522,6 +601,8 @@ For how events carry schemas across teams, see [[Event Schemas and Schema Regist
 - **Do not use `float`/`double` for money.** Use `int64` minor units (as `total_cents` does) or a decimal string.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the schema, the wire bytes, presence, unknown fields and the JSON form, with measured sizes and speeds. **Next is the advanced part**: the evolution rules in full, which type changes are safe, `oneof` moves, catching breaks with `buf`, Editions, and Go API traps.
 
 - **Real systems:** gRPC uses protobuf as its default format ([[gRPC]]). Google's public Cloud APIs are designed as protobuf services with JSON mappings. Confluent Schema Registry stores protobuf schemas and checks compatibility for Kafka topics.
 
@@ -616,11 +697,11 @@ Check toolchain support (protoc, buf, protoc-gen-go) before adopting a new editi
 	- Never copy a message by value (`*m`). Generated structs hold internal state, and `go vet`'s copylocks check flags the copy. Use `proto.Clone`.
 	- Compare with `proto.Equal`, not `==` or `reflect.DeepEqual`, which see internal fields.
 	- Getters are nil-safe, so `inv.GetCustomer().GetName()` returns "" instead of panicking when `Customer` is nil. The trap: `inv.GetIssuedAt().AsTime()` also does not panic on nil, but returns 1970-01-01 UTC. Check `inv.GetIssuedAt() != nil` when a missing time must not look like a real one.
-	- The **Opaque API** (protobuf-go v1.36.0, December 2024) generates structs with hidden fields and accessor methods only (`GetX`, `SetX`, `HasX`, `ClearX`). It enables lazy decoding and prevents aliasing bugs. It is opted into per file with an Editions feature, and a "hybrid" API eases migration.
+	- The **Opaque API** (protobuf-go v1.36.0, December 2024) generates structs with hidden fields and accessor methods only (`GetX`, `SetX`, `HasX`, `ClearX`). It enables **lazy decoding** (parsing a field only when it is first read) and prevents **aliasing** bugs (two places unknowingly sharing and changing the same data). It is opted into per file with an Editions feature, and a "hybrid" API eases migration.
 - **Determinism:** `MarshalOptions{Deterministic: true}` makes output stable within one binary (it sorts map keys and, for dynamic messages, fields). It is not a cross-language or cross-version guarantee. Never use encoded bytes as cache keys or signatures without a canonical form.
 - **Last one wins:** if a singular field appears twice on the wire, parsers keep the last value; embedded messages are merged. Concatenating two encoded messages therefore merges them, which is how some systems apply patches.
 - **Size limits:** a single message must be under 2 GiB. Long before that, gRPC's 4 MiB default limit applies; stream large data in chunks.
-- **Recursion limit:** protobuf-go refuses nesting deeper than 10,000 levels by default (`protowire.DefaultRecursionLimit`), which stops stack-exhaustion attacks with crafted input.
+- **Recursion limit:** protobuf-go refuses nesting deeper than 10,000 levels by default (`protowire.DefaultRecursionLimit`), which stops **stack-exhaustion** attacks (input nested so deep the program runs out of call-stack memory) with crafted input.
 - **FieldMask semantics:** in an update, a path in the mask with no value in the message means "clear this field". A missing mask, per AIP-134, means "update every field that is set", which cannot clear implicit-presence fields. Clients that send a full object with a mask avoid that ambiguity.
 
 ## 9. Interview questions 🔴
@@ -635,7 +716,7 @@ Check toolchain support (protoc, buf, protoc-gen-go) before adopting a new editi
 > Add `reserved <number>;` and `reserved "<name>";`. Otherwise a later developer can reuse the number, and old data or old clients would decode the new field's bytes as the deleted one, silently corrupting values.
 
 > [!question]- What is the difference between implicit and explicit presence, and when does it matter?
-> With implicit presence (plain proto3 scalars), a zero value is not sent, so "unset" and "set to zero" look the same. With `optional` (explicit presence), the reader can ask `Has...`. It matters for partial updates, defaults that differ from zero, and tri-state flags.
+> With implicit presence (plain proto3 scalars), a zero value is not sent, so "unset" and "set to zero" look the same. With `optional` (explicit presence), the reader can ask `Has...`. It matters for partial updates, defaults that differ from zero, and **tri-state** flags (yes, no, or not set).
 
 > [!question]- A service on an old schema forwards messages from a newer producer. Is data lost?
 > No. Unknown fields are preserved on parse and written back on serialize, so field 3 survives the hop (the test in section 4 shows this). Data is lost only if the service copies fields one by one into a new message, or converts through JSON.
@@ -656,6 +737,26 @@ Check toolchain support (protoc, buf, protoc-gen-go) before adopting a new editi
 - Evolve: add new numbers, never reuse, `reserved` number and name, add instead of renaming (JSON uses names).
 - protojson: lowerCamelCase names, int64 as strings, never compare output bytes.
 - `buf breaking` in CI; Editions replace `syntax`; Go: `proto.Clone`, `proto.Equal`, nil-safe getters.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what travels on the wire for each field, the name or the number?
+> The number (in a tag), plus the value. Names never travel in binary.
+
+> [!question]- Easy: what must you do when you delete a field?
+> `reserved` its number and its name.
+
+> [!question]- Easy: does an old reader crash on a field number it does not know?
+> No. It skips it and keeps its bytes.
+
+> [!question]- Medium: is renaming a field safe?
+> Safe for binary, but it breaks the JSON form and generated code; add a new field instead.
+
+> [!question]- Medium: a discount of 0% looks the same as "no discount". How do you fix it?
+> Mark the field `optional` so the reader can check whether it was set.
+
+> [!question]- Medium: how do you stop a breaking schema change from merging?
+> Run `buf breaking` in CI against the last release, with the right category (`FILE`, `PACKAGE`, `WIRE_JSON` or `WIRE`).
 
 ## Links 🟢
 

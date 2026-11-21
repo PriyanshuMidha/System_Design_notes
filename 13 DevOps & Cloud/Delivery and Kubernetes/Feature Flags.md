@@ -30,6 +30,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Deployment Strategies - Rolling, Blue-Green, Canary]]: a canary sends a small, growing share of traffic to a new version and rolls back if its error rate rises.
+
 **From zero, in 60 seconds** 🟢
 
 A **feature flag** is an on/off switch in your code that you can flip without a new deploy.
@@ -73,6 +76,13 @@ If it misbehaves, you flip it off in seconds.
 | Default value | What the code uses if flag rules are unavailable | `false` = keep old checkout |
 | Hash | A function that turns input into a fixed-looking number | `hash("user42")` → bucket 37 |
 | Rollout percentage | Share of users who get the feature | 10% → 50% → 100% |
+| Bucket | A fixed number from 0 to 99 that a user always gets for one flag | user42 → bucket 37 |
+| Targeting rule | A condition that decides who gets the flag before the percentage is used | `plan == enterprise` → on |
+| Segment | A saved, named group of users | "internal staff", "beta testers" |
+| Kill switch | A flag used to switch something off fast during trouble | Turn off recommendations when search is slow |
+| A/B experiment | Two versions shown to two random groups to see which does better | 50% see the green button, 50% the blue |
+| Control plane | The flag service where people edit rules; apps only download them | LaunchDarkly dashboard |
+| Flag debt | Old flags left in code after their decision is made | `if newCheckout {...}` a year after launch |
 
 **Picture it**
 
@@ -112,21 +122,59 @@ With a flag:
 
 The flag turns "redeploy under pressure, with a live incident running" into "change one number," which is both faster and far less risky, since changing a flag's rollout percentage cannot introduce a new bug the way a fresh deploy can.
 
+### Real-life example: a new WhatsApp feature reaching you late 🟢
+
+You may have noticed a friend gets a new WhatsApp feature weeks before you do, even on the same app version.
+That is a feature flag at work: the code is already on both phones, but it is switched on for a small share of users first.
+The team watches crash and usage numbers for that group, then widens the share.
+If something goes wrong, they switch it off for everyone in minutes, without asking anyone to update the app.
+The same idea works on the server side for a Go API.
+
 ## 2. Mental model 🟢
 
-A feature flag is a named, cached decision table the application consults before running a branch of code: "for this flag, for this user/request, true or false (or which variant)?"
+A feature flag is a named, cached decision table the application consults before running a branch of code: "for this flag, for this user/request, true or false (or which variant, meaning which of several versions)?"
 
 The key mental shift from a naive implementation is that this table is **not fetched over the network on every request**.
 
-Instead, a real flag SDK fetches or streams the rules once, caches them in memory, and evaluates locally, so flag checks cost a map lookup and a hash, not an RPC.
+Instead, a real flag SDK fetches or streams the rules once, caches them in memory, and evaluates locally, so flag checks cost a map lookup and a hash, not an RPC (a call to another service over the network).
 
 A flag's rules are usually more than one percentage number. A real targeting configuration is an ordered list: match an **attribute** first ("`plan == enterprise`" or "`country in {IN, US}`"), fall back to a named **segment** (a saved, reusable group of users — "beta testers", "internal staff"), and only once nothing more specific matches, fall through to the **percentage rollout** this note's code implements.
 
 The percentage bucket is the last, catch-all rule in the list, not the whole targeting model.
 
+## Common beginner mistakes 🟢
+
+- **Calling the flag service over the network on every request** → it adds delay, and if it is down your app is down → use an SDK that keeps the rules in memory and checks them locally.
+- **Picking users with plain random numbers each request** → the same user flips between old and new pages → hash the user ID with the flag name so each user always gets the same answer.
+- **Never deleting finished flags** → the code fills with dead branches nobody tests → give every flag an owner and a cleanup date.
+- **Hiding a paid feature with a browser-side flag** → anyone can read and change it in their browser → enforce access on the server.
+- **Using a flag to "protect" a release whose binary might crash** → no flag check runs if the app never starts → use a canary for risk in the binary itself.
+
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that a flag lets you ship code switched off and turn it on later for some or all users. **Next we open the box**: how the app gets the rules once and checks them in memory, and how hashing gives each user a stable answer as the percentage grows.
+
 **In plain words:** the app keeps a copy of all flag rules in memory. For each request it checks the rules locally, so no network call slows you down.
+
+**Step by step (getting and checking the rules):**
+1. The Go service starts and its flag SDK downloads every flag rule once from the flag service.
+2. The SDK keeps a streaming connection (a connection that stays open so the server can push updates) to hear about changes.
+3. A request from user 42 asks "is `new-checkout` on?". The SDK answers from memory in microseconds; no network call.
+4. Someone changes the rollout from 5% to 25% on the dashboard. The change is pushed and the SDK updates its copy within seconds.
+5. If the flag service is down, the SDK keeps using its last copy, or the safe default (`false`), and requests carry on.
+
+```mermaid
+flowchart LR
+    Q["Is new-checkout on?"] --> M{"Rules in memory?"}
+    M -- "yes" --> A["Answer from cached rules"]
+    M -- "no, service down at start" --> D["Use safe default: off"]
+```
+
+**Step by step (percentage buckets):**
+1. Mix the flag name and user ID: `hash("new-checkout", "user42")`, then take the remainder after dividing by 100. User 42 gets bucket 37, today and every day.
+2. Rollout is 10%: is 37 under 10? No, so user 42 sees the old checkout.
+3. Rollout becomes 50%: 37 is under 50, so user 42 now sees the new one.
+4. Raising the percentage only adds users; nobody who was already "in" is ever pushed out.
 
 ```mermaid
 sequenceDiagram
@@ -186,7 +234,7 @@ The full version below adds the edge cases that matter in production: percentage
 
 **In plain words:** Go code of that exact trick, with tests showing the split comes out close to the target.
 
-This models what an OpenFeature-style SDK does per request: no network call, just a deterministic hash against a cached percentage. A real OpenFeature client call looks like `client.BooleanValue(ctx, "new-checkout", false /* default */, evalCtx)`.
+This models what an OpenFeature-style SDK (OpenFeature is a vendor-neutral standard API for checking flags) does per request: no network call, just a deterministic hash against a cached percentage. A real OpenFeature client call looks like `client.BooleanValue(ctx, "new-checkout", false /* default */, evalCtx)`.
 
 `evalCtx` carries the attributes (user ID, plan, country) the provider's targeting rules match against before ever reaching a percentage bucket; `Enabled` below is the percentage-bucket piece of that evaluation.
 It is written directly instead of through the OpenFeature API so it stays a dependency-free, readable example.
@@ -227,6 +275,8 @@ func Enabled(flagKey, userID string, percentage int) bool {
 ```
 
 Tests covering the three properties that actually matter for a rollout: determinism (a user's result never flips between calls at the same percentage), monotonic ramping (raising the percentage only adds users), and a roughly even distribution:
+
+**What this code does, in plain words:** the tests ask the same question many times and check the answer never changes, raise the percentage and check nobody drops out, and run 100,000 fake users to check that about 10% are "on" at 10%.
 
 ```go
 package flags
@@ -287,17 +337,26 @@ func TestEnabled_Bounds(t *testing.T) {
 }
 ```
 
-**Measured (Go 1.24, `go test -race`, 2026-11-07):** over 100,000 synthetic user IDs, `Enabled(..., pct)` turned on 10.05% of users at `pct=10`, 25.08% at `pct=25`, and 50.14% at `pct=50` — within about 0.15 percentage points of the target at every level, which is the kind of spread an `FNV-1a`-based bucketing gives in practice.
+**Measured (Go 1.24, `go test -race`, 2026-11-07):** over 100,000 synthetic user IDs, `Enabled(..., pct)` turned on 10.05% of users at `pct=10`, 25.08% at `pct=25`, and 50.14% at `pct=50` — within about 0.15 percentage points of the target at every level, which is the kind of spread an `FNV-1a`-based (a simple, fast hash function built into Go) bucketing gives in practice.
 
 ## 5. Variants and comparison 🟡
 
 | Flag type | How it works | Use when | Cost |
 | --- | --- | --- | --- |
-| Release toggle | On/off switch wrapping unfinished or unreleased code, usually removed soon after full rollout | Shipping a feature across multiple PRs/deploys before it's ready for any users | Short-lived; cheap if actually deleted after full rollout |
+| Release toggle | On/off switch wrapping unfinished or unreleased code, usually removed soon after full rollout | Shipping a feature across multiple PRs (pull requests, proposed code changes)/deploys before it's ready for any users | Short-lived; cheap if actually deleted after full rollout |
 | Experiment (A/B) flag | Randomly assigns each user to a variant, held stable for the life of the experiment, and tied to an analytics event | Measuring a feature's effect on a business metric, not just rolling it out safely | Needs a stats/experimentation platform to read results correctly, not just the SDK |
 | Ops / kill switch | A flag that disables a feature or an entire dependency call under operational stress (e.g. "disable recommendations if search is slow") | Protecting the system during an incident or overload, independent of any release | Must have a safe, well-tested "off" code path, or the kill switch itself is untested until the worst moment |
 | Entitlement flag | Gates a feature by plan/tier/tenant rather than by rollout percentage | Paid-plan gating, enterprise-only features | Long-lived by design; not something to "clean up" like a release toggle |
 | Client-side flag | Evaluated in the browser/mobile app, often fetched at app start | UI-only behavior, where no sensitive targeting logic needs to stay server-side | Flag values and targeting rules are visible to the client; never put a security decision behind a client-side flag |
+
+### Feature flag vs canary deploy: the pair people mix up 🟡
+
+| Question | Feature flag | Canary deploy |
+| --- | --- | --- |
+| What changes for the user? | Which code path runs inside the same app | Which version of the whole app serves them |
+| How fast is "off"? | Seconds, a setting change | Seconds to minutes, shift traffic back |
+| Protects against a crash at start-up? | No, the flag check never runs | Yes, the bad version gets little traffic |
+| Needs a new deploy to change? | No | Yes, a new version must be deployed |
 
 ## 6. Trade-offs and when not to use 🟡
 
@@ -305,11 +364,14 @@ func TestEnabled_Bounds(t *testing.T) {
 - A flag is not a substitute for a real deployment strategy when the risk is in the binary itself (a crash, a memory leak, a broken startup) rather than in one code path — no flag check runs if the process never starts.
 - Flags add a layer of indirection to "what is actually running for this user," which makes some production bugs harder to reproduce locally unless the targeting rules (or at least the specific user's evaluation) are easy to query.
 - For a one-off internal script or a feature with no realistic rollback scenario, the overhead of wiring a flag is not worth it; plain code plus a normal deploy is simpler and has no flag debt to clean up later.
-- If the flag service's SDK does not evaluate locally with a safe default, a flag you added to reduce risk can itself become a single point of failure that blocks every request when it can't be reached — the opposite of its purpose.
+- If the flag service's SDK does not evaluate locally with a safe default, a flag you added to reduce risk can itself become a single point of failure (one part whose failure stops everything) that blocks every request when it can't be reached — the opposite of its purpose.
 
 ## 7. In production 🔴
 
-- **Real systems:** LaunchDarkly, Unleash, GrowthBook, and Flagsmith are commercial/open-source flag platforms; most of them, along with in-house systems at large tech companies, follow the same shape — a control plane for rules and a lightweight SDK that caches and evaluates locally. The OpenFeature project (under the CNCF) standardizes the evaluation API so an application can swap providers without rewriting every flag check.
+> 🟡 → 🔴 **You now know** how flags are evaluated locally from cached rules, how hashing makes percentage rollouts stable, and the main kinds of flags. **Next is the advanced part**: the failure modes real teams hit (unreachable flag service, flag debt, untested combinations, client-side bypass) and the deeper design of streaming, bucketing, audit trails and testing.
+
+
+- **Real systems:** LaunchDarkly, Unleash, GrowthBook, and Flagsmith are commercial/open-source flag platforms; most of them, along with in-house systems at large tech companies, follow the same shape — a control plane for rules and a lightweight SDK that caches and evaluates locally. The OpenFeature project (under the CNCF, the foundation that also hosts Kubernetes) standardizes the evaluation API so an application can swap providers without rewriting every flag check.
 - **Failure modes → fixes:**
   - The flag service is unreachable at startup or mid-run → the SDK must serve its last cached rules (or a hardcoded default baked into the flag definition), never block or error the request; test this path explicitly, since it's the one path that only runs during an actual incident.
   - A flag's default silently changes meaning over time (someone edits the rule, forgetting what depends on it) → keep an owner and an expiry/cleanup date on every flag, and alert on flags past their expected lifetime.
@@ -320,10 +382,10 @@ func TestEnabled_Bounds(t *testing.T) {
 
 ## 8. Deep dive 🔴
 
-- **Streaming vs. polling.** A flag SDK typically either polls the control plane every N seconds or holds a long-lived streaming connection (SSE or a websocket) that pushes rule changes as they happen. Streaming gets near-instant propagation (useful for an ops kill switch during an incident); polling is simpler and tolerates flakier networks, at the cost of a propagation delay bounded by the poll interval.
+- **Streaming vs. polling.** A flag SDK typically either polls the control plane every N seconds or holds a long-lived streaming connection (SSE, server-sent events, a one-way stream from server to client; or a websocket) that pushes rule changes as they happen. Streaming gets near-instant propagation (useful for an ops kill switch during an incident); polling is simpler and tolerates flakier networks, at the cost of a propagation delay bounded by the poll interval.
 - **Local evaluation is the architecture, not an optimization.** The naive design — call the flag service synchronously on every request — adds a network round trip (and a new failure mode: flag service down means app down) to every single request. Real SDKs instead treat the flag service purely as a source of *rule updates*, decoupling "is the flag service healthy right now" from "can this request be served."
 - **Deterministic bucketing and sticky assignment.** Hashing `(flagKey, userID)` guarantees the same user always lands in the same bucket for that flag, which is what makes a ramp from 10% to 50% to 100% monotonic (nobody who was "in" at 10% is ever excluded later) and what makes an A/B experiment valid (a user doesn't switch variants mid-experiment). Using a different hash per flag (not a single global per-user hash) also avoids correlating unrelated experiments — two independent 50% flags shouldn't always land the same users in the same bucket.
-- **Flag debt and expiry.** A release toggle is meant to be temporary: once a feature is at 100% and stable, the flag and the old code path should be deleted, or the codebase accumulates permanent conditionals that nobody dares remove. Mature setups track an owner and a review/expiry date per flag and flag "stale flags over N days old" as a lint-style check in CI.
+- **Flag debt and expiry.** A release toggle is meant to be temporary: once a feature is at 100% and stable, the flag and the old code path should be deleted, or the codebase accumulates permanent conditionals that nobody dares remove. Mature setups track an owner and a review/expiry date per flag and flag "stale flags over N days old" as a lint-style check (an automatic code-quality rule) in CI.
 - **Audit trail.** Every rule or percentage change is logged with who changed it, when, and the before/after value — LaunchDarkly and Unleash both keep this as a first-class feature, not an afterthought. When an incident review starts with "did anything change recently?", the flag audit log is one of the first places to check, right alongside the deploy log, precisely because a flag change can cause a production regression with no code deploy and no entry in Git history at all.
 - **Testing flag combinations.** Since most of a test suite exercises only the currently-default combination of flags, a common practice is to explicitly run the critical path's tests once with each release toggle forced on and once forced off, rather than relying on incidental coverage — this is one of the concerns [[Testing in CI-CD, Flaky Tests and Testing in Production]] covers for CI pipelines with flags in play.
 
@@ -365,6 +427,30 @@ func TestEnabled_Bounds(t *testing.T) {
 - Flag types: release toggle (temporary), experiment (A/B), ops kill switch, entitlement (long-lived).
 - Track an owner and expiry per flag; delete release toggles once the rollout is complete and stable.
 - A flag moves a code path; a deployment strategy moves a binary — use both for the riskiest releases.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is the difference between deploying and releasing?
+> Deploying puts the code on the servers; releasing lets users actually see it.
+
+> [!question]- What should happen if the flag service is down?
+> The app keeps using its last cached rules or a safe default, and requests still succeed.
+
+> [!question]- What should you do with a flag once the feature is at 100% and stable?
+> Delete the flag and the old code path.
+
+🟡 Medium
+
+> [!question]- Why hash `(flag name, user ID)` instead of picking a random number per request?
+> The hash gives each user the same bucket every time, so they do not flip between old and new.
+
+> [!question]- Raising a rollout from 10% to 50%: can a user who had the feature lose it?
+> No. Their bucket stays the same, and the threshold only goes up.
+
+> [!question]- Why can a browser-side flag not protect a paid feature?
+> Users can see and change client-side values, so the server must enforce access itself.
 
 ## Links
 

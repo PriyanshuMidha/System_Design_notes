@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Docker 01 - Why Containers]]: a container is a process walled off by Linux namespaces, including its own network view.
+> - [[Docker 02 - Images, Layers and Containers]]: you start containers from images with `docker run`, and one image can run as many containers.
+
 **From zero, in 60 seconds** 🟢
 
 Each container gets its own private little network, with its own address. Outsiders can't see it by default.
@@ -75,6 +79,12 @@ This note explains how containers get connected, and why it is "off" by default.
 | Network namespace | A Linux feature giving a process its own private network view | Each container has one |
 | NAT | Rewriting addresses on packets as they pass through a router | Host `:8080` → container `:80` |
 | Bridge | A virtual network switch inside the host | `docker0` |
+| veth pair | Two linked virtual network cards, like a cable with a plug at each end | One end in the container, one on the bridge |
+| iptables | Linux's built-in firewall and address-rewriting rules | Docker adds rules here for `-p` |
+| Publish a port | Tell Docker to forward a host port into a container port | `-p 8080:80` |
+| User-defined network | A network you create by name; it can look up containers by name | `docker network create app-net` |
+| Embedded DNS | Docker's tiny name lookup service inside each container on a user-defined network | Answers at `127.0.0.11` |
+| Subnet | A block of IP addresses that belong to one network | `172.18.0.0/24` = 256 addresses |
 
 **Picture it**
 
@@ -112,6 +122,20 @@ The reason: the default `bridge` network Docker creates automatically has no emb
 
 Without understanding that one fact, the "just use Compose, it works" advice looks like magic.
 
+```mermaid
+flowchart LR
+    D["Default bridge:<br/>api asks for 'redis'"] --> X["no DNS: 'no such host'"]
+    U["User-defined network:<br/>api asks for 'redis'"] --> Y["embedded DNS: 172.18.0.3"]
+```
+
+### Real-life example: a payments service on your laptop 🟢
+
+Say you build a payments service for a UPI-style app and test it locally with Postgres and Redis in containers.
+The API container must reach Postgres by the name `db`, which works only on a user-defined network (Compose makes one for you).
+Your browser must reach the API, so you publish its port with `-p 8080:8080`.
+Postgres should not be reachable from outside your laptop at all, so you either do not publish it, or publish it only on `127.0.0.1`.
+Those three decisions are this whole note in miniature.
+
 ## 2. Mental model 🟢
 
 Picture the Docker host as an apartment building:
@@ -121,11 +145,28 @@ Picture the Docker host as an apartment building:
 - The building's main electrical panel (iptables NAT rules) decides which signals from the street (the host's external interface) get forwarded into which apartment.
 - That forwarding only happens for the specific rules you've installed — that's what `-p` does.
 
+## Common beginner mistakes 🟢
+
+- **Using `localhost` to reach another container** → inside a container, `localhost` means that same container → use the other container's name, like `redis:6379`.
+- **Leaving the app listening on `127.0.0.1`** → forwarded traffic arrives on a different address and finds nobody → listen on `0.0.0.0` (in Go, just `":8080"`).
+- **Thinking `EXPOSE` publishes a port** → it is only a note in the image → use `-p` on `docker run` or `ports:` in Compose.
+- **Publishing a database with `-p 5432:5432` on a cloud server** → it is open to the whole internet, past your firewall → bind to `127.0.0.1:5432:5432` or do not publish it.
+- **Relying on the default bridge network** → container names do not resolve there → create a network (`docker network create`) or use Compose.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that each container has its own private network, that a bridge joins containers on one host, and that `-p` lets outsiders in. **Next we open the box**: the virtual cables and rules that make this work, the different network modes, and a checklist for when "it won't connect".
 
 ### The host, the bridge, and two containers
 
 **In plain words:** each container has a virtual cable plugged into the bridge. The bridge connects them to each other and, through the host, to the internet.
+
+**Step by step:**
+1. You run `api` and `redis` on a network called `br-app`. Docker gives them addresses `172.18.0.2` and `172.18.0.3`.
+2. For each container, Docker makes a veth pair: one end becomes the container's `eth0`, the other end plugs into the bridge.
+3. `api` sends a packet to `172.18.0.3`. The bridge passes it straight to `redis`, like a switch in an office.
+4. A user outside sends a request to the host's real address on port 8080.
+5. A firewall rule on the host (iptables) rewrites the destination to `172.18.0.2:80` and sends it across the bridge to `api`.
 
 ```mermaid
 flowchart TB
@@ -156,13 +197,19 @@ flowchart TB
     ethA -->|"redis:6379 (embedded DNS resolves 'redis' → 172.18.0.3)"| ethB
 ```
 
-Each container's `eth0` lives inside its own network namespace and is one end of a virtual ethernet (veth) pair; the other end is attached to the bridge.
+Each container's `eth0` (its network card; on the host, `eth0` is the real NIC, the physical network card) lives inside its own network namespace and is one end of a virtual ethernet (veth) pair; the other end is attached to the bridge.
 
-The bridge acts as a virtual switch connecting every container on that network, and the host's iptables rules (in the `DOCKER` and `POSTROUTING` chains) handle both NAT for outbound traffic and port forwarding for published ports.
+The bridge acts as a virtual switch connecting every container on that network, and the host's iptables rules (in the `DOCKER` and `POSTROUTING` chains, which are named lists of rules checked in order) handle both NAT for outbound traffic and port forwarding for published ports.
 
 ### Network drivers
 
 **In plain words:** a few network modes: bridge (the normal one), host (no wall at all), none (no network), and overlay (across many machines).
+
+**Step by step (picking one):**
+1. Several containers on one machine that need to talk by name? Create a user-defined `bridge`. This is the answer 9 times out of 10.
+2. A tool that must see the host's own network traffic, or you need every last microsecond? `host`, accepting there is no wall.
+3. A job that must never touch the network? `none`.
+4. Containers spread over several machines? `overlay` in Docker Swarm, or Kubernetes' own networking.
 
 | Driver | What it does | Use when |
 | --- | --- | --- |
@@ -170,12 +217,17 @@ The bridge acts as a virtual switch connecting every container on that network, 
 | `bridge` (user-defined) | Same isolation, plus embedded DNS resolving container names and `--network-alias` | The default choice for one host running several containers that must find each other by name |
 | `host` | Container shares the host's network namespace directly; no NAT, no port mapping needed | Maximum network performance, or a tool that needs to see host-level network traffic; loses network isolation entirely |
 | `none` | No networking at all | A batch job or CLI tool that must not reach the network |
-| `overlay` | A virtual network spanning multiple Docker hosts, built on VXLAN | Docker Swarm multi-host clusters (Kubernetes uses its own CNI model instead; see [[IP Addressing, Subnets, NAT and VPC Basics]] for the underlying concepts) |
-| `macvlan` | Container gets its own MAC address and appears as a physical device on the LAN | Legacy apps that expect to own a real network identity (e.g. must be directly reachable by IP from other LAN devices, not just the host) |
+| `overlay` | A virtual network spanning multiple Docker hosts, built on VXLAN (a way to wrap one network's packets inside another's so they cross machines) | Docker Swarm multi-host clusters (Kubernetes uses its own CNI model instead, CNI being the plug-in standard for pod networking; see [[IP Addressing, Subnets, NAT and VPC Basics]] for the underlying concepts) |
+| `macvlan` | Container gets its own MAC address (the hardware ID of a network card) and appears as a physical device on the LAN (the local office or home network) | Legacy apps that expect to own a real network identity (e.g. must be directly reachable by IP from other LAN devices, not just the host) |
 
 ### Container-to-container, container-to-host, host-to-container
 
 **In plain words:** containers on the same user-made network find each other by name. Reaching the host or being reached from it needs special names or published ports.
+
+**Step by step:**
+1. `api` wants Redis: it calls `redis:6379`. Docker's embedded DNS turns `redis` into `172.18.0.3`.
+2. `api` wants a tool running on your laptop itself (not in a container) on port 9000: it calls `host.docker.internal:9000`.
+3. You on your laptop want `api`: you call `localhost:8080`, which only works because `api` was started with `-p 8080:80`.
 
 ```mermaid
 flowchart LR
@@ -197,6 +249,12 @@ flowchart LR
 ### Publishing a port
 
 **In plain words:** -p 8080:80 means "host port 8080 goes to container port 80". Docker adds a forwarding rule on the host to do it.
+
+**Step by step:**
+1. You run `docker run -p 8080:80 api`. Docker adds one rule: "packets for host port 8080 go to `172.18.0.2:80`".
+2. A client opens a connection to the host on port 8080 (the first packet of a TCP connection is called a SYN).
+3. The rule rewrites the packet's destination to the container's address and port. This rewrite is called DNAT (destination NAT).
+4. The app replies. On the way out the host rewrites the reply so the client sees it coming from host port 8080.
 
 ```mermaid
 sequenceDiagram
@@ -223,18 +281,24 @@ sequenceDiagram
 
 `EXPOSE 80` in a Dockerfile does **none** of this on its own — it only documents intent and changes what `-P` publishes.
 
-A port not published at all is still reachable by *other containers on the same network* at its container-internal port, which is sufient for most inter-service traffic and is one reason not to publish a database's port to the host at all in production.
+A port not published at all is still reachable by *other containers on the same network* at its container-internal port, which is sufficient for most inter-service traffic and is one reason not to publish a database's port to the host at all in production.
 
 > [!warning] Interview trap
 > `-p 8080:80` with no explicit bind address publishes to **every** interface on the host, not just loopback.
 >
-> On a cloud VM with a public IP and no firewall, that line alone makes the container reachable from the internet, bypassing any `ufw`/`iptables` rules you think are blocking that port — Docker inserts its own rules ahead of most host firewall configurations.
+> On a cloud VM with a public IP and no firewall, that line alone makes the container reachable from the internet, bypassing any `ufw` (Ubuntu's simple firewall tool)/`iptables` rules you think are blocking that port — Docker inserts its own rules ahead of most host firewall configurations.
 >
-> Bind explicitly to `127.0.0.1:` for anything that should stay local, and put a real firewall or security group in front of anything that shouldn't.
+> Bind explicitly to `127.0.0.1:` for anything that should stay local, and put a real firewall or security group (a cloud provider's firewall around a server) in front of anything that shouldn't.
 
 ### Debugging checklist
 
 **In plain words:** walk the path step by step: is the app running, is it listening on 0.0.0.0, is the port published, is anything else using the port.
+
+**Step by step:**
+1. From inside the container: `docker exec api curl localhost:80`. Fails? The app is down or on the wrong port.
+2. From a neighbour container: `curl api:80`. Fails? Check both are on the same user-defined network.
+3. From the host: `curl localhost:8080`. Fails? Check `docker port api` for the mapping, and that the app listens on `0.0.0.0`.
+4. From another machine: fails? The port is bound to `127.0.0.1` only, or a firewall blocks it.
 
 ```mermaid
 flowchart TD
@@ -295,7 +359,7 @@ http.ListenAndServe(":8080", mux)
 }
 ```
 
-`docker network inspect br-app` confirms both containers share a subnet; `docker exec api nslookup redis` resolving to `172.18.0.3` confirms the embedded DNS is working.
+`docker network inspect br-app` confirms both containers share a subnet (`IPAM`, IP address management, is the part that hands out addresses); `docker exec api nslookup redis` resolving to `172.18.0.3` confirms the embedded DNS is working.
 
 `netshoot` (`docker run --rm -it --network container:api nicolaka/netshoot`) attaches a full network-debugging toolbox (`tcpdump`, `curl`, `dig`) into the same network namespace as a running container, which is the standard way to debug a distroless container that has no shell of its own.
 
@@ -313,11 +377,14 @@ http.ListenAndServe(":8080", mux)
 ## 6. Trade-offs and when not to use 🟡
 
 - Bridge networking adds a few microseconds of NAT/veth overhead per packet versus `host` networking — irrelevant for almost all applications, worth measuring before trading away isolation for it.
-- Publishing a port is an all-or-nothing decision per `-p` line; fine-grained access control (allow service A, deny service B) needs a firewall, security group, or service mesh in front, not Docker networking alone.
+- Publishing a port is an all-or-nothing decision per `-p` line; fine-grained access control (allow service A, deny service B) needs a firewall, security group, or service mesh (a proxy next to every service that controls who may call whom) in front, not Docker networking alone.
 - `macvlan` makes a container a first-class citizen on the physical LAN, which also means it bypasses the host's own firewall rules for that container — a real security trade-off, not just a convenience.
 - Container-to-container names only resolve on networks with embedded DNS (user-defined or Compose-created); mixing in the default `bridge` network silently breaks name resolution with no obvious error beyond "connection refused" or "no such host."
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how veth pairs, the bridge and iptables rules carry traffic, which network mode fits which job, and how to debug "can't connect". **Next is the advanced part**: the exposures and failures seen on real servers, and the kernel details (namespaces, NAT chains, embedded DNS) interviewers ask about.
+
 
 - **Real systems:** Compose and Docker Swarm both default to user-defined bridge/overlay networks precisely so service discovery by name works out of the box; Kubernetes solves the same container-to-container reachability problem with its own CNI-based pod network model instead of Docker's bridge driver — see [[IP Addressing, Subnets, NAT and VPC Basics]] for the shared concepts (subnets, NAT, routing) that both build on.
 - **Failure modes → fixes:**
@@ -364,6 +431,30 @@ http.ListenAndServe(":8080", mux)
 - `-p 8080:80` with no bind address publishes to every host interface, not just loopback — use `-p 127.0.0.1:8080:80` for anything that should stay local.
 - `docker network inspect <net>` shows which containers share a subnet; `nslookup`/`netshoot` debug name resolution from inside.
 - `--network host` removes NAT and isolation entirely and makes `-p` a no-op.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Inside a container, what does `localhost` mean?
+> That same container, never the host and never another container.
+
+> [!question]- What does `-p 8080:80` do?
+> It forwards traffic that hits port 8080 on the host into port 80 of the container.
+
+> [!question]- How does the `api` container reach Redis on a user-defined network?
+> By name, `redis:6379`; Docker's embedded DNS turns the name into the current IP.
+
+🟡 Medium
+
+> [!question]- The port mapping in `docker ps` looks right, but `curl localhost:8080` gets "connection refused". What do you check first?
+> Whether the app inside listens on `127.0.0.1`; it must listen on `0.0.0.0` (or `:8080`).
+
+> [!question]- Why is `-p 5432:5432` risky on a cloud VM, and what is safer?
+> It listens on every interface, so the database may be open to the internet; use `-p 127.0.0.1:5432:5432` or do not publish it.
+
+> [!question]- Why does `-p` do nothing with `--network host`?
+> The container uses the host's network directly, so container port 8080 already is host port 8080.
 
 ## Links
 

@@ -106,6 +106,7 @@ The owner rejected the first API reels and the character voices. Rules:
 4. **Less on screen.** Only a few big words, at most. No paragraph captions repeating the narration.
 5. **Each reel is independent.** It does NOT have to stay in the Orbit Station / space world. Pick whatever setting explains the idea best (a bridge, a kitchen, a city, a toy factory). Reuse a storyline only when it genuinely fits.
 6. **Script first.** Show the reel script (narration paragraph plus the shot list) and wait for approval before building.
+7. **Narrator only (owner, 2026-11-21).** No character voices and no talking or acting characters in reels. 3D objects and graphics explain everything. Fast pace (narrator about +8%, a visual change every 2 to 3 s), everyday words and everyday analogies, 45 to 60 s. It must not look or sound like the long story videos.
 
 **Character dialogue in long videos**
 1. Characters must sound like people talking, not reading a script: contractions, short sentences, interruptions, reactions ("wait", "hold on", "oh no"), questions answered with questions, quick back and forth of 3 to 8 words. No lecture-style paragraphs from characters.

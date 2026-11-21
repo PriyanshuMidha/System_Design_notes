@@ -33,6 +33,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (what the CPU numbers mean), 4 (first 5 minutes and the incident), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Production Debugging Playbook]]: check "what changed" first, and stop the damage before hunting the cause.
+> - [[Incident Response]]: one person leads, and you post short updates on a fixed schedule.
+
 **From zero, in 60 seconds** 🟢
 
 The **CPU** is the part of a computer that does the actual thinking work.
@@ -80,6 +84,12 @@ A server with saturated CPU is that cashier: requests queue and the site slows d
 | Throttling | The kernel pausing a container that hit its limit | Pod slow at 50% CPU |
 | Profile (pprof) | A sample of which functions use the CPU | `json.Marshal` = 40% |
 | Thread / goroutine | A unit of work the scheduler runs | Go runs goroutines on threads |
+| Run queue | Tasks ready to run but waiting for a free core | `vmstat` column `r` = 12 on 8 cores |
+| Load average | Average number of tasks running or waiting, over 1, 5 and 15 minutes | load 16 on 8 cores = a queue |
+| Millicores (`500m`) | Kubernetes's unit for CPU: 1000m = 1 core | `500m` = half a core |
+| Steal time | Time a cloud host gave your virtual CPU to another customer | `st` = 8% |
+| `GOMAXPROCS` | How many threads Go runs your code on at once | should match the CPU limit |
+| HPA | Kubernetes's autoscaler that adds pods when CPU rises | stuck at its max of 8 |
 
 **Picture it**
 
@@ -113,7 +123,7 @@ A CPU is like a single cashier. If customers arrive slower than the cashier can 
 - p99 latency rises first, then p50; timeouts and 5xx follow.
 - Load average above the number of cores; `vmstat` shows a long run queue.
 - Health checks start to fail because the process is too busy to answer, so Kubernetes restarts pods, which concentrates traffic on the rest.
-- Autoscaler maxes out at its replica limit.
+- Autoscaler (HPA) maxes out at its replica limit (the most pods it may create).
 - Batch jobs run late; queue consumers fall behind (consumer lag grows).
 
 **User impact:**
@@ -135,6 +145,13 @@ flowchart LR
 > [!tip] Remember
 > Saturation is about waiting, not about the percentage. Look for the queue, not only the usage.
 
+### Real-life example: search on sale day 🟢
+
+Think of the search box on a shopping app like Myntra during a big sale.
+A new release adds a clever "did you mean" feature that is fine for short searches but very heavy for long ones.
+When a crawler (a bot that reads many pages) sends long queries, every search pod hits its CPU limit and search takes 4 seconds.
+Rolling back the release brings it back in minutes; a CPU profile the next day shows one function using most of the CPU.
+
 ## 2. Mental model 🟢
 
 A CPU core is a cashier; the run queue is the line; throttling is a manager who says "you only get 2 hours of cashier time per shift" even though the shop is open; steal time is another shop borrowing your cashier.
@@ -155,11 +172,27 @@ Where it breaks down: a real CPU can be time-sliced across thousands of threads,
 > [!warning] Common mistake
 > Reading "CPU 50 percent" on a pod with a 1-core limit as healthy. If the pod is throttled, the node looks half idle while the pod has used 100 percent of its quota and is being paused.
 
+## Common beginner mistakes 🟢
+
+- **Reading "CPU 50%" as healthy** → a pod at its limit can be throttled while the node looks half idle → check throttled periods first.
+- **Scaling out when a database is the real bottleneck** → more pods put more load on it → check dependency dashboards before scaling.
+- **Fixing code before mitigating** → users keep waiting while you read profiles → roll back, scale out or shed load first.
+- **Ignoring `GOMAXPROCS` on older Go** → Go runs as many threads as the node has cores and gets throttled constantly → use Go 1.25+ or `automaxprocs`.
+- **Restarting pods and forgetting the profile** → the evidence vanishes → take a 30-second CPU profile before or right after mitigating.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that saturation means work is waiting, and that four different causes look the same. **Next we open the box**: what each CPU number means, how container limits pause your app, how Go picks its thread count, and why load average tells you more than "% busy".
 
 ### CPU time and what each number means
 
 **In plain words:** tools like `top` split CPU time into buckets: your code, the system, waiting for disk, and so on. Each bucket points to a different cause.
+
+**Step by step:**
+1. Run `mpstat -P ALL 1` or look at the top line of `top`.
+2. High `us` → your app's own code is busy: take a profile.
+3. High `sy` → lots of kernel work: syscalls (calls from the app into the kernel) or context switches (the CPU swapping between threads).
+4. High `wa` → waiting on disk; not a CPU problem. High `st` → another customer on the same cloud host is taking CPU.
 
 On Linux, CPU time per core is split into states. `top` and `mpstat` show them.
 
@@ -169,7 +202,7 @@ On Linux, CPU time per core is split into states. `top` and `mpstat` show them.
 | `sy` | Kernel code | Many syscalls, context switches, network or disk I/O handling |
 | `wa` | Waiting for I/O | Disk or network storage is slow (not a CPU problem) |
 | `st` | Stolen by hypervisor | Noisy neighbour or oversold host |
-| `si`, `hi` | Interrupts | Heavy network traffic on few cores |
+| `si`, `hi` | Interrupts (hardware asking the CPU for attention) | Heavy network traffic on few cores |
 | `id` | Idle | Spare capacity |
 
 ```mermaid
@@ -182,11 +215,19 @@ flowchart TD
     B -- "si" --> G["Interrupts: spread NIC queues, RSS and IRQ affinity"]
 ```
 
+(In that last box, NIC queues, RSS and IRQ affinity are network-card settings that spread incoming traffic across more CPU cores.)
+
 ### How container CPU limits throttle you
 
 **In plain words:** A CPU **limit** in Kubernetes is enforced by the kernel's CFS (Completely Fair Scheduler) **bandwidth control**. Time is cut into periods of 100 ms by default. A limit of 500m CPU gives the container 50 ms of CPU time per period across all its threads.
 
 When the budget is used up, every thread in the container is paused until the next period.
+
+**Step by step:**
+1. The pod has a limit of `500m`, half a core: 50 ms of CPU per 100 ms period.
+2. Four threads run at once, so they burn those 50 ms in about 12.5 ms of real time.
+3. The kernel pauses all threads for the remaining 87.5 ms.
+4. A request needing 30 ms of CPU now takes over 100 ms, while the average graph shows only 50%.
 
 ```mermaid
 sequenceDiagram
@@ -209,6 +250,12 @@ sequenceDiagram
 
 **In plain words:** Go decides how many things to run at once. If it guesses more than your container is allowed, your app gets paused a lot.
 
+**Step by step:**
+1. The pod's limit is 2 CPUs, but it runs on a 64-core node.
+2. Before Go 1.25, Go sets `GOMAXPROCS` to 64 and runs 64 threads.
+3. Those threads burn the 2-CPU quota very fast, so the pod is throttled again and again.
+4. Go 1.25+ reads the container limit and sets 2; on older Go, use `automaxprocs` or set it by hand.
+
 Go starts as many running threads as `GOMAXPROCS`. Before Go 1.25 it defaulted to the number of CPUs on the node, not the container limit. A pod limited to 2 CPUs on a 64-core node would run 64 scheduler threads and get throttled constantly.
 
 Since Go 1.25 the runtime reads the cgroup CPU limit and sets `GOMAXPROCS` accordingly. On older versions use `go.uber.org/automaxprocs` or set `GOMAXPROCS` by hand. See [[Runtime - Goroutine Scheduler (GMP)]].
@@ -216,6 +263,12 @@ Since Go 1.25 the runtime reads the cgroup CPU limit and sets `GOMAXPROCS` accor
 ### Load average versus utilisation
 
 **In plain words:** "busy %" tells how full the CPU is. "Load" tells how many things are waiting. Waiting is what users feel.
+
+**Step by step:**
+1. Count cores: say 8.
+2. Read load average: 8 means fully busy with no queue; 16 means 8 tasks waiting.
+3. High load with low CPU use often means tasks are stuck waiting on disk.
+4. For a direct answer, read `/proc/pressure/cpu`: the share of time tasks were stalled waiting for CPU.
 
 ```mermaid
 flowchart LR
@@ -261,7 +314,7 @@ An illustrative scenario: a search API in Go, 8 pods, CPU limit 2 cores each.
 
 | Time | Event |
 | --- | --- |
-| 10:00 | A release adds a "did you mean" feature that runs an O(n squared) fuzzy-match loop over every word of the user query |
+| 10:00 | A release adds a "did you mean" feature that runs an O(n squared) (work grows with the square of the input size) fuzzy-match loop over every word of the user query |
 | 11:20 | A crawler sends long queries. p99 goes from 80 ms to 4 s. CPU on all pods hits the 2-core limit |
 | 11:23 | Alert: `HighLatencyP99` fires. On-call paged |
 | 11:26 | `kubectl top` shows all 8 pods at 2000m. HPA already scaled to its max of 8 |
@@ -280,7 +333,7 @@ flowchart LR
 ```
 
 > [!tip] Remember
-> In this example the hot spot is plain algorithmic cost. Go's `regexp` uses RE2 and runs in linear time in the input size, so it cannot backtrack catastrophically; in other runtimes (Java, Python, Node, PCRE) nested quantifiers can. In Go, a hot path is more likely a JSON encode loop, a giant loop over a big list, or a CPU-bound hash.
+> In this example the hot spot is plain algorithmic cost. Go's `regexp` uses RE2 and runs in linear time in the input size, so it cannot backtrack catastrophically (retry possible matches so many times that it effectively hangs); in other runtimes (Java, Python, Node, PCRE) nested quantifiers can. In Go, a hot path is more likely a JSON encode loop, a giant loop over a big list, or a CPU-bound hash.
 
 ### Whiteboard version
 
@@ -303,6 +356,14 @@ flowchart TD
 
 ### Diagnosis flowchart: from symptom to cause
 
+**In plain words:** first rule out throttling and steal, then find which process, thread and function uses the CPU.
+
+**Step by step:**
+1. Throttled periods high? Raise or remove the limit, and fix `GOMAXPROCS`.
+2. Steal (`st`) above 5%? Move to another host or instance type.
+3. One thread at 100%? A single-thread bottleneck: a lock or one loop.
+4. Otherwise profile: one function on top means a hot path; a flat, broad profile means real load growth.
+
 ```mermaid
 flowchart TD
     A["High latency, CPU suspected"] --> B{"Is cfs throttling above 25 percent?"}
@@ -320,6 +381,11 @@ flowchart TD
 ### Investigation steps for each likely cause
 
 **In plain words:** one row per suspect: where to look, what to type, and what the answer means.
+
+**Step by step:**
+1. Pick the row for your suspect, say "CFS throttling".
+2. Run its command on the affected pod or node.
+3. Compare the result with the last column to confirm or rule it out, then move to the next row.
 
 | Cause | Where to look | Command or query | What the result means |
 | --- | --- | --- | --- |
@@ -367,6 +433,12 @@ rate(go_gc_duration_seconds_sum[5m])
 ### Reading the CPU profile
 
 **In plain words:** a profile is a list of which functions used the most CPU. The top few lines usually name the problem.
+
+**Step by step:**
+1. Take a 30-second profile from the internal pprof port.
+2. Run `top`: `flat` is time inside a function itself, `cum` includes everything it calls.
+3. Big `flat` in your own function → that is the hot path. Big `flat` in GC functions → too many allocations.
+4. Use `list FuncName` to see the exact lines, or `-http` for a flame graph.
 
 ```bash
 # Print the top functions by cumulative time (non-interactive)
@@ -426,10 +498,13 @@ sequenceDiagram
 ### Autoscaling pitfalls
 
 - HPA on CPU reacts in minutes, not seconds, and starts after the pod is already hot.
-- New pods need warm-up time and may be slow at first (cold caches, JIT, connection pools).
+- New pods need warm-up time and may be slow at first (cold caches, JIT (code compiled while running, as in Java), connection pools).
 - If the cause is a retry storm, adding pods only lets more retries in. Shed load first. See [[Autoscaling]].
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how to read CPU states, spot throttling, read a profile, and pick a fix. **Next is the advanced part**: alerts that catch saturation early, always-on profiling, safe pprof, common hot spots, and the deeper mechanics (queueing curves, CFS details, steal time, single-thread bottlenecks).
+
 
 ### Alerts that catch it early
 
@@ -509,7 +584,7 @@ flowchart LR
 
 **In plain words:** on shared cloud machines, another customer can borrow your CPU. Your app waits even though it did nothing wrong.
 
-In a VM, `st` is time the hypervisor ran another guest on your vCPU. On burstable instance types (such as AWS T-series), running out of CPU credits also appears as throttling at the instance level. Check the cloud provider's CPU credit metrics. The fix is a non-burstable instance type or a dedicated host.
+In a VM, `st` is time the hypervisor (the software that runs many virtual machines on one host) ran another guest on your vCPU (virtual CPU). On burstable instance types (such as AWS T-series, cheap machines that can only run fast for limited time), running out of CPU credits also appears as throttling at the instance level. Check the cloud provider's CPU credit metrics. The fix is a non-burstable instance type or a dedicated host.
 
 ### Single-thread bottleneck
 
@@ -570,6 +645,30 @@ CPU may be high because something else is slow: a slow database makes requests p
 - [ ] Capacity headroom, HPA max, CPU requests and limits reviewed.
 - [ ] Benchmark or load test added for the hot path.
 - [ ] Blameless postmortem with owners and dates: [[Postmortems and Root Cause Analysis]].
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is CPU saturation?
+> More work arrives than the CPU can run, so tasks wait and latency climbs.
+
+> [!question]- What does throttling mean for a pod?
+> The kernel pauses it because it used its CPU limit for the current 100 ms period.
+
+> [!question]- What do you do first: profile or mitigate?
+> Mitigate (roll back, scale out, shed load), then profile.
+
+🟡 Medium
+
+> [!question]- Latency is high but the pod shows 50% CPU. What do you check first?
+> Throttled periods divided by total periods, and `GOMAXPROCS` against the limit.
+
+> [!question]- A pod has limit `250m`. How much CPU time does it get per 100 ms period?
+> 25 ms, shared by all its threads.
+
+> [!question]- Load average is 24 on 8 cores. What does it mean?
+> About 16 tasks are waiting; there is a real queue.
 
 ## Links
 

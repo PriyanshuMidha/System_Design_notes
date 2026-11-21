@@ -34,6 +34,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Authentication vs Authorization]]: first prove who is calling, then check what that caller may do; here the caller is a program, not a person.
+> - [[JWT - Structure, Validation and Pitfalls]]: a JWT is a signed token with an expiry, checked with a key; one of the four methods here is a JWT the service signs for itself.
+
 **From zero, in 60 seconds** 🟢
 
 When one of your services calls another, no human is typing a password.
@@ -77,6 +81,12 @@ This note covers the three common ways machines prove who they are to each other
 | Timestamp / nonce | Values that make each request unique and fresh | `X-Timestamp`, a random ID |
 | TLS certificate | A signed file binding a public key to a name | `CN=orders.internal` |
 | mTLS | TLS where both sides show certificates | Orders and payments both verify each other |
+| Allowlist | A list of callers that are allowed; everyone else is refused | Only `orders` may call `/charge` |
+| Canonical string | One exact, agreed text layout of the request that both sides sign | `POST\n/v1/charge\n1700000000\n{...}` |
+| Clock skew | How far apart two servers' clocks are | Orders says 10:00:00, payments says 10:00:03 |
+| Service mesh | A layer of helper proxies that handle security and routing between all services | Istio, Linkerd |
+| Sidecar | A small helper process running next to each service, often part of a mesh | Envoy proxy beside `orders` |
+| SPIFFE ID | A standard name for a service, written as a URL | `spiffe://acme.internal/ns/payments/sa/payments-service` |
 
 **Picture it**
 
@@ -103,15 +113,19 @@ Where it breaks: office badges are checked once at the door; services must check
 
 ## 1. Why it exists 🟢
 
-An e-commerce platform's `orders` service needs to call its `payments` service to charge a card. There is no browser, no user to redirect, and no password to type. If `orders` simply calls `payments` over plain HTTP with no credential, then anything on the internal network — a compromised sidecar, a misconfigured proxy, a pod that should not have network access but does — can call `payments` and charge or refund at will.
+An e-commerce platform's `orders` service needs to call its `payments` service to charge a card. There is no browser, no user to redirect, and no password to type. If `orders` simply calls `payments` over plain HTTP with no credential, then anything on the internal network — a compromised sidecar (helper process next to a service), a misconfigured proxy (a middle server that forwards traffic), a pod (one running copy of a service) that should not have network access but does — can call `payments` and charge or refund at will.
 
 The service needs to prove three things on every call, in increasing order of strength:
 
-1. **Who is calling** (an identity the receiver can check against an allowlist).
+1. **Who is calling** (an identity the receiver can check against an allowlist, the list of callers it accepts).
 2. **That this exact request was not altered in transit** (method, path, and body all match what the caller sent).
 3. **That this exact request is not a captured copy of an old one being replayed** (a request from ten minutes ago being resent now).
 
 A single static secret in a header (an API key) gives you (1). Signing the request with that secret over a timestamp gives you (1) and (2) and (3). A certificate-based handshake (mTLS) gives you (1) and (2) for free at the transport layer, for every byte of every connection, not just a chosen header.
+
+### Real-life example: Swiggy's order service calling payments 🟢
+
+When you pay for a Swiggy order, the order service, not you, asks the payments service to charge your card or UPI. Your login token proved who *you* are to the app, but now payments must check who *this caller* is: is it really the order service, or some other program inside the network that got hacked? Big apps like this usually give every service its own short-lived certificate (mTLS), so payments can see "this connection is from `orders`" before it reads a single byte. Partners outside the company, like a restaurant's billing system, are more often given an API key or HMAC-signed requests, because they are not part of the internal mesh.
 
 ## 2. Mental model 🟢
 
@@ -121,7 +135,25 @@ Think of three ways a courier company can prove the delivery person really works
 - **HMAC-signed request** = a wax seal on every single parcel, stamped with details unique to that parcel (what's inside, when it was sealed). Even if someone captures one sealed parcel, they cannot reseal a different one — they would need the original stamp (the shared secret), and the recipient checks the stamp matches the one parcel in hand.
 - **mTLS** = the courier and the warehouse check each other's government ID at the door, before a single parcel changes hands. The identity check happens once per visit (connection), not once per parcel (request), and neither side can be impersonated without stealing an actual ID (private key).
 
+### TLS vs mTLS 🟡
+
+| | Normal TLS (HTTPS) | mTLS |
+| --- | --- | --- |
+| Who shows a certificate | Only the server | Both server and client |
+| What the server learns about the caller | Just an IP address | A verified service name |
+| Typical use | Browsers talking to websites | Services talking to services inside a company |
+
+## Common beginner mistakes 🟢
+
+- **No auth on internal calls ("it's a private network")** → any hacked pod can call `/refund` → every service call needs a credential.
+- **Storing API keys in plain text** → a database leak hands out every key → store only the SHA-256 hash and show the key once.
+- **HMAC without a timestamp** → a captured request can be replayed forever → sign a timestamp and reject anything older than a few minutes.
+- **Comparing signatures with `==`** → timing differences can leak the right value → use `hmac.Equal` or `subtle.ConstantTimeCompare`.
+- **Thinking mTLS means "allowed to do anything"** → mTLS only says which service is calling → still check if that service may do this action.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a calling service must prove who it is, and that there are four ways to do it. **Next we open the box**: how to pick one, and how API keys, HMAC signatures, mTLS certificates and signed JWT assertions each work, step by step.
 
 ### Choosing a mechanism
 
@@ -146,7 +178,14 @@ These are not mutually exclusive: a common production shape is mTLS for the tran
 
 **In plain words:** treat an API key like a password: show it once, store only its hash, and add a short readable prefix so you can tell keys apart in logs.
 
-An API key is a long random secret, generated once and shown to the caller exactly one time. The server never stores the plaintext key — it stores a hash, exactly like a password, with one important difference: API keys are machine-generated with hundreds of bits of entropy, so a fast cryptographic hash (SHA-256) is the right tool, unlike human-chosen passwords, which need a slow, memory-hard KDF such as argon2id specifically because they carry so little entropy on their own (see the OWASP Password Storage Cheat Sheet and [[Password Storage and Login Security]]).
+**Step by step:**
+1. A partner asks for a key. The server makes `sk_live_7f3a9c...` (a prefix plus 32 random bytes).
+2. It shows the full key to the partner once, and stores only the first 12 characters (for lookup) and the SHA-256 hash.
+3. The partner sends `X-API-Key: sk_live_7f3a9c...` on every call.
+4. The server finds the row by the prefix, hashes the presented key, and compares the hashes in constant time.
+5. Match → the caller is that partner. No match, or a revoked key → 401.
+
+An API key is a long random secret, generated once and shown to the caller exactly one time. The server never stores the plaintext key — it stores a hash, exactly like a password, with one important difference: API keys are machine-generated with hundreds of bits of entropy, so a fast cryptographic hash (SHA-256) is the right tool, unlike human-chosen passwords, which need a slow, memory-hard KDF (key derivation function: a deliberately slow hash) such as argon2id specifically because they carry so little entropy on their own (see the OWASP Password Storage Cheat Sheet and [[Password Storage and Login Security]]).
 
 The key is shaped `<prefix>_<random>`, for example `sk_live_7f3a9c...`. The prefix is deliberately **not secret**:
 
@@ -169,6 +208,13 @@ stateDiagram-v2
 
 **In plain words:** both sides know a secret. The caller stamps each request with that secret plus the time. The receiver redoes the stamp, and old stamps are rejected.
 
+**Step by step:**
+1. `orders` wants to send `POST /v1/charge` with body `{"amount":100}` at time 1700000000.
+2. It joins method, path, time and body into one line of text and computes `HMAC-SHA256(secret, that text)`.
+3. It sends the request with headers `X-Timestamp: 1700000000` and `X-Signature: <result>`.
+4. `payments` checks the time is within 5 minutes of its own clock, rebuilds the same text, and computes the HMAC with its copy of the secret.
+5. Same result → accept. Changed amount, wrong secret or a 10-minute-old copy → 401.
+
 ```mermaid
 flowchart LR
     C["Caller: sign(method+path+body+time)"] --> R["Receiver"]
@@ -177,7 +223,7 @@ flowchart LR
     A -- "no" --> NO["Reject"]
 ```
 
-The caller and the callee share a secret out of band (a secrets manager, never in source control). For every request, the caller builds a **canonical string** — a fixed, unambiguous representation of exactly what is being signed — and computes `HMAC-SHA256(secret, canonical_string)`:
+The caller and the callee share a secret out of band (handed over through a separate safe route, such as a secrets manager, never in source control). For every request, the caller builds a **canonical string** — a fixed, unambiguous representation of exactly what is being signed — and computes `HMAC-SHA256(secret, canonical_string)`:
 
 ```mermaid
 sequenceDiagram
@@ -200,7 +246,7 @@ sequenceDiagram
     P-->>M: 401 signature does not match: wrong secret or tampered request
 ```
 
-Signing the **timestamp** bounds how long a captured request stays valid — typically a few minutes, matched to realistic clock skew between services. Signing the **body** means any edit, even to a single byte, breaks the signature, so a man-in-the-middle cannot alter amounts or fields and keep the original signature valid.
+Signing the **timestamp** bounds how long a captured request stays valid — typically a few minutes, matched to realistic clock skew between services. Signing the **body** means any edit, even to a single byte, breaks the signature, so a man-in-the-middle (someone sitting between the two services, reading and changing traffic) cannot alter amounts or fields and keep the original signature valid.
 
 Neither check alone is enough: a signature without a timestamp can be replayed forever; a timestamp without a signature can be forged outright.
 
@@ -208,13 +254,20 @@ Neither check alone is enough: a signature without a timestamp can be replayed f
 
 **In plain words:** normal HTTPS proves the server is real. mTLS makes the client show a certificate too. SPIFFE is a standard way to name and hand out those certificates.
 
+**Step by step:**
+1. When `orders` starts, a local helper (the SPIRE agent) checks it really is the orders program and hands it a certificate named `spiffe://acme.internal/ns/orders/sa/orders-service`, valid for about an hour.
+2. `orders` opens a connection to `payments`. Payments shows its certificate, as in normal HTTPS.
+3. Payments asks for the client's certificate too; `orders` shows its own.
+4. Payments checks that the certificate was issued by the company's trusted issuer and that the name is on its allowlist.
+5. Both sides are now sure who is on the other end, and requests flow over that connection.
+
 In ordinary (server-only) TLS, the client verifies the server's certificate but the server has no cryptographic idea who the client is beyond its IP. **Mutual TLS** adds a second certificate check in the other direction: the server also requests and verifies a client certificate during the handshake, so both sides authenticate before a single application byte is exchanged.
 
 The handshake mechanics themselves — the key exchange, cipher negotiation, certificate chain validation — belong to [[TLS and HTTPS]]; what matters here is the extra step mTLS adds and what identity it carries.
 
-A raw X.509 certificate's subject (`CN=payments.internal`) is just a string with no standard shape for "which service, in which trust domain, run by which platform." **SPIFFE** (Secure Production Identity Framework for Everyone) standardizes that shape as a URI: `spiffe://acme.internal/ns/payments/sa/payments-service`.
+A raw X.509 certificate's (the standard certificate file format) subject (`CN=payments.internal`) is just a string with no standard shape for "which service, in which trust domain, run by which platform." **SPIFFE** (Secure Production Identity Framework for Everyone) standardizes that shape as a URI: `spiffe://acme.internal/ns/payments/sa/payments-service`.
 
-A SPIFFE-aware platform (commonly SPIRE as the issuer) hands every workload a short-lived X.509 certificate (an "SVID") carrying that URI as a Subject Alternative Name, rotated automatically every few hours — so compromise of one certificate has a short blast radius, with no manual rotation step.
+A SPIFFE-aware platform (commonly SPIRE as the issuer) hands every workload (a running service) a short-lived X.509 certificate (an "SVID", SPIFFE's name for an identity document) carrying that URI as a Subject Alternative Name (an extra name field inside the certificate), rotated automatically every few hours — so compromise of one certificate has a short blast radius, with no manual rotation step.
 
 ```mermaid
 sequenceDiagram
@@ -233,6 +286,13 @@ sequenceDiagram
 ### JWT client assertions
 
 **In plain words:** the service signs a short-lived token with its private key and sends that instead of a shared secret.
+
+**Step by step:**
+1. Ahead of time, `billing` registers its public key with the login server.
+2. When it needs a token, it writes a tiny JWT: "I am `billing`, for `https://auth.example/token`, expires in 2 minutes, id `a91`".
+3. It signs that JWT with its private key and sends it to the token endpoint.
+4. The login server checks the signature with the registered public key, plus audience and expiry, and returns an access token.
+5. A copied assertion is useless 2 minutes later, and the private key never left `billing`.
 
 RFC 7523 defines a fourth option, mainly for authenticating to an OAuth token endpoint without ever sending a shared secret over the wire: the calling service signs a short-lived JWT with its own private key and sends that JWT as the credential (`client_assertion`).
 
@@ -531,12 +591,15 @@ func TestHMACRejectsTamperedBody(t *testing.T) {
 
 ## 6. Trade-offs and when not to use 🟡
 
-- API keys are the cheapest to build but the weakest: no built-in expiry, no per-request integrity. Fine for low-risk, easily rotated internal calls; wrong for anything handling money or PII without additional layers.
+- API keys are the cheapest to build but the weakest: no built-in expiry, no per-request integrity. Fine for low-risk, easily rotated internal calls; wrong for anything handling money or PII (personally identifiable information: names, phone numbers, addresses) without additional layers.
 - HMAC signing requires both sides to build byte-identical canonical strings — a client library that re-serializes JSON differently than the server expects (key ordering, whitespace) breaks every signature. Keep the canonical string to method, path, timestamp, and the *raw* body bytes, never a re-encoded structure.
 - mTLS is the strongest default for a mesh of many services but is the heaviest to operate without platform support (SPIRE, a service mesh's sidecar-managed certs, or a cloud provider's managed mTLS). Standing it up for two services calling each other directly is usually more operational burden than the risk justifies.
 - JWT client assertions need clock-synced verification and a key-registration step per client; they solve a narrower problem (OAuth client authentication) than general service-to-service calls.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how each of the four methods works and when to pick which. **Next we look at real systems**: what Stripe, AWS and service meshes do, how these setups fail (leaked keys, clock drift, expired certificates), and the deeper design ideas such as tokens tied to certificates and rotation without downtime.
+
 
 - **Real systems:**
   - Stripe, GitHub, and most SaaS platforms use prefixed, hashed API keys (`sk_live_`, `ghp_`) for third-party integrations.
@@ -544,7 +607,7 @@ func TestHMACRejectsTamperedBody(t *testing.T) {
   - Istio, Linkerd, and Consul Connect issue and rotate mTLS certificates automatically for every service in the mesh, commonly backed by SPIRE for SPIFFE identity.
   - Google and Okta both support `private_key_jwt` client authentication for their OAuth token endpoints.
 - **Failure modes → fixes:**
-  - API key committed to a public repo → automated secret scanning (GitHub secret scanning, truffleHog) plus immediate revocation and a short time-to-detect target; design keys to be cheap to rotate.
+  - API key committed to a public repo → automated secret scanning (tools that search code for anything that looks like a key: GitHub secret scanning, truffleHog) plus immediate revocation and a short time-to-detect target; design keys to be cheap to rotate.
   - Clock drift between services makes valid HMAC-signed requests look replayed → monitor NTP sync, and choose a skew window (commonly 1–5 minutes) wide enough for realistic drift but narrow enough to bound replay risk.
   - A rotated API key breaks callers that cached the old one → issue the new key with an overlap window where both the old and new hash validate, then revoke the old one after callers have migrated.
   - mTLS certificate expires mid-incident because rotation silently failed → alert on certificate expiry well before the deadline, not only on handshake failures after the fact.
@@ -557,8 +620,15 @@ func TestHMACRejectsTamperedBody(t *testing.T) {
 ## 8. Deep dive 🔴
 
 - **Why sign the body and not just the headers.** AWS SigV4 and most serious HMAC schemes include a hash of the body in the signed string specifically so a proxy or load balancer that can read (but should not alter) the payload cannot tamper with it silently; signing only headers would leave the body open to modification while the signature still "matches."
-- **Certificate-bound access tokens (RFC 8705).** mTLS and OAuth can combine: the authorization server binds an issued access token to the client's TLS certificate (via a thumbprint claim), so even if the token itself leaks, it cannot be used over a different connection without also presenting the matching private key. This closes the classic "stolen bearer token works from anywhere" gap.
+- **Certificate-bound access tokens (RFC 8705).** mTLS and OAuth can combine: the authorization server binds an issued access token to the client's TLS certificate (via a thumbprint claim, a short hash of the certificate), so even if the token itself leaks, it cannot be used over a different connection without also presenting the matching private key. This closes the classic "stolen bearer token works from anywhere" gap.
 - **Key rotation without downtime.** Both API keys and HMAC secrets should support an overlap window: issue the new credential, accept both old and new for a bounded period, then revoke the old one. The alternative — rotate and revoke atomically — guarantees an outage for any caller that has not redeployed in time.
+
+```mermaid
+flowchart LR
+    A["Only key A valid"] --> B["Issue key B:<br/>A and B both valid"]
+    B --> C["Callers switch to B"]
+    C --> D["Revoke A"]
+```
 - **SPIFFE beyond certificates.** The same SPIFFE ID can also back JWT-SVIDs (signed JWTs carrying the `spiffe://` identity) for contexts where a full TLS handshake is not the transport, such as authenticating a message on a queue.
 - **Defense in depth.** Production systems rarely pick exactly one of these. A common real shape: mTLS for every connection inside the mesh (transport-level identity), plus a signed JWT or HMAC header carrying the specific action being authorized (field-level authorization, since "this is really the orders service" does not by itself say "and it is allowed to issue a $10,000 refund").
 
@@ -594,6 +664,26 @@ func TestHMACRejectsTamperedBody(t *testing.T) {
 - JWT client assertion (RFC 7523): sign a short-lived JWT with your own private key instead of sending a shared secret.
 - None of these alone is "secure" — pair transport-level identity (mTLS) with request-level authorization, and rotate every secret with an overlap window.
 - A leaked static API key is valid until someone notices and revokes it; that is the core weakness every other mechanism here addresses in a different way.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) Why does a service need its own identity when no user is involved?
+> Otherwise any program on the network could call sensitive endpoints like "charge card".
+
+> [!question]- (easy) What does the server store for an API key?
+> A non-secret prefix for lookup and the SHA-256 hash, never the key itself.
+
+> [!question]- (easy) In mTLS, who shows a certificate?
+> Both sides: the server and the calling client.
+
+> [!question]- (medium) What two things must an HMAC signature cover to stop replay and tampering?
+> A timestamp (to limit how long a copy works) and the raw body (so any edit breaks the signature).
+
+> [!question]- (medium) Why can API keys use fast SHA-256 while passwords need argon2id?
+> API keys are long random values, so guessing is already hopeless; passwords are short human choices that must be made slow to guess.
+
+> [!question]- (medium) Why rotate keys with an overlap window?
+> So callers that still use the old key keep working while they switch; revoking at once causes an outage.
 
 ## Links
 - **Before this:** [[OAuth 2.0 and OpenID Connect]], [[JWT - Structure, Validation and Pitfalls]]

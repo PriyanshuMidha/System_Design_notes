@@ -23,6 +23,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Work through the Code steps 1-4 and the Tests.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Processes, Threads and Context Switching]]: goroutines run side by side and share memory, and any of them can be paused at any moment. Read [[Concurrency Primitives - Mutex, Semaphore, Atomics]] first too: a mutex lets one in, a semaphore lets N in, an atomic is one unbreakable step.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the runnable half of [[Concurrency Primitives - Mutex, Semaphore, Atomics]]. The theory note explains locks, semaphores and atomics with stories and pictures; this one builds each of them in real Go and then attacks them with hundreds of goroutines at once to prove they hold up. Read each "Step" top to bottom: a plain-words line, the code, then a numbered walk-through. The tests at the end are the proof — each one would fail (or hang) if the primitive above it were broken.
@@ -69,6 +72,8 @@ flowchart LR
 - Everything here runs with no external services.
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** which four tools this package builds and how to run the tests. **Next we read the code:** a locked counter, its lock-free twin, a channel used as a semaphore, and a transfer that can never deadlock. Each step starts with one plain-words line.
 
 ### Step 1: a mutex-protected counter
 
@@ -231,7 +236,7 @@ func (s *AccountStore) TransferConsistentOrder(amount int) {
 **How it works.**
 1. Both locks are acquired in the same order (`muA` first, always) regardless of which direction money moves — this is the entire fix.
    A version that locked `muB` first for transfers in the other direction would reintroduce the circular-wait condition.
-2. `defer` unlocks in reverse order (`muB`, then `muA`) automatically, since deferred calls run LIFO — this doesn't affect correctness here, but it's worth noticing because it's not the order you wrote them in.
+2. `defer` unlocks in reverse order (`muB`, then `muA`) automatically, since deferred calls run LIFO (last in, first out: the last `defer` written runs first) — this doesn't affect correctness here, but it's worth noticing because it's not the order you wrote them in.
 3. Holding both locks for the whole function keeps the two balance updates atomic as a pair — releasing `muA` between the two field updates would let another transfer observe a half-moved amount.
 
 > [!example]- Full file (concurrency package, all four source files concatenated)
@@ -324,6 +329,8 @@ Proves the mutex-protected counter never loses an increment under real concurren
 
 A failure here (any value less than 100000) would mean the mutex isn't actually excluding concurrent `c.n++` calls — the exact race condition from the theory note's section 1.
 
+**What this code does, in plain words:** start 100 goroutines, have each add 1 a thousand times, wait for all of them, and check the counter shows exactly 100,000.
+
 ```go
 func TestCounterConcurrentIncrements(t *testing.T) {
 	c := &Counter{}
@@ -384,6 +391,8 @@ Proves the CAS retry loop is correct under contention: 50 goroutines race to inc
 
 A failure above 1000 would mean two goroutines both read the same `cur` and both succeeded past the limit — a broken CAS. A failure below 1000 would mean a goroutine gave up too early.
 
+**What this code does, in plain words:** start 50 goroutines that all keep trying to add 1 while the counter is under 1,000, and check it stops at exactly 1,000, never 1,001.
+
 ```go
 func TestIncIfLessThanNeverOvershoots(t *testing.T) {
 	c := &AtomicCounter{}
@@ -409,7 +418,7 @@ func TestIncIfLessThanNeverOvershoots(t *testing.T) {
 
 ### `TestSemaphoreBoundsConcurrency`
 
-Proves the channel-backed semaphore never lets more than `capacity` goroutines hold it at once, by tracking the live holder count with its own atomic and recording the high-water mark.
+Proves the channel-backed semaphore never lets more than `capacity` goroutines hold it at once, by tracking the live holder count with its own atomic and recording the high-water mark (the highest number of holders ever seen at once).
 
 | Input | Expected output |
 | --- | --- |
@@ -430,6 +439,8 @@ func recordHighWaterMark(live, maxLive *atomic.Int32) {
 	}
 }
 ```
+
+**What this code does, in plain words:** start 20 goroutines that each take a slot, wait 2 ms, and give it back, while a side counter records the most holders ever inside at once; that number must be 3 or less.
 
 ```go
 func TestSemaphoreBoundsConcurrency(t *testing.T) {
@@ -470,6 +481,8 @@ Proves the fixed lock order actually prevents the deadlock it's meant to prevent
 
 A failure here would show up as the whole test process hanging (the Go test runner's default timeout eventually kills it) rather than a normal assertion failure — that hang *is* the deadlock.
 
+**What this code does, in plain words:** run 500 transfers of ₹1 at the same time; if the test finishes and the balances are 499,500 and 500, nothing deadlocked and no money was lost.
+
 ```go
 func TestTransferConsistentOrderNoDeadlock(t *testing.T) {
 	s := &AccountStore{balanceA: 500000, balanceB: 0}
@@ -495,11 +508,13 @@ func TestTransferConsistentOrderNoDeadlock(t *testing.T) {
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** what each primitive does and how the tests hammer it with real concurrent goroutines. **Next comes the advanced part:** why each design was chosen over its alternative, the ways this code can still be misused, and exercises.
+
 | Choice | Alternative | Trade-off |
 | --- | --- | --- |
 | `chan struct{}` for `Semaphore` | `golang.org/x/sync/semaphore.Weighted` | The channel version has zero dependencies and is simpler to read; the `x/sync` version adds context cancellation and weighted acquires, worth it once a caller needs to abandon a wait cleanly |
-| Manual CAS loop in `IncIfLessThan` | Wrap everything in a `sync.Mutex` | The CAS loop avoids blocking under low contention, but degrades toward a busy-wait under very high contention — see the theory note's trade-offs section |
-| Fixed lock order in `AccountStore` | Try-lock with backoff, or a single lock for both balances | A single shared lock is simpler and also deadlock-free, but serializes transfers that don't even touch the same pair of accounts; the fixed-order two-lock design keeps unrelated account pairs independent |
+| Manual CAS loop in `IncIfLessThan` | Wrap everything in a `sync.Mutex` | The CAS loop avoids blocking under low contention, but degrades toward a busy-wait (spinning in a loop, burning CPU, instead of sleeping) under very high contention — see the theory note's trade-offs section |
+| Fixed lock order in `AccountStore` | Try-lock with backoff (try to take the lock, and if busy, wait a little and try again), or a single lock for both balances | A single shared lock is simpler and also deadlock-free, but serializes (forces one-at-a-time) transfers that don't even touch the same pair of accounts; the fixed-order two-lock design keeps unrelated account pairs independent |
 | `atomic.Int64` wrapper type (not a plain `int64` with free functions) | `atomic.AddInt64(&n, 1)` style (pre-Go 1.19) | The wrapper type makes it a compile error to touch the field without going through an atomic method; the older free-function style compiles even if you forget and read the field directly |
 
 ## Running it 🟢
@@ -544,6 +559,26 @@ That means the race detector found zero unsynchronized concurrent accesses acros
 2. **Change it, predict the result:** in `AccountStore`, write a second method `TransferReverseOrder` that locks `muB` before `muA`, and call it concurrently with `TransferConsistentOrder` in a test. Predict whether it deadlocks, then run it with a test timeout (`go test -timeout 3s`) to check.
    Explain why the fixed-order rule has to apply to *every* function touching both locks, not just the "main" one.
 3. **Change it, predict the result:** lower `TestSemaphoreBoundsConcurrency`'s capacity to 1 and its goroutine count to 2. Predict the new maximum concurrent holders before running it, and explain in one sentence why a capacity-1 semaphore is just a mutex with extra steps.
+
+## Self-check 🟢🟡
+
+> [!question]- Why must `Counter` always be used through a pointer (`*Counter`)?
+> Copying it copies the mutex too, and the copy's lock protects nothing.
+
+> [!question]- What does `Acquire` do when the semaphore channel is full?
+> The send blocks, so the goroutine waits until someone calls `Release`.
+
+> [!question]- What does `-race` add to `go test`?
+> It turns on the race detector, which flags unsynchronized access to shared memory.
+
+> [!question]- In `IncIfLessThan`, what happens when `CompareAndSwap` fails?
+> Another goroutine changed the value first; the loop re-reads it and tries again.
+
+> [!question]- Why does `TransferConsistentOrder` lock `muA` before `muB` in every direction?
+> One fixed order means no two transfers can each hold the lock the other needs, so there is no circular wait.
+
+> [!question]- Why does the semaphore test track the high-water mark with a CAS loop and not `Add`?
+> "Set the max only if the new number is bigger" is a conditional update, which plain `Add` cannot express.
 
 ## Links
 

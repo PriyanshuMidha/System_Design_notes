@@ -21,6 +21,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add the Code steps, Tests and Design decisions.
 > - 🔴 **Interview / SDE-3 prep?** Add Pitfalls and do the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Heaps and Priority Queues]]: a min-heap hands back the smallest item fast; Dijkstra's `distHeap` is one.
+> - [[Stacks, Queues and Deques]]: BFS needs a first-in-first-out queue; DFS uses the call stack.
+> - [[Hash Tables and Go Maps]]: `map[int][]Edge` finds a vertex's neighbour list by key in about one step.
+> - Read [[Graphs and Graph Algorithms]] first too: it traces every algorithm below by hand on the same sample graph.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on twin of [[Graphs and Graph Algorithms]]. That note explains, in pictures and words, how to store a network of connected things (a graph) and walk it: level by level (BFS), deep first (DFS), cheapest first (Dijkstra), in dependency order (topological sort), and how to spot loops. This note is the same material as working Go code: one small `Graph` type, then each algorithm built on it step by step, each step opening with the idea in plain words before the code. Two tests run everything against one tiny 4-vertex sample graph that the theory note traces by hand, so the code and the diagrams prove each other. Read the theory note first, then read this top to bottom; the Go you need is maps, slices, recursion and one standard-library heap.
@@ -64,6 +70,8 @@ flowchart LR
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** what each file holds and how to run the tests. **Next we read the code:** the graph type, then BFS and DFS, cycle detection, topological sort, Dijkstra and Kruskal, one step each, every step opening with a plain-words line.
+
 ### Step 1: the graph type and adjacency list
 
 **In plain words:** store the graph as a notebook with one page per vertex, listing who it points to — that is all an adjacency list is.
@@ -95,7 +103,7 @@ func (g *Graph) AddEdge(u, v, weight int) {
 ```
 
 **How it works.**
-1. `adj` is unexported — every algorithm in this package reaches the graph only through `AddEdge` and its own traversal, keeping the internal map from being mutated incorrectly from outside the package.
+1. `adj` is unexported (lower-case name, so code outside the package cannot touch it) — every algorithm in this package reaches the graph only through `AddEdge` and its own traversal, keeping the internal map from being mutated incorrectly from outside the package.
 2. `AddEdge` only adds the directed edge `u → v`; an undirected graph (as Kruskal's MST needs) is modeled by calling `AddEdge` twice, once each direction, or — as `KruskalMST` does below — by working from a flat `WEdge` list instead of this adjacency-list type at all.
 3. The `if _, ok := ...; !ok` line ensures `v` has an entry in `adj` even with zero out-edges — without it, `TopoSort`'s in-degree counting would miss vertices that are only ever a destination, never a source.
 
@@ -128,6 +136,8 @@ func BFS(g *Graph, start int) []int {
 	return order
 }
 ```
+
+**What this code does, in plain words:** mark the start vertex, add it to the output, then for each neighbour not yet marked, call the same function on it; when a vertex has no new neighbours, the call returns and we fall back to the vertex before it.
 
 ```go
 func DFSRecursive(g *Graph, start int) []int {
@@ -174,6 +184,8 @@ const (
 
 The three constants give the three DFS states names; the zero value (`white`, since `iota` starts at 0) means every vertex starts unvisited with no initialization loop needed.
 
+**What this code does, in plain words:** for each vertex still white, walk deep: paint it gray on the way in; if a road leads to a gray vertex, report a cycle; paint it black on the way out.
+
 ```go
 // HasCycle: three-color DFS. A gray -> gray edge is a back edge: a cycle.
 func HasCycle(g *Graph) bool {
@@ -216,7 +228,7 @@ func HasCycle(g *Graph) bool {
 
 **Concept.** This is [[Graphs and Graph Algorithms#Topological sort: Kahn's algorithm]] directly: repeatedly remove in-degree-0 vertices.
 
-The alternative — DFS-based topological sort (post-order, then reverse) — is equally valid and is what many textbooks show first, but Kahn's version was chosen here because its `len(order) == len(g.adj)` check gives cycle detection for free, without a separate pass.
+The alternative — DFS-based topological sort (post-order, meaning record each vertex when you finish it, then reverse) — is equally valid and is what many textbooks show first, but Kahn's version was chosen here because its `len(order) == len(g.adj)` check gives cycle detection for free, without a separate pass.
 
 ```go
 package graph
@@ -243,6 +255,8 @@ func TopoSort(g *Graph) (order []int, ok bool) {
 The first loop initializes every vertex's in-degree to 0 before the second loop increments it — without this, a vertex with in-degree 0 that's never a map key would be invisible to the seeding step below.
 
 `queue` then seeds with every vertex that starts at in-degree 0 — in a DAG with multiple independent starting points, all of them go in at once, not just one.
+
+**What this code does, in plain words:** take a ready task off the front of the line, add it to the order, and lower the "waiting on" count of every task that needed it; any task whose count hits 0 joins the line.
 
 ```go
 	for len(queue) > 0 {
@@ -301,6 +315,8 @@ func (h *distHeap) Pop() any {
 2. `Push` and `Pop` take a pointer receiver (`*distHeap`) because they resize the underlying slice — a value receiver's changes wouldn't be visible to the caller, exactly the pointer-vs-value distinction [[Concurrency Primitives - Mutex, Semaphore, Atomics - Go#Step 1: a mutex-protected counter]] flags for `sync.Mutex`.
 3. `Pop` removes from the *end* of the slice, not the front — `container/heap`'s internal `Pop` call always swaps the true minimum to the end first, so popping the end is popping the logical minimum, just relocated there by the heap's own sift-down.
 
+**What this code does, in plain words:** set the start's distance to 0 and push it; then keep popping the closest vertex, skip it if a better distance is already known, and for each road out of it, if the road gives a shorter distance to the neighbour, save it and push the neighbour.
+
 ```go
 // Dijkstra: shortest distances from start. Requires non-negative weights.
 // O((V+E) log V) with a binary heap frontier.
@@ -327,7 +343,7 @@ func Dijkstra(g *Graph, start int) map[int]int {
 **How it works.**
 1. `if d, ok := dist[cur.vertex]; ok && cur.dist > d { continue }` skips a stale heap entry — the same vertex can be pushed more than once (once per relaxation that improved its distance), so this line discards any copy that's no longer the best known distance by the time it's popped.
 2. The relaxation check `!ok || nd < d` is the one line that embodies "is going through `cur.vertex` cheaper than what I already know?" — exactly the relaxation step the theory note's sequence diagram walks through.
-3. `heap.Push`/`heap.Pop` are the package-level `container/heap` functions, not `distHeap`'s own methods directly — they wrap the methods with the sift-up/sift-down bookkeeping that keeps the heap property intact after each call.
+3. `heap.Push`/`heap.Pop` are the package-level `container/heap` functions, not `distHeap`'s own methods directly — they wrap the methods with the sift-up/sift-down (moving an item up or down the heap until it sits in the right place) bookkeeping that keeps the heap property intact after each call.
 
 ### Step 6: union-find and Kruskal's MST
 
@@ -367,6 +383,8 @@ func (uf *UnionFind) Find(x int) int {
 2. `Find`'s recursive case `uf.parent[x] = uf.Find(uf.parent[x])` is path compression: it repoints `x` directly at the root it eventually finds, so the *next* `Find(x)` call is `O(1)` instead of re-walking the same chain.
 3. The base case `uf.parent[x] == x` means `x` *is* its component's root — the recursion bottoms out there.
 
+**What this code does, in plain words:** find the group leader of each item; if they are the same, say "already joined" (false); otherwise hang the shorter tree (lower rank) under the taller one's leader and say "joined" (true).
+
 ```go
 func (uf *UnionFind) Union(x, y int) bool {
 	rx, ry := uf.Find(x), uf.Find(y)
@@ -391,6 +409,8 @@ func (uf *UnionFind) Union(x, y int) bool {
 `Union`'s return value doubles as the "would this close a cycle?" answer Kruskal needs — `false` means `x` and `y` were already in the same component (adding this edge would close a cycle), `true` means the merge happened.
 
 The `rank` comparison in the `switch` is union by rank: always attach the shorter tree under the taller one's root, which is what keeps future `Find` calls' paths short even before path compression kicks in.
+
+**What this code does, in plain words:** copy the edge list, sort it cheapest first, and keep each edge whose two ends are in different groups, joining those groups as you go.
 
 ```go
 // WEdge is a weighted, undirected edge between vertices U and V, the shape
@@ -652,6 +672,8 @@ Proves Dijkstra picks the genuinely cheapest path, not just the fewest hops: on 
 
 A failure where `dist[3]` came out as `6` instead of `3` would mean Dijkstra picked the path by hop count instead of total weight — exactly the BFS-vs-Dijkstra confusion the theory note's first interview question covers.
 
+**What this code does, in plain words:** build the 4-vertex sample graph, run Dijkstra from vertex 0, and check the distances are exactly `{0:0, 1:1, 2:4, 3:3}`.
+
 ```go
 package graph
 
@@ -690,6 +712,8 @@ Proves Kruskal's MST picks exactly the cheapest non-cycle-closing edges on a 4-v
 | Edges (U,V,W): (0,1,1), (1,2,2), (0,2,4), (2,3,3), (1,3,5) | MST has exactly 3 edges (`n-1` for `n=4`), total weight 6 |
 
 A failure with a total weight above 6, or fewer/more than 3 edges, would mean the greedy edge selection picked a pricier edge over a cheaper one, or failed to correctly detect a cycle via union-find.
+
+**What this code does, in plain words:** run Kruskal on five weighted edges between 4 vertices and check it keeps exactly 3 edges with total weight 6.
 
 ```go
 func TestKruskalMST(t *testing.T) {
@@ -744,6 +768,8 @@ Reading it: both tests pass under `-race` with zero flagged data races (none exp
 
 ## Pitfalls in the code 🔴
 
+> 🟡 → 🔴 **You now know** how each algorithm is coded and how the two tests check them against hand-worked answers. **Next comes the advanced part:** the subtle ways this code can waste memory, return wrong answers or panic, and exercises.
+
 - `BFS` and `TopoSort` both re-slice `queue = queue[1:]` to dequeue — this never reclaims the already-dequeued elements' backing array space until the whole slice is discarded, which is fine for a one-shot traversal but would leak memory in a long-lived, continuously-refilled queue; a ring buffer (see [[Stacks, Queues and Deques]]) avoids this.
 - `Dijkstra`'s `dist` map can hold multiple stale entries in the heap for the same vertex (pushed once per improving relaxation) — forgetting the `cur.dist > d` staleness check would make the algorithm re-process a vertex with an already-worse distance, silently degrading performance (though not correctness, since the check still runs before any work).
 - `KruskalMST` assumes vertex IDs are `0..n-1` with no gaps, because `NewUnionFind(n)` allocates exactly `n` slots — passing an edge list with a vertex ID `>= n` panics on an out-of-range slice index.
@@ -753,6 +779,26 @@ Reading it: both tests pass under `-race` with zero flagged data races (none exp
 1. **Change it, predict the result:** add a fifth edge `0→3` with weight `2` to `buildSample()`. Predict the new `Dijkstra(g, 0)` result for vertex 3 before running it — does the new direct edge beat the existing `0→1→3` path?
 2. **Change it, predict the result:** remove the staleness check (`if d, ok := dist[cur.vertex]; ok && cur.dist > d { continue }`) from `Dijkstra`. Does `TestDijkstraShortestPaths` still pass? Explain why removing it changes performance but not (for this algorithm) correctness.
 3. **Change it, predict the result:** call `HasCycle` on a graph built only with `g.AddEdge(0, 1, 1)` and `g.AddEdge(1, 0, 1)` (two directed edges forming a 2-cycle). Predict `true` or `false` before running it, and explain which gray-to-gray edge the three-color DFS catches.
+
+## Self-check 🟢🟡
+
+> [!question]- Why does `AddEdge` also create an empty entry for `v`?
+> So vertices that only receive edges still appear in `adj`, and `TopoSort` counts them.
+
+> [!question]- In `BFS`, why is `visited[start] = true` set before the loop?
+> So the start is never queued again if some edge points back to it.
+
+> [!question]- What does `HasCycle` return for edges `0→1` and `1→0`?
+> `true`: walking 0 → 1 → 0 reaches a gray vertex.
+
+> [!question]- How does `TopoSort` know there is a cycle?
+> `len(order)` is smaller than the number of vertices; some never reached in-degree 0.
+
+> [!question]- Why does `Dijkstra` skip a popped item when `cur.dist > d`?
+> It is a stale, older entry for a vertex that already has a shorter distance.
+
+> [!question]- What does `Union` returning `false` mean to `KruskalMST`?
+> Both ends are already in one group, so this edge would make a loop; skip it.
 
 ## Links
 

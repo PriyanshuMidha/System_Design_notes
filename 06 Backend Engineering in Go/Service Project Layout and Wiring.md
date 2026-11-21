@@ -30,6 +30,10 @@ status: reviewed
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Backend Request Lifecycle and Layering]]: a request flows handler → service → repository, and each layer has one job.
+> - [[Packages, Modules and Dependency Management]]: a Go module is a project with a `go.mod`; each folder in it is a package you can import by path.
+
 **From zero, in 60 seconds** 🟢
 
 A Go service's folders are not decoration. They exist to answer one question at a glance: who is allowed to import whom.
@@ -65,6 +69,11 @@ A good layout lets them see, from folder names alone, what depends on what.
 | Interface | A list of methods; any type with them fits | `type Store interface { Get(id) }` |
 | Dependency injection (DI) | Passing a part in, instead of the code building it | `NewService(repo)` |
 | Layer | A role in a request: handler, service, repository | Handler reads HTTP, repo talks SQL |
+
+| Manual DI | Building every part by hand in `main` and passing it in | `svc := invoice.NewService(repo)` |
+| Import cycle | Two packages importing each other; Go refuses to compile it | `invoice` ↔ `store` |
+| Feature package | A package named after a business thing, holding all of its code | `internal/invoice` |
+| Structural typing | A type fits an interface just by having its methods, no `implements` keyword | `InMemoryInvoices` fits `invoice.Repo` |
 
 **Picture it**
 
@@ -103,15 +112,28 @@ It's naming the two decisions that actually matter and writing them down once: *
 
 Once those two rules are fixed, "where does `MarkInvoicePaid` go" has exactly one answer: in the `invoice` package, because that's the feature it belongs to, regardless of whether it's "business logic" or "a handler."
 
+### A real-life example 🟢
+
+A food-delivery backend like Swiggy's has features such as orders, restaurants and payments. In a clean Go service each one gets its own folder (`internal/order`, `internal/restaurant`, `internal/payment`) instead of one big `models` folder and one big `utils` folder. A new engineer fixing a refund bug opens `internal/payment` and finds everything about payments in one place. `cmd/api/main.go` is the one file that creates the database pool, the repositories and the services, and plugs them together at startup.
+
 ## 2. Mental model 🟢
 
 Picture the service as a one-way street map, not a layer cake. `cmd/api` is the entrance; it's the only building allowed to walk into every other building and introduce them to each other.
 
 Every other building (`internal/invoice`, `internal/httpapi`, `internal/store`) only knows the buildings it directly needs, and only through a door it defined itself (an interface) — it never has the address of a building's internals.
 
-`internal/invoice` defines the door shape it needs ("something with `Get` and `Save`"); `internal/store` builds a thing matching that door shape without `invoice` ever being told the full blueprint of `store`. That's dependency inversion by construction, not by a generic rule: the consumer owns the interface.
+`internal/invoice` defines the door shape it needs ("something with `Get` and `Save`"); `internal/store` builds a thing matching that door shape without `invoice` ever being told the full blueprint of `store`. That's dependency inversion (the high-level code defines what it needs; the low-level code adapts to it) by construction, not by a generic rule: the consumer owns the interface.
 
 ## 3. How it works 🟡
+
+🟢 → 🟡 You now know the two rules: package by feature, and imports point one way with `main` wiring everything. Next we open the box: the exact folder tree, the order `main` builds things in, and how a small interface keeps `invoice` from ever importing `store`.
+
+**Step by step:**
+1. `internal/invoice` declares `type Repo interface { Get(...); Save(...) }` next to its `Service`.
+2. `internal/store` has `InMemoryInvoices` with `Get` and `Save` methods; it imports `invoice` only for the `Invoice` type.
+3. `main` calls `store.NewInMemoryInvoices()` first (it needs nothing).
+4. Then `invoice.NewService(repo)`, passing the store as a `Repo`; Go checks the methods fit.
+5. Then `httpapi.NewMux(svc)`, and finally `http.ListenAndServe(":8080", mux)`.
 
 ```mermaid
 flowchart TD
@@ -240,6 +262,8 @@ svc := invoice.NewService(store.NewInMemoryInvoices())
 ```
 
 The full version below is a real three-package InvoiceOps slice: `internal/invoice` (the feature), `internal/store` (an implementation of its `Repo`), and `internal/httpapi` (the HTTP glue), wired from `cmd/api/main.go`. It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
+
+**What this code does, in plain words (for the four files below):** `invoice` defines the `Invoice` type, the `Repo` interface and a `Service` whose `MarkPaid` refuses void invoices; `store` keeps invoices in a map and satisfies `Repo`; `httpapi` turns a request into a `MarkPaid` call and maps "not found" to 404; `main` builds them in order and starts the server.
 
 **`internal/invoice/invoice.go`** — the feature package. It declares the interface it needs, next to the service that needs it:
 
@@ -522,7 +546,26 @@ func TestMarkPaidHandler_NotFoundMapsTo404(t *testing.T) {
 - `internal/` visibility is enforced by the compiler, which is good for discipline but means genuinely sharing a package across two separate repositories requires actually publishing it (a real module), not just renaming the folder.
 - Manual DI in `main.go` degrades once a service has 30+ dependencies with branching construction logic (different wiring per environment); that's the point to evaluate `wire`, not before.
 
+### Package by feature vs package by layer 🟡
+
+| | By feature (this note) | By layer |
+| --- | --- | --- |
+| Folders | `invoice/`, `payment/` | `controllers/`, `services/`, `models/` |
+| To understand one feature | open one folder | open three folders |
+| Typical smell | a feature grows big (split it) | a `common`/`utils` dumping ground |
+| Go fit | matches `internal/` and small interfaces | fights import direction |
+
+### Common beginner mistakes 🟢
+
+- Creating `internal/utils` for anything that "fits nowhere" → it becomes a dumping ground every package imports → put each helper in the feature that calls it.
+- Declaring interfaces in the implementing package → arrows point the wrong way and cycles appear → declare the interface in the package that uses it.
+- Copying `golang-standards/project-layout` with `pkg/`, `api/`, `build/` → empty folders and confusion → start with `cmd/` and `internal/` only.
+- Building dependencies inside services (`NewService()` opens its own DB) → hard to test and reuse → pass dependencies in through constructors.
+- Reaching for `wire` or `fx` on day one → extra tools for a small `main.go` → wire by hand until it is genuinely hard to read.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now lay out a Go service and wire it by hand. The advanced part covers how layouts decay in real teams: import cycles, growing `util` packages, repeated wiring across binaries, and the compiler rules behind `internal/` and structural typing.
 
 - **Real systems:** this is the layout Ardan Labs' Go service training teaches and the shape most production Go HTTP services converge on; `go.dev/doc/modules/layout` documents the same two conventions (`cmd/`, `internal/`) as the only ones the Go team itself recommends.
 - **Failure modes → fixes:**
@@ -584,6 +627,26 @@ func TestMarkPaidHandler_NotFoundMapsTo404(t *testing.T) {
 - No official Go project layout exists beyond `cmd/` + `internal/`; `golang-standards/project-layout` is a popular community convention, not a standard.
 - Avoid `util`/`common`: ask which feature a function actually belongs to instead.
 - Start with manual DI in `main.go`; reach for `wire`/`fx` only once that becomes genuinely hard to read.
+
+## Self-check 🟢🟡
+
+> [!question]- Which file knows every concrete type in the service?
+> `cmd/<binary>/main.go`.
+
+> [!question]- Who can import a package under `internal/`?
+> Only code inside the same module, rooted at the parent of that `internal` folder.
+
+> [!question]- Which way do imports point?
+> Handler → service → repository, never back.
+
+> [!question]- Where should the `Repo` interface be declared, and why?
+> In the `invoice` package that uses it, so `invoice` never has to import `store`.
+
+> [!question]- What does "manual DI" mean?
+> `main` calls each constructor in order and passes the results in, with no framework.
+
+> [!question]- What is wrong with a `util` package?
+> Its name says nothing, so unrelated code piles up there and every package ends up importing it.
 
 ## Links 🟢
 

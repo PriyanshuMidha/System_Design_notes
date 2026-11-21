@@ -29,6 +29,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Structs, Methods and Embedding]]: a struct groups fields, and a method is a function attached to a type, like `func (c Circle) Area() float64`.
+> - [[Pointers, Values and Escape Analysis]]: `*T` is a pointer to a `T`, a pointer can be `nil`, and a method with a `*T` receiver belongs to the pointer, not the plain value.
+
 **From zero, in 60 seconds** 🟢
 
 You write a checkout function. It needs to save stock in a database.
@@ -74,6 +78,12 @@ A Go interface is that socket shape.
 | Satisfy | A type has every method the interface lists | `Circle` satisfies `Shape` |
 | Nil | "Points at nothing" | `var p *Circle = nil` |
 | Fake | A small test stand-in for a real dependency | `fakeReserver` returning `nil` |
+| Method set | The full list of methods a type has; this decides which interfaces it fits | `*PostgresInventory` has `Reserve` |
+| Dynamic dispatch | Picking which method to run at runtime, based on what is inside the interface | `s.Area()` runs `Circle.Area` |
+| itab | A small table Go builds once per (type, interface) pair, holding the method addresses | the "which methods" half of an interface value |
+| Type assertion | Asking an interface "is a `Circle` inside?" and getting it out | `c, ok := s.(Circle)` |
+| Inlining | The compiler copying a small function's body into its caller to skip the call | not possible through an interface call |
+| Consumer | The code that calls the interface's methods (not the code that implements them) | `CheckoutService` |
 
 **Picture it**
 
@@ -99,7 +109,7 @@ Where it breaks: a real socket either has power or not, but a Go interface holdi
 
 ## 1. Why it exists 🟢
 
-A checkout service needs to reserve stock before charging a card. Writing it directly against `*PostgresInventory` works until a test needs to run without a real database, or until the team swaps Postgres for a cache-backed store — at which point every caller of the concrete type needs to change, and every test needs a running database.
+A checkout service needs to reserve stock before charging a card. Writing it directly against `*PostgresInventory` works until a test needs to run without a real database, or until the team swaps Postgres (a popular SQL database) for a cache-backed store — at which point every caller of the concrete type needs to change, and every test needs a running database.
 
 An interface breaks that coupling: `CheckoutService` depends on a `StockReserver` — a single method, `Reserve(ctx, productID, qty) error` — instead of on `*PostgresInventory` and its dozen other methods. In production, a real `*PostgresInventory` satisfies it.
 
@@ -111,9 +121,11 @@ Think of an interface as a **socket**, not a blueprint. A wall socket doesn't ca
 
 Any type whose methods line up with the interface's "pins" fits, with no registration required. Go's compiler checks the fit at compile time by comparing method signatures, not by looking for a `type X implements Y` declaration, because Go has no such declaration.
 
-An interface **variable**, though, is not the plugged-in device itself — it's a small adapter that remembers two things: which kind of device is plugged in (its concrete type), and where that device actually is (its data). That adapter is always the same fixed size, two machine words, no matter how large or small the plugged-in device is.
+An interface **variable**, though, is not the plugged-in device itself — it's a small adapter that remembers two things: which kind of device is plugged in (its concrete type), and where that device actually is (its data). That adapter is always the same fixed size, two machine words (a word is 8 bytes on a 64-bit computer), no matter how large or small the plugged-in device is.
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that an interface lists the methods you need, and any type with those methods fits automatically. **Next we open the box**: where to declare interfaces, the two-part value hiding inside every interface variable, the nil trap that follows from it, and how to get the concrete type back out.
 
 ### Implicit satisfaction and small, consumer-side interfaces
 
@@ -159,7 +171,7 @@ func NewCheckoutService(stock StockReserver) *CheckoutService {
 }
 ```
 
-Accepting an interface lets the caller supply any satisfying type, real or fake. Returning a concrete `*CheckoutService` (not an interface) lets callers see its full, specific API and lets the compiler devirtualize calls *on* `CheckoutService` itself — you only pay the interface's indirection cost at the one boundary that needs flexibility, not throughout the call chain.
+Accepting an interface lets the caller supply any satisfying type, real or fake. Returning a concrete `*CheckoutService` (not an interface) lets callers see its full, specific API and lets the compiler devirtualize (turn an interface call back into a direct call) calls *on* `CheckoutService` itself — you only pay the interface's indirection cost at the one boundary that needs flexibility, not throughout the call chain.
 
 ### Compile-time assertion
 
@@ -195,7 +207,7 @@ The type word points at an **itab** — a small table built once per (concrete t
 
 Calling `s.Area()` through the interface means: follow the type word to the itab, look up `Area`'s slot, call that function pointer with the data word as the receiver.
 
-That extra hop is the entire cost of dynamic dispatch — there's no reflection and no map lookup involved.
+That extra hop is the entire cost of dynamic dispatch — there's no reflection (inspecting types at runtime) and no map lookup involved.
 
 ### Nil interface vs. typed nil
 
@@ -327,7 +339,7 @@ A repository interface varies in *behaviour* (a real DB call vs. an in-memory fa
 
 ### Interface pollution
 
-The anti-pattern carried over wholesale from Java: an `IOrderService` interface with exactly one implementation, `OrderServiceImpl`, created "for testability" before any second implementation or any test fake actually exists.
+The anti-pattern (a common but harmful habit) carried over wholesale from Java: an `IOrderService` interface with exactly one implementation, `OrderServiceImpl`, created "for testability" before any second implementation or any test fake actually exists.
 
 It adds a layer of indirection, a naming collision (`I`-prefixes and `Impl`-suffixes are not idiomatic Go), and zero benefit until there's a real second shape — a fake, a second backend — that needs it.
 
@@ -360,6 +372,8 @@ ok      interfaces      1.4s
 ```
 
 Consumer-side interface, a real implementation, and a test fake:
+
+**What this code does, in plain words:** `StockReserver` lists the one method checkout needs. `PostgresInventory` (here just a map standing in for a database) has that method, so it fits, and the `var _` line makes the build fail if it ever stops fitting. `CheckoutService.Buy` only talks to the interface. `fakeStock` also has `Reserve`, counts how often it was called, and is what the test plugs in.
 
 ```go
 type StockReserver interface {
@@ -422,6 +436,8 @@ func TestRealImplementationSatisfiesTheSameInterface(t *testing.T) {
 
 Nil interface vs. typed nil:
 
+**What this code does, in plain words:** `Describe` returns a `*FieldError` variable that is `nil`, through a result of type `error`. The caller gets an `error` that is not `nil`, because the type half is filled in. `describeFixed` returns a plain `nil`, which really is nil. `alwaysOKValidator` is a normal type whose `Validate` returns `nil` correctly.
+
 ```go
 type Validator interface{ Validate() error }
 
@@ -467,6 +483,8 @@ func TestNilInterfaceVsTypedNil(t *testing.T) {
 ```
 
 Type assertion (comma-ok) and a type switch:
+
+**What this code does, in plain words:** two shapes, `Circle` and `Square`, both have `Area()`, so both fit `Shape`. The code then opens a `Shape` to ask which one is inside, once with comma-ok (`c, ok := s.(Circle)`) and once with a `switch` on the type.
 
 ```go
 type Shape interface{ Area() float64 }
@@ -514,6 +532,8 @@ func TestTypeSwitchAndCommaOkAssertion(t *testing.T) {
 ```
 
 Interface embedding, generics vs. `any`, and the measured interface header size:
+
+**What this code does, in plain words:** `ReadWriter` is built from two small interfaces, `Reader` and `Writer`; `memStore` has both methods, so it fits all three. `Sum[T Number]` shows the generic way to accept "any number type" with compile-time checks instead of `any`. `interfaceHeaderSize` returns the size of an interface value: 16 bytes.
 
 ```go
 type Reader interface {
@@ -630,6 +650,9 @@ A larger concrete type, or one captured by a pointer, would add an allocation on
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** implicit satisfaction, consumer-side interfaces, the `(type, data)` pair, the nil trap, assertions, embedding, and when to use `any` or generics instead. **Next is the advanced part**: how interfaces shape real Go services, the review comments they trigger, and the compiler details (itabs, PGO devirtualization) interviewers ask about.
+
+
 - **Real systems:** `io.Reader`/`io.Writer` are the standard library's own proof of small, decoupling interfaces working at scale — nearly every I/O type in Go satisfies them without ever importing `io`.
 
   Repository interfaces at the consumer side (`checkout` declaring `StockReserver`, not `inventory` declaring it) are the standard Go layering for services over a database; see [[Transactions and the Repository Pattern]] in `06 Backend Engineering in Go` for the full pattern in a service.
@@ -643,10 +666,10 @@ A larger concrete type, or one captured by a pointer, would add an allocation on
 
 - **The itab in more detail.** An itab is built once per distinct `(concrete type, interface type)` pair the first time that combination is needed, then reused — it is not rebuilt on every assignment.
 
-  It holds the concrete type's `*rtype` (for type assertions and reflection) and a slice of function pointers, one per method the interface requires, in the interface's declared method order.
+  It holds the concrete type's `*rtype` (the runtime's description of a type) (for type assertions and reflection) and a slice of function pointers, one per method the interface requires, in the interface's declared method order.
 
   A method call `s.Area()` through an interface compiles to: load the itab pointer from `s`, index into its function-pointer slice, call that pointer with `s`'s data word as the receiver.
-- **PGO devirtualization (Go 1.21+).** With profile-guided optimization enabled (a `default.pgo` file in the main package, built from a production CPU profile), the compiler can look at a call site through an interface and see that one concrete type accounts for the overwhelming majority of calls there in practice.
+- **PGO devirtualization (Go 1.21+).** With profile-guided optimization (the compiler using a CPU profile from real traffic to decide what to speed up) enabled (a `default.pgo` file in the main package, built from a production CPU profile), the compiler can look at a call site through an interface and see that one concrete type accounts for the overwhelming majority of calls there in practice.
 
   It then emits a direct, inlinable call for that common case with a fallback to the normal indirect call for anything else — recovering much of the direct-call performance at exactly the call sites profiling shows are hot, without giving up the interface's flexibility in the source code.
 
@@ -693,6 +716,30 @@ A larger concrete type, or one captured by a pointer, would add an allocation on
 - `any` is for genuinely unknown shapes at runtime; a generic constraint is for a fixed set of types sharing one algorithm.
 - Dynamic dispatch costs one itab lookup plus an indirect call per method call — measured ~35% slower than a direct call for a trivial method; PGO (Go 1.21+) can devirtualize the dominant concrete type at a hot call site automatically.
 - Interface pollution: an `IX`/`XImpl` pair with one implementation and no present need. Add the interface when a real second shape exists.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- How does a Go type say it implements an interface?
+> It does not. If it has all the methods, it fits automatically.
+
+> [!question]- Where should you usually declare an interface: next to the code that uses it, or next to the type that implements it?
+> Next to the code that uses it (the consumer).
+
+> [!question]- What does `var _ StockReserver = (*PostgresInventory)(nil)` do at runtime?
+> Nothing. It only makes the build fail if the type stops fitting.
+
+🟡 Medium
+
+> [!question]- How big is any interface value on a 64-bit machine, and what are its two parts?
+> 16 bytes: a type word (pointing at the itab) and a data word.
+
+> [!question]- `var fe *FieldError; var err error = fe`. Is `err == nil`?
+> No. The type half is `*FieldError`, so the interface is not nil even though the pointer is.
+
+> [!question]- What is the difference between `c := s.(Circle)` and `c, ok := s.(Circle)` when `s` holds a `Square`?
+> The first panics. The second sets `ok = false` and `c` to the zero `Circle`.
 
 ## Links
 

@@ -32,6 +32,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Structs, Methods and Embedding]]: how to declare a struct, attach a method with a receiver, and put one struct inside another.
+> - [[Interfaces]]: an interface lists methods, and any type with those methods can be used where the interface is expected.
+
 **From zero, in 60 seconds** 🟢
 
 Most LLD advice is written for Java, which has classes and inheritance. Go has neither, but it can do the same jobs. A **struct** holds the data, methods attach behaviour to it, an **interface** is a list of methods any type can meet without saying so, and **embedding** puts one struct inside another so its methods show through. This note maps each OOP idea to its Go form, then shows a full tested example. Read the plain-words line above each code block first, then the code.
@@ -55,6 +59,11 @@ It just uses three smaller tools: structs, interfaces and embedding.
 | Pointer | A value holding the address of another value | `&car` gives a `*Car` |
 | Interface | A named set of methods; any type with them fits | `type Parker interface { Park() }` |
 | Nil | The "nothing here" value for pointers and interfaces | `var c *Car = nil` |
+| Embedding | Putting a type inside a struct with no field name, so its methods show through | `type Report struct { Logger }` |
+| Method set | The list of methods you can call through a type; it decides which interfaces the type fits | `*Order` has more methods than `Order` |
+| Dynamic dispatch | Picking which method body to run while the program runs, based on the real type | `s.Save(o)` runs the Postgres or the in-memory `Save` |
+| Constructor | A function that builds a valid object | `NewOrder(id, amount) (*Order, error)` |
+| Package | All Go files in one folder; the unit of privacy | `package order` |
 
 **Picture it**
 
@@ -89,6 +98,10 @@ Most LLD material is written in Java: abstract classes, `extends`, `@Override`, 
 
 Getting these right is the price of entry for writing Go in an LLD round.
 
+### Real-life example: paying on a ride app 🟢
+
+On a ride app like Uber or Ola you can pay by card, UPI or wallet. In Go, each way to pay is its own struct (`Card`, `UPI`, `Wallet`), and each has a `Pay(amount int64) error` method. The checkout code only knows a small `Payer` interface, so adding a new method such as "pay later" means one new struct and no change to checkout. Roughly, that one idea, a small interface with several structs behind it, is most of what "OOP in Go" means.
+
 ## 2. Mental model 🟢
 
 Separate **data**, **behaviour contracts** and **reuse**, which Java's class bundles together:
@@ -99,11 +112,37 @@ Separate **data**, **behaviour contracts** and **reuse**, which Java's class bun
 
 **Analogy:** a power socket (interface) does not know which appliance you plug in; any plug with the right pins fits. Embedding is a toolbox bolted inside a van: you can reach the tools from the van, but the toolbox does not know it is in a van.
 
+## Common beginner mistakes 🟢
+
+- **Expecting embedding to work like `extends`** → the embedded type's methods never call the outer type's versions, so your "override" is silently ignored → pass the varying step in as an interface or a function.
+- **Using a value receiver on a method that changes the object** → the method changes a copy, and the real object stays the same → use a pointer receiver (`func (o *Order) Cancel()`).
+- **Returning a nil pointer of your own error type as an `error`** → the caller sees `err != nil` even on success → write `return nil` when there is no error.
+- **Writing an interface for every struct** (`OrderService` plus `OrderServiceImpl`) → it adds files and helps nobody → declare a small interface in the code that uses it, when a second version or a test fake needs it.
+- **Storing structs by value in a map and calling pointer methods on them** → `m["o1"].Cancel()` does not compile → store pointers: `map[string]*Order`.
+
+### Compare: Go embedding vs inheritance 🟡
+
+| Question | Java `extends` | Go embedding |
+| --- | --- | --- |
+| Can I pass the child where the parent is expected? | Yes, a `SalesReport` is a `Report` | No; define an interface both satisfy |
+| If the parent calls `step()`, whose `step` runs? | The child's (virtual dispatch) | Always the inner type's own `step` |
+| Do the parent's public methods show on the child? | Yes | Yes, they are promoted |
+| How do I vary one step? | Override it | Inject it as an interface or a func |
+
+> 🟢 → 🟡 **You now know** the three Go tools: structs with methods for data and behaviour, small interfaces for "any type that can do this", and embedding for reuse. **Next we open the box**: the exact rules for value and pointer receivers, how interfaces are matched, what embedding does and does not do, and how Go builds enums, constructors and privacy.
+
 ## 3. How it works 🟡
 
 ### Java/OOP to Go translation
 
 **In plain words: each OOP word on the left, and how you write it in Go on the right.**
+
+**Step by step:**
+1. Read a Java design: `class Order` with `private status` and a `cancel()` method.
+2. Turn the class into `type Order struct { status Status }`; the lower-case `status` is private to the package.
+3. Turn the constructor into `func NewOrder(id string) (*Order, error)`, which checks the input.
+4. Turn `cancel()` into `func (o *Order) Cancel() error` and return an error instead of throwing.
+5. If something "extends" a base class, use a field or an injected interface instead.
 
 | OOP idea | Go version | Note |
 | --- | --- | --- |
@@ -114,16 +153,22 @@ Separate **data**, **behaviour contracts** and **reuse**, which Java's class bun
 | `extends` (inheritance) | embedding or a field | No subtype relation: a `SalesReport` is not a `Report` |
 | abstract class | interface + an injected helper, or a struct with a function field | No abstract methods; the "hook" must be passed in |
 | method override | a different type implementing the same interface | Or shadowing through embedding, which is not override |
-| `enum` | typed constant + `iota` + `String()` | Any integer converts to the type; validate |
+| `enum` | typed constant + `iota` (Go's auto-counter: 0, 1, 2 for each constant) + `String()` | Any integer converts to the type; validate |
 | `static` method / field | package-level function / variable | Avoid mutable package state |
 | `synchronized` | `sync.Mutex` in the struct, or an atomic update in the database | Mutex protects one process only |
 | exceptions | `error` return values | `panic` only for programmer bugs |
-| dependency injection container | pass dependencies into `NewX`, wire them in `main` | Code-generated (google/wire) or reflection-based (uber/fx) wiring are optional |
-| generic class `Cache<K,V>` | `type LRU[K comparable, V any] struct` (since Go 1.18) | Use generics when the algorithm is identical for all types |
+| dependency injection container | pass dependencies into `NewX`, wire them in `main` | Code-generated (google/wire) or reflection-based (uber/fx; reflection means inspecting types while the program runs) wiring are optional |
+| generic class `Cache<K,V>` | `type LRU[K comparable, V any] struct` (generics: a type with type parameters `K` and `V`, filled in when used; since Go 1.18) | Use generics when the algorithm is identical for all types |
 
 ### Value vs pointer receivers and method sets
 
 **In plain words: a pointer receiver can change the object; a value receiver gets a copy.**
+
+**Step by step:**
+1. `func (o Order) Cancel()` gets a copy of the order. It sets `status = cancelled` on the copy, and the stored order is unchanged.
+2. `func (o *Order) Cancel()` gets the address, so the change sticks.
+3. An interface `Canceller` that needs `Cancel()` is now met by `*Order`, not by `Order`.
+4. So pass `&order` (a `*Order`) wherever a `Canceller` is needed, and keep `*Order` in maps.
 
 A method's receiver is either a value (`func (o Order) ID()`) or a pointer (`func (o *Order) Cancel()`).
 
@@ -138,13 +183,20 @@ The **method set** decides interface satisfaction (Go spec, "Method sets"):
 | `Order` | methods with value receivers only | No |
 | `*Order` | methods with value **and** pointer receivers | Yes |
 
-Calling `v.Cancel()` on a plain variable `v Order` still compiles, because the variable is addressable and Go rewrites the call to `(&v).Cancel()`. That convenience does not extend to interface satisfaction, and it does not work for values that are not addressable, such as map elements: `m["o1"].Cancel()` with `map[string]Order` does not compile. Store `map[string]*Order` instead.
+Calling `v.Cancel()` on a plain variable `v Order` still compiles, because the variable is addressable (it has a fixed place in memory whose address Go can take) and Go rewrites the call to `(&v).Cancel()`. That convenience does not extend to interface satisfaction, and it does not work for values that are not addressable, such as map elements: `m["o1"].Cancel()` with `map[string]Order` does not compile. Store `map[string]*Order` instead.
 
 ### Interfaces: implicit, small, consumer-side
 
 **In plain words: a type meets an interface just by having the methods. No "implements" keyword.**
 
-An interface value is a pair: (dynamic type, dynamic value). Calling a method looks up the method for the dynamic type at run time. That is Go's only dynamic dispatch.
+**Step by step:**
+1. The order service needs to save orders, so in its own package it declares `type Saver interface { Save(ctx, o) error }`.
+2. `MemStore` and `PostgresStore` each have a `Save` method with that shape. Neither mentions `Saver`.
+3. `NewService(store Saver)` accepts either one.
+4. In tests you pass `MemStore`; in `main` you pass `PostgresStore`.
+5. Add `var _ Saver = (*MemStore)(nil)` so the compiler tells you if the methods ever drift apart.
+
+An interface value is a pair: (dynamic type, dynamic value). Calling a method looks up the method for the dynamic type at run time. That is Go's only dynamic dispatch (choosing the method body while the program runs).
 
 Rules that interviewers check:
 
@@ -152,7 +204,7 @@ Rules that interviewers check:
 | --- | --- |
 | Small | 1–3 methods. `io.Reader` has one. |
 | Consumer-side | The package that *uses* a dependency declares the interface with only the methods it calls. |
-| Accept interfaces, return structs | `NewService(store Saver) *Service`: callers can pass fakes, and they get the full concrete type back. |
+| Accept interfaces, return structs | `NewService(store Saver) *Service`: callers can pass fakes (simple stand-ins used in tests), and they get the full concrete type back. |
 | Implicit | No `implements`; a type satisfies every interface whose methods it has, including ones declared later in other packages. |
 | Compile-time check | `var _ Canceller = (*Order)(nil)` fails to compile if the methods drift. |
 | No interface for one implementation | Unless it is a real boundary (database, external API) or you need a fake in tests. |
@@ -161,6 +213,13 @@ Rules that interviewers check:
 ### Embedding: promotion, shadowing, no virtual dispatch
 
 **In plain words: embedding is not inheritance. The inner methods show through, but they never call back into the outer type.**
+
+**Step by step:**
+1. `Report` has `Run()`, and `Run()` calls `r.step()`, which returns `"base step"`.
+2. `SalesReport` embeds `Report` and defines its own `step()`.
+3. You call `s.Run()`. Go rewrites it to `s.Report.Run()`.
+4. Inside `Run`, the receiver is just the inner `Report`. It cannot see `SalesReport`, so `r.step()` runs `Report.step`.
+5. Result: `"base step"`, not the sales step. To vary a step, pass it in.
 
 ```mermaid
 classDiagram
@@ -221,13 +280,20 @@ sequenceDiagram
 The Go way to get a template method is to **inject the varying step** as an interface or function value (`Runner{steps: SalesStep{}}`), which is the Strategy pattern; see [[Strategy and Template Method]].
 
 Other embedding facts:
-- Embedding a **pointer** (`struct{ *Logger }`) shares one helper between values, but a zero-value outer struct has a nil `*Logger`, and a promoted method that touches its fields panics.
-- Embedding an **interface** in a struct promotes the interface's methods; calling one that was never set panics with a nil pointer dereference. It is useful in tests to implement only the methods a test needs.
+- Embedding a **pointer** (`struct{ *Logger }`) shares one helper between values, but a zero-value outer struct has a nil `*Logger`, and a promoted method that touches its fields panics (crashes with a run-time error).
+- Embedding an **interface** in a struct promotes the interface's methods; calling one that was never set panics with a nil pointer dereference (reading through a pointer that points at nothing). It is useful in tests to implement only the methods a test needs.
 - Embedding a type also promotes its **exported** methods into your public API, which is how a `sync.Mutex` embedded in an exported struct leaks `Lock`/`Unlock` to callers. Use a named field `mu sync.Mutex` instead.
 
 ### Enums, constructors and zero values
 
 **In plain words: Go builds enums from constants, and a New function checks the rules when you make an object.**
+
+**Step by step:**
+1. Declare `type Status int`.
+2. List the constants with `iota`: `StatusUnknown` is 0, `StatusCreated` is 1, `StatusPaid` is 2, `StatusCancelled` is 3.
+3. Keep 0 for "unknown", so a field nobody set is easy to spot.
+4. Add `String()` for logs and `Valid()`, because `Status(9)` still compiles.
+5. Build orders only through `NewOrder`, which rejects bad input.
 
 - **Enums:** `type Status int` plus `const ( StatusUnknown Status = iota; ... )`. Reserve the zero value for "unknown" so a forgotten field is detectable, add `String()` for logs, and a `Valid()` check, because `Status(9)` compiles.
 - **Constructors:** `NewOrder` validates input and returns `(*Order, error)`. Other packages cannot set unexported fields, so the constructor is the only way to build a valid `Order` from outside.
@@ -236,6 +302,12 @@ Other embedding facts:
 ### Encapsulation by package
 
 **In plain words: lower-case names are private to the package, not to the struct.**
+
+**Step by step:**
+1. In `package order`, the field `status` is lower-case, so only files in that folder can touch it.
+2. Code in `package api` must call `o.Cancel()` instead of setting `o.status`.
+3. Two types inside `package order` can still read each other's private fields.
+4. Put the package under `internal/` to stop other modules from importing it at all.
 
 - Lower-case names are visible only inside the **package** (all files in one directory). Two types in the same package can read each other's unexported fields; that is the unit of encapsulation, not the type.
 - A directory named `internal/` limits imports to code rooted at the parent of `internal` (enforced by the go command). `myapp/internal/order` can be imported by `myapp/cmd/api` but not by another module.
@@ -281,6 +353,8 @@ func validate() error {
 ### Full code (tested)
 
 **In plain words: the full example, one file at a time, with its tests.**
+
+**What this code does, in plain words:** `order.go` defines an `Order` with a `Status` enum and a `NewOrder` constructor, a pointer-receiver `Cancel`, a `Saver` interface with an in-memory store behind it, and a `Service` that takes a `Saver` in its constructor. It also contains the two traps on purpose: a `Report` that `SalesReport` embeds, and a validator that returns a typed nil. `order_test.go` proves each fact, including that `SalesReport.Run()` still returns `"base step"`.
 
 `order.go`:
 
@@ -580,9 +654,9 @@ How to get "same call, different behaviour" in Go:
 
 | Mechanism | How it works | Use when | Cost |
 | --- | --- | --- | --- |
-| Interface | Dynamic dispatch on the stored type | Behaviour varies by implementation (stores, providers, strategies) | One indirect call; harder "go to definition" |
+| Interface | Dynamic dispatch on the stored type | Behaviour varies by implementation (stores, providers, strategies) | One indirect call (the program looks up which method to run first); harder "go to definition" |
 | Function value | Store a `func` field or pass a closure | One varying operation, no state | No name for the role; can hide too much |
-| Type switch | `switch v := x.(type)` over a closed set | A fixed, small set of types you own (AST nodes, events) | Every new type edits the switch |
+| Type switch | `switch v := x.(type)` over a closed set | A fixed, small set of types you own (AST nodes, the pieces of a parsed program tree; events) | Every new type edits the switch |
 | Generics | Type parameters, `[K comparable, V any]` | Same algorithm, different element types (`LRU[K,V]`, sets, queues) | Cannot vary behaviour by type without an interface constraint |
 | Embedding | Promote methods of an inner type | Reuse a helper's methods (logger, metrics, base fields) | No override; leaks the inner API |
 | Named field | `log *Logger` and explicit delegation | Same as embedding when you want control over the API | A few delegating lines |
@@ -594,9 +668,11 @@ Generics and interfaces combine: `func Max[T cmp.Ordered](a, b T) T` uses an int
 - **Do not create an interface per struct.** `OrderService` + `OrderServiceImpl` is Java style. Declare the interface in the consumer when a second implementation or a test fake exists.
 - **Do not embed to get "is-a".** If you want `SalesReport` to be usable where a `Report` is expected, define an interface both satisfy. Embedding does not create a subtype.
 - **Do not embed a mutex in an exported type.** It makes `Lock` part of the public API.
-- **Value receivers for small immutable types** (money, coordinates, IDs) are fine and avoid aliasing bugs; pointer receivers for entities that change (orders, accounts).
+- **Value receivers for small immutable types** (money, coordinates, IDs) are fine and avoid aliasing bugs (two names pointing at the same data, so a change through one surprises the other); pointer receivers for entities that change (orders, accounts).
 - **Generics are not polymorphism.** A generic `Notifier[T]` does not let you choose email or SMS at run time; an interface does.
 - **Large producer-side interfaces** (a 12-method `Repository` declared next to the Postgres code) force every fake to implement 12 methods. Split by consumer.
+
+> 🟡 → 🔴 **You now know** how each OOP idea maps to Go and why the traps happen. **Next comes the production view**: how the standard library uses these tools, the bugs they cause in real code, and the exact language rules behind typed nil and promotion.
 
 ## 7. In production 🔴
 
@@ -612,7 +688,7 @@ Generics and interfaces combine: `func Max[T cmp.Ordered](a, b T) T` uses an int
 | Copying a struct with a mutex | Two copies, two locks, data race | Pointer receivers; `go vet` copylocks |
 | Unvalidated enum | `Status(7)` stored in the database | `Valid()` at the boundary; zero value means unknown |
 
-- **What to monitor:** in code review, `go vet` (copylocks, printf), `staticcheck`, and the race detector in CI (`go test -race`). Compile-time `var _ I = (*T)(nil)` assertions catch interface drift before deploy.
+- **What to monitor:** in code review, `go vet` (copylocks, printf), `staticcheck` (a popular extra Go code checker), and the race detector in CI (the server that runs your tests on every push; `go test -race`). Compile-time `var _ I = (*T)(nil)` assertions catch interface drift before deploy.
 
 ## 8. Deep dive 🔴
 
@@ -658,6 +734,26 @@ Generics and interfaces combine: `func Max[T cmp.Ordered](a, b T) T` uses an int
 - Never return a typed nil pointer as an interface; return `nil`.
 - Enums: `iota`, zero = unknown, `String()`, `Valid()`.
 - Wire concrete types in `main` (composition root); everything else takes interfaces.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What plays the role of a class in Go?
+> A struct for the data plus methods declared on it, with a `NewX` function as the constructor.
+
+> [!question]- 🟢 How does a type "implement" an interface in Go?
+> It just has all the interface's methods; there is no `implements` keyword.
+
+> [!question]- 🟢 What makes a name private in Go, and private to what?
+> A lower-case first letter; it is private to the package, not to the struct.
+
+> [!question]- 🟡 `Cancel` has a pointer receiver. Does `Order` (not `*Order`) satisfy `Canceller`?
+> No. Pointer-receiver methods are only in the method set of `*Order`.
+
+> [!question]- 🟡 `SalesReport` embeds `Report` and has its own `step()`. What does `s.Run()` use?
+> `Report.step`, because embedding has no virtual dispatch; inject the step if it must vary.
+
+> [!question]- 🟡 Why does returning a nil `*ValidationError` as an `error` look non-nil?
+> The interface holds a type (`*ValidationError`) and a nil value, and it is nil only when both parts are nil.
 
 ## Links 🟢
 

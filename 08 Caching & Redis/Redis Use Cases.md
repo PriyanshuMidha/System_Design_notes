@@ -35,6 +35,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3.2 and 3.3 (each use case and the lock hazard), section 4 (the Go code), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Redis Data Structures and When to Use Each]]: strings, hashes, lists, sets, sorted sets, HyperLogLog, bitmaps and geo, and which question each answers fast.
+> - [[Redis Hands-on Setup with Go]]: running Redis, `SET ... EX ... NX`, and calling Redis from Go with go-redis and timeouts.
+
 **From zero, in 60 seconds** 🟢
 
 Your main database is the official record, but some jobs are slow or clumsy there.
@@ -80,6 +84,10 @@ This note is the catalogue of those jobs and how to do each one right.
 | Idempotency key | An ID that makes a repeated request run only once | Retrying a payment does not charge twice |
 | Sorted set | A set where each member has a score, kept in order | Leaderboard: player → points |
 | Lua script | A small program Redis runs atomically on the server | Check-and-delete a lock in one step |
+| Fencing token | A number that goes up each time a lock is handed out; the database rejects older numbers | Token 34 beats a late write with 33 |
+| HyperLogLog | A 12 KB structure that estimates how many different items it has seen | Unique visitors per page |
+| Bitmap | A string used as a row of on/off bits, one per numeric ID | Bit 42 = user 42 was active today |
+| Pub/Sub | Redis's live broadcast: listeners connected right now get the message, nothing is stored | `PUBLISH events "order 9 paid"` |
 
 **Picture it**
 
@@ -118,6 +126,8 @@ A ticketing backend on PostgreSQL starts getting these requests in the same quar
 
 Each one can be built on PostgreSQL, but each would add load, latency or locking to the database that serves bookings. Redis solves them with in-memory structures that do the work in one atomic command, and with TTLs that clean up by themselves.
 
+**Real-life example.** Open a food app like Swiggy and several of these jobs run at once. Your login stays alive across the app's many servers (a session in Redis). The OTP you typed expires after a few minutes (a key with a TTL). "Delivery partners near you" is a geo search. And if you tap "Pay" twice on a slow network, an idempotency key makes sure you are charged once, with the payment record itself kept in the real database.
+
 ## 2. Mental model 🟢
 
 Think of Redis as a **toolbox next to the database**, with one tool per job:
@@ -127,9 +137,26 @@ Think of Redis as a **toolbox next to the database**, with one tool per job:
 
 If the workbench is wiped, you lose convenience, not the business. Use cases that would lose the business if the workbench were wiped need the database too.
 
+## Common beginner mistakes 🟢
+
+- **Keying a session by user ID (`session:42`)** → one user has many devices, and anyone who knows a user ID could pretend to be them → use a long random session ID as the key.
+- **Running `INCR` and then `EXPIRE` as two separate steps** → a crash between them leaves a counter that never resets, so the user is blocked forever → do both in one Lua script or one `MULTI` with `EXPIRE ... NX`.
+- **Releasing a lock with a plain `DEL`** → if your lock already expired and someone else took it, you delete their lock → store a random token and delete only if it still matches.
+- **Trusting a Redis lock to stop double work that would corrupt data** → a long pause can let the lock expire while you still work → add fencing tokens, or use the database for that guarantee.
+- **Keeping locks and sessions in the same Redis as an evicting cache** → a burst of cache data can evict a lock or a session → put them on a separate instance with `noeviction`.
+
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that each Redis job is four choices (shape, key name, TTL, and what happens if Redis is down), and that money must also live in the database. **Next we open the box**: the map from each job to its shape and key, a short recipe for each, and why a Redis lock can fail.
+
 ### 3.1 Use case → structure → key pattern
+
+**Step by step (designing one use case, a login rate limit):**
+1. Name the job: "at most 5 login tries per user per minute".
+2. Pick the shape: a counter, so a string with `INCR`.
+3. Pick the key: `rl:user:42:minute`, one per user.
+4. Pick the TTL: 60 seconds, set in the same atomic step as the first `INCR`, so the counter resets by itself.
+5. Pick the failure policy: if Redis is down, allow the request and lean on a small in-app limiter, so one broken Redis does not block every login.
 
 ```mermaid
 flowchart LR
@@ -150,13 +177,20 @@ flowchart LR
 
 **In plain words:** a short recipe for each job: the command to use, the key name, and the one trap to avoid.
 
+**Step by step (one recipe end to end, the session store):**
+1. Asha logs in. The server makes a random 128-bit session ID, say `k3J9...`, and sends it to her browser as a cookie.
+2. It saves `session:k3J9...` as a hash (user ID, device, login time) with a 30-minute idle TTL.
+3. It also adds `k3J9...` to the set `user_sessions:42`, the list of all of Asha's sessions.
+4. Each request looks up the session by the cookie and refreshes the TTL. After 30 idle minutes the key expires and she is logged out.
+5. "Log out of all devices" reads `user_sessions:42` and deletes every session in it.
+
 **Cache.** Store the result of an expensive read under a key with a TTL: `SET cache:event:9 <json> EX 60`. Cache-aside, read-through and write-through, with their failure semantics, are in [[Caching Patterns]]; TTL choice and invalidation in [[Cache Invalidation, TTL and Consistency]].
 
-**Session store.** Generate a random 128-bit session ID, store `session:<sid>` as a hash with an idle TTL, and add the ID to `user_sessions:<uid>` so you can log the user out everywhere. Keying by user ID (`session:42`) is wrong: one user has many devices, and a session ID derived from the user ID is guessable, so anyone could hijack a session by sending another user's ID. Cookie flags and CSRF are in [[Sessions and Cookies]].
+**Session store.** Generate a random 128-bit session ID, store `session:<sid>` as a hash with an idle TTL, and add the ID to `user_sessions:<uid>` so you can log the user out everywhere. Keying by user ID (`session:42`) is wrong: one user has many devices, and a session ID derived from the user ID is guessable, so anyone could hijack a session by sending another user's ID. Cookie flags and **CSRF** (cross-site request forgery: another website tricking your browser into sending a request with your cookie) are in [[Sessions and Cookies]].
 
 **OTP and verification codes.** `SET otp:<id> <hmac> EX 300 NX`, an attempt counter, delete on success; full code in [[Redis Hands-on Setup with Go]].
 
-**Counters and rate limits.** `INCR views:event:9` is atomic. For a rate limit, `INCR` plus `EXPIRE` must run as one unit (a Lua script, or `MULTI` / `INCR key` / `EXPIRE key 60 NX` / `EXEC`, using `EXPIRE ... NX` from Redis 7.0), or a crash between them leaves a counter that never resets. Avoid `SET key 0 EX 60 NX` followed by a separate `INCR`: if the key expires between the two commands, `INCR` recreates it with no TTL. Algorithms (fixed window, sliding window, token bucket, GCRA) and the distributed design live in [[Rate Limiting - Algorithms and Distributed Design]].
+**Counters and rate limits.** `INCR views:event:9` is atomic. For a rate limit, `INCR` plus `EXPIRE` must run as one unit (a Lua script, or `MULTI` / `INCR key` / `EXPIRE key 60 NX` / `EXEC`, using `EXPIRE ... NX` from Redis 7.0), or a crash between them leaves a counter that never resets. Avoid `SET key 0 EX 60 NX` followed by a separate `INCR`: if the key expires between the two commands, `INCR` recreates it with no TTL. Algorithms (fixed window, sliding window, token bucket, GCRA: different ways of counting requests over time) and the distributed design live in [[Rate Limiting - Algorithms and Distributed Design]].
 
 **Leaderboards.** `ZINCRBY lb <points> <player>`, `ZREVRANGE lb 0 99 WITHSCORES` for the top 100, `ZREVRANK lb <player>` for "you are #N". Measured on Redis 8.2:
 
@@ -210,6 +244,13 @@ flowchart LR
 
 **In plain words:** a lock is a "busy" sign with a timer. The danger: your worker pauses, the timer runs out, someone else takes the lock, and now two workers run at once.
 
+**Step by step:**
+1. Worker A sets `lock:report` to its random token `tokA`, with a 30-second expiry. It holds the lock.
+2. A freezes for more than 30 seconds, for example in a long **GC pause** (Go's garbage collector briefly stopping the program).
+3. The lock expires. Worker B takes it with `tokB` and writes the report using fencing token 34.
+4. A wakes up and tries to write with its older fencing token 33. The database refuses, because it has already seen 34.
+5. A tries to release the lock, but the script sees the value is `tokB`, not `tokA`, so A cannot delete B's lock.
+
 ```mermaid
 sequenceDiagram
     participant A as Worker A
@@ -237,7 +278,7 @@ Two things save the day here:
 - The **token check** on release stops A from deleting B's lock.
 - The **fencing token** (a number that increases each time the lock is granted, checked by the resource) stops A's late write.
 
-Redis alone gives you the first. The second needs a source of increasing numbers (for example `INCR lock:report:fence` at acquire time, or a consensus store's revision) and a storage layer that rejects lower tokens; `SET NX PX` itself produces no fencing token.
+Redis alone gives you the first. The second needs a source of increasing numbers (for example `INCR lock:report:fence` at acquire time, or the revision number of a **consensus store** such as etcd or ZooKeeper, where a majority of servers must agree on every write) and a storage layer that rejects lower tokens; `SET NX PX` itself produces no fencing token.
 
 ## 4. Worked example 🟡
 
@@ -639,12 +680,12 @@ Measured: `go test -race ./usecases/` against Redis 8.2 passed all five tests. I
 | Use case | Redis approach | Alternative | Pick the alternative when |
 | --- | --- | --- | --- |
 | Cache | String with TTL | In-process cache (ristretto) | One instance, or as an L1 in front of Redis |
-| Sessions | Hash per random session ID + TTL | Signed/encrypted cookie, JWT | You want no server-side store and can live with harder revocation |
+| Sessions | Hash per random session ID + TTL | Signed/encrypted cookie, JWT (a signed token the client carries, so the server stores nothing) | You want no server-side store and can live with harder revocation |
 | Counters / rate limits | `INCR` + TTL, Lua | API gateway limiter, in-process `x/time/rate` | Per-instance limits are good enough |
 | Leaderboard | Sorted set | SQL `ORDER BY score LIMIT 100` with an index | Small boards, or ranks needed only in batch |
 | Unique counts | HyperLogLog | `COUNT(DISTINCT)` in an analytics store | Exact numbers, offline reporting |
 | Daily actives | Bitmap | Event table + warehouse query | Sparse or non-integer IDs |
-| Nearby search | Geo set | PostGIS | Polygons, complex filters, durable data |
+| Nearby search | Geo set | PostGIS (PostgreSQL's add-on for maps and shapes) | Polygons, complex filters, durable data |
 | Lock (efficiency) | `SET NX PX` + token | Database row lock, advisory lock | The protected work already runs in that database |
 | Lock (correctness) | Not Redis alone | etcd / ZooKeeper lease + fencing token | Two holders at once would corrupt data |
 | Idempotency | `SET NX EX` | Unique constraint in the database | Always also do this for money |
@@ -653,7 +694,7 @@ Measured: `go test -race ./usecases/` against Redis 8.2 passed all five tests. I
 The **Redlock debate** in brief:
 
 - Redlock acquires the same lock on a majority of independent Redis primaries (for example 3 of 5) to survive one node failing.
-- Martin Kleppmann argued in 2016 that it still depends on bounded clock drift and pauses, and cannot give fencing tokens, so it is unsafe for correctness.
+- Martin Kleppmann argued in 2016 that it still depends on bounded **clock drift** (server clocks slowly running at different speeds) and pauses, and cannot give fencing tokens, so it is unsafe for correctness.
 - Salvatore Sanfilippo (antirez) replied that its assumptions are reasonable in practice.
 
 The practical rule: a single-instance `SET NX PX` lock is fine for efficiency (avoiding duplicate work); for correctness, use fencing tokens with a consensus-based store. See [[Distributed Locks and Fencing Tokens]].
@@ -669,6 +710,8 @@ The practical rule: a single-instance `SET NX PX` lock is fine for efficiency (a
 - **When a simpler option wins:** a unique constraint beats a Redis idempotency key for correctness; `SELECT ... FOR UPDATE SKIP LOCKED` beats a Redis lock when the job queue already lives in PostgreSQL.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the shape, key and TTL for each common job, working Go code for four of them, and where Redis is the wrong tool. **Next is the advanced part**: how these run in real systems, what breaks, why caches and locks should not share an instance, and how failover can break a lock.
 
 - **Real systems:** Redis is widely used for sessions, rate limiting, leaderboards and caching in front of relational stores; managed services (ElastiCache, Memorystore, Upstash) host most of these deployments. Go client patterns that combine these use cases are in [[Redis in Go]].
 - **Failure modes and fixes:**
@@ -721,6 +764,30 @@ The practical rule: a single-instance `SET NX PX` lock is fine for efficiency (a
 - Lock: `SET NX PX` + random token; release and renew by token in Lua; fence for correctness.
 - Idempotency: `SET NX EX`, store the response, plus a database unique constraint.
 - Not for: system of record, big blobs, ad-hoc queries, must-not-lose messages via Pub/Sub.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Which Redis shape fits a live leaderboard?
+> A sorted set: `ZINCRBY` to add points, `ZREVRANGE` for the top N, `ZREVRANK` for a player's rank.
+
+> [!question]- Why is a session keyed by a random ID and not by user ID?
+> A user has many devices, and a user-ID key would let anyone guess and steal a session.
+
+> [!question]- What makes a login code expire after 5 minutes?
+> A TTL on its key, for example `SET otp:42 <hmac> EX 300`.
+
+🟡 Medium
+
+> [!question]- Why must a lock be released with a token check instead of a plain `DEL`?
+> Your lock may have expired and been taken by someone else; a plain `DEL` would remove their lock.
+
+> [!question]- What does a fencing token protect against that a Redis lock cannot?
+> A worker that paused past its lock's expiry; the database rejects its write because its token is older.
+
+> [!question]- Why keep an idempotency key in Redis and also a unique constraint in the database for payments?
+> Redis can lose recent writes in a crash or failover; the database constraint is the guarantee that never goes away.
 
 ## Links 🟢
 

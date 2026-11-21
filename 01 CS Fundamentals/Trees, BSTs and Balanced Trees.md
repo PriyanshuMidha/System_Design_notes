@@ -29,6 +29,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5, 6 and 8.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 9 and 10. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Arrays and Dynamic Arrays (Go Slices)]]: a sorted slice finds things fast with binary search but is slow to insert into the middle.
+> - [[Stacks, Queues and Deques]]: a stack (newest first) and a queue (oldest first); tree walks use one or the other.
+
 **From zero, in 60 seconds** 🟢
 
 A **tree** is data arranged like a family tree: one node at the top (the root), each node pointing to children below it. Folders inside folders is a tree you already use daily.
@@ -74,6 +78,10 @@ A balanced search tree does both in about 20 steps, because each step throws awa
 | `O(log n)` | Work grows with the number of halvings | 1M items → ~20 steps |
 | Rotation | Re-hanging a few nodes to fix balance | AVL and red-black trees use it |
 | B-tree | A wide tree with many keys per node, made for disk pages | Database indexes |
+| Subtree | A node plus everything below it | the 3-branch under 8 |
+| In-order traversal | Visit left, then the node, then right; gives sorted output | 1, 3, 6, 8, 10 |
+| AVL / red-black tree | Two kinds of BST that fix their own shape after each change | Java `TreeMap` is red-black |
+| Fan-out | How many children a node can have | binary = 2; a B-tree node = hundreds |
 
 **Picture it**
 
@@ -116,6 +124,13 @@ That "as long as" is the whole story of this note: a BST's worst case is as bad 
 > [!tip] Remember
 > A BST is the structure that tries to give you binary search's speed and a linked list's cheap inserts at the same time — but only while its shape stays balanced.
 
+### Real-life example 🟢
+
+The folders on your phone or laptop form a tree: one root, folders inside folders, files as leaves.
+When Flipkart or Swiggy looks up your order by its ID, the database walks a B+tree index (a wide, shallow tree) and finds the row in 3-4 steps among billions.
+A calendar or a BookMyShow-style booking system checking "does this new slot overlap an existing one?" can use an interval tree, which is a BST with a little extra data per node.
+And Linux decides which program runs next by picking the leftmost node of a red-black tree.
+
 ## 2. Mental model 🟢
 
 ### Guess-the-number, with pointers instead of an array
@@ -145,11 +160,21 @@ flowchart TD
 >
 > A tree can look locally sorted at every parent-child pair and still violate this globally (see the "validate BST" problem in the Deep dive).
 
+## Common beginner mistakes 🟢
+
+- **Checking only a node's direct children to validate a BST** → a deep node can still break the rule against an ancestor → pass a `(min, max)` range down as you recurse.
+- **Inserting sorted data into a plain BST** → it becomes a straight line and every lookup is `O(n)` → use a balanced tree, or build from the middle of the sorted list.
+- **Treating a heap as a BST** → a heap only orders parent vs children, not left vs right → use a BST (or sorted slice) when you need sorted output.
+- **Forgetting the two-children delete case** → you can't just remove a node with two subtrees → swap in its in-order successor, then delete that.
+- **Reaching for a tree in Go by default** → Go has no built-in ordered map, and a sorted slice is often faster for data that rarely changes → use a map for lookups, a sorted slice for ordered reads.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a BST plays "higher or lower" at each node and that its speed depends on staying short. **Next we open the box:** the exact rules for search, insert and delete, the four ways to walk a tree, and how a tree turns into a slow linked list.
 
 ### Terms, defined before they're used
 
-- **Depth** of a node: the number of edges from the root to it.
+- **Depth** of a node: the number of edges (the links between a parent and a child) from the root to it.
 - **Height** of a node: the number of edges on the longest path from it down to a leaf. A single node has height 0; an empty tree has height -1 by convention.
 - **Degree**: the number of children a node has. In a binary tree, degree is at most 2.
 - **Subtree**: a node together with all its descendants.
@@ -160,6 +185,13 @@ flowchart TD
 ### The BST property and its three operations
 
 **In plain words:** Every node's key is greater than every key in its left subtree and less than every key in its right subtree. This one rule is what makes "go left or right" always lead you to the right place.
+
+**Step by step (tree with 50 at the root):**
+1. Search for 60: at 50, 60 is bigger, go right to 70.
+2. At 70, 60 is smaller, go left to 60. Found in 3 steps.
+3. Insert 65: walk the same way (50 → 70 → 60); at 60, 65 is bigger, and 60 has no right child.
+4. Attach 65 as the right child of 60. Done; nothing else moved.
+5. Delete is the same walk to find the node, then one of three cases (below).
 
 **Picture it:** (the tree above already shows the property: every value under `30` is < 30; every value under `70` is > 70)
 
@@ -195,6 +227,12 @@ flowchart LR
 
 ### Traversals: four ways to walk the same tree
 
+**Step by step (tree: 8 at the root, 3 on the left, 10 on the right):**
+1. In-order (left, node, right): 3, 8, 10. Sorted.
+2. Pre-order (node, left, right): 8, 3, 10. The parent comes first, so you can rebuild the tree.
+3. Post-order (left, right, node): 3, 10, 8. Children come first, so you can free them safely.
+4. Level-order (row by row, using a queue): 8, then 3, 10.
+
 | Order | Visit sequence | Used for |
 |---|---|---|
 | In-order | left, node, right | Reads keys in sorted order |
@@ -208,6 +246,13 @@ flowchart LR
 ### The degenerate case: when a tree is secretly a linked list
 
 **In plain words:** If you insert keys in already-sorted order, with no rebalancing, every new key is larger than everything before it — so it always becomes the right child of the previous node. The "tree" is now a straight chain.
+
+**Step by step:**
+1. Insert 1. It is the root.
+2. Insert 2. Bigger than 1, so it hangs to the right of 1.
+3. Insert 3. Bigger than 1, bigger than 2, so it hangs right of 2.
+4. Keep going to 5: every key hangs off the right of the last one.
+5. Finding 5 now takes 5 steps, like walking a linked list.
 
 **Picture it:**
 
@@ -276,10 +321,32 @@ Runnable Go version: [[Trees, BSTs and Balanced Trees - Go]]
 |---|---|---|---|
 | Plain BST | Doesn't | O(log n) average, O(n) worst case | Teaching, or input order is guaranteed random |
 | **AVL tree** | After every insert/delete, rotate to keep every node's left/right subtree heights within 1 of each other | O(log n) always | Read-heavy workloads: stricter balance means faster lookups, at the cost of more rotations on write |
-| **Red-black tree** | Color nodes red/black; rotation + recoloring rules bound the longest root-to-leaf path to at most 2× the shortest | O(log n) always, looser bound than AVL | Write-heavy workloads: fewer rotations than AVL on average; used by Linux's `rbtree` (the CFS scheduler's runqueue), Java's `TreeMap`/`TreeSet`, C++'s `std::map`/`std::set` |
-| **B-tree / B+tree** | Each node holds many keys (high fan-out) instead of just one, so the tree stays shallow even with billions of keys | O(log_b n), b in the hundreds | On-disk data: one node = one disk page, so height directly bounds the number of disk reads — see [[Storage Engines - B-tree vs LSM and WAL]] |
+| **Red-black tree** | Color nodes red/black; rotation + recoloring rules bound the longest root-to-leaf path to at most 2× the shortest | O(log n) always, looser bound than AVL | Write-heavy workloads: fewer rotations than AVL on average; used by Linux's `rbtree` (the CFS scheduler's runqueue, its list of programs waiting to run), Java's `TreeMap`/`TreeSet`, C++'s `std::map`/`std::set` |
+| **B-tree / B+tree** | Each node holds many keys (high fan-out: many children per node) instead of just one, so the tree stays shallow even with billions of keys | O(log_b n), b in the hundreds | On-disk data: one node = one disk page, so height directly bounds the number of disk reads — see [[Storage Engines - B-tree vs LSM and WAL]] |
 | Heap (as a tree) | Only a weaker ordering (parent ≤ children, not left < node < right) | O(log n) | You only ever need the min/max, not arbitrary search — see [[Heaps and Priority Queues]] |
 | Trie | Branches by key *prefix*, not by comparison | O(key length) | Keys share structure (strings, routes, IPs) — see [[Tries, Suffix Trees and Suffix Arrays]] |
+
+### What a rotation does 🟡
+
+**In plain words:** a rotation lifts a child up into its parent's place and moves the parent down one level, keeping the left-smaller / right-bigger rule true. It is the basic move AVL and red-black trees use to get short again.
+
+**Step by step (fixing the chain 1 → 2 → 3):**
+1. The tree leans right: 1 at the top, 2 below it, 3 below that. Height 2.
+2. Rotate left at 1: 2 moves up to be the root.
+3. 1 becomes 2's left child; 3 stays 2's right child.
+4. Height is now 1 and every BST rule still holds: 1 < 2 < 3.
+
+```mermaid
+flowchart LR
+    subgraph before["Before: leaning right"]
+        A1(("1")) --> B1(("2")) --> C1(("3"))
+    end
+    subgraph after["After rotate-left at 1"]
+        B2(("2")) --> A2(("1"))
+        B2 --> C2(("3"))
+    end
+    before --> after
+```
 
 ### AVL vs. red-black, side by side
 
@@ -312,6 +379,14 @@ flowchart TB
 > [!warning] Interview trap
 > "Heap" and "BST" are both trees, but a heap is **not** a BST: a heap only guarantees a parent is ≤ (or ≥) its children, not that left < node < right. You cannot do an ordered in-order traversal of a heap and expect sorted output.
 
+### Sorted slice vs BST vs hash map: people mix these up 🟡
+
+| Need | Sorted slice | Balanced BST | Hash map (Go `map`) |
+| --- | --- | --- | --- |
+| Find one key | `O(log n)` | `O(log n)` | `O(1)` average |
+| Insert / delete | `O(n)` (shift) | `O(log n)` | `O(1)` average |
+| Walk keys in order / range query | Yes, fast | Yes | No order at all |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - A plain BST is only as good as its insert order; never use one on data that might arrive sorted (log files, sequential IDs) without balancing.
@@ -319,20 +394,22 @@ flowchart TB
 - Go has **no ordered map in the standard library.** If you need sorted iteration or range queries over a map, either keep a separate sorted slice of keys, use a third-party ordered tree (`github.com/google/btree`), or reach for a sorted slice + `slices.BinarySearch` directly if mutation is infrequent.
 - Pointer-chasing trees (AVL, red-black) are cache-unfriendly in memory: each node is a separate heap allocation. For in-memory data that fits comfortably, a sorted slice often outperforms a pointer-based tree because of cache locality (see [[Memory Hierarchy and CPU Caches]]).
 
+> 🟡 → 🔴 **You now know** BST operations, traversals, rotations, and how AVL, red-black and B-trees differ. **Next comes the advanced part:** where trees run real systems (Linux, databases, file systems), how they fail under load, and the deep details of AVL vs red-black, B+trees, and classic interview problems.
+
 ## 7. In production 🔴
 
 - **Real systems:**
-	- Linux's completely fair scheduler keeps runnable tasks in a red-black tree ordered by virtual runtime, so "pick the next task to run" is "find the leftmost node," `O(log n)`.
+	- Linux's completely fair scheduler keeps runnable tasks in a red-black tree ordered by virtual runtime (how much CPU time each task has had, adjusted by priority), so "pick the next task to run" is "find the leftmost node," `O(log n)`.
 	- Java's `TreeMap`/`TreeSet` and C++'s `std::map`/`std::set` are red-black trees under the hood.
 	- PostgreSQL and InnoDB (MySQL) store table indexes as B+trees: internal nodes hold only routing keys, and every row lives in a leaf, with leaves linked together for fast range scans (`WHERE id BETWEEN ...`) — detailed in [[Storage Engines - B-tree vs LSM and WAL]].
-	- File systems (ext4's htree directory index, NTFS) and ASTs (Go's own `go/ast` package represents parsed source as a tree) use tree structures for the same reason: hierarchical data with efficient lookup.
+	- File systems (ext4's htree directory index, NTFS) and ASTs (abstract syntax trees: source code parsed into a tree; Go's own `go/ast` package represents parsed source as a tree) use tree structures for the same reason: hierarchical data with efficient lookup.
 	- Decision trees, random forests and gradient-boosted trees (ML) are trees in the literal data-structure sense, each internal node a yes/no split on a feature.
 	- Interval trees (a BST ordered by interval start, with each node also tracking the max end point in its subtree) answer "which intervals overlap this point or range?" in `O(log n + k)` — used for calendar/booking conflict checks and for finding overlapping memory regions or network ranges.
 - **Failure modes → fixes:**
 	- Sorted-order inserts degrade a plain BST to a linked list → use a self-balancing tree, or shuffle/batch-build from sorted input.
 	- Deep recursion on a very tall tree can exhaust the goroutine stack on pathological input → bound tree height via balancing, or convert hot-path recursion to the iterative, explicit-stack form.
-	- A tree's rotations under heavy concurrent writes serialize all writers → batch writes, or move to a structure built for concurrent access (e.g., a B-tree variant with latch-crabbing, as in production database engines).
-- **What to monitor:** tree height (or a cheap proxy like node count vs. log of node count) if you maintain one yourself; for a database, index bloat and the planner's chosen scan type for the query patterns you actually run.
+	- A tree's rotations under heavy concurrent writes serialize all writers → batch writes, or move to a structure built for concurrent access (e.g., a B-tree variant with latch-crabbing, locking a child before releasing its parent while walking down, as in production database engines).
+- **What to monitor:** tree height (or a cheap proxy like node count vs. log of node count) if you maintain one yourself; for a database, index bloat (an index much bigger than its live data, from dead entries) and the planner's chosen scan type for the query patterns you actually run.
 
 ## 8. Whiteboard version 🟡
 
@@ -415,6 +492,30 @@ This is a deliberate minimalism choice, not an oversight — it is one of the fe
 - B-tree/B+tree: high fan-out keeps height tiny for disk-backed data; B+tree additionally links leaves for fast range scans.
 - A heap is a tree but not a BST — only parent/child order is guaranteed, not left/right.
 - Go's standard library has no ordered map/tree; reach for a sorted slice or `google/btree`.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- In a BST, where do smaller keys go?
+> To the left; bigger keys go to the right, at every level.
+
+> [!question]- Which traversal gives sorted output?
+> In-order: left, node, right.
+
+> [!question]- What happens if you insert 1, 2, 3, 4, 5 into a plain BST?
+> It becomes a straight chain, so search takes `O(n)` like a linked list.
+
+🟡 Medium
+
+> [!question]- How do you delete a node with two children?
+> Copy in its in-order successor (smallest key in the right subtree), then delete that successor node.
+
+> [!question]- Why do databases use B+trees instead of binary trees for indexes?
+> Hundreds of keys per node keep the tree 3-4 levels deep, so a lookup needs only a few disk reads.
+
+> [!question]- Why do libraries usually pick red-black over AVL?
+> Red-black needs fewer rotations per write, which suits mixed read/write workloads.
 
 ## Links
 

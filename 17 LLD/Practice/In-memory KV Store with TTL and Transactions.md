@@ -36,6 +36,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs) and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[LLD Interview Method]]: the step order these notes follow: clarify, entities, APIs, storage, code, edge cases.
+> - [[Concurrency for LLD]]: goroutines run at the same time; a mutex makes them take turns on shared data.
+> - [[Command, Undo and Memento]]: keep pending changes aside so you can throw them away (undo) without touching the real data.
+
 **From zero, in 60 seconds** 🟢
 
 Think of a tiny Redis: a box of name-value pairs kept in memory. You can save a value, read it back and delete it. A value can have a **TTL**, a time to live, after which it is gone. You can also start a **transaction** with BEGIN, make changes, then keep them with COMMIT or throw them away with ROLLBACK. Transactions can sit inside other transactions. Each one is just a layer of changes stacked on top of the real data.
@@ -71,6 +76,10 @@ This note builds a small in-memory store that does both: keys that expire, and u
 | Nested transaction | A transaction opened inside another | `BEGIN; BEGIN; ...` |
 | Tombstone | A marker saying "deleted in this transaction" | `DELETE a` inside `BEGIN` |
 | Mutex | Lets only one goroutine touch shared data at a time | `mu.Lock()` around the map |
+| O(1), O(depth) | Cost that stays the same / grows with the number of open transactions | 3 nested `BEGIN`s: a read checks at most 3 layers |
+| Isolation | How much one session sees of another session's unfinished writes | Session B cannot see A's uncommitted `SET` |
+| Savepoint | A bookmark inside a transaction you can roll back to | Inner `BEGIN` acts like one |
+| Lost update | Two writers read the same value and one write silently wins | Both read 5, both write 6 |
 
 **Picture it**
 
@@ -107,7 +116,7 @@ ROLLBACK undoes only the innermost open transaction. Keys with a TTL disappear o
 it passes, even if nobody reads them again. Many clients use the store at once.
 ```
 
-- It tests data-structure choice (maps and a TTL index), two expiry strategies and their memory and latency costs, the layered-map trick for nested transactions, testability with an injected clock, and lock design.
+- It tests data-structure choice (maps and a TTL index), two expiry strategies and their memory and latency (how long one call takes) costs, the layered-map trick for nested transactions, testability with an injected clock, and lock design.
 - It is also the LLD half of [[Case Study - Key-Value Store]]. Time box: 10 minutes for Steps 1-4, 5 for Steps 5-7, 30 for the code, 10 for edge cases.
 
 ### Solving path
@@ -124,13 +133,13 @@ it passes, even if nobody reads them again. Many clients use the store at once.
 ### Questions to ask (with assumed answers)
 
 - Value types? *Assume: strings. Lists and hashes are an extension.*
-- TTL resolution and semantics? *Assume: any `time.Duration`; a key is gone at exactly `SET time + TTL`; `SET` without a TTL clears an old TTL (as Redis `SET` does).*
+- TTL resolution and semantics? *Assume: any `time.Duration`; a key is gone at exactly `SET time + TTL`; `SET` without a TTL clears an old TTL (as Redis, the popular in-memory key-value server, does for `SET`).*
 - Must expired keys free memory if nobody reads them? *Assume: yes, so a background sweeper is required.*
-- What does `COMMIT` do inside nested transactions? *Assume: it commits the innermost transaction into its parent, like a savepoint release; only the outermost `COMMIT` makes writes visible. Some versions of this problem say `COMMIT` closes all open transactions; that is the same code with a loop.*
+- What does `COMMIT` do inside nested transactions? *Assume: it commits the innermost transaction into its parent, like a savepoint release (folding a bookmark's changes into the transaction around it); only the outermost `COMMIT` makes writes visible. Some versions of this problem say `COMMIT` closes all open transactions; that is the same code with a loop.*
 - What does `ROLLBACK` do? *Assume: discards only the innermost transaction; with none open, it returns an error.*
 - Transactions per client or global? *Assume: per client session. Two sessions can each have open transactions.*
-- Isolation between sessions? *Assume: a session sees its own uncommitted writes plus the latest committed data (read committed); concurrent commits are last-writer-wins. Conflict detection is an extension.*
-- Persistence? *Assume: none; snapshots and an append-only log are extensions.*
+- Isolation between sessions? *Assume: a session sees its own uncommitted writes plus the latest committed data (read committed); concurrent commits are last-writer-wins (whoever commits second overwrites the first). Conflict detection is an extension.*
+- Persistence? *Assume: none; snapshots (a full copy saved to disk) and an append-only log (a file you only ever add lines to) are extensions.*
 
 ### Functional
 
@@ -143,7 +152,7 @@ it passes, even if nobody reads them again. Many clients use the store at once.
 - `Get`, `Set` and `Delete` are O(1) on average, plus O(depth) for reads inside nested transactions.
 - `BEGIN` is O(1): it never copies the store.
 - The sweeper holds the lock only for one bounded sample at a time.
-- Thread-safe under `go test -race`; deterministic TTL tests through an injected clock.
+- Thread-safe under `go test -race` (Go's race detector, which flags unsafe shared access); deterministic (same result every run) TTL tests through an injected clock.
 
 ### Out of scope
 
@@ -175,6 +184,8 @@ The hardest use case is a **read inside nested transactions** that must see the 
 Modelling insight: **a transaction layer stores only differences**. Copying the whole store on `BEGIN` is O(size) per `BEGIN` and is the most common wrong answer. **A delete inside a transaction must be a tombstone**, not a missing entry, because "missing" means "look further down" while the delete means "stop, it is gone".
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know TTL, lazy and active expiry, and that a transaction is a stack of small maps. Next we open the box: how store and session link, the commands, the memory cost of each layer, and the Go code.
 
 ```mermaid
 classDiagram
@@ -256,7 +267,7 @@ Everything is in memory; there is no repository. What the store keeps:
 
 Memory estimate: a layer costs only the keys written inside it, so `BEGIN` followed by 3 writes costs 3 map entries no matter how many million keys the store has.
 
-Durability, if asked: append every committed write to a log file and replay it on start, and take periodic snapshots so replay stays short. This is the Redis RDB and AOF idea ([[Redis Persistence - RDB and AOF]]); the commit path would write the whole outermost layer as one log record so a crash never leaves half a transaction.
+Durability, if asked: append every committed write to a log file and replay it on start, and take periodic snapshots so replay stays short. This is the Redis RDB (snapshot file) and AOF (append-only file) idea ([[Redis Persistence - RDB and AOF]]); the commit path would write the whole outermost layer as one log record so a crash never leaves half a transaction.
 
 ## Step 7: Patterns 🟡
 
@@ -833,6 +844,8 @@ func TestConcurrentSessions(t *testing.T) {
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working store and its tests. Next is interview depth: reading at the exact expiry instant, tombstones, inner commit then outer rollback, lock order and lost updates between sessions.
+
 | Edge case | What happens | How the design handles it |
 |---|---|---|
 | Read exactly at the expiry instant | Off-by-one | `expired` uses `!now.Before(exp)`, so `now == exp` is expired |
@@ -854,24 +867,24 @@ func TestConcurrentSessions(t *testing.T) {
 - Only lazy expiry, so write-once keys leak forever.
 - A sweeper that scans every key under the lock.
 - Storing a relative TTL and recomputing it at commit.
-- `RWMutex` with lazy deletion inside `Get` under the read lock: a write under a read lock is a data race.
+- `RWMutex` with lazy deletion inside `Get` under the read lock: a write under a read lock is a data race (two goroutines touch the same memory at once and one writes).
 
 ## Step 10: Tradeoffs and extensions 🔴
 
 | Follow-up | Design change |
 |---|---|
-| Conflict detection (serializable-ish) | Record the version of every key read in a transaction; at outermost commit, abort if any version changed (optimistic concurrency, as in [[Locking - Optimistic vs Pessimistic]]) |
+| Conflict detection (serializable-ish) | Record the version of every key read in a transaction; at outermost commit, abort if any version changed (optimistic concurrency: let everyone work, then check for clashes at commit, as in [[Locking - Optimistic vs Pessimistic]]) |
 | `COMMIT` closes all transactions (classic variant) | Loop `Commit` until depth is 0, or merge all layers in one pass |
 | Read-heavy load | Shard the store into N maps by key hash, each with its own lock; a multi-key commit then locks the shards in index order |
 | Memory limit | Add LRU or LFU eviction ([[LRU Cache with TTL]], [[Cache Eviction Policies - LRU, LFU, TTL]]) |
-| Expiry notifications | A min-heap of `(exp, key)` or a timer wheel, plus Observer |
+| Expiry notifications | A min-heap of `(exp, key)` or a timer wheel (a ring of time buckets, each holding the keys due in that slot), plus Observer |
 | Persistence | Append-only log of committed transactions plus snapshots |
 | Network server | One goroutine per connection owns one `Session`; a line parser maps commands to methods |
 | Many nodes | Partitioning and replication: [[Case Study - Key-Value Store]] |
 
 Tradeoffs chosen:
 
-- **One mutex for the store.** Simple and correct. `Get` writes (lazy deletion), so an `RWMutex` would need an upgrade dance; shard before reaching for it.
+- **One mutex for the store.** Simple and correct. `Get` writes (lazy deletion), so an `RWMutex` (a lock with a shared read mode) would need an upgrade dance (drop the read lock, take the write lock, check again); shard before reaching for it.
 - **Read committed, last writer wins.** Matches what most interviewers expect for this problem; say it out loud and offer the version check.
 - **Layered maps over snapshots.** `BEGIN` is O(1), memory is proportional to writes, and reads pay O(depth), which is tiny in practice.
 - **Sampled sweep over a heap.** No index maintenance on every `SET`; expiry timing is approximate, but correctness comes from lazy expiry on read.
@@ -928,9 +941,9 @@ Redraw it from memory:
 > No. The Redis documentation states that if a command fails at execution time inside `EXEC`, the other commands still run; there is no rollback. Commands that are rejected while being queued (a syntax error, for example) make `EXEC` refuse the whole transaction. The design here buffers writes per session, which is what gives it a real `ROLLBACK`.
 
 > [!question]- What does `COMMIT` do when transactions are nested?
-> In this design it merges the innermost layer into its parent, like releasing a savepoint, and only the outermost commit touches the store. Some problem statements say `COMMIT` closes every open transaction; ask, then implement it as a loop. Either way, the store is updated in one critical section so other sessions never see half a commit.
+> In this design it merges the innermost layer into its parent, like releasing a savepoint, and only the outermost commit touches the store. Some problem statements say `COMMIT` closes every open transaction; ask, then implement it as a loop. Either way, the store is updated in one critical section (code run while holding the lock) so other sessions never see half a commit.
 
-> [!question]- How do you avoid deadlock between the session lock and the store lock?
+> [!question]- How do you avoid deadlock (two goroutines each waiting forever for the other's lock) between the session lock and the store lock?
 > Fix an order: session first, then store. Session methods may call into the store; store methods never call into a session. A cycle needs one goroutine holding the store and waiting for a session, which cannot happen.
 
 > [!question]- Two sessions read `x = 5`, both write `x + 1` and commit. What is `x`?
@@ -948,6 +961,26 @@ Redraw it from memory:
 - Lock order: session, then store. `Get` writes, so use `Mutex`, not `RWMutex`.
 - Read committed and last writer wins unless you add version checks.
 - Injected clock; `!now.Before(exp)` means expired at the exact instant.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 `SET otp 1234 TTL 60s`, then `GET otp` at 61 s. What happens?
+> Missing; lazy expiry sees the deadline has passed, deletes the key and reports it as not found.
+
+> [!question]- 🟢 Why do we need a background sweeper if reads already delete old keys?
+> Keys that are written once and never read again would stay in memory forever.
+
+> [!question]- 🟢 What does `BEGIN` push, and what does `ROLLBACK` do?
+> `BEGIN` pushes an empty map; `ROLLBACK` throws the top map away.
+
+> [!question]- 🟡 Inside a transaction you `DELETE a`. Why store a tombstone instead of removing `a` from the layer?
+> A missing key means "look further down", so the store's old value would show through; the tombstone says "stop, it is gone".
+
+> [!question]- 🟡 Inner `COMMIT`, then outer `ROLLBACK`. Is the inner write in the store?
+> No. The inner commit only merges into the parent layer, and the outer rollback drops that layer.
+
+> [!question]- 🟡 What lock order avoids deadlock?
+> Session lock first, then store lock; store methods never take a session lock, so no cycle can form.
 
 ## Links 🟢
 

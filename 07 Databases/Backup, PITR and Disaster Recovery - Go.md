@@ -28,6 +28,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code steps 1-4 and Design decisions, then Running it.
 > - 🔴 **Interview / SDE-3 prep?** Add Tests, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Storage Engines - B-tree vs LSM and WAL]]: the database writes every change into a log (the WAL) first, in 16 MB files, and can replay that log later.
+> - [[Replication]]: replicas copy every write, mistakes included, which is why backups are needed at all.
+> - The theory twin [[Backup, PITR and Disaster Recovery]] explains base backups, WAL archiving and RPO/RTO in plain words; read its sections 1-3 first.
+
 **From zero** 🟢 — This file is the hands-on twin of [[Backup, PITR and Disaster Recovery]]. It builds a tiny Go program that answers one question: "if we had to rewind the database to time T, do we have an unbroken set of backups and log files to do it?" Read the theory note first, then walk the code here top to bottom; each step is short and every test checks one rule.
 
 ## Before the code 🟢
@@ -37,7 +42,7 @@ updated: 2026-11-13
 - **Multiple return values with `error`** (`(Plan, error)`): the planner returns either a plan or a reason the restore is impossible.
 - **Slices** (`[]Segment`): the ordered list of archived WAL segments the planner walks.
 - **Unit tests** with the `testing` package and `errors.Is`: each test builds a fixture and checks one rule.
-- **What to run:** `go vet ./... && go test -race ./...` inside the module. No goroutines, interfaces or generics are needed.
+- **What to run:** `go vet ./... && go test -race ./...` inside the module (`go vet` looks for common mistakes; `-race` turns on Go's race detector, which catches two goroutines touching the same data unsafely). No goroutines, interfaces or generics are needed.
 
 ## What this code shows 🟢
 
@@ -76,6 +81,8 @@ go test -race ./...
 ```
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** what the package is for: checking, before any disaster, whether a restore to time T is possible. **Next we open the code** one piece at a time: the record types, the planner that picks a backup, the walk along the WAL chain, and the restore-time sum.
 
 ### Step 1: the catalog types
 
@@ -178,7 +185,7 @@ func PlanRestore(backups []BaseBackup, wal []Segment, target time.Time) (Plan, e
 **How it works.**
 
 1. `Plan` is the answer: one backup to restore and the ordered segments to replay on top of it.
-2. `ErrNoBackup` is a sentinel error. Callers test it with `errors.Is`, so it must be a package-level variable created once.
+2. `ErrNoBackup` is a sentinel error (one fixed error value that callers can compare against, like a named signal). Callers test it with `errors.Is`, so it must be a package-level variable created once.
 3. The first `sort.Slice` orders backups newest first by `EndTime`, so the loop visits the cheapest restore first. The second orders WAL by `StartLSN`, which `chain` relies on to walk the log in order.
 4. `lastErr` starts as `ErrNoBackup`. If the loop never reaches `chain` (every backup ended after the target), that is the error returned.
 5. `continue` skips backups whose `EndTime` is after the target. This is the rule that a backup must finish before the moment you want to restore to.
@@ -294,7 +301,7 @@ flowchart LR
 
 ## Tests 🟡
 
-The tests share one fixture: one WAL segment per hour from midnight (24 segments of 16 MB), and two backups, a nightly one finishing at 01:30 and a midday one finishing at 12:20.
+The tests share one fixture (a small set of fake test data built once and reused): one WAL segment per hour from midnight (24 segments of 16 MB), and two backups, a nightly one finishing at 01:30 and a midday one finishing at 12:20.
 
 Five tests then cover the newest-backup choice, the fallback to the nightly backup, a lost segment, no backup, an archive that ends too early, and the restore-time arithmetic.
 
@@ -484,6 +491,8 @@ Reading the output line by line:
 
 ## Pitfalls in the code 🔴
 
+> 🟡 → 🔴 **You now know** how the planner and its tests work. **Next come the sharp edges** a reviewer or interviewer would poke at: slices reordered behind your back, trusting timestamps, and estimates that are only guesses until a drill measures them.
+
 - `PlanRestore` sorts the slices it receives, which reorders the caller's data. Pass copies if order matters to you.
 - The segment size here is 16 MB, as in PostgreSQL's default; real WAL files are named by timeline and segment number, and LSNs are 64-bit byte positions.
 - The check compares `LastTime` against the target, so segments need correct commit-timestamp metadata. A catalog that records only file times would make the check wrong.
@@ -577,6 +586,30 @@ Reading the output line by line:
 > 	return time.Duration(secs * float64(time.Second))
 > }
 > ```
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What question does `PlanRestore` answer?
+> "To restore to time T, which base backup and which WAL segments do we use, and is the chain unbroken?"
+
+> [!question]- Why does the code use LSN numbers instead of file names?
+> An LSN is a byte position, so "is there a gap?" becomes a simple check that each segment starts where the last one ended.
+
+> [!question]- What two parts does `RestoreTime` add together?
+> Time to copy the base backup, plus time to replay the WAL on top of it.
+
+🟡 Medium
+
+> [!question]- Why is a backup that ended at 12:20 skipped for a 12:05 target?
+> Its files only become consistent after WAL past its end is replayed, so it cannot represent the state at 12:05.
+
+> [!question]- Segment 5 is lost. Why can a 14:00 target still succeed?
+> The midday backup starts at segment 12, after the hole, so its chain never needs segment 5.
+
+> [!question]- What surprise does `sort.Slice` give the caller?
+> It sorts the caller's own slices in place, so their order changes after the call; pass copies if order matters.
 
 ## Links
 

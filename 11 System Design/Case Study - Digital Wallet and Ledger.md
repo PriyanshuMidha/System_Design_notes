@@ -36,6 +36,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+> - [[Transactions and ACID]]: a database transaction saves a group of writes all together or not at all.
+> - [[Idempotency and Idempotency Keys]]: a unique key on a request lets the server spot a retry and not repeat the work.
+> - [[Case Study - Payment System]]: how money comes in from banks and cards through a payment provider (PSP).
+
 **From zero, in 60 seconds** 🟢
 
 A wallet app holds money for you, like Paytm or PhonePe.
@@ -77,6 +83,11 @@ A wallet's job is to make "pay twice" and "money disappears" impossible, even wi
 | Saga | A multi-step operation with an undo for each step | Hold money, credit, then capture or release |
 | Reconciliation | Checking two records agree, and flagging if not | Sum of balances = sum of ledger |
 
+| Minor units | Money stored as a whole number of the smallest unit, to avoid decimal errors | ₹300.00 stored as 30000 paise |
+| Hold | Money set aside for a payment that is not finished yet | ₹300 held, still yours but not spendable |
+| PSP | Payment service provider: the company that talks to banks, cards and UPI for you | Razorpay, Stripe |
+| Outbox | A "to send" table written in the same transaction, so events are never lost | row "transfer 91 completed" |
+
 **Picture it**
 
 ```mermaid
@@ -113,16 +124,23 @@ A wallet exists to make these two failures impossible: **no double spend and no 
 
 **Functional requirements**
 - Create a wallet for a user or merchant, with a currency.
-- **Top-up**: add money from a bank account, card or UPI through a PSP (see [[Case Study - Payment System]]).
+- **Top-up**: add money from a bank account, card or UPI (India's instant bank-to-bank payment system) through a PSP (see [[Case Study - Payment System]]).
 - **Transfer** between two wallets (peer to peer, or customer to merchant).
 - **Withdraw** to a bank account.
 - **Balance and history**: current balance and a paginated list of transactions.
 - **Holds**: reserve an amount for a pending purchase, then capture or release it.
 - **Refunds and reversals**.
-- Limits and compliance: per-day limits, KYC tiers, fraud holds (mention, do not design).
+- Limits and compliance: per-day limits, KYC tiers (KYC, "know your customer": identity checks; more checks unlock higher limits), fraud holds (mention, do not design).
+
+### Real-life example: paying at a chai stall 🟢
+
+You scan a chai stall's QR code in a wallet app like Paytm and pay ₹20.
+The app writes two ledger lines: minus ₹20 from your wallet, plus ₹20 to the stall's wallet.
+If your network flickers and the app retries, the same idempotency key means you still pay ₹20 once.
+At the end of the day the stall owner moves the money to a bank account, which is a withdrawal written as its own pair of lines.
 
 **Non-functional requirements**
-- **Correctness above all.** Balances never negative (unless the product allows overdraft), money is conserved, every movement is traceable.
+- **Correctness above all.** Balances never negative (unless the product allows overdraft, i.e. spending more than you have), money is conserved, every movement is traceable.
 - **Exactly-once effect** for each transfer, built from at-least-once delivery plus idempotency (see [[Delivery Semantics and Exactly-Once]]).
 - **Strong consistency** for balances and ledger; eventual consistency is fine for notifications, search and analytics.
 - **Latency:** p99 under 500 ms for a transfer (an estimate of a typical target).
@@ -167,10 +185,29 @@ flowchart LR
     R --> PSP
 ```
 
+## Common beginner mistakes 🟢
+
+- **Running `balance = balance - 300` with no ledger** → you cannot explain or rebuild a balance after a bug → write ledger entries and update the balance in the same transaction.
+- **Storing money as a decimal float** → ₹0.1 + ₹0.2 is not exactly ₹0.3 in floating point → store whole paise as integers.
+- **Retrying a transfer without an idempotency key** → a timeout plus a retry pays twice → create one key per user action and resend it on every retry.
+- **Debiting the sender first, then crediting on another database** → a crash in between makes money vanish → hold first, credit, then capture (a saga with holds).
+- **Fixing a wrong entry with `UPDATE`** → history is lost and audits fail → add a reversing entry instead.
+
 ## 3. How it works - high-level design 🟡
 
+> 🟢 → 🟡 **You now know** the two failures a wallet must prevent: paying twice and money vanishing. **Next we open the box** and follow one transfer through the API, the idempotency check, the database transaction and the event that tells other systems.
+
+**Step by step (plain):**
+1. Asha taps "Send ₹300 to Ravi". The app makes a key, `pay-abc123`, and sends it with the request.
+2. The server writes down `pay-abc123`. If it was already there, it just returns the old answer.
+3. It checks Asha has at least ₹300 free and the transfer looks safe.
+4. In one database transaction it takes ₹300 from Asha, adds ₹300 to Ravi, and writes the two ledger lines.
+5. It replies "done", and a background relay tells other systems (notifications, history) through Kafka.
+
+**Full detail:**
+
 1. **Request.** The app calls `POST /v1/transfers` with `from_wallet`, `to_wallet`, `amount_minor`, `currency` and an `Idempotency-Key` header created once per user action.
-2. **Claim the key.** The API inserts the key into an `idempotency_keys` table with a unique constraint (atomic `INSERT ... ON CONFLICT DO NOTHING`). If the key already exists, it returns the stored result, or "in progress".
+2. **Claim the key.** The API inserts the key into an `idempotency_keys` table with a unique constraint (atomic `INSERT ... ON CONFLICT DO NOTHING`: insert the row, or quietly do nothing if the key already exists). If the key already exists, it returns the stored result, or "in progress".
 3. **Validate.** Check both wallets exist and are active, currencies match, amount is positive, the daily limit is not exceeded, and fraud rules pass.
 4. **Move the money.**
    - **Same shard:** one local transaction debits `from`, credits `to`, appends two ledger entries and an outbox row. It commits or rolls back as a unit.
@@ -277,7 +314,7 @@ Content-Type: application/json
 ```
 
 - `GET /v1/wallets/{id}` returns balance and held amount.
-- `GET /v1/wallets/{id}/transactions?cursor=...` returns history (keyset pagination; see [[Pagination, Filtering and Sorting]]).
+- `GET /v1/wallets/{id}/transactions?cursor=...` returns history (keyset pagination, which asks for "the next 50 after this ID" instead of page numbers; see [[Pagination, Filtering and Sorting]]).
 - `POST /v1/holds`, `POST /v1/holds/{id}/capture`, `POST /v1/holds/{id}/release` for merchant checkouts.
 - `POST /v1/topups` and `POST /v1/withdrawals`, each with its own idempotency key.
 
@@ -369,9 +406,9 @@ Wallet W1 has ₹1,000, W2 has ₹200. Transfer ₹300 from W1 to W2 on one shar
 
 1. Insert idempotency key K (first time, so proceed).
 2. `BEGIN`.
-3. Lock both wallet rows in ascending id order (at the default Read Committed level in PostgreSQL this is enough, because the balance is re-read after the lock is granted; do not check the balance before locking) with `SELECT ... FOR UPDATE`.
+3. Lock both wallet rows in ascending id order (at the default Read Committed level in PostgreSQL this is enough, because the balance is re-read after the lock is granted; do not check the balance before locking) with `SELECT ... FOR UPDATE` (read the row and lock it until the transaction ends).
 
-   Ordered locking prevents two opposite transfers (W1 to W2 and W2 to W1) deadlocking (see [[Locking - Optimistic vs Pessimistic]]).
+   Ordered locking prevents two opposite transfers (W1 to W2 and W2 to W1) deadlocking (each holding one lock and waiting forever for the other) (see [[Locking - Optimistic vs Pessimistic]]).
 4. Check `W1.balance - W1.held >= 300`. Yes (1,000).
 5. `UPDATE wallets SET balance_minor = balance_minor - 30000 WHERE id = W1`, and `+ 30000` on W2.
 6. Insert entries: debit W1 30000, credit W2 30000, same `txn_id`.
@@ -403,9 +440,9 @@ flowchart LR
 | Withdrawal ₹100 to bank | `wallet:W1` 100 | `psp_clearing` 100 |
 | Refund of the merchant payment | `wallet:M1` 196 and `platform_fees` 4 | `wallet:W1` 200 |
 
-Note the convention: here a wallet's balance is a liability to the user, so crediting a user wallet increases what the system owes them.
+Note the convention: here a wallet's balance is a liability (money the company owes someone) to the user, so crediting a user wallet increases what the system owes them.
 
-For a wallet, balance = credits minus debits; for the asset account `psp_clearing` (bank money we hold a claim on) a debit increases it.
+For a wallet, balance = credits minus debits; for the asset account (something the company owns or is owed) `psp_clearing` (bank money we hold a claim on) a debit increases it.
 
 Whichever convention you pick, state it once and keep every row consistent. The key invariant never changes: per `txn_id`, debits equal credits.
 
@@ -432,7 +469,7 @@ flowchart LR
 | --- | --- | --- | --- | --- |
 | Source of truth | mutable `balance` only, **ledger entries plus cached balance**, pure event sourcing | ledger entries plus cached balance in one transaction | audit trail with fast reads; pure event sourcing adds replay complexity | [[Choosing a Database - Decision Guide]] |
 | Database | in-memory store (Redis) with persistence, **sharded relational DB**, distributed SQL, NoSQL | sharded relational (PostgreSQL or MySQL), or distributed SQL if multi-region | ACID, constraints and row locks give the invariants for free | [[Choosing a Database - Decision Guide]] |
-| Cross-shard method | **2PC**, **TC/C** (try-confirm-cancel), **saga**, avoid by placement | saga with holds, plus placement to keep most transfers in-shard | no global locks, each step is a local transaction | [[Choosing Consistency, Replication and Partitioning - Decision Guide]] |
+| Cross-shard method | **2PC** (two-phase commit: a coordinator asks every database to prepare, then to commit), **TC/C** (try-confirm-cancel), **saga**, avoid by placement | saga with holds, plus placement to keep most transfers in-shard | no global locks, each step is a local transaction | [[Choosing Consistency, Replication and Partitioning - Decision Guide]] |
 | Concurrency | pessimistic row lock, optimistic version column, single-writer per wallet | pessimistic lock in id order for transfers; optimistic for low-contention updates | contention on a wallet is low except hot accounts | [[Locking - Optimistic vs Pessimistic]] |
 | Event delivery | direct publish, outbox plus Kafka | outbox plus Kafka | never lose or invent an event | [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]] |
 | Balance reads | always from DB, cached in Redis, from a read replica | primary for authoritative checks, cache or replica for display | display can be a moment stale; checks cannot | [[Choosing a Caching Strategy - Decision Guide]] |
@@ -447,6 +484,14 @@ flowchart TD
     Q3 -->|"yes, rare, low rate"| A3["2PC across two shards<br/>(blocking risk)"]
     Q3 -->|"no, eventual completion is fine"| A4["Saga with a hold<br/>and compensation"]
 ```
+
+### Things people confuse a wallet with 🟡
+
+| System | What it does | How it differs from a wallet |
+| --- | --- | --- |
+| [[Case Study - Payment System]] | Moves money between banks and cards through a PSP | It does not hold your money; the wallet does, inside its own ledger |
+| Bank account | Money held by a licensed bank | Same ledger idea, but the bank is regulated as the money keeper; a wallet often uses a partner bank behind it |
+| Reward points | Points you earn and spend in one app | Not real money, so a simple counter with periodic checks is often enough |
 
 ## 6. Trade-offs and when not to use 🟡
 
@@ -467,12 +512,14 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the API, tables and a full same-shard transfer, with the double entries for each kind of movement. **Next is the advanced part**: how real companies run ledgers, racing retries, transfers across shards, very busy merchant wallets, and the daily proof that no money was lost.
+
 - **Square's Books.** Square describes "Books", an immutable double-entry accounting database service, as the ledger beneath its payments. The public lesson: entries are immutable, balances are derived, and the ledger is its own service with strict invariants.
 - **Stripe idempotency.** Stripe documents idempotency keys on every POST and prunes keys after at least 24 hours. Wallet APIs copy the pattern, scoping keys by caller.
-- **Typical metrics:** transfer success rate by failure reason, p99 latency, count of sagas pending longer than a threshold, outbox lag, idempotency conflicts (409), reconciliation mismatches (alert on any).
+- **Typical metrics:** transfer success rate by failure reason, p99 latency (the time 99 out of 100 transfers beat), count of sagas pending longer than a threshold, outbox lag, idempotency conflicts (409), reconciliation mismatches (alert on any).
 - **Alerts that matter:** a non-zero global invariant (sum of balances differs from the ledger), a wallet with a negative available balance, holds older than their expiry, and bank statement mismatches.
-- **Operations:** monthly partitions on `ledger_entries`, archive old months to object storage, keep an audit export. Backups with point-in-time recovery (see [[Backup, PITR and Disaster Recovery]]); a restore drill is part of the compliance story.
-- **Money moves, so test it:** property tests that random sequences of transfers never change the total, and chaos tests that kill services mid-saga.
+- **Operations:** monthly partitions on `ledger_entries`, archive old months to object storage, keep an audit export. Backups with point-in-time recovery (restoring the database to any chosen second in the past; see [[Backup, PITR and Disaster Recovery]]); a restore drill is part of the compliance story.
+- **Money moves, so test it:** property tests (tests that run thousands of random inputs and check a rule always holds) that random sequences of transfers never change the total, and chaos tests (tests that deliberately crash parts of the system) that kill services mid-saga.
 
 ## 8. Deep dive 🔴
 
@@ -625,9 +672,9 @@ flowchart TD
     K --> R3["Fraud and analytics"]
 ```
 
-- **Bottleneck 1: database write throughput.** Shard by wallet id, 8 to 16 shards for the estimate above, each with a synchronous replica for durability.
+- **Bottleneck 1: database write throughput.** Shard by wallet id, 8 to 16 shards for the estimate above, each with a synchronous replica (a copy that must confirm every write before the commit is reported) for durability.
 - **Bottleneck 2: hot wallets.** Deep dive 3.
-- **Bottleneck 3: history queries.** Move history to a read model fed by events, keyset-paginated, separate from the write path (see [[CQRS]]).
+- **Bottleneck 3: history queries.** Move history to a read model (a separate copy of the data shaped only for reading) fed by events, keyset-paginated, separate from the write path (see [[CQRS]]).
 - **Bottleneck 4: resharding.** Use many logical shards mapped onto fewer physical hosts (for example 256 logical, 16 physical), so rebalancing means moving a logical shard, not rehashing everything (see [[Consistent Hashing]]).
 
 ### Failure handling
@@ -669,6 +716,26 @@ flowchart TD
 
 > [!question]- The interviewer says 1 million transfers per second. What changes?
 > About 1,000 TPS per shard means on the order of 1,000 shards, so I maximise same-shard transfers by placement, move cross-shard transfers to sagas, make merchant credits append-only, use a read model for history, and use a router with logical shards for resharding. Correctness rules, idempotency and reconciliation stay identical.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: why write two ledger lines for one transfer?
+> One debit and one equal credit show where the money left and where it went, so totals always balance.
+
+> [!question]- Easy: how do you fix a wrong ledger entry?
+> Add a new reversing entry; never edit or delete the old one.
+
+> [!question]- Easy: why store ₹300 as 30000?
+> Whole paise as integers avoid floating-point rounding errors.
+
+> [!question]- Medium: the server committed the transfer but crashed before replying. The app retries. What happens?
+> The idempotency key is already `completed`, so the stored response is returned and no second debit happens.
+
+> [!question]- Medium: why lock both wallets in ascending ID order?
+> Two opposite transfers then take locks in the same order, so they cannot deadlock.
+
+> [!question]- Medium: W1 and W2 live on different shards. How do you move ₹300 safely?
+> A saga: hold ₹300 on W1, credit W2 with transfer ID T, then capture the hold; release the hold if the credit fails.
 
 ## 10. Cheat sheet 🟢
 

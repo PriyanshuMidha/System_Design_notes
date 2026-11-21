@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Context Package]]: a `ctx` gets cancelled on shutdown, and a loop that checks `ctx.Done()` can stop cleanly.
+> - [[Goroutines and Channels]]: a goroutine is a cheap concurrent function, and a channel passes values between goroutines (a ticker delivers its ticks on one).
+
 **From zero, in 60 seconds** 🟢
 
 Some work runs on a clock, not on a request: "every night at 2 a.m., mark overdue invoices". That is a **scheduled job**.
@@ -71,6 +75,11 @@ A scheduled job needs "exactly one helper does it, every time, even if one is mi
 | Batch | A limited chunk of rows handled in one go | "Claim up to 500 invoices" |
 | Graceful shutdown | Stopping cleanly after finishing current work | Finish the batch, then exit on `SIGTERM` |
 
+| Advisory lock | A Postgres lock on a number you choose, not on a row | `pg_try_advisory_lock(7001)` |
+| `SKIP LOCKED` | Postgres option: skip rows another transaction already locked | two callers get different rows |
+| Fencing token | A number that grows with each lock grant; writes with an old number are rejected | token 41 rejected after 42 |
+| UTC | One world clock with no daylight-saving changes | run at 02:00 UTC |
+
 **Picture it**
 
 ```mermaid
@@ -109,6 +118,10 @@ A second problem is independent of replica count: if the overdue scan takes 90 s
 
 A bare ticker loop answers this by accident, not by design — and the accidental answer (explained below) is "that tick is silently thrown away."
 
+### A real-life example 🟢
+
+Every morning, Netflix-style subscription services charge cards whose renewal date is today and email people whose card is about to expire. These jobs run on a clock, on a service that has many copies. If every copy ran the renewal job, customers would be charged several times. So each morning all copies try to take one lock, one wins and charges each due subscription once, and if that copy crashes halfway, the next run simply picks up the subscriptions that are still due.
+
 ## 2. Mental model 🟢
 
 Separate two questions that a tutorial usually blurs together:
@@ -131,9 +144,17 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+🟢 → 🟡 You now know the three parts: a timer, a lock so only one replica runs each tick, and a job that is safe to run again. Next we open the box: why a plain ticker drops ticks, how to skip overlapping runs, how the lock picks one winner, how batches resume after a crash, and what happens on shutdown.
+
 ### The bare ticker, and why it drops ticks
 
 **In plain words:** a ticker holds at most one pending tick; if a run is slower than the interval, ticks silently fall on the floor.
+
+**Step by step:**
+1. The ticker fires every 60 s. At 10:00 the job starts and takes 90 s.
+2. At 10:01 the next tick arrives, but the loop is still busy inside the job, so the tick is dropped.
+3. At 10:01:30 the job ends; the loop waits for the next tick at 10:02.
+4. So the job ran at 10:00 and 10:02, never at 10:01, and nothing logged that.
 
 ```go
 func RunTicker(ctx context.Context, interval time.Duration, run func(context.Context)) {
@@ -168,6 +189,12 @@ The loop never sees two ticks queued up and never "catches up"; it simply runs l
 ### Never overlapping, and saying so
 
 **In plain words:** if last night's run is still going, this tick must skip — and log that it skipped, so you notice the job is too slow.
+
+**Step by step:**
+1. A tick arrives. Is a run already in progress? Check a flag.
+2. If yes: log "skipped tick, previous run still going" and wait for the next tick.
+3. If no: set the flag, start the run, clear the flag when it ends.
+4. A rising count of skips tells you the job is too slow for its interval.
 
 The fix is not a bigger buffer; it is refusing to start a second run while one is in flight, and logging when a tick is skipped instead of hiding it:
 
@@ -212,13 +239,19 @@ _, _ = c.AddFunc("@every 1m", tick) // or "0 */15 * * * *" (seconds field includ
 c.Start()
 ```
 
-- `cron.WithLocation(time.UTC)` matters: a spec evaluated in a local zone with DST hits a one-hour gap or a repeated hour twice a year (`2:30 AM` either does not exist or happens twice). Running in UTC removes the ambiguity entirely.
+- `cron.WithLocation(time.UTC)` matters: a spec evaluated in a local zone with DST (daylight saving time, when clocks jump an hour) hits a one-hour gap or a repeated hour twice a year (`2:30 AM` either does not exist or happens twice). Running in UTC removes the ambiguity entirely.
 - `cron.SkipIfStillRunning` is the library version of `RunTickerSkipIfBusy` above; `cron.DelayIfStillRunning` is the alternative when you would rather queue one pending run than drop it, at the cost of runs bunching up after a slow one.
 - A cron spec (`0 */15 * * * *`) fires at wall-clock marks; `@every 15m` fires 15 minutes after the *previous fire*, so a slow run pushes every later tick back. Pick the spec form when "every 15 minutes on the dot" matters for a report or an SLA.
 
 ### Running once across N replicas
 
 **In plain words:** all replicas try to grab the same database lock at the same moment; one wins, the rest shrug and go back to sleep.
+
+**Step by step:**
+1. At 10:00 all 3 replicas call `pg_try_advisory_lock(7001)`.
+2. Postgres says `true` to replica 1 and `false` to replicas 2 and 3.
+3. Replicas 2 and 3 skip this tick.
+4. Replica 1 runs the job and releases the lock. If it crashes, its connection closes and Postgres releases the lock by itself.
 
 Coordination needs one more piece than the in-process loop: a lock that is visible to every replica.
 
@@ -268,6 +301,12 @@ A Kubernetes `Lease` object gives a third option, used when the service already 
 
 **In plain words:** write each batch step so running it again does nothing the second time — then a crash mid-batch costs nothing but a re-run.
 
+**Step by step:**
+1. Claim up to 500 invoices where `due_date < now()` and `status = 'sent'`, locked with `SKIP LOCKED`.
+2. Set them to `overdue` and enqueue a reminder for each; commit.
+3. Repeat until a claim returns 0 rows.
+4. If the process crashes after 3 batches, those 1,500 invoices are already `overdue`, so the next run's `WHERE` skips them and continues with the rest.
+
 The lock answers "who runs this tick," not "what if the run itself dies halfway through 2 million rows." That is a query design question:
 
 ```sql
@@ -298,6 +337,12 @@ The work itself — sending the reminder email — is handed to a worker rather 
 
 ### Graceful shutdown mid-batch
 
+**Step by step:**
+1. `SIGTERM` arrives while batch 4 is running.
+2. Batch 4 finishes and commits.
+3. Before claiming batch 5, the loop sees `ctx.Err()` and stops.
+4. The deferred `release()` frees the lock, so another replica can take over on the next tick.
+
 A deploy or a pod eviction can send `SIGTERM` while a replica is partway through the claim-enqueue-claim loop.
 
 The loop in `ScanOverdue` already checks `ctx.Err()` at the top of every iteration, so a cancelled context (wired to the process's shutdown signal, the same one that drains in-flight HTTP requests — see [[Graceful Shutdown and Health Checks]]) stops the loop after the batch already claimed finishes enqueuing, not mid-batch: a `SKIP LOCKED` claim is a single statement, so it either commits a whole batch or none of it, and cancellation is only ever observed between batches, never inside one.
@@ -314,6 +359,8 @@ Two consequences follow from this:
 The bare ticker loop from above is the whole idea in eight lines: wait for a tick or cancellation, run the job. Its known gap — dropped ticks under a slow run — is exactly what the production version below exists to fix, not an oversight to copy.
 
 ### Production version
+
+**What this code does, in plain words (for the blocks below):** `RunTickerSkipIfBusy` runs a job on a ticker and skips ticks while a run is in progress. `ScanOverdue` takes the lock, then claims and enqueues batches in a loop until none are left, checking for shutdown between batches and always releasing the lock. Fakes stand in for Postgres so the tests can run.
 
 `Locker` and the SKIP LOCKED store are faked in-process below because Postgres cannot run in this environment; the fakes reproduce the exact semantics the real SQL gives (one non-blocking holder per key; a row claimed by one caller invisible to a concurrent caller), so the tests below exercise the real race the production code must survive.
 
@@ -376,7 +423,9 @@ func ScanOverdue(ctx context.Context, store Store, now time.Time, batchSize int,
 }
 ```
 
-Wired together with `robfig/cron`:
+Wired together with `robfig/cron`.
+
+**What this code does, in plain words:** it creates a UTC cron scheduler with "skip if still running" and registers the overdue scan every minute. Each run tries the lock (`RunIfLocked`), scans in batches of 500 if it wins, and logs a skip if another replica holds the lock.
 
 ```go
 func NewOverdueScanner(log *slog.Logger, store Store, locker Locker, enqueue func(int64)) *cron.Cron {
@@ -405,7 +454,9 @@ func NewOverdueScanner(log *slog.Logger, store Store, locker Locker, enqueue fun
 }
 ```
 
-Three tests that each prove one specific claim, run with `go test -race`:
+Three tests that each prove one specific claim, run with `go test -race`.
+
+**What this code does, in plain words:** one test runs several fake replicas on the same tick and checks only one did the work; one checks a slow run is skipped, never overlapped; one checks the batch loop claims every due row exactly once.
 
 ```go
 // 5 "replicas" race the same advisory-lock key on one tick; exactly one runs.
@@ -505,7 +556,26 @@ All three pass under `go test -race`, along with a fourth test (`TestRunTicker_D
 - `cron.DelayIfStillRunning` trades dropped runs for a growing backlog: if a job is reliably slower than its own interval, that backlog never drains and memory for queued closures grows without bound. `SkipIfStillRunning` is the safer default; fix the real problem (the job is too slow for its interval) rather than queuing around it.
 - Kubernetes `CronJob` is the wrong tool for anything sub-minute: Pod scheduling and image pull overhead alone can exceed the interval.
 
+### Scheduled job vs background job queue 🟡
+
+| | Scheduled job | Job queue ([[Background Workers and Job Queues]]) |
+| --- | --- | --- |
+| Triggered by | the clock | an event, like a request |
+| Main risk | many replicas running the same tick | losing or doubling one job |
+| Fix | a lock per tick plus an idempotent batch | durable rows, leases, retries |
+| How they meet | the scheduler finds due rows and enqueues jobs | workers send the actual emails |
+
+### Common beginner mistakes 🟢
+
+- Running a plain ticker on every replica → 4 replicas send 4 emails → take a lock so one replica wins each tick.
+- Running the job on "just one special replica" → it stops when that replica restarts → let any replica win the lock.
+- Scheduling in local time → a 2 AM job runs twice or never on DST days → schedule in UTC.
+- Doing slow work (emails) inside the locked loop → one slow provider holds the lock and stalls every tick → enqueue the work.
+- Trying to replay every missed tick after downtime → hundreds of runs at once → query by due date so one run catches up.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now run a job on a clock, once per tick, safely across replicas. The advanced part covers how this fails for real: paused lock holders, DST, long outages, shutdowns mid-scan, every replica firing at the same second, and how to notice a scheduler that has silently stopped.
 
 - **Real systems:** Kubernetes `CronJob` for batch and reporting jobs; `robfig/cron` is the de facto standard in-process scheduler for Go services; river and asynq both ship a periodic-job feature on top of their durable queues; AWS EventBridge Scheduler and GCP Cloud Scheduler for schedules that should survive the whole fleet being down.
 - **Failure modes → fixes:**
@@ -569,6 +639,26 @@ All three pass under `go test -race`, along with a fourth test (`TestRunTicker_D
 - Schedule in UTC always; add jitter to avoid every replica hitting the DB at `:00`.
 - Catch-up policy is per job: query by due date for anything that must eventually happen; never for "best effort, now stale" notifications.
 - Monitor a staleness gauge (`last_success_timestamp`), not just error counts — a scheduler that silently stopped firing produces no errors at all.
+
+## Self-check 🟢🟡
+
+> [!question]- What happens to a tick that arrives while the previous run is still going?
+> A bare ticker drops it.
+
+> [!question]- Why does every replica need the lock, not just a timer?
+> All replicas fire on the same tick; the lock makes sure only one does the work.
+
+> [!question]- Why schedule in UTC?
+> UTC has no daylight-saving jumps, so a job never runs twice or gets skipped.
+
+> [!question]- What happens to a Postgres advisory lock if the holder crashes?
+> It is released automatically when the connection closes.
+
+> [!question]- How does the batch query make a crash mid-run harmless?
+> Rows already done no longer match the `WHERE`, so the next run only picks up what is left.
+
+> [!question]- What does a fencing token protect against?
+> A paused old lock holder waking up and writing after a newer holder took over.
 
 ## Links 🟢
 

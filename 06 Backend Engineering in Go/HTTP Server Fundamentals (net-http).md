@@ -30,6 +30,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Backend Request Lifecycle and Layering]]: a request goes through a router, then middleware, then a handler; this note is the Go code for the first steps of that trip.
+
 **From zero, in 60 seconds** 🟢
 
 Everything in Go's web world is built on one tiny idea: a **handler**, a function that takes a request and writes a response. That is the whole interface — one method.
@@ -69,6 +72,12 @@ And it must not let one slow or broken client hold resources forever.
 | Router (mux) | Picks the handler for a method and path | `"GET /invoices/{id}"` → `getInvoice` |
 | Interface | A Go type defined by the methods it has | `http.Handler` has `ServeHTTP` |
 | Goroutine | A cheap, Go-managed concurrent function | One per connection |
+
+| `ServeMux` | Go's built-in router | `mux.HandleFunc("GET /invoices/{id}", h)` |
+| `ResponseWriter` | The object a handler writes the reply into | `w.WriteHeader(201)` |
+| Timeout | The longest the server will wait for one step | `ReadHeaderTimeout: 5 * time.Second` |
+| Slowloris | An attack that sends a request very slowly to tie up the server | one header byte every 10 s |
+| Keep-alive | Reusing one open connection for several requests | browser sends 5 requests on one connection |
 
 **Picture it**
 
@@ -124,6 +133,10 @@ Concretely: before Go 1.22, `net/http`'s router matched paths only (`"/invoices/
 
 InvoiceOps' old HTTP note had exactly that bug: a hand-rolled method check that the ServeMux itself now does correctly, for free, as long as the registration says which method the pattern is for.
 
+### A real-life example 🟢
+
+When you open an order page in Swiggy, the app sends `GET /orders/9812` to a Go server. The server's router sees "GET" and the path pattern `/orders/{id}`, pulls out `9812`, and calls the order handler, which writes a status, headers and a JSON body. At the same time, thousands of other phones are sending requests, each served on its own goroutine. If one phone on a bad network sends its request painfully slowly, the server's timeouts cut it off so it cannot hold a goroutine forever.
+
 ## 2. Mental model 🟢
 
 A `ServeMux` is a filing clerk holding a stack of index cards, each one reading "if the request's method and path look like *this*, hand it to *that* function".
@@ -140,9 +153,18 @@ Without a policy, one slow visitor can occupy the clerk's desk (and the goroutin
 
 ## 3. How it works 🟡
 
+🟢 → 🟡 You now know the three pieces: a handler answers, a `ServeMux` picks the handler, and an `http.Server` holds the limits. Next we open the box: how goroutines serve connections, how patterns match, the rules for writing a reply, and which timeout blocks which attack.
+
 ### The `Handler` interface and the goroutine model
 
 **In plain words:** one interface with one method runs the whole web layer, and every request gets its own goroutine — parallel by default.
+
+**Step by step:**
+1. A phone opens a TCP connection to the server.
+2. The server starts one goroutine for that connection.
+3. A request arrives on it; the goroutine calls `ServeHTTP` on your mux (or middleware wrapping it).
+4. The mux finds the handler and calls it; the handler writes the reply.
+5. Over HTTP/1.1, the next request on the same connection waits its turn; over HTTP/2, each request (stream) is handled on its own.
 
 ```go
 type Handler interface {
@@ -177,9 +199,15 @@ sequenceDiagram
 
 Over HTTP/1.1 without pipelining, requests on that one connection are handled one at a time, in order — a slow handler on request 1 delays request 2 on the *same* connection, but a browser or client opening several connections gets real concurrency across them.
 
-HTTP/2 changes this at the protocol level: multiple streams share one TCP connection, and `net/http`'s HTTP/2 support (automatic over TLS) gives each stream its own goroutine, so one slow request no longer head-of-line-blocks the others on that connection (full HTTP/2 and TLS setup is [[TLS, HTTPS and HTTP2 in Go Servers]]'s job).
+HTTP/2 changes this at the protocol level: multiple streams share one TCP connection, and `net/http`'s HTTP/2 support (automatic over TLS) gives each stream its own goroutine, so one slow request no longer head-of-line-blocks (holds up everything queued behind it on) the others on that connection (full HTTP/2 and TLS setup is [[TLS, HTTPS and HTTP2 in Go Servers]]'s job).
 
 ### Go 1.22 ServeMux patterns
+
+**Step by step:**
+1. Register `"GET /invoices/{id}"` and `"GET /invoices/{id}/exports/{path...}"`.
+2. `GET /invoices/42` matches the first; `r.PathValue("id")` returns `"42"`.
+3. `GET /invoices/42/exports/2026/a.pdf` matches the second; `path` is `"2026/a.pdf"`.
+4. If two patterns match equally well, the program panics at startup, so you see the mistake before any user does.
 
 A pattern is `[METHOD ][HOST]/[PATH]`. Each part is optional except the path:
 
@@ -195,9 +223,15 @@ Precedence is "the most specific pattern wins", not registration order: `/invoic
 
 Two patterns that could both match the same request with neither more specific than the other is a conflict the mux detects, and it panics at registration time (process startup), not silently at request time — a registration bug surfaces as a crash on boot, which is the earliest and cheapest place for it to surface.
 
-A plain GET registration also matches `HEAD` automatically: net/http runs the same handler and then discards the body, so a handler doesn't special-case `HEAD` unless it specifically needs to skip work that only matters for the body (an expensive render, for instance).
+A plain GET registration also matches `HEAD` (a request that wants only the headers, not the body) automatically: net/http runs the same handler and then discards the body, so a handler doesn't special-case `HEAD` unless it specifically needs to skip work that only matters for the body (an expensive render, for instance).
 
 ### Automatic 405 with Allow, and why the old manual check was wrong
+
+**Step by step:**
+1. Register `"GET /invoices"` and `"POST /invoices"`.
+2. A client sends `DELETE /invoices`.
+3. The mux finds the path but not the method, so it answers `405 Method Not Allowed` with `Allow: GET, POST`.
+4. No handler runs, so there is nothing for you to write.
 
 Register `"GET /invoices"` and `"POST /invoices"` on the same mux. A `DELETE /invoices` now gets a `405 Method Not Allowed` with an `Allow: GET, POST` header, generated by the mux itself — no handler code runs, and no handler needs to write:
 
@@ -216,6 +250,12 @@ This was the exact bug the audit found in the old note for this topic: a manual 
 
 **In plain words:** writing a response has a fixed order — headers, then status code, then body — and breaking the order fails silently.
 
+**Step by step:**
+1. `w.Header().Set("Content-Type", "application/json")` — headers first.
+2. `w.WriteHeader(201)` — the status, once.
+3. `w.Write(body)` — the body.
+4. If you skip step 2, the first `Write` sends `200` for you. After step 2 or 3, changing headers or status does nothing.
+
 Three rules, none enforced by the compiler:
 
 1. **Set headers before calling `WriteHeader` or `Write`.** `w.Header().Set(...)` after either one is a no-op — the header map is only read once, at the moment the status line is actually sent.
@@ -228,6 +268,12 @@ That sniffing is a convenience, not something to depend on for anything security
 
 ### Per-request body and time limits
 
+**Step by step:**
+1. Wrap the body: `r.Body = http.MaxBytesReader(w, r.Body, 1<<20)` caps it at 1 MiB.
+2. A client sends 50 MB; reading stops at 1 MiB with an error, and you answer 413.
+3. For one fast endpoint, `http.NewResponseController(w).SetWriteDeadline(...)` gives it a tighter deadline than the rest.
+4. `http.TimeoutHandler` wraps a whole handler and returns 503 if it does not finish in time.
+
 `http.MaxBytesReader(w, r.Body, n)` wraps the request body so reading past `n` bytes returns an `*http.MaxBytesError` instead of continuing to buffer: without it, `json.NewDecoder(r.Body).Decode(&v)` will read as much as the client sends, and a multi-gigabyte body sent to a small JSON endpoint is a cheap way to exhaust memory one connection at a time.
 
 `http.ResponseController` (Go 1.20) gives a single handler its own deadline, tighter or looser than the server-wide `ReadTimeout`/`WriteTimeout`: `rc := http.NewResponseController(w); rc.SetWriteDeadline(time.Now().Add(2*time.Second))` for an endpoint that must respond faster than the rest of the API.
@@ -237,6 +283,12 @@ That sniffing is a convenience, not something to depend on for anything security
 ### `http.Server` fields, with values and the failure each one prevents
 
 **In plain words:** each timeout field is a lock on a different door; the table says which attacker or accident each one keeps out.
+
+**Step by step:**
+1. A connection opens. The client has 5 s (`ReadHeaderTimeout`) to send all headers.
+2. It has 10 s (`ReadTimeout`) to send the whole request, body included.
+3. The handler runs; the reply must be fully written within 15 s (`WriteTimeout`).
+4. The connection then sits idle for the next request; after 60 s (`IdleTimeout`) the server closes it.
 
 ```mermaid
 flowchart TD
@@ -261,6 +313,12 @@ flowchart TD
 
 ### `ListenAndServe` always returns an error
 
+**Step by step:**
+1. `srv.ListenAndServe()` blocks while the server runs.
+2. If the port is taken, it returns a "bind" error right away: a real failure.
+3. If someone calls `srv.Shutdown`, it returns `http.ErrServerClosed`: a normal stop.
+4. So log an error only when `!errors.Is(err, http.ErrServerClosed)`.
+
 `srv.ListenAndServe()` (and `ListenAndServeTLS`) blocks until the server stops, then returns a non-nil error — there is no "clean" return value, only a reason it stopped. A listener that failed to bind the port returns that `bind` error.
 
 A server asked to stop gracefully via `Server.Shutdown` returns `http.ErrServerClosed`, which is not a failure and must be checked for and ignored rather than logged as one:
@@ -277,15 +335,28 @@ Treating every non-nil return as a crash means a normal, intentional shutdown lo
 
 **In plain words:** the global default router is shared by every package in your program, so a stray import can quietly add routes to your server.
 
+**Step by step:**
+1. Some library you use imports `net/http/pprof` (Go's profiling tool).
+2. Its `init()` function (code Go runs automatically when a package loads) adds `/debug/pprof/*` routes to `DefaultServeMux`.
+3. Your `main` calls `http.ListenAndServe(":8080", nil)`; `nil` means "use `DefaultServeMux`".
+4. Now anyone on the internet can open your profiling pages. Fix: always pass your own `http.NewServeMux()`.
+
 `http.HandleFunc` (the package-level function, not a method on a mux you created) registers onto `http.DefaultServeMux`, a single mux shared by the whole process.
 
 Importing `net/http/pprof` anywhere in a binary's dependency graph registers `/debug/pprof/*` on that same default mux as an `init()` side effect — including transitively, through a dependency that imports it for its own reasons.
 
-A service that calls `http.ListenAndServe(addr, nil)` (passing `nil` for the handler means "use `DefaultServeMux`") can end up serving profiling and expvar endpoints on its public port with nobody having written a single line of code that looks like it did that.
+A service that calls `http.ListenAndServe(addr, nil)` (passing `nil` for the handler means "use `DefaultServeMux`") can end up serving profiling and expvar (Go's built-in page of internal counters) endpoints on its public port with nobody having written a single line of code that looks like it did that.
 
 Always construct a mux with `http.NewServeMux()` and pass it explicitly.
 
 ### Thin handlers
+
+**Step by step:**
+1. Decode the JSON body into a struct.
+2. Validate it.
+3. Call one service method.
+4. Turn any error into a status code.
+5. Encode the reply. Anything more belongs in another layer.
 
 A handler's job is five steps, each of which belongs to its own layer, not inline in the handler: decode the request → validate it → call a service method → map a domain error to an HTTP status → encode the response.
 
@@ -300,6 +371,8 @@ The decode/validate/encode steps are [[Request Decoding, Validation and DTOs]]'s
 `fiber` is a different thing entirely: it's built on `fasthttp`, not `net/http`, so it is not compatible with any of the stdlib's `http.Handler`-based middleware, and migrating away from it later means rewriting the HTTP layer, not just swapping a router.
 
 ## 4. Worked example 🟡
+
+**What this code does, in plain words:** it builds a small invoice server: a mux with method-and-path routes, a recover middleware that turns panics into 500s, handlers that cap the body and write headers, status and body in the right order, and an `http.Server` with every timeout set.
 
 A trimmed InvoiceOps HTTP server showing method+wildcard routing, every `http.Server` timeout, `MaxBytesReader`, and the `ResponseWriter` ordering rules enforced in one place. It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
 
@@ -502,6 +575,8 @@ func recoverMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
 	}
 }
 ```
+
+**What this code does, in plain words:** each test sends one request through the real mux with `httptest` and checks one rule: the wildcard value is read, a wrong method gets 405 with `Allow`, a too-big body gets 413, a panic becomes 500, and so on.
 
 Ten tests, each proving one specific behavior this note claims rather than just exercising the code (`go test -race`, all pass):
 
@@ -779,7 +854,25 @@ func TestServerHasProductionTimeouts(t *testing.T) {
 - `MaxBytesReader` on every body-reading endpoint means picking a limit per endpoint; too tight breaks a legitimate large payload (a bulk import), too loose doesn't actually protect anything. There's no single correct number — it has to match the endpoint's real traffic.
 - Setting `ResponseController` deadlines per-handler only pays off for the one or two endpoints that genuinely need a different timeout than the server-wide default; doing it everywhere just duplicates the server's own `WriteTimeout` with extra code.
 
+### `Handler` vs `HandlerFunc` vs `ServeMux` 🟡
+
+| | `http.Handler` | `http.HandlerFunc` | `http.ServeMux` |
+| --- | --- | --- | --- |
+| What it is | an interface with one method, `ServeHTTP` | a function type that satisfies `Handler` | a router that is itself a `Handler` |
+| You use it to | accept "anything that can answer" | turn a plain `func(w, r)` into a `Handler` | map method + path to handlers |
+| Example | middleware takes and returns one | `http.HandlerFunc(getInvoice)` | `mux.HandleFunc("GET /x", h)` |
+
+### Common beginner mistakes 🟢
+
+- Starting `http.Server` with no timeouts → a slow client holds a goroutine forever (Slowloris) → set `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, `IdleTimeout`.
+- Checking `r.Method` by hand → no `Allow` header, two 405 paths that can disagree → put the method in the pattern.
+- Setting a header after `WriteHeader` → it is silently ignored → set headers first.
+- Using `http.HandleFunc` and `ListenAndServe(addr, nil)` → any imported package can add routes, like pprof → create and pass your own mux.
+- Logging `http.ErrServerClosed` as a crash → every deploy looks like an outage → ignore that one error.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now build a server with correct routes, correct replies and every timeout set. The advanced part covers how these settings fail at scale: exposed debug pages, goroutine pile-ups, half-written replies, and the exact rules behind pattern priority and HTTP/2.
 
 - **Real systems:** nearly every Go HTTP service at scale (Google's own internal Go services, Cloudflare, HashiCorp's Go tooling) builds on `net/http` directly or on a thin wrapper like `chi`, specifically because stdlib compatibility means every middleware, every `httptest` helper and every profiling tool works without an adapter layer.
 - **Failure modes → fixes:**
@@ -830,6 +923,26 @@ func TestServerHasProductionTimeouts(t *testing.T) {
 - `ResponseWriter`: set headers before `WriteHeader`; call `WriteHeader` once; an unwritten response implicitly sends 200 on the first `Write`.
 - `http.MaxBytesReader` bounds request bodies; `http.ResponseController` and `http.TimeoutHandler` bound per-handler or whole-handler response time.
 - One goroutine per HTTP/1.1 connection, requests sequential on it; HTTP/2 gives each stream its own handling.
+
+## Self-check 🟢🟡
+
+> [!question]- What one method does `http.Handler` have?
+> `ServeHTTP(ResponseWriter, *Request)`.
+
+> [!question]- What does `"GET /invoices/{id}"` match, and how do you read the ID?
+> Only GET requests to `/invoices/<one segment>`; read it with `r.PathValue("id")`.
+
+> [!question]- What is the default value of `http.Server` timeouts?
+> Zero, which means no limit.
+
+> [!question]- Which timeout blocks a Slowloris attack?
+> `ReadHeaderTimeout`.
+
+> [!question]- What status does the client get if a handler calls `Write` without `WriteHeader`?
+> `200 OK`, sent automatically on the first `Write`.
+
+> [!question]- Why avoid `DefaultServeMux`?
+> It is shared by the whole program, so imported packages like pprof can add routes to your public server.
 
 ## Links 🟢
 

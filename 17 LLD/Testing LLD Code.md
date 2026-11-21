@@ -36,6 +36,11 @@ Generic Go testing mechanics (`go test` flags, coverage, benchmarks, subtests) l
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Testing in Go]]: a test is a `func TestXxx(t *testing.T)` in a `_test.go` file, run with `go test`.
+> - [[OOP in Go - Structs, Interfaces, Embedding]]: a service that takes small interfaces in its constructor can be handed any type with those methods.
+> - [[Concurrency for LLD]]: two goroutines can both pass "is there stock?" unless check and change sit inside one lock.
+
 **From zero, in 60 seconds** 🟢
 
 A good design is easy to test. If your service depends on small interfaces, a test can plug in tiny in-memory **fakes** instead of a real database, a fake clock instead of real time, and fixed IDs instead of random ones. Then every test is fast and gives the same answer each run. This note shows what to test in an LLD round, how to write the fakes, and how to prove that two people racing for the same seat cannot both win. Read the plain-words line above each code block first, then the code.
@@ -58,6 +63,11 @@ This note shows how to write such tests for interview-style designs.
 | Mock | A stand-in that checks which calls happened | "Expect `Charge` called once" |
 | Race condition | Two goroutines touching the same data at once, giving wrong results | Two buyers both get the last item |
 | Deterministic | Same input, same result, every run | A fixed fake clock instead of `time.Now()` |
+| Goroutine | A light task Go runs at the same time as others | 50 buyers in a test are 50 goroutines |
+| `-race` | A `go test` flag that watches memory and reports unsafe sharing between goroutines | `go test -race ./...` |
+| Table-driven test | One test that loops over a list of cases (input and expected result) | Rows for "ok", "out of stock", "declined" |
+| Golden file | A saved file holding the exact expected output | `testdata/receipt.golden` |
+| Fuzz test | Go feeds your code millions of random inputs looking for a crash or a broken rule | `FuzzParseCoupon` |
 
 **Picture it**
 
@@ -96,6 +106,10 @@ Concrete scenario: a checkout service reserves stock, charges the card, and rele
 
 Each has a 10-to-30-line test, shown below.
 
+### Real-life example 🟢
+
+Picture the Swiggy team changing the checkout code on a Friday evening. Before it reaches your phone, hundreds of small automatic checks run: does a declined card put the item back on the shelf, can two people buy the last biryani, does a 10-minute hold really expire after 10 minutes. None of these checks talk to a real bank or wait 10 real minutes; they use pretend stand-ins and a pretend clock. That is what testing LLD code looks like: fast, small checks that prove the rules hold.
+
 ## 2. Mental model 🟢
 
 Think of the service as an **engine on a test bench**.
@@ -108,8 +122,10 @@ Vocabulary, from Meszaros's *xUnit Test Patterns*:
 
 - **Stub**: returns canned answers (`StubPayment{Err: declined}`).
 - **Fake**: a working, simplified implementation (a map-backed inventory).
-- **Mock**: records calls and fails the test if the expected calls did not happen.
+- **Mock**: records calls and fails the test if the expected calls did not happen (call-expectation recorder).
 - **Spy**: records calls so the test can inspect them afterwards.
+
+> 🟢 → 🟡 **You now know** why tests matter in a round and the names of the stand-ins: stub, fake, mock and spy. **Next we open the box**: which tests an interviewer expects, how the stand-ins plug into the service, and exactly how a "one winner" race test is built.
 
 ## 3. How it works 🟡
 
@@ -121,8 +137,8 @@ Vocabulary, from Meszaros's *xUnit Test Patterns*:
 | --- | --- | --- |
 | Happy path | Checkout succeeds and decrements stock | Table case |
 | Rule failures | Out of stock, invalid transition, limit exceeded | Table cases with `errors.Is` |
-| Concurrent invariants | 50 buyers, 1 unit, exactly 1 winner | Barrier + goroutines + `-race` |
-| Failure and compensation | Payment declined releases stock | Stub returns an error; assert final state |
+| Concurrent invariants (rules that must hold even when many requests run at once) | 50 buyers, 1 unit, exactly 1 winner | Barrier + goroutines + `-race` |
+| Failure and compensation (the undo step after a later step fails) | Payment declined releases stock | Stub returns an error; assert final state |
 | Time rules | Hold expires at 10 min, not at 9:59 | Fake clock, `Advance` |
 | Parsers and inputs | Coupon codes, `find` expressions | Table cases + fuzz test |
 | Rendered output | Receipt, bill split, parking ticket | Golden file |
@@ -131,7 +147,7 @@ Vocabulary, from Meszaros's *xUnit Test Patterns*:
 
 **In plain words: the service asks for small interfaces, so the test can hand it fakes.**
 
-The service declares only the interfaces it uses (consumer-side), so each fake is a few lines.
+The service declares only the interfaces it uses (consumer-side: the interface lives in the package that calls it), so each fake is a few lines.
 
 ```mermaid
 flowchart LR
@@ -167,8 +183,8 @@ sequenceDiagram
 
 Why each part is there:
 
-- **Start barrier** (`close(start)`): without it, the first goroutines often finish before the last ones start, so they never overlap and the bug hides.
-- **Atomic winner count**: a plain `int` incremented from 50 goroutines is itself a data race.
+- **Start barrier** (`close(start)`, a closed channel that releases every waiting goroutine at the same instant): without it, the first goroutines often finish before the last ones start, so they never overlap and the bug hides.
+- **Atomic winner count** (`atomic.Int32`, a counter that is safe to bump from many goroutines): a plain `int` incremented from 50 goroutines is itself a data race.
 - **`-race`**: catches unsynchronised access even when the final numbers happen to look right.
 - **`-count=N`**: reruns the test N times; races are probabilistic, so one green run proves little.
 
@@ -200,6 +216,17 @@ All code below is one package tested with Go 1.24.4: `go vet` is clean, `go test
 ### Code under test
 
 **In plain words: the small service that all the tests below exercise.**
+
+**What this code does, in plain words:** `Service.Checkout` reserves stock through an `Inventory`, charges through a `Payment`, and releases the stock again if the charge fails. It gets the time from a `Clock` and order IDs from an `IDGen`, so tests can control both. The next two blocks add the pieces the other tests need: `Receipt` (text output for the golden-file test), `Holds` (seat holds that expire after a TTL, a time limit), and `ParseCoupon` (input parsing for the fuzz test).
+
+**Step by step:**
+
+1. `Inventory`, `Payment`, `Clock` and `IDGen` are small interfaces with only the methods the service calls; tests will plug fakes into them.
+2. `NewService` receives all four, so nothing inside reaches for the real time or a real bank.
+3. `Service.Checkout` calls `Reserve`; if that fails (for example `ErrOutOfStock`), it stops.
+4. It then calls `Charge`. If the charge fails, it calls `Release` to put the stock back and returns the error.
+5. On success it builds an `Order` with an ID from `ids.NewID()` and a time from `clock.Now()`.
+6. `Receipt`, `Holds` and `ParseCoupon` are small extras that the golden-file, fake-clock and fuzz tests use.
 
 ```go
 package checkout
@@ -363,6 +390,8 @@ func (c Coupon) Apply(total int64) int64 {
 
 The fake clock guards its time with a mutex. A version with a bare `time.Time` field is a data race as soon as `Advance` in the test runs while a service goroutine calls `Now`, and `-race` will report it.
 
+**What this code does, in plain words:** `FakeInventory` is a map of stock behind a mutex, `StubPayment` returns whatever error you set, `FakeClock` only moves when the test calls `Advance`, and `SeqIDs` hands out `ord-1`, `ord-2` and so on.
+
 ```go
 package checkout
 
@@ -441,6 +470,8 @@ func (s *SeqIDs) NewID() string { return fmt.Sprintf("ord-%d", s.n.Add(1)) }
 ### The tests
 
 **In plain words: table-driven tests for the rules, plus the race test.**
+
+**What this code does, in plain words:** `TestCheckout` runs a table of cases (success, out of stock, declined card that must give the stock back). `TestCheckout_LastItemOnlyOneWinner` releases 50 goroutines at the last unit and checks exactly one wins. `TestHolds_ExpireWithFakeClock` moves the clock to just before and just after 10 minutes. The last tests compare the receipt with a golden file, check coupon parsing, and fuzz the parser.
 
 ```go
 package checkout
@@ -630,7 +661,7 @@ go test -run=TestReceipt_Golden -update .   # only after reviewing the diff
 
 **In plain words: one test that runs against every version of a store, so the fake and the real one behave the same.**
 
-A contract test is one test function that takes a constructor for the interface, so the same rules run against the fake now and the PostgreSQL repository later. The benchmark uses `for b.Loop()` (Go 1.24).
+A contract test is one test function that takes a constructor for the interface, so the same rules run against the fake now and the PostgreSQL repository later. The benchmark (a test that measures how fast code runs) uses `for b.Loop()` (Go 1.24).
 
 ```go
 package checkout
@@ -701,9 +732,9 @@ Measured on an Apple Silicon laptop with Go 1.24.4: `BenchmarkCheckout-10  17603
 
 **In plain words: synctest gives goroutines a fake clock, so sleeps finish instantly.**
 
-When the code under test calls `time.Sleep`, `time.After` or `context.WithTimeout` itself, an injected clock is not enough. `testing/synctest` runs the test in a "bubble" with a fake clock that jumps forward whenever every goroutine in the bubble is blocked.
+When the code under test calls `time.Sleep`, `time.After` or `context.WithTimeout` itself, an injected clock is not enough. `testing/synctest` runs the test in a "bubble" (a closed group of goroutines started inside the test) with a fake clock that jumps forward whenever every goroutine in the bubble is blocked.
 
-This snippet passed on Go 1.24.4 with `GOEXPERIMENT=synctest go test -race`; without the experiment flag the file is excluded by its build tag.
+This snippet passed on Go 1.24.4 with `GOEXPERIMENT=synctest go test -race`; without the experiment flag the file is excluded by its build tag (the `//go:build` line that says when a file is compiled).
 
 ```go
 //go:build goexperiment.synctest
@@ -729,15 +760,23 @@ func TestSleepIsInstant(t *testing.T) {
 
 In Go 1.25 the package is standard: no build tag or experiment flag, and the entry point is `synctest.Test(t, func(t *testing.T) { ... })`; `synctest.Run` is deprecated.
 
+## Common beginner mistakes 🟢
+
+- **Mistake:** calling `time.Now()` and `time.Sleep` inside the code under test. → **Why it's wrong:** testing a 10-minute hold then takes 10 real minutes, so nobody tests it. → **Do this instead:** pass a `Clock` in, and in tests use `FakeClock.Advance(10 * time.Minute)`.
+- **Mistake:** testing only the happy path. → **Why it's wrong:** the payment-failure branch that forgets `Release` slips through and leaks stock. → **Do this instead:** use `StubPayment{Err: ...}` and check the stock went back up, as the table test does.
+- **Mistake:** a "concurrency test" that starts goroutines one by one with no barrier. → **Why it's wrong:** they rarely overlap, so the race never happens in the test. → **Do this instead:** make them all wait on a `start` channel and `close(start)` together, as `TestCheckout_LastItemOnlyOneWinner` does, then count wins with an atomic.
+- **Mistake:** a fake that is not safe for many goroutines. → **Why it's wrong:** the race detector flags the fake itself, not your code. → **Do this instead:** guard the fake's map with a mutex, as `FakeInventory` does.
+- **Mistake:** mocking every internal call and checking how it was called. → **Why it's wrong:** renaming an internal method breaks ten tests that should still pass. → **Do this instead:** check results (order, stock left, error), and run the same `testInventoryContract` against the fake and the real store.
+
 ## 5. Variants and comparison 🟡
 
 | Double | How it works | Good for | Risk |
 | --- | --- | --- | --- |
 | Stub | Returns a canned value or error | Driving a branch (declined card) | None worth noting |
 | Fake | Small real implementation (map + mutex) | State-based tests; most LLD tests | Drifts from the real implementation unless contract-tested |
-| Mock (gomock, testify/mock) | Expects specific calls, fails otherwise | When the interaction is the behaviour ("send exactly one notification") | Brittle: breaks on harmless refactors and call-order changes |
+| Mock (gomock, testify/mock: popular Go mocking libraries) | Expects specific calls, fails otherwise | When the interaction is the behaviour ("send exactly one notification") | Brittle: breaks on harmless refactors and call-order changes |
 | Spy | Records calls for later assertions | Checking an event was published | Same brittleness as mocks if overused |
-| Real dependency (Testcontainers) | Runs PostgreSQL or Redis in a container | Repository and SQL tests | Slow; not available in a 60-minute round |
+| Real dependency (Testcontainers, a library that starts real services in Docker for a test) | Runs PostgreSQL or Redis in a container | Repository and SQL tests | Slow; not available in a 60-minute round |
 
 | Technique | When it pays in LLD | Example |
 | --- | --- | --- |
@@ -759,6 +798,8 @@ In Go 1.25 the package is standard: no build tag or experiment flag, and the ent
 - **Coverage** is a signal, not a goal. 100% line coverage with no concurrency test still ships the oversell bug.
 - **Through-HTTP tests** in an LLD round are usually wasted time. Test the service directly; one `httptest` test is enough if the handler has real logic.
 
+> 🟡 → 🔴 **You now know** how to write fakes, table tests, a race test, clock tests, contract tests and fuzz tests for an LLD. **Next comes the senior view**: how real Go projects keep fakes honest, what breaks in CI, a minute-by-minute test plan for a round, and the limits of each tool.
+
 ## 7. In production 🔴
 
 - **Real practice:** Go's own standard library is full of table-driven tests and golden files (`go/printer` and `gofmt` use `testdata/*.golden`). The `-update` flag convention comes from there.
@@ -766,10 +807,10 @@ In Go 1.25 the package is standard: no build tag or experiment flag, and the ent
 - **Goroutine leaks:** add `goleak.VerifyTestMain(m)` in packages that start goroutines (worker pools, janitors); [[Concurrency for LLD]] shows it.
 - **Failure modes → fixes:**
 	- Flaky time-based test → it reads `time.Now()` or sleeps; inject a clock or use `synctest`.
-	- Race test passes locally, fails in CI → it is probabilistic; run `-race -count=20` before merging.
+	- Race test passes locally, fails in CI (the server that runs tests on every push) → it is probabilistic; run `-race -count=20` before merging.
 	- Fake and real repo disagree → contract test both.
 	- Deterministic IDs collide across parallel cases → give each case its own `SeqIDs`.
-- **What to watch in CI:** race reports (the job must fail on them), flaky test rate, fuzz corpus growth (`testdata/fuzz/FuzzXxx/` holds failing inputs; commit them as regression cases).
+- **What to watch in CI:** race reports (the job must fail on them), flaky test rate, fuzz corpus (the saved set of inputs the fuzzer has found useful) growth (`testdata/fuzz/FuzzXxx/` holds failing inputs; commit them as regression cases).
 
 ### A test layout for a 60-minute round
 
@@ -827,6 +868,26 @@ In Go 1.25 the package is standard: no build tag or experiment flag, and the ent
 - Winner test: barrier, N goroutines, atomic count, `-race -count=N`.
 - `testing/synctest` for code that sleeps: experimental in 1.24, standard in 1.25.
 - Fuzz parsers with properties; golden files for long output; contract tests keep fakes honest.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What is the difference between a fake and a stub?
+> A fake is a small working version (a map-backed inventory); a stub just returns a fixed answer (payment always "declined").
+
+> [!question]- 🟢 Why inject a clock instead of calling `time.Now()`?
+> So a test can jump 10 minutes ahead instantly and get the same result every run.
+
+> [!question]- 🟢 Why give the service small interfaces?
+> So each test can plug in a fake of a few lines instead of a real database or payment service.
+
+> [!question]- 🟡 What four parts does a "one winner" race test need?
+> A start barrier, N goroutines, an atomic winner count, and a run with `-race -count=N`.
+
+> [!question]- 🟡 Why must the fake inventory have its own mutex?
+> The race test hits the fake from 50 goroutines; an unlocked fake fails under `-race` or shows two winners even when the service is right.
+
+> [!question]- 🟡 Your fake allows negative stock but the real table forbids it. How do you catch that?
+> Run one contract test against both the fake and the real repository.
 
 ## Links 🟢
 

@@ -31,6 +31,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[OWASP API Security Top 10]]: the most common ways APIs are broken into (missing ownership checks, weak auth, injection, SSRF); this checklist closes those doors.
+> - [[Authentication vs Authorization]]: "who are you?" and "what may you do?" are separate checks, and both must be hardened.
+
 **From zero, in 60 seconds** 🟢
 
 Most websites are not hacked by geniuses. They are hacked by scripts that scan millions of sites for easy mistakes.
@@ -68,6 +72,13 @@ No single item makes you safe; together they make you a hard target.
 | Least privilege | Give each thing only the access it needs | DB user can't drop tables |
 | Patching | Installing security fixes for software you run | Upgrading a vulnerable library |
 | WAF | Web Application Firewall: filters bad requests | Blocking obvious SQL injection |
+| Defense in depth | Several independent layers, so one failure is not fatal | WAF + safe queries + least privilege |
+| P0 / P1 / P2 | Priority tags: before launch / first month / ongoing | HTTPS is P0, pen tests are P2 |
+| Parameterized query | SQL where values are sent separately from the SQL text, so they can never become code | `WHERE email = $1` |
+| HSTS | A header that tells browsers "always use HTTPS for this site" | `Strict-Transport-Security: max-age=63072000` |
+| CDN | Servers around the world that cache your site and absorb traffic floods | Cloudflare, CloudFront |
+| SIEM | A central system that collects security logs and runs alert rules on them | Splunk, Elastic Security |
+| Bastion | One locked-down server that admins must go through to reach private machines | SSH only via `bastion.example.com` |
 
 **Picture it**
 
@@ -107,11 +118,32 @@ The checklist exists because the mistakes are repetitive. The same ten categorie
 > [!tip] Remember
 > You are not defending against "hackers". You are defending against scripts that try the same twenty mistakes on every site.
 
+### Real-life example: a restaurant partner portal 🟢
+
+Think of the web portal where restaurants on a food app like Zomato or Swiggy update menus and see payouts. Within minutes of going live, bots try `/admin`, `/.env`, default passwords and old plugin bugs. A hardened portal answers only over HTTPS, needs MFA for owners, uses safe database queries, keeps its database off the public internet, limits login attempts, and logs every payout change. When a bot does find a weak spot, the logs and alerts let the team notice in hours, and tested backups let them restore cleanly.
+
 ## 2. Mental model 🟢
 
 Think of a building. You do not rely on one lock. You have a fence (network rules), a front door (TLS and authentication), badge readers on inner doors (authorization and least privilege), cameras (logs and alerts), a safe for valuables (secrets and encryption), and a fire plan with a backup site (backups and incident response).
 
 The analogy breaks down in one place. A burglar must be physically present, so one person attacks one building at a time. On the internet, one script attacks a million sites at once, so even a low-value site gets attacked. Being "too small to target" is not a defense.
+
+## Common beginner mistakes 🟢
+
+- **"We have HTTPS, so we're secure"** → HTTPS only protects data on the wire, not your code or passwords → treat TLS as one item among many.
+- **Leaving the database on a public IP** → scanners find port 5432 within hours → keep databases in a private network, reachable only from the app.
+- **Default or weak admin passwords, no MFA** → the first thing bots try → strong unique passwords plus MFA for every admin.
+- **Never restoring a backup** → you find out it is broken on the worst day → restore on a schedule and time it.
+- **Relying on the WAF instead of fixing the bug** → attackers reword the payload to slip past → fix the code (e.g. parameterized queries); use the WAF to buy time.
+
+### Hardening vs incident response 🟡
+
+| | Hardening (this note) | Incident response |
+| --- | --- | --- |
+| When | Before and between attacks | During and after an attack |
+| Goal | Make attacks hard and their damage small | Stop an attack, recover, learn |
+| Main output | Closed doors, alerts, tested backups | Timeline, rotated secrets, clean rebuild |
+| Link | Feeds detection and recovery | Its lessons feed back into this checklist |
 
 ```mermaid
 flowchart LR
@@ -128,6 +160,8 @@ flowchart LR
 ```
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that most break-ins use the same boring mistakes, and that you stack layers so one failure is not fatal. **Next we open the box**: the priority order, then each of the ten layers with what to do, how to check it, and why it matters.
 
 The checklist has ten layers. Each layer below follows the same pattern: what to do, how to check it, and why it matters. Priority tags are **P0** (do before launch), **P1** (do in the first month) and **P2** (do as the system matures).
 
@@ -158,6 +192,12 @@ flowchart TD
 ### 3.2 TLS and security headers
 
 In plain words: TLS encrypts traffic between the browser and your server so nobody on the network path can read or change it. Security headers are instructions your server sends so the browser itself refuses risky behavior.
+
+**Step by step:**
+1. Turn on HTTPS with an auto-renewing certificate, and make plain `http://` redirect to `https://`.
+2. Add HSTS so browsers never try plain HTTP again; start with a short `max-age` and raise it later.
+3. Add CSP (Content-Security-Policy: which scripts may run), `nosniff` and `frame-ancestors` (stops clickjacking: framing your page under a fake one).
+4. Check from outside with `curl -sI https://example.com` that the headers really arrive.
 
 Example response headers (a good baseline, tune the CSP for your own site):
 
@@ -200,6 +240,12 @@ More detail: [[TLS and HTTPS]] and [[CSRF, XSS and Security Headers]].
 ### 3.3 Authentication, sessions and rate limits
 
 In plain words: attackers do not break passwords one at a time by hand. They replay millions of leaked username and password pairs from other sites, which is called **credential stuffing**. Your defenses are strong hashing, MFA, rate limits and safe sessions.
+
+**Step by step:**
+1. A login arrives. The edge counts tries for this IP and this account; over 5 a minute → 429.
+2. The app checks the password against an argon2id hash and answers the same "invalid email or password" for every failure.
+3. Correct password → ask for MFA if this is an admin or a new device.
+4. Success → issue a brand-new session ID in an `HttpOnly; Secure; SameSite=Lax` cookie.
 
 ```mermaid
 sequenceDiagram
@@ -257,6 +303,13 @@ More detail: [[Sessions and Cookies]], [[Authentication vs Authorization]], [[JW
 
 In plain words: every value that comes from a user is untrusted text, even from your own mobile app. **Injection** happens when untrusted text is mixed into a command (SQL, shell, HTML, a URL fetch) so the data is read as code.
 
+**Step by step:**
+1. A user types `' OR '1'='1` into the email box.
+2. First, validate on the server: is it a sane email, under 254 characters?
+3. Then use a parameterized query, so the database receives the SQL and the value separately and treats the value only as text.
+4. When showing it back on a page, encode it for HTML.
+5. If a value is a URL your server will fetch, allow only known hosts and block internal addresses (SSRF: tricking your server into calling internal URLs).
+
 ```mermaid
 flowchart LR
     I["Untrusted input"] --> V["Validate: type, length, allow-list"]
@@ -302,6 +355,12 @@ More detail: [[OWASP API Security Top 10]] and [[CSRF, XSS and Security Headers]
 
 In plain words: your code is mostly other people's code. A single vulnerable library or a single leaked key can undo every other control.
 
+**Step by step:**
+1. Keep secrets in a secrets manager; run `gitleaks` in CI so a key in a commit fails the build.
+2. Run `govulncheck`, `npm audit` and `trivy` on every pull request to find known-vulnerable libraries.
+3. Patch critical findings within days, not months; remove plugins and packages you do not use.
+4. Give CI short-lived cloud access (OIDC federation: the CI job proves who it is and gets temporary keys) instead of stored keys.
+
 Secrets rules:
 
 - No secrets in Git, container images, front-end bundles or logs. Use a secrets manager. See [[Secrets Management]].
@@ -338,6 +397,12 @@ go mod verify
 
 In plain words: every identity (a person, a service, a CI job) should be able to do only what it needs, so a stolen identity cannot do everything. This is the **principle of least privilege**.
 
+**Step by step:**
+1. The web app's database user may only `SELECT`, `INSERT`, `UPDATE` its own tables; migrations use a separate role.
+2. The app's cloud role may read one storage folder and one secret, nothing else.
+3. Humans log in through SSO with MFA; no long-lived keys on laptops.
+4. Every quarter, list users, roles and keys, and delete the unused ones.
+
 ```mermaid
 flowchart TD
     subgraph bad["Over-privileged"]
@@ -355,17 +420,23 @@ flowchart TD
 Checklist:
 
 - Application database user cannot `DROP`, `CREATE ROLE` or read tables it does not use. Use a separate role for migrations.
-- Cloud: no `*:*` policies, no long-lived access keys on laptops, humans use SSO with MFA, workloads use roles (instance profile, IRSA on Kubernetes, OIDC from CI).
-- Enable **IMDSv2** on EC2 so an SSRF bug cannot read instance credentials with a single simple GET request. Example: `aws ec2 modify-instance-metadata-options --instance-id i-0123456789abcdef0 --http-tokens required --http-endpoint enabled`.
+- Cloud: no `*:*` policies, no long-lived access keys on laptops, humans use SSO with MFA, workloads use roles (instance profile, IRSA on Kubernetes, i.e. a cloud role tied to a pod's service account, OIDC from CI).
+- Enable **IMDSv2** (AWS's newer metadata service that needs a session token first) on EC2 so an SSRF bug cannot read instance credentials with a single simple GET request. Example: `aws ec2 modify-instance-metadata-options --instance-id i-0123456789abcdef0 --http-tokens required --http-endpoint enabled`.
 - Turn on S3 Block Public Access at the account level, and check with `aws s3api get-public-access-block --bucket my-bucket`.
 - Review access every quarter: list users, roles, keys and API tokens, and delete what is unused. In AWS, `aws iam generate-credential-report` and `aws iam get-credential-report` show key age and last use.
-- Admin tools (database consoles, dashboards, Kubernetes API) are not on the public internet. Put them behind a VPN, bastion, or identity-aware proxy.
+- Admin tools (database consoles, dashboards, Kubernetes API) are not on the public internet. Put them behind a VPN, bastion, or identity-aware proxy (a gateway that checks your company login before letting you reach the tool).
 
 More detail: [[AWS 02 - IAM]] and [[Service-to-Service Auth - API Keys, HMAC, mTLS]].
 
 ### 3.7 Network, WAF and DDoS protection
 
 In plain words: the fewer doors you expose, the fewer you must guard. A **WAF** (web application firewall) filters known-bad HTTP requests. A **DDoS** shield absorbs floods of traffic so real users still get through.
+
+**Step by step:**
+1. Open only ports 80 and 443 to the internet; SSH and databases are reachable only via a bastion or VPN.
+2. Put the site behind a CDN with DDoS protection, and let your origin server (your real server behind the CDN) accept traffic only from the CDN.
+3. Turn on the WAF's managed rules in "count" mode, check for false alarms, then switch to "block".
+4. Give expensive endpoints like login and search their own tighter rate limits.
 
 ```mermaid
 flowchart LR
@@ -397,6 +468,12 @@ More detail: [[CDN and Edge]], [[API Abuse and Bot Protection]], [[Load Shedding
 
 In plain words: ransomware, a bad deploy, a deleted table or a hacked admin all end the same way. You need a clean copy you can restore. Backups the attacker can also delete are not backups.
 
+**Step by step:**
+1. Back up the database daily and keep point-in-time recovery on.
+2. Copy backups to a separate account with write-once storage, so a hacked production account cannot delete them.
+3. Once a month, restore into a scratch database and time it.
+4. Write down how much data you can afford to lose (RPO) and how long you can be down (RTO), and check the restore meets both.
+
 - Automated daily backups plus point-in-time recovery for the main database. See [[Backup, PITR and Disaster Recovery]].
 - Keep at least one copy in a separate account or region with write-once or versioned storage (for example S3 Object Lock), so a compromised production account cannot erase it.
 - **Test the restore** on a schedule. Record how long it took. That number is your real recovery time.
@@ -409,6 +486,12 @@ In plain words: ransomware, a bad deploy, a deleted table or a hacked admin all 
 ### 3.9 Logging, alerting and compromise monitoring
 
 In plain words: you cannot respond to what you cannot see. Many breaches are discovered by outsiders (customers, researchers, banks) long after they start, partly because nobody was looking at the logs.
+
+**Step by step:**
+1. Send web, login, cloud-audit and server logs to one central, write-once store, kept 90+ days.
+2. Never log passwords, tokens or full card numbers.
+3. Write a few rules on day one: login-failure spike, new cloud user or key, logging turned off, huge outbound traffic.
+4. Route each alert to the on-call engineer, with a link to the incident runbook.
 
 ```mermaid
 flowchart LR
@@ -560,12 +643,15 @@ Where to place the WAF:
 - **WAF false positives.** A rule meant to stop SQL injection can block a legitimate search for a phrase like "select from". Run new rules in count mode first.
 - **Logging vs privacy.** More logging helps investigations but increases the data you must protect and the regulations you fall under. Log events and identifiers, not secrets or whole request bodies.
 - **Cost.** Managed WAF, SIEM and bot services cost money. For a tiny site, a CDN with free tier protection, automatic updates, MFA and tested backups give most of the value.
-- **When not to over-engineer.** A static brochure site without logins or user data does not need an HSM, a SIEM or a pen test each quarter. It needs HTTPS, patched hosting, a locked-down admin account and backups.
+- **When not to over-engineer.** A static brochure site without logins or user data does not need an HSM (hardware security module: a tamper-proof box for keys), a SIEM or a pen test each quarter. It needs HTTPS, patched hosting, a locked-down admin account and backups.
 
 > [!tip] Remember
 > Spend security effort in proportion to what an attacker could steal or break, and always do the cheap P0 items.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the ten layers and the order to tackle them. **Next we look at how mature teams keep the checklist true over time**: security checks in CI, header regression tests, attack-surface reviews, what to measure, and the deeper "why" behind HSTS preload, parameterized queries and SSRF defenses.
+
 
 Real-world habits that separate mature teams:
 
@@ -664,6 +750,26 @@ Pick measurable indicators: percent of services behind the WAF, median time to p
 - Backups: separate account, write-once, encrypted, and restore-tested with a recorded time.
 - Detect: alert on login failure spikes, new IAM keys, disabled logging, odd outbound volume and new files in the web root.
 - Prepare: a written response plan, a contact list, fast secret rotation, and a drill twice a year.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) Name three P0 items to do before launch.
+> HTTPS with HSTS, no default/weak admin passwords plus MFA, parameterized queries (also: no secrets in Git, private database, patched dependencies).
+
+> [!question]- (easy) Which ports should be open to the internet for a normal website?
+> Only 80 and 443.
+
+> [!question]- (easy) When is a backup "real"?
+> Only after you have restored it successfully.
+
+> [!question]- (medium) Why is rate limiting only by IP not enough for login?
+> Botnets spread attempts across thousands of IPs; you also need per-account and device limits.
+
+> [!question]- (medium) Why should the origin server accept traffic only from the CDN?
+> Otherwise attackers hit the origin IP directly and skip the CDN's WAF and DDoS protection.
+
+> [!question]- (medium) Why does IMDSv2 help against SSRF?
+> It needs a session token from a `PUT` request with a special header, which a simple SSRF `GET` cannot get.
 
 ## Links
 

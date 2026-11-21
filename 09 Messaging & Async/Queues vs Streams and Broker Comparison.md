@@ -36,6 +36,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (the three shapes and ack models), 4 (worked example) and 5-6, including the decision guide.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Stacks, Queues and Deques]]: a queue is first in, first out: items leave in the order they arrived.
+> - [[Monolith vs Microservices]]: a system can be split into separate services that talk over the network.
+
 **From zero, in 60 seconds** 🟢
 
 A **broker** is a middle-man program that holds messages between two services.
@@ -82,6 +86,10 @@ That mailbox can work like a to-do pile (a queue) or like a shared diary (a stre
 | Offset | Position number of a message in a stream | "I have read up to message 1,203" |
 | Fan-out | One message copied to many receivers | `order.placed` to email and analytics |
 | At least once | Every message arrives, but maybe more than once | A receipt email sent twice after a crash |
+| Partition | One ordered slice of a log; a topic is split into several so many readers can work in parallel | Topic `orders` with 12 partitions |
+| Consumer group | A named team of readers that share the work of one log and keep one bookmark | `billing` group with 3 workers |
+| Visibility timeout | In SQS, how long a received message stays hidden before others can get it again | 30 seconds |
+| Retention | How long a log keeps messages, whether read or not | 7 days |
 
 **Picture it**
 
@@ -125,6 +133,8 @@ The email consumer can be down for 5 minutes; its messages wait in the broker an
 - **Load levelling:** a burst of 5,000 orders in a minute becomes a backlog that 10 workers drain at their own rate instead of 5,000 concurrent calls.
 - **Fan-out:** one "order placed" fact can reach email, loyalty and analytics without the checkout knowing they exist.
 
+**Real-life example.** After you book a movie ticket on BookMyShow, you get an SMS, an email with the QR code, and the theatre's seat map updates. The booking itself finishes in a second; the SMS and email go through a queue, so a slow SMS provider never holds up your booking. Meanwhile an analytics team reads the same "booking made" events from a log to count sales per show, at its own pace, and can re-read yesterday's events if it finds a bug.
+
 The question this note answers is *which shape of broker*: a queue, a pub/sub topic, or a log, and which product implements it.
 
 **Before and after a broker** (rough numbers from the example):
@@ -151,6 +161,14 @@ flowchart TB
 
 Analogy summary: queue = work to be done once; log = history to be read by many.
 
+## Common beginner mistakes 🟢
+
+- **Calling Kafka "a queue"** → it is a log: every consumer group gets every record, and reading does not delete → use a log when many teams read the same events, a queue for one-time jobs.
+- **Using Redis Pub/Sub for jobs** → it stores nothing, so messages sent during a deploy are lost → use a real queue or Redis Streams.
+- **Expecting each message exactly once** → durable brokers redeliver after crashes and timeouts → make consumers safe to run twice.
+- **Setting the visibility timeout shorter than the work** → the message reappears and a second worker does the same job in parallel → set it above your slowest normal run, and extend it while working.
+- **Adding more consumers than partitions** → in a log, each partition is read by one consumer per group, so extras sit idle → plan the partition count for the parallelism you need.
+
 **Three shapes, one picture:**
 
 ```mermaid
@@ -161,6 +179,8 @@ flowchart LR
 ```
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the three shapes: a queue (work done once), pub/sub (a copy for everyone) and a log (history read by many). **Next we open the box**: how a queue hides and re-shows messages, how fan-out gives each team its own copy, how a partitioned log keeps a bookmark per team, and how each broker hears "done".
 
 ### Point-to-point queue with competing consumers
 
@@ -177,13 +197,20 @@ flowchart LR
 ```
 
 1. The producer sends a message; the broker stores it.
-2. A consumer receives it. The broker does **not** delete it yet; it hides it from others (SQS calls this the **visibility timeout**; RabbitMQ tracks it as an **unacknowledged** delivery on that consumer's channel).
+2. A consumer receives it. The broker does **not** delete it yet; it hides it from others (SQS calls this the **visibility timeout**; RabbitMQ tracks it as an **unacknowledged** delivery on that consumer's **channel**, a light connection inside one network connection).
 3. The consumer does the work and **acks** (SQS: `DeleteMessage`; RabbitMQ: `basic.ack`). Now the broker deletes it.
 4. If the consumer crashes, the hidden message becomes available again (SQS: timeout expires; RabbitMQ: the channel or connection closes). Another consumer gets it. This is why delivery is **at least once**.
 
 ### Pub/sub fan-out
 
 **In plain words:** one post is copied into a separate box for each subscriber, so each team gets its own copy.
+
+**Step by step:**
+1. The orders service publishes one message, `order.placed`, to a topic.
+2. Three queues are attached to that topic: email, loyalty and fraud-in.
+3. The topic copies the message into the email queue and the loyalty queue.
+4. The fraud-in queue has a filter "country = IN". This order is from India, so it gets a copy too.
+5. Each team's workers now read their own queue at their own speed. If email is down, its copy simply waits.
 
 ```mermaid
 flowchart LR
@@ -196,11 +223,18 @@ flowchart LR
     QF --> F[fraud workers]
 ```
 
-The topic (SNS topic, RabbitMQ fanout or topic exchange) copies the message to each bound queue. Each queue then behaves like the point-to-point queue above, so each subscriber gets durability, retries and its own pace. Filters (SNS filter policies, RabbitMQ routing keys) decide which queues get a copy.
+The topic (SNS topic, RabbitMQ fanout or topic **exchange**, RabbitMQ's routing box that decides which queues get a message) copies the message to each bound queue. Each queue then behaves like the point-to-point queue above, so each subscriber gets durability, retries and its own pace. Filters (SNS filter policies, RabbitMQ routing keys) decide which queues get a copy.
 
 ### Partitioned log with two consumer groups
 
 **In plain words:** the log is split into pages; each team keeps its own bookmark per page, and teams never get in each other's way.
+
+**Step by step:**
+1. The producer sends an event with key `order_id=42`. The key always maps to the same partition, say partition 0.
+2. The event is added to the end of partition 0 at position (offset) 5. Nothing is deleted when it is read.
+3. The billing group has two workers, one per partition. Billing's bookmark on partition 0 is at 6: it has done everything up to 5.
+4. The analytics group reads the same partition separately. Its bookmark is at 2, so it is 4 events behind.
+5. After 7 days (the retention), old events are removed whether or not anyone read them.
 
 ```mermaid
 flowchart LR
@@ -225,11 +259,17 @@ flowchart LR
 
 **In plain words:** each broker has its own way to say "done", and its own thing that happens if you never say it. The table lines them up.
 
+**Step by step (the same crash on two brokers):**
+1. A worker receives message 7 and starts sending an email, then crashes before saying "done".
+2. On SQS, message 7 was only hidden. After the 30-second visibility timeout it shows up again, and another worker sends the email.
+3. On Kafka, the worker's group had committed offset 7 ("everything before 7 is done"). The next worker starts again at 7.
+4. In both cases the email may now go out twice. That is "at least once", and why consumers must handle duplicates.
+
 | Broker | How a consumer says "done" | What happens if it never does |
 | --- | --- | --- |
 | SQS | `DeleteMessage(receiptHandle)` | Message reappears when the visibility timeout (default 30 s, max 12 h) expires |
 | RabbitMQ | `basic.ack(deliveryTag)`; `basic.nack`/`basic.reject` with or without requeue | Redelivered when the channel closes; `prefetch` (`basic.qos`) caps unacked messages per consumer |
-| Kafka | Commit offset N for a partition (meaning "everything before N is done") | After a crash or rebalance, the group restarts from the last committed offset, so records after it are reprocessed |
+| Kafka | Commit offset N for a partition (meaning "everything before N is done") | After a crash or **rebalance** (the group reshuffling which worker reads which partition), the group restarts from the last committed offset, so records after it are reprocessed |
 | Redis Streams | `XACK stream group id` | Entry stays in the group's pending entries list (PEL) until another consumer claims it with `XAUTOCLAIM` |
 | Redis Pub/Sub | No ack | Nothing: a message is delivered only to subscribers connected right now |
 
@@ -501,12 +541,12 @@ What the tests show:
 
 | System | Model | Ordering | Retention and replay | Routing and fan-out | Ops burden | Go client |
 | --- | --- | --- | --- | --- | --- | --- |
-| **Amazon SQS** standard | Queue, pull (long polling up to 20 s) | Best effort | Deleted on ack; unacked kept 1 min to 14 days (default 4 days); no replay | None; use SNS or EventBridge in front | None (managed) | `aws-sdk-go-v2/service/sqs` |
+| **Amazon SQS** standard | Queue, pull (**long polling**: the request waits up to 20 s for a message instead of returning empty at once) | Best effort | Deleted on ack; unacked kept 1 min to 14 days (default 4 days); no replay | None; use SNS or EventBridge in front | None (managed) | `aws-sdk-go-v2/service/sqs` |
 | **SQS FIFO** | Queue | Strict within a `MessageGroupId` | As above; 5-minute deduplication window | As above | None | same |
 | **Amazon SNS** | Pub/sub push | FIFO topics only | Stores nothing durable for you; durability comes from the SQS queue behind it | Filter policies; fan-out to SQS, Lambda, HTTP, email, SMS | None | `aws-sdk-go-v2/service/sns` |
-| **RabbitMQ** classic/quorum queues | Queue, push with `prefetch` | Per queue, until redeliveries or several consumers interleave | Deleted on ack; no replay | Exchanges: direct, topic, fanout, headers | Medium (cluster, quorum queues use Raft) | `rabbitmq/amqp091-go` |
+| **RabbitMQ** classic/quorum queues | Queue, push with `prefetch` | Per queue, until redeliveries or several consumers interleave | Deleted on ack; no replay | Exchanges: direct, topic, fanout, headers | Medium (cluster, quorum queues use Raft, a voting protocol that keeps copies in agreement) | `rabbitmq/amqp091-go` |
 | **RabbitMQ streams** (3.9+) | Append-only log | Per stream | Retained by size or age; replay from an offset | Via exchanges | Medium | `rabbitmq-stream-go-client` |
-| **Apache Kafka** | Partitioned log, pull | Per partition | Retained by time or size, or compacted by key; replay by offset | Topics; consumer groups | High self-hosted; managed options (Amazon MSK, Confluent Cloud) | `twmb/franz-go`, `segmentio/kafka-go`, `confluent-kafka-go` (cgo) |
+| **Apache Kafka** | Partitioned log, pull | Per partition | Retained by time or size, or **compacted** by key (only the latest record per key is kept); replay by offset | Topics; consumer groups | High self-hosted; managed options (Amazon MSK, Confluent Cloud) | `twmb/franz-go`, `segmentio/kafka-go`, `confluent-kafka-go` (cgo) |
 | **Apache Pulsar** | Log with queue-style subscriptions | Per partition (Exclusive, Failover); per key (Key_Shared) | Retained in BookKeeper, offload to object storage | Subscription types: Exclusive, Shared, Failover, Key_Shared | High (brokers + BookKeeper + metadata store) | `apache/pulsar-client-go` |
 | **NATS JetStream** | Log (stream) with pull or push consumers | Per stream (per subject within it) | Limits by age, size or count; work-queue retention deletes on ack | Subject wildcards | Low to medium (single binary, Raft) | `nats-io/nats.go` |
 | **Redis Streams** | Log with consumer groups | Per stream | Trimmed with `MAXLEN`/`MINID`; replay by ID | None built in | Low, but memory-bound | `redis/go-redis/v9` |
@@ -523,7 +563,7 @@ What the tests show:
 
 | Use case | First choice | Why |
 | --- | --- | --- |
-| Background task queue (emails, PDFs, thumbnails) | SQS, or a Postgres-backed queue (River) if Postgres is already there; asynq on Redis | Per-message ack, retries, DLQ; no need for replay |
+| Background task queue (emails, PDFs, thumbnails) | SQS, or a Postgres-backed queue (River) if Postgres is already there; asynq on Redis | Per-message ack, retries, DLQ (dead letter queue: where messages that keep failing are parked); no need for replay |
 | Event bus between services (many independent consumers) | SNS → SQS per consumer, EventBridge, Kafka | Each consumer gets its own copy and pace |
 | CDC stream, audit trail, rebuilding read models | Kafka (or Pulsar, Kinesis) | Ordered per key, long retention, replay |
 | Complex routing (by region, priority, header) | RabbitMQ exchanges, EventBridge rules | Routing is a broker feature, not consumer code |
@@ -533,13 +573,15 @@ What the tests show:
 ## 6. Trade-offs and when not to use 🟡
 
 - **Queues lose history.** Once acked, a message is gone. If a bug corrupted 2 hours of processing, you cannot replay; you need the producer's database or an archive.
-- **Logs push work onto consumers.** The consumer must track offsets, handle rebalances and avoid head-of-line blocking within a partition. A poison record stops its partition unless you skip it into a retry topic ([[Dead Letter Queues and Poison Messages]]).
+- **Logs push work onto consumers.** The consumer must track offsets, handle rebalances and avoid **head-of-line blocking** (one stuck record holding up every record behind it) within a partition. A **poison record** (one that fails every time it is processed) stops its partition unless you skip it into a retry topic ([[Dead Letter Queues and Poison Messages]]).
 - **Parallelism in a log is capped by partitions.** A topic with 12 partitions supports at most 12 active consumers per group; the 13th sits idle.
 - **Push brokers can overwhelm consumers** unless prefetch is set. RabbitMQ with no `basic.qos` limit pushes as fast as the network allows. See [[Backpressure and Flow Control]].
 - **Do not add a broker** when the caller needs the answer now (a price quote, a login). A synchronous call with a timeout is simpler. Also skip it for 50 jobs a day in a monolith: a jobs table in Postgres is enough.
 - **Every broker hop adds failure modes:** duplicates, reordering, poison messages, schema drift. The [[Transactional Outbox and CDC]] solves the "DB committed but publish failed" gap that a naive broker integration has.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how queues, fan-out and logs work, how each broker acks, and which product suits which job. **Next is the advanced part**: how real teams run these, the failures you will see, and why logs make extra readers so cheap.
 
 - **Real systems:**
 	- SQS + SNS fan-out is the default AWS pattern for decoupled services ([[AWS SQS, SNS and EventBridge]]).
@@ -625,6 +667,30 @@ flowchart LR
 - Ordering is per group/partition/queue, never global for free.
 - Everything is at least once in practice: make consumers idempotent.
 - Task queue → SQS, RabbitMQ, River; event bus → SNS+SQS, EventBridge, Kafka; replay/CDC → Kafka; lossy real-time → Redis Pub/Sub, NATS core.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- In a queue, how many workers get each message?
+> One. After it acks, the message is deleted.
+
+> [!question]- Does reading a message from a log delete it?
+> No. Each group just moves its bookmark (offset); retention deletes old messages later.
+
+> [!question]- What does Redis Pub/Sub do with a message when no subscriber is connected?
+> It drops it. Nothing is stored.
+
+🟡 Medium
+
+> [!question]- A topic has 12 partitions and your group has 15 consumers. How many do work?
+> 12. Each partition is read by one consumer per group, so 3 sit idle.
+
+> [!question]- An SQS worker takes 60 s but the visibility timeout is 30 s. What happens?
+> The message reappears after 30 s and a second worker processes it at the same time.
+
+> [!question]- Why do you usually put an SQS queue behind each SNS subscriber?
+> SNS itself does not keep messages; the queue gives each subscriber durability, retries and its own pace.
 
 ## Links
 

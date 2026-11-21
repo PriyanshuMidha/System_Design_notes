@@ -33,6 +33,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (the worked example) and 5-6 (variants and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[NoSQL Data Modeling]]: list the questions first, then shape the data so each question is one read by key.
+> - [[Storage Engines - B-tree vs LSM and WAL]]: an LSM engine writes to a log and a memory table, dumps sorted files (SSTables), and merges them later. Cassandra is built this way.
+> - [[Consistent Hashing]]: keys are hashed onto a ring of servers, so adding a server moves only a small share of keys.
+
 **From zero, in 60 seconds** 🟢
 
 Imagine one database server trying to swallow millions of writes a second. It can't. So Cassandra uses many ordinary servers and splits the data between them.
@@ -77,6 +82,10 @@ The price: you must design tables around the exact questions you will ask.
 | Consistency level | How many replicas must answer a read or write | `QUORUM` = 2 of 3 |
 | Tombstone | A "this was deleted" marker instead of an instant delete | Deleting a row writes a tombstone |
 | Denormalise | Store the same data in several tables to avoid joins | Events by tenant and events by user |
+| Coordinator | The node that receives your request and talks to the replicas | any node can coordinate |
+| Data centre (DC) | A group of nodes in one region | Mumbai DC, Frankfurt DC |
+| Compaction | Background merging of data files, keeping the newest version | many small SSTables become one |
+| LWT (lightweight transaction) | A write that only happens "if nobody else did it first" | `INSERT ... IF NOT EXISTS` |
 
 **Picture it**
 
@@ -133,6 +142,22 @@ flowchart LR
 
 The arithmetic: 1.7 billion events a day × 300 bytes is about 510 GB a day, and a year of it is the roughly 190 TB quoted above, before replication multiplies it by 3 in each data centre.
 
+### Real-life example 🟢
+
+Think of a chat app storing messages for millions of group chats.
+Each chat's messages are stored together under the chat ID (the partition key), sorted by send time (the clustering column).
+Opening a chat reads "the newest 50 messages of chat X": one partition, already in order.
+Billions of new messages a day are just appended, on many servers, and losing one server loses nothing because every message has three copies.
+Discord ran its messages on Cassandra this way for years before moving to ScyllaDB, a Cassandra-compatible engine.
+
+## Common beginner mistakes 🟢
+
+- **Designing tables like SQL and querying by any column** → without the partition key Cassandra must ask every node (`ALLOW FILTERING`) → make one table per question, keyed by what that question filters on.
+- **Letting one partition grow forever** (all events of a workspace under one key) → it gets huge and slow and lands on the same few nodes → add a time bucket such as `day` to the partition key.
+- **Using Cassandra as a queue** (insert, then delete when processed) → tombstones pile up and reads crawl → use a real queue such as Kafka.
+- **Reading and writing at `ONE`** → fast, but you may read data that is out of date → use `LOCAL_QUORUM` on both reads and writes.
+- **Skipping repairs** → a replica that missed a delete can bring the row back after 10 days → run repair more often than `gc_grace_seconds`.
+
 ## 2. Mental model 🟢
 
 Think of a distributed, sorted **map of maps**: `partition key → (clustering key → row)`. Hashing the partition key decides which nodes hold the partition. Inside a partition, rows sit on disk in clustering order, so "the newest 50 events of workspace 7 on 2 November" is one sequential read from one partition.
@@ -165,13 +190,21 @@ Terms:
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the model: a partition key picks the servers, clustering columns sort rows inside, and each question gets its own table. **Next we open the box**: where a row is placed, how writes and reads travel, how many copies must agree, how deletes and repairs work, and the rare "only if" write.
+
 ### 3.1 Placement: tokens and replicas
 
 **In plain words:** the cluster is a circle of servers; each row's key is hashed to a spot on the circle, and that spot plus the next couple of servers hold the copies.
 
-The default partitioner hashes the partition key with Murmur3 into a 64-bit **token**. Each node owns several token ranges (virtual nodes: `num_tokens` is 16 by default since Cassandra 4.0, 256 before), and replicas go to the next nodes clockwise on the ring, as described in [[Consistent Hashing]].
+**Step by step (partition key `('ws-7', '2026-11-02')`):**
+1. Hash the partition key into one big number, called the token.
+2. Find the node on the ring that owns the slice containing that token: node B.
+3. With RF = 3, the next two nodes clockwise (C and D) hold the other copies.
+4. Any node can take the request; it forwards it to B, C and D.
 
-`NetworkTopologyStrategy` places RF replicas in each data centre, on different racks where it can. Nodes learn about each other by gossip (see [[Failure Detection, Gossip and Membership]]).
+The default partitioner hashes the partition key with Murmur3 into a 64-bit **token**. Each node owns several token ranges (virtual nodes, many small slices of the ring per node: `num_tokens` is 16 by default since Cassandra 4.0, 256 before), and replicas go to the next nodes clockwise on the ring, as described in [[Consistent Hashing]].
+
+`NetworkTopologyStrategy` places RF replicas in each data centre, on different racks where it can. Nodes learn about each other by gossip (each node regularly swaps status news with a few random others; see [[Failure Detection, Gossip and Membership]]).
 
 ```mermaid
 flowchart LR
@@ -207,7 +240,7 @@ flowchart LR
 ```
 
 1. The coordinator sends the mutation to **all** replicas of the partition, and waits only for as many acknowledgements as the consistency level asks for.
-2. Each replica appends the mutation to its **commit log** and inserts it into the **memtable**, then acknowledges. No read happens first: `INSERT` and `UPDATE` are both blind upserts.
+2. Each replica appends the mutation to its **commit log** and inserts it into the **memtable**, then acknowledges. No read happens first: `INSERT` and `UPDATE` are both blind upserts (they write without checking whether the row exists).
 3. A full memtable is flushed to a new, immutable **SSTable** on disk. A row's cells may now be spread across several SSTables.
 4. **Compaction** merges SSTables in the background, keeping the newest version of each cell.
 
@@ -254,6 +287,13 @@ sequenceDiagram
 
 **In plain words:** every single request chooses how many copies must agree before it counts. Ask few copies and you are fast but may read stale data; ask enough so readers and writers always overlap, and you read your own writes.
 
+**Step by step (RF = 3, write and read both at `LOCAL_QUORUM`):**
+1. The write goes to all 3 local replicas: A, B and C.
+2. As soon as 2 of them (say A and B) confirm, the client hears "ok". C may get it a moment later.
+3. A read asks 2 of the 3 replicas, say B and C.
+4. B has the new value; C may not. The newest timestamp wins, so the read returns the new value.
+5. Because 2 + 2 > 3, any read group always includes at least one replica that has the write.
+
 | Level | Replicas that must answer (RF = 3 in Mumbai and 3 in Frankfurt) | Use |
 | --- | --- | --- |
 | `ONE` / `LOCAL_ONE` | 1 (in any DC / in the local DC) | Fastest; may read stale data |
@@ -266,7 +306,7 @@ sequenceDiagram
 
 If the write CL plus the read CL is greater than RF (for example `LOCAL_QUORUM` + `LOCAL_QUORUM` = 2 + 2 > 3), every read overlaps at least one replica that took the latest acknowledged write in that DC.
 
-That is overlap, not linearizability: concurrent writes, writes that failed half way, and last-write-wins with skewed clocks can still surprise you. See [[Quorums and Leaderless Replication]].
+That is overlap, not linearizability (the strict promise that everyone sees one single, up-to-date order of writes): concurrent writes, writes that failed half way, and last-write-wins with skewed clocks can still surprise you. See [[Quorums and Leaderless Replication]].
 
 ```mermaid
 flowchart LR
@@ -289,9 +329,16 @@ Example with numbers: RF = 3 and both sides use 2. The write reached A and B. An
 
 **In plain words:** a delete is not an erase — it is a sticky note saying "this is gone". If one copy never gets the note before the others throw theirs away, the deleted data comes back from the dead.
 
+**Step by step:**
+1. You delete event E. Replicas A and B write a tombstone; replica C is down and misses it.
+2. The coordinator stores a hint for C, but C stays down longer than 3 hours, so the hint is dropped.
+3. Repair should copy the tombstone to C. If it runs within 10 days, all is well.
+4. If not, after 10 days A and B purge their tombstones during compaction.
+5. C still has E with no tombstone anywhere, so the next repair copies E back to A and B: the row is "alive" again.
+
 - **Hinted handoff:** when a replica is down, the coordinator stores the write as a hint and replays it later, for up to `max_hint_window` (3 hours by default). A node down for longer misses writes until **repair**.
-- **Anti-entropy repair** (`nodetool repair`) compares replicas with Merkle trees per token range and streams the differences. Every table must be fully repaired at least once every `gc_grace_seconds`.
-- **Tombstones:** a delete, or an expired TTL, writes a marker that hides older data. Compaction may drop a tombstone only after `gc_grace_seconds`, which defaults to 864,000 s (10 days).
+- **Anti-entropy repair** (`nodetool repair`) compares replicas with Merkle trees (trees of hashes that let two nodes find which ranges differ without sending all the data) per token range and streams the differences. Every table must be fully repaired at least once every `gc_grace_seconds`.
+- **Tombstones:** a delete, or an expired TTL (a time-to-live after which a value expires by itself), writes a marker that hides older data. Compaction may drop a tombstone only after `gc_grace_seconds`, which defaults to 864,000 s (10 days).
 - **Zombie data:** a replica that missed the delete still holds the old value. If repair has not copied the tombstone to it before the other replicas purge theirs, the next read or repair brings the deleted row back (worked in §4).
 
 ```mermaid
@@ -309,6 +356,12 @@ stateDiagram-v2
 
 **In plain words:** when a write must be "only if nobody else did it first", Cassandra makes the replicas vote on it. It works, but it costs several round trips, so keep it rare.
 
+**Step by step (claim invoice number 1042):**
+1. The coordinator asks the replicas to promise to consider only this proposal (prepare).
+2. It reads the current value: is 1042 already taken?
+3. If free, it asks the replicas to accept "1042 → inv-01JC9V".
+4. Once a majority accept, it commits. A second claim for 1042 now fails with `[applied] = false`.
+
 ```sql
 -- CQL: claim invoice number 1042 for workspace ws-7 exactly once
 INSERT INTO invoice_numbers (workspace_id, number, invoice_id)
@@ -316,9 +369,9 @@ VALUES ('ws-7', 1042, 'inv-01JC9V')
 IF NOT EXISTS;
 ```
 
-`IF NOT EXISTS` and `UPDATE … IF col = value` run Paxos among the partition's replicas. The classic implementation (Paxos v1) needs 4 round trips for a write and 3 for a read. Cassandra 4.1 added Paxos v2 (`paxos_variant: v2`, opt-in), which needs 2 round trips for a write and 1 or 2 for a read.
+`IF NOT EXISTS` and `UPDATE … IF col = value` run Paxos (an agreement protocol in which a majority of replicas vote on one value) among the partition's replicas. The classic implementation (Paxos v1) needs 4 round trips for a write and 3 for a read. Cassandra 4.1 added Paxos v2 (`paxos_variant: v2`, opt-in), which needs 2 round trips for a write and 1 or 2 for a read.
 
-Use LWTs only for compare-and-set (unique claims, state transitions), keep them off hot partitions, and do not mix LWT and plain writes on the same cells: plain writes bypass Paxos and break its guarantees.
+Use LWTs only for compare-and-set (write only if the current value is what you expect) (unique claims, state transitions), keep them off hot partitions, and do not mix LWT and plain writes on the same cells: plain writes bypass Paxos and break its guarantees.
 
 ```mermaid
 sequenceDiagram
@@ -501,6 +554,8 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how Cassandra places, writes, reads, repairs and deletes data, and how to design query-first tables. **Next is the senior view**: real deployments, failure modes such as hot partitions and zombie rows, what to monitor, and the internals behind timestamps, the commit log, indexes and batches.
+
 - **Real systems:**
 	- Discord started on a single MongoDB replica set, moved messages to Cassandra (2017 post), bucketed by channel and time, and in 2022 moved them to ScyllaDB (their 2023 post has the numbers above).
 	- Netflix and Apple are long-time large Cassandra users.
@@ -561,6 +616,9 @@ flowchart LR
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** Cassandra spreads data over many servers by a partition key and keeps three copies of everything. Build one table for each question, and keep each partition small with a time bucket. Use `LOCAL_QUORUM` for reads and writes so you see your own writes. Deletes leave markers that need regular repair, or deleted rows can come back.
+
+
 - Primary key `((partition key), clustering…)`: the partition key picks the nodes, clustering columns sort rows inside the partition.
 - Model query-first: one table per query, duplicated data, logged batches to keep tables in step.
 - Keep partitions bounded (well under about 100 MB) with time buckets and sub-buckets.
@@ -569,6 +627,30 @@ flowchart LR
 - Tombstones live for `gc_grace_seconds` (10 days): repair within it or deleted data returns.
 - LWT = Paxos per partition, several round trips: compare-and-set only.
 - Avoid `ALLOW FILTERING`, secondary indexes on hot paths, queue patterns and huge partitions.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does the partition key decide?
+> Which nodes store the row (by hashing it to a token on the ring).
+
+> [!question]- Why are Cassandra writes so fast?
+> A write is just a commit-log append and a memory insert, with no read first.
+
+> [!question]- What is a tombstone?
+> A marker that says "this was deleted"; the data is removed later by compaction.
+
+🟡 Medium
+
+> [!question]- RF = 3. Why does `LOCAL_QUORUM` for both reads and writes give read-your-writes?
+> 2 + 2 > 3, so every read group overlaps at least one replica that took the write.
+
+> [!question]- How can a deleted row come back?
+> A replica missed the tombstone, repair did not run within `gc_grace_seconds`, the others purged their tombstones, and the old copy spread back.
+
+> [!question]- Why keep lightweight transactions rare?
+> Each one runs Paxos with several round trips (about 4 for a write in Paxos v1).
 
 ## Links
 

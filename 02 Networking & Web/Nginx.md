@@ -29,6 +29,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example), plus 5 and 6 for comparisons.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Forward and Reverse Proxies - L4 vs L7]]: a reverse proxy takes requests on the server's behalf and forwards them to backend servers; 502 means a bad answer, 504 means too slow.
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: requests have a path and headers like `Host`, and answers have status codes.
+
 **From zero, in 60 seconds** 🟢
 
 You build a website. It runs as a program on one computer (your **app server**).
@@ -73,6 +77,11 @@ Nginx sits in front, juggles all those slow visitors cheaply, and hands finished
 | Event loop | A loop that handles whichever connection is ready next, never waiting on one | Worker serving 5,000 sockets in turn |
 | Timeout | How long to wait before giving up | `proxy_read_timeout 60s` |
 | Load balancer | Spreads requests across several backends | Round-robin across 3 servers |
+| Master / worker process | The boss process that reads config, and the few processes that serve traffic | 1 master + 4 workers on a 4-core machine |
+| epoll | The Linux feature that tells a program which of its many connections are ready | One worker waits on 5,000 sockets at once |
+| Location block | A config rule for one URL pattern | `location /api/ { ... }` |
+| `proxy_pass` | The config line that says "forward this request to there" | `proxy_pass http://orders_backend;` |
+| Rate limit | A cap on how many requests one client may send per second | `rate=10r/s` |
 
 **Picture it**
 
@@ -99,9 +108,11 @@ Where it breaks: one receptionist talks to one guest at a time, while one nginx 
 
 ## 1. Why it exists 🟢
 
-A traditional thread-per-connection web server needs one OS thread (with its own stack, typically megabytes) for every open connection.
+🟢 **Plain version:** Old web servers gave every visitor their own thread, and each thread eats memory. With 10,000 slow visitors that means gigabytes of memory just for waiting. Nginx instead runs a few workers, about one per CPU core, and each worker juggles thousands of visitors by only touching the ones that are ready. Waiting visitors then cost almost nothing.
 
-At 10,000 concurrent slow clients — the classic "C10K problem" — that's gigabytes of thread stacks and brutal context-switching overhead, most of it spent on connections that are simply idle, waiting on a slow network.
+A traditional thread-per-connection web server needs one OS thread (with its own stack, a block of memory for its work, typically megabytes) for every open connection.
+
+At 10,000 concurrent slow clients — the classic "C10K problem" ("how do you serve 10,000 connections at once on one machine?") — that's gigabytes of thread stacks and brutal context-switching overhead (the CPU's cost of pausing one thread and resuming another), most of it spent on connections that are simply idle, waiting on a slow network.
 
 Nginx was built specifically to answer the C10K problem: a fixed small number of worker processes (often one per CPU core), each managing tens of thousands of connections through a non-blocking event loop, so idle connections cost memory for a small connection-state struct, not an entire OS thread.
 
@@ -112,6 +123,20 @@ HTTP/1.1 200 OK
 Server: nginx/1.31.3
 strict-transport-security: max-age=31536000
 accept-ranges: bytes
+```
+
+### Real-life example: a ticket sale rush 🟢
+
+Ticket sales for a big concert open on BookMyShow at 12:00, and lakhs of people refresh at once.
+A front layer like Nginx can hold all those connections, many from slow phones, without running out of memory.
+It can serve the logo, CSS and posters straight from disk or a short cache, so the app servers never see those requests.
+Only real API calls such as `/seats` and `/book` are forwarded to the app servers, spread across them, and a rate limit stops one client from hammering `/book` 100 times a second.
+
+```mermaid
+flowchart LR
+    U["Lakhs of users"] --> N["Nginx"]
+    N -- "posters, CSS" --> D["Disk / cache"]
+    N -- "/seats, /book (rate limited)" --> A["App servers"]
 ```
 
 ## 2. Mental model 🟢
@@ -129,11 +154,28 @@ Where it breaks down is staffing: a restaurant can't usually hire a fractional c
 > [!tip] Remember
 > One **master** that never touches traffic, N **workers** that do all the work, each one juggling many connections by switching between whichever is ready next — never one worker per connection.
 
+## Common beginner mistakes 🟢
+
+- **Thinking `location` blocks are checked top to bottom** → nginx uses a fixed order: exact, then `^~`, then regex, then plain prefix → write rules with that order in mind.
+- **Raising `proxy_read_timeout` globally to fix one slow page** → every hung request everywhere now waits longer → override it only in that one `location`.
+- **Setting `keepalive` in `upstream` but nothing else** → nginx still opens a new connection per request → also set `proxy_http_version 1.1` and `proxy_set_header Connection "";`.
+- **Proxying WebSockets like normal requests** → the connection breaks or drops after 60 s idle → forward `Upgrade`/`Connection` headers and raise the timeout for that path.
+- **Rate limiting by IP behind an office NAT** → hundreds of real users share one IP and get blocked together → limit by user ID or API key where you can.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** nginx is a cheap front door: a few workers holding many connections, sending each request to a file or a backend. **Next we open the box**: how workers are organized, how the config tree picks a rule, how backends are chosen, and the timeouts, limits and special cases that matter in production. Each subsection starts with a plain step-by-step walk; the full detail follows it.
 
 ### Master and worker processes
 
 **In plain words: one boss who never serves customers, and a few tireless waiters who each juggle thousands of tables at once.**
+
+**Step by step:**
+1. You start nginx on a 4-core machine. The master process reads the config and opens port 443.
+2. With `worker_processes auto`, the master starts 4 workers.
+3. Each worker asks the kernel (through `epoll`) to tell it when any of its connections has data.
+4. Worker 1 handles whichever of its, say, 3,000 connections are ready, then waits for the next batch. It never sits blocked on one slow phone.
+5. You change the config and run `nginx -s reload`. New workers start with the new config; old ones finish their current requests and exit.
 
 ```mermaid
 flowchart TD
@@ -152,6 +194,13 @@ flowchart TD
 - `nginx -s reload` sends the master a signal to re-read config and spawn **new** workers with the new config while **old** workers finish their current connections and then exit — a graceful, zero-downtime config change with no dropped connections.
 
 ### Config structure: http → server → location
+
+**Step by step:**
+1. A request arrives for `https://api.example.com/orders/42`.
+2. Inside `http`, nginx picks the `server` block whose `server_name` is `api.example.com` on port 443.
+3. Inside that `server`, it picks the `location` that matches `/orders/42`, here `location /orders/`.
+4. That location says `proxy_pass`, so the request is forwarded to the orders backend.
+5. A request for `/static/logo.png` would instead match `location /static/` and be served from disk.
 
 ```nginx
 http {
@@ -179,7 +228,7 @@ http {
 ```
 
 - `http` is the top-level context for anything HTTP-related: logging format, gzip, the `upstream` blocks, and every `server`.
-- `server` is one virtual host: it listens on a port and matches a `server_name` (or several), much like one tenant of the whole nginx instance.
+- `server` is one virtual host (one website among several served by the same nginx): it listens on a port and matches a `server_name` (or several), much like one tenant of the whole nginx instance.
 - `location` matches a request's URL path within a `server` and decides how to handle it: proxy it, serve a static file, redirect it, or something else.
 
 **In plain words:** think of the config as a filing system with three drawers nested inside each other.
@@ -205,6 +254,13 @@ flowchart TB
 ### Location matching precedence (not "first match wins")
 
 **In plain words: nginx does not read your URL rules top to bottom like a checklist; it has a fixed pecking order, and an exact match always wins.**
+
+**Step by step:**
+1. Request: `/images/logo.png`. Rules: `location /images/` and `location ~* \.(jpg|png)$` (a regex: a text pattern, here "ends in .jpg or .png").
+2. Is there an exact rule `location = /images/logo.png`? No.
+3. Find the longest plain prefix that matches: `/images/`. Remember it, but keep going because it has no `^~`.
+4. Check regex rules in file order. `\.(jpg|png)$` matches, so it wins.
+5. Had the prefix been written `location ^~ /images/`, nginx would have stopped at step 3 and skipped the regex.
 
 Nginx does **not** scan `location` blocks top to bottom and stop at the first match. It applies a fixed precedence order regardless of where each block appears in the file:
 
@@ -239,6 +295,13 @@ A common bug: a `location ~* \.(jpg|png)$` regex block "wins" over a plain `loca
 
 **In plain words: `upstream` is your list of app servers, and `proxy_pass` says "forward matching requests to that list" — like a receptionist with a roster of departments.**
 
+**Step by step:**
+1. `upstream orders_backend` lists three app servers: `.11`, `.12`, and `.13` as backup.
+2. A request matches `location /orders/`, whose `proxy_pass` points at `orders_backend`.
+3. Nginx picks a server (round robin by default) and reuses an open connection to it from the `keepalive` pool.
+4. It adds headers so the app still knows the real client: `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`.
+5. If `.11` fails 3 times within 10 s, nginx skips it for 10 s. If both `.11` and `.12` are down, `.13` takes over.
+
 ```nginx
 upstream orders_backend {
     server 10.0.1.11:8080 max_fails=3 fail_timeout=10s;
@@ -263,7 +326,7 @@ server {
 }
 ```
 
-`$proxy_add_x_forwarded_for` appends the immediate client's IP to any inbound `X-Forwarded-For` rather than overwriting it — the same append-only rule covered for any reverse proxy in [[Forward and Reverse Proxies - L4 vs L7]]; a backend reading this header still needs to trust only as many hops as it actually controls, nginx included.
+In the config, `Connection` is a hop-by-hop header (it only applies to one link, not the whole path), so clearing it lets nginx keep its own connection to the backend open. `$proxy_add_x_forwarded_for` appends the immediate client's IP to any inbound `X-Forwarded-For` rather than overwriting it — the same append-only rule covered for any reverse proxy in [[Forward and Reverse Proxies - L4 vs L7]]; a backend reading this header still needs to trust only as many hops as it actually controls, nginx included.
 
 **Upstream load-balancing methods**, chosen per `upstream` block:
 
@@ -272,18 +335,25 @@ server {
 | Round robin | (default, no directive needed) | Requests cycle through servers in order |
 | Weighted round robin | `server … weight=3` | Some servers get proportionally more requests |
 | Least connections | `least_conn` | Send to whichever server currently has the fewest open connections |
-| IP hash | `ip_hash` | Same client IP always maps to the same server (session stickiness, at the cost of uneven load if client IPs aren't evenly distributed) |
+| IP hash | `ip_hash` | Same client IP always maps to the same server (session stickiness, meaning a user keeps landing on the same server, at the cost of uneven load if client IPs aren't evenly distributed) |
 | Generic consistent hash | `hash $request_uri consistent` | A custom key (e.g. the URI) maps consistently to a server, minimizing remapping when a server is added or removed — see [[Consistent Hashing]] |
 
 **Health checks**: open-source nginx only does **passive** checks.
 
 - `max_fails` failed attempts within `fail_timeout` marks a server temporarily down, and traffic stops going to it until `fail_timeout` elapses and it's tried again.
-- **Active** health checks (proactively probing a `/health` endpoint on a timer, independent of real traffic) are an NGINX Plus (commercial) feature.
-- Open-source deployments typically pair nginx with an external health-checking sidecar or rely on the orchestrator (Kubernetes readiness probes) instead.
+- **Active** health checks (proactively probing a `/health` endpoint on a timer, independent of real traffic) are an NGINX Plus (the paid version of nginx) feature.
+- Open-source deployments typically pair nginx with an external health-checking sidecar or rely on the orchestrator (Kubernetes readiness probes: Kubernetes itself pings each copy and stops sending traffic to ones that fail) instead.
 
 ### Timeouts and buffering
 
 **In plain words: three separate stopwatches — one for dialing the backend, one for talking to it, one for waiting on its answer — and each resets on activity, so a slow trickle never trips them.**
+
+**Step by step:**
+1. Nginx starts connecting to the backend. If that takes over 5 s (`proxy_connect_timeout`), it gives up.
+2. It sends the request. If 30 s pass between two writes (`proxy_send_timeout`), it gives up.
+3. It waits for the answer. If 30 s pass with no new bytes (`proxy_read_timeout`), it gives up and returns 504.
+4. Each new chunk of data restarts that 30 s clock, so a slow but steady stream never times out.
+5. A refused or reset connection is a different failure: nginx returns 502.
 
 ```nginx
 proxy_connect_timeout 5s;   # time to establish the TCP connection to the upstream
@@ -309,11 +379,17 @@ flowchart LR
 
 This is exactly why a single misconfigured timeout produces the two different failures described in [[Forward and Reverse Proxies - L4 vs L7]]: nginx returns **502** if the upstream connection is refused or reset, and **504** if the connection succeeded but a read or connect timeout fires waiting on it.
 
-`proxy_buffering` lets nginx read the upstream's entire response (up to the buffer limits) before forwarding it to a slow client, freeing the upstream connection quickly; turning it off (`proxy_buffering off`) is needed for real-time streaming responses (e.g. server-sent events) where the client must see each chunk as it arrives, not after nginx has buffered the whole thing.
+`proxy_buffering` lets nginx read the upstream's entire response (up to the buffer limits) before forwarding it to a slow client, freeing the upstream connection quickly; turning it off (`proxy_buffering off`) is needed for real-time streaming responses (e.g. server-sent events, where the server keeps pushing small updates down one open response) where the client must see each chunk as it arrives, not after nginx has buffered the whole thing.
 
 ### TLS, HTTP/2, HSTS
 
 **In plain words: this block turns on the padlock (HTTPS), the faster HTTP/2 protocol, and a header that tells browsers to always use HTTPS from now on.**
+
+**Step by step:**
+1. `listen 443 ssl` plus the certificate and key files turn on HTTPS for this site.
+2. `http2 on` lets browsers fetch many files at once over one connection.
+3. `ssl_protocols TLSv1.3 TLSv1.2` refuses older, weaker TLS versions.
+4. The `Strict-Transport-Security` header (HSTS) tells the browser: for the next year, never use plain HTTP for this site.
 
 ```nginx
 server {
@@ -329,6 +405,13 @@ server {
 ### Static files, compression, and micro-caching
 
 **In plain words: serve files straight from disk, pre-squeezed, and keep a few-second copy of hot API answers so a thousand identical requests become one.**
+
+**Step by step:**
+1. A request for `/static/app.css` is served straight from `/var/www/static/app.css`. If `app.css.gz` exists, nginx sends that pre-compressed copy instead.
+2. `expires 30d` tells browsers to keep it for 30 days.
+3. A request for `/orders/` goes to the backend, and nginx keeps a copy of the 200 answer for 5 seconds.
+4. In those 5 seconds, 1,000 identical requests get the saved copy; the backend sees only about one.
+5. If the backend errors, `proxy_cache_use_stale` serves the last good copy instead.
 
 ```nginx
 location /static/ {
@@ -348,6 +431,12 @@ location /orders/ {
 A 5-second micro-cache in front of a popular, rapidly-repeated endpoint can turn thousands of identical requests per second into a handful of upstream requests per second — the same request-collapsing idea covered for a CDN's origin shield in [[CDN and Edge]], applied at a single reverse proxy instead of globally.
 
 ### Rate limiting
+
+**Step by step:**
+1. `limit_req_zone` makes a shared memory area (10 MB) that counts requests per client IP, allowing 10 per second.
+2. In `location /api/`, `limit_req ... burst=20 nodelay` applies it: a client may briefly go 20 above the rate.
+3. A client sends 25 requests at once: 20 are served at once, 5 get `503`.
+4. `limit_conn per_ip_conn 5` separately caps each IP at 5 open connections at the same time.
 
 ```nginx
 http {
@@ -394,6 +483,12 @@ flowchart LR
 ### WebSocket proxying
 
 **In plain words: a WebSocket starts as a normal request but turns into an open phone line; nginx must be told to hold the line instead of hanging up after one answer.**
+
+**Step by step:**
+1. The browser sends `GET /ws/` with `Upgrade: websocket`.
+2. Nginx forwards those `Upgrade` and `Connection` headers to the chat backend (they are not passed on by default).
+3. The backend answers `101 Switching Protocols`. From now on it is an open two-way pipe.
+4. Chat messages flow both ways for as long as the user stays. `proxy_read_timeout 3600s` stops nginx closing it after 60 s of quiet.
 
 ```nginx
 location /ws/ {
@@ -504,21 +599,23 @@ sequenceDiagram
 | --- | --- | --- | --- |
 | Nginx | Event loop per worker (epoll) | Mature, huge deployment base, simple static+proxy config | General-purpose reverse proxy, static serving, Kubernetes Ingress (legacy) |
 | HAProxy | Event loop, very low overhead | Best-in-class L4/L7 load balancing performance and observability (stats page) | High-throughput load balancing, often paired with nginx for static serving |
-| Envoy | Event loop, built for dynamic config via xDS APIs | Deep L7 observability, designed as a service-mesh data plane | Sidecar proxy, API gateway, modern Kubernetes Ingress/Gateway API |
-| Caddy | Event loop (Go's own netpoller) | Automatic HTTPS via ACME out of the box | Small deployments wanting zero-config TLS |
+| Envoy | Event loop, built for dynamic config via xDS APIs (APIs that push new routes to the proxy while it runs) | Deep L7 observability, designed as a service-mesh data plane | Sidecar proxy, API gateway, modern Kubernetes Ingress/Gateway API |
+| Caddy | Event loop (Go's own netpoller) | Automatic HTTPS via ACME (the protocol Let's Encrypt uses to issue free certificates automatically) out of the box | Small deployments wanting zero-config TLS |
 | Traefik | Event loop (Go), native service-discovery integration | Auto-discovers routes from Docker/Kubernetes labels | Container-native reverse proxying |
 
 > [!warning] ingress-nginx is retired
-> Kubernetes' `ingress-nginx` project — a Kubernetes-specific controller built around nginx, distinct from running nginx directly — was announced for retirement in November 2025 and stopped receiving releases, bug fixes, and security updates in March 2026, per the Kubernetes Steering and Security Response Committees. The Kubernetes project recommends the Gateway API (implemented by Envoy-based and other controllers) as the long-term-supported replacement. Existing `ingress-nginx` deployments keep running but get no further security fixes.
+> Kubernetes' `ingress-nginx` project — a Kubernetes-specific controller built around nginx, distinct from running nginx directly — was announced for retirement in November 2025 and stopped receiving releases, bug fixes, and security updates in March 2026, per the Kubernetes Steering and Security Response Committees. The Kubernetes project recommends the Gateway API (Kubernetes' newer standard way to describe how outside traffic reaches services; implemented by Envoy-based and other controllers) as the long-term-supported replacement. Existing `ingress-nginx` deployments keep running but get no further security fixes.
 
 ## 6. Trade-offs and when not to use 🟡
 
-- Open-source nginx's load balancing is simpler than a dedicated L4 load balancer or a service mesh's data plane: no active health checks, no fine-grained per-request retry budgets or circuit breaking out of the box.
+- Open-source nginx's load balancing is simpler than a dedicated L4 load balancer or a service mesh's data plane: no active health checks, no fine-grained per-request retry budgets or circuit breaking (automatically stopping calls to a failing backend for a while) out of the box.
 - A single event-loop-per-worker model is extremely efficient for I/O-bound proxying but doesn't parallelize a single CPU-bound request across cores — that's not its job, and isn't what it's for.
 - For deep L7 observability, dynamic configuration pushed from a control plane, or a service-mesh data plane, Envoy is usually the better-suited modern choice; nginx's config is static and requires a reload (graceful, but still a config file change) to update routing.
 - For Kubernetes ingress specifically, `ingress-nginx` is no longer a sound long-term choice given its retirement — new deployments should evaluate a Gateway API implementation instead.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** workers, the config tree, location matching, upstreams, timeouts, caching, rate limits and WebSockets. **Next comes the advanced part**: what breaks in real deployments, what to watch, and why `epoll`, `keepalive` and micro-caching behave the way they do.
 
 - **Real systems:** nginx as the reverse proxy and static file server in front of countless web applications; as a TLS-terminating edge in content platforms; paired with HAProxy or an L4 load balancer in larger deployments; historically as the default Kubernetes `ingress-nginx` controller, now retired in favor of Gateway API implementations.
 - **Failure modes → fixes:**
@@ -527,14 +624,14 @@ sequenceDiagram
   - WebSocket connections dropping after exactly 60 seconds idle → the default `proxy_read_timeout` applies to WebSocket proxying too; raise it specifically on that location.
   - Keepalive to upstream not actually reused → `keepalive` in the `upstream` block requires `proxy_http_version 1.1` and clearing the inbound `Connection` header; missing either silently falls back to one connection per request.
   - `limit_req` rejecting legitimate traffic behind a corporate NAT → many users sharing one public IP all count against the same `$binary_remote_addr` bucket; key on an authenticated user ID or API key instead where available.
-- **What to monitor:** nginx's own 4xx/5xx split by upstream (`$upstream_status` in logs, distinct from nginx's own response code), `$upstream_response_time` vs total request time, active/reading/writing connection counts (`stub_status`), rate-limit rejection count, and worker connection saturation relative to `worker_connections`.
+- **What to monitor:** nginx's own 4xx/5xx split by upstream (`$upstream_status` in logs, distinct from nginx's own response code), `$upstream_response_time` vs total request time, active/reading/writing connection counts (`stub_status`, nginx's built-in status page), rate-limit rejection count, and worker connection saturation relative to `worker_connections`.
 
 ## 8. Deep dive 🔴
 
-- **Why `epoll` beats a thread-per-connection or naive `select`/`poll` model at scale.** `select`/`poll` require the kernel to rescan the *entire* set of watched file descriptors on every call, an O(n) cost per check regardless of how many are actually ready.
+- **Why `epoll` beats a thread-per-connection or naive `select`/`poll` model at scale.** `select`/`poll` require the kernel to rescan the *entire* set of watched file descriptors on every call, an O(n) cost per check (work grows with the number of connections watched) regardless of how many are actually ready.
 
   `epoll` keeps the watched set registered in the kernel and only returns the subset that's actually ready, making each check proportional to the number of ready events, not the number of watched connections — the mechanism itself lives in [[I-O Models - Blocking, epoll, io_uring and the Go Netpoller]].
-- **Why `worker_processes auto` is usually right, but not always.** One worker per core avoids both under-utilization (fewer workers than cores) and unnecessary context-switching between workers contending for the same core. On a machine also running other CPU-heavy processes, pinning worker count below the core count (and using `worker_cpu_affinity`) can reduce contention and tail latency.
+- **Why `worker_processes auto` is usually right, but not always.** One worker per core avoids both under-utilization (fewer workers than cores) and unnecessary context-switching between workers contending for the same core. On a machine also running other CPU-heavy processes, pinning worker count below the core count (and using `worker_cpu_affinity`) can reduce contention and tail latency (the slowest few percent of requests).
 - **Why `keepalive` in the `upstream` block needs `proxy_http_version 1.1` specifically.** HTTP/1.0 has no persistent-connection concept by default; without bumping the proxy-to-upstream protocol version to 1.1, nginx cannot keep that backend connection open for reuse regardless of the `keepalive` directive's value — the directive sets the pool size, but the protocol version is what makes pooling possible at all.
 - **Micro-caching's narrow safety window.** A `proxy_cache_valid 200 5s` micro-cache is safe for public, non-personalized responses.
 
@@ -549,7 +646,7 @@ sequenceDiagram
 > The regex block wins, even though the prefix block appears first and looks more specific to a path-based reading. Nginx's precedence is: exact match, then `^~` prefix (which would skip regex), then the first matching regex in file order, and only then a plain prefix match. A plain prefix location never outranks a matching regex location.
 
 > [!question]- A proxied endpoint intermittently returns 504 under load, while the same backend's health-check endpoint always responds fine. What would you check first?
-> Whether `proxy_read_timeout` is tuned for this endpoint's actual p99 latency, not a blanket default. A health check typically does trivial, fast work, while the real endpoint might run a slow query under load; the fix is a per-location timeout override (or fixing the backend's slow path), not raising the global timeout and hiding genuinely hung requests elsewhere.
+> Whether `proxy_read_timeout` is tuned for this endpoint's actual p99 latency (the time 99% of requests finish within), not a blanket default. A health check typically does trivial, fast work, while the real endpoint might run a slow query under load; the fix is a per-location timeout override (or fixing the backend's slow path), not raising the global timeout and hiding genuinely hung requests elsewhere.
 
 > [!question]- What's the difference between nginx's passive and active health checks, and why does it matter for open-source nginx specifically?
 > Passive checks mark a server down only after real traffic to it fails `max_fails` times within `fail_timeout` — so the first few real requests during an outage still get routed to the bad server. Active checks proactively probe a health endpoint on a timer, independent of real traffic, catching failures before users hit them — but that's an NGINX Plus (commercial) feature; open-source nginx needs an external prober or orchestrator-level readiness checks to get the same effect.
@@ -562,6 +659,8 @@ sequenceDiagram
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** One master reads the config; a few workers serve all traffic, each juggling many connections. Config goes `http` → `server` (which site) → `location` (which path), and an exact match always wins. `upstream` lists your app servers and `proxy_pass` sends requests there. Three timeouts guard the backend; silence gives 504, a refused connection gives 502. The dense list follows.
+
 - One master (config + socket binding + worker lifecycle), N workers, each a single-threaded event loop on `epoll`; `worker_processes × worker_connections` is the practical connection ceiling.
 - Config nests `http` → `server` → `location`; location precedence is exact → `^~` prefix → first-matching regex (file order) → longest plain prefix — never "first block in the file."
 - `upstream` + `proxy_pass` is the reverse-proxy-to-backend-pool pattern; `least_conn`, `ip_hash`, and consistent hashing are the common balancing methods; active health checks are NGINX Plus only.
@@ -571,6 +670,26 @@ sequenceDiagram
 - WebSocket and long-streaming routes need `Upgrade`/`Connection: upgrade` forwarding and their own longer `proxy_read_timeout`.
 - `nginx -s reload` is zero-downtime: new workers start with new config while old workers drain and exit.
 - `ingress-nginx` (the Kubernetes controller) is retired as of March 2026; new Kubernetes ingress should target the Gateway API instead.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What does the master process do, and what do workers do?
+> The master reads config, opens ports and manages workers; workers handle all the actual connections.
+
+> [!question]- 🟢 What are the three nested config levels?
+> `http` (shared settings), `server` (one site), `location` (one URL pattern).
+
+> [!question]- 🟢 Which line forwards a request to backend servers?
+> `proxy_pass`, usually pointing at an `upstream` group.
+
+> [!question]- 🟡 `location /images/` and `location ~* \.(jpg|png)$` both match `/images/logo.png`. Which wins?
+> The regex, because any matching regex beats a plain prefix unless the prefix uses `^~`.
+
+> [!question]- 🟡 A backend streams a few bytes every 20 s for 5 minutes with `proxy_read_timeout 30s`. Does it time out?
+> No. The timer resets on every chunk; only 30 s of total silence trips it.
+
+> [!question]- 🟡 With `rate=10r/s burst=20 nodelay`, a client sends 25 requests at once. What happens?
+> 20 are served immediately and 5 are rejected with 503.
 
 ## Links
 

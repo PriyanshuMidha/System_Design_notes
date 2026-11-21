@@ -34,6 +34,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Latency Numbers Every Engineer Should Know]]: rough costs of basic steps, such as a memory read in nanoseconds, a network hop inside a data centre in under a millisecond, and a trip across the world in about 100 ms. That sense of scale tells you which step is "suspiciously slow".
+
 **From zero, in 60 seconds** 🟢
 
 **Latency** is how long one request takes. Users feel it as "fast" or "slow".
@@ -78,6 +81,12 @@ This note is about measuring that slow 1% and finding the one stage that causes 
 | Queue | Requests waiting their turn for a busy resource | 50 requests waiting for a DB connection |
 | Fan-out | One request calling many other services | A search page calling 100 shards |
 | Saturation | How much extra work is waiting beyond capacity | CPU run queue of 8 on a 4-core box |
+| Service time | Time spent actually doing the work | 8 ms to run the query |
+| Queueing time | Time spent waiting for a busy resource before work starts | 30 ms waiting for a free DB connection |
+| Latency knee | The load level after which waiting time shoots up | fine at 70% busy, awful at 95% |
+| Little's Law | In-flight requests = arrival rate × time each takes | 500/s × 0.04 s = 20 in flight |
+| Histogram | Counts of requests in time ranges (buckets) | 900 under 50 ms, 90 under 500 ms |
+| Coordinated omission | A load-test bug where the tester stops sending during a stall, so the stall is never measured | a 2 s pause shows up as 10 ms |
 
 **Picture it**
 
@@ -107,15 +116,23 @@ Where it breaks: shoppers pick a different till, but in a fan-out request you mu
 
 ## 1. Why it exists 🟢
 
-A checkout API has an average latency of 45ms — looks healthy on any dashboard that only plots the mean. But 1 request in 100 takes 2.1 seconds, because it happens to land on a connection pool that is momentarily full.
+A checkout API has an average latency of 45ms — looks healthy on any dashboard that only plots the mean. But 1 request in 100 takes 2.1 seconds, because it happens to land on a connection pool (the fixed set of open database connections the app shares) that is momentarily full.
 
 That's 1% of users sitting on a loading spinner for two seconds, every minute, all day. The average told you nothing was wrong.
 
-Worse: if that checkout page calls 20 downstream services to render (pricing, inventory, promotions, recommendations, ...), and each one independently has that same 1%-slow tail, the checkout page itself is slow for far more than 1% of its users — because it only needs *one* of 20 calls to be slow.
+Worse: if that checkout page calls 20 downstream services (other services it depends on) to render (pricing, inventory, promotions, recommendations, ...), and each one independently has that same 1%-slow tail, the checkout page itself is slow for far more than 1% of its users — because it only needs *one* of 20 calls to be slow.
 
 That's **tail amplification**, and it's why "p99 is only slow for 1% of requests" is the wrong way to reason about a fan-out system.
 
-Bottleneck analysis answers the next question correctly: of DNS, TLS, the load balancer, app CPU, GC, the database, a cache, an external API and a queue, which one actually owns the time in the slow 1%? Guessing wastes an afternoon optimizing a cache that was never the problem.
+Bottleneck analysis answers the next question correctly: of DNS (name lookup), TLS (secure-connection setup), the load balancer, app CPU, GC (Go's garbage collector pausing to free memory), the database, a cache, an external API and a queue, which one actually owns the time in the slow 1%? Guessing wastes an afternoon optimizing a cache that was never the problem.
+
+### Real-life example: an app home screen 🟢
+
+Think of the Swiggy or Zomato home screen.
+To draw it, the app server may call many services at once: offers, restaurants near you, past orders, delivery times, ads.
+The screen can only appear when the slowest of those answers is back.
+If each service is slow just 1 time in 100, a screen that calls 20 of them is slow for about 1 user in 5.
+That is why these teams watch p99 for every service and put time limits on each call.
 
 ## 2. Mental model 🟢
 
@@ -124,17 +141,43 @@ Every request's total latency is a sum of two very different things:
 - **Service time**: the work itself — a CPU instruction, a disk read, a network round trip.
 - **Queueing time**: time spent waiting for a resource (a connection, a goroutine, a CPU core, a lock) that is busy serving someone else.
 
-As a system's utilization climbs toward 100%, queueing time does not grow linearly — it grows **asymptotically**, because an almost-full resource occasionally has a long queue build up behind it. This is the **latency knee**: the point past which small increases in load cause disproportionate latency increases.
+As a system's utilization climbs toward 100%, queueing time does not grow linearly — it grows **asymptotically** (it shoots up steeply, heading towards infinity, as you near 100%), because an almost-full resource occasionally has a long queue build up behind it. This is the **latency knee**: the point past which small increases in load cause disproportionate latency increases.
 
 A server at 60% CPU utilization and the same server at 95% CPU utilization can have wildly different p99s for the same average service time, because the 95%-loaded one is far more likely to have a queue.
 
 Think of a single supermarket checkout lane. At 60% of capacity, a new customer almost never waits. At 95% of capacity, a slightly slow customer ahead of you (a wait that a 60%-loaded lane would absorb instantly) now creates a visible line. The register didn't get slower; it got closer to its limit.
 
+## Common beginner mistakes 🟢
+
+- **Watching only average latency** → a few very slow requests barely move it, so real pain hides → always look at p95, p99 and p99.9.
+- **Averaging p99 across pods** → percentiles cannot be averaged; one quiet pod can skew it 50× → merge histograms, then compute p99 once.
+- **Optimizing the step you assume is slow** → you speed up something that was never the problem → open a slow trace and see which step owns the time.
+- **Load testing with a loop that waits for each reply** → stalls are never measured (coordinated omission) → use a fixed-rate tool like k6 or wrk2.
+- **Running a pool or CPU near 100% busy** → waiting time explodes past the knee → size pools with Little's Law and keep spare room.
+
+### Latency vs throughput 🟡
+
+| | Latency | Throughput |
+| --- | --- | --- |
+| Question | How long does one request take? | How many requests finish per second? |
+| Unit | milliseconds | requests per second |
+| Can be good while the other is bad? | Yes: fast replies, but only 10 per second | Yes: 5,000 per second, but each takes 2 s |
+| Linked by | Little's Law: in flight = throughput × latency | |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that averages hide the slow tail, that time is work plus waiting, and that busy resources make waiting explode. **Next we open the box**: where a request's time goes hop by hop, the USE and RED checklists, how percentiles are computed and combined, and why fan-out makes the tail worse.
 
 ### Where time goes
 
 **In plain words:** add up every hop: network, load balancer, your code, database, other services. One of them is usually most of the time.
+
+**Step by step:**
+1. The client measures 90 ms for `GET /checkout`.
+2. The trace shows spans: app code 10 ms, cache 5 ms, database 15 ms. That adds up to 30 ms.
+3. 60 ms is not covered by any span.
+4. That missing time is almost always waiting: for a free thread, for the server to accept the connection, or for a free worker.
+5. So check the queues and pools first, not the database.
 
 A single request's latency decomposes into every hop it takes:
 
@@ -154,13 +197,20 @@ flowchart LR
     Q --> RESP
 ```
 
-A trace span exists for most of these hops. **The dangerous gap is the time that belongs to none of them** — the unaccounted time between the end of one span and the start of the next, which is almost always queueing: a goroutine waiting for a free OS thread, a request waiting in an HTTP server's accept queue, or a task waiting for a worker pool slot.
+A trace span exists for most of these hops. **The dangerous gap is the time that belongs to none of them** — the unaccounted time between the end of one span and the start of the next, which is almost always queueing: a goroutine waiting for a free OS thread (the operating system's unit of running code), a request waiting in an HTTP server's accept queue (connections waiting to be picked up), or a task waiting for a worker pool slot.
 
 If spans account for 30ms but the client measured 90ms, 60ms went somewhere your tracing isn't looking — usually a queue.
 
 ### The USE method and the RED method
 
 **In plain words:** USE checks each resource (busy? full? errors?). RED checks each service (requests, errors, duration). Use both.
+
+**Step by step:**
+1. An alert says p99 latency is high. That is a RED signal (duration).
+2. Use RED to narrow it: which service, which endpoint, which region? Say `POST /orders` in one region.
+3. Open a slow trace there: the `db.query` span takes most of the time.
+4. Use USE on the database pool: utilization 100%, 40 requests waiting. It is saturated.
+5. That pool is the bottleneck: add capacity, shed load, or make the query faster.
 
 Two complementary lenses, each answering a different question:
 
@@ -177,9 +227,17 @@ flowchart TD
     Sat -- no --> Deeper["Not a resource limit: look for lock contention, N+1 calls, or a slow dependency"]
 ```
 
+(N+1 calls means one call for a list and then one more call per item in it.)
+
 ### Percentiles, and why averages lie
 
 **In plain words:** sort all times and pick the one at the 99% mark. That number shows what your unluckiest users feel.
+
+**Step by step:**
+1. Collect 1,000 request times and sort them from fastest to slowest.
+2. p50 is the one in the middle (number 500). p99 is number 990.
+3. If 990 requests took 10 ms and 10 took 2 s, p50 = 10 ms but p99 jumps toward 2 s.
+4. Have two servers? Do not average their p99s. Pool all their times (or add their histogram buckets) and pick p99 again.
 
 Given a sorted set of latencies, the p99 is the value below which 99% of requests fall (the "nearest-rank" method: for `n` samples, `rank = round(p/100 × (n-1))`, 0-indexed). The mean is dragged only a little by a rare huge value; the p99 is defined entirely by the tail.
 
@@ -193,13 +251,19 @@ This is exactly why Prometheus's `histogram_quantile()` function requires **hist
 
 **In plain words:** if one request calls 100 backends, it waits for the slowest one. So a 1-in-100 slow backend makes most requests slow.
 
+**Step by step:**
+1. One backend call is slow 1 time in 100 (p = 0.01). It is fast 99 times in 100.
+2. A page makes 100 such calls. The chance all 100 are fast is 0.99 multiplied by itself 100 times, about 0.37.
+3. So about 63% of pages hit at least one slow call.
+4. You cannot fix that only by tuning each backend; you limit the damage with per-call time limits, backup requests and partial answers.
+
 If a single dependency call is slow with probability `p`, and a request makes `n` independent calls to dependencies with that same slowness rate, the probability that *at least one* call is slow is `1 − (1 − p)ⁿ`. At `p = 1%` (a dependency with a clean p99) and `n = 100` fan-out calls:
 
 ```text
 1 − 0.99^100 = 1 − 0.366 ≈ 0.634  →  about 63% of top-level requests hit a slow call somewhere
 ```
 
-**Estimate** (model assumes independent dependency slowness; real systems share infrastructure, so correlated slowness — e.g. a shared database having a bad minute — pushes this even higher). The fix is never "make every one of the 100 calls p99 better" alone; it's bounding how much a single slow call can cost the whole request (timeout budgets, hedged requests, partial responses).
+**Estimate** (model assumes independent dependency slowness; real systems share infrastructure, so correlated slowness — e.g. a shared database having a bad minute — pushes this even higher). The fix is never "make every one of the 100 calls p99 better" alone; it's bounding how much a single slow call can cost the whole request (timeout budgets, meaning a fixed time limit per call; hedged requests, meaning sending a backup copy to another server if the first is slow; partial responses, meaning returning the page without the late part).
 
 ```mermaid
 sequenceDiagram
@@ -309,7 +373,7 @@ func SimulateClosedLoop(serviceTimesMS []float64) []float64 {
 }
 ```
 
-Test: 1,000 requests normally take 10ms, but request 500 hits a 2,000ms stop-the-world pause.
+Test: 1,000 requests normally take 10ms, but request 500 hits a 2,000ms stop-the-world pause (the whole program freezes, for example during a big garbage-collection step).
 
 ```go
 func TestCoordinatedOmissionHidesTheStall(t *testing.T) {
@@ -329,7 +393,7 @@ func TestCoordinatedOmissionHidesTheStall(t *testing.T) {
 
 The stalled request and every one of the 499 requests that arrive right after it (500 of the 1000 requests, half the sample) all end up at the full 2000ms, not a fraction of it (in a system with real slack — interval comfortably longer than service time — the backlog would instead shrink request by request back to baseline).
 
-This is why load-testing tools built for this (k6, wrk2, Gatling) use **constant-arrival-rate** execution, never "wait for the response before sending the next one."
+This is why load-testing tools built for this (k6, wrk2, Gatling: popular load-test programs) use **constant-arrival-rate** execution, never "wait for the response before sending the next one."
 
 Finally, Little's Law for pool sizing:
 
@@ -351,7 +415,7 @@ func LittlesLawConcurrency(lambdaPerSec, wSeconds float64) float64 {
 | Client-side summary quantile (Prometheus `summary`) | Each process computes its own streaming quantile and exposes it | A single instance's own view is enough; low cardinality | Cannot be aggregated across instances or time windows — that's the averaging trap above |
 | Histogram + `histogram_quantile()` (Prometheus `histogram`) | Fixed latency buckets per label set; counts are summed across instances, then quantile is computed on the sum | You need a fleet-wide or cross-window percentile (the common case) | Bucket boundaries must be chosen up front; precision is bounded by bucket width |
 | Native histograms (Prometheus 2.40+) | Exponential bucket boundaries chosen automatically | You want histogram accuracy without hand-picking buckets | Newer feature; check your Prometheus version |
-| HdrHistogram / t-digest (client library) | Mergeable, high-precision sketch kept in the app or a tracing backend | You need very precise, mergeable percentiles outside Prometheus | Extra library and memory per process |
+| HdrHistogram / t-digest (client library) | Mergeable, high-precision sketch (a compact summary of many values) kept in the app or a tracing backend | You need very precise, mergeable percentiles outside Prometheus | Extra library and memory per process |
 | Open-loop load generator (k6, wrk2, Gatling) | Fixed arrival rate regardless of response time | Any latency benchmark that must be trustworthy | Needs a generator actually built for constant-arrival-rate; naive scripts default to closed-loop |
 | Closed-loop load generator (naive `for` loop calling an HTTP client) | Waits for each response before sending the next | Never, for latency measurement (fine for pure throughput ceiling tests) | Silently hides tail latency (coordinated omission) |
 
@@ -364,9 +428,12 @@ func LittlesLawConcurrency(lambdaPerSec, wSeconds float64) float64 {
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** where time goes, how USE and RED narrow a problem down, how to compute and combine percentiles, and why fan-out multiplies slowness. **Next is the advanced part**: how real systems report and defend their tail, the common failure patterns, and the theory (queueing math, coordinated omission) behind them.
+
+
 - **Real systems:**
 	- Google's SRE book frames the four golden signals (latency, traffic, errors, saturation) around exactly this split between request symptoms and resource causes.
-	- Envoy, Istio and most API gateways export p50/p90/p99 histograms per route out of the box, because a single "average latency" panel is considered insufficient for any serious on-call rotation.
+	- Envoy, Istio (service proxies that sit in front of each service) and most API gateways export p50/p90/p99 histograms per route out of the box, because a single "average latency" panel is considered insufficient for any serious on-call rotation.
 	- Amazon's internal culture of "the customer experience is the tail, not the average" (popularized via the Dynamo paper's discussion of SLA-driven design) is the origin of designing explicitly for p99.9, not the mean.
 - **Failure modes → fixes:**
 	- Tail amplification under fan-out → bound the blast radius with per-call timeout budgets, hedged requests (send a second request to a different replica if the first hasn't returned by some threshold, cancel whichever finishes second), or return partial results instead of waiting for every dependency.
@@ -382,7 +449,7 @@ func LittlesLawConcurrency(lambdaPerSec, wSeconds float64) float64 {
 - **Why the knee happens.** This is a textbook queueing model, not a measured production curve: for a simple M/M/1 queue (Poisson arrivals, exponential service time — a simplification of a real server, which rarely matches either assumption exactly), average wait time scales with `ρ/(1−ρ)` where `ρ` is utilization (0 to 1). At `ρ = 0.5`, the factor is 1; at `ρ = 0.9`, it's 9; at `ρ = 0.99`, it's 99. Real systems don't follow this formula exactly, but they share its qualitative shape — the explanation for why a resource "at 90% CPU, still fine" can be one bad minute away from a latency cliff: the curve is not linear, it diverges as `ρ → 1`.
 - **Coordinated omission, precisely.** Gil Tene's point is that most load-testing and even some in-process latency measurement (e.g. timing only requests a thread pool actually picked up) never samples the time *during which the measuring system itself was blocked*. The fix is always: decide the sampling schedule in advance (fixed-rate), and if a sample is "late" because the system was busy, record it as a very long latency rather than skipping it or compressing it.
 - **Why percentiles don't average, formally.** A percentile is a quantile of a distribution, not a linear statistic; quantiles do not commute with averaging (`Q(mean(X, Y)) ≠ mean(Q(X), Q(Y))` in general). The only operation that is valid is merging the full sample sets (or additive histogram bucket counts) and computing the quantile once, on the merged distribution — exactly what `histogram_quantile(0.99, sum by (le) (...))` does in PromQL and what naive "average the per-pod p99 panel" does not.
-- **Regression workflow.** When p99 jumps after a deploy: canary-compare the new version against the old one on identical traffic (not before/after on different days, which conflates time-of-day load); if that confirms a regression, take CPU profiles from both versions under the same load and diff the flame graphs — the function whose time share grew is almost always the regression's location.
+- **Regression workflow.** When p99 jumps after a deploy: canary-compare (run the new version on a small slice of traffic next to the old one) the new version against the old one on identical traffic (not before/after on different days, which conflates time-of-day load); if that confirms a regression, take CPU profiles from both versions under the same load and diff the flame graphs (pictures of where CPU time goes, one bar per function) — the function whose time share grew is almost always the regression's location.
 - **Trace critical path.** In a trace with parallel spans, total latency is **not** the sum of every span's duration; it's the length of the longest chain of causally-dependent spans (the critical path). A span that ran in parallel and finished early is not on the critical path even if it was slow in isolation — don't "fix" it first.
 
 ## 9. Interview questions 🔴
@@ -418,6 +485,30 @@ func LittlesLawConcurrency(lambdaPerSec, wSeconds float64) float64 {
 - Little's Law (`L = λW`) sizes pools and worker counts from arrival rate and latency.
 - A load generator that waits for each response before sending the next one suffers coordinated omission and hides exactly the stalls you're hunting.
 - Trace the critical path, not the sum of every span — parallel work off the critical path isn't your bottleneck even if it looks slow alone.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does p99 = 800 ms mean?
+> 99 out of 100 requests finished in 800 ms or less; 1 in 100 took longer.
+
+> [!question]- Why is the average latency not enough?
+> A few very slow requests barely move the average, so the users who suffer stay hidden.
+
+> [!question]- What two parts make up a request's time?
+> Service time (the work) and queueing time (waiting for a busy resource).
+
+🟡 Medium
+
+> [!question]- A page calls 10 services, each slow 1% of the time. Roughly how often is the page slow?
+> 1 − 0.99^10 ≈ 10%, about 1 page in 10.
+
+> [!question]- 300 requests per second at 50 ms each. How many are in flight on average?
+> 300 × 0.05 = 15 (Little's Law).
+
+> [!question]- p99 jumped but p50 is flat. Global slowdown or local?
+> Local: some subset (one pod, one dependency, one saturated pool) is hurting; most requests are fine.
 
 ## Links
 

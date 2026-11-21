@@ -34,6 +34,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 (variants) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Distributed Systems Fundamentals]]: a dead machine and a slow one look the same from outside, so "is it down?" is always a guess.
+> - [[Replication]]: a primary database copies its changes to standbys, either before replying (sync) or a little after (async).
+> - [[Load Balancing]]: a load balancer spreads requests over several servers and stops sending to ones that fail health checks.
+
 **From zero, in 60 seconds** 🟢
 
 Your app runs on one server with one database.
@@ -80,6 +85,10 @@ High availability means keeping a second copy ready, so traffic moves to it on i
 | Health check | A small regular "are you alive?" request | `GET /healthz` every 10 s |
 | Availability Zone (AZ) | A separate data centre inside one cloud region | `ap-south-1a` vs `ap-south-1b` |
 | Downtime budget | How long you may be down per month for a target | 99.9% allows about 43 min/month |
+| RTO | Recovery time objective: the longest outage you accept | "Back within 1 minute" |
+| RPO | Recovery point objective: how much recent data you accept losing | "At most 5 seconds of orders" |
+| Split brain | Two copies both acting as primary and taking writes | Old and new primary both accept orders |
+| Fencing | Cutting off the old primary so it cannot write any more | Revoke its network access, or power it off |
 
 **Picture it**
 
@@ -120,9 +129,15 @@ flowchart LR
     R --> B["Back hours later"]
 ```
 
+### Real-life example 🟢
+
+At 8 pm on a Saturday, a food delivery app is at its busiest. If one of its database servers dies, the app cannot stop taking orders for an hour.
+So the database has a standby copy in another data centre building. Within a minute the standby is promoted, the app reconnects, and most people only see one "something went wrong, try again".
+Maybe the last few seconds of order updates need to be checked again; that is the RPO. The minute of errors is the RTO.
+
 ## 2. Mental model 🟢
 
-- **Availability**: `uptime / (uptime + downtime)`, measured over a window (a month or a year). An SLO usually defines "up" from the user's view: successful requests divided by all requests (see [[SLIs, SLOs, SLAs and Error Budgets]]).
+- **Availability**: `uptime / (uptime + downtime)`, measured over a window (a month or a year). An SLO (service level objective: a reliability target) usually defines "up" from the user's view: successful requests divided by all requests (see [[SLIs, SLOs, SLAs and Error Budgets]]).
 - **Single point of failure (SPOF)**: a component with no redundant copy.
 - **Failover**: moving the work of a failed component to a standby.
 - **RTO (recovery time objective)**: the longest acceptable outage.
@@ -130,11 +145,27 @@ flowchart LR
 
 **Analogy.** A hospital has two generators and a switch that starts the second when mains power fails. Two generators are useless if the switch is broken, if both share one fuel tank (a shared SPOF), or if nobody has tested the switch in a year.
 
+## Common beginner mistakes 🟢
+
+- **Adding a standby and never testing failover** → the switch fails the one day you need it → run regular drills that kill the primary on purpose.
+- **Putting both copies in the same rack or zone** → one power or network failure takes both down → spread copies across Availability Zones.
+- **A very short failure timeout "for speed"** → normal pauses trigger needless failovers that each lose a few writes → wait for several missed heartbeats.
+- **Letting whichever standby notices first promote itself** → two standbys can both become primary → let one node win a majority vote or a lease.
+- **Forgetting the old primary** → it may come back and keep taking writes (split brain) → fence it before or while promoting the new one.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that high availability means spare copies of everything plus an automatic switch (failover) when one dies. **Next we open the box**: what the "nines" really allow, how chains and spares change the maths, how to find single points of failure, how failure is detected, the failover patterns and where the seconds of a failover go.
 
 ### The nines
 
 **In plain words:** 99.9% sounds high, but it still allows about 43 minutes of downtime a month. Each extra 9 cuts that by 10 times.
+
+**Step by step:**
+1. Pick a target, say 99.9%. The allowed downtime is 0.1% of the time.
+2. A 30-day month has about 43,200 minutes. 0.1% of that is about 43 minutes.
+3. At 99.99% the budget drops to about 4 minutes a month.
+4. So one 5-minute failover already breaks a four-nines target for that month.
 
 Downtime allowed by each target (from `(1 − a) × period`; the 30-day column uses 30 days):
 
@@ -151,6 +182,12 @@ At four nines, a failover that takes 5 minutes uses more than a month's budget. 
 ### Serial vs parallel math
 
 **In plain words:** parts in a chain multiply their weak spots; spare copies side by side cover for each other.
+
+**Step by step:**
+1. A request goes through service A, then service B, each up 99.9%. Both must work: 0.999 × 0.999 ≈ 99.8%. Worse than either.
+2. Now run two copies of A side by side; either one is enough. Each is down 0.1% of the time.
+3. Both are down together only 0.1% × 0.1% = 0.0001% of the time, so the pair is up about 99.9999%.
+4. That only holds if they fail independently. Two copies on one power supply fail together.
 
 - **Series** (every component must work): multiply availabilities. Two 99.9% services in a chain: `0.999 × 0.999 = 0.998` (99.8%).
 - **Parallel** (any one copy is enough, failures independent): multiply the *failure* probabilities. Two 99.9% copies: `1 − 0.001 × 0.001 = 0.999999` (six nines on paper).
@@ -170,6 +207,13 @@ flowchart LR
 ### Removing SPOFs
 
 **In plain words:** for every box, ask "what if this dies?" and add a spare where the answer is "everything stops".
+
+**Step by step:**
+1. Draw every box a request touches: DNS, load balancer, app servers, database, config service, NAT gateway.
+2. For each box ask: "if only this dies, does everything stop?"
+3. Two app servers in two zones: no. One database primary with a standby: no, after failover.
+4. One config service both apps read at startup: yes. That is a single point of failure.
+5. Add a spare (or remove the dependency) for each "yes", then check again.
 
 ```mermaid
 flowchart TB
@@ -195,22 +239,35 @@ flowchart TB
     classDef spof fill:#fdd,stroke:#c00,stroke-width:2px
 ```
 
-The app tier and the database are redundant, but the red boxes are still SPOFs. An HA review walks every arrow and asks "what if this one dies?". **N+1** means one spare beyond the capacity you need, so you survive one failure; **N+2** survives one failure during maintenance of another.
+The app tier and the database are redundant, but the red boxes are still SPOFs. An HA review walks every arrow and asks "what if this one dies?". A **NAT gateway** is the box that lets private servers make calls to the internet. **N+1** means one spare beyond the capacity you need, so you survive one failure; **N+2** survives one failure during maintenance of another.
 
 ### Failure detection
 
 **In plain words:** a machine cannot see another one crash. It only notices silence, so it waits a little before deciding.
+
+**Step by step:**
+1. The load balancer calls `GET /healthz` on app-1 every 10 s.
+2. One check times out. That alone could be a short pause, so it waits.
+3. Three checks in a row fail. Now the load balancer removes app-1 from rotation.
+4. If app-1 recovers, it passes checks again and is added back.
 
 A node cannot see that another node crashed; it can only notice silence.
 
 - **Health checks**: the LB or orchestrator probes `/healthz` every few seconds and removes a target after k failures in a row.
 - **Heartbeats**: each node sends "I am alive" periodically; a peer declares it dead after a timeout.
 - **Phi-accrual detector** (Hayashibara et al., 2004): instead of a fixed timeout, it learns the distribution of heartbeat gaps and outputs a suspicion level φ. Cassandra marks a node down at `phi_convict_threshold = 8` by default.
-- **The timeout trade-off:** a short timeout detects failure quickly but fires on GC pauses and network blips (false positives cause needless, risky failovers). A long timeout avoids false alarms but adds directly to downtime.
+- **The timeout trade-off:** a short timeout detects failure quickly but fires on GC pauses (the program freezing while it cleans memory) and network blips (false positives cause needless, risky failovers). A long timeout avoids false alarms but adds directly to downtime.
 
 ### Failover patterns
 
 **In plain words:** spares can sit idle and cold, warm and ready, or already serve traffic. Faster switch means higher cost.
+
+**Step by step:**
+1. Active-active: two servers both take traffic. One dies; the load balancer sends everything to the other in seconds.
+2. Hot standby: a second database copies the first all the time. On failure it is promoted in about a minute.
+3. Warm standby: a smaller copy runs, and is scaled up on failure. Minutes.
+4. Cold standby: only the setup scripts and backups exist. Restore takes hours.
+5. Each step down is cheaper and slower; pick per system using its RTO.
 
 | Pattern | How it works | Failover time | Cost |
 | --- | --- | --- | --- |
@@ -222,6 +279,13 @@ A node cannot see that another node crashed; it can only notice silence.
 ### The failover time budget
 
 **In plain words:** total switch time is notice + decide + promote + move traffic. Each step adds seconds.
+
+**Step by step:**
+1. t = 0 s: the primary database's host dies. It stops renewing its "I am leader" key in etcd.
+2. t ≈ 30 s: the key's TTL runs out. That was detection.
+3. The standby asks etcd for the leader key and gets it, because a majority agrees. That is the decision.
+4. t ≈ 31 s: the standby switches itself to read-write (promote), and the DNS name or proxy is pointed at it (reroute).
+5. Apps notice the change after their DNS cache expires, reconnect, and retry. Total: roughly 35 to 60 s.
 
 `failover time = detect + decide + promote + reroute`
 
@@ -246,12 +310,12 @@ sequenceDiagram
     Note over App,S: total ~35-60 s (estimate for these settings)
 ```
 
-The timings above are an estimate for Patroni-like defaults (`ttl: 30`, `loop_wait: 10`) and a short DNS TTL. Each term is a knob:
+The timings above are an estimate for Patroni-like (Patroni is a popular PostgreSQL failover manager) defaults (`ttl: 30`, `loop_wait: 10`) and a short DNS TTL. Each term is a knob:
 
 - **Detect**: heartbeat interval × misses. Shorter = more false failovers.
 - **Decide**: who is allowed to promote? It must be one node, chosen with a majority (see [[Leader Election]]), never "whoever notices first".
-- **Promote**: replay remaining WAL, switch to read-write.
-- **Reroute**: DNS TTL, connection pool refresh, LB target change. Clients that cache DNS forever (some JVM configurations do) never reroute. Drain connections from the old target so in-flight requests finish.
+- **Promote**: replay remaining WAL (the write-ahead log of changes not yet applied), switch to read-write.
+- **Reroute**: DNS TTL, connection pool refresh, LB target change. Clients that cache DNS forever (some JVM, Java runtime, configurations do) never reroute. Drain connections from the old target so in-flight requests finish.
 
 ## 4. Worked example 🟡
 
@@ -438,6 +502,14 @@ With a 3 s timeout, 3 confirmations and a 1 s check interval, the peer is declar
 | Redis Sentinel | sentinels agree by quorum that the master is down, then promote a replica | `down-after-milliseconds` plus election (see [[Redis Replication, Sentinel and Cluster]]) |
 | Route 53 failover records | primary and secondary records; health checks every 30 s (or 10 s fast) with a failure threshold of 3 by default | detection interval × threshold plus record TTL |
 
+### High availability versus things people confuse it with 🟡
+
+| Thing | What it protects against | How it differs from HA |
+| --- | --- | --- |
+| Backups and disaster recovery | Losing data or a whole region | Restore takes minutes to hours; HA switches in seconds to minutes using live copies |
+| CAP "availability" | Refusing requests during a network split | A theory term: every working node answers; HA is measured uptime from the user's view |
+| Scaling out | Too much load | More servers for capacity; HA needs spares even when load is low |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - **Synchronous replication gives RPO 0 but adds a cross-AZ round trip to every commit**, and if the only sync standby dies, writes block unless the system falls back to async (PostgreSQL keeps waiting by default; `synchronous_standby_names` with `ANY 1 (s1, s2)` needs two standbys to avoid that).
@@ -448,8 +520,10 @@ With a 3 s timeout, 3 confirmations and a 1 s check interval, the peer is declar
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the nines, the series and parallel maths, how to hunt single points of failure, how detection works, the failover patterns and the four parts of failover time. **Next comes the advanced part**: how RDS, Patroni and Kubernetes fail over in practice, split brain and fencing, static stability, failback, testing, and gray failures.
+
 - **Real systems:**
-  - RDS Multi-AZ flips a DNS CNAME to the standby; applications must re-resolve DNS and reconnect.
+  - RDS Multi-AZ flips a DNS CNAME (an alias record pointing one name at another) to the standby; applications must re-resolve DNS and reconnect.
   - Patroni stores a leader key in etcd. If the primary cannot renew it (for example it is partitioned from etcd), it demotes itself, which is how Patroni avoids two primaries.
   - Kubernetes restarts failed pods (liveness probes) and removes unready pods from Services (readiness probes); see [[Graceful Shutdown and Health Checks]].
 - **Split brain → fencing.** If the old primary is only slow, not dead, it may come back and accept writes while the new primary does too. Fixes:
@@ -457,21 +531,21 @@ With a 3 s timeout, 3 confirmations and a 1 s check interval, the peer is declar
   - **Fence** the old primary: revoke its storage or network access, or power it off (STONITH, "shoot the other node in the head").
   - Use fencing tokens on downstream writes (see [[Distributed Locks and Fencing Tokens]]).
 - **Static stability** (AWS Builders' Library): the data plane should keep working with what it already has when the control plane is down. Pre-provision capacity in every AZ instead of planning to launch instances during an AZ failure, because the launch API may be the thing that is impaired.
-- **Failback**: after the old primary is repaired, rebuild it as a replica (for example with `pg_rewind`) rather than promoting it back blindly; schedule the switch-back in a quiet window.
-- **Testing**: run game days and chaos experiments that kill a primary, block an AZ, or slow DNS (see [[Chaos Engineering]]). Measure the real failover time against the RTO.
+- **Failback**: after the old primary is repaired, rebuild it as a replica (for example with `pg_rewind`, a PostgreSQL tool that rewinds an old primary so it can follow the new one) rather than promoting it back blindly; schedule the switch-back in a quiet window.
+- **Testing**: run game days (planned practice outages) and chaos experiments that kill a primary, block an AZ, or slow DNS (see [[Chaos Engineering]]). Measure the real failover time against the RTO.
 - **Failure modes → fixes:**
   - Health check only checks the process, so a node with a dead DB connection stays in rotation → make readiness check dependencies that the node cannot work without, but not shared dependencies (or every node fails the check at once).
-  - Health checks all fail together because the DB is down, so the LB removes every node → rely on "fail open": an ALB target group whose targets are all unhealthy routes to all of them anyway (NLB behaves the same way); other balancers may need it configured, and Envoy's equivalent is panic mode.
-  - Connection pools hold sockets to the dead primary → set TCP keepalives and pool `MaxConnLifetime`, retry on connection errors.
+  - Health checks all fail together because the DB is down, so the LB removes every node → rely on "fail open": an ALB target group whose targets are all unhealthy routes to all of them anyway (NLB behaves the same way); other balancers may need it configured, and Envoy's (a common proxy) equivalent is panic mode.
+  - Connection pools hold sockets to the dead primary → set TCP keepalives (small probes that detect dead connections) and pool `MaxConnLifetime`, retry on connection errors.
 - **What to monitor:** replication lag (bytes and seconds), time since last successful failover drill, number of failovers per week, health-check flaps, and error rate during failovers.
 
 ## 8. Deep dive 🔴
 
-- **Correlated failures break the parallel formula.** A bad config push, a certificate expiry or a shared dependency hits all replicas together. Real availability is usually limited by deploys and dependencies, not hardware. Staged rollouts and cell-based architecture limit this blast radius.
+- **Correlated failures break the parallel formula.** A bad config push, a certificate expiry or a shared dependency hits all replicas together. Real availability is usually limited by deploys and dependencies, not hardware. Staged rollouts and cell-based architecture (splitting users into independent copies of the whole stack) limit this **blast radius** (how much one failure can damage).
 - **Detection is a consensus problem in disguise.** Two observers can disagree about whether a node is dead. Only one decision may win, so promotion uses a lease or a majority vote (see [[Leader Election]] and [[Consensus - Raft and Paxos]]). A self-demoting primary also needs its own clock to be trustworthy for the lease; see [[Clocks and Ordering]].
 - **Gray failure.** A node that answers health checks but fails 30% of real requests is not detected by liveness probes. Detect it from the client side (error rate per backend, outlier ejection in Envoy) rather than from the node itself.
 - **Retry storms after failover.** Every client retries at once when the new primary appears and overloads it. Use jittered backoff (see [[Timeouts, Retries and Backoff]]) and connection-pool limits.
-- **Multi-region** adds DNS or anycast failover and much larger replication lag; see [[Multi-Region Architecture]].
+- **Multi-region** adds DNS or anycast (one IP address served from many places) failover and much larger replication lag; see [[Multi-Region Architecture]].
 
 ## 9. Interview questions 🔴
 
@@ -506,6 +580,30 @@ With a 3 s timeout, 3 confirmations and a 1 s check interval, the peer is declar
 - Prevent split brain: majority to promote, fence the old primary, fencing tokens.
 - Static stability: pre-provision, do not depend on the control plane to recover.
 - Test failover with game days; an untested standby is not HA.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is a single point of failure?
+> One component with no spare, whose death stops the whole service.
+
+> [!question]- About how much downtime does 99.9% allow in a 30-day month?
+> About 43 minutes.
+
+> [!question]- What is the difference between RTO and RPO?
+> RTO is how long you may be down; RPO is how much recent data you may lose.
+
+🟡 Medium
+
+> [!question]- Two independent copies are each up 99.9%. What is the pair's availability, and what assumption does that need?
+> About 99.9999%, assuming they fail independently (different zones, power, deploys).
+
+> [!question]- Name the four parts of failover time.
+> Detect, decide, promote, reroute.
+
+> [!question]- With async replication, how much data can a failover lose?
+> Whatever the old primary had confirmed but not yet shipped: about the replication lag at that moment.
 
 ## Links
 

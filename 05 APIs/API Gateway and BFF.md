@@ -39,6 +39,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[REST and HTTP API Design]]: clients call URLs like `GET /orders/7` and get JSON plus a status code back.
+> - [[Forward and Reverse Proxies - L4 vs L7]]: a reverse proxy is a server that sits in front of your servers and forwards each request to one of them.
+> - [[Load Balancing]]: traffic for one service is spread across several copies of it, skipping unhealthy ones.
+
 **From zero, in 60 seconds** 🟢
 
 A big backend is usually many small programs, each doing one job: one for users, one for orders, one for payments.
@@ -88,6 +93,12 @@ And because the phone home screen needs data from five services, a small helper 
 | Rate limit | A cap on requests per caller per time window | 100 requests per minute |
 | Latency | Time from sending a request to getting the answer | 80 ms per call |
 | BFF | Backend for frontend: one small service per client type | `mobile-bff` builds the home screen |
+| Monolith | One big program that does everything | the old single `shop-server` |
+| Fan-out | One request turning into several parallel calls | BFF calls users, orders and offers at once |
+| mTLS | TLS where both sides prove who they are with certificates | service-to-service calls inside the cluster |
+| Canary | Sending a small share of traffic to a new version first | 10% of requests go to `orders-v2` |
+| Circuit breaker | A switch that stops calling a failing service for a while | after 50% errors, fail fast for 30 s |
+| Service mesh | A layer of small proxies beside every service that handles calls between services | Istio, Linkerd |
 
 **Picture it**
 
@@ -118,8 +129,8 @@ Where it breaks: a receptionist may decide who enters, but each service must sti
 
 A shop splits its monolith into 30 services. Without a gateway:
 
-- **Every service re-implements the edge.** TLS certificates, JWT validation, CORS, rate limits, request logging: 30 copies, 30 slightly different behaviours, and one forgotten check is a breach.
-- **Clients know the internal topology.** The mobile app hard-codes `orders.shop.com`, `users.shop.com`, … Splitting or renaming a service breaks shipped apps that users never update.
+- **Every service re-implements the edge.** TLS certificates, JWT validation, CORS (browser rules on which websites may call your API), rate limits, request logging: 30 copies, 30 slightly different behaviours, and one forgotten check is a breach.
+- **Clients know the internal topology** (the map of which services exist and where). The mobile app hard-codes `orders.shop.com`, `users.shop.com`, … Splitting or renaming a service breaks shipped apps that users never update.
 - **Phones pay for chattiness.** The home screen needs user, orders, recommendations, cart, offers and notifications: 6 calls. On a mobile link with about 100 ms round-trip time (an estimate), six sequential calls cost about 600 ms of network alone, before any server time.
 
   HTTP/2 lets the app send independent calls in parallel, but calls that need an earlier result (orders need the user's ID) still wait, and every call costs radio time, battery and repeated headers.
@@ -134,11 +145,37 @@ The gateway is the **reception desk of an office building**. It checks your badg
 
 A BFF is a **personal assistant per type of visitor**. The assistant for mobile visitors collects documents from five offices and hands over one slim folder; the assistant for partners hands over a different folder.
 
+### Real-life example: the Swiggy home screen 🟢
+
+When you open a food app like Swiggy, one screen shows your address, offers, "order again" restaurants and nearby restaurants.
+Those come from different backend services, but the app makes one call to something like `GET /home`.
+That call first hits the gateway, which checks your login token and your request rate.
+It then reaches a mobile BFF, which asks the address, offers, orders and restaurant services at the same time and sends back one combined answer.
+If the offers service is slow, the BFF sends the screen without offers instead of making you wait.
+
+## Common beginner mistakes 🟢
+
+- **Putting business rules in the gateway** ("free delivery above ₹199") → every team waits on the gateway team, and the rule hides in config → keep rules in services.
+- **Trusting an `X-User-Id` header sent by the client** → anyone can pretend to be anyone → strip it at the gateway and set it only from a verified token.
+- **Skipping authorization in services because "the gateway checked the token"** → user 42 can read user 7's order → each service checks who owns the data.
+- **One shared BFF for every app** → it becomes a second monolith → one BFF per client type, owned by that client's team.
+- **Retrying at every layer** → 3 × 3 × 3 = 27 calls hit a struggling database → retry in one place, with a budget.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the gateway is one front door and a BFF is a per-app helper. **Next we open the box**: the exact checks a request passes in the gateway, how outside traffic differs from service-to-service traffic, and how a BFF builds one response from many calls.
 
 ### The filter pipeline
 
 **In plain words:** each request passes a row of checkpoints, cheapest first, like airport security: ticket check before the slow body scanner. Fail early, fail cheap.
+
+**Step by step:**
+1. `GET /orders/7` arrives over HTTPS. The gateway decrypts it (TLS termination).
+2. It checks size and headers. A 50 MB body is rejected with `413` right here.
+3. It checks the login token. A bad token gets `401` without touching any service.
+4. It checks the caller's rate. Over 100 a minute? `429` with `Retry-After`.
+5. It matches `/orders` to the orders service, picks a healthy copy, and forwards the request.
+6. On the way back it compresses the response and writes one log line with the request ID.
 
 Every request runs through an ordered chain of filters (Envoy calls them filters, Kong calls them plugins). Cheap rejections come first, so expensive work only happens for requests that deserve it.
 
@@ -165,18 +202,25 @@ flowchart LR
     RESP --> OUT["Compression, response headers,<br/>access log, RED metrics"]
 ```
 
-- **TLS termination** and HTTP/2 or HTTP/3 to clients ([[HTTP-1.1 vs HTTP-2 vs HTTP-3]]); plain HTTP or mTLS to upstreams.
+- **TLS termination** (decrypting HTTPS at the gateway) and HTTP/2 or HTTP/3 to clients ([[HTTP-1.1 vs HTTP-2 vs HTTP-3]]); plain HTTP or mTLS to **upstreams** (the services behind the gateway). The pipeline above also shows a **WAF** (web application firewall: blocks known attack patterns) and **RED metrics** (Rate, Errors, Duration per route).
 - **Validation:** body size limits, required headers, optionally the request body against the OpenAPI schema.
 - **Authentication** verifies tokens or API keys ([[JWT - Structure, Validation and Pitfalls]], [[OAuth 2.0 and OpenID Connect]]). The gateway caches the identity provider's JWKS (JSON Web Key Set, its published public signing keys) so it validates signatures locally.
-- **Coarse authorization** answers "may this caller use this route at all?" (scope `orders:read`, partner plan). Fine-grained decisions ("may user 42 see order 7?") stay in the service.
+- **Coarse authorization** answers "may this caller use this route at all?" (**scope**, a permission label inside the token, like `orders:read`; or the partner's plan). Fine-grained decisions ("may user 42 see order 7?") stay in the service.
 - **Rate limits and quotas** per API key, user or route ([[Rate Limiting - Algorithms and Distributed Design]]).
-- **Routing** by path, host, header or weight, then **service discovery** to pick a healthy instance ([[Service Discovery]]).
+- **Routing** by path, host, header or weight, then **service discovery** (looking up the current addresses of a service's running copies) to pick a healthy instance ([[Service Discovery]]).
 - **Protocol translation:** JSON over HTTP outside, gRPC inside (Envoy's gRPC-JSON transcoder, or grpc-gateway in Go; see [[Serving REST and gRPC Together]]).
 - **Caching** of public `GET` responses and **compression** of responses ([[HTTP Caching - Cache-Control, ETag, Conditional Requests]]).
 
 ### North-south vs east-west
 
 **In plain words:** traffic coming in from the internet is "north-south"; chatter between your own services inside is "east-west". The gateway guards the first; a service mesh handles the second.
+
+**Step by step:**
+1. The iOS app calls `GET /home`. That request comes from outside: north-south. The gateway handles it.
+2. The gateway passes it to the mobile BFF inside the cluster.
+3. The BFF calls the orders service. That call is inside: east-west.
+4. A small **sidecar** proxy next to the BFF encrypts the call with mTLS, adds a timeout, and hands it to the sidecar next to orders.
+5. A **control plane** (the mesh's central config server) tells every sidecar its certificates and rules.
 
 ```mermaid
 flowchart TB
@@ -217,7 +261,7 @@ flowchart TB
     CP -.-> SP
 ```
 
-- **The gateway handles north-south traffic**: requests entering from outside. It cares about API keys, end-user tokens, quotas, public routing and API products.
+- **The gateway handles north-south traffic**: requests entering from outside. (The diagram's "3 AZs" are three **availability zones**: separate data centres in one region, and a **pod** is one running copy of a service in Kubernetes.) It cares about API keys, end-user tokens, quotas, public routing and API products.
 - **A service mesh handles east-west traffic**: calls between services inside. Sidecar proxies (Istio with Envoy, Linkerd with its own Rust proxy) give every call mTLS identity, retries, timeouts and telemetry, configured centrally by a control plane.
 
   Istio's ambient mode (generally available since Istio 1.24, November 2024) replaces sidecars with a per-node proxy for mTLS and optional waypoint proxies for L7 rules; the north-south vs east-west split is the same.
@@ -226,6 +270,13 @@ flowchart TB
 ### BFF: one response per client
 
 **In plain words:** the diagram below is one home-screen request: the BFF asks three services at the same time, waits a fixed budget, and ships whatever arrived, marking missing optional bits as partial.
+
+**Step by step:**
+1. The app sends one `GET /home` with its login token.
+2. The BFF starts three calls at once: user, last 3 orders, recommendations. It gives them 300 ms in total.
+3. User and orders answer in 40 ms. Recommendations do not answer in time.
+4. At 300 ms the BFF stops waiting and returns user and orders with `partial: true`.
+5. If the required orders call had failed, the BFF would return an error instead, because the screen cannot work without it.
 
 ```mermaid
 sequenceDiagram
@@ -301,7 +352,7 @@ func main() {
 
 ### Full version
 
-**In plain words:** the real rails: tag every request with an ID, never trust identity headers from outside, reject extra load fast instead of queueing, and send a small share of traffic to the new version (canary).
+**In plain words:** the real rails: tag every request with an ID, never trust identity headers from outside, reject extra load fast instead of queueing (**load shedding**), and send a small share of traffic to the new version (canary).
 
 A minimal gateway in Go: request IDs, longest-prefix routing, identity headers set only from a verified token, per-route load shedding and a weighted canary. It compiles and passes `go vet` and `go test -race` on Go 1.24. A production gateway is a product (section 5), not 80 lines; the code shows what each step really does.
 
@@ -543,18 +594,26 @@ func (b *HomeBFF) fetch(ctx context.Context, url string, in *http.Request) (json
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the gateway pipeline, gateway vs mesh, how a BFF fans out, and the main products. **Next is the advanced part**: keeping the edge alive under failure (retry storms, slow services, bad config), zero-trust authorization, rate limits across many gateway copies, and AWS limits.
+
 - **Real systems:** Netflix's Zuul edge gateway; SoundCloud's BFFs (Phil Calçado, formerly of SoundCloud, coined the name, and Sam Newman's 2015 article describes the pattern in use at SoundCloud and REA); Kong, Envoy Gateway and AWS API Gateway as the common off-the-shelf choices; Istio and Linkerd as meshes behind the edge.
 - **Failure modes → fixes:**
-	- **Single point of failure** → run several stateless instances across availability zones behind an L4 load balancer or anycast; keep config in a store that survives the loss of an instance; keep rate-limit counters in a replicated store or accept per-instance limits.
+	- **Single point of failure** → run several **stateless** (keeping no data of their own between requests) instances across availability zones behind an L4 load balancer or **anycast** (one IP address served from many places, routed to the nearest); keep config in a store that survives the loss of an instance; keep rate-limit counters in a replicated store or accept per-instance limits.
 	- **Retry storms:** the gateway retries, the BFF retries, the service retries, and 3 × 3 × 3 = 27 attempts hit a struggling database.
 
 	  Fix: retry only at one layer, only idempotent requests, with a **retry budget** (an Envoy retry budget, once configured, caps concurrent retries at a share of active plus pending requests: 20% by default, never below 3 concurrent retries) ([[Timeouts, Retries and Backoff]]).
 	- **Slow upstream exhausts the gateway** → per-route timeouts, circuit breakers (Envoy defaults: 1,024 max connections, pending requests and requests per cluster, 3 concurrent retries), and per-route concurrency limits with fast `503`, as in the code above ([[Circuit Breaker]], [[Bulkheads and Concurrency Limits]], [[Load Shedding and Graceful Degradation]]).
-	- **Timeouts that grow inward** → deadlines must shrink as you go deeper: client 10 s > gateway route 3 s > service 2.5 s > database 1 s. Otherwise the gateway gives up while the work continues, and retries pile duplicate work on top.
+	- **Timeouts that grow inward** → deadlines must shrink as you go deeper:
+
+	  ```mermaid
+	  flowchart LR
+	      C["client 10 s"] --> G["gateway 3 s"] --> S["service 2.5 s"] --> D["database 1 s"]
+	  ```
+ client 10 s > gateway route 3 s > service 2.5 s > database 1 s. Otherwise the gateway gives up while the work continues, and retries pile duplicate work on top.
 	- **Bad config push takes down every route** → validate config in CI, roll it out gradually, keep the last good version for instant rollback.
 	- **Canary goes wrong** → weighted routing (1%, 10%, 50%) with automatic rollback on error-rate or latency regressions ([[Deployment Strategies - Rolling, Blue-Green, Canary]]).
 - **What to monitor:**
-	- RED metrics **per route and per upstream**: request rate, error rate (separate 4xx from 5xx, and gateway-generated 401, 429 and 503 from upstream errors), and p50, p99 latency ([[Metrics and Prometheus]]).
+	- RED metrics **per route and per upstream**: request rate, error rate (separate 4xx from 5xx, and gateway-generated 401, 429 and 503 from upstream errors), and p50, p99 latency (the time half of requests beat, and the time 99 of 100 beat) ([[Metrics and Prometheus]]).
 	- Gateway overhead (total latency minus upstream latency), shed and rate-limited counts, circuit-breaker state, certificate expiry.
 	- Structured access logs with request ID, route, consumer, status, upstream and durations; inject a trace context (W3C `traceparent`) so traces start at the edge ([[Distributed Tracing with OpenTelemetry]]).
 
@@ -564,7 +623,7 @@ func (b *HomeBFF) fetch(ctx context.Context, url string, in *http.Request) (json
 
 - accept identity only over a trusted channel: mesh mTLS plus either the original JWT (re-verified locally against the cached JWKS) or a short-lived internal token minted by the gateway;
 - never trust a plain `X-User-Id` header that any pod in the cluster could forge (the gateway strips client-sent copies, as in the code, but internal callers could still set one);
-- make object-level decisions themselves. Broken object-level authorization is the first item in the OWASP API Security Top 10 ([[OWASP API Security Top 10]]).
+- make object-level decisions themselves. Broken object-level authorization is the first item in the OWASP API Security Top 10 (a well-known list of the most common API security holes) ([[OWASP API Security Top 10]]).
 
 **Rate limits across a gateway fleet.** Nine instances each enforcing "100 requests per minute" locally allow up to 900.
 
@@ -623,6 +682,26 @@ HTTP APIs allow up to 30 s. Both cap payloads at 10 MB, and in most Regions an a
 - Resilience: deadlines shrink inward, one retry layer with a budget, circuit breakers, shed with `503` instead of queueing.
 - No single point of failure: stateless instances across zones, gradual config rollout.
 - AWS API Gateway: 29 s default (REST) or 30 s (HTTP API) timeout, 10 MB payload; long work goes async.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is an API gateway?
+> The single front door for outside clients: it checks TLS, login and rate limits, then routes each request to the right service.
+
+> [!question]- Easy: what does a BFF do?
+> It calls several services for one client type and returns one response shaped for that client.
+
+> [!question]- Easy: is north-south traffic from outside or between services?
+> From outside, into your system.
+
+> [!question]- Medium: the gateway verified the JWT. Does the orders service still need to check anything?
+> Yes. It must check that this user may see this specific order; the gateway cannot know who owns it.
+
+> [!question]- Medium: nine gateway copies each allow 100 requests a minute per user. What is the real limit?
+> Up to 900. Share counters (for example in Redis) or split the limit across copies.
+
+> [!question]- Medium: why reject extra requests with `503` instead of queueing them?
+> Queueing makes everyone slow and clients time out anyway; shedding keeps admitted requests fast.
 
 ## Links 🟢
 

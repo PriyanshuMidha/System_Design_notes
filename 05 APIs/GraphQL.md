@@ -33,6 +33,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[REST and HTTP API Design]]: a REST API has one URL per resource (`GET /games/7`), and the server decides what each URL returns.
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: requests use methods like `GET` and `POST`, and responses carry status codes like `200` and `404`.
+
 **From zero, in 60 seconds** 🟢
 
 With a normal web API, the server decides what each URL returns. Often you get a big blob with 30 fields and use 1, or you need three requests to build one screen.
@@ -81,6 +85,12 @@ GraphQL lets the app send one request that lists exactly the fields it wants, an
 | Query / mutation | A read request / a write request | `query { game(id: "7") { title } }` |
 | Resolver | A server function that fetches one field | `Game.reviews` loads reviews from the DB |
 | N+1 problem | 1 query for a list, then 1 more per item | 10 invoices cause 10 customer lookups |
+| Over-fetching | Getting more data than the screen needs | 30 fields returned, 1 used |
+| Under-fetching | One call is not enough, so you make more | reviews come without author names |
+| DataLoader | A helper that collects many lookups and does them as one | 10 customer lookups → 1 query |
+| Variables | Values sent separately from the query text | `{"first": 10}` |
+| Fragment | A named, reusable set of fields | `fragment GameCard on Game { title }` |
+| Directive | A tag in the schema or query that adds a rule | `@deprecated`, `@auth` |
 
 **Picture it**
 
@@ -139,6 +149,13 @@ query GamePage {
 
 Facebook built GraphQL in 2012 for exactly this: many client screens, each needing a different slice of the same graph, over slow mobile networks. It was open-sourced in 2015.
 
+### Real-life example: GitHub and Shopify 🟢
+
+GitHub offers a GraphQL API next to its REST API.
+A tool that wants "my last 10 pull requests, each with its title and the names of its reviewers" can get all of that in one GraphQL query, instead of one REST call for the list plus more calls per pull request.
+Shopify's Admin API works the same way, so a shop's mobile app and its web dashboard can each ask for exactly the fields their screens show.
+Both put strict limits on how big a query may be, because one giant query could overload them.
+
 ## 2. Mental model 🟢
 
 - The **schema** is a typed menu of everything a client may ask for.
@@ -149,11 +166,27 @@ The client **never talks to the database**. It calls one GraphQL server endpoint
 
 **Analogy:** a restaurant waiter. You order one plate with exactly the items you want. The waiter (the GraphQL server) walks to the grill, the salad station and the bar (resolvers calling services), and brings back one plate laid out as you ordered.
 
+## Common beginner mistakes 🟢
+
+- **Writing a naive resolver for a list's child field** → 10 invoices make 11 database queries (N+1) → batch with a per-request DataLoader.
+- **Treating HTTP 200 as "it worked"** → field errors arrive in an `errors` array under 200 → check `errors` in clients and in monitoring.
+- **Exposing the graph with no limits** → one deeply nested query returns 100,000 items and stalls the server → depth limits, cost scoring, page caps.
+- **Checking permissions only on one entry field** → the same invoice is reachable through `customer.invoices` and `search` → check access where the object is loaded.
+- **Building query text by gluing strings** → injection bugs and no caching → keep the query fixed and pass values as variables.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the schema is the menu, a query is the order, and resolvers fetch each field. **Next we open the box**: how the schema is written, how queries use variables and fragments, the exact order the server runs resolvers in, and how a DataLoader removes the N+1 problem.
 
 ### The schema (SDL)
 
 **In plain words:** the schema is the printed menu: every type, every field, and what is allowed as input. If it is not on the menu, no client can order it.
+
+**Step by step:**
+1. You write `type Game { id: ID!  title: String!  reviews: [Review!]! }`. The `!` means "never null".
+2. You write `type Query { game(id: ID!): Game }`. That is the entry point clients start from.
+3. For writes you add `type Mutation { addReview(input: AddReviewInput!): Review! }`, with an `input` type for the arguments.
+4. A client asking for `game(id: "7") { title }` is checked against this menu; asking for `game { price }` is rejected because `price` is not on it.
 
 The Schema Definition Language describes types and the three root operation types.
 
@@ -216,11 +249,17 @@ type Subscription { invoicePaid(customerId: ID!): Invoice! }
 - `!` means non-null. `[T!]!` is a list that is never null and never holds a null; `[T]` allows both.
 - `input` types are the only object types allowed as arguments. Output types cannot be reused as inputs.
 - An **interface** lists shared fields that every implementing type must have. A **union** is "one of these types" with no shared fields. Clients pick fields per concrete type with inline fragments: `... on Invoice { number }`.
-- The `__typename` field and the introspection queries (`__schema`, `__type`) let tools read the schema at runtime.
+- The `__typename` field and the **introspection** queries (`__schema`, `__type`: built-in queries that return the schema itself) let tools read the schema at runtime.
 
 ### Operations, variables and fragments
 
 **In plain words:** a query is the order form; variables are the blanks you fill in so the form itself never changes; a fragment is a reusable block of fields you paste by name.
+
+**Step by step:**
+1. The app writes `query Dashboard($first: Int!) { invoices(first: $first) { ...InvoiceRow } }`.
+2. It sends the variables separately: `{"first": 10}`. The query text never changes between calls.
+3. `fragment InvoiceRow on Invoice { number total }` lists the fields one row needs; any query can reuse it by name.
+4. The server fills in `$first = 10`, expands the fragment, and runs the query.
 
 ```graphql
 query Dashboard($first: Int!, $after: String) {
@@ -256,13 +295,13 @@ subscription OnInvoicePaid($customerId: ID!) {
 
 The schema above and these operations were validated with `github.com/graph-gophers/graphql-go` v1.9.0 (`ParseSchema`, then `ValidateWithVariables`).
 
-Variables travel separately as JSON (`{"first": 10}`), so the query text stays constant. That keeps it cacheable and avoids string-building injection. A **fragment** is a reusable field selection; Relay co-locates one fragment with each UI component.
+Variables travel separately as JSON (`{"first": 10}`), so the query text stays constant. That keeps it cacheable and avoids string-building **injection** (attackers sneaking their own query text in through a value). A **fragment** is a reusable field selection; Relay co-locates one fragment with each UI component.
 
 ### Execution: one resolver per field, parent before child
 
 **In plain words:** the server fills in the answer field by field, parents first, children after, like filling a family tree top-down.
 
-1. **Parse** the query text into an AST.
+1. **Parse** the query text into an AST (abstract syntax tree: the query turned into a tree structure the program can walk).
 2. **Validate** it against the schema: fields exist, argument types match, fragments fit. A failure here means nothing runs.
 3. **Execute**: start at the root type and call each selected field's resolver. Each resolver gets `(parent value, arguments, context)`. A child resolver runs only after its parent returns, and it receives the parent's value.
 4. **Complete** values: check them against the declared types, apply non-null rules, and build the JSON in query order.
@@ -291,7 +330,14 @@ The over-fetching did not disappear; it moved to the server side of the network,
 
 **In plain words:** ask for 10 invoices and their customers, and a naive server runs 1 query for the list plus 10 more, one per customer. A DataLoader waits a moment, collects all 10 customer IDs, and asks the database once.
 
-Resolvers are per field, so a naive `Invoice.customer` resolver runs one query per invoice. Ten invoices produce 1 + 10 SELECTs. A **DataLoader** collects every key requested during one short window (or one execution tick), then issues one batched query.
+**Step by step:**
+1. `Query.invoices` runs one SQL query and gets 10 invoices.
+2. Each of the 10 `Invoice.customer` resolvers calls `loader.Load(customerID)` instead of querying the database itself.
+3. The loader waits about 1 ms, collecting all 10 IDs. Five of them are repeats, so 5 unique IDs remain.
+4. It runs one query: `SELECT ... FROM customers WHERE id = ANY($1)` with those 5 IDs.
+5. It hands each resolver its customer. Total: 2 queries instead of 11.
+
+Resolvers are per field, so a naive `Invoice.customer` resolver runs one query per invoice. Ten invoices produce 1 + 10 SELECTs. A **DataLoader** collects every key requested during one short window (or one execution **tick**, one turn of the runtime's loop), then issues one batched query.
 
 ```mermaid
 flowchart TB
@@ -306,7 +352,7 @@ flowchart TB
     end
 ```
 
-The loader must be **created per request**. Its memo cache would otherwise serve stale rows, and worse, serve one user's authorized data to another user.
+The loader must be **created per request**. Its **memo cache** (remembered answers for keys it already loaded) would otherwise serve stale rows, and worse, serve one user's authorized data to another user.
 
 ## 4. Worked example 🟡
 
@@ -540,6 +586,8 @@ Side by side, topic by topic:
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how schemas, queries, resolvers and DataLoaders work, and when to pick GraphQL over REST or gRPC. **Next is the advanced part**: errors under HTTP 200, authorization with one URL, cost control, caching, schema evolution, federation, and building it in Go with gqlgen.
+
 - **Real systems:**
 	- GitHub's GraphQL API (once called v4) enforces cost limits (GitHub Docs):
 		- Every connection must pass `first` or `last` between 1 and 100.
@@ -586,9 +634,17 @@ By long-standing convention, a server that answers with `application/json` retur
 
 There is one endpoint, so URL-based rules cannot express "who may read `Customer.email`". Authorization happens in the resolver layer:
 
+```mermaid
+flowchart LR
+    A["invoice(id)"] --> L["load Invoice inv_1"]
+    B["customer.invoices"] --> L
+    C["search(text)"] --> L
+    L --> CHK{"may this user<br/>see inv_1?"}
+```
+
 - **Authentication** happens once, in HTTP middleware. It puts the caller (from a session cookie or a token, see [[JWT - Structure, Validation and Pitfalls]]) into the request context.
 - **Object-level checks** (may this user see invoice `inv_1`?) belong in the resolver or the data layer that loads the object. A query can reach the same object through many paths (`invoice`, `customer.invoices`, `search`, `node(id:)`), so a check on one entry field is not enough.
-- **Field-level checks** (only billing admins may see `email`) fit a schema directive such as `@auth`, enforced before the field resolver runs.
+- **Field-level checks** (only billing admins may see `email`) fit a schema **directive** such as `@auth`, enforced before the field resolver runs.
 
 ### Cost control
 
@@ -615,11 +671,11 @@ A single nested query can explode: `users(first: 100) { posts(first: 50) { comme
 	- On a miss the server replies `PersistedQueryNotFound`, the client resends the hash with the full text, and the server stores it.
 	- Small hash-only requests can then go out as **GET**, which a CDN can cache.
 	- APQ saves bandwidth but still accepts any query, so it is not a security control. Trusted documents are.
-- **Normalized client caches:** Apollo Client and Relay split each response into objects keyed by `__typename` + `id` (Relay uses a global ID). When a mutation returns `Invoice:inv_1` with a new status, every screen that shows that invoice updates.
+- **Normalized client caches:** (a client-side store that keeps each object once, by type and ID) Apollo Client and Relay split each response into objects keyed by `__typename` + `id` (Relay uses a global ID). When a mutation returns `Invoice:inv_1` with a new status, every screen that shows that invoice updates.
 
 ### Pagination and schema evolution
 
-- **Relay cursor connections** are the standard shape: `invoices(first: 20, after: "cursor")` returns `edges { cursor node }` and `pageInfo { hasNextPage endCursor }`. The cursor is an opaque string, usually the base64 of the sort key. Why cursors beat offsets lives in [[Pagination, Filtering and Sorting]].
+- **Relay cursor connections** are the standard shape: `invoices(first: 20, after: "cursor")` returns `edges { cursor node }` and `pageInfo { hasNextPage endCursor }`. The cursor is an **opaque** string (clients must not read meaning into it), usually the **base64** (a way to write any bytes as plain letters and digits) of the sort key. Why cursors beat offsets lives in [[Pagination, Filtering and Sorting]].
 - **Evolve, don't version:** add fields and types freely, because old clients never ask for them.
 	- Mark old fields `@deprecated(reason: "...")`, watch field-usage metrics until traffic reaches zero, then delete.
 	- Removing a field, making a nullable argument non-null, or turning a non-null output field nullable breaks clients.
@@ -627,7 +683,7 @@ A single nested query can explode: `users(first: 100) { posts(first: 50) { comme
 
 ### Federation
 
-With Apollo Federation 2, each team runs a **subgraph** that owns some types.
+With Apollo Federation 2 (a way to split one big graph across many teams' services), each team runs a **subgraph** that owns some types.
 
 1. A subgraph marks an entity type with `@key(fields: "id")`, and other subgraphs declare the same type with the same key and add their own fields.
 2. **Composition** (the Rover CLI or GraphOS) merges the subgraph schemas into one supergraph schema.
@@ -694,7 +750,7 @@ sequenceDiagram
 - **Mutations are serial, queries are not:** two top-level mutation fields in one request run in order, so `payInvoice(id: "inv_1")` followed by `archiveInvoice(id: "inv_1")` happens in that order.
 	- One field cannot pass its result to the next, though: creating an invoice and then sending it by its new ID takes two requests.
 	- Two query fields may run concurrently, so they must not depend on each other's side effects.
-- **Subscriptions** are long-lived operations, usually carried over WebSocket with the `graphql-transport-ws` subprotocol (from the `graphql-ws` library).
+- **Subscriptions** are long-lived operations, usually carried over WebSocket with the `graphql-transport-ws` **subprotocol** (the agreed message format inside the WebSocket) (from the `graphql-ws` library).
 	- The older Apollo protocol is confusingly named `graphql-ws`, so check which one the client speaks.
 	- They inherit every scaling problem in [[Real-time APIs - WebSocket, SSE and Long Polling]] and [[Scaling WebSockets]].
 	- For fan-out to many listeners, a subscription resolver should subscribe to a broker topic rather than poll the database.
@@ -738,6 +794,26 @@ sequenceDiagram
 - Guard cost: depth limit, complexity with `first` multipliers, page caps, timeouts, trusted documents.
 - Cache with APQ + GET at the edge and normalized client caches; evolve with `@deprecated`, not versions.
 - Go: gqlgen schema-first, `handler.New` + explicit transports and extensions, dataloadgen, `client.New` in tests.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what does a GraphQL client send instead of calling many URLs?
+> One query to one endpoint, naming exactly the fields it wants.
+
+> [!question]- Easy: what is a resolver?
+> A server function that fetches the value of one field.
+
+> [!question]- Easy: what does `!` mean in `title: String!`?
+> The field is never null.
+
+> [!question]- Medium: a list of 20 posts each loads its author with a plain resolver. How many database queries?
+> 21 (1 + 20). A DataLoader brings it down to 2.
+
+> [!question]- Medium: why must a DataLoader be created per request?
+> Its cache would otherwise serve stale data, or one user's data to another user.
+
+> [!question]- Medium: a response is HTTP 200. Is everything fine?
+> Not necessarily; check the `errors` array, which can sit next to partial `data`.
 
 ## Links 🟢
 

@@ -53,6 +53,11 @@ flowchart TD
 > - 🟡 **Know the basics?** Add section 3 (first 5 minutes, steps and causes), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Production Debugging Playbook]]: check "what changed" and stop the damage before hunting the deep cause.
+> - [[Incident Response]]: one person leads, and you post short updates on a fixed schedule.
+> - [[Structured Logging]]: apps write log lines to files or stdout, and a log agent ships them away; log levels (DEBUG, INFO, ERROR) control how much is written.
+
 **From zero, in 60 seconds** 🟢
 
 Every server has a **disk** where it saves files: data, logs, temporary stuff.
@@ -99,6 +104,12 @@ Now the database cannot save orders, and the app crashes on every write.
 | Deleted but open file | A file removed from the folder but still held by a process, so space is not freed | `lsof +L1` lists them |
 | WAL | Write-ahead log: a database's journal of changes written before data files | PostgreSQL `pg_wal` directory |
 | Sampling / rate limiting logs | Keeping only some log lines | Log 1 in 100 identical errors |
+| ENOSPC | The Linux error code for "no space left on device" | `write: no space left on device` |
+| Mount | Attaching a disk to a folder path | the data disk mounted at `/var` |
+| PVC | PersistentVolumeClaim: a Kubernetes pod's request for a disk | `data-postgres-0`, 100 GB |
+| Replication slot | A Postgres bookmark that keeps WAL until a replica or reader has taken it | a dead replica's slot holding 80 GB |
+| Kubelet / DiskPressure | The Kubernetes agent on each node, and its "disk nearly full" warning | pods evicted at 10% free |
+| `predict_linear` | A PromQL function that extends the recent trend into the future | "full in 4 hours" |
 
 **Picture it**
 
@@ -136,8 +147,8 @@ Disk is the quietest resource. CPU and memory problems show up as slowness. A di
 **Symptoms:**
 
 - Errors such as `No space left on device` (ENOSPC), `write: no space left on device`, or `Disk quota exceeded`.
-- Database: Postgres cannot write WAL and shuts down with a PANIC; MySQL stops accepting writes; Redis returns `MISCONF` errors when it cannot persist.
-- Pods evicted with `The node was low on resource: ephemeral-storage`; the node reports `DiskPressure`.
+- Database: Postgres cannot write WAL and shuts down with a PANIC; MySQL stops accepting writes; Redis returns `MISCONF` errors when it cannot persist (save its data to disk).
+- Pods evicted (removed from the machine by Kubernetes) with `The node was low on resource: ephemeral-storage` (the node's local scratch disk); the node reports `DiskPressure`.
 - Application hangs on a log write, because a synchronous logger blocks when the disk is full or the pipe is slow.
 - Deploys fail: images cannot be pulled, new files cannot be created.
 - No new logs appear in your tooling, so you are blind exactly when you need them.
@@ -148,6 +159,14 @@ The 120 GB of free space is gone in roughly 29 hours, with no alert, because the
 
 > [!tip] Remember
 > The failure is sudden, but the cause is slow. A trend alert such as "full in 4 hours" turns an outage into a ticket.
+
+### Real-life example: a payment-reminder service 🟢
+
+Imagine a service that sends payment reminders for an app like Paytm.
+The SMS provider starts failing, and the service retries every message in a tight loop, writing a long error line each time.
+Overnight, the log file grows by about 9 GB an hour on the same disk as the database.
+At 2 a.m. the disk hits 100%, the database stops, and every page in the app that needs it breaks.
+Emptying the giant log file brings the database back in minutes; a trend alert would have warned four hours earlier.
 
 ## 2. Mental model 🟢
 
@@ -184,11 +203,21 @@ flowchart LR
 > [!tip] Remember
 > Disk is shared. Many unrelated things write to the same volume, so the biggest directory is not always the one that changed.
 
+## Common beginner mistakes 🟢
+
+- **Running `rm` on a log file the app still has open** → the name disappears but the space is not freed → use `truncate -s 0 file`, or restart the app.
+- **Deleting files in `pg_wal` by hand** → this can corrupt the database → free space elsewhere and fix the slot or archiving that holds WAL.
+- **Checking only `df -h`** → you can also run out of inodes (file slots) with space left → check `df -i` too.
+- **Alerting only at 90-95% full** → a fast flood fills the rest in minutes → add a trend alert like "full within 4 hours".
+- **Growing the volume and calling it fixed** → the flood fills the new space too → find and stop the source.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a full disk breaks things all at once, and that you free space safely first and stop the source second. **Next we open the box**: the first five minutes, the six steps from "which disk" to "is it really fixed", and the four usual causes (log floods, database WAL, Kafka, containers).
 
 ### The first 5 minutes
 
-1. **Confirm the problem and its blast radius.** Which host, volume or PVC? One pod, one node, or the whole fleet? Is the database affected? Check `df -h` and `df -i` on the affected host.
+1. **Confirm the problem and its blast radius** (how much is affected). Which host, volume or PVC? One pod, one node, or the whole fleet? Is the database affected? Check `df -h` and `df -i` on the affected host.
 2. **Check what changed.** A deploy that raised log verbosity, a new feature, a traffic spike, a stuck replica, a failing backup job, a log shipper that stopped, an expired retention policy.
 3. **Mitigate first.** Free 5 to 10 GB of safe space in seconds (see the table below). If the database is the critical writer, protect its volume first. Do not wait for root cause.
 4. **Communicate.** State the affected system, the headroom now, and the next update time. If writes already failed, warn about possible data loss windows.
@@ -197,6 +226,11 @@ flowchart LR
 ### Step 1: Confirm which resource is full
 
 **In plain words:** a disk can be "full" in two ways: out of space, or out of slots for new files. Check both.
+
+**Step by step:**
+1. Run `df -h` and find the line with `Use%` at or near 100%. Note its mount, say `/var`.
+2. Run `df -i` on the same host. `IUse%` at 100% means out of inodes even if space is left.
+3. If `df` says full but `du` adds up to much less, suspect deleted-but-open files (step 4).
 
 ```bash
 df -h
@@ -211,8 +245,8 @@ Two more cases that confuse people:
 | `df -h` says | Real meaning |
 | --- | --- |
 | 100% but `du` adds up to far less | Deleted-but-open files, or a mount hiding files under it |
-| Free space exists but non-root cannot write | ext4 reserves about 5% of blocks for root by default |
-| Plenty free but `ENOSPC` | Out of inodes, or a quota, or a full overlay/ephemeral layer |
+| Free space exists but non-root cannot write | ext4 (a common Linux filesystem) reserves about 5% of blocks for root by default |
+| Plenty free but `ENOSPC` | Out of inodes, or a quota, or a full overlay/ephemeral layer (a container's own temporary file layer) |
 
 ### Step 2: Free safe space fast (the mitigation)
 
@@ -222,14 +256,14 @@ Choose the first action that is safe for your host. Do these in order of safety.
 
 | Action | Command | Notes |
 | --- | --- | --- |
-| Vacuum the systemd journal | `journalctl --vacuum-size=500M` | Safe. `journalctl --disk-usage` first |
+| Vacuum the systemd journal (the system log store on most Linux hosts) | `journalctl --vacuum-size=500M` | Safe. `journalctl --disk-usage` first |
 | Delete old rotated logs | `rm /var/log/app/*.log.[2-9]*` or `find /var/log -name '*.gz' -mtime +7 -delete` | Check names first. Never `rm -rf /var/log` |
 | Empty a huge active log | `truncate -s 0 /var/log/app/app.log` | Frees space even if a process has the file open |
 | Force rotation | `logrotate -f /etc/logrotate.d/app` | Needs a valid config |
 | Clean package caches | `apt-get clean`, `yum clean all` | Small but safe |
 | Docker cleanup | `docker system df` then `docker system prune` | `prune -a` also removes unused images. Check first |
 | Remove core dumps and temp | `ls -lh /var/crash /tmp` then delete | Confirm nothing needed for the investigation |
-| Expand the volume | Cloud console, then `growpart` and `resize2fs` or `xfs_growfs` | Slower but safe. EBS volumes can be grown online |
+| Expand the volume | Cloud console, then `growpart` and `resize2fs` or `xfs_growfs` | Slower but safe. EBS volumes (AWS's network disks) can be grown online |
 
 > [!warning] Common mistake
 > Using `rm` on a log file that is still open. The name disappears, but the process keeps writing to the deleted inode and the space is not freed. Use `truncate -s 0 file` (or `: > file`) instead, or restart the process.
@@ -237,6 +271,11 @@ Choose the first action that is safe for your host. Do these in order of safety.
 ### Step 3: Find what is big
 
 **In plain words:** walk the folders and sort by size. The biggest one is usually the culprit.
+
+**Step by step:**
+1. Run `du -xh --max-depth=1 /var | sort -h`. Say `/var/log` is 148 GB.
+2. Go one level deeper: `du -xh --max-depth=1 /var/log | sort -h`.
+3. Repeat until you reach the file, for example `/var/log/notify/app.log` at 146 GB.
 
 ```bash
 sudo du -xh --max-depth=1 / 2>/dev/null | sort -h | tail -15
@@ -251,6 +290,12 @@ sudo find / -xdev -type f -size +500M -exec ls -lh {} \; 2>/dev/null
 ### Step 4: Find deleted-but-open files
 
 **In plain words:** if you delete a file an app still has open, the space is NOT freed until the app lets go of it.
+
+**Step by step:**
+1. Run `lsof +L1`: it lists files that are deleted but still open.
+2. Read the `SIZE/OFF` column: one line holding 40 GB explains a 40 GB gap between `df` and `du`.
+3. Note the process ID (PID) that holds it.
+4. Restart that process, or truncate the file through `/proc/<pid>/fd/<n>`.
 
 ```mermaid
 flowchart LR
@@ -278,6 +323,12 @@ This is the classic case where `df` says 100% and `du` shows 40%.
 
 **In plain words:** how fast is it filling? That tells you whether you have minutes or days.
 
+**Step by step:**
+1. Read free bytes now, wait 60 seconds, read again.
+2. The drop × 60 = bytes per hour. Say 9 GB per hour.
+3. Free space ÷ that rate = time left. 45 GB free ÷ 9 GB/hour = 5 hours.
+4. Make it an alert: `predict_linear` over 6 hours warns when the volume will be full within 4 hours.
+
 How fast is it growing and how long do you have?
 
 ```bash
@@ -286,7 +337,7 @@ df -PB1 /var | awk 'NR==2{print $4}'; sleep 60; df -PB1 /var | awk 'NR==2{print 
 
 The difference in available bytes over 60 seconds, times 60, is bytes per hour. This tells you whether you have 20 minutes or 20 hours.
 
-PromQL (node_exporter):
+PromQL (node_exporter, the standard Prometheus exporter for machine metrics):
 
 ```promql
 node_filesystem_avail_bytes{mountpoint="/var", fstype!~"tmpfs|overlay"}
@@ -313,6 +364,14 @@ kubelet_volume_stats_available_bytes / kubelet_volume_stats_capacity_bytes < 0.1
 
 ### The diagnosis flowchart
 
+**In plain words:** first decide space or inodes, then follow the biggest folder to its owner.
+
+**Step by step:**
+1. Out of inodes? Look for millions of tiny files.
+2. `df` and `du` disagree? Look for deleted-but-open files.
+3. Biggest folder is `/var/log`? Log flood (cause A).
+4. Biggest is the database's `pg_wal`? WAL growth (cause B). Kafka's data folder? Retention (cause C). `/var/lib/docker` or the kubelet folder? Containers (cause D).
+
 ```mermaid
 flowchart TD
     S["No space left on device"] --> Q1{"df -h shows 100%?"}
@@ -332,6 +391,12 @@ flowchart TD
 ### Cause A: Log flood
 
 **In plain words:** one app logs the same line over and over, usually an error in a loop.
+
+**Step by step:**
+1. List log files by size with `ls -lhS /var/log/...` and find the one growing fastest.
+2. Save a small sample (`tail -n 200`) before you truncate it.
+3. Count repeated messages with `sort | uniq -c` to find the line in a loop.
+4. Lower the log level or stop the loop, then add rotation and a size cap.
 
 **What it looks like:** one log file or one service grows far faster than normal. The same message repeats thousands of times.
 
@@ -387,7 +452,13 @@ Important: logrotate is not a daemon. It only checks sizes when it runs (normall
 
 **In plain words:** databases keep a change journal. If something stops it from being cleaned up, it grows without end.
 
-**Postgres.** WAL (write-ahead log) files in `pg_wal` are removed only when they are no longer needed by checkpoints, archiving, or replication slots. A stuck consumer makes WAL pile up.
+**Step by step:**
+1. Check how big `pg_wal` is.
+2. Query `pg_replication_slots`: an inactive slot with a large `retained_wal` is holding WAL for a dead reader.
+3. Query `pg_stat_archiver`: a rising `failed_count` means WAL can't be archived, so it is kept.
+4. Fix the reader or archiving, or drop the dead slot after confirming it is dead. Never delete WAL files by hand.
+
+**Postgres.** WAL (write-ahead log) files in `pg_wal` are removed only when they are no longer needed by checkpoints (moments when Postgres has written all changes to the data files), archiving, or replication slots. A stuck consumer makes WAL pile up.
 
 ```sql
 SELECT slot_name, active, restart_lsn,
@@ -408,7 +479,7 @@ SELECT archived_count, failed_count, last_failed_wal, last_failed_time FROM pg_s
 
 | You see | Meaning | Fix |
 | --- | --- | --- |
-| Inactive slot with a large `retained_wal` | A replica, CDC connector or consumer is down or lagging | Restore the consumer, or drop the slot: `SELECT pg_drop_replication_slot('slot_name');` after confirming it is dead |
+| Inactive slot with a large `retained_wal` | A replica, CDC connector (a tool that streams database changes to other systems) or consumer is down or lagging | Restore the consumer, or drop the slot: `SELECT pg_drop_replication_slot('slot_name');` after confirming it is dead |
 | `failed_count` rising in `pg_stat_archiver` | `archive_command` failing (bucket, permissions, full target) | Fix archiving; WAL is kept until archived |
 | Very old open transaction | Does not keep `pg_wal` files, but blocks vacuum so tables and indexes bloat (data files grow instead) | Find it in `pg_stat_activity` and end it |
 | Heavy write burst, or large `max_wal_size` / `wal_keep_size` | WAL is legitimately large, or kept on purpose for replicas | Compare against settings; the WAL shrinks after the next checkpoints |
@@ -418,9 +489,9 @@ Set `max_slot_wal_keep_size` (available since PostgreSQL 13) so a dead slot cann
 > [!warning] Common mistake
 > Deleting files in `pg_wal` by hand. This can corrupt the database and break recovery. Free space elsewhere, fix the cause (slot, archiving), and let Postgres remove WAL itself. If Postgres has already shut down after running out of space, free space on the volume and start it; it replays WAL and recovers.
 
-**MySQL:** old binary logs. Check `SHOW BINARY LOGS;`, then purge with `PURGE BINARY LOGS BEFORE 'YYYY-MM-DD hh:mm:ss';` after confirming replicas have read them.
+**MySQL:** old binary logs (binlogs, MySQL's change journal). Check `SHOW BINARY LOGS;`, then purge with `PURGE BINARY LOGS BEFORE 'YYYY-MM-DD hh:mm:ss';` after confirming replicas have read them.
 
-**Redis:** `MISCONF` errors mean it cannot write its RDB or AOF snapshot. Free disk, then writes resume. See [[Redis Persistence - RDB and AOF]].
+**Redis:** `MISCONF` errors mean it cannot write its RDB or AOF snapshot (Redis's two ways of saving data to disk). Free disk, then writes resume. See [[Redis Persistence - RDB and AOF]].
 
 ### Cause C: Kafka and other data stores
 
@@ -431,6 +502,11 @@ du -sh /var/lib/kafka/data/* | sort -h | tail
 kafka-log-dirs.sh --bootstrap-server broker:9092 --describe | head
 kafka-configs.sh --bootstrap-server broker:9092 --entity-type topics --entity-name orders --describe
 ```
+
+**Step by step:**
+1. Run `kafka-log-dirs.sh` (or `du`) to find the biggest topics on the broker.
+2. Check each big topic's `retention.ms` and `retention.bytes`; `-1` means "keep forever".
+3. If consumers don't need older data, shorten retention; Kafka deletes old segments (chunk files) shortly after.
 
 Kafka keeps data until `retention.ms` or `retention.bytes` is hit, per topic, and deletes whole segments only (`segment.bytes`), so the active segment is never deleted. If a topic has `retention.ms=-1` (infinite) or a huge value, disk grows without bound. Quick relief:
 
@@ -444,6 +520,12 @@ Only shorten retention if consumers do not need older data. See [[Kafka and Even
 ### Cause D: Containers and Kubernetes
 
 **In plain words:** old container images, container logs and temp folders pile up on each machine.
+
+**Step by step:**
+1. Check node conditions for `DiskPressure=True`.
+2. Run `docker system df` (or `crictl` on containerd) to see image and log sizes.
+3. Find the pod whose logs or temp files are huge.
+4. Set `ephemeral-storage` limits and Docker log `max-size` so one pod can't fill the node.
 
 ```bash
 docker system df
@@ -589,6 +671,9 @@ Every state before `Full` is cheap to fix. The aim of the alerts is to act in `G
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to find what filled the disk, free space safely, and fix each common cause. **Next is the advanced part**: the alerts and protective defaults real teams use, and the deeper "why" (df vs du, tiny writes failing, Postgres at 100%, blocking loggers).
+
+
 ### Alerts to have
 
 **In plain words:** alert early, at about 80% full, and on how fast it is filling, not only when it is already full.
@@ -610,7 +695,7 @@ Every state before `Full` is cheap to fix. The aim of the alerts is to act in `G
 - Resource limits: `ephemeral-storage` requests and limits on pods.
 - A runbook entry with the exact `du` and `lsof` commands and the safe cleanup list.
 - Disk headroom in capacity planning: see [[Performance Engineering and Capacity Planning]].
-- Test restore and PITR; disk-full incidents sometimes end in recovery from backup ([[Backup, PITR and Disaster Recovery]]).
+- Test restore and PITR (point-in-time recovery: restoring the database to any chosen moment); disk-full incidents sometimes end in recovery from backup ([[Backup, PITR and Disaster Recovery]]).
 
 ### After the fire: recovery checks
 
@@ -635,13 +720,13 @@ flowchart LR
 1. A file was unlinked but a process holds it open. The inode and blocks remain allocated until the last handle closes.
 2. Another filesystem is mounted over a directory that previously held files. The files still occupy space but are hidden. Unmount temporarily, or bind-mount the root filesystem to look underneath.
 3. Filesystem overhead and reserved blocks exist (ext4 reserves 5% for root by default; `tune2fs -m` changes it).
-4. Sparse files report a large apparent size but use few blocks (`du --apparent-size` vs `du`).
+4. Sparse files (files with big empty gaps that take no real space) report a large apparent size but use few blocks (`du --apparent-size` vs `du`).
 
 ### Why a full disk can break even a small write
 
 **In plain words:** at 100%, there is no room even for a tiny note, so services fail in strange ways.
 
-Creating a file or extending one needs a block and often a journal entry. At 100% there is none to give. Services that write PID files, lock files, sockets, session files or temp files fail in surprising ways. SSH can fail when it cannot write the login record or a temp file.
+Creating a file or extending one needs a block and often a journal entry. At 100% there is none to give. Services that write PID files (a file holding a process's ID), lock files, sockets, session files or temp files fail in surprising ways. SSH can fail when it cannot write the login record or a temp file.
 
 ### Postgres behaviour at 100%
 
@@ -690,6 +775,30 @@ Log bytes per second per service is a good anomaly signal. A sudden 10x jump usu
 - Alert on trend: `predict_linear(node_filesystem_avail_bytes[6h], 4*3600) < 0`.
 - Separate volumes for data and logs; cap every log; set pod ephemeral-storage limits.
 - Fix the source (retry loop, log level, retention), not just the space.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What are the two ways a disk can be "full"?
+> Out of space (`df -h`) or out of inodes, the slots for new files (`df -i`).
+
+> [!question]- How do you empty a huge log file the app still has open?
+> `truncate -s 0 file`, not `rm`.
+
+> [!question]- What do you do first: free space or find the cause?
+> Free a safe amount of space first, then find and stop the source.
+
+🟡 Medium
+
+> [!question]- `df` says 100% but `du` adds up to 40%. Why?
+> Deleted files are still held open by a process; find them with `lsof +L1`.
+
+> [!question]- `pg_wal` is huge. What do you check?
+> `pg_replication_slots` for an inactive slot and `pg_stat_archiver` for failing archiving.
+
+> [!question]- 30 GB free, filling at 6 GB an hour. How long do you have?
+> About 5 hours.
 
 ## Links
 

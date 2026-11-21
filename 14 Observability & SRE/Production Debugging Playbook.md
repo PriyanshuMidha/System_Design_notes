@@ -40,6 +40,11 @@ Each step narrows scope by roughly an order of magnitude: metrics narrow "someth
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Observability Fundamentals]]: metrics show trends, traces show where one request's time went, logs show exact events, and a shared `trace_id` links them.
+> - [[Metrics and Prometheus]]: you can graph request rate, error rate and p99 latency per route.
+> - [[Distributed Tracing with OpenTelemetry]]: a trace waterfall shows each step (span) of one request as a timed bar.
+
 **From zero, in 60 seconds** 🟢
 
 Something is broken in production. The worst move is to open the logs and start reading at random.
@@ -83,6 +88,12 @@ Following it gets you to the cause faster than guessing.
 | Hypothesis | A guess you write down and then test | "The new index made writes slow" |
 | Mitigate | Stop user pain before full understanding | Roll back, or turn off a feature flag |
 | Deploy / feature flag | Shipping code / switching behaviour without shipping | Flag `new_pricing=on` at 01:50 |
+| p50 / p99 | The time half of requests beat / the time 99 in 100 beat | p50 40 ms, p99 2.1 s |
+| Connection pool | The fixed set of open database connections an app shares | 20 connections, all busy |
+| Rollback | Going back to the previous version that worked | undo the 01:50 deploy |
+| Retry storm | Clients retrying failed calls so fast that they overload the service more | one blip turns into 10× traffic |
+| Consumer lag | How far a queue reader is behind the newest message | 50,000 messages behind |
+| Poison message | One message that always fails and blocks the ones behind it | a malformed order event |
 
 **Picture it**
 
@@ -110,13 +121,23 @@ Where it breaks: a patient can describe symptoms; a service can't, so you rely o
 
 ## 1. Why it exists 🟢
 
+🟢 **Plain version:** At 2 a.m. one page suddenly gets slow for some users. Instead of reading code, the engineer checks graphs: only the slowest requests are slow, the error count is normal, and traffic is normal. Splitting by server shows all the slow requests come from one server. A trace from it shows the time is spent waiting for a free database connection, and that server's pool is full. Restarting that one server fixes it in 30 seconds.
+
+
 At 02:14, InvoiceOps's p99 latency on `GET /invoices/:id` jumps from 180 ms to 2.1 s. p50 stays flat at 40 ms. Without a method, the natural instinct is to open the slowest-looking code path and start reading — which, on a 40,000-line service, is a search with no stopping condition.
 
 With the playbook: metrics show p99 up but p50 and error rate flat, and request volume unchanged — so it is **not** a traffic spike and **not** every request, which rules out "capacity" and "a bad deploy affecting everyone" in under a minute.
 
-Scoping by cohort shows the slow requests cluster on one Kubernetes pod. A trace from that pod shows 1.9 s of the 2.1 s sitting in a single span: `db.pool.acquire`. `sql.DBStats` on that pod shows `WaitCount` climbing and `MaxOpenConns` maxed out.
+Scoping by cohort shows the slow requests cluster on one Kubernetes pod (one running copy of the service). A trace from that pod shows 1.9 s of the 2.1 s sitting in a single span: `db.pool.acquire` (waiting to borrow a database connection). `sql.DBStats` on that pod shows `WaitCount` climbing and `MaxOpenConns` maxed out.
 
 One pod's connection pool is exhausted — probably by a long-running query or a connection leak specific to that pod's recent restart — not a database-wide problem. The mitigation (restart the pod, which resets its pool) takes thirty seconds; finding that same fact by reading code would have taken much longer, if it was found at all.
+
+### Real-life example: slow UPI payments in one city 🟢
+
+Imagine a payments app like PhonePe where payments suddenly feel slow.
+The on-call engineer first checks "what changed": no deploy, but a new rate-limit config went out 10 minutes ago.
+Splitting traffic by city shows only Mumbai users are slow, and a trace shows time stuck in calls to one bank's gateway.
+Turning the config back off fixes it within a minute, and only then does the team dig into why that config hurt one bank.
 
 ## 2. Mental model 🟢
 
@@ -124,11 +145,38 @@ Debugging in production is **the scientific method under time pressure**: form a
 
 The funnel in the whiteboard version encodes a cost ordering: a metrics query answers in milliseconds over already-aggregated data; a trace lookup answers in seconds over one request; grepping logs across a fleet can take minutes. Always spend the cheap step first, because it usually tells you exactly where to spend the next, more expensive one.
 
+## Common beginner mistakes 🟢
+
+- **Opening the logs first** → millions of lines and no idea where to look → start with metrics, then a trace, then only that request's logs.
+- **Skipping "what changed?"** → you debug code for an hour when a config flip caused it → check deploys, flags, config and cron runs first.
+- **Not splitting by group** → a problem on one pod looks like "the whole service is slow" → compare by pod, region, endpoint and customer.
+- **Chasing the root cause while users suffer** → the outage lasts longer → roll back or flip the flag first, then investigate calmly.
+- **Trusting "last time it was the database"** → a past pattern can be wrong this time → write the guess down and check it against today's evidence.
+
+### Debugging locally vs in production 🟡
+
+| | On your laptop | In production |
+| --- | --- | --- |
+| Can you pause it with a debugger? | Yes | No, real users are on it |
+| Main evidence | Breakpoints, print statements | Metrics, traces, logs already being recorded |
+| First goal | Understand the bug | Stop user pain, then understand |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the fixed order: how bad, what changed, who is affected, then metrics, traces, logs, and mitigate first. **Next we open the box**: each step in detail, the graph shapes that point to common causes, a catalogue of quiet culprits, and how queues fail differently.
 
 ### Step 1: Impact and severity
 
-Before anything else: how many users, which operation, and is data being lost? This decides whether you are debugging calmly or triggering [[Incident Response]] first. A 2 s p99 on a read endpoint and a payment webhook silently dropping events are both "slow," but only one needs a kill switch flipped in the next sixty seconds.
+**In plain words:** first decide how bad it is, because that decides whether to call in the full incident process.
+
+**Step by step:**
+1. How many users? Say 1 in 100 requests on one page.
+2. Which operation? A read page, or payments?
+3. Is data being lost or corrupted? If yes, it is urgent no matter how few users.
+4. Big or data-losing → start [[Incident Response]] now. Small → keep debugging calmly.
+
+
+Before anything else: how many users, which operation, and is data being lost? This decides whether you are debugging calmly or triggering [[Incident Response]] first. A 2 s p99 on a read endpoint and a payment webhook silently dropping events are both "slow," but only one needs a kill switch (an on/off setting that turns a feature off without a deploy) flipped in the next sixty seconds.
 
 ### Step 2: What changed?
 
@@ -139,7 +187,7 @@ In order of how often each one is the actual cause:
 1. **Deploy** — a new build of this service or one it calls.
 2. **Feature flag** — a flag flipped, even one that looks unrelated to the symptom.
 3. **Config** — a timeout, pool size, or retry setting changed.
-4. **Data** — a backfill, migration, or a new large customer's data shape.
+4. **Data** — a backfill (a job that fills in or rewrites old data), migration, or a new large customer's data shape.
 5. **Dependency** — a downstream service's own deploy or degradation.
 6. **Cron** — a scheduled job that just ran (backups, reports, reindexing) competing for the same resources.
 7. **Traffic** — a genuine spike, bot traffic, or a retry storm from a client.
@@ -149,6 +197,13 @@ A changefeed that lists all of these on one timeline (see the Go example below) 
 ### Step 3: Scope by cohort
 
 **In plain words:** split traffic into groups (region, endpoint, version) and see which group is broken. The difference points at the cause.
+
+**Step by step:**
+1. Split the slow requests by pod: are they all on one pod? Here, yes: pod 7.
+2. If not, split by region or AZ (availability zone, one data centre in a region), then by tenant (customer), then by app version.
+3. One pod only → look at that pod's own state (its pool, memory, local cache).
+4. One tenant only → look at that tenant's data or a hot key (one key everyone hits).
+5. Everyone everywhere → look at a shared dependency or a recent global change.
 
 Compare a cohort that is failing against one that is not, varying one dimension at a time: endpoint, region/AZ, tenant, client version, pod, or client type. "Everyone, everywhere, right now" points at a global dependency or deploy.
 
@@ -175,7 +230,13 @@ flowchart TD
 
 **In plain words:** use graphs to find where, traces to find which step, and logs to find exactly why.
 
-- **Metrics** answer "which RED signal, for which route, since when" (see [[Metrics and Prometheus]]). This is where you learn p99-only-not-p50, or 5xx-only-from-one-pod, or 429s rising on calls to one dependency.
+**Step by step:**
+1. Metrics: p99 on `GET /invoices/:id` jumped at 02:14 on pod 7; errors are flat.
+2. Traces: open one slow request from pod 7. The `db.pool.acquire` span takes 1.9 s of 2.1 s.
+3. Logs: search only that request's `trace_id` for the exact error or warning.
+4. Each step is slower and more detailed, so do them in this order.
+
+- **Metrics** answer "which RED signal, for which route, since when" (see [[Metrics and Prometheus]]). This is where you learn p99-only-not-p50, or 5xx-only-from-one-pod, or 429s ("too many requests", the dependency is rate-limiting you) rising on calls to one dependency.
 - **Traces** answer "which span, on an actual slow or erroring request" (see [[Distributed Tracing with OpenTelemetry]]). Read the waterfall for the critical path: a gap between spans with no span covering it is time lost to queueing, scheduling, or GC, not to any instrumented code.
 - **Logs** answer "what exact error, for which request ID, with what payload shape" (see [[Structured Logging]]) — the most expensive signal to search, so it is read last, once traces have already pointed at the suspect component.
 
@@ -183,15 +244,28 @@ flowchart TD
 
 **In plain words:** pick the cheapest fix that stops user pain now. Find the true cause once things are calm.
 
+**Step by step:**
+1. Is there a feature flag for the new thing? Turn it off.
+2. Was there a recent deploy? Roll it back.
+3. Is one replica or region bad? Fail over to a healthy one.
+4. Is it plain overload? Add servers, or shed (reject) low-priority work.
+5. Once stable, hand the "why" to the postmortem.
+
 Pick the cheapest mitigation that removes user impact, in roughly this order of cost: feature flag off, rollback, failover to a healthy replica/region, scale out, shed low-priority load, block one abusive client. Root cause and prevention become the postmortem's job once the system is stable (see [[Postmortems and Root Cause Analysis]]).
 
 ### Symptom patterns worth recognizing on sight
 
 **In plain words:** some graph shapes are almost signatures. Learn them and you skip half the search.
 
+**Step by step:**
+1. Look at p50 and p99 together. Only p99 up? Some requests are slow, not all.
+2. Look at errors by pod. Errors from just one pod? That pod is sick.
+3. Look across services. Timeouts in many at once? Find the one slow dependency underneath.
+4. Look at the time shape. Slow rise over hours with no deploy? Think "something filling up".
+
 | Pattern | Usual cause |
 | ------- | ----------- |
-| p99 up, p50 flat, errors flat | Tail-only issue: one bad node/pod, GC pauses, a hot partition, pool exhaustion for a minority of requests |
+| p99 up, p50 flat, errors flat | Tail-only issue: one bad node/pod, GC pauses (Go's garbage collector briefly slowing the program), a hot partition (one data shard getting most of the traffic), pool exhaustion for a minority of requests |
 | 5xx from exactly one pod | That pod's local state: leaked connections, a stuck goroutine, a bad local cache entry, disk full on that node |
 | Cascading timeouts across several services | One slow dependency with no timeout budget, backing up every caller above it |
 | 429s or 5xxs from one dependency only | That dependency is overloaded, rate-limiting you, or itself mid-incident |
@@ -202,17 +276,26 @@ Pick the cheapest mitigation that removes user impact, in roughly this order of 
 **In plain words:** when nobody deployed anything, look at things that fill up slowly: pools, disks, certificates, memory.
 
 - **Connection pool exhaustion** — `sql.DBStats.WaitCount` climbing; see [[Debugging Database Performance]] and [[Connection Pooling]].
-- **DNS** — a resolver cache expiring, or a DNS-based failover not propagating; check with `dig` (see [[Network Debugging Toolkit - dig, curl, ss, tcpdump]]).
+- **DNS** — a resolver cache (the saved name-to-address answers) expiring, or a DNS-based failover not propagating; check with `dig` (see [[Network Debugging Toolkit - dig, curl, ss, tcpdump]]).
 - **TLS certificate expiry** — a silent cutover failure at a fixed, predictable time, easy to miss because nothing "changed" in your own deploys.
 - **Clock skew** — breaks anything comparing timestamps across hosts: TTL checks, idempotency windows, token expiry.
-- **Disk full** — the write path for logs, WAL, or temp files fails, often with a confusing downstream error far from the real cause.
+- **Disk full** — the write path for logs, WAL (a database's write-ahead log file), or temp files fails, often with a confusing downstream error far from the real cause.
 - **Noisy neighbour** — another workload on the same node or shared database saturating CPU, memory bandwidth, or disk I/O.
 - **Retry storm** — a client's own retries, with no backoff or circuit breaker, amplify a transient blip into sustained overload.
 - **Cache stampede** — many requests miss the same cache key at once (on expiry or after a restart) and hit the backing store simultaneously.
 
 ### Debugging async work
 
-Queues and background workers fail in their own characteristic ways, invisible to request-path metrics: **consumer lag** (the gap between produced and consumed offsets growing), a **poison message** stuck retrying forever and blocking everything behind it on an ordered partition, a **dead-letter queue (DLQ)** silently filling, and **consumer group rebalances** causing brief processing pauses whenever a worker joins or leaves.
+**In plain words:** queues fail quietly: work piles up, one bad message blocks the rest, or failed messages pile up on the side.
+
+**Step by step:**
+1. Check consumer lag: is the reader falling further behind each minute?
+2. Check for one message retrying again and again; on an ordered partition it blocks all messages behind it.
+3. Check the dead-letter queue: is it growing?
+4. Check for rebalances: each time a worker joins or leaves the group, processing pauses briefly.
+
+
+Queues and background workers fail in their own characteristic ways, invisible to request-path metrics: **consumer lag** (the gap between produced and consumed offsets growing; an offset is a message's position number in the queue), a **poison message** stuck retrying forever and blocking everything behind it on an ordered partition, a **dead-letter queue (DLQ)** silently filling, and **consumer group rebalances** causing brief processing pauses whenever a worker joins or leaves.
 
 ### Tool cheat-sheet
 
@@ -248,9 +331,11 @@ func recentChanges(all []Change, since time.Time) []Change {
 }
 ```
 
-The full version below bounds memory with a ring buffer (a production service cannot keep every change forever) and is safe for concurrent writers (deploy hooks, flag-service webhooks, and cron wrappers all append from different goroutines).
+The full version below bounds memory with a ring buffer (a fixed-size list that overwrites the oldest entry when full; a production service cannot keep every change forever) and is safe for concurrent writers (deploy hooks, flag-service webhooks, and cron wrappers all append from different goroutines).
 
 A bounded, concurrency-safe change feed, used in step 2 of the playbook. Compiles and passes `go vet` and `go test -race` on Go 1.24.
+
+**What this code does, in plain words:** `Record` adds one change (deploy, flag, config, cron) with the current time; when the list is full it overwrites the oldest. `Since` returns every change after a given time, oldest first. A mutex (lock) makes it safe when many goroutines record at once.
 
 ```go
 package debugging
@@ -404,7 +489,10 @@ Twenty connections, all in use, 1,842 goroutines having queued for one at some p
 
 ## 7. In production 🔴
 
-- **Real systems:** this funnel (narrow by metric, confirm by trace, nail down by log) is the backbone of how Google's SRE practice describes effective troubleshooting, and matches how most APM vendors (Datadog, Honeycomb, Grafana) structure their own investigation UIs — metrics dashboard first, trace waterfall next, log search last.
+> 🟡 → 🔴 **You now know** each playbook step, the graph shapes worth recognising, the quiet culprits, and how to read a real incident's numbers. **Next is the advanced part**: how real teams build this into their tools, what makes the method fail, what to measure about your own debugging, and why the order of steps matters so much.
+
+
+- **Real systems:** this funnel (narrow by metric, confirm by trace, nail down by log) is the backbone of how Google's SRE practice describes effective troubleshooting, and matches how most APM vendors (application performance monitoring tools: Datadog, Honeycomb, Grafana) structure their own investigation UIs — metrics dashboard first, trace waterfall next, log search last.
 - **Failure modes → fixes:**
   - No shared ID between logs/metrics/traces → instrument the trace ID into every log line and as a metric exemplar (see [[Observability Fundamentals]]) before the next incident, not during it.
   - Cohort scoping is impossible because labels are too coarse → add route-template, pod, and tenant-tier labels (never raw tenant ID) to the relevant metrics ahead of time.
@@ -454,6 +542,30 @@ That gap is time spent somewhere the SDK did not see: scheduler queueing, GC, a 
 - Mitigate with the cheapest reversible action; root cause is the postmortem's job.
 - Async failures need their own signals: consumer lag, poison messages, DLQ growth, rebalance churn.
 - Keep a hypothesis written down and falsifiable — discard it the moment evidence contradicts it.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is the first question after "how bad is it?"
+> "What changed?": deploys, flags, config, cron jobs, data changes.
+
+> [!question]- In what order do you read the three signals?
+> Metrics, then traces, then logs.
+
+> [!question]- What comes first: mitigation or root cause?
+> Mitigation, with the cheapest reversible action.
+
+🟡 Medium
+
+> [!question]- p99 is up, p50 and errors are flat. What kind of cause is likely?
+> A tail cause: one bad pod, GC pauses, a hot partition or a full pool for some requests.
+
+> [!question]- 5xx errors come from exactly one pod. Where do you look?
+> That pod's own state: leaked connections, a stuck goroutine, a bad local cache, or a full disk on its node.
+
+> [!question]- A trace shows a 400 ms gap with no span. What does it usually mean?
+> Time lost to waiting the code did not measure: queueing, GC, scheduling or a pool wait.
 
 ## Links
 

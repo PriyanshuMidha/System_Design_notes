@@ -36,6 +36,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 5 (cousins like HyperLogLog and Count-Min Sketch) and 6 (when not to use).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Hash Tables and Go Maps]]: a hash function turns any key into a number, and the same key always gives the same number.
+> - [[Back-of-the-Envelope Estimation]]: how to turn "1 billion items" into bytes and gigabytes with rough maths.
+
 **From zero, in 60 seconds** 🟢
 
 You often need to ask "have I seen this before?" about millions of things.
@@ -76,6 +80,11 @@ A Bloom filter is a small memory-only check that says "definitely free" for most
 | Cardinality | How many distinct items there are | 3 distinct users in `a, b, a, c` |
 | Probabilistic | Gives an answer with a small, known chance of error | "Right 99% of the time" |
 
+| Database index lookup | The database searching its sorted lookup structure for one key | "find user 'alice'" costs a disk read |
+| SSTable | A sorted, never-changed data file written by some databases (LSM stores) | RocksDB keeps thousands of these files |
+| Fingerprint | A short piece of a hash used as a tiny stand-in for the item | 8 bits taken from `hash("alice")` |
+| Sketch | A small summary structure that answers a question roughly | Count-Min Sketch estimates "how many times?" |
+
 **Picture it**
 
 ```mermaid
@@ -105,12 +114,36 @@ Where it breaks: a real guest list can cross a name off; a basic Bloom filter ca
 A signup form checks "is this username taken?" on every keystroke. There are 1 billion usernames averaging 12 bytes. Some options:
 
 - **Ask the database every time.** Most usernames people type are *not* taken, so most queries do an index lookup only to find nothing. At 20,000 checks per second this is pure wasted load.
-- **Keep all usernames in a hash set in memory.** 1 billion × (12 bytes of text + string header and hash-table overhead, roughly 40 bytes or more) ≈ **50 GB or more** (an estimate). Too big for one app server.
+- **Keep all usernames in a hash set (a structure that stores every item for instant exact lookup, like a Go map) in memory.** 1 billion × (12 bytes of text + string header and hash-table overhead, roughly 40 bytes or more) ≈ **50 GB or more** (an estimate). Too big for one app server.
 - **Keep a Bloom filter in memory.** At a 1% false-positive rate it needs 9.585 bits per name: 1,000,000,000 × 9.585 bits = 9.585 × 10^9 bits ÷ 8 = **1.2 GB** (1.12 GiB).
 
   If the filter says "definitely not taken", answer immediately. If it says "probably taken", check the database. Now 99% of the "free" names never touch the database.
 
 The same pattern appears all over backend systems: skip a disk read for a key that is not in this file, skip a cache-miss query for an ID that does not exist, skip a URL the crawler has already fetched.
+
+### Real-life example: picking a username 🟢
+
+Think of choosing a username on a big app like Instagram, where you type and it instantly says "available" or "taken".
+A site of that size could keep a Bloom filter of all taken names in memory (this shows the pattern, not a claim about Instagram's code).
+You type "priya_99". If the filter says "definitely not taken", the app shows "available" without touching the database.
+If the filter says "maybe taken", the app asks the database to be sure, because the filter can be wrong in that direction.
+Since most names people try are free, most checks never reach the database.
+
+```mermaid
+flowchart LR
+    T["type 'priya_99'"] --> F{"filter"}
+    F -- "definitely not" --> OK["show 'available'"]
+    F -- "maybe" --> DB["check the database"]
+    DB --> R["show the true answer"]
+```
+
+## Common beginner mistakes 🟢
+
+- **Trusting a "yes"** → a "yes" can be a false positive, so you would reject a free username → treat "yes" as "go check the database".
+- **Trying to delete from a plain Bloom filter** → turning a bit off may erase other items that share it, causing wrong "no" answers → use a counting Bloom or cuckoo filter, or rebuild.
+- **Using it for a small set** → 100,000 items fit easily in a normal map with zero error → use a Bloom filter only when the set is too big for memory.
+- **Not planning the item count** → at 2× the planned items, 1% errors become about 16% → size for the peak count and watch how full it is.
+- **Changing the hash between writer and reader** → every answer becomes wrong → save the hash name and seed with the filter.
 
 ## 2. Mental model 🟢
 
@@ -131,7 +164,16 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** what a Bloom filter answers and why its "no" is always right. **Next we open the box**: how hashes pick bits, how many bits you must buy for a given error rate, and what happens if you overfill it. Each subsection starts with a plain step-by-step walk.
+
 ### Add and query
+
+**Step by step:**
+1. Start with 16 switches (bits), all off.
+2. Add "alice": three hash functions give positions 3, 9 and 14. Turn those three on.
+3. Check "bob": his hashes give 3, 7 and 14. Switch 7 is off, so bob was never added. Answer "no" right away.
+4. Check "carol": her hashes give 3, 9 and 14. All on, so answer "maybe", even though only alice turned them on. That is a false positive.
+5. On "maybe", go and ask the real store to confirm.
 
 ```mermaid
 flowchart LR
@@ -164,6 +206,15 @@ The steps:
 
 **In plain words:** more items or fewer bits means more wrong "yes" answers. These formulas just tell you how many bits to buy for the error rate you want. About 10 bits per item gives roughly 1 wrong "yes" in 100.
 
+**Step by step:**
+1. Decide how many items: say 1 million usernames.
+2. Decide how often a wrong "yes" is OK: say 1 in 100 (1%).
+3. Look up the bits per item for 1%: about 10 (9.59 exactly).
+4. Multiply: 1 million × 10 bits = 10 million bits ≈ 1.2 MB.
+5. Use about 7 hash functions, the best number for 1%.
+
+In the formulas, `e` (about 2.718) and `ln` (the natural logarithm) are standard maths constants; you only need the final table.
+
 With `n` items added, `m` bits and `k` hash functions:
 
 - The chance that one particular bit is still 0 after all inserts is about `e^(−kn/m)`.
@@ -186,6 +237,13 @@ At the optimal `k`, about half the bits end up set. That fill ratio is a useful 
 
 **In plain words:** a filter is sized for a fixed number of items. Overfill it and almost every switch is on, so it starts saying "yes" to everything.
 
+**Step by step:**
+1. You build a filter for 1 million items at 1% error.
+2. At 1 million items, about half the bits are on, and 1 in 100 checks is a false "yes".
+3. You keep adding: at 2 million items, most bits are on, and about 16 in 100 checks are a false "yes".
+4. At 3 million, nearly half of all "no" items get a "maybe". The filter has almost stopped saving work.
+5. Fix: rebuild a bigger filter, or chain a second one.
+
 Sized for `n` at 1% (9.585 bits per item, k = 7), then filled past `n`:
 
 | Items actually added | False-positive rate |
@@ -201,7 +259,7 @@ Sized for `n` at 1% (9.585 bits per item, k = 7), then filled past `n`:
 
 ### Whiteboard version
 
-The bare idea, with `k` hash functions made by seeding FNV-1a with a different byte each time:
+The bare idea, with `k` hash functions made by seeding FNV-1a (a simple, fast, standard hash function) with a different byte each time:
 
 ```go
 package wb
@@ -307,13 +365,23 @@ func (f *Filter) Params() (m, k uint64) { return f.m, f.k }
 
 **In plain words:** a small grid of counters that answers "how many times did I see X?". It can count too high, never too low.
 
+```mermaid
+flowchart LR
+    X["add 'cricket'"] --> R1["row 1: counter 5 +1"]
+    X --> R2["row 2: counter 2 +1"]
+    X --> R3["row 3: counter 9 +1"]
+    R1 --> M["estimate = smallest of the rows"]
+    R2 --> M
+    R3 --> M
+```
+
 A Count-Min Sketch is a `d × w` grid of counters. Each row has its own hash.
 
 **Add** increments one counter per row; **Estimate** returns the smallest of those `d` counters.
 
 Collisions only ever add to a counter, so the estimate is never below the truth, and taking the minimum picks the row with the fewest collisions.
 
-With `w = ⌈e/ε⌉` and `d = ⌈ln(1/δ)⌉`, the overcount is at most `ε × N` (N = total of all counts) with probability at least `1 − δ`.
+With `w = ⌈e/ε⌉` and `d = ⌈ln(1/δ)⌉`, the overcount is at most `ε × N` (N = total of all counts) with probability at least `1 − δ`. Here `ε` (epsilon) is the error you allow, such as 0.001, and `δ` (delta) is the small chance you exceed it, such as 0.01.
 
 ```go
 package bloom
@@ -463,12 +531,12 @@ How the two non-membership structures work:
 
 - **HyperLogLog** hashes each item and looks at the number of leading zeros. Seeing a hash that starts with 20 zero bits is a 1-in-2^20 event, so it suggests about a million distinct items have passed.
 
-  To smooth out luck, it splits items into many buckets (registers) by the first bits of the hash, keeps the maximum leading-zero count per register, and combines them with a harmonic mean.
+  To smooth out luck, it splits items into many buckets (registers) by the first bits of the hash, keeps the maximum leading-zero count per register, and combines them with a harmonic mean (a kind of average that is not thrown off by a few very large values).
 
   Redis uses 16,384 registers of 6 bits each: 16,384 × 6 ÷ 8 = **12,288 bytes (12 KB)**, with a standard error of 1.04 / √16,384 = **0.81%**.
 
   `PFMERGE` combines HLLs by taking the maximum per register, so you can count daily uniques per server and merge them.
-- **Cuckoo filter** stores a short fingerprint of each item in one of two possible buckets. To delete, remove the fingerprint. Inserts can fail when the table is nearly full, so size it with headroom.
+- **Cuckoo filter** (named after the cuckoo bird, which pushes other eggs out of the nest: a new item can push an old one to its other bucket) stores a short fingerprint of each item in one of two possible buckets. To delete, remove the fingerprint. Inserts can fail when the table is nearly full, so size it with headroom.
 
 ```mermaid
 flowchart LR
@@ -501,12 +569,14 @@ flowchart TD
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to size a Bloom filter, build one in Go, and pick between it and its cousins. **Next is the advanced part**: where real databases and caches use these structures, how they fail in production, and the maths and CPU tricks behind them.
+
 - **Real systems:**
-	- **LSM-tree databases** keep a Bloom filter per SSTable file, so a read for a key skips every file that does not contain it (see [[Storage Engines - B-tree vs LSM and WAL]]). RocksDB's filters are commonly configured at about 10 bits per key, which gives roughly a 1% false-positive rate. Cassandra exposes the target as the table option `bloom_filter_fp_chance`.
-	- **Redis** has HyperLogLog built in (`PFADD`, `PFCOUNT`, `PFMERGE`). Bloom and cuckoo filters (`BF.RESERVE`, `BF.ADD`, `BF.EXISTS`, `CF.*`) come from the RedisBloom module, which ships with Redis Stack and with Redis 8.
-	- **Akamai** used Bloom filters to avoid caching "one-hit wonders" (objects requested only once): an object is cached only on its second request, saving disk space and writes on its edge servers (Maggs and Sitaraman, 2015).
-	- **Cache penetration defence:** put a Bloom filter of all valid IDs in front of the cache, so requests for IDs that do not exist are rejected without a database query (see [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]).
-	- **Heavy hitters:** a Count-Min Sketch plus a small min-heap of the current top K tracks the most frequent items in a stream (see [[Case Study - Leaderboard and Top-K]]).
+	- **LSM-tree databases** (log-structured merge trees: databases such as RocksDB and Cassandra that write data in sorted files and merge them in the background) keep a Bloom filter per SSTable file, so a read for a key skips every file that does not contain it (see [[Storage Engines - B-tree vs LSM and WAL]]). RocksDB's filters are commonly configured at about 10 bits per key, which gives roughly a 1% false-positive rate. Cassandra exposes the target as the table option `bloom_filter_fp_chance`.
+	- **Redis** has HyperLogLog built in (`PFADD`, `PFCOUNT`, `PFMERGE`). Bloom and cuckoo filters (`BF.RESERVE`, `BF.ADD`, `BF.EXISTS`, `CF.*`) come from the RedisBloom module (an add-on that gives Redis extra commands), which ships with Redis Stack and with Redis 8.
+	- **Akamai** used Bloom filters to avoid caching "one-hit wonders" (objects requested only once): an object is cached only on its second request, saving disk space and writes on its edge servers (servers placed close to users around the world) (Maggs and Sitaraman, 2015).
+	- **Cache penetration defence** (cache penetration means many requests for keys that exist nowhere, so every one misses the cache and hits the database): put a Bloom filter of all valid IDs in front of the cache, so requests for IDs that do not exist are rejected without a database query (see [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]]).
+	- **Heavy hitters** (the few items that appear most often): a Count-Min Sketch plus a small min-heap (a structure that always keeps the smallest value on top, so it is cheap to drop) of the current top K tracks the most frequent items in a stream (see [[Case Study - Leaderboard and Top-K]]).
 - **Failure modes and fixes:**
 	- *The filter fills past its design size* and false positives soar → monitor the fill ratio and rebuild at a larger size, or use a scalable filter.
 	- *A filter built from stale data* says "definitely not" for an item added after the build → that is a **false negative** from the system's point of view. Add new items to the filter in the same code path that writes them, or rebuild on a schedule and fall back to the database for recent items.
@@ -532,7 +602,7 @@ Minimising over `k` gives `k = (m/n) ln 2`, at which point exactly half the bits
 
 A query with k = 7 touches 7 random bits spread over a large array, so for a 1 GB filter it can cause up to 7 cache misses.
 
-A **blocked Bloom filter** first hashes the item to one 64-byte block (one CPU cache line) and puts all `k` bits inside it, so each query costs one cache miss.
+A **blocked Bloom filter** first hashes the item to one 64-byte block (one CPU cache line: the chunk of memory the CPU fetches in one go; a "cache miss" means it had to wait for main memory) and puts all `k` bits inside it, so each query costs one cache miss.
 
 The price is a slightly higher false-positive rate for the same memory, because blocks fill unevenly. RocksDB's newer filter formats use this idea.
 
@@ -596,6 +666,26 @@ Redis also stores small HLLs in a compact **sparse** encoding and converts to th
 - Cuckoo or counting Bloom when you need deletes.
 - HyperLogLog: distinct counts, Redis `PFADD`/`PFCOUNT`/`PFMERGE`, 12 KB, 0.81% error.
 - Count-Min Sketch: frequencies that only overcount; `w = e/ε`, `d = ln(1/δ)`; with a heap for top-K.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: a Bloom filter says "no". Can it be wrong?
+> No. "No" is always right; only "yes" can be wrong.
+
+> [!question]- Easy: what is a false positive?
+> The filter says "probably yes" for an item that was never added.
+
+> [!question]- Easy: why can't you delete from a plain Bloom filter?
+> Its bits may be shared with other items, so turning them off could make those items look absent.
+
+> [!question]- Medium: how much memory for 100 million items at 1%?
+> About 10 bits each: 100 M × 9.59 bits ≈ 959 M bits ≈ 120 MB, with 7 hashes.
+
+> [!question]- Medium: you need to count unique visitors per day across many servers. Which structure?
+> HyperLogLog: 12 KB per key in Redis, about 0.81% error, and per-server counts merge with `PFMERGE`.
+
+> [!question]- Medium: a filter sized for 1 M items now holds 2 M. What happens?
+> The false-positive rate jumps from 1% to about 16%, so many more lookups go to the database. Rebuild it bigger.
 
 ## Links
 

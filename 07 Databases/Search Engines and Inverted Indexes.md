@@ -38,6 +38,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5 (variants).
 > - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Indexing Fundamentals]]: an index is a prepared lookup structure that saves reading the whole table.
+> - [[Index Types and Index Design]]: a normal B-tree index finds exact values and prefixes (`'abc%'`), but not words in the middle of text.
+> - [[Storage Engines - B-tree vs LSM and WAL]]: some engines write new data into small, write-once files and merge them later (LSM). Search engines work the same way.
+
 **From zero, in 60 seconds** 🟢
 
 You have a million emails and want every one that mentions "refund".
@@ -82,6 +87,10 @@ Now "refund" is one lookup, and that list is an inverted index.
 | Relevance score | A number that ranks how well a document matches | BM25 score 2.4 |
 | Shard | One slice of a big index stored on one node | Index split into 5 shards |
 | Refresh | Making newly written documents visible to search | Every 1 s by default in Elasticsearch |
+| Stemming | Cutting a word down to its root so forms match | `invoices` → `invoice` |
+| Stop words | Very common words the analyzer drops | `the`, `for`, `to` |
+| BM25 | The standard formula that scores how well a document matches | rare words and short documents score higher |
+| Segment | A small write-once piece of the index; many make up one shard | merged in the background |
 
 **Picture it**
 
@@ -120,12 +129,27 @@ WHERE workspace_id = 42
   AND (notes ILIKE '%acme%' AND notes ILIKE '%overdue%');
 ```
 
-A B-tree index cannot help a pattern that starts with `%`, so Postgres reads every invoice of the workspace and runs a substring match on each `notes` value. For 400,000 invoices with 1 KB of notes each, that is about 400 MB of text per search (an estimate). It also fails at the job itself:
-- Searching `invoices` does not find a note that says `invoice` (no stemming), and `Acme` in another case only works because of `ILIKE`.
+A B-tree index (the normal sorted index) cannot help a pattern that starts with `%`, so Postgres reads every invoice of the workspace and runs a substring match on each `notes` value. For 400,000 invoices with 1 KB of notes each, that is about 400 MB of text per search (an estimate). It also fails at the job itself:
+- Searching `invoices` does not find a note that says `invoice` (no stemming, the step that cuts words to their root), and `Acme` in another case only works because of `ILIKE`.
 - `acme` with a typo (`acne`) finds nothing.
 - Results come back in no useful order: an invoice whose title is "Acme Ltd" is not ranked above one that mentions Acme once in a footnote.
 
 A search engine fixes all three: it indexes terms once at write time, normalizes them, and ranks results.
+
+### Real-life example 🟢
+
+Type "chiken biryani" into a food delivery app's search box.
+It still shows biryani places, ranks the ones with "Chicken Biryani" in the dish name above ones that mention it once in a review, and does it in a few milliseconds over millions of dishes.
+That is a search engine: it cleaned your words, forgave the typo, looked them up in an inverted index, and scored the matches.
+The menu itself still lives in the main database; the search index is a copy kept up to date from it.
+
+## Common beginner mistakes 🟢
+
+- **Using `LIKE '%word%'` on a big table** → the database reads every row's text on every search → use Postgres full-text search (`tsvector` + GIN) or a search engine.
+- **Using a different analyzer for queries than for documents** → "Invoices" in the box never becomes `invoice`, so nothing matches → run the same analyzer on both sides.
+- **Writing to the database and the search engine from the same request** → if one write fails they disagree forever → save to the database once and feed the index from an outbox or CDC.
+- **Treating the search index as the source of truth** → it has no multi-document transactions and must be rebuilt for mapping changes → keep the database as the truth and be able to re-index from it.
+- **Filtering by tenant only in the UI** → search can return another customer's records → put the tenant filter inside every search query.
 
 ## 2. Mental model 🟢
 
@@ -152,9 +176,18 @@ Terms used below:
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the idea: prepare a word → documents list once, clean the words the same way on both sides, and rank the matches. **Next we open the box**: how text is cleaned, how the index is stored and searched, how BM25 scores, and how Elasticsearch splits and refreshes the index. Each subsection starts with a short step-by-step walk.
+
 ### 3.1 Analysis: text to terms
 
 **In plain words:** before text goes in the index it gets washed: split into words, lowercased, filler words dropped, endings trimmed. The search box text must go through the same wash, or "Invoices" will never find "invoice".
+
+**Step by step (the note "Overdue invoices for the client"):**
+1. Split into words: `Overdue`, `invoices`, `for`, `the`, `client`.
+2. Lowercase: `overdue`, `invoices`, `for`, `the`, `client`.
+3. Drop stop words: `overdue`, `invoices`, `client`.
+4. Stem: `overdue`, `invoice`, `client`. These terms go into the index.
+5. The search box text "Invoices" goes through the same steps and becomes `invoice`, so it matches.
 
 ```mermaid
 flowchart LR
@@ -180,6 +213,12 @@ A common Elasticsearch mapping uses both: `client_name` as `text` plus a `client
 ### 3.2 The inverted index
 
 **In plain words:** the index is a sorted word list where each word points to the documents that contain it, with the exact spots inside each document noted so the engine can check word order for quoted phrases.
+
+**Step by step:**
+1. Document 1 has terms `overdue(0) invoice(1) acme(2)`.
+2. The engine adds 1 to the list for each term: `overdue → [1]`, `invoice → [1]`, `acme → [1]`, and notes each position.
+3. Document 3 adds itself to `acme`, `overdue` and `invoice` too, so `acme → [1, 3]`.
+4. All terms are kept in sorted order, so finding `acme` is a quick lookup, not a scan.
 
 ```mermaid
 flowchart LR
@@ -207,13 +246,19 @@ flowchart LR
     docs -. "analyze, then append<br/>doc id to each term's list" .-> dict
 ```
 
-- The **term dictionary** is sorted, so a term is found by lookup (Lucene stores it in a compact finite-state structure).
-- Each **postings list** is sorted by document id. AND queries intersect lists by walking them together, skipping ahead with skip data; OR queries merge them.
+- The **term dictionary** is sorted, so a term is found by lookup (Lucene, the Java search library inside Elasticsearch and OpenSearch, stores it in a compact finite-state structure).
+- Each **postings list** is sorted by document id. AND queries intersect lists by walking them together, skipping ahead with skip data (small signposts inside a list that let the engine jump far forward); OR queries merge them.
 - **Term frequency** (how often the term appears in that document) feeds ranking. **Positions** make phrase queries possible: `"overdue invoice"` matches only where `invoice` sits at the position right after `overdue`.
 
 ### 3.3 Query execution: AND, OR and phrases
 
 **In plain words:** once the engine has each word's document list, AND keeps only the documents on every list, OR keeps documents on any list, and a quoted phrase also checks the words sit side by side.
+
+**Step by step (`overdue AND invoice`):**
+1. Look up `overdue → [1, 3]` and `invoice → [1, 2, 3]`.
+2. Walk both lists together: 1 is on both, keep it; 2 is only on one, skip; 3 is on both, keep it.
+3. Result: documents 1 and 3.
+4. For the phrase `"overdue invoice"`, also check that `invoice` sits at the position right after `overdue` in each.
 
 Looking up the terms is only the first step. The engine then combines the postings lists according to the query operator.
 
@@ -242,6 +287,12 @@ Example with numbers: in the three-document collection above, `overdue AND invoi
 ### 3.4 Relevance: TF-IDF to BM25
 
 **In plain words:** the best match is the document that uses your words often, uses rare words (rare words carry more meaning), and is not just long for the sake of it. BM25 is the formula that balances those three.
+
+**Step by step:**
+1. For each word in the query, ask: how rare is it across all documents? Rare words get a bigger weight (IDF).
+2. How often does it appear in this document? More is better, but each extra mention adds less (saturation, set by `k1`).
+3. How long is this document compared to the average? Longer documents are scaled down (set by `b`).
+4. Multiply those for each word and add the words up. Highest total is shown first.
 
 Two intuitions:
 - **TF (term frequency):** a document that says `acme` five times is probably more about Acme than one that says it once.
@@ -299,6 +350,13 @@ The curve flattens toward `k1 + 1 = 2.2`, so ten mentions of `acme` score less t
 
 **In plain words:** one big index is cut into slices (shards) spread over machines, each slice has a backup copy on another machine, and a search asks every slice and merges the best answers.
 
+**Step by step:**
+1. Index `invoices_v3` is cut into 3 primary shards on different machines (nodes).
+2. Each new invoice goes to one shard, picked by hashing its routing value.
+3. Each primary shard has a replica copy on another node, for failover and extra search capacity.
+4. A search is sent to one copy of every shard; each returns its own top 10.
+5. The coordinating node (the node that received the request) merges the 30 candidates and returns the best 10.
+
 ```mermaid
 flowchart TB
     subgraph cluster["Cluster: 3 data nodes"]
@@ -354,6 +412,13 @@ With `from = 0, size = 10` and 3 shards the coordinator merges 30 candidates. Wi
 ### 3.6 Segments, refresh, flush and merge
 
 **In plain words:** new documents pile up in small write-once files (segments), become searchable about a second after saving, and a background job keeps gluing small files into bigger ones, like tidying receipts into folders.
+
+**Step by step (invoice `inv_812`):**
+1. You index it. It sits in a memory buffer and in the translog (a crash-safe log), but searches cannot see it yet.
+2. Within about 1 second, a refresh writes the buffer into a new small segment. Now searches find it.
+3. Later a flush saves segments to disk for good and trims the translog.
+4. You update it: the old copy is only marked deleted, and the new copy goes into a new segment.
+5. A background merge glues small segments together and finally drops the deleted copy.
 
 ```mermaid
 sequenceDiagram
@@ -609,6 +674,8 @@ Common mistakes:
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how text becomes an index, how matches are scored, and how to keep the index in sync. **Next is the senior view**: keeping search results secure per tenant, autocomplete and fuzzy matching, deep pagination, cluster failure modes, and the compression and scoring tricks inside Lucene.
+
 **Search result security.** The engine is separate from the database, so authorization must be designed into it:
 - Index `workspace_id` and access fields as `keyword` fields.
 - Always filter by tenant and permissions inside the query (a `filter` clause, which is not scored and is cached), never only in the UI.
@@ -620,9 +687,9 @@ Common mistakes:
 **Autocomplete and fuzzy matching.**
 - **Edge n-grams** index prefixes at write time (`acme` → `a`, `ac`, `acm`, `acme`), so a prefix query becomes an exact term lookup. Larger index, flexible.
 - **Completion suggester** keeps an in-memory finite-state transducer of suggestions; very fast, prefix-only.
-- **Fuzzy queries** match terms within a Levenshtein edit distance. `fuzziness: AUTO` allows 0 edits for terms of 1–2 characters, 1 edit for 3–5 and 2 edits for longer terms.
+- **Fuzzy queries** match terms within a Levenshtein edit distance (the number of single-letter inserts, deletes or swaps needed to turn one word into another; `acne` → `acme` is 1). `fuzziness: AUTO` allows 0 edits for terms of 1–2 characters, 1 edit for 3–5 and 2 edits for longer terms.
 
-**Facets.** Aggregations count matches per `keyword` value ("status: overdue 12, paid 40") over the query's result set, using column-oriented doc values rather than the inverted index.
+**Facets.** Aggregations count matches per `keyword` value ("status: overdue 12, paid 40") over the query's result set, using column-oriented doc values (a per-field, column-by-column copy of values kept for sorting and counting) rather than the inverted index.
 
 **Deep pagination.** `from` + `size` makes every shard return `from + size` hits to the coordinator, so cost grows with depth; `index.max_result_window` caps `from + size` at 10,000 by default.
 
@@ -712,6 +779,9 @@ flowchart LR
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** A search engine keeps a list of which documents contain each word. Words are cleaned the same way when saving and when searching. Matches are ranked so rare words, repeated words and short documents come first. The index is a copy of your database, so feed it changes through a pipeline and be ready to rebuild it. Try Postgres full-text search before running a separate search cluster.
+
+
 - Inverted index: term → sorted postings (doc ids, frequencies, positions); analysis must match at index and query time.
 - `text` is analyzed for matching; `keyword` is exact, for filters, sorts and facets.
 - BM25: rare terms, repeated terms (saturating) and short documents score higher; k1 = 1.2, b = 0.75.
@@ -720,6 +790,30 @@ flowchart LR
 - Sync via outbox or CDC with external versions and deletes; never dual-write.
 - Deep pages: `search_after` + point in time, not `from`/`size` past 10,000.
 - Start with Postgres `tsvector` + GIN and `pg_trgm`; always filter by tenant in the query.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is an inverted index?
+> A map from each word (term) to the list of documents that contain it.
+
+> [!question]- Why must the query go through the same analyzer as the documents?
+> Otherwise "Invoices" in the search box would not become `invoice` and would not match the stored term.
+
+> [!question]- Why is a document saved now not searchable straight away?
+> It becomes visible only at the next refresh, about 1 second later by default.
+
+🟡 Medium
+
+> [!question]- Two documents both contain `overdue` and `acme` once. Why does the 4-term one beat the 8-term one?
+> BM25's length normalization (`b`) scales down longer documents.
+
+> [!question]- Why is dual-writing to Postgres and Elasticsearch unsafe?
+> If one write fails or the process crashes between them, the index silently disagrees with the database.
+
+> [!question]- How do you change an analyzer without downtime?
+> Build a new index, backfill and check it, then move the alias to it in one atomic request.
 
 ## Links
 

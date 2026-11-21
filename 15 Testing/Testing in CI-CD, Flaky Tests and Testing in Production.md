@@ -36,6 +36,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Testing Strategy and the Test Pyramid]]: many fast unit tests, fewer integration tests, very few end-to-end tests, each run at its own stage.
+> - [[Unit, Integration and E2E Tests]]: how each kind is written in Go (`t.Parallel`, `httptest`, testcontainers, `-race`).
+
 **From zero, in 60 seconds** 🟢
 
 **CI** is a robot that runs your tests every time someone pushes code.
@@ -74,6 +78,11 @@ This note covers running tests in CI well, fixing flaky tests, and safely testin
 | Quarantine | Moving a flaky test out of the blocking set until it is fixed | Tagged and skipped in the gate |
 | Feature flag | A switch that turns code on or off without a deploy | `new_checkout=false` |
 | Canary | Sending a small share of real traffic to a new version first | 1% of users |
+| Dark launch | Code is deployed to production but switched off, so no user sees it yet | New checkout shipped with flag at 0% |
+| Rollback | Quickly going back to the previous version | Flag back to 0%, or redeploy v41 |
+| Kill switch | A flag that turns a feature off instantly in an emergency | `new_checkout=off` in one click |
+| Synthetic monitoring | Scripted robot users that keep checking production | "Log in and search" every minute |
+| `-shuffle=on` | A `go test` flag that runs tests in random order to expose order dependence | `go test -shuffle=on ./...` |
 
 **Picture it**
 
@@ -113,6 +122,10 @@ But speed creates two new problems this note is about:
 1. **Flaky tests.** A test that sometimes fails for no code reason trains engineers to re-run and ignore red builds — which is worse than having no test, because a real regression now also gets re-run and ignored.
 2. **The gap pre-release testing can't close.** No staging environment has production's real traffic shape, real data skew, or real third-party latency. Some bugs only show up after release, so "testing" has to include a safe way to test on production itself.
 
+### Real-life example: Swiggy rolling out a new checkout 🟢
+
+Say Swiggy rebuilds its checkout screen. Every pull request runs unit tests in about a minute; integration tests run before merge; the full end-to-end suite runs every night. When the new checkout is ready, it ships to production switched off behind a feature flag. Then the flag is turned on for 1% of users in one city, and the team compares failed orders and payment errors against everyone else. If numbers look normal, it grows to 5%, 25%, 100%. If payment errors jump, one click sets the flag back to 0% and nobody else is affected. Meanwhile robot "users" place test orders every few minutes to catch outages like an expired certificate.
+
 ## 2. Mental model 🟢
 
 Think of the pipeline as a series of checkpoints that get progressively more expensive to run and more expensive to skip:
@@ -124,6 +137,23 @@ Think of the pipeline as a series of checkpoints that get progressively more exp
 
 A flaky test is a checkpoint that lies: it sometimes says "stop" or "go" independent of whether the code is actually broken. The fix is always to find why the checkpoint is non-deterministic, never to make the checkpoint louder (more retries) or quieter (skip it).
 
+## Common beginner mistakes 🟢
+
+- **Clicking "re-run" until the build is green** → people stop trusting red builds and a real bug ships → find and fix the cause, or quarantine the test with an owner and a deadline.
+- **Running the whole slow suite on every commit** → every merge waits 45 minutes → fast unit gate per push, integration before merge, E2E nightly.
+- **Sharding tests that share one database** → shards trip over each other's rows → give each shard its own database or schema.
+- **Picking canary users at random on every request** → the same user flips between old and new → bucket by a stable ID like user ID.
+- **Never removing feature flags after rollout** → dead branches pile up and nobody tests them → delete the flag once it reaches 100%.
+
+### Canary release vs feature flag 🟡
+
+| | Canary release | Feature flag |
+| --- | --- | --- |
+| Splits at | Deploy level: two versions running | Request level: one version with an `if` |
+| Who routes | Load balancer or service mesh | A flag check inside the code |
+| Roll back by | Shifting traffic back to the old version | Setting the flag to 0% (instant) |
+| Best for | New service versions, infra changes | Product features, kill switches |
+
 ```mermaid
 flowchart LR
     F["Test fails"] --> R{"Same code passes on rerun?"}
@@ -133,7 +163,16 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that CI runs cheap tests first, flaky tests must be fixed not retried, and production gets tested carefully with canaries. **Next we open the box**: the pipeline stages, sharding, the causes of flakiness, quarantine done right, flags and canaries, and synthetic monitoring.
+
 ### 3.1 The pyramid mapped onto a pipeline
+
+**Step by step:**
+1. Priya pushes a commit. Unit tests and lint run in about a minute; a failure blocks the commit right there.
+2. She opens a pull request. Integration tests run with real Postgres/Redis in containers; a failure blocks the merge.
+3. Every night, the end-to-end suite runs against a full copy of the system; a failure alerts on-call and stops promotion.
+4. The release goes to a canary slice of production; if its numbers regress, it rolls back automatically.
+5. If healthy, it rolls out to everyone.
 
 ```mermaid
 flowchart TB
@@ -166,6 +205,12 @@ Each stage trades speed for scope. A unit test that touches a real database has 
 
 **In plain words: split the tests across many machines so the whole run finishes faster.**
 
+**Step by step:**
+1. 10,000 tests take 50 seconds on one machine.
+2. CI starts 8 runners and gives each about 1,250 tests (or, better, an equal share of past run time).
+3. Each runner gets its own database or schema, so no two runners touch the same rows.
+4. All 8 run at once; the whole suite finishes in well under 10 seconds plus start-up time.
+
 A suite of 10,000 unit tests at 5 ms each takes 50 seconds serially. Split across 8 shards (for example, 8 CI runner containers, each taking roughly `10,000 / 8 = 1,250` tests), wall-clock time drops toward `50 / 8 ≈ 6.25` seconds **(an estimate — real speedup is lower because of fixed per-shard startup cost and uneven test duration)**.
 
 Two sharding strategies:
@@ -191,6 +236,13 @@ flowchart LR
 
 **In plain words: most flaky tests come from a few causes: time, order, shared state, and the network.**
 
+**Step by step (debugging one flaky test):**
+1. Confirm it: same commit, run it 100 times with `go test -run TestX -count=100 -race`.
+2. Run with `-shuffle=on` to see if the order of tests matters.
+3. Search the test for `time.Now`, `time.Sleep`, unseeded `rand`, real network calls and shared DB rows.
+4. Replace the cause: fake clock, fixed seed, stub server, per-test data.
+5. Run 100 times again; only call it fixed when it passes every time.
+
 | Root cause | What it looks like | Fix |
 | --- | --- | --- |
 | Shared state | Test B fails only when test A ran first and left a row in the DB / a file on disk / a package-level variable set | Give each test (or each shard) its own schema/namespace/tempdir; reset global state in `t.Cleanup` |
@@ -201,6 +253,15 @@ flowchart LR
 | Concurrency bugs in the code under test | The test is correct; the production code has a genuine race, visible only sometimes | This is not a flaky test — `go test -race` existing to catch exactly this is why "just retry it" is the wrong first move |
 
 ### 3.4 Quarantine and retry, used correctly
+
+**In plain words:** retries and quarantine buy time while you fix a flaky test; they are never the fix itself.
+
+**Step by step:**
+1. `TestCheckoutTimeout` fails 1 run in 20 with no code change.
+2. Tag it as flaky so it no longer blocks merges, but keep it running and reporting.
+3. Assign an owner and a deadline, like any open bug.
+4. The owner finds the cause (say, a 100 ms sleep) and fixes it.
+5. Remove the tag; it blocks merges again. If it gives no useful signal, delete it on purpose.
 
 Retrying a failed test before giving up is a tool for keeping CI usable while a flaky test is being fixed — never a substitute for fixing it:
 
@@ -222,6 +283,15 @@ stateDiagram-v2
 - Retrying blindly in a loop with no quarantine and no owner is the "fix" that makes a suite untrustworthy: engineers learn to re-run red builds instead of reading them, and the day a retry hides a real regression, it ships.
 
 ### 3.5 Feature flags and canary releases as testing in production
+
+**In plain words:** ship the new code switched off, turn it on for a few users, compare their numbers with everyone else, then grow or roll back.
+
+**Step by step:**
+1. Deploy the new checkout to every server with the flag `new-checkout` at 0% (dark launch).
+2. For each request, hash the user ID into a bucket 0-99; users in buckets 0 get the new code (1%).
+3. Compare error rate, p99 latency and conversion for that 1% against the other 99% (the control group).
+4. All good → raise to 5%, then 25%, then 100%.
+5. Worse → set the flag to 0%; everyone is back on the old code instantly.
 
 A **canary release** deploys the new version to a small slice of production traffic (a "canary," after the coal-mine sensor) and compares its error rate, latency, and business metrics against the rest of the fleet before rolling out further.
 
@@ -255,6 +325,12 @@ The bucketing must be **deterministic per identity** (the same user always gets 
 ### 3.6 Synthetic monitoring vs. real test suites
 
 **In plain words: a robot user that keeps clicking through production to check it still works.**
+
+**Step by step:**
+1. Write a script: open the site, log in as a test account, search "pizza", add to cart.
+2. Run it every minute from a few places outside your network.
+3. If it fails or gets slow, page on-call, even if nobody deployed anything.
+4. This catches things like an expired TLS certificate at 3 am that no pre-release test could.
 
 Synthetic monitoring runs test-shaped scripts (log in, search, add to cart) against the live production system on a schedule, from real or simulated external locations, and alerts when they fail or slow down — independent of any deploy.
 
@@ -436,7 +512,7 @@ func randomID(i int) string {
 | Test sharding by timing | CI balances shards by historical duration | You have timing history and want even wall-clock time per shard | Needs a timing data source; useless on day one |
 | Retry-on-failure (no quarantine) | Failed test reruns automatically, build only reds after N failures | Never, as a permanent policy | Hides real regressions; erodes trust in red builds |
 | Quarantine | Flaky test tagged out of the gate, still runs and reports, owned with a deadline | A flaky test is identified and can't be fixed immediately | Needs process discipline or it becomes a graveyard |
-| Canary release (deploy-level) | New binary version serves a % of traffic; old version serves the rest | Infra-level changes (new service version, new dependency) | Needs traffic splitting at the load balancer/service-mesh level |
+| Canary release (deploy-level) | New binary version serves a % of traffic; old version serves the rest | Infra-level changes (new service version, new dependency) | Needs traffic splitting at the load balancer/service-mesh (a layer of proxies that routes traffic between services) level |
 | Feature flag (request-level) | One binary; a flag decides per-request which code path runs | Product-level changes, instant kill switch without a redeploy | Flag debt accumulates if flags aren't removed after full rollout |
 | Synthetic monitoring | Scripted checks run against live production on a schedule | Catching infra/config/third-party failures a deploy didn't cause | Blind to logic bugs the script doesn't specifically check |
 
@@ -451,7 +527,10 @@ func randomID(i int) string {
 
 ## 7. In production 🔴
 
-- **Real systems:** Google's test infrastructure auto-detects and reruns flaky tests while flagging them for investigation, rather than letting a single flaky run block a release train (Google Testing Blog, 2016).
+> 🟡 → 🔴 **You now know** how stages, sharding, quarantine, flags, canaries and synthetic checks fit together. **Next we look at real practice**: how large companies handle flaky tests and automated canary rollback, the common ways these setups go wrong, what to monitor, and the deeper statistics and Go-specific details interviews like to probe.
+
+
+- **Real systems:** Google's test infrastructure auto-detects and reruns flaky tests while flagging them for investigation, rather than letting a single flaky run block a release train (a scheduled, regular release) (Google Testing Blog, 2016).
 
   Automated canary analysis — rolling back a release automatically when it regresses on key metrics, without a human in the loop — is a widely used pattern at companies operating large-scale services, popularized in industry engineering blogs alongside Martin Fowler's canary-release write-up cited above.
 - **Failure modes → fixes:**
@@ -473,7 +552,7 @@ This is the core argument for quarantine-with-ownership over blind retries: it k
 
 **Canary analysis as a statistical test, not a vibe check.** A naive canary compares one metric's absolute value between canary and control, but with a small canary slice (1% of traffic), noise alone can produce a difference that looks like a regression.
 
-Robust canary analysis treats this as a hypothesis test: it compares distributions (not single numbers) between canary and control cohorts that are matched on confounders (same time window, similar traffic mix), and only flags a regression when the difference exceeds a threshold accounting for the sample size — otherwise a canary at 1% traffic will "detect" false regressions constantly on pure sampling noise.
+Robust canary analysis treats this as a hypothesis test: it compares distributions (not single numbers) between canary and control cohorts (groups of users) that are matched on confounders (other things that could explain a difference: same time window, similar traffic mix), and only flags a regression when the difference exceeds a threshold accounting for the sample size — otherwise a canary at 1% traffic will "detect" false regressions constantly on pure sampling noise.
 
 **Order-dependent flakiness and Go specifically.** Go's `go test` runs tests within a package sequentially by default in the order they appear in source, except for tests calling `t.Parallel()`: each such test pauses at that call, and only once every non-parallel test in the package has finished running do all the paused parallel tests resume and run concurrently with each other.
 
@@ -542,6 +621,26 @@ It will not notice a new feature silently failing for 2% of users in one region 
 - Canary release = infra-level traffic split between two deployed versions; feature flag = request-level branch inside one binary; both need deterministic, identity-based bucketing to avoid flicker and to make analysis meaningful.
 - Synthetic monitoring runs test-shaped checks against live production on a schedule — it catches infra/config/third-party failures pre-release tests can't, but only for the exact paths it scripts.
 - None of production testing replaces pre-release gates; it catches a different, real-traffic-only class of failure, and it ships last, after the gates, not instead of them.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is a flaky test?
+> A test that passes and fails on the same code with no change.
+
+> [!question]- (easy) Which tests run on every push?
+> Fast ones: lint and unit tests.
+
+> [!question]- (easy) What is a canary release?
+> Sending a small share of real traffic to the new version first and watching its numbers.
+
+> [!question]- (medium) Why is "retry until green" harmful?
+> Red builds stop meaning "broken", so a real regression gets retried, ignored and shipped.
+
+> [!question]- (medium) Why bucket canary users by user ID instead of per request?
+> So each user stays on one version and any regression can be pinned on the canary group.
+
+> [!question]- (medium) What does synthetic monitoring catch that the test suite cannot?
+> Live production problems like an expired certificate, DNS mistakes or a third-party outage, even with no deploy.
 
 ## Links 🟢
 - **Before this:** [[Testing Strategy and the Test Pyramid]], [[Unit, Integration and E2E Tests]]

@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (the formulas), 4 (worked examples) and 5 (variants).
 > - 🔴 **Interview / SDE-3 prep?** Add 6, 7, 8 and the interview questions (9). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Fundamentals]]: an app is clients talking to servers, which read and write data in a database.
+> - [[Latency Numbers Every Engineer Should Know]]: memory is fast, disk is slower, and a trip across the network is slower still.
+
 **From zero, in 60 seconds** 🟢
 
 You are told to build an app. First question: how big is "big"?
@@ -78,6 +82,12 @@ That rough multiplication is back-of-the-envelope estimation.
 | Replica / copy | Extra copy of data kept for safety | 3 copies of every file |
 | Utilisation | How busy a machine is, as a % of its max | Running at 70% CPU |
 
+| Cache | A fast in-memory copy of popular data, so the database is asked less often | keep the 10 GB of hot links in Redis |
+| Primary | The one database server that accepts writes | one PostgreSQL primary takes all new links |
+| Partition (shard) | Split data across several machines, each holding one slice | users A-M on server 1, N-Z on server 2 |
+| Load test | Sending fake traffic to one server to measure how much it really handles | "one node did 10,000 requests/s" |
+| Payload | The bytes carried by one request or response | a 500-byte link row |
+
 **Picture it**
 
 ```mermaid
@@ -104,11 +114,11 @@ Where it breaks: a party has one obvious peak; real systems have hidden spikes (
 
 ## 1. Why it exists 🟢
 
-Two candidates design a URL shortener. One draws Kafka, Cassandra and twelve microservices.
+Two candidates design a URL shortener. One draws Kafka (a message queue), Cassandra (a database spread over many machines) and twelve microservices (many small separate services).
 
 The other spends three minutes on arithmetic, finds 1,200 writes per second and 116,000 reads per second, and concludes:
 
-1. Writes fit one relational primary.
+1. Writes fit one relational primary (a single SQL database server, such as PostgreSQL, that takes all writes).
 2. Reads need a cache.
 3. Five years of data (about 91 TB per copy) will not fit on one node, so the store must be partitioned.
 
@@ -124,9 +134,41 @@ You estimate guests (300), plates per guest (1.2), kitchen throughput (60 plates
 
 If the answer were "0.1 cooks" or "500 cooks", you would know your inputs were wrong. The precision is low; the decision ("hire 6 cooks, not 1 and not 50") is solid.
 
+### Real-life example: a food app at dinner time 🟢
+
+Think of a food delivery app like Swiggy in one city. Say it gets 2 million orders a day (a made-up round number).
+2,000,000 ÷ 86,400 is about 23 orders a second on average.
+But most people order at lunch and dinner, so the busiest minute may be 5 times the average: about 120 orders a second.
+That tells the team to size servers for 120 a second, not 23, and that one good database can still hold all the writes.
+
+```mermaid
+flowchart LR
+    D["2 M orders a day"] --> A["÷ 86,400 = 23 a second"]
+    A --> P["× 5 at dinner = 120 a second"]
+    P --> S["size servers for 120"]
+```
+
+## Common beginner mistakes 🟢
+
+- **Sizing for the average** → traffic is never flat, so the system falls over at the busiest hour → always multiply by a peak factor (2-10×).
+- **Forgetting copies** → databases keep 3 copies of data, so real disk use is 3× your number → multiply storage by the number of copies.
+- **Mixing up bits and bytes** → network speeds are in bits, file sizes in bytes, so you can be 8× off → write the unit on every number and × 8 for bits.
+- **Being too exact** → "1,157.4 per second" wastes time and looks no smarter than "about 1,200" → round to one or two digits.
+- **Estimating everything** → you run out of time before the design → estimate only the numbers that change a decision (QPS, storage, sometimes bandwidth).
+
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** why we do rough maths and what QPS and storage mean. **Next we open the box** and learn the exact formulas, the units, and the speed numbers that turn "users per day" into servers and disks. Each subsection starts with a plain step-by-step walk.
+
 ### The pipeline
+
+**Step by step:**
+1. Guess how many people use the app each day: say 10 million.
+2. Multiply by actions per person: 10 actions each = 100 million requests a day.
+3. Divide by 86,400 seconds: about 1,200 requests a second on average.
+4. Multiply by a peak factor of 3: plan for about 3,600 a second.
+5. Divide by what one server handles (from a load test): 3,600 ÷ 1,000 ≈ 4 servers, then add room to spare.
+6. In parallel, multiply objects × size × days × copies to get disk space.
 
 ```mermaid
 flowchart LR
@@ -146,6 +188,12 @@ flowchart LR
 ### Units and powers of two
 **In plain words:** computers count in 1,024s but we round to 1,000s; the tiny error never changes the answer.
 
+**Step by step:**
+1. A photo is 2 MB. A million photos is 2 MB × 10⁶ = 2 × 10⁶ MB.
+2. Treat 1,000 MB as 1 GB, so that is 2,000 GB.
+3. Treat 1,000 GB as 1 TB, so that is 2 TB.
+4. The "real" answer (with 1,024s) is about 1.9 TB. Same decision, so keep the easy number.
+
 
 | Power of 2 | Exact | Approx | Name |
 | --- | --- | --- | --- |
@@ -161,6 +209,12 @@ Handy sizes: an ASCII character is 1 byte; a UUID is 16 bytes binary (36 as text
 
 ### Time shortcuts
 
+**Step by step:**
+1. You have 5 million requests a day.
+2. Use the shortcut 1 day ≈ 100,000 (10⁵) seconds.
+3. 5,000,000 ÷ 100,000 = 50 requests a second.
+4. The exact answer (÷ 86,400) is about 58. Say "about 50-60 a second" and move on.
+
 - 1 day = 86,400 s ≈ 10⁵ s. Dividing by 10⁵ instead of 86,400 understates the rate by about 14%; fine for estimates, and you can say so.
 - 1 million per day ≈ 12 per second. 1 billion per day ≈ 11,600 per second.
 - 1 month ≈ 2.6 × 10⁶ s. 1 year ≈ 3.15 × 10⁷ s.
@@ -168,12 +222,19 @@ Handy sizes: an ASCII character is 1 byte; a UUID is 16 bytes binary (36 as text
 ### Latency numbers (orders of magnitude)
 **In plain words:** this table says how long each kind of fetch takes, from "instant" (RAM) to "noticeably slow" (across an ocean). Memory is a desk drawer; another continent is a parcel in the post.
 
+**Step by step:**
+1. Units first: 1 ms (millisecond) = 1,000 µs (microseconds) = 1,000,000 ns (nanoseconds).
+2. Reading from RAM (the computer's working memory) takes about 100 ns: effectively free.
+3. Reading from an SSD (a fast flash disk) takes about 0.1 ms; an old spinning disk (HDD) about 5 ms.
+4. A call to another server in the same building takes about 0.5 ms.
+5. A call to another continent takes about 150 ms. A page that does this twice already feels slow.
+
 
 These are approximate values from Jeff Dean's list and Colin Scott's updated version; the owning note is [[Latency Numbers Every Engineer Should Know]].
 
 | Operation | Approx time |
 | --- | --- |
-| L1 cache reference | ~1 ns |
+| L1 cache reference (the tiny memory inside the CPU itself) | ~1 ns |
 | Main memory (RAM) reference | ~100 ns |
 | Read 1 MB sequentially from RAM | ~a few µs to 10 µs |
 | SSD random read (4 KB) | ~16-100 µs |
@@ -182,10 +243,17 @@ These are approximate values from Jeff Dean's list and Colin Scott's updated ver
 | Disk (HDD) seek | ~2-10 ms |
 | Round trip across a continent or ocean (for example California to Netherlands) | ~150 ms |
 
-Consequences: a Redis `GET` across the data centre costs about one network round trip (sub-millisecond), so 20 sequential cache calls cost several milliseconds; a request that crosses an ocean twice cannot meet a 100 ms p99.
+Consequences: a Redis (a popular in-memory cache) `GET` across the data centre costs about one network round trip (sub-millisecond), so 20 sequential cache calls cost several milliseconds; a request that crosses an ocean twice cannot meet a 100 ms p99 (the time within which 99 out of 100 requests must finish).
 
 ### The formulas
 **In plain words:** every row is just multiply-and-divide: how often, times how big, times how long you keep it.
+
+**Step by step:**
+1. Count how often: 1 million new posts a day.
+2. Count how big: 1 KB each, so 1 GB a day.
+3. Count how long you keep it: 1 year, so about 365 GB.
+4. Count copies: × 3 = about 1.1 TB of disk.
+5. Do the same for reads, and for bytes sent out per second (bandwidth).
 
 
 | Quantity | Formula | Remember |
@@ -193,10 +261,10 @@ Consequences: a Redis `GET` across the data centre costs about one network round
 | Average QPS | requests/day ÷ 86,400 | Split read QPS and write QPS |
 | Peak QPS | average × peak factor | 2-3× for smooth global traffic, up to 10× for spiky (sales, match days) |
 | Storage | objects/day × bytes × retention days × replication factor (often 3) | Add indexes and overhead (often +30-100%, estimate) |
-| Bandwidth | QPS × payload bytes | Ingress (uploads) and egress (downloads) separately; × 8 for bits |
+| Bandwidth | QPS × payload bytes | Ingress (data coming in, uploads) and egress (data going out, downloads) separately; × 8 for bits |
 | Cache | hot objects × bytes | 80/20: about 20% of items get most reads; cache that 20% |
 | Servers | ⌈peak QPS ÷ (per-node QPS × target utilisation)⌉ | Per-node QPS comes from a load test, not a guess |
-| DB connections | app instances × pool size | Must stay under the DB limit (PostgreSQL 17 default `max_connections` = 100) |
+| DB connections | app instances × pool size (the number of open database connections each app copy keeps ready) | Must stay under the DB limit (PostgreSQL 17 default `max_connections` = 100) |
 
 ## 4. Worked example 🟡
 
@@ -233,7 +301,7 @@ Assumptions (all estimates, stated out loud in an interview): 100 M new short li
 | Ingress | 1,157 /s × 500 B | ≈ 0.6 MB/s |
 | Cache | 20% of 100 M URLs read per day (estimate) = 20 M × 500 B | 10 GB |
 | App servers | ⌈231,481 ÷ (10,000 × 0.7)⌉ | 34 |
-| Key space | 7 base-62 characters = 62⁷ | ≈ 3.5 × 10¹² keys vs 1.8 × 10¹¹ needed in 5 years |
+| Key space | 7 base-62 characters (a-z, A-Z, 0-9: 62 choices per character) = 62⁷ | ≈ 3.5 × 10¹² keys vs 1.8 × 10¹¹ needed in 5 years |
 
 **What the numbers decided:** about 1,200 writes/s (2,300/s at peak) fits one well-indexed relational primary comfortably (an estimate; benchmark your hardware).
 
@@ -252,10 +320,18 @@ Assumptions (estimates): 50 M DAU, 40 messages per user per day, 200 bytes per m
 | Messages/s | 50 × 10⁶ × 40 ÷ 86,400 /s | ≈ 23,148 /s (peak ≈ 69,000 /s) |
 | Storage per day | 2 × 10⁹ × 200 B | 400 GB/day |
 | Storage per year, 3 copies | 400 GB × 365 × 3 | ≈ 438 TB/year |
-| Concurrent connections | 50 × 10⁶ × 0.2 | 10 M WebSockets |
+| Concurrent connections | 50 × 10⁶ × 0.2 | 10 M WebSockets (connections that stay open so the server can push messages) |
 | Gateway nodes | 10 M ÷ 50,000 per node (estimate; load-test it) | 200 nodes |
 
-**What the numbers decided:** the message store is write-heavy (69k writes/s at peak) and grows by 438 TB a year, which points to a partitioned, write-optimised store (see [[Wide-Column Stores and Cassandra]]) rather than one PostgreSQL primary. Ten million long-lived connections make the connection tier its own scaling problem: [[Scaling WebSockets]] and [[Case Study - Chat System]].
+**What the numbers decided:** the message store is write-heavy (69k writes/s at peak) and grows by 438 TB a year, which points to a partitioned, write-optimised store (a database built so new writes are cheap, often by only appending) (see [[Wide-Column Stores and Cassandra]]) rather than one PostgreSQL primary. Ten million long-lived connections make the connection tier its own scaling problem: [[Scaling WebSockets]] and [[Case Study - Chat System]].
+
+### Estimation vs things people confuse it with 🟡
+
+| Thing | What it is | How it differs from a back-of-the-envelope estimate |
+| --- | --- | --- |
+| Capacity planning | Sizing real production from measured traffic and load tests | Uses real data and takes days; the estimate uses guesses and takes minutes |
+| Load testing | Firing fake traffic at a server to measure its limit | Gives you the "per-node QPS" input; it is not the estimate itself |
+| Benchmark | A test of one component (a disk, a database) on set hardware | One measured number; the estimate combines many rough numbers |
 
 ### Go code for the arithmetic
 **In plain words:** the same multiply-and-divide, written as three tiny Go functions with tests, so the numbers in the tables are machine-checked.
@@ -363,20 +439,29 @@ func TestChat(t *testing.T) {
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the formulas and how to run a full estimate for a URL shortener and a chat app. **Next is the advanced part**: how real teams turn estimates into production capacity plans, what goes wrong, and deeper tools like Little's law and IOPS that interviewers like to probe.
+
 - **Real systems:** Capacity planning at most companies follows the same arithmetic, fed with measured data: traffic forecasts from analytics, per-instance throughput from load tests, storage growth from database size metrics.
 - **Failure modes → fixes:**
 	- Sized for the average, fell over at peak → size for peak plus a lost zone; keep headroom.
 	- Forgot replication → raw storage was 3× the estimate; always multiply by the replication factor and add index overhead.
 	- Forgot metadata and indexes → a 100-byte message became 300 bytes on disk; add 30-100% overhead (estimate) or measure a sample.
 	- Forgot growth → plan for 12-24 months of growth, not today's size.
-	- Connection budget exceeded → 40 pods × 10 connections = 400 against `max_connections` = 100 in PostgreSQL 17; add a pooler.
-- **What to monitor:** actual vs estimated QPS, peak-to-average ratio, storage growth per day, per-instance throughput at the SLO, and egress cost.
+	- Connection budget exceeded → 40 pods × 10 connections = 400 against `max_connections` = 100 in PostgreSQL 17; add a pooler (a small proxy, such as PgBouncer, that lets many app connections share a few database connections).
+- **What to monitor:** actual vs estimated QPS, peak-to-average ratio, storage growth per day, per-instance throughput at the SLO (the speed and uptime target the team has promised), and egress cost.
 
 ## 8. Deep dive 🔴
 
 - **Little's law** links three numbers you estimate: `concurrency = arrival rate × time in system`. 2,000 RPS at 50 ms average latency means about 100 requests in flight at once, which sizes worker pools, DB connection pools and goroutine counts. At 500 ms latency the same load needs 1,000 in flight.
-- **Hot sets are skewed.** Request popularity often follows a power law, so a cache of 1-20% of items can serve most reads. The exact share depends on the workload; measure the hit-rate curve with real keys.
-- **IOPS, not just bytes.** A disk that stores 10 TB may still not keep up with 50,000 random reads/s. Estimate operations per second against the volume's IOPS limit as well as capacity.
+
+```mermaid
+flowchart LR
+    R["2,000 requests a second"] --> X["× 0.05 s each"]
+    X --> F["= 100 in flight at once"]
+    F --> P["size pools for ~100"]
+```
+- **Hot sets are skewed.** Request popularity often follows a power law (a few items get most of the traffic, and a long tail gets very little), so a cache of 1-20% of items can serve most reads. The exact share depends on the workload; measure the hit-rate curve with real keys.
+- **IOPS (input/output operations per second: how many separate reads or writes a disk can do), not just bytes.** A disk that stores 10 TB may still not keep up with 50,000 random reads/s. Estimate operations per second against the volume's IOPS limit as well as capacity.
 - **When one PostgreSQL stops being enough.** Rules of thumb (estimates that depend heavily on hardware and query shape): a few thousand to a few tens of thousands of simple writes per second on one primary, and data up to a few TB per node before backups, restores and index rebuilds become slow.
 
   Crossing either is the signal to look at partitioning; below both, one primary plus a replica is usually the right answer.
@@ -413,7 +498,7 @@ flowchart TD
 > ⌈peak QPS ÷ (per-node QPS × target utilisation)⌉, with per-node QPS from a load test. 231k ÷ (10k × 0.7) = 34. Then check that the DB connection budget allows that many pools.
 
 > [!question]- Which numbers would make you shard the database?
-> Sustained writes beyond what one primary can take on your hardware, or data per node beyond what you can back up and restore in your recovery time objective. If neither is crossed, one primary plus replicas and a cache is simpler.
+> Sustained writes beyond what one primary can take on your hardware, or data per node beyond what you can back up and restore in your recovery time objective (RTO: the longest you are allowed to be down after a failure). If neither is crossed, one primary plus replicas and a cache is simpler.
 
 ## 10. Cheat sheet 🟢
 
@@ -425,6 +510,26 @@ flowchart TD
 - Servers = ⌈peak ÷ (per-node × 0.6-0.7)⌉; check DB connections.
 - Little's law: in-flight = rate × latency.
 - Estimate what changes a decision; round; sanity-check.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: roughly how many seconds are in a day?
+> 86,400, which you can round to 100,000 (10⁵).
+
+> [!question]- Easy: 1 million requests a day is about how many per second?
+> About 12 per second.
+
+> [!question]- Easy: why do we multiply storage by 3?
+> Databases usually keep 3 copies of data for safety, so the disk needed is 3× one copy.
+
+> [!question]- Medium: 50 M uploads a day of 2 MB each, kept 1 year, 3 copies. Storage?
+> 50 M × 2 MB = 100 TB a day; × 365 ≈ 36.5 PB; × 3 ≈ 110 PB. Clearly a big distributed object store.
+
+> [!question]- Medium: peak is 30,000 QPS and one server does 5,000 in a load test. How many servers at 70%?
+> 30,000 ÷ (5,000 × 0.7) ≈ 8.6, so 9 servers (more if you must survive losing a zone).
+
+> [!question]- Medium: 40 app pods each keep 10 database connections. What breaks on default PostgreSQL 17?
+> 40 × 10 = 400 connections, but the default limit is 100. Add a pooler or shrink the pools.
 
 ## Links
 

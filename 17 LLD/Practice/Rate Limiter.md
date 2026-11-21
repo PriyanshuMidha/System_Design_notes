@@ -40,6 +40,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code) and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs) and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Strategy and Template Method]]: a rule behind an interface you can swap, here the five limiting algorithms.
+> - [[Decorator and Middleware]]: a wrapper that adds a step (here "check the limit") around a handler without changing it.
+> - [[Concurrency for LLD]]: goroutines run at the same time; a mutex makes them take turns on shared data.
+
 **From zero, in 60 seconds** 🟢
 
 A rate limiter is a bouncer for your API. It lets each user make, say, 100 requests a minute. Extra requests get a polite "slow down" answer, HTTP **429**. There are a few ways to count. The popular one is a **token bucket**: a bucket fills with tokens at a steady speed, and each request takes one. If the bucket is empty, the request waits or is refused. With many servers, the count lives in Redis so they all share it.
@@ -74,6 +79,11 @@ A rate limiter says "you get 10 tries a second; the rest wait" and tells each ca
 | Mutex | A lock so only one goroutine changes shared data at a time | Two requests for the same key update one counter safely |
 | Atomic | Done as one step nobody can interrupt halfway | Read, refill, check and write a bucket together |
 | Redis | A shared in-memory store many servers can use | All app instances count in one place |
+| Token bucket | A bucket of tokens that refills at a steady rate; each request spends one | 10 tokens max, +5 per second |
+| TTL (time to live) | A timer after which Redis deletes a key by itself | Counter key gone after 60 s |
+| Lua script (in Redis) | A small program Redis runs as one step, with nobody cutting in | Read, check and update the counter together |
+| Fail open / fail closed | If the limiter store is down: let requests through / block them | Feed: open. Login: closed |
+| Janitor | A background job that deletes per-key state nobody needs | Drops a full bucket for an IP seen once |
 
 **Picture it**
 
@@ -94,7 +104,7 @@ It breaks down because real stamps are physical, while here "refill" is just ari
 - First the problem statement and requirements (Steps 1-2): what is limited, per which key, and what the client sees.
 - Then entities, relationships and APIs (Steps 3-5): the rule versus the per-key state, and one `Allow(ctx, key)` method.
 - Then storage and patterns (Steps 6-7): SQL for rules, memory or Redis for state, Strategy for algorithms.
-- Finally the SDE-3 deep dive in the code and tests (Step 8 onward): token bucket, GCRA, sliding windows, the janitor, Redis Lua scripts, and fail-open versus fail-closed.
+- Finally the SDE-3 deep dive in the code and tests (Step 8 onward): token bucket, GCRA (Generic Cell Rate Algorithm: a token bucket stored as one timestamp), sliding windows, the janitor, Redis Lua scripts, and fail-open versus fail-closed.
 
 > [!tip] Remember
 > Each request does one atomic "refill, check, spend" on its key's state, and every "no" tells the client when to retry.
@@ -128,16 +138,16 @@ Questions to ask, with the assumptions this design makes:
 
 - Limit by what? *One key string per request from a key function: the user ID when logged in, else the client IP.*
 - Bursts allowed? *Yes for normal APIs (token bucket or GCRA); strict limits use a sliding window.*
-- One instance or many pods? *Code in memory first, then Redis for a global limit.*
+- One instance or many pods (copies of the app running on Kubernetes)? *Code in memory first, then Redis for a global limit.*
 - Limiter store down? *Fail open by default; fail closed for login, OTP and payment endpoints.*
-- Headers? *`Retry-After` on every 429, computed from the algorithm; quota headers on every response, using the `RateLimit-*` names of the IETF draft up to -06.*
+- Headers? *`Retry-After` on every 429, computed from the algorithm; quota headers on every response, using the `RateLimit-*` names of the IETF draft (a proposed internet standard, not final yet) up to -06.*
 - How many distinct keys? *Millions of IPs per day (an estimate for a public API), so idle state must be deleted.*
 
 **Functional:** `Allow(ctx, key)` returns a `Decision`; five swappable algorithms; HTTP middleware returns 429 with a computed `Retry-After`; fail mode per route; a janitor removes idle keys.
 
-**Non-functional:** O(1) or close per check, no SQL on the hot path; concurrent requests for one key never exceed the limit; tests without `time.Sleep`; bounded memory; a shared store for multi-instance limits.
+**Non-functional:** O(1) (constant time) or close per check, no SQL on the hot path (code that runs on every request); concurrent requests for one key never exceed the limit; tests without `time.Sleep`; bounded memory; a shared store for multi-instance limits.
 
-**Out of scope:** concurrency limits (max in-flight requests: a semaphore), DDoS at the network edge (CDN or WAF), monthly quotas and billing (metering).
+**Out of scope:** concurrency limits (max in-flight requests: a semaphore, a counter that lets at most N in at once), DDoS (a flood of traffic from many machines) at the network edge (CDN, a network of edge servers, or WAF, a web application firewall), monthly quotas and billing (metering).
 
 ## Step 2: Actors and use cases 🟢
 
@@ -159,7 +169,7 @@ The use case to code: `Allow(ctx, key)` under concurrency, where refill or windo
 | `Decision` | Allowed, Limit, Remaining, RetryAfter, Reset | Everything the HTTP layer needs for status and headers |
 | `Sweeper` (interface) | `Sweep() int` | What the janitor calls on in-memory limiters |
 | `TokenBucket` + `bucket` | capacity, rate; tokens, last | Bursts up to capacity, average = rate |
-| `GCRA` | burst, interval, tolerance; TAT per key | Same traffic as a token bucket with one timestamp per key |
+| `GCRA` | burst, interval, tolerance; TAT per key | Same traffic as a token bucket with one timestamp per key (TAT: theoretical arrival time, when the next request is "due") |
 | `FixedWindow` + `window` | limit, size; start, count | One counter per window; maps to Redis `INCR` |
 | `SlidingWindowLog` | limit, window; timestamps per key | Exact, O(limit) memory per key |
 | `SlidingWindowCounter` | limit, size; prev, curr per key | Two counters, weighted estimate, no edge burst |
@@ -172,6 +182,8 @@ One policy has millions of per-key states, so the rule lives in SQL and the stat
 The second insight: state is **deletable when it equals a fresh key** (a full bucket, a past window), and that is exactly the janitor's rule.
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know what a key, a rate and a burst are, and that each request does one "refill, check, spend". Next we open the box: how the algorithms plug in, the headers, where rules and state live, and the Go code.
 
 ```mermaid
 classDiagram
@@ -216,7 +228,7 @@ classDiagram
 ```
 
 - **Realization:** the five algorithms implement both `Limiter` and `Sweeper`. A Redis limiter implements only `Limiter`, because Redis expires its own keys.
-- **Composition:** each limiter owns its per-key map; the state has no life outside it. One mutex per limiter guards the whole map (not one per bucket); sharding by `hash(key)` is the fix if that lock becomes hot.
+- **Composition:** each limiter owns its per-key map; the state has no life outside it. One mutex per limiter guards the whole map (not one per bucket); sharding (splitting the map into N parts, each with its own lock) by `hash(key)` is the fix if that lock becomes hot.
 - **Association:** limiters use an injected `Clock`; the middleware uses a `Limiter` and never knows which algorithm.
 
 ## Step 5: APIs and public methods 🟡
@@ -233,13 +245,13 @@ GET /rate-limits/{policy}      admin
 PUT /rate-limits/{policy}      {"algorithm": "gcra", "burst": 10, "per_sec": 5, "fail_mode": "closed"}
 ```
 
-`429` comes from RFC 6585 and `Retry-After` (whole seconds here) from RFC 9110.
+`429` comes from RFC 6585 (RFCs are the official internet standard documents) and `Retry-After` (whole seconds here) from RFC 9110.
 
 The quota headers come from an IETF draft whose field names changed between versions. The code below sends the three fields of the IETF draft `draft-ietf-httpapi-ratelimit-headers` up to version -06: `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset`, where `Reset` is seconds from now.
 
 From -07 the draft replaces those three with a single structured `RateLimit` field next to `RateLimit-Policy`, so a server that follows -07 or a later version sends different names.
 
-Many public APIs use their own `X-RateLimit-*` set instead; GitHub, for example, sends `x-ratelimit-reset` as a Unix timestamp, not as seconds from now. Write down which form you send, because clients parse names and units literally.
+Many public APIs use their own `X-RateLimit-*` set instead; GitHub, for example, sends `x-ratelimit-reset` as a Unix timestamp (seconds since 1 January 1970), not as seconds from now. Write down which form you send, because clients parse names and units literally.
 
 | Function | Contract |
 | --- | --- |
@@ -299,7 +311,7 @@ sequenceDiagram
   Note over R: from 10:01 requests use a new key, and this one expires 60 s after its first INCR, so no janitor is needed
 ```
 
-The other algorithms map the same way: a token bucket is a hash `{tokens, last}` updated by one script (`HMGET`, refill by elapsed time, check, decrement, `HSET`, `PEXPIRE`); a sliding log is a sorted set (`ZREMRANGEBYSCORE`, `ZCARD`, `ZADD`, `PEXPIRE`); GCRA is one string holding the TAT, and it is the algorithm `go-redis/redis_rate` implements.
+The other algorithms map the same way: a token bucket is a hash `{tokens, last}` updated by one script (`HMGET`, refill by elapsed time, check, decrement, `HSET`, `PEXPIRE`); a sliding log is a sorted set (a Redis set kept in order by a score, here the time) (`ZREMRANGEBYSCORE`, `ZCARD`, `ZADD`, `PEXPIRE`); GCRA is one string holding the TAT, and it is the algorithm `go-redis/redis_rate` implements.
 
 Every Redis key gets a TTL, so Redis needs no janitor.
 
@@ -1116,6 +1128,8 @@ func TestCeilSeconds(t *testing.T) {
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working limiters and their tests. Next is interview depth: races between pods, Redis outages, clock problems, spoofed IPs, and the trade-offs behind each default.
+
 | Edge case | Risk | Handling |
 | --- | --- | --- |
 | 100 requests read `tokens = 1` at once | All pass | Refill, check and decrement under one mutex; the test asserts exactly 10 of 100 |
@@ -1125,11 +1139,11 @@ func TestCeilSeconds(t *testing.T) {
 | Millions of one-off IPs | Memory grows without bound | Janitor deletes state equal to a fresh key; Redis keys carry a TTL |
 | Redis down | `Allow` errors | Fail open for normal APIs, fail closed for login, OTP and payments; alert either way |
 | Fixed-window boundary | 2× burst | Sliding counter, GCRA or token bucket where it matters |
-| Clock skew between pods | Windows disagree | Use Redis `TIME` inside the script, not each pod's clock |
+| Clock skew (machines' clocks disagree by a little) between pods | Windows disagree | Use Redis `TIME` inside the script, not each pod's clock |
 | Clock going backwards | Negative elapsed time | `elapsed > 0` check; GCRA uses `max(TAT, now)` |
-| Spoofed `X-Forwarded-For` | Attackers rotate keys | Trust the header only from your own load balancer; prefer the user ID |
+| Spoofed `X-Forwarded-For` (a header that claims the original client IP, easy to fake) | Attackers rotate keys | Trust the header only from your own load balancer; prefer the user ID |
 | Signed payment-provider webhooks | Legitimate events rejected | Do not limit authenticated provider traffic; limit unauthenticated traffic |
-| Clients retry at once after 429 | Retry storm | Computed `Retry-After`; clients add jittered backoff |
+| Clients retry at once after 429 | Retry storm | Computed `Retry-After`; clients add jittered backoff (wait longer after each failure, plus a random bit so they do not all retry together) |
 
 ## Step 10: Tradeoffs and extensions 🔴
 
@@ -1199,6 +1213,26 @@ Redraw it from memory, then add what it predates: GCRA, the sliding counter, the
 - Janitor deletes keys equal to fresh state; Redis keys carry a TTL.
 - `Retry-After` is computed and rounded up; quota headers on every response (draft -06 `RateLimit-Limit/-Remaining/-Reset` here; from -07 the draft uses `RateLimit` plus `RateLimit-Policy`).
 - Fail open by default, fail closed for login, OTP and payments.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What does HTTP 429 mean, and what header must come with it?
+> "Too Many Requests"; it must come with `Retry-After` saying how long to wait.
+
+> [!question]- 🟢 Capacity 2, refill 1 per second. Three requests arrive at once. What happens?
+> Two pass, the third is denied with a wait of about 1 second.
+
+> [!question]- 🟢 Why does the rule live in SQL but the per-key counters do not?
+> There is one rule but millions of counters updated on every request; a SQL write per request is far too slow.
+
+> [!question]- 🟡 Limit 2 per minute, fixed window. How can a client get 4 requests in 10 seconds?
+> 2 at 0:50 and 2 more at 1:00, because the counter resets at the window boundary.
+
+> [!question]- 🟡 Why is `INCR` then `EXPIRE` as two Redis calls a bug?
+> If the app dies between them, the key has no TTL, never resets, and the user is limited forever; put both in one Lua script.
+
+> [!question]- 🟡 Redis is down. Allow or reject?
+> Fail open for normal routes; fail closed for login, OTP and payments; alert in both cases.
 
 ## Links 🟢
 

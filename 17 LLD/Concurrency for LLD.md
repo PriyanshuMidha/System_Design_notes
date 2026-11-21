@@ -38,6 +38,11 @@ This note is the LLD angle: where invariants live and how to defend them in an i
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Goroutines and Channels]]: `go f()` starts a task that runs alongside others, and a channel passes values between those tasks.
+> - [[sync Primitives and Atomics]]: `sync.Mutex` has `Lock` and `Unlock`, and `atomic.Int64` is a counter that is safe to bump from many tasks.
+> - [[OOP in Go - Structs, Interfaces, Embedding]]: a service is a struct with methods, and other code calls it through those methods.
+
 **From zero, in 60 seconds** 🟢
 
 A Go server handles each request in its own **goroutine** (a light thread), so two users can run the same code at the same moment. If both read "1 seat left" and both book it, you sold the seat twice. This is a **race**. The fix is to make "check" and "change" one step that only one goroutine can run at a time, using a **mutex** (a lock), or a database row lock when you have many servers. This note shows where to put that lock, how to avoid two locks waiting on each other forever (a deadlock), and why you never hold a lock while calling the network. It is code-heavy: read the plain-words line above each block first, then the code.
@@ -61,6 +66,11 @@ Now the shop owes milk it does not have. This note is about stopping that.
 | Atomic operation | A single step nobody can interrupt halfway | `counter.Add(1)` with `atomic.Int64` |
 | Deadlock | Two tasks each wait for the other forever | A holds lock 1 and wants 2; B holds 2 and wants 1 |
 | Instance | One running copy of your server | Three pods behind a load balancer |
+| Data race | Two goroutines touch the same memory at once, at least one writes, and nothing orders them | Two requests write `stock["milk"]` together |
+| Race condition | The result depends on who runs first, even with no data race | Both buyers see "1 left" and both pay |
+| Channel | A pipe that carries values from one goroutine to another | `jobs <- job` sends, `job := <-jobs` receives |
+| I/O | Talking to anything outside your program: network, disk, database | Calling the payment API takes about 200 ms |
+| Backpressure | A full queue says "no" so callers slow down instead of piling up | `Submit` returns `ErrQueueFull`, the API returns HTTP 429 |
 
 **Picture it**
 
@@ -90,18 +100,22 @@ Where it breaks: with several server instances there are several bathrooms with 
 
 ## 1. Why it exists 🟢
 
-A **data race** is two goroutines touching the same memory at the same time, with at least one write and no synchronisation between them. A **race condition** is the broader bug: the result depends on timing, even if every single access is synchronised.
+A **data race** is two goroutines touching the same memory at the same time, with at least one write and no synchronisation (nothing, such as a lock, that makes one access wait for the other) between them. A **race condition** is the broader bug: the result depends on timing, even if every single access is synchronised.
 
-Concrete scenario: a dark store has **1 packet of milk** left. Two customers tap "Pay" within the same millisecond. Two HTTP requests arrive, `net/http` starts one goroutine for each, and both call `inventory.Reserve("milk", 1)`.
+Concrete scenario: a **dark store** (a small warehouse that only packs app orders, like a quick-commerce store) has **1 packet of milk** left. Two customers tap "Pay" within the same millisecond. Two HTTP requests arrive, `net/http` (Go's built-in web server package) starts one goroutine for each, and both call `inventory.Reserve("milk", 1)`.
 
 - If `Reserve` reads the stock, releases the lock, and then writes, both goroutines see `1` and both succeed. Stock becomes `-1`: one customer is charged for milk that does not exist.
-- If the map is not locked at all, Go's runtime may crash the whole process with `fatal error: concurrent map read and map write`. That is not a panic you can recover; every request on the instance dies.
+- If the map is not locked at all, Go's runtime may crash the whole process with `fatal error: concurrent map read and map write`. That is not a panic (Go's crash-style error) you can recover (catch with `recover()` and carry on); every request on the instance dies.
 
 Almost every LLD follow-up is a version of this: two users book the last seat, two riders get the same order, two requests spend the same wallet balance. The interviewer wants three answers:
 
 1. **Where** is the shared mutable state?
 2. **What** protects it, and why that tool?
 3. **What happens** to the loser? (A clear error such as `ErrOutOfStock`, never a silent corruption.)
+
+### Real-life example 🟢
+
+Picture the last packet of milk on Blinkit, and two people tapping "Pay" in the same instant. Or picture the last seat in a BookMyShow row, or two PhonePe payments trying to spend the same ₹500 balance at once. The app must make sure exactly one of them wins and the other gets a clear "sold out" or "not enough balance", never a negative stock or a seat sold twice. Inside one Go server, that is the job of a lock around the check and the change; across many servers, the database does it.
 
 ## 2. Mental model 🟢
 
@@ -112,6 +126,8 @@ Think of shared state as a **single-occupancy room** with a whiteboard inside.
 - **Holding a lock across I/O** is staying in the room while on the phone to the bank. The queue outside grows for no reason.
 - A **single-owner goroutine** is a receptionist who alone may touch the whiteboard. Everyone else hands her a note (a channel message) and waits for the reply.
 - **Many app instances** are many buildings, each with its own room. A lock on one building's door does not stop the next building. The only shared whiteboard is the database.
+
+> 🟢 → 🟡 **You now know** the problem: two goroutines can both pass "is there stock?" and both take it, and the fix is one lock around check and change. **Next we open the box**: which tool to pick for which kind of state, how big a lock should be, how to avoid deadlock, and why slow calls must happen outside the lock.
 
 ## 3. How it works 🟡
 
@@ -138,17 +154,17 @@ flowchart TD
 
 | Situation | Use | Why | Cost |
 | --- | --- | --- | --- |
-| Shared map or struct in one process | `sync.Mutex` | Simplest and clearest; covers multi-field invariants | All callers serialise on one lock |
-| Reads far outnumber writes and the critical section is not tiny | `sync.RWMutex` | Readers run in parallel | More bookkeeping than `Mutex`; often slower for tiny sections; a waiting writer blocks new readers |
+| Shared map or struct in one process | `sync.Mutex` | Simplest and clearest; covers multi-field invariants | All callers serialise (run one after another) on one lock |
+| Reads far outnumber writes and the critical section is not tiny | `sync.RWMutex` (a lock that lets many readers in together, but a writer alone) | Readers run in parallel | More bookkeeping than `Mutex`; often slower for tiny sections; a waiting writer blocks new readers |
 | One counter or flag | `atomic.Int64`, `atomic.Bool` | Lock-free, very cheap | Only one value; cannot keep two fields consistent |
-| Read-mostly config or routing table | `atomic.Pointer[T]` with immutable snapshots | Readers never block; reload swaps the whole snapshot | Every write copies the snapshot |
-| One-time init | `sync.Once` / `sync.OnceValue` | Safe lazy init (see [[Singleton and sync.Once]]) | A panic or error inside is not retried |
+| Read-mostly config or routing table | `atomic.Pointer[T]` with immutable snapshots (copies that are never changed after they are built) | Readers never block; reload swaps the whole snapshot | Every write copies the snapshot |
+| One-time init | `sync.Once` / `sync.OnceValue` | Safe lazy init (build it the first time someone needs it; see [[Singleton and sync.Once]]) | A panic or error inside is not retried |
 | Stream of independent jobs | Bounded channel + N workers | Caps concurrency and memory; gives backpressure | Need a drain and shutdown story |
 | State machine with many rules (matching engine, elevator controller) | Single owner goroutine reading a command channel | No locks at all; events processed strictly in order | One goroutine is the throughput ceiling; every call is a round trip |
 | Wait for N goroutines, first error cancels the rest | `errgroup.Group` | Join plus error plus context cancel | Extra dependency (`golang.org/x/sync`) |
 | Many callers miss the cache for the same key | `singleflight.Group` | One load, shared result | A slow load blocks all waiters for that key |
 | At most K things at once | `semaphore.Weighted` or a buffered `chan struct{}` | Caps parallel calls to a fragile dependency | Callers wait or fail fast |
-| At most R things per second | `golang.org/x/time/rate.Limiter` | Token bucket with burst | Per process only |
+| At most R things per second | `golang.org/x/time/rate.Limiter` | Token bucket (a jar that refills at R tokens per second; each call takes one) with burst (a few extra calls allowed at once) | Per process only |
 | State shared across instances | Database or Redis | A Go mutex protects only one process | Network round trip; needs DB design |
 
 Go proverb: *"Don't communicate by sharing memory; share memory by communicating."* For guarding a map or a struct, a mutex is still simpler and perfectly idiomatic. Use channels when ownership of data really moves between goroutines.
@@ -181,7 +197,7 @@ Lock granularity is how much state one lock covers.
 
 1. **Global lock**: one mutex for the whole service. Correct and simple; the right first answer in an interview.
 2. **Per entity**: one mutex per show, per wallet, per store. Bookings for different shows no longer wait on each other.
-3. **Striped (sharded)**: `N` locks, and key `k` uses lock `hash(k) % N`. Bounded memory, most contention removed. Used inside caches and rate limiters with millions of keys.
+3. **Striped (sharded)**: `N` locks, and key `k` uses lock `hash(k) % N`. Bounded memory, most contention (goroutines queueing for the same lock) removed. Used inside caches and rate limiters with millions of keys.
 
 Move down this list only when you can say which lock is contended. Each step adds a way to get it wrong, such as an operation that needs two entities and now needs two locks.
 
@@ -222,7 +238,7 @@ The claim in step 1 is an **atomic pick-and-claim**: the check ("is it free?") a
 
 The re-check in step 3 matters because the world may have changed while the lock was released.
 
-The code below keeps the hold-expiry janitor out for brevity, so its `ErrSeatTaken` branch in step 3 only fires once a TTL sweeper is added; in that branch a failed charge is masked by `ErrSeatTaken`, and a successful one must be refunded.
+The code below keeps the hold-expiry janitor out for brevity, so its `ErrSeatTaken` branch in step 3 only fires once a TTL sweeper (a background job that frees holds older than their time limit, the TTL or time to live) is added; in that branch a failed charge is masked by `ErrSeatTaken`, and a successful one must be refunded.
 
 ## 4. Worked example 🟡
 
@@ -251,6 +267,14 @@ All the code below is one package, tested with Go 1.24.4 (`golang.org/x/sync`, `
 ### Check-then-act in one critical section
 
 **In plain words: the check and the change sit inside the same lock.**
+
+**Step by step:**
+
+1. `Store` keeps a map from product ID to stock, plus one `sync.Mutex` named `mu` that guards it.
+2. `NewStore` makes an empty map; `Add` locks, adds stock and unlocks.
+3. `Reserve` locks once, checks whether there is enough stock, and returns `ErrOutOfStock` if not.
+4. Still under the same lock, it subtracts the quantity. Because the check and the change share one lock, two buyers of the last unit cannot both win.
+5. `Available` also locks before reading, so even a read never sees a half-finished change.
 
 ```go
 package conc
@@ -358,6 +382,8 @@ func Transfer(from, to *Wallet, amount int64) error {
 ```
 
 ### Never hold a lock across I/O
+
+**What this code does, in plain words:** `SeatBooker` keeps each seat as FREE, HELD or BOOKED. Booking first marks the seat HELD for this user under the lock, then lets go of the lock and calls the payment gateway, then takes the lock again to turn HELD into BOOKED, or back into FREE if the payment failed.
 
 ```go
 package conc
@@ -549,7 +575,7 @@ func (p *Pool) Stop(ctx context.Context) error {
 }
 ```
 
-In a real service `Stop` runs from the shutdown path after `http.Server.Shutdown`, with a deadline shorter than the orchestrator's kill timeout (Kubernetes sends `SIGKILL` 30 s after `SIGTERM` by default). Jobs that matter more than that window belong in a durable queue, not in a channel.
+In a real service `Stop` runs from the shutdown path after `http.Server.Shutdown`, with a deadline shorter than the orchestrator's kill timeout (Kubernetes, the system that runs the containers, sends `SIGKILL`, a forced stop, 30 s after `SIGTERM`, a polite "please stop" signal, by default). Jobs that matter more than that window belong in a durable queue, not in a channel.
 
 ### Copy-on-write config with atomic.Pointer
 
@@ -588,6 +614,8 @@ The rule that makes this safe: a published `*Config` is never mutated. A reload 
 **In plain words: a semaphore caps how many run at once; a rate limit caps how many per second.**
 
 A **semaphore** limits how many operations run at once. A **rate limiter** limits how many start per second. They answer different questions, and calls to a fragile partner API often need both.
+
+**What this code does, in plain words:** `FetchAll` calls a partner API once per ID. A semaphore stops more than `maxInFlight` calls running at the same time, and a rate limiter stops more than `rps` calls starting each second. The second half shows a small blocking queue built with `sync.Cond`.
 
 `sync.Cond` lets goroutines sleep until a condition on locked state becomes true; it is the textbook tool for a blocking bounded queue, although a buffered channel does the same job in most Go code.
 
@@ -675,7 +703,9 @@ func (q *BlockingQueue) Take() int {
 
 **In plain words: errgroup runs tasks together and stops on the first error; singleflight makes many same requests share one call.**
 
-`errgroup.Group` (from `golang.org/x/sync`) is a `WaitGroup` that also collects the first error and, with `WithContext`, cancels the other goroutines when one fails. `SetLimit` caps how many run at once. `singleflight.Group` collapses concurrent calls with the same key into one call whose result all callers share, which stops a cache stampede when a hot key expires.
+**What this code does, in plain words:** `LoadOrderPage` fetches an order, its user and its items at the same time, and if any one fails the other two are told to stop. A second function puts `singleflight` in front of a cache load, so 100 callers asking for the same key cause just one database read. The test block after it checks both behaviours.
+
+`errgroup.Group` (from `golang.org/x/sync`) is a `WaitGroup` that also collects the first error and, with `WithContext`, cancels the other goroutines when one fails. `SetLimit` caps how many run at once. `singleflight.Group` collapses concurrent calls with the same key into one call whose result all callers share, which stops a cache stampede (hundreds of requests all hitting the database at once) when a hot key (a very popular cache entry) expires.
 
 ```go
 package conc
@@ -802,6 +832,8 @@ func TestPriceCache_OneLoadForConcurrentMisses(t *testing.T) {
 **In plain words: tools that catch races and leaked goroutines in your tests.**
 
 `goleak` (from `go.uber.org/goleak`) fails the package if goroutines are still alive when tests end, which catches workers that were never stopped. The winner test releases 100 goroutines from a closed channel (a **start barrier**) so they really collide, and counts winners with an atomic.
+
+**What this code does, in plain words:** these are the tests for every piece above. The first block fires 100 goroutines at the last packet of milk and checks that exactly one wins, then tests the wallet transfer, the seat booking with payment, and the worker pool shutdown. The second block checks that the semaphore never lets more than 3 calls run at once. `goleak` fails the run if any goroutine is left behind.
 
 ```go
 package conc
@@ -1078,6 +1110,14 @@ go test -race -count=3 ./...
 
 Measured: `ok example.com/conc 3.048s` on an Apple Silicon laptop with Go 1.24.4 (three runs of every test under the race detector).
 
+## Common beginner mistakes 🟢
+
+- **Mistake:** checking the stock under the lock, unlocking, then subtracting under a second lock. → **Why it's wrong:** two goroutines both see 1 and both take it, so stock goes to -1. → **Do this instead:** keep the check and the change in one locked section, as `Store.Reserve` does.
+- **Mistake:** locking `from` then `to` in `Transfer` in the order the caller passed them. → **Why it's wrong:** A→B and B→A at the same time each hold one lock and wait forever for the other (a deadlock). → **Do this instead:** always lock in a fixed order, by wallet ID, as `Transfer` does.
+- **Mistake:** holding the lock while calling the payment gateway. → **Why it's wrong:** one slow payment freezes every other booking for seconds. → **Do this instead:** mark the seat HELD, unlock, call payment, then lock again to confirm, as `SeatBooker.Book` does.
+- **Mistake:** letting `Submit` wait when the job queue is full. → **Why it's wrong:** request goroutines pile up and the server slows to a halt. → **Do this instead:** return `ErrQueueFull` at once, as `Pool.Submit` does, and let the caller reply "try later".
+- **Mistake:** believing a test proves safety because it passed once. → **Why it's wrong:** races show up only on some runs. → **Do this instead:** start many goroutines behind a start barrier, count winners, and run `go test -race -count=3`.
+
 ## 5. Variants and comparison 🟡
 
 | Approach | How it works | When to use | Cost and risk |
@@ -1088,15 +1128,17 @@ Measured: `ok example.com/conc 3.048s` on an Apple Silicon laptop with Go 1.24.4
 | Single owner goroutine (actor or event loop) | One goroutine owns the state; callers send commands on a channel and wait for a reply | Order book, elevator scheduler, game loop: strict ordering, many rules | One core of throughput; every call is a channel round trip; must handle shutdown |
 | Atomics | CPU-level read-modify-write on one word | Counters, flags, pointer swaps | Cannot protect multi-field invariants; easy to write subtle bugs |
 | Database owns the invariant | Conditional `UPDATE`, unique index, `FOR UPDATE` | Any state shared by more than one instance | Round trip per operation; lock contention moves to the DB |
-| Distributed lock (Redis `SET NX PX`) | Lease with a TTL across instances | Short holds where the DB cannot express the rule | Leases expire during GC pauses; needs fencing tokens |
+| Distributed lock (Redis `SET NX PX`) | Lease with a TTL across instances | Short holds where the DB cannot express the rule | Leases (locks that expire on their own) expire during GC pauses (moments when Go's memory cleaner briefly stops the program); needs fencing tokens (explained in section 7) |
 
 ## 6. Trade-offs and when not to use 🟡
 
 - **Do not add concurrency the problem does not need.** A parking lot with one gate and an in-memory map needs one mutex, not channels, actors and striping. Over-engineering costs interview minutes and adds bugs.
-- **RWMutex is not a free upgrade.** For a critical section of a few map operations, a plain `Mutex` is often as fast or faster, and `RWMutex` makes it easy to forget that a "read" path (an LRU `Get` moves the item to the front) actually writes.
+- **RWMutex is not a free upgrade.** For a critical section of a few map operations, a plain `Mutex` is often as fast or faster, and `RWMutex` makes it easy to forget that a "read" path (an LRU, or least-recently-used, cache `Get` moves the item to the front) actually writes.
 - **Channels are not automatically safer.** A design with five channels and three `select` statements is harder to prove correct than a struct with one mutex. Use channels when work or ownership moves; use a mutex when goroutines share a struct.
 - **Atomics only cover one word.** Two atomics are not one atomic: `count.Add(1)` followed by `total.Add(price)` can be observed half done.
 - **The in-process lock is pointless across instances.** Once the service is horizontally scaled, only the database or a fenced distributed lock can enforce "exactly one wins". Say this unprompted in an interview.
+
+> 🟡 → 🔴 **You now know** how to protect shared state inside one Go process and how to test it. **Next comes the production view**: what changes when the same code runs on many servers at once, what breaks under real traffic, and the finer points of the Go runtime that interviewers like to probe.
 
 ## 7. In production 🔴
 
@@ -1108,7 +1150,7 @@ Measured: `ok example.com/conc 3.048s` on an Apple Silicon laptop with Go 1.24.4
 | --- | --- | --- |
 | Conditional UPDATE | `UPDATE inventory SET qty = qty - $1 WHERE product_id = $2 AND qty >= $1;` and 0 rows affected means out of stock | Counters and stock; one statement, no explicit lock |
 | Row lock | `SELECT qty FROM inventory WHERE product_id = $1 FOR UPDATE;` then update in the same transaction | Read-modify-write that needs logic between read and write |
-| Queue claim | `SELECT id FROM jobs WHERE status = 'ready' ORDER BY id LIMIT 10 FOR UPDATE SKIP LOCKED;` | Many workers taking distinct rows without blocking each other |
+| Queue claim | `SELECT id FROM jobs WHERE status = 'ready' ORDER BY id LIMIT 10 FOR UPDATE SKIP LOCKED;` | Many workers taking distinct rows without blocking each other (`SKIP LOCKED` jumps over rows another worker has already locked) |
 | Optimistic version | `UPDATE orders SET status = $1, version = version + 1 WHERE id = $2 AND version = $3;` and retry on 0 rows | Low contention; long user think time |
 | Unique constraint | `UNIQUE (show_id, seat_id)` on bookings | "Only one can ever win", enforced even against buggy code |
 | Partial unique index | `CREATE UNIQUE INDEX one_active_hold ON seat_holds (show_id, seat_id) WHERE status = 'HELD';` | One active row per key while history rows remain |
@@ -1138,7 +1180,7 @@ Without it, a holder that paused (GC, network) past its TTL can still write afte
 
 - **Oversell under load** → check and act in one critical section; in the DB, a conditional `UPDATE` or a unique index.
 - **p99 latency spikes when a dependency is slow** → a lock was held across I/O; move the call out and re-check.
-- **Requests hang forever under specific traffic** → lock-order deadlock; sort locks; dump goroutines with `SIGQUIT` or `/debug/pprof/goroutine?debug=2` to see who waits on what.
+- **Requests hang forever under specific traffic** → lock-order deadlock; sort locks; dump goroutines with `SIGQUIT` or `/debug/pprof/goroutine?debug=2` (pprof is Go's built-in profiler; this page lists every goroutine and where it is stuck) to see who waits on what.
 - **Memory and goroutine count grow slowly** → leaked goroutines blocked on a channel nobody closes; add `ctx.Done()` cases and goleak tests.
 - **Jobs lost during deploys** → the pool did not drain; close the queue, wait with a deadline, persist anything important.
 
@@ -1151,7 +1193,7 @@ Without it, a holder that paused (GC, network) past its TTL can still write afte
 
 ## 8. Deep dive 🔴
 
-- **What a mutex actually guarantees.** Under the Go memory model, `Unlock` *synchronises before* the next `Lock` of the same mutex. Everything written before the unlock is visible after the lock. That visibility guarantee, not just mutual exclusion, is why reading a field "just once" without the lock is still a data race.
+- **What a mutex actually guarantees.** Under the Go memory model (the official rules for when one goroutine is guaranteed to see another's writes), `Unlock` *synchronises before* the next `Lock` of the same mutex. Everything written before the unlock is visible after the lock. That visibility guarantee, not just mutual exclusion, is why reading a field "just once" without the lock is still a data race.
 - **Mutex starvation mode.** Since Go 1.9, a `sync.Mutex` switches to starvation mode when a waiter has waited longer than 1 ms: the lock is handed directly to the oldest waiter instead of letting new arrivals barge in. This trades throughput for fairness under heavy contention.
 - **`go vet` copylocks.** A struct holding a `sync.Mutex` must not be copied after first use; the copy has its own lock state. `go vet` reports value receivers and assignments that copy locks, which is why the types above use pointer receivers.
 - **`sync.Cond` needs a loop.** `Wait` can return when the condition is still false: Go's `Cond` has no spurious wake-ups, but between `Signal` and the waiter re-locking, another goroutine can take the item first, so it is always `for !cond { c.Wait() }`, never `if`. `Cond` also cannot be combined with `select` or a context, which is why channels usually win in Go.
@@ -1197,6 +1239,26 @@ Without it, a holder that paused (GC, network) past its TTL can still write afte
 - Background work: bounded channel, fixed workers, backpressure, drain on stop.
 - Many instances: conditional `UPDATE`, unique or partial unique index, `FOR UPDATE SKIP LOCKED`, fenced leases.
 - Prove it: start barrier, atomic winner count, `-race -count=N`, goleak.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What is the difference between a data race and a race condition?
+> A data race is two goroutines touching the same memory with no lock and at least one write; a race condition is any bug where timing decides the result, even when every access is locked.
+
+> [!question]- 🟢 Why does locking for the check and locking again for the update still oversell?
+> Between the two lock sections the lock is free, so a second goroutine can also read "1 left" before either one writes.
+
+> [!question]- 🟢 Why is a Go mutex useless once you run three server instances?
+> Each instance has its own mutex in its own memory; only a shared store such as the database can make one request win across all three.
+
+> [!question]- 🟡 How does `Transfer` avoid deadlock when A→B and B→A run together?
+> It always locks the lower wallet ID first, so both transfers try the same lock first and no waiting cycle can form.
+
+> [!question]- 🟡 What are the three steps for a slow call such as a payment, and why the last one?
+> Claim under the lock, call with no lock held, then re-lock and re-check the claim is still yours, because the world may have changed while you were away.
+
+> [!question]- 🟡 When do you pick `atomic.Int64` and when a mutex?
+> An atomic for one number or flag; a mutex as soon as two fields must change together, because two atomics are not one atomic.
 
 ## Links 🟢
 

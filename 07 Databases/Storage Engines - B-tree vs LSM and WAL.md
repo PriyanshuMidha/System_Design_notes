@@ -45,6 +45,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Indexing Fundamentals]]: an index is a sorted structure (usually a B-tree) that finds rows without reading everything.
+> - [[Transactions and ACID]]: after `COMMIT` returns, the change must survive a crash (the D in ACID). This note shows how.
+> - [[Page Cache, File Systems and fsync]]: a normal write lands in the operating system's memory first; only `fsync` forces it onto the disk.
+
 **From zero, in 60 seconds** 🟢
 
 You type something into an app and press save. If the power dies one second later, you still expect your save to be there when the machine comes back.
@@ -91,6 +96,12 @@ This note is about how it keeps that promise and how it lays data out on disk so
 | Buffer pool | Pages the database keeps cached in RAM | Hot pages stay in memory, cold ones go to disk |
 | Crash recovery | What the database does at restart to get back to a correct state | Replaying the log after a power cut |
 | Compaction | Background merging of files to drop old versions and deleted data | Merging 4 small sorted files into 1 |
+| WAL (write-ahead log) | The diary file every change is written to before the data files | replayed after a crash |
+| Checkpoint | The moment the data files are caught up with the WAL, so older WAL can be recycled | every 5 minutes in PostgreSQL |
+| Memtable / SSTable | An LSM's sorted in-memory buffer, and the sorted read-only file it is dumped into | 64 MB memtable → one SSTable |
+| Tombstone | A "this key is deleted" marker in an LSM | removed later by compaction |
+| Torn page | A page left half old, half new by a crash mid-write | 4 kB of an 8 kB page written |
+| LSN | Log sequence number: a byte position in the WAL | stamped on each page |
 
 **Picture it**
 
@@ -139,6 +150,21 @@ So engines do something cheaper and safer: append a small record describing the 
 
 The flush, not the write, is the expensive part. Every design in this note is shaped by that.
 
+### Real-life example 🟢
+
+When you send a payment in a UPI app, the bank's database must remember it even if a server loses power a moment later.
+It does not rewrite the big account tables right away; it first appends one short line ("account A −₹500, account B +₹500, committed") to its log and forces that line onto disk.
+Only then does the app show "Payment successful".
+The account tables are brought up to date a little later, and after a crash the log is replayed so nothing confirmed is lost.
+
+## Common beginner mistakes 🟢
+
+- **Thinking `COMMIT` means "written to the table file"** → it only means "written to the log on disk"; the table files catch up later → trust the WAL, and keep it on reliable storage.
+- **Turning off `fsync` or `full_page_writes` for speed** → a power cut can then corrupt data, not just lose the last commits → if you must trade safety, use `synchronous_commit = off`, which can lose recent commits but never corrupts.
+- **Using random UUIDv4 keys on a hot B-tree** → inserts land all over the index, causing many page splits and half-empty pages → use ever-increasing keys such as identity columns or UUIDv7.
+- **Assuming a delete in an LSM frees space at once** → it only writes a tombstone; space comes back after compaction → watch tombstone counts and plan compaction.
+- **Picking an LSM engine for a normal app "because writes are faster"** → reads and range scans get more expensive, and compaction needs tuning → use a B-tree engine like PostgreSQL unless write volume is the real bottleneck.
+
 ## 2. Mental model 🟢
 
 - **Pages and a cache.** Data lives in fixed-size pages: 8 kB in PostgreSQL, 16 kB by default in InnoDB. The engine copies pages into an in-memory **buffer pool**, changes them there, and writes them back later.
@@ -151,11 +177,20 @@ Analogy: an accountant's **journal and ledger**. Every transaction is first writ
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the one rule (write the log, flush it, then answer) and the two ways to lay out data files. **Next we open the box**: pages and the cache, how a B+tree grows, the WAL rules, group commit, checkpoints, crash recovery, and how LSM trees write, read and compact. Most subsections start with a short step-by-step walk.
+
 ### Pages and the buffer pool
 
 **In plain words:** the database reads and writes the disk in fixed-size blocks called pages, like a binder that only accepts full sheets, and keeps the busiest sheets copied in RAM.
 
-A PostgreSQL page has a 24-byte header, an array of 4-byte line pointers growing forward, row versions (tuples) growing backward from the end, and free space in between. The header records the **LSN** (log sequence number, a byte position in the WAL) of the last WAL record that changed the page.
+**Step by step (update invoice 42):**
+1. The row lives on some 8 kB page of the `invoices` file.
+2. If that page is not already in RAM (the buffer pool), read the whole page from disk.
+3. Change the row inside the page in RAM. The page is now "dirty" (newer in RAM than on disk).
+4. Write a small WAL record describing the change.
+5. The dirty page is written back to its file later, not at commit time.
+
+A PostgreSQL page has a 24-byte header, an array of 4-byte line pointers (small slots that say where each row sits inside the page) growing forward, row versions (tuples) growing backward from the end, and free space in between. The header records the **LSN** (log sequence number, a byte position in the WAL) of the last WAL record that changed the page.
 
 Recovery uses it to skip changes the page already has.
 
@@ -200,7 +235,7 @@ flowchart LR
     before ==> after
 ```
 
-- **Key order decides page fill.** Ever-increasing keys (identity columns, UUIDv7) always land on the rightmost leaf. PostgreSQL then splits so the left page stays at the fillfactor (90% for B-tree indexes), and InnoDB leaves pages about 15/16 full. Random keys (UUIDv4) split pages everywhere; InnoDB documents random-order pages as 1/2 to 15/16 full. That means more pages, more cache misses and more writes; see [[Unique ID Generation]].
+- **Key order decides page fill.** Ever-increasing keys (identity columns, UUIDv7) always land on the rightmost leaf. PostgreSQL then splits so the left page stays at the fillfactor (how full a page is packed, leaving room for later updates; 90% for B-tree indexes), and InnoDB leaves pages about 15/16 full. Random keys (UUIDv4) split pages everywhere; InnoDB documents random-order pages as 1/2 to 15/16 full. That means more pages, more cache misses and more writes; see [[Unique ID Generation]].
 - **Splits run concurrently.** PostgreSQL's B-tree is a Lehman–Yao **B-link tree**: every page has a right-link and a "high key", so a reader that lands on a page that was just split simply moves right instead of waiting for a lock on the parent.
 - **Space is not given back eagerly.** Deleting entries leaves half-empty pages. PostgreSQL's VACUUM recycles a B-tree page only once it is completely empty.
 
@@ -239,6 +274,12 @@ sequenceDiagram
 
 **In plain words:** one trip to the disk can carry many commits at once, like one delivery van taking everyone's parcels instead of one van per parcel.
 
+**Step by step:**
+1. Session A commits and starts an `fsync` of the WAL, which takes about 3.8 ms.
+2. While that flush is running, sessions B and C write their commit records and wait.
+3. When A's flush ends, one more `fsync` makes both B's and C's records durable.
+4. Three commits needed two flushes instead of three; with more sessions the saving grows.
+
 One `fsync` makes every record written before it durable, so commits that arrive while a flush is running can share the next one.
 
 ```mermaid
@@ -265,6 +306,12 @@ With a flush costing about 3.8 ms (measured above), three sessions that commit i
 
 **In plain words:** every engine has knobs that trade a little safety for speed; they decide how many of your very latest commits a crash may eat.
 
+**Step by step:**
+1. Default PostgreSQL: each `COMMIT` waits for the WAL flush. A crash loses nothing that was acknowledged.
+2. `synchronous_commit = off`: `COMMIT` returns before the flush. A crash can lose up to about 0.6 s of recent commits, but data is never corrupted.
+3. InnoDB `innodb_flush_log_at_trx_commit = 1`: flush at every commit (safe). `2` or `0`: flush once a second (faster, can lose about a second).
+4. Choose per kind of data: payments stay safe; click-tracking events can use the faster setting.
+
 - **PostgreSQL:** the WAL lives in 16 MB segment files in `pg_wal`. One flush covers every record written so far, so commits that arrive together share it (**group commit**). The same WAL stream feeds [[Replication]] and point-in-time recovery ([[Backup, PITR and Disaster Recovery]]).
 	- `synchronous_commit = off` acknowledges before the flush. A crash can lose the last commits (at most about three times `wal_writer_delay`, 600 ms by default) but never corrupts data. It can be set per transaction, for example for analytics events but not payments.
 	- `commit_delay` (default 0) makes the flushing backend wait briefly so more commits join the flush.
@@ -275,6 +322,12 @@ With a flush costing about 3.8 ms (measured above), three sessions that commit i
 ### Checkpoints and torn pages
 
 **In plain words:** a checkpoint is the moment the database catches the data files up with the diary, so old diary pages can be thrown away; a torn page is a sheet the power cut left half old, half new.
+
+**Step by step:**
+1. Every 5 minutes (or after 1 GB of WAL) a checkpoint starts.
+2. It writes all dirty pages from RAM to the data files, spread out over time.
+3. It writes a checkpoint record to the WAL. WAL from before this point is no longer needed for recovery.
+4. The first time each page changes after the checkpoint, PostgreSQL logs a full copy of that page, so a page torn by a crash can be restored whole.
 
 A **checkpoint** writes every dirty page to the data files, then writes a checkpoint record to the WAL. Recovery starts from the last checkpoint's REDO point, so WAL before it can be recycled.
 
@@ -298,8 +351,8 @@ Example: after checkpoint 1, a hot page changes 5 times before the next checkpoi
 **In plain words:** at restart the database opens the diary at the last "books balanced" mark and redoes every entry from there, skipping anything the pages already have.
 
 1. Read `pg_control` to find the last checkpoint and its REDO point.
-2. Replay WAL records in order from there. A full-page image overwrites the page. A normal record is applied only if the page's LSN is older than the record's, which makes replay idempotent.
-3. Stop at the first record with a bad CRC or a missing next segment: that is the end of the WAL.
+2. Replay WAL records in order from there. A full-page image overwrites the page. A normal record is applied only if the page's LSN is older than the record's, which makes replay idempotent (running it twice has the same effect as once).
+3. Stop at the first record with a bad CRC (checksum: a number that shows whether bytes were damaged) or a missing next segment: that is the end of the WAL.
 4. There is **no undo pass**. A transaction without a commit record counts as aborted; its row versions stay invisible and VACUUM removes them later. InnoDB, which updates rows in place, must also roll back unfinished transactions from the undo log, which it does in the background after startup.
 
 ```mermaid
@@ -328,6 +381,13 @@ An LSM engine turns every write into a sequential append.
 
 **In plain words:** writes pile up in a sorted in-memory pad, get dumped as read-only sorted files, and a read checks the pad first and then the files from newest to oldest.
 
+**Step by step:**
+1. A write `invoice:42 = paid` is appended to the WAL and inserted into the memtable (a sorted structure in RAM).
+2. When the memtable reaches 64 MB, it is frozen and written to disk as one sorted, read-only file: an SSTable (sorted string table).
+3. A read for `invoice:42` checks the memtable first, then SSTables from newest to oldest.
+4. Each SSTable has a bloom filter (a tiny summary that can say "definitely not here"), so most files are skipped without reading them.
+5. The first version found is the newest, and it wins.
+
 ```mermaid
 flowchart LR
     W["Put / Delete"] --> LOG["append to WAL<br/>(commit log)"]
@@ -350,6 +410,12 @@ flowchart LR
 ### Deletes and compaction
 
 **In plain words:** an LSM never erases anything on the spot; a delete is just a "this is gone" note (a tombstone), and a background merge later throws out the old copies and the notes together.
+
+**Step by step:**
+1. You delete `invoice:42`. The engine writes a tombstone: "`invoice:42` deleted".
+2. Older SSTables still hold the old value; reads see the tombstone first and return "not found".
+3. Compaction merges a few SSTables into one, keeping only the newest version of each key.
+4. Once the tombstone has passed every older copy, both are dropped and the space is freed.
 
 - **Delete.** Write a **tombstone**. The old value is only physically removed when compaction carries the tombstone past every older version.
 - **Compaction** merges SSTables, drops overwritten versions and expired tombstones, and keeps reads bounded. **Leveled** compaction (RocksDB default, LevelDB, Cassandra LCS) keeps one sorted run per level, each about 10 times larger than the last (RocksDB L1 target 256 MB). **Size-tiered** (Cassandra STCS, RocksDB "universal") merges files of similar size.
@@ -379,6 +445,12 @@ flowchart LR
 ### Read, write and space amplification
 
 **In plain words:** these three numbers say how much extra work the engine does per read, how many extra bytes it writes per byte you save, and how much extra disk it wastes — and no design can win on all three at once.
+
+**Step by step (the three ratios with small numbers):**
+1. You write 1 MB. Compaction rewrites it several times over its life, say 10 MB in total: write amplification 10.
+2. A point read checks the memtable and 3 files: read amplification about 4.
+3. 1 GB of live data takes 1.1 GB on disk because old versions wait for compaction: space amplification 1.1.
+4. Making one of these smaller usually makes another bigger.
 
 - **Write amplification:** bytes written to storage ÷ bytes the application wrote.
 - **Read amplification:** pages or files touched per logical read.
@@ -522,6 +594,8 @@ flowchart TD
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how both engine families write, read, recover and clean up. **Next is the senior view**: real tuning settings and failure modes in production, and the deeper internals interviewers probe.
+
 - **Real systems:** see the list in section 5. Defaults differ in ways that matter:
 	- Cassandra's default `commitlog_sync: periodic` (every 10 s) acknowledges writes before they are fsynced, relying on replicas for durability.
 	- RocksDB's `WriteOptions.sync` is false by default: a process crash loses nothing (the WAL is in the OS page cache), but a machine crash can.
@@ -573,6 +647,9 @@ flowchart TD
 
 ## 10. Cheat sheet 🟢
 
+🟢 **Plain version:** A database first writes each change to a log and forces it onto disk, then says "saved"; the real data files catch up later, and the log is replayed after a crash. The slow part is forcing data onto disk, so many commits share one flush. B-trees edit sorted pages in place; LSM trees keep writing new sorted files and merge them in the background. B-trees suit most apps; LSM trees suit very heavy writing.
+
+
 - WAL rule: log before data, flush the log before acknowledging the commit.
 - The cost is the `fsync`: about 3.8 ms each on this laptop (measured); group commit shares one flush across many commits.
 - Checkpoint = write dirty pages + mark a REDO point; recovery replays the WAL from it. Full-page writes or doublewrite protect against torn pages.
@@ -580,6 +657,30 @@ flowchart TD
 - LSM: WAL + memtable → SSTables → compaction; bloom filters for point misses; tombstones for deletes.
 - Leveled = low space amp and high write amp; tiered = the reverse; you cannot minimise read, write and space at once (RUM).
 - PostgreSQL: heap + redo-only WAL + VACUUM. InnoDB: clustered PK + redo + undo + doublewrite. RocksDB, Cassandra, Pebble: LSM.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does the database write first when you commit?
+> A small record in the WAL, which it forces onto disk before replying.
+
+> [!question]- What is the difference between a B-tree and an LSM tree in one line?
+> A B-tree edits sorted pages in place; an LSM tree only writes new sorted files and merges them later.
+
+> [!question]- How does an LSM tree delete a key?
+> It writes a tombstone; compaction removes the old value and the tombstone later.
+
+🟡 Medium
+
+> [!question]- Why is group commit faster?
+> One `fsync` makes every record written before it durable, so many commits share one slow flush.
+
+> [!question]- Why does PostgreSQL log a full page image after each checkpoint?
+> So a page torn by a crash mid-write can be restored whole before smaller changes are replayed onto it.
+
+> [!question]- Why do bloom filters help LSM point reads but not range scans?
+> They answer "is this exact key maybe here?"; a range has no single key to test.
 
 ## Links 🟢
 

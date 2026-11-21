@@ -33,6 +33,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[AWS 05 - ECS, Fargate and ECR]]: ECS services keep N container tasks running from images stored in ECR.
+> - [[AWS 08 - RDS and Aurora]]: RDS runs the database with a standby in another AZ, and failover takes about 1-2 minutes.
+> - [[AWS 06 - Load Balancing (ALB vs NLB)]]: an ALB spreads HTTP requests over healthy tasks in a target group.
+> - [[Infrastructure as Code with Terraform]]: the whole setup is written as Terraform files and changed through reviewed plans.
+
 **From zero, in 60 seconds** 🟢
 
 This note puts all the AWS pieces together into one real setup for a Go API.
@@ -75,6 +81,10 @@ This note shows the standard AWS layout for that.
 | Security group | A firewall attached to a resource | DB only accepts the app's traffic |
 | Availability Zone (AZ) | A separate data center group | Two AZs = survive one failing |
 | Secrets Manager | Safe store for passwords and keys | DB password injected at start |
+| NAT gateway | Lets private tasks call out to the internet without being reachable | Calling a payment API |
+| Isolated subnet | A subnet with no route to the internet at all | Where RDS lives |
+| Task definition | The blueprint ECS runs: image, CPU, memory, secrets | `checkout-api:42` |
+| Target tracking | Auto scaling that keeps one number near a target | Keep CPU near 60% |
 | Health check | A regular "are you alive?" request | `GET /healthz` returns 200 |
 
 **Picture it**
@@ -112,6 +122,14 @@ This note is the plan B, assembled in advance: every AWS note this folder covers
 
 Concretely, this reference architecture answers five questions an interviewer — or an incident — will ask: Where does a request go on the happy path? What happens when one AZ disappears? Where do secrets come from? How does a bad deploy get undone? And roughly what does this cost per month?
 
+### Real-life example: a checkout API for a sale 🟢
+
+Picture the checkout API of a shopping app like Flipkart during a big sale.
+Users reach it by name through Route 53, hit an ALB in two AZs, and land on Go containers in private subnets.
+The containers talk to a Multi-AZ database and a cache that the internet cannot reach at all.
+When traffic triples, more containers start; if one AZ fails, the other carries on and the database fails over in about a minute while the app retries.
+A bad deploy is rolled back automatically by the ECS circuit breaker.
+
 ## 2. Mental model 🟢
 
 Picture three concentric rings, each one only trusting the ring just inside it:
@@ -122,11 +140,28 @@ Picture three concentric rings, each one only trusting the ring just inside it:
 
 Every arrow between rings is also a security-group rule and a potential health check. If you can draw the three rings and what crosses between them, you can draw this whole architecture from memory.
 
+## Common beginner mistakes 🟢
+
+- **Running everything in one AZ** → one building's outage takes the whole service down → spread the ALB, tasks and database over at least 2 AZs.
+- **Opening the database security group to an IP range** → anything in that range can connect → allow only the app's security group.
+- **Baking the DB password into the image or task env** → anyone who can read them sees it → reference it from Secrets Manager.
+- **Pointing the ALB health check at a "deep" check** → one slow dependency pulls every task out of traffic → keep it to "is this task ready".
+- **No retry around database connects** → every failover becomes a full outage until restart → retry with backoff for a bounded time.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the three rings: public edge, private compute, isolated data. **Next we open the box**: the exact path of a request, the chain of security groups, where config and secrets come from, and how scaling, monitoring and deploys fit together.
 
 ### End-to-end request path and VPC/AZ layout
 
 **In plain words:** follow one request from the user's browser to the database. Each box is a service with its own note.
+
+**Step by step:**
+1. The browser asks Route 53 for `api.example.com` and gets the ALB (through an alias record).
+2. HTTPS reaches the ALB in public subnets in two AZs; it decrypts with the ACM certificate.
+3. The ALB sends the request to a healthy Go task in a private subnet.
+4. The task reads from the cache or queries RDS in an isolated subnet.
+5. The answer goes back the same way. Outbound calls (say, to a payment API) leave through the NAT gateway.
 
 ```mermaid
 flowchart TB
@@ -179,6 +214,12 @@ Isolated subnets hold RDS and ElastiCache, with no route to the internet in eith
 
 **In plain words:** each layer's guard says "only let in the layer in front of me". The database only accepts the app; the app only accepts the ALB.
 
+**Step by step:**
+1. ALB group: allows 443 from anywhere.
+2. App group: allows 8080 only from the ALB group.
+3. DB group: allows 5432 only from the app group; cache group allows 6379 only from the app group.
+4. A new task joins the app group, so it can reach the database without anyone editing rules.
+
 ```mermaid
 flowchart LR
     Internet((Internet)) -- "443" --> ALBSG["ALB security group<br/>ingress: 0.0.0.0/0:443"]
@@ -195,6 +236,12 @@ A Network ACL at the subnet boundary is a second, stateless layer most teams lea
 
 **In plain words:** plain settings come from env vars, secrets come from Secrets Manager at start-up, and health URLs tell the ALB who is ready.
 
+**Step by step:**
+1. The task definition sets `LOG_LEVEL=info` as a plain environment variable.
+2. It names the DB password's ARN in Secrets Manager; at task start, ECS fetches it with the execution role and injects it.
+3. The container's own health check restarts it if the process hangs (liveness).
+4. The ALB's `/healthz` check decides if the task gets traffic right now (readiness).
+
 The ECS task definition pulls plain config from environment variables set directly in the task definition (region, log level, feature flags) and secrets (DB password, API keys) from AWS Secrets Manager or SSM Parameter Store **by reference** — the task execution role is granted `secretsmanager:GetSecretValue` for exactly those ARNs, and the value is injected into the container's environment at start time, never written to the image or to Terraform state in plaintext.
 
 See [[Secrets Management]] for the rotation and access-pattern details this reuses rather than repeats.
@@ -206,6 +253,12 @@ Health checks exist at two layers with different meanings:
 ### Scaling, observability, CI/CD and rollback
 
 **In plain words:** more tasks when busy, logs and metrics to CloudWatch, deploys by pipeline, and an automatic undo if health checks fail.
+
+**Step by step:**
+1. Requests per task climb past the target; ECS auto scaling adds tasks.
+2. Every layer sends metrics and logs to CloudWatch; alarms page on-call.
+3. A merge builds one image, pushes it to ECR, and updates the ECS service.
+4. If the new tasks keep failing health checks, the circuit breaker rolls back.
 
 ECS service auto scaling adds tasks on a target-tracking policy (CPU, or `ALBRequestCountPerTarget`); RDS read replicas and ElastiCache absorb read and cache load separately from compute scaling.
 
@@ -309,6 +362,8 @@ func ConnectWithBackoff[T any](
 	return zero, maxAttempts, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
 }
 ```
+
+**What this code does, in plain words:** the code tries to connect, and on failure waits a little longer each time, up to a limit. The test makes the first 3 tries fail, like a failover, and checks the 4th succeeds.
 
 Test, simulating the first 3 dials failing (the failover window) and the 4th succeeding (the standby is promoted and reachable):
 
@@ -425,6 +480,9 @@ These are the failures that show up first when a new service goes to this archit
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the full request path, the security-group chain, config and secrets, scaling, monitoring and rollback, plus how the app survives a database failover. **Next is the advanced part**: what breaks in real deployments, what to watch, and the deeper design choices interviewers probe.
+
+
 - **Real systems:** this Route 53 → ALB → ECS Fargate → RDS/ElastiCache shape is the default AWS reference architecture referenced across AWS's own Well-Architected guidance and is what most mid-size SaaS companies run before any team-specific Kubernetes or multi-region investment; the SQS queue is the standard escape hatch for anything that shouldn't block the request (emails, webhooks, image processing).
 - **Failure modes → fixes:**
   - **AZ loss:** the ALB and ECS service's tasks in the surviving AZ keep serving; RDS fails over to its standby in 60-120s (see the worked example above for the Go-side retry behavior this requires) — drilled by actually stopping one AZ's tasks in a game day, not just trusting the diagram.
@@ -497,6 +555,30 @@ These are the failures that show up first when a new service goes to this archit
 - RDS Multi-AZ failover takes ~60-120s; the app must retry with backoff and jitter through that window, not fail hard.
 - VPC endpoints for ECR/S3/Logs avoid most NAT gateway cost; the NAT gateway is the most commonly underestimated line item.
 - RPO/RTO are explicit numbers you test (a failover drill), not assumptions you hope are true.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Which ring is the only one reachable from the internet?
+> The edge ring: Route 53, the optional CDN/WAF and the ALB.
+
+> [!question]- Where does the DB password come from?
+> Secrets Manager (or SSM), injected into the task at start.
+
+> [!question]- Why run in two AZs?
+> So one AZ failing does not take the service down.
+
+🟡 Medium
+
+> [!question]- Why does the DB security group name the app security group instead of an IP range?
+> Only traffic that passed through the app tier can connect, and new tasks need no rule edits.
+
+> [!question]- What does the Go app need to survive a 60-120 s RDS failover?
+> Bounded retry with backoff on connects, so it reconnects once the standby is promoted.
+
+> [!question]- What is the difference between the container health check and the ALB health check?
+> The container check restarts a dead process; the ALB check only removes a task from traffic.
 
 ## Links
 

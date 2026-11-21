@@ -38,6 +38,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example) and 8 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 5 (deep dives), 6, 7, 9 and 10. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Interview Framework]]: the order to work in: requirements, estimates, API, data, design, deep dives.
+> - [[Scaling WebSockets]]: millions of open connections need many gateway servers and a way to route messages to the right one.
+> - [[Fan-out on Write vs Fan-out on Read]]: copy an item to every reader up front, or let readers fetch it when they look.
+> - [[Back-of-the-Envelope Estimation]]: turning viewers and comments into messages per second.
+
 **From zero, in 60 seconds** 🟢
 
 During a live match, a million people watch and post comments at the same time.
@@ -78,6 +84,10 @@ But if 50,000 comments arrive per second, nobody can read them all, and sending 
 | Batching | Sending many small items together in one message | 5 comments in one push |
 | Counter | A number you add to instead of sending each event | `hearts = 81,204` |
 
+| SSE | Server-sent events: a one-way stream from server to browser over plain HTTP | new comments pushed down as they come |
+| Hot stream | One stream so big it overloads a single server or channel | a cricket final with millions watching |
+| Best effort | The system tries, but a lost live message is not resent | a dropped comment is simply not shown |
+
 **Picture it**
 
 ```mermaid
@@ -114,6 +124,13 @@ This is the product that **live comments** solve, and the interesting part is th
 Real-life picture: a stadium announcer. One person (a comment) speaks into one microphone; the sound reaches the whole stadium through many speakers (gateways). Nobody replays each fan's shout individually to each seat.
 
 And if 10,000 fans shout at once, the announcer does not read them all aloud; the crowd noise is summarised ("the crowd goes wild"). That is sampling and aggregation.
+
+### Real-life example: an IPL final on a streaming app 🟢
+
+During an IPL final on an app like JioCinema or Hotstar, the comment strip races by and hearts float up the screen.
+You cannot read every comment because there are thousands a second; the app shows you a readable sample.
+The heart count jumps in big steps every second instead of one by one, because the hearts are counted, not sent one at a time.
+If your connection drops and comes back, you see the latest comments, not the ones you missed.
 
 **Functional requirements**
 - Viewers see new comments on a live video in near real time.
@@ -168,7 +185,17 @@ flowchart LR
     T2 --> R2["Radios nearby"]
 ```
 
+## Common beginner mistakes 🟢
+
+- **Looping over every viewer from one server for each comment** → a million sends per comment melts it → publish once per stream and let each gateway fan out to its own viewers.
+- **Sending every comment to every phone** → nobody can read 5,000 a second and phones freeze → sample to about 10 a second per viewer.
+- **Treating each heart tap as a message** → 100,000 taps a second become billions of deliveries → count taps and broadcast totals once a second.
+- **Letting one slow phone fill the gateway's memory** → the gateway runs out of memory → use small buffers and drop the oldest live items.
+- **Writing every comment to the database before showing it** → the database becomes the bottleneck → keep the live path in memory and pub/sub; save to storage through Kafka.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the three tricks: publish once, sample what you show, and count reactions. **Next we open the box** and follow one comment from the phone to a million screens, then look at the gateways that hold the open connections.
 
 ### Step by step: one comment
 
@@ -177,7 +204,7 @@ flowchart LR
 1. **Post.** The viewer sends `POST /streams/{id}/comments` (or sends a WebSocket frame). The request carries a client-generated id for deduplication.
 2. **Gate.** The API authenticates the user, checks stream rules (comments on, slow mode, followers-only) and applies a per-user rate limit.
 3. **Moderate.** A fast synchronous filter runs: banned words, link spam, duplicate text, user reputation. Heavy ML runs asynchronously and can retract later.
-4. **Id and persist.** Give the comment a time-sortable id and append it to a durable log (Kafka) for storage and replay. Acknowledge the poster.
+4. **Id and persist.** Give the comment a time-sortable id (an ID that starts with the time, so sorting IDs sorts by time) and append it to a durable log (Kafka) for storage and replay. Acknowledge the poster.
    - (Keying by `stream_id` keeps order per stream, but a 50,000 comments/s x ~200 B = ~10 MB/s stream is one hot partition; for the biggest streams key by `stream_id` plus a small salt, since replay sorts by `comment_id` anyway.)
 5. **Publish.** Send the comment to the stream's **live channel** (Redis pub/sub or a similar broker, or the Kafka topic via a relay).
 6. **Fan-out at the edge.** Every gateway that has viewers for this stream receives the message once. The gateway puts it into each local viewer's outgoing buffer.
@@ -209,6 +236,13 @@ sequenceDiagram
 ```
 
 ### Connection tier
+
+**Step by step:**
+1. Ravi opens the stream. A load balancer sends his connection to gateway 7.
+2. Gateway 7 had no viewers of stream 42 before, so it subscribes to channel `stream:42`.
+3. 50,000 more viewers land on gateway 7. It still has only one subscription to `stream:42`.
+4. A comment is published once. Gateway 7 receives one copy and writes it to all 50,000 local connections.
+5. When the last viewer on gateway 7 leaves, it unsubscribes.
 
 ```mermaid
 flowchart TB
@@ -289,7 +323,7 @@ POST /v1/streams/{stream_id}/reactions    # or a WS frame
 204
 ```
 
-**SSE or WebSocket?** Comments flow mostly one way to the viewer, so **SSE** (server-sent events) is simpler: plain HTTP, built-in reconnect and `Last-Event-ID`, works through proxies. Posting uses a normal `POST`. Use WebSocket if you want one bidirectional channel (very chatty reactions, interactive polls).
+**SSE or WebSocket?** Comments flow mostly one way to the viewer, so **SSE** (server-sent events) is simpler: plain HTTP, built-in reconnect and `Last-Event-ID` (the browser tells the server the last event it got, so it can resume), works through proxies. Posting uses a normal `POST`. Use WebSocket if you want one bidirectional channel (very chatty reactions, interactive polls).
 
 LinkedIn's engineering write-up on real-time likes on live video used SSE-style long-lived connections for the same reason. See [[Choosing an API and Communication Style - Decision Guide]].
 
@@ -331,6 +365,8 @@ erDiagram
 > Live path in memory and pub/sub; durable path in a log and a time-bucketed store. Never put the live path through the database.
 
 ## 5. Deep dives 🔴
+
+> 🟡 → 🔴 **You now know** one comment's full path, the gateway tier, the sizing, the API and the storage. **Next is the advanced part**: fan-out choices, sampling and batching, reactions as counters, very hot streams, moderation and late joiners, then scaling and failures.
 
 ### 5.1 Fan-out: push, pull or hybrid
 
@@ -385,7 +421,7 @@ flowchart LR
 1. **Per-stream budget.** Decide the target display rate R per viewer (for example 10 per second). If the incoming rate is below R, send everything.
 2. **If above R, sample.** The gateway keeps each comment with probability R / incoming_rate. Use the same random seed per batch so all viewers on a gateway see the same sample (cheaper) or a different sample per viewer (more variety, more CPU).
 3. **Prioritise.** Always include comments from the broadcaster, moderators, pinned comments, and replies to the viewer's own comments. Sample only the rest.
-4. **Batch.** Collect for 250 ms, then write one frame with a list. This cuts write syscalls by 10x versus one write per comment.
+4. **Batch.** Collect for 250 ms, then write one frame with a list. This cuts write syscalls (calls into the operating system, each with a fixed cost) by 10x versus one write per comment.
 5. **Drop for slow clients.** Each connection has a small outgoing buffer (for example 64 messages). If it fills, drop the **oldest** and never block the gateway. Live comments are perishable.
 6. **Show honest counts.** The "N comments" counter comes from a separate aggregate, not from what was displayed.
 
@@ -419,7 +455,7 @@ flowchart LR
 2. **Gateway aggregation.** The receiving gateway adds to in-memory counters per `(stream, type)`.
 3. **Flush each second.** It publishes `{"love": 5400}` for that second to the stream channel. That is one message per gateway per second.
 4. **Merge and display.** Each gateway sums counts from all gateways for that second and sends the viewer **one** small event. The client spawns about `min(count, 30)` animated hearts, scaled down visually. Users do not need exactness.
-5. **Persist totals** with an async increment every few seconds (`HINCRBY` in Redis, and periodically into the store). If a gateway crashes, you lose at most one second of counts. Acceptable.
+5. **Persist totals** with an async increment every few seconds (`HINCRBY` in Redis, which adds to one field of a hash, and periodically into the store). If a gateway crashes, you lose at most one second of counts. Acceptable.
 6. **Dedup is not needed** for counts, but per-user rate limits (for example 5 taps per second) stop bots from inflating them.
 
 #### Example
@@ -526,7 +562,7 @@ flowchart TD
 ```
 
 - **Connections:** memory per connection dominates (buffers, goroutine or thread stacks). Event-loop or goroutine-per-connection servers with small buffers hold tens to hundreds of thousands per node. The Mail.Ru write-up on a million WebSockets in Go shows the memory tuning needed. See [[Scaling WebSockets]].
-- **Load balancing:** long-lived TCP needs an L4 balancer (least connections) and graceful draining on deploy. See [[Choosing Load Balancers, Gateways and Service Mesh - Decision Guide]].
+- **Load balancing:** long-lived TCP needs an L4 balancer (one that forwards raw connections; "least connections" sends each new one to the emptiest gateway) and graceful draining on deploy. See [[Choosing Load Balancers, Gateways and Service Mesh - Decision Guide]].
 - **Reconnect storms:** if a gateway dies, 50,000 clients reconnect at once. Clients use exponential backoff with jitter. The server caps new connections per second and sheds with a "retry in N seconds" signal.
 - **Write path:** the API tier is stateless and scales horizontally. The slow part (database) is off the live path, behind Kafka. If the store lags, live comments still flow.
 - **Cross-region:** put gateways near viewers (regional fleets), and replicate the stream channel across regions through a backbone relay. A comment from Mumbai should reach Delhi viewers without going through the US. Regional fan-out keeps latency low. See [[Multi-Region Architecture]].
@@ -553,6 +589,14 @@ flowchart LR
     B --> S["Spread over other gateways,<br/>catch up from last comment ID"]
 ```
 
+### Things people confuse this with 🟡
+
+| System | Who receives a message | How it differs from live comments |
+| --- | --- | --- |
+| [[Case Study - Chat System]] | The few members of a chat | Every message must arrive, in order, with receipts; no sampling |
+| [[Case Study - Notification System]] | One user per alert | Delivered even when the app is closed; not a live firehose |
+| [[Case Study - News Feed]] | Followers, read later | Ranked and stored per user; not real time to millions at once |
+
 ## 8. Trade-offs 🟡
 
 | Decision | Option A | Option B | Pick and why |
@@ -570,7 +614,7 @@ flowchart LR
 ## 9. In production 🔴
 
 - **Real examples:** LinkedIn engineers described real-time likes and comments on live video using long-lived connections and a subscription layer, with the aim of delivering to many concurrent viewers per video (see sources).
-  - Twitch chat is built on IRC and uses slow mode, follower-only mode and rate limits to keep rooms readable, which show the same sampling-and-throttling ideas.
+  - Twitch chat is built on IRC (an old, simple chat protocol) and uses slow mode, follower-only mode and rate limits to keep rooms readable, which show the same sampling-and-throttling ideas.
   - Exact internal numbers of large platforms are not public, so the numbers in this note are estimates.
 - **Metrics:** concurrent connections per gateway, message publish-to-deliver latency (p50, p95, p99), dropped-for-slow-client count, sampling ratio per stream, reconnect rate, pub/sub node CPU, egress Gbps, moderation retract rate.
 - **Alerts:** publish-to-deliver p95 above 3 s, reconnect rate spike, gateway memory per connection rising, a stream with sampling ratio below 0.1 percent (tell product).
@@ -606,6 +650,26 @@ flowchart LR
 > [!question]- Follow-up: traffic grows 10 times. What changes?
 > Add gateways horizontally, shard the hot channel more, add a relay tree and regional fleets, lower the sampling budget, and consider a CDN-cached polling mode for the largest stream. The durable path barely changes because comment storage volume is small.
 
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is a gateway here?
+> A server that holds many viewers' open connections and pushes comments to them.
+
+> [!question]- Easy: why show only a sample of comments?
+> Nobody can read thousands a second, and sending them all wastes bandwidth and freezes phones.
+
+> [!question]- Easy: is it OK if a live comment is lost?
+> Yes. The live view is best effort; the stored copy for replay goes through Kafka.
+
+> [!question]- Medium: 1 million viewers on 20 gateways. How many messages does the pub/sub layer send per comment?
+> 20, one per gateway; each gateway then writes to its own 50,000 viewers.
+
+> [!question]- Medium: how do you handle 100,000 heart taps a second?
+> Debounce on the client, add up per gateway, publish one total per gateway per second, and show viewers one combined count.
+
+> [!question]- Medium: one stream's channel overloads a pub/sub node. What do you do?
+> Split the channel into K shards on different nodes, add a relay tier, and sample before publishing.
+
 ## 11. Cheat sheet 🟢
 
 - Gateways hold SSE/WebSocket connections; subscribe to stream channels only while they have viewers.
@@ -618,14 +682,12 @@ flowchart LR
 - Live path at most once; durable path via Kafka then wide-column store by `(stream_id, time_bucket)`.
 - Degrade in order: sampling, slow mode, drop reaction animations, never fall over.
 
-## 12. Links
+## Links
 
 - Decision guides: [[Choosing an API and Communication Style - Decision Guide]], [[Kafka vs RabbitMQ vs SQS - Choosing a Message Broker]], [[Choosing a Database - Decision Guide]], [[Choosing a Caching Strategy - Decision Guide]], [[Choosing Load Balancers, Gateways and Service Mesh - Decision Guide]]
 - Concepts: [[Scaling WebSockets]], [[Fan-out on Write vs Fan-out on Read]], [[Real-time APIs - WebSocket, SSE and Long Polling]], [[Redis as a Queue - Lists, Streams and Pub-Sub]], [[Hot Keys and Hot Partitions]], [[Backpressure and Flow Control]], [[Load Shedding and Graceful Degradation]], [[Rate Limiting - Algorithms and Distributed Design]], [[CDN and Edge]]
 - Related case studies: [[Case Study - Chat System]], [[Case Study - News Feed]], [[Case Study - Notification System]], [[Case Study - Video Streaming]]
 - Framework: [[System Design Interview Framework]], [[HLD Round - Complete Step-by-Step Guide]]
-
-## Links
 
 ### Watch on YouTube
 

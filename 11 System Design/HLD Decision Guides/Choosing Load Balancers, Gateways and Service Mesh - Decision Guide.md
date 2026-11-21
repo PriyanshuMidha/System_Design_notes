@@ -38,6 +38,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how each piece works), 4 (worked example), 5, 6 and 9 (drills).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8, 10 and 11. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Load Balancing]]: a load balancer gives clients one address and spreads requests over healthy copies of a service.
+> - [[Forward and Reverse Proxies - L4 vs L7]]: a reverse proxy stands in front of servers; at L4 it sees only addresses and ports, at L7 it reads the whole web request.
+
 **From zero, in 60 seconds** 🟢
 
 One server cannot take all your traffic, so you run many copies.
@@ -84,6 +88,12 @@ A load balancer is that greeter for web requests.
 | Health check | A periodic "are you alive?" ping to each backend | Call `/healthz` every 5 seconds |
 | Gateway | A front door that adds auth, rate limits, routing | Reject requests with no valid token |
 | Service mesh | Small proxies beside each service that handle calls between services | Envoy sidecar adds retries and mTLS |
+| TLS termination | The point where encrypted HTTPS is decrypted so the request can be read | the ALB decrypts, then routes by path |
+| mTLS | TLS where both sides show certificates, so both prove who they are | order service ↔ payment service |
+| Sidecar | A helper proxy running next to your app in the same pod | Envoy beside the checkout container |
+| gRPC / HTTP/2 | Ways to send many requests over one long-lived connection | 1,000 calls on one connection |
+| Canary | Sending a small share of traffic to a new version first | 5% of requests to v2 |
+| BFF | Backend for Frontend: a small server shaped for one kind of client | one for the mobile app, one for web |
 
 **Picture it**
 
@@ -141,6 +151,22 @@ Think of an **airport**.
 
 The analogy breaks down because in software a single product (Envoy, Nginx) can play several of these roles at once.
 
+### Real-life example: one tap in a food app 🟢
+
+You tap "Restaurants near me" in Swiggy. DNS sends your phone to the nearest region.
+A load balancer there decrypts the request, reads the path, and sends it to the API gateway, which checks your login token and your request rate.
+The mobile app's own backend (a BFF) then calls the restaurant, offers and delivery-time services and trims the answer to what the phone screen needs.
+Those internal calls go through small proxies beside each service (a mesh), which encrypt them, retry failures and record timings.
+Netflix's Zuul and Lyft's Envoy are well-known public examples of an edge gateway and a mesh proxy.
+
+## Common beginner mistakes 🟢
+
+- **Putting gRPC behind a plain L4 balancer** → one long connection carries everything, so one backend gets all the work → use an L7 balancer or client-side balancing.
+- **Putting business logic in the API gateway** → it becomes a slow, shared bottleneck that every team must change → keep it to auth, limits and routing.
+- **Drawing the gateway and the BFF as one box** → generic rules and client-specific shaping get mixed up → gateway for everyone, one BFF per client type.
+- **Adding a service mesh for five services** → extra proxies, latency and a control plane to run for little gain → use a good client library until you have many services and teams.
+- **Retries at every layer** → one failure turns into dozens of calls and makes an outage worse → retry in one place, with a budget.
+
 ```mermaid
 flowchart TD
     C["Client"] --> D["DNS: pick region or fleet"]
@@ -153,9 +179,17 @@ flowchart TD
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the airport picture: DNS picks a region, balancers pick a server, the gateway checks everyone, a BFF shapes the answer, and a mesh handles calls inside. **Next we open the box**, one layer at a time. Several layers start with a plain walk-through; the full detail follows.
+
 ### 3.1 DNS load balancing
 
 **In plain words.** One name returns several IP addresses, or different addresses depending on who asks. See [[DNS - Resolution, Records and Caching]].
+
+**Step by step:**
+1. A phone in Pune asks DNS for `api.example.com`.
+2. DNS sees the request comes from India and answers with the Mumbai balancer's IP.
+3. The phone's resolver (the DNS helper that does lookups for it) caches that answer for 60 seconds.
+4. If Mumbai fails, DNS starts answering with Singapore, but phones only notice after their cached answer expires.
 
 Methods: round-robin records, weighted records, latency-based or geo-based answers, and health-checked failover (for example Route 53, see [[AWS 09 - Route 53 and ACM]]).
 
@@ -180,6 +214,12 @@ sequenceDiagram
 
 **In plain words.** It forwards TCP or UDP connections using IP and port, without reading HTTP. See [[Load Balancing]].
 
+**Step by step:**
+1. A client opens a connection to port 443 on the L4 balancer.
+2. The balancer picks a backend for the whole connection and passes bytes through without reading them.
+3. Every request sent on that connection goes to the same backend.
+4. Very fast and works for any protocol, but one busy long-lived connection lands on one backend.
+
 ```mermaid
 sequenceDiagram
     participant C as Client
@@ -191,13 +231,19 @@ sequenceDiagram
     Note over LB,B: all requests on this connection go to the same backend
 ```
 
-Strengths: very high throughput, low latency, static IPs (AWS NLB gives one static IP per AZ), keeps client source IP, handles any TCP/UDP protocol (databases, MQTT, game traffic).
+Strengths: very high throughput, low latency, static IPs (AWS NLB, its L4 balancer, gives one static IP per AZ), keeps client source IP, handles any TCP/UDP protocol (databases, MQTT, game traffic).
 
 Weakness: **it balances connections, not requests.** One gRPC or HTTP/2 connection carries thousands of requests, all to one backend. See [[gRPC]].
 
 ### 3.3 L7 load balancer
 
 **In plain words.** It reads each HTTP request and decides where it goes, based on host, path, header or cookie.
+
+**Step by step:**
+1. The L7 balancer decrypts the HTTPS request (TLS termination).
+2. It reads `GET /images/logo.png` and sends it to the image service.
+3. The next request on the same connection, `POST /orders`, goes to the order service.
+4. It can also retry, add headers, or send 5% of traffic to a new version.
 
 ```mermaid
 flowchart LR
@@ -219,8 +265,8 @@ Capabilities: path and host routing, TLS termination, HTTP/2 and gRPC, WebSocket
 | AWS ALB | L7 | Managed; path/host routing, gRPC, WebSocket, Lambda targets; target group algorithms: round robin (default), least outstanding requests, or weighted random; default idle timeout 60 s |
 | AWS NLB | L4 | Managed; static IP per AZ, preserves source IP, TCP/UDP/TLS |
 | Nginx | L7 (and L4 stream) | Self-run; widely used as reverse proxy and web server; see [[Nginx]] |
-| HAProxy | L4 and L7 | Self-run; very efficient; rich health checks and ACLs |
-| Envoy | L7 (and L4) | Programmable by an API (xDS); basis of most service meshes; created at Lyft |
+| HAProxy | L4 and L7 | Self-run; very efficient; rich health checks and ACLs (access control lists: allow/deny rules) |
+| Envoy | L7 (and L4) | Programmable by an API (xDS, Envoy's API for pushing routes and backend lists); basis of most service meshes; created at Lyft |
 | Cloud-native (GCP, Azure) | Both | Managed equivalents |
 
 For the AWS comparison in depth see [[AWS 06 - Load Balancing (ALB vs NLB)]].
@@ -257,6 +303,13 @@ Consistent hashing detail: see [[Consistent Hashing]]. Hot keys can overload one
 
 **In plain words.** A **gateway** is one entry point for external API calls that handles cross-cutting concerns before traffic reaches services. See [[API Gateway and BFF]].
 
+**Step by step:**
+1. A request arrives at the gateway with a login token.
+2. The gateway checks the token. Bad token: `401`, and the request never reaches a service.
+3. It checks this caller's rate. Over the limit: `429`.
+4. It routes `/v2/orders` to the order service, adding a request ID for tracing.
+5. The services behind it skip all those checks, because the gateway already did them.
+
 ```mermaid
 sequenceDiagram
     participant C as Client
@@ -279,6 +332,12 @@ Do not put business logic in it. It becomes a bottleneck and a deployment choke 
 ### 3.7 API gateway vs BFF
 
 **In plain words.** A **BFF (Backend for Frontend)** is a gateway-like service owned by a client team, shaped for one kind of client. Mobile wants small payloads and fewer round trips, the web wants richer data, partners want stable public contracts.
+
+**Step by step:**
+1. The phone's home screen needs restaurants, offers and delivery times.
+2. Without a BFF, the phone makes 3 calls over a slow mobile network.
+3. With a mobile BFF, the phone makes 1 call; the BFF makes the 3 calls inside the data centre.
+4. The BFF trims the result to what the small screen shows, and the web BFF returns a richer version for browsers.
 
 ```mermaid
 flowchart LR
@@ -303,6 +362,13 @@ flowchart LR
 ### 3.8 Service mesh
 
 **In plain words.** A **service mesh** moves service-to-service networking (mTLS, retries, timeouts, traffic splitting, metrics) out of your code into proxies deployed next to each service, managed by a control plane.
+
+**Step by step:**
+1. The checkout service calls `payments`. The call first goes to checkout's own sidecar proxy.
+2. The sidecar opens an mTLS connection to the sidecar beside a payment pod.
+3. If that pod fails, the sidecar retries another one, within a set timeout.
+4. Both sidecars record timing and errors, so you get the same metrics for every service.
+5. A control plane (the mesh's central manager) pushes the rules to every sidecar.
 
 ```mermaid
 flowchart LR
@@ -424,6 +490,8 @@ Numbers are rough estimates unless marked documented.
 > The balancer, the gateway and the mesh are themselves services. Each needs redundancy, capacity planning and monitoring.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** what each layer does and when to add it. **Next comes the senior view**: running these layers in production, then the details of power of two choices, health checks, lining up timeouts, keeping the client IP, stickiness and the mesh retry trap.
 
 **Real-life examples.**
 
@@ -577,6 +645,26 @@ flowchart LR
 - Mesh only for many services and uniform mTLS or polyglot policy.
 - Align timeouts inward-shorter; budget retries.
 - Drain connections on deploy; run every layer redundantly.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What is the difference between an L4 and an L7 balancer?
+> L4 sees only addresses and ports and routes connections; L7 reads each HTTP request and can route by path or header.
+
+> [!question]- (easy) What does an API gateway do?
+> One front door for outside calls: checks login, applies rate limits, routes to services.
+
+> [!question]- (easy) Why can DNS not fail over in seconds?
+> Clients and resolvers cache answers until the TTL runs out.
+
+> [!question]- (medium) Gateway vs BFF?
+> The gateway applies shared rules for every caller; a BFF shapes and combines data for one kind of client.
+
+> [!question]- (medium) Why does gRPC behind an L4 balancer often overload one backend?
+> All requests share one long connection, and L4 balances connections, not requests.
+
+> [!question]- (medium) Name one benefit and one cost of a service mesh.
+> Benefit: automatic mTLS, retries and metrics for every call. Cost: extra proxy latency and CPU per pod, plus a control plane to run.
 
 ## Links 🟢
 

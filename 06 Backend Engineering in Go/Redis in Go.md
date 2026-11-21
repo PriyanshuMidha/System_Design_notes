@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Redis Hands-on Setup with Go]]: you have run Redis locally and can `SET` and `GET` a key from Go.
+> - [[Caching Patterns]]: cache-aside means "look in the cache, on a miss read the database, then save a copy in the cache".
+
 **From zero, in 60 seconds** 🟢
 
 **Redis** is a tiny, very fast database that keeps everything in memory. Services use it for things that must be quick and may be forgotten: caches, counters, rate limits, locks.
@@ -69,6 +73,12 @@ This note is about using it safely from Go.
 | Lua script | A small program Redis runs as one atomic command | `EVAL "..." 1 key` |
 | `redis.Nil` | go-redis's signal that a key does not exist | Cache miss on `GET` |
 
+| Fail-open | If Redis is down, carry on without it (slower, still works) | skip the cache, read Postgres |
+| Fail-closed | If Redis is down, refuse the action | no lock, so no job runs |
+| Rate limiter | A counter that blocks a caller after too many requests | 5 logins per minute per IP |
+| Lock (lease) | A key that says "I own this" for a limited time | `SET lock:job token NX PX 30000` |
+| Cache stampede | Many requests miss the same key at once and all hit the database | 100 misses → 100 queries |
+
 **Picture it**
 
 ```mermaid
@@ -98,9 +108,9 @@ Where it breaks: a sticky note never vanishes mid-sentence, but Redis can be slo
 
 InvoiceOps's dashboard handler does one `SELECT` across workspaces, clients and invoices to build a summary.
 
-Illustrative numbers for a workspace with 50,000 invoices: **p50 around 40 ms, p99 around 180 ms** (assumed for the story, not measured; measure your own).
+Illustrative numbers for a workspace with 50,000 invoices: **p50 around 40 ms, p99 around 180 ms** (half of queries are faster than 40 ms; 99 out of 100 are faster than 180 ms) (assumed for the story, not measured; measure your own).
 
-At 200 requests/second from a handful of busy workspaces refreshing their dashboard every few seconds, that is 200 of those queries per second landing on the primary, most of them asking for data that changed a second ago.
+At 200 requests/second from a handful of busy workspaces refreshing their dashboard every few seconds, that is 200 of those queries per second landing on the primary (the main database server that takes writes), most of them asking for data that changed a second ago.
 
 The question this note answers is not "should InvoiceOps cache this" — [[Caching Patterns]] already covers cache-aside — but **how a Go service wires a Redis dependency so that caching, rate limiting and locking survive contact with concurrency and failure**:
 
@@ -120,14 +130,18 @@ The first request from an IP runs `INCR` and gets `n == 1`. Now picture a crash,
 
 The key now has a count but no TTL: it never expires, and once the count passes 5 that IP is rate-limited forever. This is not a hypothetical; it is the default behavior of two separate commands against a service that has no idea they were meant to be one unit.
 
+### A real-life example 🟢
+
+When thousands of people open the same movie page on BookMyShow, the server does not ask the main database for the movie details each time. It keeps a copy in Redis for a short time, so most requests are answered from memory in about a millisecond. The same Redis also counts OTP attempts so one phone number cannot ask for 100 codes a minute. If Redis has a hiccup, the movie page still loads (just slower, from the database), because a cache should never be the reason a page fails.
+
 ## 2. Mental model 🟢
 
 Treat Redis exactly like Postgres: a remote dependency with a connection pool, a context on every call, and a failure mode the service must have an opinion about.
 
 The difference that matters for Go code is **atomicity across two commands**. Postgres gives you `BEGIN; ...; COMMIT`. Redis gives you three ways to get the same guarantee for a handful of commands:
 
-- `MULTI`/`EXEC` (queues commands, but can't branch on a value it just read),
-- `WATCH` (optimistic, retries under contention),
+- `MULTI`/`EXEC` (Redis’s simple transaction: queues commands and runs them together, but can't branch on a value it just read),
+- `WATCH` (optimistic: abort and retry if the watched key changed in the meantime),
 - or a **Lua script** (the one Redis command that runs several steps with no other client's command in between).
 
 For anything that reads a value and then decides what to write based on it — a rate limiter, a lock release — the script is the standard answer.
@@ -146,9 +160,17 @@ flowchart LR
 
 ## 3. How it works 🟡
 
+🟢 → 🟡 You now know Redis is a fast remote store you share through one client, that a miss is `redis.Nil`, and that multi-step changes need one Lua script. Next we open the box: client settings, the miss path, cache-aside wiring, the atomic rate limiter, and the traps in Redis locks.
+
 ### The client as a shared dependency
 
 **In plain words:** build the client once in main and pass it in through constructors, the same way the database pool travels.
+
+**Step by step:**
+1. In `main`, create `redis.NewClient(&redis.Options{Addr: "redis:6379", PoolSize: 10, ReadTimeout: 200 * time.Millisecond})`.
+2. Pass that one client into `NewClientCache(rdb, db)` and `NewLimiter(rdb)`.
+3. Every call passes the request `ctx`, so a cancelled request stops waiting on Redis.
+4. Keep `MaxRetries` low, because a retried `INCR` may count twice.
 
 Build one `*redis.Client` in `main`, next to the `*pgxpool.Pool`, and inject it the same way (see [[Service Project Layout and Wiring]]). The options that matter:
 
@@ -160,6 +182,12 @@ Build one `*redis.Client` in `main`, next to the `*pgxpool.Pool`, and inject it 
 ### `redis.Nil` is the miss, not the failure
 
 **In plain words:** 'the key is not there' is normal life for a cache; only network and server errors are real failures, and the code must split the two.
+
+**Step by step:**
+1. `rdb.Get(ctx, "v1:client:7")` returns an error.
+2. If `errors.Is(err, redis.Nil)`: it is a miss. Read Postgres, save the result with a TTL, return it.
+3. Any other error (timeout, refused): Redis has a problem. For a cache, log it and read Postgres anyway.
+4. No error: decode the JSON and return the cached value.
 
 Every `Get` that finds nothing returns `redis.Nil` as the error. Code that does `if err != nil { return err }` without checking `errors.Is(err, redis.Nil)` first turns every cache miss into a 500.
 
@@ -180,6 +208,12 @@ sequenceDiagram
 
 ### Cache-aside: the wiring, not the pattern
 
+**Step by step:**
+1. Read: try Redis; on a miss or a Redis error, read Postgres (fail-open).
+2. Save the value under a versioned key like `v1:client:7` with a TTL plus a little random extra (jitter), so many keys do not expire at the same second.
+3. Write: `UpdateClientEmail` updates Postgres, then deletes `v1:client:7`.
+4. The next read misses and loads the fresh value.
+
 The pattern itself — check, miss, fill, invalidate — is [[Caching Patterns]]'s job, with the full `singleflight`-coalesced version. The part that is specific to writing it into a real Go service:
 
 - **Fail-open vs fail-closed.** When `Get` returns a non-`Nil` error (a timeout, a connection refused), a cache almost always fails *open*: skip Redis, read the database, the request is just slower. A rate limiter or a lock usually fails the other way — more on that below.
@@ -190,7 +224,13 @@ The pattern itself — check, miss, fill, invalidate — is [[Caching Patterns]]
 
 **In plain words:** a few lines of script run inside Redis itself, so 'read the counter, check it, bump it' happens as one uninterruptible step.
 
-A fixed-window limiter needs exactly the atomicity problem from Section 1 solved: increment and set-expiry-only-once, as one step. `redis.NewScript` loads the script once; go-redis sends `EVALSHA` and transparently falls back to `EVAL` the first time the server hasn't cached it.
+**Step by step:**
+1. Login request from IP `1.2.3.4` runs the script on key `rl:{login:1.2.3.4}`.
+2. Inside Redis, in one step: `INCR` the key; if the result is 1, set a 60-second expiry.
+3. The script returns the count, say 3.
+4. Go compares it with the limit of 5: allowed. On the 6th request in that minute, it returns 429.
+
+A fixed-window limiter needs exactly the atomicity problem from Section 1 solved: increment and set-expiry-only-once, as one step. `redis.NewScript` loads the script once; go-redis sends `EVALSHA` (run a script Redis already has, by its hash) and transparently falls back to `EVAL` (send the full script) the first time the server hasn't cached it.
 
 ```mermaid
 sequenceDiagram
@@ -213,6 +253,12 @@ This note's script is the simpler fixed-window form, shown for the atomicity les
 
 ### Lock caveats
 
+**Step by step:**
+1. Worker A runs `SET lock:report <random token> NX PX 30000`: it gets the lock for 30 seconds.
+2. If A's work takes 40 seconds, the lock expires at 30 and worker B can take it. Now both think they own it.
+3. When A finishes, it must delete the lock only if the value is still its own token, using a Lua script.
+4. A plain `DEL` would delete B's lock by mistake.
+
 [[Redis Use Cases]] has the full `SET NX PX` + Lua-compare-and-delete lock, its test, and the Redlock debate. The two caveats worth repeating here because they bite in service code specifically:
 
 - A Redis lock is a **lease with a timer**, not a mutex. If the critical section can run longer than the lease TTL — a slow downstream call, a GC pause, a stalled goroutine scheduler — a second caller acquires the lock while the first still believes it holds it. Size the TTL to the work, and treat the lock as an efficiency device (avoid duplicate work) rather than a correctness guarantee, unless it carries a fencing token the protected resource checks.
@@ -222,13 +268,13 @@ This note's script is the simpler fixed-window form, shown for the atomicity les
 
 Each of these has a full treatment in the linked note. Here is the Go-specific one-liner:
 
-- **Stampede protection.** Wrap the miss path in `golang.org/x/sync/singleflight` (`g.Do(key, load)`) so 100 concurrent misses for one key become one database query. Cache a short-lived "not found" marker (negative caching, 30 to 60 seconds) so a flood of lookups for ids that do not exist cannot bypass the cache.
+- **Stampede protection.** Wrap the miss path in `golang.org/x/sync/singleflight` (a helper that lets only one goroutine load a key while the others wait for its result) (`g.Do(key, load)`) so 100 concurrent misses for one key become one database query. Cache a short-lived "not found" marker (negative caching, 30 to 60 seconds) so a flood of lookups for ids that do not exist cannot bypass the cache.
 - **Sliding window and token bucket.** A sliding window uses a `ZSET` (`ZADD` now, `ZREMRANGEBYSCORE` old, `ZCARD`) inside one Lua script. GCRA / token bucket needs one key and one script; `github.com/go-redis/redis_rate` ships a ready one. Choose the key by who you want to limit: IP for anonymous traffic, user id or API key once authenticated.
 - **Do not rate-limit signed webhooks.** A payment provider's webhook endpoint (`rate:webhook:{provider}`) must not return 429 to legitimate events. Verify the signature first and process idempotently; apply rate limits to unauthenticated traffic such as login.
 - **Lock.** `SET key token NX PX ttl` to acquire, a token-checked Lua `DEL` to release. Redlock is debated: a single-node lock plus a fencing token the resource checks is the defensible design (see [[Distributed Locks and Fencing Tokens]]).
 - **Queues.** `LMOVE`/`BLMOVE` from a ready list to a processing list for a reliable List queue; Streams consumer groups (`XADD`, `XREADGROUP`, `XACK`, `XAUTOCLAIM` to re-deliver a crashed consumer's pending entries, `MAXLEN` to bound size); Pub/Sub is at-most-once, fine for WebSocket fan-out and wrong for jobs.
 - **Pipelines and transactions.** `rdb.Pipeline()` batches round trips without atomicity; `rdb.TxPipeline()` wraps the batch in `MULTI`/`EXEC`.
-- **Cluster.** A multi-key script or transaction needs every key in one hash slot: use a hash tag such as `{workspace:7}:...` (the limiter above already tags `{key}`).
+- **Cluster.** A multi-key script or transaction needs every key in one hash slot (Redis Cluster splits keys into slots across servers): use a hash tag such as `{workspace:7}:...` (the limiter above already tags `{key}`).
 - **Tests.** `miniredis` (used below) covers commands and Lua; it is not real Redis, so use testcontainers for anything that depends on exact server behavior (Streams edge cases, cluster, eviction).
 
 ### What this note does not re-derive
@@ -271,6 +317,8 @@ The full version below wires a real `*redis.Client`: pool and timeouts, `redis.N
 
 **The client:**
 
+**What this code does, in plain words:** `NewClient` builds the shared client with an explicit pool size and short timeouts, and pings Redis once at startup.
+
 ```go
 package redisgo
 
@@ -311,6 +359,8 @@ func Ping(ctx context.Context, rdb *redis.Client) error {
 ```
 
 **Cache-aside, wired with fail-open/fail-closed and delete-on-write:**
+
+**What this code does, in plain words:** `GetClient` tries Redis, treats `redis.Nil` (or a value that no longer decodes) as a miss, and on a Redis error either reads Postgres (fail-open mode) or returns the error (fail-closed mode); on a miss it saves the result with a TTL plus jitter. `UpdateClientEmail` writes Postgres and then deletes the cached key.
 
 ```go
 package redisgo
@@ -433,6 +483,8 @@ func (c *ClientCache) UpdateClientEmail(ctx context.Context, id int64, email str
 
 **The atomic fixed-window limiter:**
 
+**What this code does, in plain words:** a short Lua script increments the counter and sets its expiry only on the first hit, all in one step; `Allow` runs it and compares the count with the limit.
+
 ```go
 package redisgo
 
@@ -495,6 +547,8 @@ func (l *FixedWindowLimiter) Allow(ctx context.Context, key string) (bool, error
 ```
 
 **Tests** (Redis replaced by `miniredis` throughout):
+
+**What this code does, in plain words:** using an in-memory fake Redis, the tests check a miss then a hit, that a write removes the cached copy instead of overwriting it, that fail-closed mode returns an error when Redis is down, and that the limiter allows up to its limit, then blocks, and resets after the window.
 
 ```go
 package redisgo
@@ -674,7 +728,26 @@ func TestFixedWindowLimiter_CountersExpireWithTheWindow(t *testing.T) {
 - A single Redis instance is a single point of failure for every service that depends on it; [[Redis Replication, Sentinel and Cluster]] covers the failover story this note assumes someone else owns.
 - For a lock, Postgres `SELECT ... FOR UPDATE SKIP LOCKED` or a plain row lock beats a Redis lock whenever the protected work is already a database transaction — no second system to keep consistent with the first.
 
+### Redis lock vs database row lock 🟡
+
+| | Redis lock | Postgres row lock |
+| --- | --- | --- |
+| Released by | your code, or the TTL running out | commit, rollback, or the connection dying |
+| Can two holders overlap? | yes, if work outlasts the TTL | no |
+| Good for | work outside the database | work that is already a DB transaction |
+| Extra system to run? | yes | no |
+
+### Common beginner mistakes 🟢
+
+- Treating `redis.Nil` as an error → every cache miss becomes a 500 → check `errors.Is(err, redis.Nil)` first.
+- Running `INCR` and then `EXPIRE` as two commands → a crash between them leaves a counter that never expires → use one Lua script.
+- Updating the cached value on write → a lost write leaves a stale value forever → delete the key instead.
+- Making a cache fail-closed → a Redis blip takes down pages that could have read Postgres → fail open on cache reads.
+- Releasing a lock with plain `DEL` → you can delete someone else's lock → compare the token in a Lua script.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now wire Redis safely for caching, counting and locking. The advanced part covers Redis under load and failure: stalls that spread to every handler, stale values, slow scripts, pool sizing math, and what changes during a rolling deploy.
 
 - **Real systems:** go-redis is the Redis project's officially supported Go client; `hibiken/asynq` and the Sidekiq/BullMQ queue ecosystem build on the same Redis atomic-script primitives shown here; Stripe has published a write-up of its Redis-backed rate limiters.
 - **Failure modes → fixes:**
@@ -722,6 +795,26 @@ func TestFixedWindowLimiter_CountersExpireWithTheWindow(t *testing.T) {
 - Fail-open for caches, fail-closed for anything where a miss means "no limit, no lock."
 - Lock release and renewal are token-checked Lua scripts, never a bare `DEL`/`PEXPIRE`.
 - Queues, Cluster hash tags and the full lock/Redlock story live in 08/09/11 — link them, don't re-derive them.
+
+## Self-check 🟢🟡
+
+> [!question]- What does `redis.Nil` mean?
+> The key does not exist: a cache miss, not a failure.
+
+> [!question]- How many `*redis.Client` values should a service create?
+> One, at startup, shared by every repository.
+
+> [!question]- On a write, should you update the cache or delete the key?
+> Delete it; the next read refills it from the database.
+
+> [!question]- Why is `INCR` then `EXPIRE` unsafe?
+> They are two separate commands; a crash between them leaves a key with no expiry.
+
+> [!question]- When should a Redis-backed feature fail closed?
+> When skipping it is unsafe, like a lock or a strict limit; caches should fail open.
+
+> [!question]- Why does a global rate limit across 10 instances need Redis and not `x/time/rate`?
+> `x/time/rate` counts in each process separately, so 10 instances would allow 10 times the limit.
 
 ## Links 🟢
 

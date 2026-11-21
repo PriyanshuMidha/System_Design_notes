@@ -37,6 +37,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 6 (variants) and 7 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 5 (deep dives), 8, 9 and 10. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Transactions and ACID]]: a transaction saves several changes all together or not at all.
+> - [[Locking - Optimistic vs Pessimistic]]: two ways to stop two people changing the same row at once.
+> - [[Isolation Levels and MVCC]]: how much one running transaction can see of another's unfinished work.
+> - [[Idempotency and Idempotency Keys]]: a unique ID on a request makes a retry safe.
+
 **From zero, in 60 seconds** 🟢
 
 A hotel site must show free rooms and let you book one without giving the same room to two people.
@@ -75,6 +81,10 @@ The site must show you what is free, take your booking once, and never give away
 | Idempotency key | An ID that makes a retry do nothing new | Double click still makes one booking |
 | Cache | Fast copy of data that may be slightly old | Search results from a minute ago |
 
+| Hold (pending) | A short claim on a room while the guest pays | held for 10 minutes |
+| Overbooking | Selling a few more rooms than exist, on purpose, because some guests cancel | 11 sold for 10 rooms |
+| 409 Conflict | The HTTP reply meaning "this clashes with the current state" | "sorry, the room was just taken" |
+
 **Picture it**
 
 ```mermaid
@@ -106,6 +116,13 @@ You run a small hotel with 10 Deluxe rooms. On Friday evening three guests try t
 
 It is harder than a cinema seat because a booking spans **several nights**. A guest for 12 to 15 March needs the room on the nights of the 12th, 13th and 14th. If the 14th is full, the whole booking fails, and the earlier nights must not stay reduced.
 
+### Real-life example: booking a Goa trip 🟢
+
+You search a travel app like MakeMyTrip for a Goa hotel for 12 to 15 March. The list shows prices and "only 2 rooms left" in a fraction of a second.
+You pick a Deluxe room; the app holds it while you pay by UPI.
+If two people tap "Book" on the last Deluxe room at the same moment, one gets the room and the other sees "sold out, pick another".
+If you cancel later, the room goes back on sale for all three nights at once.
+
 **Functional requirements**
 - Search hotels by destination, dates, guests; filter by price, rating, amenities; sort.
 - View a hotel page with room types, photos, policies and live price.
@@ -120,7 +137,7 @@ It is harder than a cinema seat because a booking spans **several nights**. A gu
 - Reservation operations are **idempotent** (retries and double clicks are safe).
 - Handle seasonal spikes (holidays, big events) and popular hotels with many simultaneous bookers.
 
-**Out of scope:** payment provider internals (see [[Case Study - Payment System]]), pricing and revenue-management algorithms, channel managers and sync with hotel PMS systems (mention only as an extension).
+**Out of scope:** payment provider internals (see [[Case Study - Payment System]]), pricing and revenue-management algorithms, channel managers and sync with hotel PMS systems (property management systems: the software the hotel front desk runs) (mention only as an extension).
 
 > [!tip] Remember
 > Two decisions matter most: inventory per room type per date, and atomic multi-night updates.
@@ -157,9 +174,26 @@ stateDiagram-v2
     CHECKED_OUT --> [*]
 ```
 
+## Common beginner mistakes 🟢
+
+- **Tracking each physical room in the booking path** → "any Deluxe free for 3 nights" becomes a slow search → keep a count per room type per night.
+- **Updating each night in separate transactions** → night 1 and 2 are taken but night 3 fails, leaving a half booking → change all nights in one transaction.
+- **Read the count, then write the count** → two guests both read 9 of 10 and both book the last room → use a conditional `UPDATE ... WHERE total_reserved + 1 <= limit`.
+- **Calling the payment provider inside the database transaction** → rows stay locked for seconds → reserve, commit, then pay.
+- **Checking availability only in the search cache** → the cache may be a minute old → re-check in the database at booking time.
+
 ## 3. How it works - high-level design 🟡
 
+> 🟢 → 🟡 **You now know** the core idea: a count per room type per night, changed for every night together. **Next we open the box**: the inventory rows, the services around them, and one booking step by step.
+
 ### Inventory as a count per date
+
+**Step by step:**
+1. Hotel 77 has 10 Deluxe rooms. There is one row per night: 12 March (6 taken), 13 March (9 taken), 14 March (10 taken).
+2. A guest wants 12 to 15 March, which means the nights of the 12th, 13th and 14th.
+3. The system tries to add 1 to all three rows, each only if it stays at or below 10.
+4. The 14th is already at 10, so that row is not changed. Only 2 of 3 rows changed.
+5. Fewer rows than nights means "not available": the whole transaction rolls back and the guest sees "sold out".
 
 **In plain words:** we do not store "room 101 is free". We store "Deluxe, 12 March: 10 rooms, 6 reserved". This is smaller (one row per type per date instead of one per room) and matches how guests book.
 
@@ -211,12 +245,19 @@ flowchart LR
 2. **Search service** answers "hotels in Goa, 12 to 15 March, 2 guests". It uses a search index for text, location and filters, and an availability cache so it does not hit the booking database for every result.
 3. **Reservation service** owns the truth: the inventory table and reservations table, in one relational database so one transaction can update several rows.
 4. **Payment service** creates a payment with the reservation ID as idempotency key and handles the webhook.
-5. **Events** (outbox, [[Transactional Outbox and CDC]]) refresh caches and the search index and trigger notifications.
+5. **Events** (outbox: a "to send" table written in the same transaction, [[Transactional Outbox and CDC]]) refresh caches and the search index and trigger notifications.
 
 > [!tip] Remember
 > Separate the two paths: search is big, read-heavy and may be stale; booking is small and exact.
 
 ### Booking flow, step by step
+
+**Step by step (plain):**
+1. The guest picks dates and room type. The server first hands out a reservation ID, say `R-501`.
+2. The guest taps "Book". The server, in one transaction, adds 1 to each night and saves `R-501` as PENDING for 10 minutes.
+3. The guest pays with `R-501` as the payment's idempotency key.
+4. The payment provider calls back. The server flips `R-501` to PAID, only if it is still PENDING.
+5. If the guest's tap is sent twice, the second `R-501` insert hits the primary key and returns the first result.
 
 ```mermaid
 sequenceDiagram
@@ -348,6 +389,8 @@ erDiagram
 
 ## 5. Deep dives 🔴
 
+> 🟡 → 🔴 **You now know** the per-night rows, the services, the booking flow, the API and the tables. **Next is the advanced part**: the exact safe update and deadlocks, overbooking on purpose, holds and late payments, search at 100x the load, hot hotels and cancellations.
+
 ### Deep dive 1: booking without overselling
 
 **In plain words:** the bug to avoid is "read the count, then write the count". Two bookers both read 9 of 10 and both write 10 (or both write 10 when the correct total is 11).
@@ -379,7 +422,7 @@ WHERE hotel_id = 77 AND room_type_id = 3
 4. Insert the reservation as PENDING with `expires_at = now() + 10 minutes`.
 5. Commit.
 
-Under PostgreSQL's READ COMMITTED level, a conflicting update waits for the first transaction's row lock, then re-checks the `WHERE` clause against the new row version, so only the rows that still pass are updated ([[Isolation Levels and MVCC]]). That re-check is what makes a single conditional statement safe where "SELECT then UPDATE" is not.
+Under PostgreSQL's READ COMMITTED level (the default: each statement sees data committed before it started), a conflicting update waits for the first transaction's row lock, then re-checks the `WHERE` clause against the new row version, so only the rows that still pass are updated ([[Isolation Levels and MVCC]]). That re-check is what makes a single conditional statement safe where "SELECT then UPDATE" is not.
 
 ```mermaid
 sequenceDiagram
@@ -401,7 +444,7 @@ sequenceDiagram
 
 **What about deadlocks?** Two transactions updating overlapping date ranges in different orders can deadlock. A single multi-row `UPDATE` does not guarantee the order in which rows are locked, so for safety first lock the rows in a fixed order with `SELECT ... WHERE ...
 
-ORDER BY date FOR UPDATE`, then run the conditional update. Also retry on SQLSTATE 40P01 (deadlock detected) with backoff ([[Timeouts, Retries and Backoff]]).
+ORDER BY date FOR UPDATE`, then run the conditional update. Also retry on SQLSTATE (the database's five-character error code) 40P01 (deadlock detected) with backoff ([[Timeouts, Retries and Backoff]]).
 
 ### Deep dive 2: overbooking on purpose
 
@@ -506,13 +549,21 @@ During a festival or sports final, one hotel's popular room type gets thousands 
 
 | Model | Unit that is booked | Strength | Weakness | Typical use |
 | --- | --- | --- | --- | --- |
-| Room type per date count (this design) | Number of rooms of a type | Simple, fast, atomic update | Does not track which physical room | Chains, OTAs |
+| Room type per date count (this design) | Number of rooms of a type | Simple, fast, atomic update | Does not track which physical room | Chains, OTAs (online travel agencies such as Booking.com) |
 | Individual room per date | One specific room | Exact room choice, simple conflicts | Many more rows; search across rooms | Small hotels, vacation rentals (one unit per listing) |
 | Date range with exclusion constraint | One unit, a `daterange` | Database prevents overlap by itself | One unit only | Single-unit listings, meeting rooms |
 | Hold in cache (Redis TTL) then DB | Count in Redis first | Very high throughput | Two sources of truth | Extreme spikes only |
 | Seat-like model (ticket booking) | One seat per event | One row per seat | Different shape (single instant, not a range of nights) | [[Case Study - Ticket Booking]] |
 
-For a vacation rental where each listing is one unit, a PostgreSQL range type with an exclusion constraint (`EXCLUDE USING gist (listing_id WITH =, stay WITH &&)`) lets the database refuse overlapping stays directly (the `=` on a bigint column needs the `btree_gist` extension: `CREATE EXTENSION btree_gist;`).
+For a vacation rental where each listing is one unit, a PostgreSQL range type with an exclusion constraint (a rule that no two rows may overlap) (`EXCLUDE USING gist (listing_id WITH =, stay WITH &&)`) lets the database refuse overlapping stays directly (the `=` on a bigint column needs the `btree_gist` extension: `CREATE EXTENSION btree_gist;`).
+
+### Things people confuse this with 🟡
+
+| System | What is booked | How it differs from hotel booking |
+| --- | --- | --- |
+| [[Case Study - Ticket Booking]] | One specific seat for one show | One item, one moment; no multi-night range |
+| [[Case Study - Flash Sale and E-commerce Checkout]] | Any unit of one product | One extremely hot counter and a huge crowd at one second |
+| Airline booking | Seats on a flight leg | Similar counts and overbooking, but trips can span several flights from different airlines |
 
 ## 7. Trade-offs and when not to use 🟡
 
@@ -539,7 +590,7 @@ flowchart LR
   - Cache out of sync with the database: short TTL plus event updates; the booking step is the truth.
   - Deadlocks on overlapping date ranges: lock rows in ascending date order (`ORDER BY date FOR UPDATE`), retry with backoff.
 - **What to monitor:** booking success and 409 rate per hotel, hold-to-paid conversion, expired holds, refund count from late payments, lock wait time and deadlocks, search latency p99, cache hit ratio, drift between cache and database, overbooking ratio per hotel-date.
-- **Security and fraud:** rate limit searches and bookings, bot protection on popular dates ([[API Abuse and Bot Protection]]), signed webhooks from the payment provider, and PII protection for guest data.
+- **Security and fraud:** rate limit searches and bookings, bot protection on popular dates ([[API Abuse and Bot Protection]]), signed webhooks from the payment provider, and PII (personally identifiable information: names, phones, ID numbers) protection for guest data.
 
 ```mermaid
 flowchart TD
@@ -598,6 +649,26 @@ flowchart LR
 
 > [!question]- How would you shard this?
 > By `hotel_id`. All inventory and reservations for one hotel live on one shard, so a multi-night booking is a single-shard transaction. Sharding by date would turn every stay into a distributed transaction.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what does one inventory row describe?
+> One room type at one hotel on one night: how many exist and how many are reserved.
+
+> [!question]- Easy: a stay from 12 to 15 March uses which nights?
+> The 12th, 13th and 14th; the check-out day is not included.
+
+> [!question]- Easy: why hand out the reservation ID before the guest taps "Book"?
+> So a retry or double click sends the same ID and cannot create a second booking.
+
+> [!question]- Medium: the conditional update for 3 nights changes only 2 rows. What do you do?
+> Roll back the whole transaction and return 409, because one night is full.
+
+> [!question]- Medium: why may search show a room that turns out to be gone?
+> Search reads a cache that can be about a minute old; the booking step re-checks the database.
+
+> [!question]- Medium: how does a 10% overbooking limit stay safe from buggy code?
+> It is enforced in the update condition and in a database `CHECK` constraint that nothing can bypass.
 
 ## 11. Cheat sheet 🟢
 

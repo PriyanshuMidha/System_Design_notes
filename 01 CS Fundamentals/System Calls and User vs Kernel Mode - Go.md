@@ -23,12 +23,18 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
 > - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[System Calls and User vs Kernel Mode]]: the theory twin. Know that a real syscall traps into the kernel and costs hundreds of nanoseconds, while a plain function call costs about 1 ns.
+> - [[Processes, Threads and Context Switching]]: background only.
+
 **From zero** 🟢: this file is the hands-on side of [[System Calls and User vs Kernel Mode]]. It measures three costs side by side: a real system call (write to /dev/null), a syscall-shaped call that may be cached (os.Getpid), and a plain function call — so 'syscalls are expensive' becomes numbers you measured yourself.
 
 ## Before the code 🟢
 
 - **`syscall` package** (`syscall.Write`): calls the raw OS system call directly, skipping `os.File`'s extra layers, so the measured cost is the kernel crossing.
 - **`os` package** (`os.Getpid`): a syscall-shaped library call that may be cached and never trap.
+- **Trap**: the CPU instruction that switches into kernel mode for a syscall; the expensive part being measured.
+- **`/dev/null`**: a special file that accepts and throws away any bytes written to it, so writing costs only the syscall itself.
 - **Timing with `time.Since`**: measure many calls in a loop and divide, because one call is too fast to time alone.
 - **Functions returning `time.Duration`**: costs come back as typed durations (nanoseconds), not raw integers.
 - **Tests that compare, not assert exact numbers**: the test checks "a syscall is slower than a pure function call", which holds on any machine.
@@ -62,7 +68,11 @@ updated: 2026-11-13
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** the three things being timed: a real syscall, a maybe-cached one, and a plain function. **Next we read the code:** three small timing functions.
+
 ### Step 1: measuring a real, always-trapping syscall
+
+**What this code does, in plain words:** it opens `/dev/null`, writes 1 byte to it thousands of times with the raw `write` syscall, and returns the average time per call.
 
 **Concept.** This is the theory note's "ground truth" measurement: `write(2)` to `/dev/null` has a real side effect (moving bytes to a device, even a null one), so it is never vDSO-eligible and must trap into the kernel on every single call. Opening the file happens once, outside the timed loop, so the measured loop contains nothing but the syscall itself plus loop overhead.
 
@@ -101,9 +111,11 @@ func WriteSyscallCost(iterations int) (time.Duration, error) {
 1. `os.OpenFile(os.DevNull, ...)` and `defer f.Close()` set up and tear down the file descriptor outside the timing window — only the loop body is meant to measure syscall cost, not file-open cost.
 2. `syscall.Write`, not `f.Write`, is used deliberately: it is the thinner wrapper, closer to the raw `write(2)` call, whereas `os.File.Write` adds a small amount of its own bookkeeping on top.
 3. Dividing `time.Since(start)` by `iterations` gives an *average* per-call cost — a single call is far too fast and noisy to measure reliably with a wall clock, so the loop exists purely to amortize measurement overhead across many calls.
-4. The error return matters here specifically because this function is making real syscalls: a transient `EINTR` or a closed descriptor would otherwise be silently ignored, which would corrupt the timing (and possibly the whole measurement) without any visible symptom.
+4. The error return matters here specifically because this function is making real syscalls: a transient `EINTR` ("interrupted by a signal, try again") or a closed descriptor would otherwise be silently ignored, which would corrupt the timing (and possibly the whole measurement) without any visible symptom.
 
 ### Step 2: a syscall-shaped call that might be cached
+
+**What this code does, in plain words:** it calls `os.Getpid()` thousands of times and returns the average time; this may be fast simply because the process ID is cached.
 
 **Concept.** `os.Getpid()` exists precisely to illustrate the warning callout in the theory note: it looks like a syscall from the caller's side, but many platforms cache the PID after the first real call, since a process's PID never changes after it starts. This function is not a reliable "syscall cost" baseline — it exists to be compared against `WriteSyscallCost`, not to replace it.
 
@@ -126,6 +138,8 @@ func GetpidCost(iterations int) time.Duration {
 2. No error path exists here because `os.Getpid()` cannot fail by its own signature — a deliberate contrast with `WriteSyscallCost`, which can.
 
 ### Step 3: the zero-crossing floor
+
+**What this code does, in plain words:** it calls a tiny arithmetic function thousands of times, with no kernel involved, to get the "floor" cost to compare against.
 
 **Concept.** `PureCallCost` establishes the baseline every other measurement is compared against: a function call that never touches the kernel at all. Without this floor, there would be nothing to prove that `write`'s ~420–550 ns and `getpid`'s ~7–12 ns are both *above* "doing essentially nothing."
 
@@ -278,6 +292,8 @@ Reading this output: the test passes silently, meaning the real trap (`write` to
 
 `-race` reports no data races, which is expected: this code is entirely single-goroutine, with no shared mutable state other than the package-level `sink` variable, which only this goroutine ever touches.
 
+> 🟡 → 🔴 **You now know** the code and the one comparison the test asserts. **Next comes the advanced part:** how the compiler can secretly delete a benchmark loop, why errors are returned instead of failing the test, and why these numbers do not travel to other machines.
+
 ## Pitfalls in the code 🔴
 
 - Removing the `sink = acc` assignment (or otherwise never reading `acc`'s final value) lets an optimizing compiler legally delete the entire loop in `PureCallCost`, since Go's compiler is permitted to eliminate computations whose results are provably never observed — this would silently turn the "pure call" baseline into "an empty loop," invalidating the whole comparison.
@@ -289,6 +305,30 @@ Reading this output: the test passes silently, meaning the real trap (`write` to
 1. **Change this, predict the result:** change `WriteSyscallCost` to write to a regular file on disk instead of `/dev/null` (clean up the file afterward). Predict whether the per-call average goes up, down, or stays about the same, and explain why using the theory note's "kernel's own work" cost component.
 2. **Change this, predict the result:** reduce `iterations` in the test from 10,000 to 10. Predict whether the test becomes more or less likely to fail, and why, in terms of what a smaller sample size does to timing noise.
 3. **Extend it:** add a `CgoCallCost`-style function (even a no-op stub that just documents what it would measure, if cgo isn't available in your environment) and a short comment explaining, using the theory note's Variants and comparison table, where you would expect its cost to land relative to the three functions already here.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Why write to `/dev/null` and not a real file?
+> It throws bytes away, so the timing is almost pure syscall cost, not disk work.
+
+> [!question]- Why time thousands of calls and divide?
+> One call is too short and noisy to time on its own.
+
+> [!question]- What does the test actually check?
+> That a real `write` costs more than zero and more than a pure function call.
+
+🟡 Medium
+
+> [!question]- What is the `sink` variable for?
+> Using the loop's result stops the compiler from deleting the "useless" loop.
+
+> [!question]- Why use `syscall.Write` instead of `f.Write`?
+> It is the thinner wrapper, so less of Go's own bookkeeping is in the measurement.
+
+> [!question]- Why is there no test asserting `GetpidCost > PureCallCost`?
+> `Getpid` may be cached on some platforms, so the result is not reliable across machines.
 
 ## Links
 

@@ -29,6 +29,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add "Setup", the three code steps and "Design decisions".
 > - 🔴 **Interview / SDE-3 prep?** Add "Tests", "Pitfalls in the code" and the exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Query Plans and EXPLAIN]]: the theory half. A plan is a tree of steps, and a big gap between guessed and real rows is usually the bug.
+> - [[SQL Essentials]]: you can read the `SELECT ... JOIN` the sample plan comes from.
+> - [[Indexing Fundamentals]]: the sample plan uses index scans, which jump to rows through an index.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on half of [[Query Plans and EXPLAIN]]. That note says: when a query is slow, compare the rows the database *expected* with the rows it *actually got*. Doing that by eye on a big plan is painful. So here we write a small Go program that reads the plan as JSON, walks every step of it, and prints the steps where the guess was way off (say, 10 times or more). It uses only Go's standard library and no database. Read it top to bottom: concepts first, then the code in three small steps, then the tests that prove it works.
@@ -37,7 +42,7 @@ This file is the hands-on half of [[Query Plans and EXPLAIN]]. That note says: w
 
 - **Structs with JSON tags**: `json:"Node Type"` tells `encoding/json` which JSON key fills which Go field.
 - **Recursive types**: a `Node` holds a slice of child `Node`s, matching the plan tree.
-- **Recursive closure**: `var walk func(n Node)` is declared first so the function can call itself.
+- **Recursive closure** (a function defined inside another function that can see its variables, and here calls itself): `var walk func(n Node)` is declared first so the function can call itself.
 - **Built-in `max`**: picks the larger value (Go 1.21+); used to treat 0 rows as 1.
 - **Table-free tests with `testing`**: each `TestXxx` feeds a small JSON plan and checks the findings.
 - **Run**: `go vet ./... && go test -race -v ./...` inside the `plans` module; no database needed.
@@ -76,6 +81,8 @@ plans/
 - To feed it a real plan, run `EXPLAIN (ANALYZE, FORMAT JSON) <query>` in `psql` and pass the output bytes to `Misestimates`.
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** what the helper is for: flag plan steps whose guess was 10 times off or more. **Next we open the box**: the Go structs that match PostgreSQL's JSON, the decoder, and the tree walk that scores each step.
 
 The program has one job: read a JSON plan tree and list the nodes whose estimates were wrong. It is built in three pieces, in one file `plans.go`: the data model, the entry point that decodes JSON, and the recursive walk.
 
@@ -199,7 +206,7 @@ func Misestimates(explainJSON []byte, minFactor float64) ([]Finding, error) {
 
 **Concept.** The mechanical check from the theory note is to compare `Plan Rows` with `Actual Rows` on every node ([[Query Plans and EXPLAIN#Plan 3: a bad estimate]]).
 
-Because plans are trees, the natural implementation is a recursive depth-first walk that visits the parent before its children. The score is `max(p/a, a/p)`, so overestimates and underestimates count equally, and `max(x, 1)` guards against a node that returned zero rows.
+Because plans are trees, the natural implementation is a recursive depth-first walk (go all the way down one branch before moving to the next) that visits the parent before its children. The score is `max(p/a, a/p)`, so overestimates and underestimates count equally, and `max(x, 1)` guards against a node that returned zero rows.
 
 A closure is used so that `walk` can append to `out` without passing it around.
 
@@ -254,6 +261,8 @@ Scoring of the three nodes in the sample (all `loops` ignored, since the numbers
 | Takes `[]byte` | Takes `io.Reader` or runs the query | Easy to test with string constants and needs no database, but the caller must read the whole output first |
 
 ## Tests 🔴
+
+> 🟡 → 🔴 **You now know** how the helper decodes and scores a plan. **Next are the proofs and the traps**: tests for the tree order, the divide-by-zero edge case and bad input, then the pitfalls of per-loop averages and parallel plans.
 
 Three tests cover the main path, the boundary arithmetic and the error paths. The first sample is trimmed from the representative Plan 3 output (PostgreSQL 17) in the theory note.
 
@@ -388,6 +397,30 @@ To feed it a real plan, run `EXPLAIN (ANALYZE, FORMAT JSON) <query>` in `psql` a
 1. Add a `Loops`-weighted total (`ActualRows * ActualLoops`) to `Finding` and print it. Predict the total for the `clients` node in the sample before running it.
 2. Raise `minFactor` in `TestMisestimates` from 10 to 5,000. Predict how many findings remain and what that says about the sample's 4,018x error.
 3. Add a node with `Plan Rows: 1` and `Actual Rows: 100` to the sample and predict whether it is flagged at `minFactor` 10.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What input does `Misestimates` expect?
+> The output of `EXPLAIN (ANALYZE, FORMAT JSON)` as raw bytes.
+
+> [!question]- Why are 0 rows treated as 1?
+> To avoid dividing by zero when working out how far off the guess was.
+
+> [!question]- What does a struct tag like `json:"Plan Rows"` do?
+> It tells `encoding/json` which JSON key fills that Go field.
+
+🟡 Medium
+
+> [!question]- Planned 5,000, actual 0. What factor is reported and why?
+> 5,000: the factor is `max(planned/actual, actual/planned)` with 0 clamped to 1.
+
+> [!question]- Why is the inner `clients` scan with 48,211 loops not flagged?
+> Its guess (1 row) and its real rows per loop (1) match; loops do not count as an error.
+
+> [!question]- What goes wrong if you run the helper on plain `EXPLAIN` output without `ANALYZE`?
+> `Actual Rows` is missing and decodes to 0, so nearly every node is flagged.
 
 ## Links 🟢
 

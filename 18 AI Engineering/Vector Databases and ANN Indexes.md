@@ -32,6 +32,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Embeddings]]: each piece of text becomes a list of numbers, and similar meaning gives nearby lists, measured by cosine similarity.
+> - [[Index Types and Index Design]]: a database index is an extra structure that lets a lookup skip most rows instead of reading the whole table.
+
 **From zero, in 60 seconds** 🟢
 
 Embeddings turn each document into a list of numbers (a vector). To answer a question, you find the stored vectors closest to the question's vector.
@@ -79,6 +83,11 @@ That is the job of a vector database and its ANN index.
 | Index | An extra structure that makes lookups faster | A book's index vs reading every page |
 | Recall@k | Share of the true top-k that the search actually returned | Found 9 of the real top 10 = 0.9 |
 | Metadata filter | A normal condition applied with the search | `tenant_id = 42` |
+| Tenant | One customer company whose data must stay separate | "acme" never sees "globex" data |
+| Centroid | The middle point of a group of vectors | The "average" of one bucket |
+| k-means | A method that splits vectors into k groups around centroids | 2,000 vectors → 20 buckets |
+| Quantization | Storing each number with fewer bits to save memory | float32 → int8, 4× smaller |
+| `O(N)` | "Work grows in step with the data size" | 2× the vectors = 2× the time |
 
 **Picture it**
 
@@ -115,20 +124,64 @@ Exact search does not scale past roughly a million vectors at interactive latenc
 
 An **approximate nearest neighbor (ANN)** index restructures the data (a graph, or clusters) so a query only compares against a small fraction of the vectors, in exchange for occasionally missing the true closest match. In practice, a well-tuned ANN index recovers 95–99% of the exact top-k while touching 1–10% of the data.
 
+### Real-life example 🟢
+
+Think of a support bot in a payments app like Paytm or PhonePe with 5 million help chunks, many of them about UPI failures.
+A user types "money got cut but merchant didn't receive". The app embeds the question and asks the vector database for the 10 closest chunks.
+The ANN index jumps to the "failed UPI payment" area and checks a few thousand chunks, not all 5 million, and answers in about 20 ms.
+It also adds a filter such as `language = hi` or `product = upi`, so only the right chunks come back.
+
+### Common beginner mistakes 🟢
+
+- **Adding an ANN index for 20,000 vectors** → checking every vector is already fast at that size, and ANN adds misses → use exact (flat) search until it is too slow.
+- **Filtering after the search** → the top 10 may all belong to other customers, so after filtering you get 1 result or none → filter during the search, or fetch many more candidates.
+- **Never measuring recall** → "approximate" can quietly become "often wrong" after new data arrives → compare against exact search on a sample of queries regularly.
+- **Calling FAISS a database** → it is a code library with no server, no saving to disk and no filters → use a real vector database, or build those parts yourself.
+- **Treating the tenant filter as security** → one bug in the filter leaks another customer's data → also check permissions in your app code.
+
 ## 2. Mental model 🟢
+
+🟢 **Plain version:** There are two main shortcuts. The first, a graph, links each vector to a few close neighbours; a search hops from neighbour to neighbour, always moving closer to the question. The second, clusters, sorts vectors into buckets ahead of time; a search only opens the few buckets nearest the question. Both skip most of the data, so they are fast, and both can sometimes miss the true closest item.
+
+```mermaid
+flowchart LR
+    Q["Question vector"] --> G["Graph: hop to<br/>closer neighbours"]
+    Q --> B["Buckets: open only<br/>the nearest few"]
+    G --> R["Top 10"]
+    B --> R
+```
 
 Exact k-NN is "check every row." An ANN index is "check only the rows likely to matter," using one of two tricks:
 
 - **Graph (HNSW):** build a graph where close vectors are linked; start somewhere and greedily walk toward the query, the way you'd navigate a social network by asking "who here is closer to what I'm looking for?"
 - **Clustering (IVF):** group vectors into clusters ahead of time (an inverted file, hence the name); at query time, only scan the few clusters whose center is closest to the query, the way a library only searches the shelves for the right subject instead of every book.
 
-Both turn `O(N)` work into roughly `O(log N)` (HNSW) or `O(N/nlist · nprobe)` (IVF) work, at the cost of sometimes skipping the true answer.
+Both turn `O(N)` work (time grows with every vector you add) into roughly `O(log N)` (time grows very slowly, like looking up a word in a dictionary) (HNSW) or `O(N/nlist · nprobe)` (IVF) work, at the cost of sometimes skipping the true answer.
+
+### Vector database vs the things people confuse it with 🟡
+
+| Thing | What it is good at | Key difference |
+| --- | --- | --- |
+| Vector database | "Find the 10 closest meanings" fast, with filters | Answers are approximate and ranked by closeness |
+| Normal database index (B-tree) | "Find the row where `id = 42`" exactly | Exact match or range; knows nothing about meaning |
+| Search engine (Elasticsearch, BM25) | "Find documents with these words" | Matches words; many now also add vector search |
+| FAISS | Fast vector search code inside your program | A library: no server, no saving, no filters |
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a vector database skips most of the data using a graph or buckets, and pays for that speed with an occasional miss. **Next we open the box**: exact search as the baseline, how HNSW and IVF really work and which knobs they have, how to shrink vectors, how filters can go wrong, and what one stored row looks like. Each subsection starts with a plain step-by-step walk.
 
 ### Exact search, for comparison
 
 **In plain words:** The slow but perfect way: measure the distance to every vector and keep the closest.
+
+**Step by step:**
+1. The question becomes one vector of 1,536 numbers.
+2. Compare it with every stored vector, say 100,000 of them, one by one.
+3. Keep a running list of the 10 best scores.
+4. Return those 10. Always correct, but the work grows in step with the number of vectors.
+
+Full detail:
 
 ```mermaid
 flowchart LR
@@ -140,6 +193,15 @@ flowchart LR
 ### HNSW (Hierarchical Navigable Small World)
 
 **In plain words:** Like using highways, then main roads, then local streets: big jumps first, then small steps to the exact spot.
+
+**Step by step:**
+1. Building: each new vector is linked to its `M` closest neighbours, say 16. A few vectors are also put on higher, sparser layers with long links.
+2. Searching starts at one entry point on the top layer.
+3. Hop to whichever linked neighbour is closer to the question. Stop when no neighbour is closer.
+4. Drop one layer down and repeat with shorter links.
+5. On the bottom layer, keep a shortlist of `efSearch` candidates, say 100, and return the best 10.
+
+Full detail:
 
 HNSW builds several layers of a graph. The top layer has few nodes and long links (for big jumps); the bottom layer has all nodes and short links (for fine-grained search).
 
@@ -175,6 +237,15 @@ HNSW is memory-heavy: it stores the full vectors plus `M` links per node per lay
 
 **In plain words:** Sort vectors into buckets ahead of time. At query time, only search the few buckets nearest the question.
 
+**Step by step:**
+1. Building: run k-means to pick `nlist` centre points, say 20 for 2,000 vectors.
+2. Put each vector in the bucket of its nearest centre: about 100 vectors per bucket.
+3. Searching: compare the question with the 20 centres only.
+4. Open the `nprobe` closest buckets, say 4, and check those 400 vectors exactly.
+5. Return the best 10. In this note's own test, that finds about 57% of the true top 10; opening 8 buckets finds about 81%.
+
+Full detail:
+
 ```mermaid
 flowchart TD
     Build["build time: k-means over all vectors -> nlist centroids"]
@@ -200,12 +271,21 @@ IVF is lighter on memory than HNSW (no per-vector link list, just `N` bucket ass
 
 **In plain words:** Store each number with fewer bits, like saving a photo at lower quality. Much less memory, slightly worse results.
 
+**Step by step:**
+1. A normal vector: 1,536 numbers × 4 bytes = about 6 KB.
+2. **Scalar** quantization: store each number in 1 byte instead of 4. Now about 1.5 KB.
+3. **Product** quantization: cut the vector into small pieces and store only a short "closest pattern" code for each piece. Now about 100 bytes.
+4. **Binary**: keep only whether each number is above or below zero, 1 bit each. Now about 200 bytes.
+5. Smaller codes mean more misses, so search with the small version first, then re-score the top results with full vectors.
+
+Full detail:
+
 Both index families can store a **compressed** copy of each vector to cut memory further:
 
 - **Scalar quantization**: each `float32` becomes an `int8`, a 4× memory cut for a small recall hit.
 - **Product quantization (PQ)**: split each vector into sub-vectors, cluster each sub-vector space separately, and store only the cluster id per sub-vector — often an 8–32× cut, at a larger recall cost that must be measured per dataset.
-- **Binary quantization**: one bit per dimension (sign of the value) with Hamming-distance search; roughly 32× smaller, usable as a cheap first pass before rescoring with full vectors.
-- **DiskANN** (Microsoft, 2019) takes this further: it keeps a compressed graph and vectors on SSD instead of RAM, making billion-scale ANN affordable without a huge memory footprint, at higher per-query latency than an all-in-RAM index.
+- **Binary quantization**: one bit per dimension (sign of the value) with Hamming-distance search (counting how many bits differ); roughly 32× smaller, usable as a cheap first pass before rescoring with full vectors.
+- **DiskANN** (Microsoft, 2019) takes this further: it keeps a compressed graph and vectors on SSD (fast disk, much cheaper than memory) instead of RAM, making billion-scale ANN affordable without a huge memory footprint, at higher per-query latency than an all-in-RAM index.
 
 ```mermaid
 flowchart LR
@@ -216,6 +296,15 @@ flowchart LR
 ### Metadata filtering: three strategies, one trap
 
 **In plain words:** You can filter before the search, after it, or during it. Filtering after can leave you with almost no results.
+
+**Step by step:**
+1. Request: "10 closest chunks where `tenant_id = acme`". Acme owns 1% of the index.
+2. Post-filter: the index finds the 100 closest chunks overall, then drops non-acme ones. Only about 1 survives.
+3. Pre-filter: first list acme's chunk IDs, then search only those. Correct, but may become a slow exact scan.
+4. In-search filter: the index skips non-acme chunks while it walks, and keeps going until it has 10 acme chunks.
+5. Pick the third when your database supports it.
+
+Full detail:
 
 A real query is rarely "nearest k vectors" alone — it is "nearest k vectors where `tenant_id = X`". There are three ways to combine the filter with the ANN index, and they are not interchangeable:
 
@@ -239,6 +328,15 @@ flowchart LR
 
 **In plain words:** One customer's question, from the app to the database and back, only ever touching that customer's data.
 
+**Step by step:**
+1. An acme user asks "find my overdue invoices".
+2. The app turns the question into a vector with the embedding model.
+3. The app asks the index for 10 matches with filter `tenant = acme` and a wider shortlist (`efSearch = 200`).
+4. The app checks permissions again in its own code.
+5. The 10 chunks go to the screen or into an LLM prompt.
+
+Full detail:
+
 ```mermaid
 sequenceDiagram
     participant User
@@ -259,6 +357,15 @@ Metadata filtering is a performance and relevance feature, not a security bounda
 ### Record design and hybrid (sparse + dense) support
 
 **In plain words:** Each stored row holds the vector plus its ID, text, source and filter fields.
+
+**Step by step:**
+1. Give each chunk an `id` and the `document_id` it came from.
+2. Store the dense `vector`, and optionally a sparse word vector next to it for hybrid search.
+3. Add filter fields: `tenant_id`, plus a `version` number.
+4. Store the chunk text and source, so results can be shown and cited.
+5. When a document changes, write new chunks with a higher `version` and filter queries to the current version only.
+
+Full detail:
 
 A stored record is more than the raw vector. A typical shape:
 
@@ -637,6 +744,8 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how HNSW and IVF work, which knobs trade speed for recall, how to shrink vectors and how to filter safely. **Next comes the senior view**: which systems teams really run, what fails in production, how much RAM you need, how to shard a vector index, and how to back it up.
+
 - **Real systems:**
 	- pgvector ships HNSW and IVFFlat index types inside Postgres 17; teams already running Postgres often start here before adopting a dedicated vector database.
 	- Pinecone, Qdrant, Weaviate and Milvus are purpose-built vector databases offering namespaces, filtering, replication and managed scaling.
@@ -645,7 +754,7 @@ flowchart LR
 	- Post-filter returns fewer than k results for a selective tenant → raise `efSearch`/`nprobe`, or switch to an index with in-graph/in-list filtering.
 	- Recall silently degrades after a bulk import → re-measure recall@k against a flat baseline after every large data change, not just at launch.
 	- Stale data after a document update → a correct re-index procedure: (1) mark old chunks inactive or delete by `document_id`, (2) parse and chunk the new version, (3) embed the new chunks, (4) upsert with version metadata, (5) verify the old version no longer appears in retrieval.
-	  Visibility is eventually consistent during this window in most managed stores — do not assume synchronous consistency.
+	  Visibility is eventually consistent (new writes show up after a short delay, not at once) during this window in most managed stores — do not assume synchronous consistency.
 	- Cross-tenant leakage → every record carries tenant/workspace metadata, every query includes a tenant filter, and tests assert cross-tenant records never appear (not just that authorization headers are checked).
 - **What to monitor:**
 	- Recall@k against a periodic flat-search sample (ground truth drifts as data grows).
@@ -662,8 +771,8 @@ flowchart LR
   - IVF's `nprobe = nlist` only *fully* recovers exact search if no vector was ever assigned to the wrong cluster — which is guaranteed here because cluster assignment is deterministic.
   - But a vector near a cluster boundary found by one centroid may genuinely be closer to a neighboring cluster that `nprobe` didn't reach at lower settings.
 - **Choosing `nlist`/`nprobe` for IVF.** Rule of thumb: `nlist ≈ √N` to `4√N`, then tune `nprobe` by measuring recall@k on a held-out query sample — target recall first, then see what latency that costs, not the other way around.
-- **Sharding and replication.** Beyond single-machine capacity, vector indexes shard the same way other data stores do: partition by a hash of the id (even distribution, no range locality) or by tenant (noisy-neighbor isolation, uneven shard sizes).
-  Each shard still answers an ANN query independently; the service fans a query out to all shards and merges the top-k results (scatter-gather), so tail latency is bounded by the slowest shard.
+- **Sharding and replication.** Beyond single-machine capacity, vector indexes shard the same way other data stores do: partition by a hash of the id (even distribution, no range locality) or by tenant (noisy-neighbor isolation, meaning one busy customer cannot slow down the others; uneven shard sizes).
+  Each shard still answers an ANN query independently; the service fans a query out to all shards and merges the top-k results (scatter-gather: send to all, collect from all), so tail latency (the wait of the slowest few requests) is bounded by the slowest shard.
 - **Backups.** A vector index is derived data (it can be rebuilt from the source documents plus the embedding model), but rebuilding at scale is slow and costs API or GPU time — back up the index snapshots themselves, not just the source documents, for any index past a few hundred thousand vectors.
 
 ## 9. Interview questions 🔴
@@ -712,6 +821,26 @@ flowchart LR
 - Measure recall@k against exact search after every index change — never assume a setting is "good enough."
 - FAISS is a library, not a database. pgvector is often the right first stop if you're already on Postgres.
 - Metadata filters add relevance and performance; authorization still belongs in application logic too.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: What does "approximate" in ANN mean?
+> It checks only the likely area, so it is fast but may sometimes miss the true closest vector.
+
+> [!question]- Easy: Name the two main ANN index families.
+> Graphs (HNSW) and clusters/buckets (IVF).
+
+> [!question]- Easy: Is FAISS a vector database?
+> No. It is a code library with no server, saving or filters.
+
+> [!question]- Medium: You raise HNSW `efSearch` from 50 to 300. What changes?
+> Recall goes up and each query gets slower; no rebuild is needed.
+
+> [!question]- Medium: A tenant filter returns 2 results when you asked for 10. Why?
+> Post-filtering: most of the candidates belonged to other tenants; filter during search or widen the shortlist.
+
+> [!question]- Medium: You have 50,000 vectors. Do you need an ANN index?
+> Probably not; exact search is fast enough at that size and never misses.
 
 ## Links 🟢
 

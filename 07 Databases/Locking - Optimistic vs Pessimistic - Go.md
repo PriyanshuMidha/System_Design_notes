@@ -30,14 +30,19 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 2-4 and the Tests.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[Transactions and ACID]]: a transaction runs from `BEGIN` to `COMMIT`, and any row lock it takes lasts until it ends.
+> - [[Isolation Levels and MVCC]]: at READ COMMITTED two read-then-write requests can overwrite each other (a lost update).
+> - The theory twin [[Locking - Optimistic vs Pessimistic]] explains version columns, `FOR UPDATE`, deadlocks and `SKIP LOCKED` in plain words; read its sections 1-3 first.
+
 **From zero** 🟢 This file is the hands-on half of [[Locking - Optimistic vs Pessimistic]]: working Go code for both cures to the lost-update bug. The heart of it is one small loop, `RecordPayment`, that reads an invoice, does the maths, and writes back only if the row's version number has not moved; if it has, the loop re-reads and tries again. The same loop runs against a tiny in-memory store (for tests, no database needed) and against real PostgreSQL, and the file ends with the pessimistic lock-first version and the job-queue SQL. Read the theory note first, then follow the steps in order; the tests show the 50-writers race actually coming out right.
 
 - **Interfaces**: `Store` has only `Get` and `UpdateIfVersion`, so the same `RecordPayment` works with memory or PostgreSQL.
-- **Sentinel errors**: `ErrConflict` and `ErrOverpay` are compared with `errors.Is` to decide "retry" or "stop".
+- **Sentinel errors** (fixed error values declared once, like named signals): `ErrConflict` and `ErrOverpay` are compared with `errors.Is` to decide "retry" or "stop".
 - **`sync.Mutex`**: the in-memory store guards its map so the version check and write are one atomic step.
 - **Goroutines and `sync.WaitGroup`**: the race test fires 50 payments at once and waits for all.
 - **`context.Context`**: every database call can be cancelled; `pgx` transactions use it too.
-- **Run**: `go mod tidy && go vet ./... && go test -race -v ./...` (no database needed).
+- **Run**: `go mod tidy && go vet ./... && go test -race -v ./...` (no database needed; `-race` turns on Go's race detector, which flags unsafe use of shared data).
 
 ## What this code shows 🟢
 
@@ -79,6 +84,8 @@ go test -race -v ./...
 ```
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** the plan: one optimistic loop that works against a memory store or PostgreSQL, plus the lock-first version and a job-queue query. **Next we open the code** in four steps, each with a line-by-line walk.
 
 ### Step 1: the optimistic loop
 
@@ -218,7 +225,7 @@ The second half writes with the version check. Success returns the new invoice, 
 
 **Concept.** The version check is simple enough to reproduce exactly in memory: compare under a mutex, then write.
 
-This gives a test double with the same contract as `UPDATE … WHERE id = $1 AND version = $2` evaluated under a row lock ([[Locking - Optimistic vs Pessimistic#3.2 Optimistic: the version column]]).
+This gives a test double (a stand-in used only in tests) with the same contract as `UPDATE … WHERE id = $1 AND version = $2` evaluated under a row lock ([[Locking - Optimistic vs Pessimistic#3.2 Optimistic: the version column]]).
 
 A mock library that returns scripted answers would be an alternative, but it cannot produce real interleavings; a store with real semantics lets 50 goroutines race and still be checked by the final state. The mutex plays the role of the row lock.
 
@@ -281,7 +288,7 @@ func (m *MemStore) UpdateIfVersion(_ context.Context, inv Invoice, expected int6
 
 **How it works.**
 
-1. The variadic constructor `NewMemStore(rows ...Invoice)` makes test setup one line.
+1. The variadic constructor `NewMemStore(rows ...Invoice)` (it accepts any number of arguments) makes test setup one line.
 2. `Get` returns the `Invoice` by value, so the caller holds a private copy and cannot mutate the stored row without going through `UpdateIfVersion`.
 3. `defer m.mu.Unlock()` releases the lock on every path. Compare-and-write happen in one critical section, which is what makes the check atomic.
 4. A version mismatch plays the part of "0 rows affected": it increments `Conflicts` (so tests can see how many races happened) and returns `ErrConflict` without writing.
@@ -485,7 +492,7 @@ Note that the pessimistic version still bumps `version`. Mixing styles is fine a
 
 Worker 1 locks the first 10 due rows; worker 2, running the same query a millisecond later, skips those 10 and gets the next 10. If a worker crashes while this statement's transaction is still open, the transaction rolls back and the rows become claimable again.
 
-Once the claim has committed, the rows stay `running`, so a reaper must reset rows whose `locked_at` is too old. Retries, visibility timeouts and dead-letter handling belong to [[Background Workers and Job Queues]].
+Once the claim has committed, the rows stay `running`, so a reaper (a periodic job that resets stuck work) must reset rows whose `locked_at` is too old. Retries, visibility timeouts and dead-letter handling (parking jobs that keep failing) belong to [[Background Workers and Job Queues]].
 
 ```sql
 WITH next AS (
@@ -504,7 +511,7 @@ RETURNING r.id, r.invoice_id;
 
 **How it works.**
 
-1. The CTE `next` selects up to 10 due pending rows in `run_at` order and row-locks them. `SKIP LOCKED` silently omits rows that are already locked by someone else.
+1. The CTE (a named sub-query written with `WITH`) `next` selects up to 10 due pending rows in `run_at` order and row-locks them. `SKIP LOCKED` silently omits rows that are already locked by someone else.
 2. The outer `UPDATE ... FROM next` flips exactly those rows to `running` and stamps `locked_at`, so a reaper can find stale claims later.
 3. `RETURNING` hands the claimed ids back to the worker in the same round trip, so claim and fetch cannot disagree.
 4. Two workers running concurrently get disjoint sets. Nobody waits and no job is claimed twice.
@@ -522,6 +529,8 @@ sequenceDiagram
 ```
 
 ## Design decisions 🔴
+
+> 🟡 → 🔴 **You now know** how the optimistic loop, both stores, the locked version and the job query work. **Next comes the review view**: why each design choice was made, how the tests prove correctness without a database, and the traps a reviewer would catch.
 
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
@@ -763,6 +772,30 @@ ok  	example.com/locking
 1. Change `maxAttempts` in `TestConcurrentPaymentsAllLand` from 1000 to 2. Predict whether the test still passes and what error some goroutines return, then run it several times with `-race`.
 2. Remove `slices.Compact` from `LockOrder`. Predict the result for `LockOrder([]int64{42, 7, 42, 13})` and why a duplicate id in a `FOR UPDATE` list is a problem even though PostgreSQL tolerates it.
 3. In `MemStore.UpdateIfVersion`, delete the `m.Conflicts++` line and the `expected` comparison so every write succeeds. Predict which test fails first.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Which two methods does the `Store` interface have?
+> `Get` and `UpdateIfVersion`.
+
+> [!question]- Which error does `RecordPayment` retry, and which does it return at once?
+> It retries `ErrConflict`; it returns `ErrOverpay` (a business rule) immediately.
+
+> [!question]- In `MemStore`, what plays the role of the database row lock?
+> The `sync.Mutex`, which makes compare-and-write one step.
+
+🟡 Medium
+
+> [!question]- After 50 concurrent payments of 2,000, why must `Version` be exactly 50?
+> Each successful write bumps it once, however many conflicts happened on the way.
+
+> [!question]- Why is the overpay check inside the retry loop, not before it?
+> After a conflict the fresh read may show the balance already used up, so the answer can change.
+
+> [!question]- What does `LockOrder([]int64{42, 7, 42, 13})` return, and why does it matter?
+> `[7, 13, 42]`: every transaction locks in the same ascending order, so no deadlock loop can form.
 
 ## Links 🟢
 

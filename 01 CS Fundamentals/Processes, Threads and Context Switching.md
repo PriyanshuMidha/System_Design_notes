@@ -30,6 +30,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[How a Computer Runs a Program]]: the CPU runs one instruction after another, keeping the current values in registers and the "next instruction" address in the program counter.
+
 **From zero, in 60 seconds** 🟢
 
 Your computer runs many programs at once, but each CPU core can only do one thing at a time. The OS fakes "at once" by switching between tasks very quickly.
@@ -73,6 +76,12 @@ Each "turn swap" has a cost, and knowing that cost is how you build fast servers
 | Registers / program counter | Tiny CPU slots holding the current values and "next instruction" | PC = address of next line to run |
 | Context switch | Saving one thread's CPU state and loading another's | Pausing music to run the editor |
 | Goroutine | Go's lightweight task, run by the Go runtime on OS threads | `go handle(conn)` |
+| Address space | The private range of memory addresses one process sees | two processes can both use address `0x1000` safely |
+| PID | Process ID: the number the OS gives each process | `ps` shows PID 4321 |
+| `fork` / `exec` | Copy the current process / replace its program with a new one | the shell runs `ls` this way |
+| Copy-on-write | Share memory pages until someone writes, then copy just that page | `fork` of a 2 GB process is still fast |
+| Scheduler | The kernel part that picks which ready thread runs next on each core | Linux CFS / EEVDF |
+| TLB | A tiny CPU cache of recent memory-address translations | flushed or re-tagged on a process switch |
 
 **Picture it**
 
@@ -104,13 +113,13 @@ Say a web server needs to handle 10,000 concurrent connections. One option is on
 
 Picture a process as a self-contained office: it has its own address space, its own open files, its own everything, and nothing it does can directly touch another process's memory.
 
-That isolation is valuable, but on Linux it has a real setup cost: creating a process means the kernel builds a brand-new address space — new page tables, a new file descriptor table, a new signal table — all copied or freshly allocated from the parent.
+That isolation is valuable, but on Linux it has a real setup cost: creating a process means the kernel builds a brand-new address space — new page tables (the map from the process's addresses to real RAM), a new file descriptor table (its list of open files and sockets), a new signal table (what to do when the OS sends it a notice like "stop") — all copied or freshly allocated from the parent.
 
 Even a modest few hundred KB of fixed per-process kernel bookkeeping multiplies to hundreds of MB before any application memory is counted, and creating each one costs a syscall round trip plus kernel address-space setup. 10,000 such offices is impractical on a single host.
 
 **Threads** exist to split "an independent flow of execution" from "an independent address space."
 
-All 10,000 connections can be handled by threads inside **one** process: they share the open listening socket, the in-memory cache, and the database connection pool, without inter-process communication.
+All 10,000 connections can be handled by threads inside **one** process: they share the open listening socket, the in-memory cache, and the database connection pool, without inter-process communication (IPC: pipes, sockets or shared memory used to pass data between separate processes).
 
 The OS still schedules each thread independently, so one slow connection does not block the others — but the heavier cost, the address space, is paid once per process, not once per connection.
 
@@ -120,6 +129,13 @@ Section 4 measures the practical effect on this machine: a goroutine-to-goroutin
 
 > [!tip] Remember
 > Threads exist because the expensive part of a process (its address space) doesn't need to be duplicated for every independent flow of execution.
+
+### Real-life example 🟢
+
+Google Chrome runs each tab (roughly) in its own process. If one website's tab crashes, the other tabs keep working, because a process cannot touch another process's memory.
+The price is memory: many tabs means many processes, which is why Chrome can use a lot of RAM.
+A Go backend, like the one behind a food-delivery app, makes the opposite choice: one process per container, and a goroutine for each incoming request.
+Thousands of requests share one process's memory (caches, database pool) and switch between goroutines in about 100 ns instead of several µs.
 
 ## 2. Mental model 🟢
 
@@ -153,13 +169,23 @@ A **context switch** is the manager walking over, writing down exactly what a wo
 
 They are separate operations because sometimes you want only one of them:
 
-- `fork` alone gives you a second, independent copy of the current program (classic Unix daemons use this).
+- `fork` alone gives you a second, independent copy of the current program (classic Unix daemons, long-running background services, use this).
 - `exec` alone (via `execve` without a prior `fork`) replaces the current process's program outright, keeping its PID — this is what a shell does for its very last command with `exec cmd`.
 
 > [!warning] Common mistake
 > Assuming "thread" means "cheap, independent program." A thread shares everything about its process except its own execution state. A bug in one thread's pointer arithmetic can silently corrupt another thread's data, because there is no office wall between them — only between separate processes.
 
+## Common beginner mistakes 🟢
+
+- **"Threads are cheap, separate programs"** → threads share the whole process memory, so one bad write can corrupt another thread's data → protect shared data with locks or channels.
+- **"Goroutines are just OS threads"** → the Go runtime runs many goroutines on a few OS threads, so their switches are about 100× cheaper → don't pool goroutines out of fear; bound them only to protect downstream resources.
+- **Starting one goroutine per request with no limit** → a traffic spike creates millions and memory runs out → cap concurrency with a worker pool or a buffered channel.
+- **Thinking a context switch is slow because of saving registers** → that part takes tens of ns; the real cost is cold caches afterwards → keep the number of busy threads close to the number of cores.
+- **Calling `fork` in a multi-threaded program and carrying on** → only the calling thread is copied, so locks held by others may never unlock → call `exec` right after `fork`, or use `os/exec` in Go.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a process owns memory, a thread is a worker inside it, and switching workers costs time. **Next we open the box:** how a new process is born (`fork` + `exec`), the states every thread moves through, and what really happens during a context switch.
 
 ### Process creation: fork + exec
 
@@ -188,7 +214,7 @@ sequenceDiagram
 2. `fork()` returns twice: once in the parent, with the child's new PID; once in the child, with `0`.
 3. The child, a near-identical copy of the shell (same code, same open files, same environment), calls `execve("/usr/bin/ls", ...)`.
 4. The kernel discards the child's old address space entirely and loads `ls`'s code and data in its place, resetting registers to `ls`'s entry point — but keeping the same PID.
-5. When `ls` exits, the kernel sends `SIGCHLD` to the shell, and the shell's `wait()` call returns with the exit status.
+5. When `ls` exits, the kernel sends `SIGCHLD` (the "your child finished" signal) to the shell, and the shell's `wait()` call returns with the exit status.
 
 **Why it matters:** `fork` is fast even for a process with gigabytes of mapped memory, because nothing is actually duplicated at `fork` time — only when either process later **writes** to a shared page does the kernel fault in, copy that one page, and let the write proceed (see [[Virtual Memory, Paging and the TLB]] for the page-table and fault mechanics).
 
@@ -200,6 +226,13 @@ sequenceDiagram
 ### Process and thread lifecycle
 
 **In plain words:** a process (and each of its threads individually) moves through the same handful of scheduling states, no matter which one it is.
+
+**Step by step:**
+1. **New**: the shell forks; the child exists but is not yet runnable.
+2. **Ready**: it waits in line for a free CPU core.
+3. **Running**: the scheduler gives it a core; it runs code.
+4. **Waiting**: it calls `read` on a socket with no data, so it steps off the core and sleeps.
+5. Data arrives → back to **Ready** → **Running** again. When it exits it becomes **Terminated** until its parent collects its exit code.
 
 ```mermaid
 stateDiagram-v2
@@ -221,6 +254,13 @@ stateDiagram-v2
 
 **In plain words:** "saving and loading CPU state" is the easy half of a context switch to picture. The expensive half is invisible in the diagram and only shows up once the new thread starts actually running.
 
+**Step by step:**
+1. Thread A (your HTTP handler) is running on core 0. Its data is warm in core 0's caches.
+2. A's time slice ends, or A waits on a lock. The kernel takes over.
+3. The kernel saves A's registers and program counter into A's record. About tens of ns.
+4. It loads thread B's saved registers. If B is in another process, it also switches page tables.
+5. B runs, but its data is not in the caches yet. Its first memory reads miss, costing hundreds of ns each. This "cold cache" is the main cost.
+
 ```mermaid
 flowchart TB
     subgraph before["Thread A is running"]
@@ -238,12 +278,12 @@ flowchart TB
 Two costs stack up here, and only one of them is "the switch" in the narrow sense:
 
 1. **Direct cost:** saving/restoring maybe 30-40 registers. On modern hardware this is a handful of store/load instructions — genuinely cheap, on the order of tens of nanoseconds.
-2. **Indirect cost:** thread B's working set is not in the CPU's L1/L2 caches or TLB (see [[Memory Hierarchy and CPU Caches]] and [[Virtual Memory, Paging and the TLB]]) — thread A's was. The first several memory accesses B makes are cache misses and possibly TLB misses, each costing tens to a few hundred nanoseconds.
+2. **Indirect cost:** thread B's working set (the data and code it is actively using) is not in the CPU's L1/L2 caches or TLB (see [[Memory Hierarchy and CPU Caches]] and [[Virtual Memory, Paging and the TLB]]) — thread A's was. The first several memory accesses B makes are cache misses and possibly TLB misses, each costing tens to a few hundred nanoseconds.
 
 > [!warning] Common mistake
 > Assuming "a context switch is expensive because saving registers is slow." The register save/restore itself is cheap. The real cost is the *aftermath*: cold caches and TLB entries for the newly-running thread, which is also why switching between two threads of the **same** process (no page-table change, so no mandatory TLB flush) is cheaper than switching between threads of different processes.
 
-A switch can be **voluntary** (the running thread calls a blocking syscall, waits on a lock, or reads from an empty channel) or **involuntary/preemptive** (the scheduler's timer interrupt fires and takes the CPU away because the time slice ran out, or a higher-priority thread became ready).
+A switch can be **voluntary** (the running thread calls a blocking syscall, waits on a lock, or reads from an empty channel) or **involuntary/preemptive** (the scheduler's timer interrupt, a regular hardware tick, fires and takes the CPU away because the time slice, the few milliseconds each thread gets in a turn, ran out, or a higher-priority thread became ready).
 
 [[CPU Scheduling]] covers how the next thread to run is chosen.
 
@@ -333,12 +373,14 @@ Runnable Go version, including the process-table model, both the unpinned and pi
 - Spawning one OS thread per unit of work still costs a fixed-size stack (commonly 1-8 MB reserved per `pthread_create` call on Linux, though only the touched pages are committed) and a kernel scheduling entity; spawning millions of OS threads will exhaust memory or hit the OS's thread-count limits long before spawning millions of goroutines would (Go starts goroutine stacks at about 2 KB, growable — see [[Process Memory Layout - Stack vs Heap]]).
 - Goroutines are not free: a CPU-bound goroutine still occupies an OS thread while it runs, and goroutines that block on a syscall make the Go runtime spin up another OS thread to keep `GOMAXPROCS` logical processors busy (see [[Runtime - Goroutine Scheduler (GMP)]]). Thousands of goroutines blocked on CPU-bound work, not I/O, do not scale better than thousands of OS threads.
 
+> 🟡 → 🔴 **You now know** how processes are created, the thread states, what a context switch costs, and a measured goroutine-vs-thread handoff. **Next comes the advanced part:** how Nginx, PostgreSQL, Redis and Go services pick processes vs threads, what goes wrong in production, and the deeper details: 1:1 vs M:N threading, `clone()`, zombies and orphans.
+
 ## 7. In production 🔴
 
-- **Real systems:** Nginx and PostgreSQL (still process-per-connection as of PostgreSQL 17, hence the usual advice to front it with a pooler like PgBouncer) use one process per connection/worker for strong isolation; Redis and Node.js run single-threaded event loops per process to avoid locking entirely; Go backend services commonly run one process per container with goroutines handling each request, the pattern this note sets up [[Runtime - Goroutine Scheduler (GMP)]] to explain.
+- **Real systems:** Nginx and PostgreSQL (still process-per-connection as of PostgreSQL 17, hence the usual advice to front it with a pooler like PgBouncer, a small proxy that lets many clients share a few database connections) use one process per connection/worker for strong isolation; Redis and Node.js run single-threaded event loops per process to avoid locking entirely; Go backend services commonly run one process per container with goroutines handling each request, the pattern this note sets up [[Runtime - Goroutine Scheduler (GMP)]] to explain.
 - **Failure modes -> fixes:**
   - "Thread/goroutine explosion" (unbounded `go f()` per request under load) exhausts memory or scheduler latency -> bound concurrency with a worker pool or a semaphore-like primitive (`golang.org/x/sync/semaphore`, or a buffered channel used as a counting semaphore).
-  - High context-switch rate shows up as elevated `%system` CPU time and poor cache locality even though "the CPUs aren't at 100%" -> reduce the number of runnable threads/goroutines competing for cores, or pin latency-critical work.
+  - High context-switch rate shows up as elevated `%system` CPU time (time the CPU spends running kernel code instead of your program) and poor cache locality even though "the CPUs aren't at 100%" -> reduce the number of runnable threads/goroutines competing for cores, or pin latency-critical work.
   - A process fork in a multi-threaded program only clones the calling thread; locks held by other threads at fork time can deadlock the child -> avoid `fork` in multi-threaded programs except immediately followed by `exec` (the common and safe pattern).
 - **What to monitor:** `vmstat`'s `cs` (context switches/sec) and `r` (runnable queue length) columns; `/proc/<pid>/status`'s `voluntary_ctxt_switches` / `nonvoluntary_ctxt_switches`; Go's `runtime.NumGoroutine()` and the scheduler latency exposed via `runtime/trace`.
 
@@ -381,6 +423,30 @@ Runnable Go version, including the process-table model, both the unpinned and pi
 - Measured on this machine, same hardware, same run: goroutine handoff ~= 80-84 ns; a real OS-thread handoff forced via `LockOSThread` ~= 7.0-7.8 µs (about 90x slower), consistent with `lmbench`'s cited 1-10 µs range for thread context switches.
 - Go uses M:N scheduling (many goroutines over few OS threads); Linux/macOS threads are 1:1 with the kernel scheduler.
 - A multi-threaded program that `fork`s without an immediate `exec` risks deadlocking the child on locks held by other (non-cloned) threads.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does a process have that a thread does not?
+> Its own address space (private memory). Threads share their process's memory.
+
+> [!question]- What is a context switch?
+> The kernel saving one thread's CPU state and loading another's so a core can run something else.
+
+> [!question]- Roughly how much cheaper was a goroutine handoff than an OS-thread handoff here?
+> About 90×: about 80 ns against about 7 µs.
+
+🟡 Medium
+
+> [!question]- Why is `fork` fast even for a process using gigabytes?
+> Copy-on-write: pages are shared and only copied when one side writes to them.
+
+> [!question]- What is the biggest cost of a context switch?
+> The cold caches and TLB afterwards, not saving the registers.
+
+> [!question]- When would you choose separate processes over threads?
+> When a crash in one part must not take down the others, such as browser tabs or untrusted plugins.
 
 ## Links
 

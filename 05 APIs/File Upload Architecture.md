@@ -39,6 +39,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[REST and HTTP API Design]]: clients call the API with requests like `POST /v1/uploads` and get JSON back.
+> - [[AWS 07 - S3]]: S3 stores whole files ("objects") in "buckets", each under a name called a key.
+> - [[Idempotency and Idempotency Keys]]: an operation that may run twice must give the same result as running once.
+
 **From zero, in 60 seconds** 🟢
 
 A user wants to upload a 2 GB video. The slow, naive way: the file travels through your API server on its way to storage. Your server spends minutes just copying bytes.
@@ -84,6 +89,12 @@ A background worker then checks the file and marks it ready.
 | Checksum | A short fingerprint that proves the bytes were not changed | SHA-256 of the file |
 | Worker | A background program that processes jobs | Makes thumbnails after upload |
 | Event | A message saying something happened | "Object created" from S3 |
+| Bucket | A top-level container for files in object storage | `uploads-prod` |
+| Idempotent | Running it twice has the same result as once | "mark uploaded if still pending" |
+| Sniffing / magic bytes | Reading the first bytes of a file to learn its real type | PNG files start with `\x89PNG` |
+| TTL | Time to live: how long something stays valid | a pending upload expires after 24 hours |
+| DLQ | Dead-letter queue: where jobs go after failing too many times | a corrupt video that never transcodes |
+| Bearer token | Anything that works for whoever holds it, like cash | a presigned URL |
 
 **Picture it**
 
@@ -117,12 +128,19 @@ Where it breaks: a warehouse guard looks at the goods, but storage accepts any b
 
 A user uploads a 500 MB video through `POST /v1/videos`, and the API server receives the bytes and forwards them to S3.
 
-- **Time.** On a 10 Mbit/s mobile uplink, 500 MB takes 400 seconds. A Go server with `ReadTimeout: 30 * time.Second` cuts it off, because that timeout covers reading the entire request, body included.
+- **Time.** On a 10 Mbit/s mobile **uplink** (the phone's upload speed), 500 MB takes 400 seconds. A Go server with `ReadTimeout: 30 * time.Second` cuts it off, because that timeout covers reading the entire request, body included.
 - **Limits on the way in.** nginx rejects bodies above `client_max_body_size` (1 MiB by default) with `413`. Amazon API Gateway caps payloads at 10 MB and a synchronous Lambda invocation at 6 MB.
-- **Memory and connections.** A handler that buffers files needs `file size × concurrent uploads` of RAM: 100 concurrent 50 MB uploads is 5 GB (arithmetic, not a measurement). Even when streaming, each upload pins a connection and a goroutine for minutes, and you pay to move every byte twice (client → API → S3).
+- **Memory and connections.** A handler that buffers files needs `file size × concurrent uploads` of RAM: 100 concurrent 50 MB uploads is 5 GB (arithmetic, not a measurement). Even when streaming, each upload pins a connection and a **goroutine** (one of Go's lightweight threads) for minutes, and you pay to move every byte twice (client → API → S3).
 - **Retries restart from zero.** A dropped connection at 480 MB means sending all 500 MB again.
 
 Object storage is built for exactly this traffic. The API only has to decide **who may upload what, where, and for how long**.
+
+### Real-life example: sending a video on WhatsApp 🟢
+
+When you send a long video on WhatsApp or upload one to Google Drive, the progress bar can pause on a weak signal and then carry on from where it stopped.
+That works because big files are sent in pieces, and only the missing pieces are sent again.
+The file goes to a storage service built for big files, not through the chat or app server itself.
+Until the file is fully received and checked, the other person sees a "loading" placeholder instead of the video.
 
 ## 2. Mental model 🟢
 
@@ -130,11 +148,27 @@ The API is a **ticket office**, not a loading dock. It checks your identity and 
 
 You drive to the warehouse (S3) yourself. The warehouse checks the ticket's signature and conditions, accepts the parcel, and rings the office (an event) when it arrives. Only then does a worker open the parcel and inspect it.
 
+## Common beginner mistakes 🟢
+
+- **Streaming every upload through the API server** → big files hit size limits, timeouts and memory limits → hand out a presigned URL and let the client upload straight to storage.
+- **Using the user's filename as the storage key** → `../../etc/passwd` or two users overwriting each other → the server picks a random key and stores the original name only for display.
+- **Trusting the declared content type** → an HTML page called `cat.png` slips in → read the file's first bytes and allow-list real types.
+- **Showing files before they are checked** → users download unscanned files → only serve files whose status is `ready`.
+- **Forgetting abandoned uploads** → half-uploaded parts keep costing money → a sweeper for old `pending` rows plus a lifecycle rule that aborts incomplete multipart uploads.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the API hands out a short-lived permission (a presigned URL) and the file goes straight to storage, then a worker checks it. **Next we open the box**: which route fits which file size, the two kinds of presigned upload, how huge files go up in parts, and the path every file takes from `pending` to `ready`.
 
 ### Pick the path by size
 
 **In plain words:** small files may ride through the API, medium files get one signed URL, huge files get split into parts. Size decides the route.
+
+**Step by step:**
+1. A 300 KB profile photo: small enough to send through the API, which limits the size and checks the type right away.
+2. A 40 MB PDF: the API gives one presigned URL, and the app uploads the whole file to S3 in one go.
+3. A 2 GB video: the API starts a **multipart upload** and gives a signed URL per piece; the app sends pieces in parallel.
+4. All three end up in the same private bucket, under a key the server chose.
 
 ```mermaid
 flowchart LR
@@ -153,7 +187,14 @@ AWS suggests considering multipart uploads once an object reaches 100 MB.
 
 **In plain words:** a presigned PUT is a ticket for one exact parcel (exact size, exact type). A presigned POST signs a small rulebook instead, so it can say "any image up to 10 MB".
 
-A **presigned PUT** is a URL with a SigV4 signature over the method, bucket, key, expiry and a list of **signed headers**. The client must send exactly those header values; anything else fails the signature check.
+**Step by step:**
+1. The app tells the API: "photo, `image/png`, exactly 1,048,576 bytes".
+2. **PUT:** the API signs a URL that only accepts that exact size and type for 15 minutes. Send 1 byte more and S3 refuses.
+3. **POST policy:** the API instead signs rules: "any size from 1 byte to 25 MB" and "type must start with `image/`".
+4. The browser sends the file as a form to S3, which checks it against those rules.
+5. Either way, S3 checks the signature itself; your API never sees the bytes.
+
+A **presigned PUT** is a URL with a SigV4 signature (AWS's way of signing a request with your secret key) over the method, bucket, key, expiry and a list of **signed headers**. The client must send exactly those header values; anything else fails the signature check.
 
 It can pin an **exact** `Content-Type`, an exact `Content-Length` and an `x-amz-checksum-sha256`, but it cannot express a **range** such as "any size up to 10 MB" or "any `image/*` type".
 
@@ -178,6 +219,13 @@ Keep both kinds short-lived (5 to 15 minutes is a common choice). A SigV4 presig
 ### Multipart upload, completion and processing
 
 **In plain words:** a big file is cut into pieces, each piece gets its own signed URL, and pieces upload in parallel. If the network drops, you resend only the missing pieces, never the whole file.
+
+**Step by step:**
+1. The app asks to upload a 2 GiB video. The API starts a multipart upload in S3 and gets an `UploadId`.
+2. The API saves a `pending` row and returns 128 signed URLs, one per 16 MiB piece.
+3. The app uploads pieces in parallel. For each one S3 returns an **ETag** (a short fingerprint of that piece).
+4. The signal drops at piece 90. After reconnecting, the app asks which pieces arrived and sends only the rest.
+5. The app calls `complete` with all 128 ETags. S3 joins the pieces, sends an "object created" event, and a worker checks the file.
 
 ```mermaid
 sequenceDiagram
@@ -221,6 +269,13 @@ Use both, and make both call the same conditional transition, `UPDATE files SET 
 ### File lifecycle
 
 **In plain words:** every file walks a fixed path: pending, uploaded, processing, ready (or expired/failed). Users only ever see "ready" files; everything else is still untrusted.
+
+**Step by step:**
+1. The API hands out a URL and saves the file as `pending`.
+2. The upload finishes; the row moves to `uploaded` (only if it was still `pending`, so duplicates do nothing).
+3. A worker claims it: `processing`. It checks the real type, size and checksum, scans for viruses, makes thumbnails.
+4. All good: `ready`, and now people can see it. Bad file or too many failures: `failed`.
+5. Nobody uploaded within 24 hours: a **sweeper** (a job that cleans up old rows) marks it `expired`.
 
 ```mermaid
 stateDiagram-v2
@@ -472,7 +527,7 @@ What the tests prove: a PNG sent as `application/octet-stream` with the filename
 
 Buffering up to 5 MiB per request is a deliberate choice: it bounds memory per upload, and anything larger takes the presigned path.
 
-**Presigned grants for direct uploads.** Compiled and tested with aws-sdk-go-v2 (`aws-sdk-go-v2` v1.47.5, `credentials` v1.20.13, `service/s3` v1.114.6). Presigning is local HMAC computation, so the tests need no network or AWS account.
+**Presigned grants for direct uploads.** Compiled and tested with aws-sdk-go-v2 (`aws-sdk-go-v2` v1.47.5, `credentials` v1.20.13, `service/s3` v1.114.6). Presigning is local **HMAC** (a signature made from a secret key and the message) computation, so the tests need no network or AWS account.
 
 ```go
 // Package presign issues short-lived S3 upload grants, so file bytes go
@@ -627,17 +682,19 @@ The partial index serves the orphan sweeper: `SELECT id, object_key, upload_id F
 | Presigned POST policy | Signed policy with conditions (`content-length-range`, `starts-with`) | Browser form uploads; size ranges; type prefixes | Form encoding; single request up to the S3 single-upload limit |
 | Multipart with presigned parts | `CreateMultipartUpload`, presigned `UploadPart` URLs, `CompleteMultipartUpload` | Large files, parallelism, resume after failure | More API calls; incomplete uploads to clean up |
 | Resumable protocol (tus, GCS resumable sessions) | Server or storage tracks the byte offset; client resumes from it | Very unreliable networks; uploads that span app restarts | A tus server or vendor-specific API |
-| Temporary credentials (STS) | Client gets scoped, short-lived credentials and uses the SDK directly | Trusted desktop or backend clients doing many uploads | Credentials are broader than one URL; scope them to a prefix |
+| Temporary credentials (STS, AWS's service for short-lived keys) | Client gets scoped, short-lived credentials and uses the SDK directly | Trusted desktop or backend clients doing many uploads | Credentials are broader than one URL; scope them to a prefix |
 
 ## 6. Trade-offs and when not to use 🟡
 
 - **Direct uploads move validation later.** The API cannot inspect bytes it never sees, so every file is untrusted until the worker marks it `ready`. Products that need an instant "this file is invalid" message either proxy small files or validate on the client and again in the worker.
 - **More moving parts.** Presigning, events, queues, workers and sweepers replace one `POST`. For an internal tool uploading 200 KB files a few times a day, a proxied upload with `MaxBytesReader` is simpler and fine.
 - **Presigned URLs are bearer tokens.** Anyone holding one can use it until it expires; never log them in full, and keep expiry short.
-- **CORS is required for browsers.** Direct browser uploads need a CORS rule on the bucket allowing your origin and the `PUT` or `POST` method; see [[CORS and Same-Origin Policy]].
+- **CORS is required for browsers.** (CORS: the browser rule that blocks a page from calling another site unless that site allows it.) Direct browser uploads need a CORS rule on the bucket allowing your origin and the `PUT` or `POST` method; see [[CORS and Same-Origin Policy]].
 - **Cost moves, not vanishes.** You stop paying API bandwidth but pay for requests per part, incomplete multipart storage until aborted, and event and queue traffic.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the upload routes, presigned PUT and POST, multipart uploads and the file lifecycle. **Next is the advanced part**: the failures real systems hit (orphans, spoofed types, public buckets), a security checklist, how the worker validates files, safe downloads, and resuming huge uploads.
 
 - **Real systems:** S3, Google Cloud Storage and Azure Blob Storage all offer signed upload URLs (Azure calls them SAS tokens). Large services serve user content from a separate domain; GitHub's `raw.githubusercontent.com` is the familiar example.
 - **Failure modes → fixes:**
@@ -646,7 +703,7 @@ The partial index serves the orphan sweeper: `SELECT id, object_key, upload_id F
 	- The upload succeeds but the `complete` call is lost → the S3 event drives the same idempotent transition; the sweeper also checks `HeadObject` before expiring a row.
 	- Duplicate `complete` calls or duplicate S3 events → conditional status updates (`WHERE status = 'pending'`), so the second one changes nothing.
 	- File type spoofing (an HTML page named `cat.png`) → sniff magic bytes in the worker, allow-list types, and set the stored `Content-Type` from the sniffed type.
-	- A private file exposed through a public bucket or policy → Block Public Access on, bucket private, every download through a presigned GET or a CDN signed URL.
+	- A private file exposed through a public bucket or policy → Block Public Access (an S3 switch that forbids any public access) on, bucket private, every download through a presigned GET or a CDN signed URL.
 	- A worker crashes during thumbnailing or transcoding → retries with backoff, a poison file moves to a DLQ after N attempts and the row to `failed` ([[Dead Letter Queues and Poison Messages]]).
 	- Uploaded HTML or SVG runs as script on your domain → never serve user files from the app's domain (see section 8).
 - **Security checklist:**
@@ -671,13 +728,13 @@ If the client sent `x-amz-checksum-sha256`, S3 already rejected a mismatching bo
 
 **Async processing.** Thumbnails and transcodes are jobs keyed by `file_id`, retried with exponential backoff, and written to deterministic keys (`tenants/42/derived/7Q/thumb_256.webp`), so a retried job overwrites instead of duplicating. A video transcode can take minutes; the client polls `GET /v1/files/{id}` or receives a webhook or SSE event when the status changes.
 
-**Tenant key layout and IAM.** The server chooses keys such as `tenants/{tenant_id}/uploads/{random}.{ext}`, never the user's filename (path traversal, collisions, and information leaks via names). Keep the original filename in the `files` row for display.
+**Tenant key layout and IAM.** (IAM: AWS's system of who may do what.) The server chooses keys such as `tenants/{tenant_id}/uploads/{random}.{ext}`, never the user's filename (**path traversal**, meaning names like `../` that escape the intended folder; collisions; and information leaks via names). Keep the original filename in the `files` row for display.
 
-The role that signs URLs gets `s3:PutObject` only on `arn:aws:s3:::uploads-prod/tenants/*`, and a presigned URL can never grant more than its signer has. S3 scales request rates per prefix (3,500 writes and 5,500 reads per second per partitioned prefix, per the S3 docs), and random, high-cardinality keys spread load naturally.
+The role that signs URLs gets `s3:PutObject` only on `arn:aws:s3:::uploads-prod/tenants/*`, and a presigned URL can never grant more than its signer has. S3 scales request rates per prefix (3,500 writes and 5,500 reads per second per partitioned prefix, per the S3 docs), and random, **high-cardinality** keys (many different values) spread load naturally.
 
 **Secure downloads.** Use a presigned `GET` with a short expiry, or CloudFront signed URLs or signed cookies when the file should be cached at the edge ([[CDN and Edge]]). Add `response-content-disposition=attachment` to the presigned `GET` (S3 honours these override parameters only on signed requests) so browsers download instead of rendering.
 
-Serve user files from a **separate registrable domain** (for example `usercontent-example.net`), so a malicious HTML or SVG file that does render cannot read the app's cookies or call its APIs as the user.
+Serve user files from a **separate registrable domain** (a different site name you buy, not just a subdomain) (for example `usercontent-example.net`), so a malicious HTML or SVG file that does render cannot read the app's cookies or call its APIs as the user.
 
 Set `X-Content-Type-Options: nosniff` so browsers do not reinterpret a "PNG" as HTML ([[CSRF, XSS and Security Headers]]).
 
@@ -702,7 +759,7 @@ Parts can be uploaded in any order and in parallel; S3 assembles them by part nu
 > S3 multipart upload: the API creates the upload and presigns part URLs; the client uploads 16 to 64 MiB parts in parallel, stores the ETags, and after a drop uses `ListParts` to resend only missing parts, then completes. A lifecycle rule aborts uploads that never complete. tus is an alternative when you run your own upload server.
 
 > [!question]- A user uploads `invoice.pdf` that is actually HTML with a script. What can go wrong, and how do you stop it?
-> If you serve it from your app's domain with a sniffable or client-supplied type, the browser may run the script with your cookies: stored XSS. Sniff magic bytes and allow-list types, store the sniffed `Content-Type`, serve with `Content-Disposition: attachment` and `nosniff`, and serve user content from a separate domain.
+> If you serve it from your app's domain with a sniffable or client-supplied type, the browser may run the script with your cookies: stored XSS (an attacker's script saved on your site and run in other users' browsers). Sniff magic bytes and allow-list types, store the sniffed `Content-Type`, serve with `Content-Disposition: attachment` and `nosniff`, and serve user content from a separate domain.
 
 > [!question]- What can go wrong, and what do you monitor?
 > Orphaned pending rows and incomplete multipart uploads, lost completion calls, duplicate events, spoofed types, malware, public buckets, and worker failures. Monitor the issued-to-ready funnel, pending and processing age, orphan and incomplete-upload counts, queue lag and DLQ depth, scan failures, and upload `4xx` and download `403` rates.
@@ -717,6 +774,26 @@ Parts can be uploaded in any order and in parallel; S3 assembles them by part nu
 - Clean up: pending TTL sweeper plus an `AbortIncompleteMultipartUpload` lifecycle rule.
 - Downloads: presigned GET or CDN signed URLs, `Content-Disposition: attachment`, `nosniff`, separate user-content domain.
 - Small files via the API: `http.MaxBytesReader`, `MultipartReader`, `DetectContentType`, server-chosen keys.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is a presigned URL?
+> A URL with a built-in signature that allows one specific action (like one upload) for a few minutes.
+
+> [!question]- Easy: who should choose the storage key, the client or the server?
+> The server, always.
+
+> [!question]- Easy: which file status may users download?
+> Only `ready`.
+
+> [!question]- Medium: a 5 GB upload drops at 80%. With multipart upload, what is resent?
+> Only the pieces that did not arrive, found with `ListParts`.
+
+> [!question]- Medium: you need "any image up to 10 MB". Presigned PUT or POST policy?
+> POST policy: it can express a size range and a type prefix; a PUT can only pin exact values.
+
+> [!question]- Medium: both the client's `complete` call and the S3 event arrive. How do you avoid processing twice?
+> Both run the same conditional update, `... SET status='uploaded' WHERE status='pending'`; the second does nothing.
 
 ## Links 🟢
 

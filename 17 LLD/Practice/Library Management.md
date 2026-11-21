@@ -34,6 +34,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 4 to 8 (relationships, APIs, storage, patterns and the core code), the Folder structure and the Test cases.
 > - 🔴 **Interview / SDE-3 prep?** Add Steps 9 and 10 (edge cases and trade-offs), the Interview explanation and the Interview questions. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Vending Machine]]: one lock around "check and change", and typed errors instead of crashes.
+> - [[Strategy and Template Method]]: a rule behind an interface you can swap, here the fine rule.
+> - [[Observer and Event Bus]]: one part says "something happened" and others react, here "your book is ready".
+
 **From zero, in 60 seconds** 🟢
 
 A library has books, and each book can have several physical **copies** on the shelf. A member borrows one copy, not the idea of the book. When all copies are out, a member can reserve the book and wait in a queue. When a copy comes back, it is held for the first person in the queue for a few days. Returning late costs a fine. Most of the design is keeping "book" and "copy" separate.
@@ -68,6 +73,10 @@ This note designs those rules so exactly one member gets each copy and nobody ju
 | Atomic | Happens as one step nobody can interrupt | Check-and-claim the last copy |
 | Strategy | A swappable rule behind an interface | `PerDayFine`: a fixed amount per day late |
 | Calendar day | A date on the library's calendar, not a 24-hour block | Due Mon, returned Tue morning = 1 day late |
+| ISBN | The ID number printed on every edition of a book | 978-0132350884 |
+| Outbox | A table where you save "send this message later" in the same transaction as the change | The ready-notice is sent after the return commits |
+| Transaction | A group of database changes that all happen or none do | Limit +1, claim copy, insert loan |
+| Partial unique index | A database rule "no two rows alike" that only checks some rows | Only one open loan per copy |
 
 **Picture it**
 
@@ -124,7 +133,7 @@ and handle a member losing a copy.
 - What does search cover? *Assume: case-insensitive substring on title, author and category; no ranking.*
 - All copies out? *Assume: the member reserves; a FIFO queue per ISBN; a returned copy is held for the queue head for 3 days, then passes to the next member or back to the shelf.*
 - What if a member loses a copy? *Assume: the loan closes, the member pays the late fine plus the book price, and the copy is marked lost and never lent again.*
-- Notifications sync or async? *Assume: a `Notifier` interface called outside the lock; async through an outbox in production.*
+- Notifications sync or async (sent while the caller waits, or later in the background)? *Assume: a `Notifier` interface called outside the lock; async through an outbox in production.*
 
 ### Functional
 
@@ -158,7 +167,7 @@ The hardest use cases are **BorrowBook** (limit, held-copy priority, last-copy r
 |---|---|---|
 | `Book` | ISBN, Title, Author, Category, Price | The catalog entry; what you search and reserve |
 | `BookCopy` | ID, ISBN, Status, HeldFor, HeldUntil | The physical item; what you lend, hold or lose |
-| `CopyStatus` | Available, Issued, Held, Lost | The copy lifecycle; Lost is terminal |
+| `CopyStatus` | Available, Issued, Held, Lost | The copy lifecycle; Lost is terminal (a final state with no way out) |
 | Member | ID, open-loan count (`active` map) | The borrow limit is per member |
 | `Loan` | CopyID, ISBN, MemberID, IssuedAt, DueAt | One borrowing of one copy; the source of the due date and the fine |
 | Fine | `int64` paise returned by `ReturnBook` and `ReportLost` | Computed by `FineStrategy`, stored on the loan row |
@@ -169,6 +178,8 @@ The hardest use cases are **BorrowBook** (limit, held-copy priority, last-copy r
 Modelling insight: **separate Book from BookCopy.** A count field on Book cannot say "copy C1 is held for Asha until Friday" or "copy C2 is lost".
 
 ## Step 4: Relationships 🟡
+
+🟢 → 🟡 You now know the split between a title (`Book`) and a physical item (`BookCopy`), and the four copy states. Next we open the box: how the pieces link, the API, how the database claims the last copy safely, and the Go code.
 
 ```mermaid
 classDiagram
@@ -368,7 +379,7 @@ cmd/demo/main.go  -> builds Library with PerDayFine, an email Notifier, the libr
 - `fine.go`: the fine Strategy, its default and the calendar-day rule.
 - `notifier.go`: the Observer seam.
 - `repository.go`: storage interfaces; the interview code keeps maps in `Library`.
-- `service.go`: the `sync.RWMutex` and every use case.
+- `service.go`: the `sync.RWMutex` (a lock that lets many readers in together but only one writer) and every use case.
 - `cmd/demo/main.go`: wiring only.
 
 ## Step 8: Core code 🟡
@@ -381,7 +392,7 @@ cmd/demo/main.go  -> builds Library with PerDayFine, an email Notifier, the libr
 
 Three rules worth stating, each with a test:
 
-1. **Fines count calendar days, not 24-hour periods.** `now.Sub(due) / 24h` charges nothing for a return 23 hours late and drifts across DST changes. `calendarDaysLate` compares the two dates in the library's `time.Location`, so "due on the 15th, back on the 16th" is one day late whatever the hour. State this policy in the interview.
+1. **Fines count calendar days, not 24-hour periods.** `now.Sub(due) / 24h` charges nothing for a return 23 hours late and drifts across DST changes (daylight saving time: clocks jump an hour, so a day is 23 or 25 hours). `calendarDaysLate` compares the two dates in the library's `time.Location` (Go's time-zone value), so "due on the 15th, back on the 16th" is one day late whatever the hour. State this policy in the interview.
 2. **A hold takes the member out of the queue.** If the queue head stayed queued while their copy was held, a second returned copy would be held for the same member and the next member would wait forever.
 3. **Holds expire.** `HeldUntil = today + HoldDays`; a scheduler calls `ExpireHolds`, which passes an uncollected copy to the next member (and notifies them after unlocking) or puts it back on the shelf.
 
@@ -389,7 +400,7 @@ Three rules worth stating, each with a test:
 
 `BorrowBook(ctx, memberID, isbn)`:
 
-1. Return early on a cancelled context, then lock. Everything after is one atomic check-then-act.
+1. Return early on a cancelled context, then lock. Everything after is one atomic check-then-act (the "is it free?" check and the "take it" step, with no gap between).
 2. The book must exist (`ErrBookNotFound`); the member must be under `MaxLoans` (`ErrLimitReached`).
 3. Scan the copies: a copy `Held` for this member wins; otherwise the first `Available`. Copies held for someone else, issued or lost are skipped.
 4. Nothing found: `ErrNoCopyAvailable` (the client can then call `ReserveBook`).
@@ -400,7 +411,7 @@ Three rules worth stating, each with a test:
 1. Lock; `openLoan` finds the copy (`ErrCopyNotFound`) and its open loan (`ErrNotIssued` covers a duplicate return and a lost copy).
 2. `closeLoan` counts calendar days late, computes the fine through `FineStrategy`, deletes the loan and decrements the member's count.
 3. `holdOrShelve`: if the queue is non-empty, pop its head, mark the copy `Held` for that member until `today + HoldDays`; otherwise mark it `Available`.
-4. Unlock, then call the `Notifier`. Slow I/O never blocks other borrowers.
+4. Unlock, then call the `Notifier`. Slow I/O (input/output such as sending an email) never blocks other borrowers.
 
 `ReportLost(ctx, copyID)`: the same `openLoan` and `closeLoan`, then charge `fine + Book.Price` and set the copy `Lost`. Lost copies are never picked by Borrow, so the queue keeps waiting for other copies.
 
@@ -725,7 +736,7 @@ func (l *Library) dequeue(isbn, memberID string) {
 | `TestReservationsAndHolds` | Reserve only when no copy, FIFO positions, no double reserve, two returns hold for two different members, held copy not stolen, an uncollected hold passes to the next member and then back to the shelf |
 | `TestConcurrentLastCopy` | 50 goroutines, 1 copy: exactly 1 winner, 49 `ErrNoCopyAvailable` |
 
-All five pass under `go test -race` (Go 1.24.4).
+All five pass under `go test -race` (Go's race detector, which flags unsafe shared access) (Go 1.24.4).
 
 **In plain words:** Tests with a fake clock and a fake notifier to check fines, holds and who gets told a book is ready.
 
@@ -973,9 +984,11 @@ func TestConcurrentLastCopy(t *testing.T) {
 
 ## Step 9: Edge cases 🔴
 
+🟡 → 🔴 You now know the working library and its tests. Next is interview depth: races on the last copy and the loan limit, holds nobody collects, fines across midnight and DST, and the trade-offs you chose.
+
 | Edge case | What happens | How the design handles it |
 |---|---|---|
-| Race: two members borrow the last copy | Both see it available | Find + mark issued under one mutex; in the database a `SKIP LOCKED` claim plus `uq_open_loan` |
+| Race: two members borrow the last copy | Both see it available | Find + mark issued under one mutex; in the database a `SKIP LOCKED` claim (a database row lock where a second caller skips a locked row instead of waiting) plus `uq_open_loan` |
 | Race: same member, parallel borrows near the limit | Both see 1 < 2 | Limit check and increment under the same lock; in SQL the conditional `UPDATE members ... WHERE active_loans < max_loans` from Step 6 |
 | No copy available | Borrow fails | `ErrNoCopyAvailable`; the member can reserve |
 | Member limit exceeded | Too many loans | `ErrLimitReached` |
@@ -1011,12 +1024,12 @@ func TestConcurrentLastCopy(t *testing.T) {
 | Notify by SMS and email | Several Notifier subscribers, fanned out through a queue |
 | Several branches | `branch_id` on the copy; borrow and reserve scoped by branch; transfers |
 | Due-date reminders | A scheduled job selects loans with `due_at` in the next 24 hours |
-| Big catalog search | A search index (Postgres trigram or Elasticsearch) behind `BookRepo.Search` |
+| Big catalog search | A search index (Postgres trigram, which matches by 3-letter chunks, or Elasticsearch, a search server) behind `BookRepo.Search` |
 
 ### Tradeoffs I chose
 
 - **One `sync.RWMutex`.** Search takes a read lock and runs in parallel; borrow and return take the write lock. Simple and correct for one library.
-- **Linear scan of copies per ISBN.** A title has a handful of copies, so O(copies) is fine; keep a free list per ISBN only if titles have hundreds of copies.
+- **Linear scan of copies per ISBN.** A title has a handful of copies, so O(copies) (time grows with the number of copies) is fine; keep a free list per ISBN only if titles have hundreds of copies.
 - **Notifier called synchronously after unlock.** Easy to reason about; production moves it to an outbox for retries ([[Case Study - Notification System]]).
 - **Substring search in memory.** Fine for thousands of books; millions need a real index.
 - **Lost charge = fine + book price.** One simple rule; a replacement-cost strategy if a library needs it.
@@ -1069,7 +1082,7 @@ sequenceDiagram
 > In memory, find the copy and mark it issued under one mutex. In Postgres, claim with `UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED)` and back it with a partial unique index on open loans per copy.
 
 > [!question]- Two copies come back while three members wait. Who gets them?
-> The first two members in the queue. Each hold removes its member from the queue; if the head stayed queued, both copies would be held for the same member and the second waiter would starve.
+> The first two members in the queue. Each hold removes its member from the queue; if the head stayed queued, both copies would be held for the same member and the second waiter would starve (wait forever).
 
 > [!question]- What happens to a hold that nobody collects?
 > `ExpireHolds`, run by a scheduler, finds holds past `HeldUntil`, gives the copy to the next waiting member (notifying them after unlocking) or puts it back on the shelf. The member who did not collect loses the turn.
@@ -1088,6 +1101,26 @@ The key modelling decision is separating Book, the catalog entry by ISBN that yo
 - A hold dequeues its member and expires after `HoldDays`.
 - Lost = fine + price, terminal; notify after unlocking (an outbox in production).
 - Postgres: `SKIP LOCKED` claim plus `uq_open_loan`.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What is the difference between `Book` and `BookCopy`?
+> `Book` is the title you search and reserve; `BookCopy` is one physical item with a barcode that you lend, hold or lose.
+
+> [!question]- 🟢 What is a hold?
+> A returned copy kept aside for the first member in the reservation queue, for `HoldDays` (3 days here).
+
+> [!question]- 🟢 What does a member pay for a lost copy?
+> The late fine plus the book price; the copy is marked Lost and never lent again.
+
+> [!question]- 🟡 Due on the 15th, returned at 9 a.m. on the 16th. How many days late, and why not 0?
+> One. Fines count calendar days in the library's time zone; dividing by 24 hours would give 0.
+
+> [!question]- 🟡 Two copies come back while three members wait. Why don't both go to the first member?
+> Each hold removes its member from the queue, so the second copy goes to the next member.
+
+> [!question]- 🟡 Why is the `Notifier` called after unlocking?
+> Sending a message is slow; under the lock it would block every other borrow and return.
 
 ## Links 🟢
 

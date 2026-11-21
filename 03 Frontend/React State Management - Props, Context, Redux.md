@@ -29,6 +29,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (Context and its re-render cost) and 4 (Redux Toolkit and choosing a tool).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[React Fundamentals - Components, JSX, Props, State]]: props go from parent to child, state lives in one component, and shared state is lifted to a common parent.
+> - [[React Rendering - Virtual DOM, Reconciliation, Lifecycle]]: when a component re-renders, its children re-render too unless something stops them.
+
 **From zero, in 60 seconds** 🟢
 
 Many parts of an app often need the same piece of data, like the current theme or the cart count. The default way to share it is **props**: the parent hands it to the child, who hands it to its child, like passing a note down a row of desks.
@@ -71,6 +75,12 @@ React offers three ways to share data: props (hand it down), Context (broadcast 
 | Prop drilling | Passing a prop through layers that do not use it | `Layout` passing `theme` it never reads |
 | Store | One central object holding shared app state | a Redux store with `cart` and `user` |
 | Selector | A function picking one slice of the store | `s => s.cart.count` |
+| Context | React's way to share a value with every component below, without props | a `ThemeContext` |
+| Provider | The component that supplies a Context value to everything inside it | `<ThemeContext.Provider value="dark">` |
+| Consumer | A component that reads a Context with `useContext` | a button reading the theme |
+| Action / dispatch | A small message saying what happened / sending it to the store | `dispatch({ type: "cart/added" })` |
+| Reducer | A pure function: old state + action → new state | `(state, action) => newState` |
+| Slice | One section of the store, with its own reducer | the `cart` slice |
 
 **Picture it**
 
@@ -148,14 +158,40 @@ function UserMenu({ user }) {
 
 For 2–3 levels this is fine and arguably clearer than an invisible global. Past that, every refactor of the middle layers risks breaking the chain, which is the actual problem prop drilling causes — not performance.
 
+### Real-life example: Swiggy's cart and theme 🟢
+
+On a food app like Swiggy, the cart count shows in the header, on the menu page and at checkout: three far-apart places, and it changes every time you tap "ADD". That suits a store with selectors, so only the parts showing the cart redraw.
+Your chosen language and dark mode rarely change but are read everywhere, which suits Context.
+A single dish card's "expanded" toggle is used only by that card, so plain `useState` is enough.
+The restaurant list itself comes from the server, so a query library (like TanStack Query) caches and refreshes it.
+
+## Common beginner mistakes 🟢
+
+- **Putting everything in Redux from day one** → lots of extra code for state only one component uses → start with `useState` and props.
+- **Passing a new object to a Provider each render** (`value={{ user, theme }}`) → every consumer re-renders every time → wrap it in `useMemo` or split the Context.
+- **Mixing a fast-changing value into a Context with slow ones** → typing in a search box re-renders the whole app → keep fast values local or in a store.
+- **Forgetting the Provider's `value` prop** → consumers get `undefined`, not the default → always pass `value`.
+- **Storing API responses in Redux by hand** → you rebuild caching and refetching badly → use RTK Query or TanStack Query.
+
+## Often confused 🟡
+
+| These two | Context | Redux store |
+| --- | --- | --- |
+| What it solves | Skipping layers when passing a value down | Sharing changing state across far-apart parts of the app |
+| Who re-renders on a change | Every consumer of that Context | Only components whose selected slice changed |
+| Best for | Theme, language, logged-in user | Cart, filters, app-wide UI state that changes often |
+| Extra code | Very little | More (slices, actions), though Redux Toolkit cuts it down |
+
 ## 2. Mental model 🟢
 
 - **Props** = function arguments. Explicit, typed, traceable by reading the component that renders you.
 - **Composition (`children`)** = pass a rendered element down instead of data, so the component accepting `children` doesn't need to know what's inside it. Often removes the need for Context entirely.
-- **Context** = a value broadcast to every descendant of a Provider, read with a hook, skipping the middle layers. Think of it as "ambient" — not traceable by reading props alone.
-- **A store (Redux, Zustand)** = state that lives outside any component, with an explicit, structured way to read it (`useSelector`) and change it (`dispatch`), independent of where in the tree you are.
+- **Context** = a value broadcast to every **descendant** (any component nested below) of a Provider, read with a hook, skipping the middle layers. Think of it as "ambient" (in the air around you) — not traceable by reading props alone.
+- **A store (Redux, Zustand, a smaller and simpler store library)** = state that lives outside any component, with an explicit, structured way to read it (`useSelector`) and change it (`dispatch`), independent of where in the tree you are.
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the three ways to share data: props, Context and a store. **Next we open the box**: a trick that often removes the need for Context, the Context default-value trap, and exactly why Context re-renders more than a store does.
 
 ```mermaid
 flowchart LR
@@ -181,6 +217,17 @@ Context's dotted line shows the actual data path: it skips `Layout` and `Sidebar
 
 **In plain words:** sometimes you can skip Context entirely by building the inner component at the top (where the data lives) and passing the finished piece down as `children`, like mailing a sealed parcel through couriers who never open it.
 
+**Step by step:**
+1. `App` has `user`. Deep inside, `UserMenu` needs it. `Layout` and `Sidebar` sit in between and do not care.
+2. Instead of passing `user` to `Layout` then `Sidebar`, `App` builds `<UserMenu user={user} />` itself.
+3. `App` passes that finished element as `children`: `<Layout><Sidebar>{menu}</Sidebar></Layout>`.
+4. `Layout` and `Sidebar` just place `{children}` where it belongs. They never see `user`.
+
+```mermaid
+flowchart LR
+    A["App: builds UserMenu(user)"] -->|"children"| L["Layout"] -->|"children"| S["Sidebar"] --> U["UserMenu shows user"]
+```
+
 Before reaching for Context, check whether passing `children` solves the drilling:
 
 ```jsx
@@ -203,6 +250,12 @@ function Sidebar({ children }) { return <aside>{children}</aside>; }
 ### The Context default-value rule
 
 **In plain words:** the default you give `createContext` only kicks in when there is no Provider above at all. A Provider that forgot its `value` prop hands out `undefined`, not the default — a classic gotcha.
+
+**Step by step:**
+1. `const ThemeContext = createContext('light');` sets the default to `'light'`.
+2. A button with **no** `ThemeContext.Provider` anywhere above it reads `'light'`.
+3. A button under `<ThemeContext.Provider value="dark">` reads `'dark'`.
+4. A button under `<ThemeContext.Provider>` with the `value` left out reads `undefined`, not `'light'`.
 
 ```jsx
 const ThemeContext = createContext('light');
@@ -231,6 +284,12 @@ The default argument to `createContext` is a fallback for "there is no Provider 
 
 **In plain words:** Context and a store like Redux solve a similar-sounding problem ("let a distant component read some shared state") in opposite ways when it comes to re-rendering.
 
+**Step by step:**
+1. `AppContext` holds `{ user, theme }`. `UserMenu` reads only `user`; `ThemeToggle` reads only `theme`.
+2. The theme changes to dark. The Provider gets a new `{ user, theme }` object.
+3. React sees a new object, so **both** `UserMenu` and `ThemeToggle` re-render, even though `user` did not change.
+4. In Redux, `UserMenu` uses `useSelector(s => s.user)`. The user part did not change, so `UserMenu` is left alone.
+
 Context is like a single office-wide announcement over the PA system — everyone within earshot stops what they're doing to listen, even if the announcement wasn't relevant to them.
 
 A store with selectors is like each person subscribing only to the specific notice board they care about.
@@ -258,7 +317,7 @@ flowchart TD
 
 In the Redux version, `SettingsPanel`'s `useSelector(s => s.settings)` simply isn't called again, because the `settings` slice of the store object didn't change.
 
-**Why it matters:** In a small app this difference is invisible. In a large one — a dashboard with many widgets reading one shared Context — a single frequently-changing field (a live search query, a websocket tick) dragged into that same Context object means *every* consumer re-renders on *every* tick, even widgets with nothing to do with that field.
+**Why it matters:** In a small app this difference is invisible. In a large one — a dashboard with many widgets reading one shared Context — a single frequently-changing field (a live search query, a **websocket** tick, meaning a push message from the server over a held-open connection) dragged into that same Context object means *every* consumer re-renders on *every* tick, even widgets with nothing to do with that field.
 
 > [!warning] Common mistake
 > Putting a frequently-changing value (something that updates many times a second) into the same Context object as rarely-changing values (theme, locale). Split them, or the fast-changing field drags every consumer of the slow-changing ones along with it.
@@ -333,15 +392,15 @@ function Counter() {
 
 `useSelector` only re-renders `Counter` when the specific slice it reads (`state.counter.value`) changes — a sibling component selecting `state.settings` is untouched, which is the opposite of the "any change re-renders every consumer" behaviour plain Context has with one big object.
 
-Reducers in Redux must stay **pure**: no side effects, no random values, no mutating arguments directly (Redux Toolkit's `createSlice` uses Immer so code that *looks* like direct mutation — `state.value += 1` — actually produces a new, structurally-shared state object behind the scenes).
+Reducers in Redux must stay **pure**: no side effects, no random values, no mutating arguments directly (Redux Toolkit's `createSlice` uses **Immer** (a library that lets you write "change this" code but quietly makes a new copy) so code that *looks* like direct mutation — `state.value += 1` — actually produces a new, **structurally-shared** state object (the unchanged parts are reused, not copied) behind the scenes).
 
-This purity is what makes time-travel debugging in Redux DevTools possible: every past state is just the result of replaying actions.
+This purity is what makes **time-travel debugging** (stepping backward and forward through past app states) in Redux DevTools possible: every past state is just the result of replaying actions.
 
 ### Async state and server data
 
 **In plain words:** data fetched from a server is its own kind of state. Query libraries handle the loading, caching and retry chores for you, so you do not hand-write that plumbing in Redux or Context.
 
-Fetched data (a list of orders, a user's profile) is a different kind of state from UI state (`isModalOpen`), and forcing it through hand-written reducers duplicates work a data-fetching library already does well: caching, retries, de-duplication, background refetch.
+Fetched data (a list of orders, a user's profile) is a different kind of state from UI state (`isModalOpen`), and forcing it through hand-written reducers duplicates work a data-fetching library already does well: caching, retries, **de-duplication** (merging identical requests made at the same time into one), background **refetch** (quietly asking the server again to stay fresh).
 
 ```jsx
 // RTK Query: generates hooks from an endpoint description
@@ -396,8 +455,8 @@ That combination (distant + changes often) points at a store with selectors, not
 | Props (+ composition via `children`) | Explicit data passed down the tree, or elements slotted in | Default for everything; always reach for this first | None beyond the drilling itself at 2–3 levels |
 | Lifting state up | Move state to the nearest common ancestor of the components that share it | Two or more siblings need the same state | Ancestor re-renders on every change |
 | Context (`createContext` + `useContext`) | Broadcast a value to every descendant of a Provider | Avoiding drilling a value through many layers that don't use it (theme, locale, auth user) | Every consumer re-renders on any change to the value's reference; split contexts or memoize to limit it |
-| Redux / Redux Toolkit | A single external store, pure reducers, `dispatch`/`useSelector` | State shared across distant, unrelated parts of the app; need for time-travel debugging, middleware, strict action auditing | Boilerplate (much reduced by RTK); a dependency and a learning curve |
-| Zustand / Jotai (lightweight stores) | A small external store or atom graph, no boilerplate reducers | Want Redux's "outside the tree" benefit without the ceremony | Less tooling/ecosystem than Redux; smaller community conventions |
+| Redux / Redux Toolkit | A single external store, pure reducers, `dispatch`/`useSelector` | State shared across distant, unrelated parts of the app; need for time-travel debugging, middleware, strict action auditing | **Boilerplate** (repetitive setup code) (much reduced by RTK); a dependency and a learning curve |
+| Zustand / Jotai (lightweight stores) | A small external store or **atom** graph (many tiny independent pieces of state), no boilerplate reducers | Want Redux's "outside the tree" benefit without the ceremony | Less tooling/ecosystem than Redux; smaller community conventions |
 | RTK Query / TanStack Query | A cache keyed by query, with built-in loading/error/refetch state | Server data (anything fetched over the network) | Another dependency; learning its cache-invalidation model |
 
 ## 6. Trade-offs and when not to use 🟡
@@ -408,6 +467,8 @@ That combination (distant + changes often) points at a store with selectors, not
 - A large Redux store for a small app is itself a cost: every contributor now has to learn the slice/action/selector convention to make a one-line change.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** when to use props, Context, a store or a query library, and why Context re-renders more. **Next is the advanced part**: a quiet "stale value" bug from `useMemo`, the failures teams hit in production, and how Immer and middleware work inside Redux.
 
 ### Why a memoized Context value still looks "stale" when done wrong
 
@@ -451,7 +512,7 @@ sequenceDiagram
 
 - **Context does not memoize for you.** `useContext` subscribes a component to the nearest Provider above it; when that Provider re-renders with a new `value` (by reference), every subscriber re-renders, full stop, regardless of whether the specific field the subscriber reads changed. Redux avoids this by having `useSelector` do its own equality check per selector, so a store with ten slices lets ten different components each re-render only for their own slice.
 - **Why `state.value += 1` is legal inside `createSlice` but illegal in plain Redux.** Redux Toolkit wraps reducers in Immer's `produce`. Writes you make to the draft are recorded and replayed against the real previous state to produce a new, structurally-shared object — so other parts of the state tree that didn't change keep the same object reference, which is exactly what reference-equality checks (`useSelector`, `React.memo`) rely on to skip work.
-- **Middleware** sits between `dispatch` and the reducer: `redux-thunk` (included by default in RTK) lets an action creator be a function that dispatches other actions after an async operation; logging middleware can record every action for replay debugging.
+- **Middleware** (code that runs on every action before it reaches the reducer) sits between `dispatch` and the reducer: `redux-thunk` (included by default in RTK) lets an action creator be a function that dispatches other actions after an async operation; logging middleware can record every action for replay debugging.
 - **When Redux is overkill:** if nothing outside one component subtree needs the state, and no middleware/time-travel/strict-auditing requirement exists, `useState` plus prop passing (or Context for read-mostly values) does the job with far less code.
 
 ## 9. Interview questions 🔴
@@ -472,7 +533,7 @@ sequenceDiagram
 > It runs the selector function against the store and compares the result to the last result (by reference, by default) before deciding to re-render that component. A component selecting `state.counter.value` doesn't re-render when `state.settings` changes, because its selector's result didn't change.
 
 > [!question]- What does Redux Toolkit's `createSlice` actually do with `state.value += 1`?
-> It uses Immer: the `state` your reducer receives is a proxy ("draft"). Writes to it are tracked, and Immer produces a brand-new, immutable state object with just the changed parts replaced — so the mutation-looking code is still produces immutable updates, which is required for both Redux's rules and for reference-equality-based re-render skipping to work.
+> It uses Immer: the `state` your reducer receives is a **proxy** (a stand-in object that records what you do to it) ("draft"). Writes to it are tracked, and Immer produces a brand-new, immutable state object with just the changed parts replaced — so the mutation-looking code is still produces immutable updates, which is required for both Redux's rules and for reference-equality-based re-render skipping to work.
 
 > [!question]- You have a dashboard where five independent widgets each fetch their own data from the same API. Context, Redux, or neither?
 > Likely neither, in the Redux/Context sense for the data itself: this is server state, best handled by TanStack Query or RTK Query, which cache per query key and handle refetching/deduplication. Reach for Context only if there's UI state (a shared filter, a selected date range) that several widgets need to read and set together.
@@ -486,6 +547,26 @@ sequenceDiagram
 - Redux/RTK is for state shared across distant, unrelated UI, not a `useState` replacement.
 - `useSelector` re-renders a component only when its own selected slice changes — Context can't do that by itself.
 - Server data (fetched from an API) belongs in RTK Query/TanStack Query, not hand-rolled into Redux or Context.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is prop drilling?
+> Passing a prop through components that do not use it, just so it reaches a deeper one.
+
+> [!question]- Easy: which is the default tool for sharing data with a child?
+> Props.
+
+> [!question]- Easy: which tool fits a theme read by almost every component that rarely changes?
+> Context.
+
+> [!question]- Medium: a Provider is rendered without `value`. What does `useContext` return?
+> `undefined`. The `createContext` default is used only when there is no Provider above at all.
+
+> [!question]- Medium: why can Redux re-render fewer components than Context for the same change?
+> `useSelector` compares each component's selected slice and skips components whose slice did not change; Context re-renders every consumer on a new value.
+
+> [!question]- Medium: where should a list of orders fetched from an API live?
+> In a query library cache (RTK Query or TanStack Query), not hand-written Redux or Context.
 
 ## Links
 

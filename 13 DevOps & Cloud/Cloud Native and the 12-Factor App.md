@@ -29,6 +29,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Cloud Computing Basics]]: you rent servers from a provider by the hour, and you can add or remove them in minutes.
+> - [[Docker 01 - Why Containers]]: a container is your app packed with everything it needs, so it starts the same way on any machine.
+
 **From zero, in 60 seconds** 🟢
 
 Moving an old app onto a cloud server does not make it "cloud native". It just runs somewhere else.
@@ -72,6 +76,13 @@ Cloud native and the 12-Factor rules are about writing apps that survive being c
 | SIGTERM | The polite "please shut down" signal sent to a process | Kubernetes sends it before killing a pod |
 | Declarative | You describe the end state you want, not the steps | "I want 3 copies running" |
 | Microservice | A small service that owns one job and talks over the network | A payments service separate from search |
+| Monolith | One big app where every feature lives in one program and ships together | Login, cart and payments in one binary |
+| Pod | Kubernetes' smallest unit: one or a few containers running together | One copy of your Go API |
+| Controller | A Kubernetes program that keeps comparing "wanted" with "running" and fixes the gap | The Deployment controller |
+| Immutable infrastructure | Never edit a running server; build a new one and swap it in | Ship image `v2`, delete `v1` copies |
+| Rolling deploy | Replace old copies with new ones a few at a time, so the app never fully stops | 3 pods: swap 1, then the next, then the last |
+| Backing service | Anything your app talks to over the network to keep data | Postgres, Redis, S3 |
+| Readiness probe | A check Kubernetes runs to ask "can this copy take traffic yet?" | `GET /ready` returns 200 |
 
 **Picture it**
 
@@ -98,9 +109,11 @@ Where it breaks: a kitchen manager reacts when someone tells them; an orchestrat
 
 ## 1. Why it exists 🟢
 
+🟢 **Plain version:** Moving an app to the cloud only helps if you can run many copies of it and kill or restart any copy at any time. Old apps often cannot do that, because each copy keeps users' data on its own disk. The CNCF (the Cloud Native Computing Foundation, the group behind Kubernetes) wrote down the style that fixes this: pack apps in containers, split them into small services, replace servers instead of fixing them, and describe what you want instead of scripting each step. The 12-Factor App is the same idea as a checklist for one service.
+
 Early cloud migrations often just moved a server into a VM in someone else's data center — same monolith, same deploy process, same assumption that the server never restarts.
 
-That gets you a rented machine, not elasticity: you still can't run 50 copies of the app behind a load balancer, because 10 of them would fight over the same local session files, and a crashed instance would lose whatever it had in memory or on disk.
+That gets you a rented machine, not elasticity: you still can't run 50 copies of the app behind a load balancer (a front door that spreads requests across the copies), because 10 of them would fight over the same local session files, and a crashed instance would lose whatever it had in memory or on disk.
 
 The CNCF's definition exists to name the opposite style precisely:
 
@@ -115,6 +128,14 @@ Each term earns its place because it removes one specific assumption that breaks
 
 The 12-Factor App, written by Heroku engineers in 2011 and still the standard checklist, is the service-level version of the same idea: a set of rules that make *one* service safe to run this way.
 
+### Real-life example: Swiggy at dinner time 🟢
+
+At 8pm, many more people open Swiggy than at 4pm.
+The platform starts, say, 30 copies of the ordering service instead of 10, then removes them after the rush.
+This only works because no copy keeps your cart on its own disk; the cart lives in a shared store such as Redis.
+If one copy crashes mid-order, the next request lands on another copy and your cart is still there.
+That "any copy can vanish and nobody notices" property is exactly what cloud native and the 12 factors are about.
+
 ## 2. Mental model 🟢
 
 Picture the difference between a hotel and a houseguest. A houseguest (the old-style server) has their own room, keeps belongings scattered around, and if they leave, the room is unusable until someone cleans it up and the guest is gone for good.
@@ -123,11 +144,28 @@ A hotel guest (a cloud-native instance) could be moved to any identical room on 
 
 Kubernetes is the front desk: it doesn't care which physical room a guest occupies, only that the right number of guests of the right type are checked in at all times — and if a room floods, it checks a new guest into an identical room without asking you.
 
+## Common beginner mistakes 🟢
+
+- **Saving sessions or uploads on the container's own disk** → that disk is wiped when the container is replaced, and other copies cannot see it → keep sessions in Redis and files in object storage like S3.
+- **Baking settings (DB address, passwords) into the image** → you must rebuild to move from staging to prod, so prod runs a build nobody tested → read settings from environment variables.
+- **Ignoring SIGTERM** → the app is killed mid-request during every deploy → catch SIGTERM, stop taking new requests, finish the current ones, then exit.
+- **Editing a running pod by hand** → the controller changes it back on its next check → change the YAML file and apply it again.
+- **Thinking "we use Kubernetes, so we are cloud native"** → a monolith with local state in one big pod is still fragile → check the properties: stateless, config from outside, safe to kill.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that cloud native means "any copy can be killed, copied or moved without anyone noticing". **Next we open the box**: the building blocks that make this possible, the loop Kubernetes runs to keep things the way you asked, and the 12 rules one service must follow.
 
 ### The CNCF pillars, as one picture
 
 **In plain words:** cloud native is a few ideas working together: package in containers, split into services, automate deploys, and watch everything.
+
+**Step by step:**
+1. Pack the Go API into a container image, say `orders:v2`. It runs the same on a laptop and in prod.
+2. Never fix a running server. To change anything, build `orders:v3` and replace the old copies (immutable infrastructure).
+3. Split the big app into small services (orders, payments, search) so each team ships on its own.
+4. Describe what you want in a file ("3 copies of `orders:v3`") and let a controller make it true (declarative APIs).
+5. Keep that file in Git, and let a tool apply whatever is in Git (GitOps). A service mesh (a helper proxy, called a sidecar, placed next to each service to handle its network calls) can come later, when there are many services.
 
 ```mermaid
 flowchart TB
@@ -151,6 +189,13 @@ flowchart TB
 
 **In plain words:** you write down what you want ("3 copies"). A robot keeps comparing that with what is running and fixes any gap, forever.
 
+**Step by step:**
+1. You apply a file that says `replicas: 3, image: app:v2`. It is stored by the API server (Kubernetes' central front desk that holds the wanted state).
+2. A controller reads it and counts what is running: 3 pods. All good.
+3. One pod crashes. The next check counts 2 pods, which differs from 3.
+4. The controller starts 1 new pod. The next check counts 3 again.
+5. You change the file to `image: app:v3`. The controller sees old pods and replaces them, a few at a time.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Declared: you apply a Deployment YAML\n(replicas: 3, image: app:v2)
@@ -168,6 +213,13 @@ This loop is *why* a pod that crashes gets replaced within seconds without a hum
 
 **In plain words:** read the last column first: it tells you the pain each rule saves you from.
 
+**Step by step (one service following the rules):**
+1. All the code lives in one Git repo, and `go.mod` lists every library (factors I, II).
+2. CI builds one image, `orders:v2`. Staging and prod both run that same image (factor V).
+3. Each environment passes its own settings as environment variables, like `DATABASE_URL` (factors III, IV).
+4. The app listens on its own port, keeps no data on its disk, and you add copies to handle more load (factors VI, VII, VIII).
+5. On SIGTERM it finishes current requests and exits; its logs go to the screen output (stdout) for the platform to collect (factors IX, XI).
+
 | # | Factor | What it means | What breaks without it |
 | --- | --- | --- | --- |
 | I | Codebase | One codebase tracked in version control, many deploys | Environments silently diverge; "works on staging" stops meaning anything |
@@ -176,12 +228,12 @@ This loop is *why* a pod that crashes gets replaced within seconds without a hum
 | IV | Backing services | Treat a database, queue or cache as an attached resource reachable by a URL, swappable without code changes | Swapping a managed RDS for a different Postgres instance means a code change |
 | V | Build, release, run | Keep build (compile), release (build + config) and run (execute) as strictly separate stages | You can't roll back to a previous release without rebuilding |
 | VI | Processes | Run the app as one or more stateless processes; anything persistent goes to a backing store | Two replicas disagree because each has its own local session cache |
-| VII | Port binding | The app is self-contained and exports its service via a port (e.g. `net/http` listening on `:8080`), not injected into a runtime container like Tomcat | Can't run it standalone in a container the same way it runs in prod |
+| VII | Port binding | The app is self-contained and exports its service via a port (e.g. `net/http` listening on `:8080`), not injected into a runtime container like Tomcat (a Java server you drop apps into) | Can't run it standalone in a container the same way it runs in prod |
 | VIII | Concurrency | Scale out via the process model: run more identical processes, not bigger threads inside one | Vertical-only scaling hits a ceiling and wastes the cluster's many small nodes |
 | IX | Disposability | Fast startup, graceful shutdown on `SIGTERM`, crash-only design | A rolling deploy or scale-in cuts requests in half; slow starts make autoscaling useless |
 | X | Dev/prod parity | Keep dev, staging and prod as similar as possible (same backing services, same deploy process) | Bugs only show up in prod, where they're expensive to debug |
 | XI | Logs | Write logs as an unbuffered stream to `stdout`; let the platform collect and route them | The app owns log rotation and storage, and logs vanish when the container dies |
-| XII | Admin processes | Run one-off tasks (migrations, a REPL) as the same release, same config, same codebase | A migration run from a different build than what's deployed silently drifts |
+| XII | Admin processes | Run one-off tasks (migrations, a REPL, an interactive prompt for typing commands) as the same release, same config, same codebase | A migration run from a different build than what's deployed silently drifts |
 
 ## 4. Worked example 🟡
 
@@ -288,9 +340,19 @@ func RunWithGracefulShutdown(srv *http.Server, stop <-chan struct{}, drain time.
 }
 ```
 
-In a real `main.go`, `stop` is closed by a `signal.Notify(ch, syscall.SIGTERM)` goroutine; Kubernetes sends `SIGTERM` to a pod, waits up to `terminationGracePeriodSeconds` (default 30s), then `SIGKILL`s it — so `drain` must be comfortably under that grace period.
+In a real `main.go`, `stop` is closed by a `signal.Notify(ch, syscall.SIGTERM)` goroutine; Kubernetes sends `SIGTERM` to a pod, waits up to `terminationGracePeriodSeconds` (default 30s), then `SIGKILL`s it (a forced kill the app cannot catch) — so `drain` must be comfortably under that grace period.
+
+```mermaid
+flowchart LR
+    T["SIGTERM arrives"] --> N["Stop taking new requests"]
+    N --> D["Finish current ones<br/>(up to drain, e.g. 20 s)"]
+    D --> E["Exit cleanly"]
+    T -.->|"after 30 s if still alive"| K["SIGKILL: forced stop"]
+```
 
 **Test, run with `go test -race` on Go 1.24:**
+
+**What this code does, in plain words:** the first test checks that missing settings fall back to 8080 and "info", and that set values win. The second test starts a real server, waits until it answers, sends the "stop" signal, and checks it shuts down without an error.
 
 ```go
 func TestLoadConfig_DefaultsAndOverrides(t *testing.T) {
@@ -351,20 +413,23 @@ func TestRunWithGracefulShutdown(t *testing.T) {
 
 ## 6. Trade-offs and when not to use 🟡
 
-- **Operational overhead.** A cloud-native setup assumes CI/CD, container registries, an orchestrator, and someone who understands all three. For a two-person team shipping an MVP, that overhead can exceed the benefit — a single server with systemd and a nightly backup is a legitimate choice early on.
-- **Debugging is distributed.** A request can now cross five services instead of one process; without distributed tracing (see [[Distributed Tracing with OpenTelemetry]]) and correlation IDs, finding where it failed is much harder than reading one stack trace.
+- **Operational overhead.** A cloud-native setup assumes CI/CD, container registries, an orchestrator, and someone who understands all three. For a two-person team shipping an MVP, that overhead can exceed the benefit — a single server with systemd (Linux's built-in tool that starts and restarts programs) and a nightly backup is a legitimate choice early on.
+- **Debugging is distributed.** A request can now cross five services instead of one process; without distributed tracing (see [[Distributed Tracing with OpenTelemetry]]) and correlation IDs (one ID attached to a request and passed along to every service it touches), finding where it failed is much harder than reading one stack trace.
 - **Microservices add network calls where function calls used to be.** Every service boundary is a new source of latency, partial failure and versioning to manage — not free architecture, a trade for independent deployability.
 - **An anti-pattern worth naming:** a containerized monolith with manual deploys gets *some* of the deployment benefits (reproducible images) but none of the independent-scaling or independent-release benefits, while still carrying most of the container tooling overhead. If you're not going to decompose it or automate its deploys, plain VMs may be simpler.
 
 ## 7. In production 🔴
 
-- **Real systems:** Netflix popularized the microservices + chaos-engineering style that much of "cloud native" thinking draws from; most CNCF graduated projects (Kubernetes, Prometheus, Envoy, containerd, Helm, Argo, Jaeger) are the default toolchain teams reach for when building this way.
+> 🟡 → 🔴 **You now know** the pillars, the reconcile loop, the 12 factors and how config-from-env and graceful shutdown look in Go. **Next is the advanced part**: what breaks in real clusters, what to watch, and the deeper ideas (GitOps, open standards, service mesh, resilience patterns) that come up in SDE-3 interviews.
+
+
+- **Real systems:** Netflix popularized the microservices + chaos-engineering (breaking things on purpose in production to prove the system survives) style that much of "cloud native" thinking draws from; most CNCF graduated projects (Kubernetes, Prometheus, Envoy, containerd, Helm, Argo, Jaeger) are the default toolchain teams reach for when building this way.
 - **Failure modes → fixes:**
   - Service ignores `SIGTERM`, keeps serving past shutdown deadline → Kubernetes `SIGKILL`s it after the grace period, dropping in-flight requests → implement graceful shutdown (factor IX) and keep the grace period comfortably longer than your slowest request.
   - Config baked into the image → a staging bug "disappears" in prod because they secretly run different images → enforce factor III: the same image, different environment variables, promoted unchanged between environments.
   - No readiness probe → traffic is routed to a pod before it's finished warming up (DB pool, cache) → add a readiness probe distinct from the liveness probe, and don't mark the pod ready until dependencies are confirmed reachable.
   - A service writes uploaded files to local disk → a rolling deploy or pod reschedule silently loses them → treat local disk as ephemeral; use object storage or a backing service (factor VI).
-- **What to monitor:** per-service error rate and latency (not just an aggregate), pod restart counts (a proxy for crash-looping), deploy frequency and rollback rate (DORA metrics), and whether readiness/liveness probes are actually distinct and correctly tuned.
+- **What to monitor:** per-service error rate and latency (not just an aggregate), pod restart counts (a proxy for crash-looping), deploy frequency and rollback rate (DORA metrics: four standard numbers for how fast and how safely a team ships), and whether readiness/liveness probes are actually distinct and correctly tuned.
 
 ## 8. Deep dive 🔴
 
@@ -382,7 +447,7 @@ Rolling back a bad deploy becomes `git revert`, and drift between "what's in Git
 
 OpenTelemetry plays the same standardizing role for observability instrumentation. Knowing these exist is what separates "I've used Kubernetes" from "I understand why Kubernetes is portable across clouds."
 
-**Service mesh, briefly.** At enough microservices, cross-cutting concerns (mTLS between services, retries, per-service traffic metrics) become repetitive to implement in every service.
+**Service mesh, briefly.** At enough microservices, cross-cutting concerns (mTLS between services, meaning both sides prove who they are with certificates and encrypt traffic, retries, per-service traffic metrics) become repetitive to implement in every service.
 
 A service mesh (Istio, Linkerd) injects a sidecar proxy next to each pod that intercepts all its network traffic and handles those concerns uniformly, outside the application code — a deeper topic of its own, but worth recognizing as "the pillar that handles networking concerns the 12 factors don't cover."
 
@@ -421,7 +486,7 @@ That's the "you build it, you run it" principle Amazon popularized: the team tha
 > [!question]- Why does immutable infrastructure matter, concretely?
 > Because it guarantees "what's running in prod" matches "what was built and tested," with no drift from manual patches applied directly to a live server.
 >
-> If a server needs a change, you build a new image or instance, deploy it, and discard the old one — you never SSH in and edit it live, so there's never a snowflake server nobody can reproduce.
+> If a server needs a change, you build a new image or instance, deploy it, and discard the old one — you never SSH in (open a remote terminal on the server) and edit it live, so there's never a snowflake server nobody can reproduce.
 
 > [!question]- What does GitOps add on top of plain Kubernetes manifests?
 > It makes Git the single source of truth for the cluster's desired state, with a controller (Argo CD, Flux) continuously reconciling the live cluster to match what's committed, instead of relying on someone remembering to run `kubectl apply`.
@@ -441,6 +506,30 @@ That's the "you build it, you run it" principle Amazon popularized: the team tha
 - GitOps = reconcile loop at the whole-cluster level, with Git as the source of truth.
 - Open standards (OCI, CRI, CNI, CSI, OpenTelemetry) are what make the stack portable across providers.
 - Anti-pattern: a containerized monolith with manual deploys — the tooling overhead of cloud native, none of its benefits.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Is an old app moved unchanged onto an EC2 VM "cloud native"?
+> No. That is cloud-hosted: it runs in the cloud but still cannot be safely copied, killed or moved.
+
+> [!question]- Where should a 12-factor app read its database address from?
+> From an environment variable such as `DATABASE_URL`, not from a file baked into the image.
+
+> [!question]- Where should a 12-factor app write its logs?
+> To stdout (normal screen output). The platform collects and ships them.
+
+🟡 Medium
+
+> [!question]- A pod crashes and you did nothing, yet a new one appears in seconds. What made that happen?
+> The reconcile loop: the controller saw 2 running where 3 were wanted and started one more.
+
+> [!question]- Users get logged out at random after you scale from 1 copy to 2. Which factor was broken?
+> Factor VI (stateless processes): sessions were stored inside one copy instead of a shared store like Redis.
+
+> [!question]- Kubernetes waits 30 seconds after SIGTERM. Your drain timeout is 45 seconds. What goes wrong?
+> Slow requests are cut off by SIGKILL at 30 seconds; keep the drain timeout well under the grace period.
 
 ## Links
 

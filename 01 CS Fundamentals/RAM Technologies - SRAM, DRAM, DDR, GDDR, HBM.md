@@ -30,6 +30,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example), then 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Memory Hierarchy and CPU Caches]]: the CPU uses small fast caches near each core and big slower main memory further away. This note shows what those two kinds of memory are made of.
+
 **From zero, in 60 seconds** 🟢
 
 "RAM" is not one thing. There are two basic ways to build a memory cell, and everything else is packaging.
@@ -74,6 +77,12 @@ Those two memories are built very differently, and graphics cards use yet anothe
 | Bandwidth | How many bytes per second can move | 50 GB/s from RAM |
 | Latency | How long one request takes to come back | ~100 ns for one RAM read |
 | Memory bus | The wires between CPU and memory chips | A 64-bit DDR channel |
+| SRAM / DRAM | Static RAM (holds a bit with 6 transistors) / Dynamic RAM (holds a bit as charge in 1 capacitor) | CPU cache / your 16 GB of RAM |
+| Refresh | Re-reading and re-writing DRAM cells before their charge leaks away | every row about every 64 ms |
+| DIMM | The stick of memory chips you plug into a motherboard | one 16 GB DDR5 stick |
+| MT/s | Mega-transfers per second: how many data moves happen each second | DDR5-6400 = 6,400 MT/s |
+| ECC | Error-correcting code: extra bits that fix a flipped bit automatically | server RAM |
+| JEDEC | The industry group that writes the official memory standards | publishes the DDR5 spec |
 
 **Picture it**
 
@@ -115,6 +124,13 @@ That single trade-off — SRAM's speed and area cost versus DRAM's density and r
 > [!tip] Remember
 > SRAM trades area and cost for speed and no refresh; DRAM trades refresh overhead for six times the density. Neither technology wins outright, which is why real systems use both, in different places.
 
+### Real-life example 🟢
+
+Your phone uses LPDDR, a low-power DRAM, so it can keep apps like WhatsApp and Instagram open in the background without draining the battery.
+A PlayStation 5 or a gaming graphics card uses GDDR6, because drawing millions of pixels 60 times a second needs a huge flow of bytes.
+The GPUs that run large AI chat models (such as Nvidia's H100) use HBM stacked right next to the chip, because moving model weights in and out is the bottleneck.
+And inside every one of those chips, the CPU or GPU still keeps a few megabytes of SRAM as its fastest cache.
+
 ## 2. Mental model 🟢
 
 **In plain words:** SRAM is a notepad on your desk — instantly available, but you only have room for a few pages, and the paper is expensive.
@@ -142,11 +158,28 @@ flowchart LR
 > [!warning] Common mistake
 > Thinking DRAM's refresh is something a program can avoid by "not touching" that memory. Every DRAM row must be refreshed on a schedule regardless of whether software is reading it — refresh is a property of the *hardware cell*, not of access patterns.
 
+## Common beginner mistakes 🟢
+
+- **Thinking "RAM" means one technology** → caches are SRAM, main memory is DRAM, GPUs use GDDR or HBM → name the type when you compare speeds.
+- **Assuming GDDR would make a CPU faster** → GDDR gives more bandwidth but slower single reads, and CPUs wait on single reads → CPUs stay on DDR.
+- **Believing memory you don't touch costs nothing** → every DRAM row is refreshed on a timer anyway → refresh is a hardware cost you cannot avoid in software.
+- **Reading "DDR5-6400" as a clock speed** → it is 6,400 million transfers per second, from both clock edges plus a bigger prefetch → compare MT/s and latency separately.
+- **Giving a Go container a memory limit but no `GOMEMLIMIT`** → the GC can let the heap grow until the kernel kills the process → set `GOMEMLIMIT` a little below the container limit.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the two cell types (SRAM fast and small, DRAM dense and leaky) and that DDR, GDDR and HBM are all DRAM packaged differently. **Next we open the box:** how each cell holds a bit, how DRAM is organised into banks and rows, how DDR generations got faster, and how GDDR and HBM trade latency for bandwidth.
 
 ### The SRAM cell: 6 transistors, no refresh
 
 **In plain words:** an SRAM bit cell is built from two cross-coupled inverters forming a **bistable latch** — a circuit with exactly two stable states, and whichever one it's in, it stays there until deliberately flipped — plus two access transistors that connect the latch to the bit lines for reading or writing.
+
+**Step by step:**
+1. Four transistors form two "inverters" (circuits that output the opposite of their input), each feeding the other.
+2. If one side holds 1, it forces the other side to 0, which forces the first side to stay 1. The loop holds itself.
+3. To read, the two remaining "access" transistors open and connect the loop to the bit lines (the wires that carry the value out).
+4. To write, the bit lines push in the new value hard enough to flip the loop.
+5. No refresh is needed: as long as power is on, the loop keeps its value.
 
 ```mermaid
 flowchart LR
@@ -174,10 +207,10 @@ flowchart LR
 ```
 
 **Step by step, what happens on a read:**
-1. The access transistor opens, connecting the capacitor to a sense amplifier.
+1. The access transistor opens, connecting the capacitor to a sense amplifier (a circuit that detects a very small charge and turns it into a clear 0 or 1).
 2. The sense amplifier drains the capacitor's tiny charge to decide whether it was a 1 or a 0 — this is a **destructive read**: the act of reading empties the capacitor.
 3. The memory controller must immediately rewrite the row, restoring whatever value was just read, before it can be considered "still there."
-4. Separately, and regardless of whether anyone reads it, each capacitor also leaks its charge on its own within tens of milliseconds — JEDEC's DDR5 standard specifies a typical refresh interval of about **64 ms per row**, meaning the controller must proactively read and rewrite every row at least that often.
+4. Separately, and regardless of whether anyone reads it, each capacitor also leaks its charge on its own within tens of milliseconds — JEDEC's (the memory standards body's) DDR5 standard specifies a typical refresh interval of about **64 ms per row**, meaning the controller must proactively read and rewrite every row at least that often.
 
 **Why it matters:** this refresh traffic uses a slice of the available memory-bus bandwidth even when the system is otherwise idle — it is pure overhead paid for DRAM's six-fold density advantage over SRAM.
 
@@ -187,6 +220,13 @@ flowchart LR
 ### DRAM organization: channels, ranks, banks, rows
 
 **In plain words:** a memory controller doesn't talk to "DRAM" as one undivided pool — it talks through a hierarchy of narrower and narrower subdivisions, each level adding a bit more independence or parallelism.
+
+**Step by step:**
+1. The CPU's memory controller asks for address X.
+2. It picks the channel (a set of wires), then the DIMM and rank (a group of chips on the stick).
+3. Inside the chips it picks a bank, then "opens" one row: the whole row is copied into a fast row buffer.
+4. It reads the needed column from that buffer.
+5. If the next request is in the same open row, it is fast (a row-buffer hit). If it is a different row in the same bank, the old row must close first (a miss).
 
 ```mermaid
 flowchart TD
@@ -217,6 +257,13 @@ A later access to the *same* open row — a **row-buffer hit** — is fast; an a
 
 **In plain words:** early DRAM was **asynchronous** (FPM, then EDO) — the memory controller and the DRAM chip ran on independent timings, which capped how fast requests could be pipelined.
 
+**Step by step:**
+1. Old DRAM ran on its own timing, so the controller had to wait and check each step.
+2. SDRAM added a shared clock, so both sides could plan requests on the same beat.
+3. DDR sent data on both the up and the down edge of each clock tick: twice as much per tick.
+4. Each later generation also fetched more bits inside the chip per request (the prefetch), then streamed them out quickly.
+5. DDR5 also split each stick into two independent halves (sub-channels), so two small requests can run at once.
+
 **SDRAM** (Synchronous DRAM) fixed that by adding a shared clock, letting the controller and chip pipeline requests against the same tick.
 
 **DDR** (Double Data Rate) then doubled throughput again by transferring data on both the rising *and* falling edge of that clock, and every generation since has grown a **prefetch buffer** (how much data is fetched internally per access, then streamed out over several clock edges) to keep scaling bandwidth without needing the clock itself to keep doubling.
@@ -227,7 +274,7 @@ A later access to the *same* open row — a **row-buffer hit** — is fast; an a
 | DDR1 | up to ~400 MT/s | 2.5 V | Double data rate (both clock edges) |
 | DDR3 | up to ~2133 MT/s | 1.5 V | 8n prefetch |
 | DDR4 | up to ~3200 MT/s | 1.2 V | 8n prefetch, bank groups |
-| DDR5 | 4800-8800+ MT/s | 1.1 V | 16n prefetch; **two independent 32-bit sub-channels per DIMM**; **on-die ECC** (corrects internal bit errors, separate from system-level ECC); on-DIMM power management (PMIC) |
+| DDR5 | 4800-8800+ MT/s | 1.1 V | 16n prefetch (16 bits fetched per data pin per access); **two independent 32-bit sub-channels per DIMM**; **on-die ECC** (corrects internal bit errors, separate from system-level ECC); on-DIMM power management (PMIC, a power-control chip on the stick itself) |
 
 **Why it matters:** DDR5's two sub-channels mean a single DDR5 DIMM behaves like two narrower, independent channels, improving the controller's ability to keep multiple requests in flight simultaneously rather than over-fetching one large one.
 
@@ -240,6 +287,13 @@ A later access to the *same* open row — a **row-buffer hit** — is fast; an a
 
 **In plain words:** Error-Correcting Code RAM adds extra bits per word — commonly a 72-bit word storing 64 data bits plus 8 check bits — so the memory controller can detect and correct single-bit errors (and detect, without correcting, many double-bit errors) caused by cosmic rays or electrical noise flipping a capacitor's charge.
 
+**Step by step:**
+1. The program writes 64 bits of data.
+2. The memory controller computes 8 extra check bits from those 64 and stores all 72.
+3. Later, the controller reads all 72 bits and recomputes the check bits.
+4. If one bit flipped (say from a cosmic ray), the mismatch shows exactly which bit, and the controller flips it back.
+5. If two bits flipped, it can usually detect it but not fix it, and it reports an error.
+
 **Example:** a server running a database or cache that holds gigabytes of state for weeks at a time has a real, non-trivial chance of an uncorrected single-bit flip occurring somewhere in that memory over its uptime — a documented failure mode at scale.
 
 A consumer laptop, by contrast, is rebooted often enough and holds state briefly enough that the same risk rarely matters in practice, which is why most consumer hardware ships without ECC.
@@ -250,13 +304,20 @@ A consumer laptop, by contrast, is rebooted often enough and holds state briefly
 
 **In plain words:** a GPU has thousands of parallel execution units all wanting data at once — its bottleneck is **total bandwidth**, not the latency of any single access, because a GPU hides latency by having enormous numbers of threads in flight (a CPU core, by contrast, needs each individual access to come back fast, since it usually has far less work to overlap with the wait).
 
+**Step by step:**
+1. A GPU has thousands of small workers, each waiting on data. What matters is total bytes per second.
+2. GDDR uses a wide bus with chips soldered right around the GPU, and sends more bits per wire tick.
+3. HBM stacks several DRAM chips on top of each other and links them with thousands of tiny vertical wires.
+4. That stack sits right next to the GPU, connected by a 1,024-bit-wide path: far wider than a normal 64-bit DDR channel.
+5. Each single read is a bit slower than DDR, but the GPU hides that by keeping thousands of reads in flight.
+
 **GDDR** (Graphics DDR, now at GDDR6/6X/7) answers the GPU's need with a much wider bus per chip and chips soldered close to the GPU die.
 
-It pushes a higher per-pin data rate (GDDR6X and 7 use multi-level signaling, PAM4/PAM3, to pack more bits per transfer) at the cost of higher latency than system DDR.
+It pushes a higher per-pin data rate (GDDR6X and 7 use multi-level signaling, PAM4/PAM3, meaning each wire uses 4 or 3 voltage levels instead of 2, to pack more bits per transfer) at the cost of higher latency than system DDR.
 
 **HBM** (High Bandwidth Memory) goes further still. Instead of a handful of chips on a circuit board, HBM stacks multiple DRAM dies vertically and connects them with thousands of through-silicon vias (TSVs).
 
-That gives each stack a **1024-bit-wide interface** — far wider than GDDR's already-wide bus — at the cost of being physically bonded next to the compute die on an interposer rather than socketed.
+That gives each stack a **1024-bit-wide interface** — far wider than GDDR's already-wide bus — at the cost of being physically bonded next to the compute die on an interposer (a thin silicon base that wires the memory stack to the processor) rather than socketed.
 
 ```mermaid
 flowchart LR
@@ -296,7 +357,7 @@ This is the kind of small, real decision a backend engineer makes using exactly 
 **In plain words:** since Go 1.19, `runtime/debug.SetMemoryLimit` (and the equivalent `GOMEMLIMIT` environment variable) sets a **soft cap** on total Go-managed memory, prompting more frequent garbage collection as usage approaches that cap, instead of waiting for the default pacer (driven by `GOGC`) alone to decide.
 
 1. A pod is given 512 MiB of DRAM by the container orchestrator (the physical resource this whole note has been about).
-2. Without `GOMEMLIMIT`, Go's GC paces itself purely off `GOGC`, which tracks *live-heap growth*, not any absolute ceiling — so the process can still be OOM-killed by the kernel even while `GOGC`'s own metrics look perfectly healthy.
+2. Without `GOMEMLIMIT`, Go's GC paces itself purely off `GOGC`, which tracks *live-heap growth*, not any absolute ceiling — so the process can still be OOM-killed (out-of-memory: the kernel force-stops a process that went over its memory limit) by the kernel even while `GOGC`'s own metrics look perfectly healthy.
 3. Setting `GOMEMLIMIT` with headroom (say, reserving 20% for runtime overhead, the OS page cache, and other processes) gives the runtime an actual number to GC against: `409.6 MiB` for a 512 MiB pod with 20% headroom.
 4. As live Go-managed memory approaches that limit, the garbage collector runs more aggressively — on purpose, trading some CPU for staying under the hard container limit — well before the kernel's OOM killer would act.
 
@@ -334,6 +395,8 @@ Runnable Go version, including input validation, the full table-driven test suit
 - DRAM's refresh cycles are pure overhead: they use bus bandwidth and power for data nobody is reading right now, which is the price paid for 6x the density of SRAM per unit area.
 - GDDR and HBM both sacrifice single-access latency for bandwidth; a workload dominated by latency-sensitive, low-parallelism memory access (most general-purpose CPU workloads) gains little or nothing from them, which is why servers run system DDR, not GDDR, for their CPUs.
 - ECC RAM costs more and (on some platforms) is slightly slower due to the extra check-bit overhead; for a short-lived process or a non-critical workload, the probability of an uncorrected bit flip mattering in its lifetime is low enough that plain DDR is the common choice.
+
+> 🟡 → 🔴 **You now know** how SRAM and DRAM cells work, how DRAM is organised, what each DDR generation changed, what ECC does, and why GPUs use GDDR and HBM. **Next comes the advanced part:** how clouds and AI accelerators advertise memory, the memory failures you meet in production, Rowhammer, and why DDR5 split its channels.
 
 ## 7. In production 🔴
 
@@ -392,6 +455,30 @@ Runnable Go version, including input validation, the full table-driven test suit
 - GDDR: wide bus, high bandwidth, higher latency than DDR — GPU VRAM.
 - HBM: 3D-stacked dies with a 1024-bit-per-stack interface, the most bandwidth of all — AI accelerators.
 - For Go services, pair `GOMEMLIMIT` (an absolute DRAM-aware ceiling) with `GOGC` (collection pacing below that ceiling).
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Which is used for CPU caches, SRAM or DRAM?
+> SRAM: fast and needs no refresh, but takes 6 transistors per bit.
+
+> [!question]- Why must DRAM be refreshed?
+> Each bit is charge in a tiny capacitor that leaks away in milliseconds.
+
+> [!question]- Is RAM kept after power-off?
+> No. All RAM, SRAM and DRAM, is volatile.
+
+🟡 Medium
+
+> [!question]- What is a row-buffer hit in DRAM?
+> A read from the row that is already open in the bank, so no close-and-open is needed; it is faster.
+
+> [!question]- Why do GPUs use GDDR or HBM but CPUs use DDR?
+> GPUs need huge total bandwidth and hide latency with many threads; CPUs need each single read back fast.
+
+> [!question]- What does `GOMEMLIMIT` add on top of `GOGC`?
+> A fixed memory ceiling the GC works to stay under, so a container is not OOM-killed.
 
 ## Links
 

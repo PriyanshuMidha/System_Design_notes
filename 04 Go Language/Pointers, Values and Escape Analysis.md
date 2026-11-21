@@ -29,6 +29,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works) and 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Syntax, Types and Control Flow]]: you can declare variables and write functions that take parameters.
+> - [[Structs, Methods and Embedding]]: a struct groups fields (`Invoice{ID, Amount}`), and a method is a function attached to a type through its receiver.
+> - [[Process Memory Layout - Stack vs Heap]]: the stack is fast scratch memory freed when a function returns; the heap holds longer-lived data that the garbage collector frees later.
+
 **From zero, in 60 seconds** 🟢
 
 When you pass a variable to a function in Go, the function gets a **copy**. Changes to the copy never touch your original.
@@ -73,6 +78,12 @@ And where that notebook is stored (a short-lived desk or a long-term shelf) is d
 | Escape analysis | Compiler check: "can this stay on the stack?" | `return &x` makes `x` escape |
 | Receiver | The value a method is called on | `func (u *User) Rename()` |
 | `nil` | A pointer that points at nothing | `var p *int` is `nil` |
+| Garbage collector (GC) | The part of Go that finds and frees heap memory nothing points to | frees an old `*Invoice` |
+| Allocation | Asking for a fresh piece of heap memory | `return &Invoice{}` allocates |
+| Method set | The list of methods a type has; decides which interfaces it fits | `*Service` has `Greet`, `Service` may not |
+| Addressable | Has a stable place in memory you can take `&` of | a local variable is; `m["a"]` is not |
+| Stack frame | The block of stack one function call uses; gone when it returns | `markPaid`'s local copy of `inv` |
+| Backing array | The array a slice's header points at | `&s[0]` points into it |
 
 **Picture it**
 
@@ -107,7 +118,7 @@ func markPaid(inv Invoice) {
 }
 ```
 
-Every call to `markPaid` copies the whole `Invoice` struct, mutates the copy, and the caller's original is untouched — the change silently vanishes. The fix is a pointer: `func markPaid(inv *Invoice)` lets the function reach back into the caller's actual struct through its address instead of a copy.
+Every call to `markPaid` copies the whole `Invoice` struct, mutates (changes) the copy, and the caller's original is untouched — the change silently vanishes. The fix is a pointer: `func markPaid(inv *Invoice)` lets the function reach back into the caller's actual struct through its address instead of a copy.
 
 The same question — copy or point at it? — comes up constantly: method receivers, function parameters, struct fields that model "this value may be absent." Each choice has a real memory cost, because a pointer that escapes a function's stack frame forces the compiler to allocate it on the heap, where the garbage collector must later scan and reclaim it.
 
@@ -127,12 +138,14 @@ You write `&x`; the compiler decides where `x` actually lives.
 
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** that Go copies every value you pass, a pointer is an address that lets a function change your original, and the compiler picks stack or heap for you. **Next we open the box**: exactly what gets copied, when to use pointer receivers, the method-set rule behind a famous interface error, nil pointers, and how to watch escape analysis decide.
+
 ### `&` and `*`, `new` vs `&T{}`
 
 - `&x` takes the address of an addressable value `x`, producing a `*T`.
 - `*p` dereferences a pointer, reading or writing the value it points at.
 - `new(T)` allocates a zeroed `T` and returns `*T` — rarely used directly in idiomatic Go.
-- `&T{...}` is the idiomatic form: build the value with a (possibly keyed) composite literal, then take its address in one expression.
+- `&T{...}` is the idiomatic form: build the value with a (possibly keyed) composite literal (writing the value out directly, like `Invoice{ID: "a"}`), then take its address in one expression.
 
 ```go
 var inv Invoice
@@ -145,7 +158,7 @@ p3 := &Invoice{ID: "x"}   // build + take address in one step: the idiomatic for
 
 **In plain words:** Go photocopies every argument — even a pointer is photocopied (the address on the slip gets copied, not the house). So reassigning a parameter inside a function changes only the photocopy.
 
-A function parameter always receives a **copy** of whatever was passed: a copy of an `int`, a copy of a `*T` (the address value, not the pointee), a copy of a slice's 3-word header (pointer, length, capacity), a copy of a map's internal pointer.
+A function parameter always receives a **copy** of whatever was passed: a copy of an `int`, a copy of a `*T` (the address value, not the pointee: the thing it points at), a copy of a slice's 3-word header (pointer, length, capacity), a copy of a map's internal pointer.
 
 Reassigning the *parameter* inside the function — `inv = &Invoice{...}`, `s = append(s, x)` without returning `s` — never affects the caller's variable, because the caller's variable was never touched, only its copy was.
 
@@ -194,7 +207,7 @@ A type's **method set** is which methods you can call on it directly. The rule: 
 
 This matters most for interface satisfaction: if `Greeter` requires `Greet()` and `Greet` is declared on `*Service`, then `*Service` satisfies `Greeter` but a bare `Service` value does not — even though you can write `svc.Greet()` directly in code, because the compiler automatically inserts `(&svc).Greet()` **when `svc` is addressable**.
 
-A map value is not addressable (`m["a"].Greet()` does not compile, because there's no stable memory location to take the address of — the map could rehash and move it), so a pointer-receiver method is unreachable on `m["a"]` even though it is on a local variable of the same type.
+A map value is not addressable (`m["a"].Greet()` does not compile, because there's no stable memory location to take the address of — the map could rehash, rebuilding its table, and move it), so a pointer-receiver method is unreachable on `m["a"]` even though it is on a local variable of the same type.
 
 ```mermaid
 flowchart LR
@@ -265,9 +278,9 @@ By contrast, `sumStaysOnStack` never lets `total`'s address leave the function, 
 
 **In plain words:** copying a tiny struct is basically free; a heap allocation costs finding space, being scanned by the garbage collector, and waiting to be cleaned up.
 
-A stack allocation is free: the stack pointer moves and nothing more happens. A heap allocation has three costs a copy doesn't: the allocator must find free space (and may trigger a GC assist if the heap is under pressure), the object must be scanned by the garbage collector on every mark pass until it's unreachable, and the memory isn't reclaimed until the next GC cycle actually runs.
+A stack allocation is free: the stack pointer moves and nothing more happens. A heap allocation has three costs a copy doesn't: the allocator must find free space (and may trigger a GC assist, where your goroutine is made to help with cleanup, if the heap is under pressure), the object must be scanned by the garbage collector on every mark pass until it's unreachable, and the memory isn't reclaimed until the next GC cycle actually runs.
 
-Copying a small, pointer-free struct is just a `memmove` of a few bytes — almost always cheaper than a heap allocation, until the struct is large enough that the copy itself dominates.
+Copying a small, pointer-free struct is just a `memmove` (a plain byte copy) of a few bytes — almost always cheaper than a heap allocation, until the struct is large enough that the copy itself dominates.
 
 ### Copying structs that hold locks
 
@@ -306,6 +319,8 @@ c.Value() // 2
 ### Full example
 
 All code below is one scratch module (`go 1.24`), `go vet`-clean, and passing under `go test -race`.
+
+**What this code does, in plain words:** four tiny functions, each trying to change something the caller passed in. `mutateCopy` changes a copy (caller sees nothing). `mutateViaPointer` changes the caller's invoice through its address (caller sees it). `reassignPointer` points its own copy of the pointer somewhere else (caller sees nothing). `appendHeaderCopy` appends to its copy of a slice header (caller's length does not change). The test after it checks all four.
 
 ```text
 $ go vet ./...
@@ -389,6 +404,8 @@ func TestMethodSetsAndAddressability(t *testing.T) {
 
 Nil receiver as a deliberate pattern, and a deref that does panic:
 
+**What this code does, in plain words:** `IntList` is a linked list where a `nil` list means "empty". `Len` on a `nil` list returns 0 safely because it checks for `nil` before reading any field. `derefNilPanics` reads a field through a `nil` pointer on purpose, and the test confirms that does panic.
+
 ```go
 type IntList struct {
     val  int
@@ -432,6 +449,8 @@ func TestDerefNilPointerPanics(t *testing.T) {
 ```
 
 `&s[i]` aliasing, and the moment `append` detaches it:
+
+**What this code does, in plain words:** take a pointer to `base[0]`, then `append` to `base`. When `base` has no spare room (cap 2), `append` copies to a new array, so setting `grown[0] = 999` does not change what the pointer sees. When `base` has spare room (cap 4), `append` reuses the same array, so the pointer sees `999` too.
 
 ```go
 func takeAddressOfElement(s []int, i int) *int { return &s[i] }
@@ -494,6 +513,8 @@ func closureCaptureEscapes() func() int {
 
 **Measured:** copying a small struct by value versus allocating the same struct on the heap through a pointer (Go 1.24.4, darwin/arm64, Apple M4, `go test -bench=. -benchmem`):
 
+**What this code does, in plain words:** two benchmarks on a 16-byte `Small` struct. One passes it by value into a function; the other builds it with a function that returns a pointer, which forces a heap allocation. `//go:noinline` stops the compiler from pasting the functions into the loop, so it cannot optimise the difference away.
+
 ```go
 type Small struct{ A, B int64 }
 
@@ -555,7 +576,10 @@ For a 16-byte struct, the heap-allocating version is about 8× slower and costs 
 
 ## 7. In production 🔴
 
-- **Real systems:** `*sql.DB` and `*sql.Tx` are shared handle types passed by pointer everywhere — copying them would be meaningless, since they wrap an internal connection pool. Request/response DTOs are usually passed by value if small (no mutation needed past decode), while service and repository structs holding dependencies (logger, DB handle, config) are passed and stored as pointers so there's exactly one instance per process.
+> 🟡 → 🔴 **You now know** what Go copies, how to choose receivers, the method-set and nil rules, how `append` can detach a pointer, and how to read `-gcflags=-m`. **Next is the advanced part**: how real services pass pointers and values, the production bugs this causes, and the limits of escape analysis that interviewers ask about.
+
+
+- **Real systems:** `*sql.DB` and `*sql.Tx` are shared handle types passed by pointer everywhere — copying them would be meaningless, since they wrap an internal connection pool. Request/response DTOs (data transfer objects: plain structs that carry request or response data) are usually passed by value if small (no mutation needed past decode), while service and repository structs holding dependencies (logger, DB handle, config) are passed and stored as pointers so there's exactly one instance per process.
 - **Failure modes → fixes:**
   - A struct embedding `sync.Mutex` gets copied (by value receiver, by `:=`, or by value parameter) → `go vet` flags it with `copylocks`; switch every method to a pointer receiver and pass `*T`.
   - Code holds `&s[i]` across an `append` on the same slice → the pointer silently detaches from the live data after a reallocation → copy the value out instead of holding a long-lived pointer into a growing slice, or pre-allocate capacity you know you won't exceed.
@@ -564,7 +588,7 @@ For a 16-byte struct, the heap-allocating version is about 8× slower and costs 
 
 ## 8. Deep dive 🔴
 
-- **Escape analysis is whole-function, interprocedural within limits.** The compiler can "see through" small, inlined calls (as shown by the `can inline` lines in the `-gcflags=-m` output above) and decide a value doesn't escape even when it's passed to another function, as long as that function is inlined or its own analysis proves the pointer doesn't leak further. Across a non-inlined call boundary, the compiler must assume the worst unless the callee's own escape analysis (also visible via `-m`) says otherwise — this is why `//go:noinline` was needed in the benchmark above: without it, the compiler would inline `newSmallOnHeap` and might prove the allocation unnecessary, hiding the exact cost being measured.
+- **Escape analysis is whole-function, interprocedural (looks across function calls) within limits.** The compiler can "see through" small, inlined calls (as shown by the `can inline` lines in the `-gcflags=-m` output above) and decide a value doesn't escape even when it's passed to another function, as long as that function is inlined or its own analysis proves the pointer doesn't leak further. Across a non-inlined call boundary, the compiler must assume the worst unless the callee's own escape analysis (also visible via `-m`) says otherwise — this is why `//go:noinline` was needed in the benchmark above: without it, the compiler would inline `newSmallOnHeap` and might prove the allocation unnecessary, hiding the exact cost being measured.
 - **`go build -gcflags="-m -m"`** (doubled) gives more detail on *why* a value escaped, which matters once the single `-m` output says "escapes to heap" without explaining which specific use triggered it.
 - **Interfaces and escape analysis interact non-trivially.** A method call through an interface value is a dynamic dispatch the compiler usually cannot inline or fully analyze, so arguments passed through an interface call tend to escape more often than the same code called on a concrete type directly — one more reason "accept interfaces, return structs" (see [[Interfaces]]) is about more than just testability.
 - **Method sets through embedding.** An embedded type's methods are promoted into the outer type's method set at the same pointer/value rule: if `Base` has a pointer-receiver method and `Outer` embeds `Base` by value, that method is promoted only into `*Outer`'s method set, not `Outer`'s — because reaching `Base`'s pointer receiver requires the address of the embedded `Base` field, which in turn requires the address of `Outer` itself.
@@ -602,6 +626,30 @@ For a 16-byte struct, the heap-allocating version is about 8× slower and costs 
 - Pick one optional-value encoding per field: nil pointer (unambiguous absence, costs an allocation), zero value (only if the zero is never meaningful), or an explicit presence flag / `sql.Null[T]` (no allocation, no ambiguity).
 - Escape analysis (`go build -gcflags=-m`) decides stack vs. heap: returned pointers, interface boxing, and closures over local variables are the common triggers.
 - Measured: copying a 16-byte struct is ~1 ns and 0 allocations; heap-allocating the same struct through a pointer is ~8 ns and 1 allocation the GC must later scan and reclaim.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- You pass an `Invoice` (not a pointer) to a function that sets `Amount = 0`. Does the caller's invoice change?
+> No. The function changed a copy.
+
+> [!question]- What do `&x` and `*p` do?
+> `&x` gives the address of `x`; `*p` reads or writes the value at that address.
+
+> [!question]- Who decides whether a variable lives on the stack or the heap?
+> The compiler, through escape analysis. You cannot choose it directly.
+
+🟡 Medium
+
+> [!question]- `Greet` has a `*Service` receiver. Can you assign a plain `Service` value to a `Greeter` interface?
+> No. `Greet` is only in `*Service`'s method set. Assign `&svc` instead.
+
+> [!question]- Name two things that make a local variable escape to the heap.
+> Returning its address, and capturing it in a closure (also: putting it in an interface, or a size not known at compile time).
+
+> [!question]- Why should a struct that holds a `sync.Mutex` always use pointer receivers?
+> A value receiver copies the mutex, and the copy's lock state no longer matches the real one. `go vet`'s `copylocks` flags it.
 
 ## Links
 

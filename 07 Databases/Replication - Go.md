@@ -24,6 +24,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add the Code steps 4-7 and the Tests.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Replication]]: the theory half. Replicas replay the primary's WAL and are a little behind, so a read right after a write can be stale.
+> - [[Transactions and ACID]]: after `COMMIT` returns, the change is saved on the primary.
+> - [[Storage Engines - B-tree vs LSM and WAL]]: the WAL is the ordered log of changes; an LSN is a position in it.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on twin of [[Replication]]. It builds one small Go program: a **read router** that decides, for every database read, whether to use a replica (fast) or the primary (always fresh). The trick is a bookmark: every write gets a position number from the database's change log, and a read may use a replica only if that replica has caught up past the bookmark. Read it top to bottom: setup commands first, then the code in seven small steps (each step is a short Concept, the code, then a numbered walkthrough), then the tests that prove it works. If you only want the idea, Step 3 is the whole thing in a dozen lines.
@@ -36,7 +41,7 @@ This file is the hands-on twin of [[Replication]]. It builds one small Go progra
 ## Before the code 🟢
 
 - **Generics**: `Router[T any]` and `Replica[T any]` work for any connection type, so tests use `string` and production uses `*pgxpool.Pool`.
-- **Atomics**: each replica's replay position is read and written with `sync/atomic`, so the poller and readers never race.
+- **Atomics** (`sync/atomic`: read or change one number in a single step that no other goroutine can interrupt): each replica's replay position is read and written with `sync/atomic`, so the poller and readers never race.
 - **Goroutines and `sync.WaitGroup`**: the concurrency test starts many goroutines and waits for all to finish.
 - **`context.Context`**: `PollReplay` stops when its context is cancelled.
 - **`time.Ticker`**: fires on a fixed interval to refresh replay positions.
@@ -103,6 +108,8 @@ flowchart LR
 ```
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** the router's one rule: a read may go to a replica only if it has replayed past the user's last write. **Next we open the box**: the SQL to set up and watch replicas, then LSN parsing, a replica position that only moves forward, the router, and the two database calls.
 
 ### Step 1: replica setup commands
 
@@ -317,7 +324,7 @@ The last two rows show why strings must not be compared: as text `16/FFFFFF` is 
 
 The position must never move backwards, because a stale value that overwrote a newer one would make a replica look further behind than it is, and a stale value that looked further ahead would break read-your-writes.
 
-Under-reporting is safe (the read just goes elsewhere), over-reporting is not. A compare-and-swap loop on an atomic integer keeps the maximum without a mutex ([[Replication#3.3 Measuring lag]]).
+Under-reporting is safe (the read just goes elsewhere), over-reporting is not. A compare-and-swap loop (read the value, then write the new one only if nobody changed it in between; otherwise retry) on an atomic integer keeps the maximum without a mutex ([[Replication#3.3 Measuring lag]]).
 
 The alternative is a `sync.Mutex` around a plain field, which is also correct but takes a lock on the hot read path of every `ForRead`.
 
@@ -493,6 +500,8 @@ func PollReplay(ctx context.Context, rep *Replica[*pgxpool.Pool], every time.Dur
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** how each piece of the router works. **Next is the senior view**: why each design choice was made, how the tests prove it under concurrency, and the gaps (the token is not the exact commit LSN, positions are up to one poll old, monotonic reads are not covered).
+
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
 | Token is the primary's WAL insert LSN | Commit LSN from the client protocol, or a timestamp | Always at or after the commit, simple to read; it may be slightly ahead, so a read can fall back to the primary unnecessarily |
@@ -533,6 +542,8 @@ func lsn(t *testing.T, s string) LSN {
 | the same | 0 | both replicas used, never `primary` |
 
 The setup and the first two assertions come first.
+
+**What this code does, in plain words:** it builds a router with one primary and two replicas, one lagging (`16/B3000000`) and one caught up (`16/B374D848`). A read carrying the write's token must always go to the caught-up replica, and a token newer than both must go to the primary.
 
 ```go
 func TestReadYourWrites(t *testing.T) {
@@ -615,6 +626,8 @@ func TestParseLSN(t *testing.T) {
 | --- | --- |
 | 8 goroutines, each observing `g*1000 + i` for `i = 1..1000`, while calling `ForRead` | final `replay == 8000` |
 
+**What this code does, in plain words:** eight goroutines report positions for the same replica at the same time, many of them older than what was already stored; the test checks the stored position ends at the highest value, 8000, and never went backwards.
+
 ```go
 func TestObserveConcurrent(t *testing.T) {
 	rep := &Replica[string]{Name: "r", Conn: "c"}
@@ -648,6 +661,8 @@ The file imports `sync` and `testing`.
 ### Test 4: the whiteboard function
 
 A small test in the `wb` package checks that `pickForRead` returns a caught-up replica and falls back to `"primary"`.
+
+**What this code does, in plain words:** it checks the tiny whiteboard router: token 15 picks the replica at 20, and token 25 falls back to the primary.
 
 ```go
 package wb
@@ -714,6 +729,30 @@ ok  	rwsplit	1.461s
 1. In `TestReadYourWrites`, make `replica-1` also reach `16/B374D848`. Predict which replicas the ten token reads return, then run it.
 2. Change `ForRead` to skip the round-robin and always start at index 0. Predict which assertion in `TestReadYourWrites` fails.
 3. Add a `Seen` token to the session: after each read, store `max(seen, replica replay position)` and pass it as the minimum for the next read. Predict how this changes behaviour for the "refresh twice and data goes backwards" anomaly.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What is the "token" in this note?
+> The WAL position (LSN) the primary had reached right after the user's write.
+
+> [!question]- When does `ForRead` choose the primary?
+> When no replica has replayed up to the session's token.
+
+> [!question]- Why parse `16/B374D848` into a number instead of comparing strings?
+> PostgreSQL does not zero-pad, so text order differs from numeric order (`16/FFFFFF` sorts after `16/1000000` but is smaller).
+
+🟡 Medium
+
+> [!question]- Why must a replica's stored position never move backwards?
+> A stale, lower value could overwrite a newer one; over-reporting would send reads to a replica that has not caught up.
+
+> [!question]- Why is the poller's cached position safe even though it is up to 100 ms old?
+> It can only be behind the real position, so at worst a read goes to the primary unnecessarily, never to a stale replica.
+
+> [!question]- Two writes in a row return tokens 30 and 25 (from different connections). Which one should the session keep?
+> 30, the maximum; keeping 25 could let a read see data from before the first write.
 
 ## Links
 

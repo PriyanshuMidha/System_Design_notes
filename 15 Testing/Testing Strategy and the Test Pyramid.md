@@ -30,6 +30,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - Nothing. This note starts from zero. It helps if you have seen a Go function and a `go test` run, but it is not required.
+
 **From zero, in 60 seconds** 🟢
 
 A **test** is a small program that runs your code and checks the answer is right.
@@ -73,6 +76,12 @@ A test strategy decides how many of each kind you write, and the test pyramid is
 | Coverage | Percent of code lines the tests ran | 80% coverage |
 | Feedback loop | Time between a change and knowing if it broke something | 5 seconds vs 40 minutes |
 | Critical path | The user journey that must never break | Login → pay |
+| CI | Continuous integration: a server that runs your tests on every push or pull request | GitHub Actions running `go test ./...` |
+| Fake / stub | A small stand-in for a real dependency, used in tests | In-memory map instead of Postgres |
+| Flaky test | A test that sometimes passes and sometimes fails on the same code | Fails 1 run in 20 |
+| Contract test | A test that checks two services agree on the shape of their messages | Orders expects `{"amount": int}` from payments |
+| Testcontainers | A library that starts a real database in Docker just for a test | Throwaway Postgres per test run |
+| Mutation testing | A tool that makes small changes to your code to see if tests notice | Flips `>` to `>=`; a good test fails |
 
 **Picture it**
 
@@ -109,6 +118,10 @@ The cost of a bug roughly multiplies by 10 at each stage it survives: free to ca
 
 A test strategy is the plan for catching as much as possible as early as possible, without paying for exhaustive testing at every layer.
 
+### Real-life example: Swiggy's checkout 🟢
+
+Think about what a food app like Swiggy must never get wrong: the bill total, charging you once, and placing the order. The price maths (item total, delivery fee, coupon) is pure logic, so it gets hundreds of tiny unit tests that run in under a second. Saving the order to the database gets a smaller set of integration tests with a real database. And one or two end-to-end tests drive the whole flow "add to cart → pay → order confirmed" through the real API, run before each release. Nobody tests "the font on the receipt" with an end-to-end test.
+
 ```mermaid
 flowchart LR
     C["You change code"] --> Q{"Which test would catch a bug here?"}
@@ -127,11 +140,27 @@ The test pyramid names three of those rings and recommends a **count**, not a ha
 
 The shape is a consequence of cost and flakiness, not dogma — a service that is 90% "call these other six services correctly" and 10% business logic should look more like a **trophy** (integration-heavy) than a pyramid.
 
+## Common beginner mistakes 🟢
+
+- **Testing everything through the browser** → tests take 40 minutes and break when a button moves → test logic with unit tests; keep only a few end-to-end tests for key journeys.
+- **Only unit tests with fakes** → the real SQL or HTTP wiring is never checked → add integration tests for each real boundary (database, broker, external API).
+- **Chasing a coverage number** → tests that run code but check nothing → write assertions on results; use coverage only to find untested branches.
+- **Fixing flaky tests with retries** → the real bug hides and people stop trusting red builds → find the cause (time, shared data, randomness, network) and remove it.
+- **Running every slow test on every pull request** → developers wait 20 minutes and switch off → fast tests per PR, slow ones on merge or nightly.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that tests come in sizes (small unit, middle integration, big end-to-end) and that you want many small ones and few big ones. **Next we open the box**: real numbers for each layer, other shapes than the pyramid, how layers map onto your code, how to pick what to test first, and when each layer runs in CI.
 
 ### The classic pyramid, with real numbers
 
 **In plain words: how many tests sit at each level, and how long each level takes to run.**
+
+**Step by step:**
+1. Bottom: about 1,000+ unit tests, each under a millisecond, with no network or disk. The whole layer runs in seconds.
+2. Middle: about 50-300 integration tests, each using one real thing such as Postgres; each takes 0.1-2 seconds.
+3. Top: about 5-20 end-to-end tests that drive the whole app through its real API; each takes 10-60 seconds.
+4. Each layer is its own separate suite. They do not hand work to each other; they just differ in how much of the real system they use.
 
 ```mermaid
 flowchart TB
@@ -158,6 +187,13 @@ The arrows in the old InvoiceOps note implied E2E tests "flow down into" integra
 ### Alternatives to the pyramid
 
 **In plain words: the pyramid is not the only shape. Some apps are mostly glue code, so they need more middle tests.**
+
+**Step by step:**
+1. Ask: where does this service's risk live, in its own logic or in its calls to other things?
+2. Lots of rules (pricing, invoice maths) → classic pyramid.
+3. Mostly glue (a BFF, backend-for-frontend, or a thin CRUD service that just creates/reads/updates/deletes rows) → trophy: most tests are integration tests.
+4. Many small microservices → honeycomb: integration tests plus contract tests instead of big cross-service end-to-end tests.
+5. If most of your checking is manual clicking → you have the ice-cream cone; move tests down the layers.
 
 ```mermaid
 flowchart LR
@@ -187,7 +223,12 @@ flowchart LR
 
 **In plain words: each layer of your service gets the kind of test that fits it best.**
 
-A hexagonal/clean-style Go service (see `16 Software Architecture`) maps directly onto the pyramid:
+**Step by step:**
+1. The core rules (e.g. "an invoice can be paid only once") are plain Go with no I/O → unit tests with fakes.
+2. The adapters, i.e. the code that talks to the outside world (Postgres repository, payment HTTP client, Kafka consumer) → integration tests against the real thing.
+3. The whole program wired together → a few end-to-end tests through its HTTP API.
+
+A hexagonal/clean-style Go service (core logic in the middle, talking to the outside only through small interfaces called ports; see `16 Software Architecture`) maps directly onto the pyramid:
 
 - **Domain/use-case layer** (pure Go, no I/O) → unit tests, one fake per port (see [[Test Doubles and Mocking in Go]]).
 - **Adapters** (Postgres repo, HTTP client to a payment provider, Kafka consumer) → integration tests against a real dependency.
@@ -207,6 +248,12 @@ Not everything deserves equal test investment. Order of priority for InvoiceOps:
 ### CI placement
 
 **In plain words: cheap tests run on every change; slow tests run less often.**
+
+**Step by step:**
+1. On every pull request (under ~3 minutes): unit tests, lint, `go vet`, `go test -race` (the race detector, which spots unsafe parallel memory access), consumer contract tests.
+2. On merge to main (~10 minutes): integration tests with real Postgres/Redis in containers.
+3. Nightly: end-to-end tests on a short-lived copy of the whole stack, plus load smoke tests.
+4. Before a production deploy: the full end-to-end suite; after deploy, canary (a small slice of real traffic first) and synthetic checks (scripted fake users hitting production).
 
 ```mermaid
 flowchart LR
@@ -275,13 +322,16 @@ flowchart LR
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** the layers, the shapes, how to rank what to test, and when each layer runs. **Next we look at real teams**: how Google and Spotify size tests, what goes wrong with suites in practice (slow, flaky, high coverage but bugs still escape), and the deeper topics of flakiness and coverage that interviews like to probe.
+
+
 - **Real systems**: Google's internal size classification (small/medium/large, roughly unit/integration/E2E) gates which machines a test is allowed to run on and how long it may take.
 
   Spotify's "honeycomb" post documented moving away from cross-service E2E toward consumer-driven contracts as the service count grew past what E2E could cover. Netflix is a well-known adopter of chaos engineering as the layer above E2E for distributed failure modes (see `Chaos Engineering`).
 - **Failure modes → fixes**:
   - *Suite is slow, PRs wait 20 minutes* → audit what layer each test is actually in; many "integration" tests that spin up a container per test case can often share one container per package (see [[Test Data Strategy]] for isolation techniques that make this safe).
   - *Suite is flaky* (see below) → the fix is almost never "add a retry"; it's removing the nondeterminism.
-  - *High coverage, bugs still escape* → check whether coverage is measuring assertions or just execution; add mutation testing (e.g., `go-mutesting`) as a periodic (not per-PR) signal.
+  - *High coverage, bugs still escape* → check whether coverage is measuring assertions or just execution; add mutation testing (e.g., `go-mutesting`, which plants small bugs and checks that some test fails) as a periodic (not per-PR) signal.
 - **What to monitor**: suite duration trend per layer, flake rate (tests that fail then pass on rerun with no code change), and escaped-defect rate (bugs found in production that a test *could* have caught) as the real measure of whether the strategy is working.
 
 ## 8. Deep dive 🔴
@@ -353,6 +403,26 @@ Use coverage to find **untested branches** ("the `amount <= 0` branch never ran 
 - Flaky tests come from time, shared state, randomness, or network — fix the cause, don't retry-and-ignore.
 - Coverage shows what ran, not what was verified; use it to find gaps, not as a quality score.
 - "What hurts users or money" gets tested first and at every layer; low-risk code gets unit tests only.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) In the pyramid, which layer has the most tests?
+> The bottom: unit tests.
+
+> [!question]- (easy) What does an integration test use for real?
+> One real outside thing, such as a database, broker or HTTP server.
+
+> [!question]- (easy) Does 100% coverage mean the code is well tested?
+> No. It only means every line ran; the test may not check anything.
+
+> [!question]- (medium) Why can't a unit test with a fake store catch a wrong SQL `WHERE` clause?
+> The fake has no real SQL, so there is nothing to get wrong; only a test against real Postgres can see it.
+
+> [!question]- (medium) When is a trophy shape better than a pyramid?
+> When the service is mostly glue to other systems, so most risk is at the boundaries.
+
+> [!question]- (medium) Why do end-to-end tests usually run nightly instead of on every pull request?
+> They are slow and need a whole stack; running them per PR would make every developer wait.
 
 ## Links 🟢
 - **Before this:** none — this is the entry point for `15 Testing`.

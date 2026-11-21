@@ -38,6 +38,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3 (how it works), 4 (worked example), 6 (variants) and 7 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 5 (deep dives), 8, 9 and 10. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[CRDTs and Conflict Resolution]]: some data types can merge changes from many copies in any order and still agree.
+> - [[Scaling WebSockets]]: keeping many always-open connections spread across servers.
+> - [[Real-time APIs - WebSocket, SSE and Long Polling]]: a WebSocket lets the server push each edit to the browser at once.
+> - [[Clocks and Ordering]]: machines cannot trust clocks to order events, so systems use counters or one orderer instead.
+
 **From zero, in 60 seconds** 🟢
 
 Google Docs lets many people type in the same document at the same time.
@@ -79,6 +85,11 @@ Making that work for many people typing at once is the collaborative editor prob
 | OT | Operational transformation: adjust an op's position for ops that landed first | "insert at 3" becomes "insert at 4" |
 | CRDT | A data type whose ops merge in any order to the same result | Each character has its own ID |
 | WebSocket | A connection that stays open so the server can push edits | Browser keeps one socket per document |
+
+| Revision | The server's count of ops applied so far | the document is at revision 1204 |
+| Sticky routing | Sending every user of one document to the same server | all of doc 42 goes to server 7 |
+| Lease | A time-limited claim, like "I own doc 42 for 15 s", that must be renewed | server 7 renews every 5 s |
+| Tombstone | A marker left where a character was deleted, kept until cleanup | deleted `B` still has a hidden entry |
 
 **Picture it**
 
@@ -130,6 +141,13 @@ Real-time collaboration fixes this: everyone types freely, and the system merges
 - **Low latency:** your own keystrokes appear instantly (local first); remote edits arrive under 200 ms.
 - **Availability:** a server crash costs a reconnect, not a document.
 
+### Real-life example: a shared trip plan 🟢
+
+Four friends plan a Goa trip in one Google Doc. Asha types the hotel name while Ravi fixes the dates two lines above, at the same moment.
+Each sees their own typing instantly, and a coloured cursor shows where the other is.
+A second later both screens show both changes, and the hotel name did not get scrambled by Ravi's edit above it.
+Later, "Version history" lets them see who changed what. That is everything this design must deliver.
+
 **Out of scope:** spreadsheet formulas, the rich-text rendering engine, full-text search across documents (a separate index fed by events).
 
 > [!tip] Remember
@@ -171,7 +189,17 @@ flowchart LR
     S --> L[("Op log<br/>source of truth")]
 ```
 
+## Common beginner mistakes 🟢
+
+- **Sending the whole document on every keystroke** → huge traffic and the last save overwrites others → send tiny ops like "insert 'x' at 5".
+- **Applying a remote op at its original position** → positions have shifted, so text lands in the wrong place and screens differ → transform it (OT) or use character IDs (CRDT).
+- **Making the user wait for the server before showing a keystroke** → typing feels laggy → apply locally at once and fix up when the server's order arrives.
+- **Saving cursor positions in the op log** → the log fills with throwaway data → treat presence as temporary, keep it in memory or Redis with a short expiry.
+- **Opening a document by replaying every op since day one** → old documents take seconds to open → load the latest snapshot and replay only newer ops.
+
 ## 3. How it works - high-level design 🟡
+
+> 🟢 → 🟡 **You now know** the goal: everyone types at once and every screen ends up the same. **Next we open the box**: why positions break, the two known fixes (OT and CRDTs), and how the servers are arranged.
 
 ### The conflict in one picture
 
@@ -207,7 +235,7 @@ sequenceDiagram
 
 **In plain words:** OT keeps ops as position-based edits and, when two ops were made against the same revision, **transforms** one so it still means the same thing after the other. In the example, Bob's `insert(0,"h")` is unaffected by Alice's insert at 3, but Alice's `insert(3,"s")` becomes `insert(4,"s")` once Bob's insert at 0 is known.
 
-A single central server makes OT manageable: the server decides the order (this is the Jupiter model, 1995), each client has at most one op in flight, and the client only needs to transform against the server's ops. Google Docs publicly describes using OT.
+A single central server makes OT manageable: the server decides the order (this is the Jupiter model, a 1995 design from Xerox where one server orders everything and each client only syncs with it), each client has at most one op in flight, and the client only needs to transform against the server's ops. Google Docs publicly describes using OT.
 
 Steps for one keystroke, client-server OT:
 1. The client applies the keystroke locally and adds it to a **pending** list.
@@ -224,11 +252,18 @@ Steps for one keystroke, client-server OT:
 
 ### Option B: CRDTs
 
+**Step by step:**
+1. The text `cat` is stored as three letters with IDs: c=A1, a=A2, t=A3.
+2. Alice adds `s` "after A3". It gets its own ID, say A4.
+3. Bob, at the same time, adds `h` "at the very start". It gets ID B1.
+4. Each op names a neighbour by ID, not a number, so it does not matter which arrives first. Both screens show `hcats`.
+5. A deleted letter is only hidden (a tombstone), so later ops that point at it still find their place.
+
 **In plain words:** a **CRDT** (see [[CRDTs and Conflict Resolution]]) removes position shifting by giving every character a unique ID, such as `(client id, counter)`, and describing an insert as "put this character after the character with ID X".
 
 IDs never shift, so ops commute: they can arrive in any order, be duplicated, and still produce the same text.
 
-Libraries such as **Yjs** (YATA algorithm) and **Automerge** implement this.
+Libraries such as **Yjs** (using the YATA algorithm, one specific rule set for ordering inserted characters) and **Automerge** implement this.
 
 ```mermaid
 flowchart TB
@@ -246,7 +281,7 @@ If both users insert at the same spot (both after A3), the CRDT breaks the tie w
 | Pros | Cons |
 | --- | --- |
 | Peer-to-peer, offline-first and multi-region work naturally | Metadata per character: the document is larger in memory |
-| No transform functions; merge is mathematically proven | Deleted characters leave **tombstones** (markers) until garbage collected |
+| No transform functions; merge is mathematically proven | Deleted characters leave **tombstones** (markers) until garbage collected (cleaned up once nobody needs them) |
 | Server can be a dumb relay plus storage | Harder to enforce rules (permissions per paragraph) on a free-form merge |
 
 > [!warning] Common mistake
@@ -272,6 +307,13 @@ The matching decision guide for the consistency side is [[Choosing Consistency, 
 
 **In plain words:** browsers talk to one server per document over an open line; that server writes every change to a log and sometimes saves a full copy.
 
+**Step by step (plain):**
+1. Asha opens doc 42. Her browser opens a WebSocket.
+2. The load balancer looks at "doc 42" and always sends it to the same server, say server 7.
+3. Ravi opens doc 42 too and also lands on server 7. Now one server sees both of their edits.
+4. Server 7 numbers each op, saves it to the op log, then tells everyone.
+5. Side jobs (search, snapshots, emails) read a copy of the ops from Kafka later, so they never slow typing.
+
 ```mermaid
 flowchart LR
     C["Client<br/>editor + local doc copy"] -->|"WebSocket"| LB["L7 load balancer<br/>sticky by doc_id"]
@@ -288,7 +330,7 @@ flowchart LR
     API --> OBJ[("Object storage<br/>images, exports")]
 ```
 
-1. The client opens a WebSocket to the load balancer, which routes by `doc_id` so everyone editing a document lands on the same collaboration server (the **document owner**).
+1. The client opens a WebSocket to the load balancer (an L7 one, which reads the request URL, so it can route by document), which routes by `doc_id` so everyone editing a document lands on the same collaboration server (the **document owner**).
 2. That server holds the live document in memory, gives ops a total order, and appends each one to the op log before acknowledging.
 3. The doc-to-server map lives in Redis so a new connection finds the owner; if the owner dies, another server takes over by loading the latest snapshot plus the log tail.
 4. Non-critical consumers (search index, notifications, snapshots) read events from Kafka; they never slow typing.
@@ -362,7 +404,7 @@ WebSocket messages (JSON for clarity; production uses a binary format):
 | Store | Table / key | Fields | Why this store |
 | --- | --- | --- | --- |
 | PostgreSQL | `docs` | `doc_id`, `owner`, `title`, `folder_id`, `latest_rev`, `created_at` | relational metadata, joins on sharing |
-| PostgreSQL | `acl` | `(doc_id, principal)`, `role` | permission checks on every connect |
+| PostgreSQL | `acl` (access control list: who may view, comment or edit) | `(doc_id, principal)`, `role` | permission checks on every connect |
 | Op log (partitioned by `doc_id`, e.g. Cassandra or a sharded SQL table) | `ops` | `(doc_id, rev)` primary key, `author`, `client_id`, `client_seq`, `payload`, `ts` | append-only, read as a range per document |
 | Op log store | `snapshots` | `(doc_id, rev)`, `blob` | fast open |
 | Redis | `doc:{id}:owner` | server id with TTL lease | find the owner |
@@ -425,6 +467,8 @@ sequenceDiagram
 
 ## 5. Deep dives 🔴
 
+> 🟡 → 🔴 **You now know** the architecture, the API, the data model and how a document opens. **Next is the advanced part**: exactly how concurrent edits are merged, what happens when the owner server dies, snapshots, cursors and offline editing.
+
 ### Deep dive 1: merging concurrent edits safely
 
 **In plain words:** the server never trusts a client's position blindly. It stamps each op with a revision, and the client says which revision it was based on. If other ops landed in between, the server must adjust the op.
@@ -450,7 +494,7 @@ flowchart LR
 
 **In plain words:** sticky routing means one process orders the edits of one document. If it dies, a new one must take over without losing or reordering anything.
 
-The owner holds a **lease** in Redis (`SET doc:42:owner srv-7 NX EX 15`, renewed every 5 s).
+The owner holds a **lease** in Redis (`SET doc:42:owner srv-7 NX EX 15`: set only if nobody holds it, expire in 15 s; renewed every 5 s).
 
 Writes to the op log carry the primary key `(doc_id, rev)`, so even if two servers briefly think they own the document, only one can write revision 1207; the other gets a duplicate-key error and steps down.
 
@@ -516,7 +560,15 @@ flowchart LR
 1. The client stores pending ops in local storage (IndexedDB).
 2. On reconnect it sends `last_known_rev` and its pending ops.
 3. The server (OT) transforms them against the whole gap, or (CRDT) merges the state difference.
-4. The client receives everything it missed and rebases.
+4. The client receives everything it missed and rebases (re-applies its own pending edits on top of the new server state).
+
+```mermaid
+flowchart LR
+    OFF["offline: edits saved locally"] --> RC["reconnect: send last rev + edits"]
+    RC --> M["server merges (OT or CRDT)"]
+    M --> BACK["client gets missed ops"]
+    BACK --> SAME["all screens match"]
+```
 
 > [!warning] Common mistake
 > Treating offline edits as "last save wins" per document. That wipes everyone else's work done during those minutes. Merge at the operation level.
@@ -528,9 +580,17 @@ flowchart LR
 | Server-ordered OT | server total order | limited | central, authoritative | Google Docs (per Google blog) |
 | CRDT with server relay | none needed | strong | persistence, auth, relay | Yjs and Automerge based apps |
 | Peer-to-peer CRDT | none | strong | optional signalling | local-first apps |
-| Server-authoritative LWW per property | server | limited | authoritative | Figma multiplayer (design objects, not text) |
+| Server-authoritative LWW (last writer wins) per property | server | limited | authoritative | Figma multiplayer (design objects, not text) |
 | Locking (one editor) | lock | none | lock manager | older document systems, file check-out |
 | Last save wins | none | n/a | none | naive file sync; loses edits |
+
+### Things people confuse this with 🟡
+
+| System | What it syncs | How it differs |
+| --- | --- | --- |
+| [[Case Study - File Storage and Sync]] (Dropbox) | Whole files | Conflicts become "conflicted copy" files; no live merge of keystrokes |
+| [[Case Study - Chat System]] | New messages appended to a list | Nobody edits the middle of someone else's message, so no position shifting |
+| Git | Code files | Merges happen later and by hand when lines clash; not live |
 
 ## 7. Trade-offs and when not to use 🟡
 
@@ -554,7 +614,7 @@ flowchart TD
   - Owner crash: clients reconnect with backoff and jitter; new owner loads snapshot plus tail; resent ops are deduplicated by `client_seq`.
   - Reconnect storm after a deploy: gradual rollout, connection draining, jittered retry; see [[Scaling WebSockets]].
   - Poison document (an op that crashes the merge code): quarantine that `doc_id`, fall back to the last good snapshot, keep other documents running.
-  - Divergence bug (two clients differ): detect with a periodic **checksum** of the document sent by clients; on mismatch the client reloads from the server snapshot.
+  - Divergence bug (two clients differ): detect with a periodic **checksum** (a short number computed from the whole text; equal text gives an equal checksum) of the document sent by clients; on mismatch the client reloads from the server snapshot.
   - Huge document: cap op size and document size; load in chunks (paragraph-level lazy loading).
 - **What to monitor:** WebSocket connections per server, op ack latency p99, op-to-remote-delivery latency, owner failovers per hour, checksum mismatches, snapshot lag (ops since last snapshot), op log write errors.
 - **Security:** check the ACL on connect and on every op (a viewer's op is rejected), expire access when a share is revoked by closing the socket, rate-limit ops per connection, and validate op size and structure.
@@ -574,7 +634,7 @@ flowchart TD
 
 **To 10x traffic.** Add collaboration servers behind the sticky load balancer (shard owners by `hash(doc_id)` with consistent hashing, see [[Consistent Hashing]]); partition the op log by `doc_id`; scale Redis presence by cluster. Because documents rarely have many editors, the system scales almost linearly with the number of documents.
 
-**To multi-region.** Give each document a **home region** (where most editors are); remote editors connect to a nearby edge but ops are forwarded to the home owner, costing one cross-region round trip (about 100 to 150 ms) for remote collaborators. CRDT-based designs can instead accept writes in every region and merge asynchronously. See [[Multi-Region Architecture]].
+**To multi-region.** Give each document a **home region** (where most editors are); remote editors connect to a nearby edge (a server close to the user) but ops are forwarded to the home owner, costing one cross-region round trip (about 100 to 150 ms) for remote collaborators. CRDT-based designs can instead accept writes in every region and merge asynchronously. See [[Multi-Region Architecture]].
 
 ```mermaid
 flowchart LR
@@ -615,6 +675,26 @@ flowchart LR
 
 > [!question]- A document is being edited by 5,000 people. What changes?
 > Fan-out is no longer tiny. Keep the few real editors on the owner, move viewers to read-only fan-out nodes fed from the op stream, throttle presence, and cap cursor broadcasts to nearby viewers.
+
+## Self-check 🟢🟡
+
+> [!question]- Easy: what is an operation (op)?
+> A tiny description of one edit, like "insert 'x' at position 5".
+
+> [!question]- Easy: why does your own typing appear instantly?
+> The browser applies it to its local copy first, before the server answers.
+
+> [!question]- Easy: why keep snapshots?
+> So opening a document loads one saved copy and replays only recent ops, not millions.
+
+> [!question]- Medium: `ABCDE`, Alice deletes `BC`, Bob inserts `X` at 3 at the same time. Final text?
+> `AXDE`: Bob's insert is transformed to position 1 after Alice's delete is applied.
+
+> [!question]- Medium: how does a CRDT avoid position shifting?
+> Each character has a unique ID, and inserts say "after character ID X", which never changes.
+
+> [!question]- Medium: two servers both think they own doc 42. What stops corruption?
+> The op log's key `(doc_id, rev)` lets only one write revision 1207; the other gets an error and steps down.
 
 ## 11. Cheat sheet 🟢
 

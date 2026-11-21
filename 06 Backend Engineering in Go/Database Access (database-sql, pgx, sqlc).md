@@ -31,6 +31,11 @@ status: reviewed
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Syntax, Types and Control Flow]]: you can read Go structs, pointers, loops and `if err != nil`.
+> - [[Error Handling]]: errors are values you check, wrap with `%w`, and compare with `errors.Is`.
+> - [[Context Package]]: a `ctx` carries a deadline, and a call that receives it stops when the deadline passes.
+
 **From zero, in 60 seconds** 🟢
 
 Your Go service needs to talk to a database. Opening a fresh connection for every request would be slow, like dialing a phone number from scratch for every sentence.
@@ -72,6 +77,12 @@ You must return each one, read errors correctly, and avoid asking the database 1
 | `context.Context` | A value that carries a deadline or cancel signal | Stop the query after 2s |
 | N+1 queries | One query for a list, then one more per item | 1 + 100 queries for 100 invoices |
 
+| DSN | The connection string with host, port, user and database name | `postgres://app@db:5432/invoiceops` |
+| NULL | "No value" in a database column, different from 0 or "" | `paid_at` is NULL until paid |
+| `RETURNING` | A Postgres clause that sends back values from an `INSERT` or `UPDATE` | `RETURNING id, created_at` |
+| Code generation | A tool writes Go code for you from another file | `sqlc generate` from `.sql` files |
+| ORM | A library that maps tables to objects and writes SQL for you | GORM |
+
 **Picture it**
 
 ```mermaid
@@ -99,13 +110,17 @@ Where it breaks: a library book does not time out by itself, but a query can be 
 
 ## 1. Why it exists 🟢
 
-InvoiceOps needs to read and write Postgres from Go: look up an invoice, list unpaid ones, mark one as paid. Go has no built-in ORM and no single blessed driver.
+InvoiceOps needs to read and write Postgres from Go: look up an invoice, list unpaid ones, mark one as paid. Go has no built-in ORM (object-relational mapper: a library that writes SQL for you from structs) and no single blessed driver.
 
 `database/sql` is the standard library's answer: a generic `*sql.DB` type and `Rows`/`Row`/`Result` types that any database driver can implement, so the same calling code works against Postgres, MySQL, or SQLite by swapping the driver import and the connection string.
 
 What `database/sql` does **not** do is manage a single connection per call. A naive read of `db.QueryRowContext(...)` looks like one call to one database — but `*sql.DB` silently opens, reuses, and closes a pool of underlying connections behind it.
 
-Get the pool sizing wrong and the symptoms show up far from the code that caused them: requests blocked in `db.Stats().WaitDuration`, or `FATAL: too many connections` while every Go profiler says the app is idle.
+Get the pool sizing wrong and the symptoms show up far from the code that caused them: requests blocked in `db.Stats().WaitDuration` (total time spent waiting for a free connection), or `FATAL: too many connections` while every Go profiler says the app is idle.
+
+### A real-life example 🟢
+
+When you open your order history in Swiggy, one Go service reads your last 20 orders from Postgres. It does not open a new database connection for you; it borrows one of maybe 20 already-open connections, runs one query, and hands the connection back in a few milliseconds. If the code asked for each order's restaurant name in a separate query (21 queries instead of 1 or 2), the page would get slower as your history grew. And if a query hung with no time limit, it would hold one of those 20 connections and slowly starve everyone else.
 
 ## 2. Mental model 🟢
 
@@ -124,9 +139,17 @@ Nothing hands you a numbered connection to hold onto across calls — unless you
 
 ## 3. How it works 🟡
 
+🟢 → 🟡 You now know that `sql.DB` is a box of reusable connections: borrow, query, return. Next we open the box: when connections are really opened, how borrowing works under load, how to size the pool, how to handle NULLs and timeouts, and which library to pick.
+
 ### Opening the pool
 
 **In plain words:** 'opening' the database does not connect to anything yet — it just sets up the box of connections; the first real query connects.
+
+**Step by step:**
+1. `sql.Open("pgx", dsn)` only checks the arguments and builds the pool object. No network call yet.
+2. `db.PingContext(ctx)` opens one real connection and logs in to Postgres.
+3. If the address or password is wrong, startup fails here with a clear error.
+4. From now on, every query borrows a connection from the pool and returns it.
 
 ```mermaid
 sequenceDiagram
@@ -146,6 +169,13 @@ sequenceDiagram
 `sql.Open` only validates its arguments and builds the `*sql.DB` struct — it does not connect. Call `PingContext` once at startup so a bad DSN or an unreachable database fails fast, instead of surfacing as a mysterious timeout on the first real request.
 
 ### Borrowing and returning a connection
+
+**Step by step:**
+1. A handler calls `QueryRowContext(ctx, "SELECT ... WHERE id = $1", 42)`.
+2. If an idle connection is free, the pool reuses it.
+3. If all 10 allowed connections are busy, the call waits until one frees up or `ctx` runs out.
+4. Postgres runs the query; the connection goes back to the pool.
+5. Only when you call `row.Scan(...)` do you see an error, including "no rows found".
 
 ```mermaid
 sequenceDiagram
@@ -174,11 +204,18 @@ The handler never sees "connection #7". It sees a `*sql.Row`, and the underlying
 
 **In plain words:** three dials decide how many connections exist, how many may sit idle, and how old one may get before it is thrown away.
 
+**Step by step:**
+1. Postgres allows `max_connections = 100`. You run 10 copies (pods) of your service.
+2. Keep some for migrations and admin: about 85 left, so about 8 per pod.
+3. Set `SetMaxOpenConns(8)` and `SetMaxIdleConns(8)` so connections are kept, not closed and reopened.
+4. Set `SetConnMaxLifetime` shorter than any proxy's idle timeout, so dropped connections are replaced quietly.
+5. Graph `db.Stats().WaitCount`; if it keeps climbing, the pool is too small.
+
 | Knob | Go default | What it controls |
 | --- | --- | --- |
 | `SetMaxOpenConns(n)` | `0` (unlimited) | Hard cap on open connections, idle + in-use. Leaving this at the default lets a traffic spike open as many connections as Postgres allows, then fail with `too many connections`. |
 | `SetMaxIdleConns(n)` | `2` | How many idle connections stay pooled instead of being closed right after use. Below `MaxOpenConns`, this causes connections to be opened and closed on every request burst. |
-| `SetConnMaxLifetime(d)` | `0` (unlimited) | Forces a connection to close and reopen after `d`, even mid-use of the pool. Needed behind load balancers or proxies (PgBouncer, cloud LBs) that silently drop long-lived TCP connections. |
+| `SetConnMaxLifetime(d)` | `0` (unlimited) | Forces a connection to close and reopen after `d`, even mid-use of the pool. Needed behind load balancers or proxies (PgBouncer, a popular Postgres connection pooler, or cloud LBs) that silently drop long-lived TCP connections. |
 | `SetConnMaxIdleTime(d)` | `0` (unlimited) | Closes an idle connection after `d` of no use. Matters when the DB itself has no pooler in front and would otherwise hold connections open forever. |
 
 Size `MaxOpenConns` against `max_connections` on the server, divided by however many replicas of your service share that server: a Postgres instance with `max_connections = 100` behind 10 pods leaves roughly 8-9 connections per pod once you reserve headroom for migrations and superuser access.
@@ -186,6 +223,12 @@ Size `MaxOpenConns` against `max_connections` on the server, divided by however 
 `db.Stats()` (`WaitCount`, `WaitDuration`, `InUse`, `Idle`) is the metric to graph to find out if the pool is actually too small.
 
 ### RETURNING and NULLs
+
+**Step by step:**
+1. Insert an invoice with `INSERT ... RETURNING id, created_at` and read both values with one `QueryRowContext(...).Scan(&id, &createdAt)`.
+2. `paid_at` is NULL for an unpaid invoice. Scanning NULL into a plain `time.Time` fails.
+3. Scan it into `sql.Null[time.Time]` instead; its `Valid` field says whether there was a value.
+4. Or write `COALESCE(paid_at, '1970-01-01')` in SQL so NULL becomes a fixed placeholder date.
 
 `ExecContext` only gives you `RowsAffected`; when you also need a value back from the write — a generated ID, a timestamp the database set — use `QueryRowContext` with Postgres's `RETURNING` clause instead of a separate `Exec` then `SELECT`:
 
@@ -195,9 +238,15 @@ INSERT INTO invoices (workspace_id, total_cents) VALUES ($1, $2) RETURNING id, c
 
 For nullable columns, three options exist: `sql.Null[T]` (generic, Go 1.22+, used in the worked example below), the older per-type wrappers (`sql.NullString`, `sql.NullInt64`, ...), or a plain `*T` pointer field.
 
-A fourth option skips Go-side null handling entirely: `COALESCE(paid_at, '1970-01-01')` or `COALESCE(discount_cents, 0)` in the `SELECT` list converts `NULL` to a sentinel value in SQL, so the Go side can scan a non-nullable type — useful when the sentinel is unambiguous and simpler than threading `Valid` checks through calling code.
+A fourth option skips Go-side null handling entirely: `COALESCE(paid_at, '1970-01-01')` or `COALESCE(discount_cents, 0)` in the `SELECT` list converts `NULL` to a sentinel value (a fixed stand-in value that means "nothing here") in SQL, so the Go side can scan a non-nullable type — useful when the sentinel is unambiguous and simpler than threading `Valid` checks through calling code.
 
 ### Context timeouts
+
+**Step by step:**
+1. The handler makes `ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)`.
+2. It runs the query with that `ctx`.
+3. The query is stuck behind a lock for 2 seconds; the deadline passes.
+4. The driver asks Postgres to cancel the query, the call returns an error, and the connection goes back to the pool.
 
 Every `*Context` method takes a `context.Context`; a query only stops early if you pass one with a deadline or cancellation.
 
@@ -208,6 +257,11 @@ Without a deadline, a slow query — a missing index, a lock wait — blocks tha
 ### pgx vs database/sql vs sqlc
 
 **In plain words:** three tools, one choice: the generic standard, the faster Postgres specialist, and the code generator that sits on top of either.
+
+**Step by step:**
+1. Need to support more than one database type? Use `database/sql` with a driver such as `pgx/v5/stdlib`.
+2. Only Postgres, and you want speed, bulk loads and rich types? Use `pgx` native with `pgxpool`.
+3. Either way, tired of hand-written `Scan` lists? Add `sqlc` on top: write SQL, get typed Go functions.
 
 ```mermaid
 flowchart TD
@@ -220,12 +274,18 @@ flowchart TD
 ```
 
 - **`database/sql` + a driver** (`pgx/v5/stdlib`, or historically `lib/pq`, which is in maintenance mode) gives you the generic interface. Swapping databases later only means swapping the driver import.
-- **`pgx` native** (`pgxpool.Pool`, not `*sql.DB`) skips that generic layer: it understands Postgres's binary wire protocol, types (arrays, `numeric`, JSON/JSONB, ranges) without extra scanning code, batched queries (`pgx.Batch`), and bulk loads (`CopyFrom`, far faster than many `INSERT`s). You give up driver portability to get this.
+- **`pgx` native** (`pgxpool.Pool`, not `*sql.DB`) skips that generic layer: it understands Postgres's binary wire protocol (the exact byte format Postgres uses on the network), types (arrays, `numeric`, JSON/JSONB, ranges) without extra scanning code, batched queries (`pgx.Batch`), and bulk loads (`CopyFrom`, far faster than many `INSERT`s). You give up driver portability to get this.
 - **`sqlc`** reads your schema and `.sql` query files and generates a Go function per query, with request and response structs whose field types already match the columns. You write SQL once; `sqlc generate` keeps the Go side honest when a column is added, renamed, or its type changes — a renamed column becomes a compile error in the generated code, not a silent `Scan` mismatch at runtime.
 
 ### N+1 queries
 
 **In plain words:** the classic slowdown — one query for a list, then one more query per item in the list; fix it by asking for everything in one query.
+
+**Step by step:**
+1. Load 100 invoices with one query.
+2. Bad version: loop over them and run one client query per invoice. That is 1 + 100 = 101 trips to the database.
+3. Good version: collect the 100 client IDs, then run one query `WHERE id = ANY($1)`. That is 2 trips.
+4. Or use one `JOIN` that returns invoices and clients together: 1 trip.
 
 ```mermaid
 flowchart LR
@@ -268,6 +328,8 @@ if errors.Is(err, sql.ErrNoRows) {
     return ErrNotFound
 }
 ```
+
+**What this code does, in plain words:** `Open` creates and sizes the pool and pings the database. `InvoiceRepo` then has four methods: `Get` reads one invoice and turns "no rows" into `ErrNotFound`; `ListUnpaid` streams rows with `defer rows.Close()` and a final `rows.Err()` check; `MarkPaid` uses `RowsAffected` to know if anything changed; and `ListByIDs` fetches many invoices in one query to avoid N+1.
 
 The full version below is the tested code: an `InvoiceRepo` with `Get`, a streaming `ListUnpaid`, `MarkPaid` using `RowsAffected`, and `ListByIDs` for the N+1 fix.
 
@@ -482,7 +544,28 @@ The table below is drawn from each project's own documentation, not from running
 - `lib/pq` is in maintenance mode (no new features, security fixes only); do not choose it for new Postgres code — use `pgx/v5/stdlib` instead.
 - A single, rarely-changing query set and a small team sometimes do better with raw `database/sql` and no codegen at all: one more build step is a real cost if the project is small.
 
+### `database/sql` vs `pgx` vs `sqlc` 🟡
+
+People often think these are three competitors. They are not all the same kind of thing:
+
+| | `database/sql` | `pgx` | `sqlc` |
+| --- | --- | --- | --- |
+| What it is | Go's standard pool and query API | A Postgres driver and pool | A code generator |
+| Works with | any database with a driver | Postgres only | either of the other two |
+| You write | SQL plus `Scan` calls | SQL plus `Scan` calls | SQL only; Go is generated |
+| Pick it for | portability | speed and Postgres features | type-safe queries |
+
+### Common beginner mistakes 🟢
+
+- Thinking `sql.Open` connects → a wrong password shows up only on the first request → call `PingContext` at startup.
+- Forgetting `defer rows.Close()` → each leaked query keeps a connection forever and the pool runs dry → defer it right after the error check.
+- Not checking `rows.Err()` after the loop → a network error mid-way looks like "fewer rows" → always check it.
+- Leaving `MaxOpenConns` unlimited → a traffic spike crashes Postgres with "too many connections" → cap it per pod.
+- Querying inside a loop → N+1 trips make pages slower as data grows → batch with `ANY($1)` or a `JOIN`.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now open, size and use a pool safely, and choose between `database/sql`, `pgx` and `sqlc`. The advanced part is about what breaks under real load: exhausted pools, dropped connections, proxies in transaction mode, and how to read `db.Stats()` to see it coming.
 
 - **Real systems:** pgx is used directly by CockroachDB's own tooling and widely in the Go Postgres ecosystem; sqlc is used by companies including Zapier and Sourcegraph for typed query layers; connection poolers like PgBouncer sit in front of either in transaction-pooling mode at scale.
 - **Failure modes → fixes:**
@@ -536,6 +619,26 @@ The table below is drawn from each project's own documentation, not from running
 - `pgx/v5` is the modern Postgres driver; `lib/pq` is in maintenance mode.
 - `sqlc` trades a codegen step for compile-time safety on query shape; reach for native `pgx` when you need `CopyFrom`, batching, or rich Postgres types and don't need portability.
 - N+1 is fixed by collecting keys and batching the query, not by adding a cache on top of the loop.
+
+## Self-check 🟢🟡
+
+> [!question]- Is `sql.DB` one connection or many?
+> A pool of many connections that queries borrow and return.
+
+> [!question]- Does `sql.Open` connect to the database?
+> No; it only builds the pool. `PingContext` makes the first real connection.
+
+> [!question]- Where does `sql.ErrNoRows` show up?
+> At `row.Scan(...)`, not at `QueryRowContext`.
+
+> [!question]- 10 pods share a Postgres with `max_connections = 100`. Roughly what `MaxOpenConns` per pod?
+> About 8-9, leaving headroom for migrations and admin access.
+
+> [!question]- Why is a query with no context deadline dangerous for the pool?
+> It holds a pooled connection for as long as it runs, so slow queries starve other requests.
+
+> [!question]- What does `sqlc` give you that hand-written `Scan` does not?
+> Generated typed functions, so a renamed or retyped column breaks the build instead of failing at runtime.
 
 ## Links 🟢
 

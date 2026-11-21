@@ -34,6 +34,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add sections 3, 4, 5 and 6 (how it works, a worked example, options and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add sections 7, 8 and 9 (production, deep dive and interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[AWS 05 - ECS, Fargate and ECR]]: your Go API runs as ECS tasks that come and go, so you cannot log in to a server to read files.
+> - [[Observability Fundamentals]]: metrics say something is wrong, logs say why, traces show where in a chain of services.
+
 **From zero, in 60 seconds** 🟢
 
 When your app runs in the cloud, you can't walk up to the server and look at it.
@@ -79,6 +83,13 @@ CloudWatch is AWS's place for all three.
 | Alarm | A rule that fires when a number crosses a line | Errors > 5% for 3 minutes |
 | SNS | AWS's notification sender | Sends the alarm to email or Slack |
 | Cardinality | How many unique label values exist | One per user ID = very high |
+| Namespace | The top-level folder a metric is filed under | `AWS/ECS`, `Prod/GoAPI` |
+| Log stream | The log of one running copy inside a log group | One stream per ECS task |
+| Retention | How long logs are kept before deletion | 30 days |
+| M of N | An alarm fires when M of the last N data points break the line | 3 of 5 minutes |
+| EMF (Embedded Metric Format) | A JSON log line that CloudWatch also turns into a metric | `{"_aws": {...}, "Duration": 42}` |
+| Trace | The path of one request through every service it touched | API → payments → DB |
+| Composite alarm | An alarm that combines other alarms with AND/OR | Errors high AND traffic high |
 
 **Picture it**
 
@@ -113,6 +124,14 @@ CloudWatch is that elsewhere: the ECS agent attaches an `awslogs` (or FireLens) 
 
 Concretely: an ALB reports `HTTPCode_Target_5XX_Count` as a metric with `1-minute` resolution. An alarm watches it, and when **3 of 5** consecutive 1-minute datapoints exceed 10 errors/minute, the alarm goes to `ALARM` and publishes to an SNS topic that pages on-call. Without this wiring, the first signal of an outage is a user complaint.
 
+### Real-life example: a payment failure at 2 a.m. 🟢
+
+Say the payment service of an app like Swiggy starts failing at 2 a.m. because a bank's API is slow.
+CloudWatch metrics show the 5xx count jumping; an alarm waits until 3 of the last 5 minutes are bad, then pages the on-call engineer.
+The engineer opens Logs Insights, filters the payment log group for errors, and sees "bank timeout" on most lines.
+A trace shows each request spending 8 seconds waiting on the bank.
+Numbers spotted it, logs explained it, the trace showed where.
+
 ## 2. Mental model 🟢
 
 Think of CloudWatch as three separate warehouses with one loading dock (alarms) between them and the outside world:
@@ -123,11 +142,27 @@ Think of CloudWatch as three separate warehouses with one loading dock (alarms) 
 
 An **alarm** is a standing query against exactly one metric. It does not look at logs or traces directly — if you want an alarm on "5xx rate in the logs," you first have to turn that log pattern into a metric (a **metric filter**, or EMF) and then alarm on the resulting metric.
 
+## Common beginner mistakes 🟢
+
+- **Leaving log retention at "never expire"** → logs pile up and the bill grows forever → set 30-90 days on every log group.
+- **Using user ID or request ID as a metric dimension** → each value becomes its own billed metric → keep such IDs in log fields.
+- **Alarming on one bad data point** → one noisy minute pages someone → use M of N, like 3 of 5.
+- **Keeping the default "missing data = not breaching"** → if the service dies and stops reporting, the alarm stays quiet → treat missing data as breaching for liveness alarms.
+- **Expecting an alarm to read logs** → alarms only watch metrics → turn the log pattern into a metric (EMF or a metric filter) first.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that CloudWatch collects metrics, logs and traces, and that alarms page someone. **Next we open the box**: how metrics are named and billed, how logs are stored and searched, how alarms decide, and where dashboards and traces fit.
 
 ### Metrics: namespace, dimensions, resolution
 
 **In plain words:** a metric is named by a folder (namespace), a name, and labels (dimensions). Different labels mean a different metric, and each one costs money.
+
+**Step by step:**
+1. Your Go API logs one EMF line per request: `Duration=42`, with dimensions `Service=checkout-api`, `Route=/v1/orders`.
+2. CloudWatch files it under namespace `Prod/GoAPI`, metric `Duration`, with those two labels.
+3. 20 routes × 5 status codes = 100 separate metrics, each billed per month.
+4. Add a `UserID` label with 50,000 users and it becomes 5 million metrics. That is the cardinality trap.
 
 A metric's identity is `(Namespace, MetricName, Dimensions)`. `AWS/ECS` is a namespace AWS owns; `Prod/GoAPI` would be one you create.
 
@@ -159,6 +194,12 @@ flowchart LR
 
 **In plain words:** one log group per service, one stream per running copy. Set how long to keep them, and search with Logs Insights.
 
+**Step by step:**
+1. The ECS service `checkout-api` writes to log group `/ecs/checkout-api`.
+2. Each running task writes its own stream inside that group.
+3. You set retention to 30 days so old lines are deleted automatically.
+4. To investigate, you run a Logs Insights query; it scans the lines at query time and bills per GB scanned, so keep the time range short.
+
 Each ECS service writes to one **log group** (e.g. `/ecs/checkout-api`); each running task gets its own **log stream** inside it. Retention defaults to **never expire**, which quietly becomes the single biggest CloudWatch bill line in a vault's worth of chatty services — set an explicit retention (30-90 days is typical; longer-lived audit logs go to S3 instead).
 
 **Logs Insights** is a query language over log groups, evaluated at query time (not indexed ahead of time), so a query over a wide time range on a busy service can take tens of seconds. Representative query and output:
@@ -183,6 +224,12 @@ representative output (CloudWatch Logs Insights, run over the last 15 minutes):
 ### Alarms: thresholds, M-of-N, missing data, composite
 
 **In plain words:** an alarm checks a number against a line over several minutes. You also decide what "no data" means, and can combine alarms.
+
+**Step by step:**
+1. Alarm: "5xx count over 10 per minute, in 3 of the last 5 minutes".
+2. Minute 1 is bad, minute 2 fine: still OK, one noisy minute is ignored.
+3. Minutes 3, 4 and 5 are bad: 3 of 5 breached, the alarm goes to ALARM and publishes to SNS, which pages on-call.
+4. If the service dies and sends no data at all, "missing = breaching" makes that silence page too.
 
 A basic alarm has a metric, a statistic (`Average`, `p99`, `Sum`), a threshold, and an **evaluation**: "M datapoints out of the last N breach the threshold." `3 of 5` is a common choice — it survives one noisy minute without paging, but still fires inside about 5 minutes.
 
@@ -210,6 +257,8 @@ stateDiagram-v2
 
 ### Dashboards and Container Insights
 
+**Step by step:** 1. A dashboard is a saved page of charts over the same metrics and queries. 2. Container Insights adds per-task CPU, memory and network charts for ECS/EKS without code changes, for an extra per-task cost.
+
 Dashboards are just saved widgets over the same metrics and Logs Insights queries above — no separate storage.
 
 **Container Insights** is a CloudWatch agent add-on for ECS/EKS that auto-collects per-task CPU, memory, network, and storage metrics plus a performance log, without instrumenting the app; it costs more per task than base ECS metrics, so it's usually enabled only where the extra granularity earns its cost.
@@ -217,6 +266,11 @@ Dashboards are just saved widgets over the same metrics and Logs Insights querie
 ### Traces: X-Ray / Application Signals vs an OpenTelemetry collector
 
 **In plain words:** traces follow one request across services. Use AWS's own tool, or the open standard (OpenTelemetry) that works anywhere.
+
+**Step by step:**
+1. A request enters the API and gets a trace ID.
+2. Every service it calls passes that ID along and records how long its part took (a span).
+3. X-Ray (or an OpenTelemetry collector sending to any backend) joins the spans into one timeline, so you see which hop was slow.
 
 X-Ray is CloudWatch's own tracing backend: the `aws-xray-sdk-go` package (or auto-instrumentation via Application Signals) attaches a trace ID header and reports segments.
 
@@ -362,6 +416,8 @@ func CustomMetricCardinality(dimensionValueCounts ...int) int {
 
 The test proves the round trip and the cardinality trap in numbers:
 
+**What this code does, in plain words:** the code builds an EMF JSON line and reads it back; the tests check the value and labels survive the round trip, and count how many metrics appear when a per-user label is added.
+
 ```go
 func TestBuildAndExtractRoundTrip(t *testing.T) {
 	ts := time.Date(2026, 11, 7, 10, 0, 0, 0, time.UTC)
@@ -417,6 +473,9 @@ Both tests pass (`go test -race ./cwemf/...`): the round trip recovers `Duration
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how metrics, logs, alarms, dashboards and traces work in CloudWatch, and how EMF turns logs into metrics. **Next is the advanced part**: silent alarms, noisy pages, surprise bills and cardinality limits in real systems, plus the deeper trade-offs of EMF, resolution and cross-account monitoring.
+
+
 - **Real systems:** every ECS/Fargate and Lambda deployment on AWS gets CloudWatch Logs by default through the platform's log driver; RDS, ALB, and most managed services publish their health metrics there with zero configuration, which is why CloudWatch is usually the first dashboard an on-call engineer opens even in shops that run Datadog for everything else.
 - **Failure modes → fixes:**
   - Alarm never fires because of `missing → not breaching` during a hard outage → set missing-data treatment to `breaching` for liveness-style alarms.
@@ -471,6 +530,30 @@ Both tests pass (`go test -race ./cwemf/...`): the round trip recovers `Duration
 - Never dimension on user ID, request ID, or IP — cardinality explodes and costs/limits follow.
 - Composite alarms fix noisy single-metric pages by requiring two signals to agree.
 - X-Ray/Application Signals is AWS-native tracing; an OTel collector is the vendor-neutral alternative with one extra hop.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What are the three kinds of data CloudWatch holds?
+> Metrics (numbers), logs (text) and traces (request paths).
+
+> [!question]- What is the default log retention, and why change it?
+> Never expire; it quietly grows the bill, so set 30-90 days.
+
+> [!question]- What does "3 of 5" mean on an alarm?
+> It fires only when 3 of the last 5 data points cross the threshold.
+
+🟡 Medium
+
+> [!question]- Why must you never use user ID as a metric dimension?
+> Each user becomes a separate billed metric, so counts and cost explode.
+
+> [!question]- The service crashed and the alarm stayed OK. Why?
+> Missing data was treated as "not breaching"; set it to breaching.
+
+> [!question]- What does EMF give you that a plain log line does not?
+> A metric extracted from the same line, with no extra API call.
 
 ## Links
 

@@ -35,6 +35,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (geohash, quadtree, S2, H3), 4 (worked example) and 5-6 (comparison and trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Indexing Fundamentals]]: an index is a sorted side-list that lets the database jump to matching rows instead of reading every row.
+> - [[Index Types and Index Design]]: a B-tree index sorts by one value and is great at ranges on that one value, like `age BETWEEN 20 AND 30`.
+> - [[Partitioning and Sharding]]: big data is split into slices on different machines, chosen by a key.
+
 **From zero, in 60 seconds** 🟢
 
 You open a cab app. The app must show cabs close to you.
@@ -80,6 +85,13 @@ It needs a way to look only at drivers who are already "in your area".
 | Geohash | A string ID for a rectangle; shared prefix means nearby | `tdr1v` lies inside `tdr1` |
 | Quadtree | A tree that splits a square into 4 smaller squares | Split only where many points are |
 | Haversine | Formula for true distance on a sphere | Distance between two lat/lng points in km |
+| Precision / resolution | How small the cells are; higher means smaller | geohash precision 6 ≈ 1.2 km × 0.6 km |
+| KNN | "The k nearest", with no fixed radius | the 5 closest drivers |
+| Sorted set | A Redis list kept in order by a number (the score) | Redis GEO stores each driver's cell as its score |
+| R-tree | An index of nested boxes around shapes | boxes around delivery zones |
+| PostGIS | A PostgreSQL add-on for maps and shapes | `ST_DWithin(pos, point, 500)` |
+| Geofence | A shape on the map you test points against | "is this address inside our delivery area?" |
+| Hot partition | One shard getting far more load than others | the cell over a stadium after a match |
 
 **Picture it**
 
@@ -132,7 +144,34 @@ Terms used below:
 - **Haversine distance:** the great-circle distance between two points on a sphere.
 - **KNN (k nearest neighbours):** "the 5 closest drivers", as opposed to "all drivers within 500 m" (a radius query).
 
+### Real-life example: Swiggy and Rapido 🟢
+
+When you open Swiggy, it shows restaurants that can deliver to you, and on the order screen you see your rider's dot move.
+When you book a Rapido bike, the app must find free riders within about a kilometre in a second or two.
+Riders send their position every few seconds, so the app files each rider under a small map cell and moves them when they cross into a new cell.
+Your search reads your cell and the 8 around it, then measures real distance to the few riders found.
+"Does Swiggy deliver to this address?" is a different question: it checks whether your point is inside a drawn delivery zone, which is a job for shape indexes like PostGIS.
+
+## Common beginner mistakes 🟢
+
+- **Searching only the cell you are in** → a driver 30 m away across the edge is missed → always read the cell and its 8 neighbours.
+- **Putting latitude where longitude goes** → points land in the ocean → Redis, PostGIS and GeoJSON all take longitude first; check the ranges.
+- **Using two normal indexes on `lat` and `lon`** → each one returns a huge strip around the world → use a spatial index (cells, GiST, S2).
+- **Picking tiny cells "for accuracy"** → a 500 m search then needs over 1,000 cells → choose cells whose smallest side is at least the search radius.
+- **Writing every driver ping to a disk database** → 250,000 updates a second overwhelm it → keep live positions in memory (Redis or an in-process index).
+
+### Questions people confuse 🟡
+
+| Question | Name | Typical tool |
+| --- | --- | --- |
+| Everything within 500 m of me | Radius query | Cell + 8 neighbours, then exact distance |
+| The 5 closest, however far | KNN | Widen rings until you have 5; PostGIS `<->` |
+| Is this point inside this shape? | Point-in-polygon (geofence) | PostGIS with GiST |
+| How many riders in each area? | Aggregation by cell | H3 hexagons |
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the trick: cut the map into named cells, search your cell plus its neighbours, then measure real distance. **Next we open the box**: how geohash names its cells, how quadtrees adapt to crowds, what Google's S2 and Uber's H3 add, and how R-trees index shapes. Each subsection starts with a plain walk-through; the full detail follows.
 
 ### 3.1 Geohash
 
@@ -174,6 +213,13 @@ flowchart TD
 
 **In plain words:** start with one big square. If too many points sit in it, cut it into 4. Keep cutting only where it is crowded. Busy city = many tiny squares, ocean = one big square.
 
+**Step by step:**
+1. One square covers the whole map. Each square may hold at most 100 drivers.
+2. Bengaluru fills up: its square passes 100 drivers, so it splits into 4 (NW, NE, SW, SE).
+3. The NE child is MG Road, still crowded, so it splits again. The quiet children stay as they are.
+4. A search walks down from the top, visiting only squares that touch the search circle.
+5. When drivers move a lot, squares keep splitting and merging, which is the main cost.
+
 ```mermaid
 flowchart TD
     W["Whole map: too many points"] --> NW["NW: few points, stop"]
@@ -187,20 +233,43 @@ A quadtree starts with one square for the whole map. When a square holds more th
 
 - **Query:** walk down the tree, visiting only squares that intersect the search circle.
 - **Strength:** adapts to density, so every leaf holds about the same number of points.
-- **Weakness:** frequent moves (drivers) cause splits and merges; the tree lives in memory and is hard to shard. PostgreSQL ships one as an index: SP-GiST with the `quad_point_ops` operator class (and `kd_point_ops` for a k-d tree).
+- **Weakness:** frequent moves (drivers) cause splits and merges; the tree lives in memory and is hard to shard. PostgreSQL ships one as an index: SP-GiST (PostgreSQL's framework for space-splitting trees) with the `quad_point_ops` operator class (and `kd_point_ops` for a k-d tree).
 
 ### 3.3 S2 and H3
 
 **In plain words:** two ready-made map grids from Google (S2, square-ish cells) and Uber (H3, six-sided cells). Same idea as geohash, just smarter shapes with fewer edge problems.
 
+**Step by step:**
+1. S2 wraps the Earth in a cube, so each of the 6 faces is a flat square.
+2. Each face is cut like a quadtree, and every cell gets a 64-bit number in a path order that keeps neighbours close.
+3. To search a circle, S2 covers it with a few cells of mixed sizes, which become a few number ranges to scan.
+4. H3 instead tiles the Earth with hexagons. Every hexagon has 6 neighbours, all the same distance away.
+5. That makes "the ring of cells around me" clean, which is why Uber uses H3 for pricing and demand maps.
+
 - **S2 (Google):** project the sphere onto the 6 faces of a cube, subdivide each face as a quadtree, and number the cells along a **Hilbert curve**. 31 levels (0 to 30); a cell ID is a 64-bit integer, and level-30 cells are about 1 cm². A **region coverer** approximates a circle or polygon with a handful of cells of mixed levels, which become a few integer **range scans**. Used inside Google and by MongoDB's `2dsphere` index.
-- **H3 (Uber):** an icosahedron-based grid of **hexagons**, 16 resolutions (0 to 15), each resolution's cells about 7 times smaller in area than the one above. Hexagons have one kind of neighbour (all 6 share an edge and are equally far from the centre), which makes "rings" of neighbours (`gridDisk(cell, k)`) and smoothing of demand and supply clean. Each resolution has exactly 12 pentagons, which code must tolerate. Children do not nest exactly inside parents.
+- **H3 (Uber):** an icosahedron-based (a 20-sided solid used as the starting shape) grid of **hexagons**, 16 resolutions (0 to 15), each resolution's cells about 7 times smaller in area than the one above. Hexagons have one kind of neighbour (all 6 share an edge and are equally far from the centre), which makes "rings" of neighbours (`gridDisk(cell, k)`) and smoothing of demand and supply clean. Each resolution has exactly 12 pentagons, which code must tolerate. Children do not nest exactly inside parents.
 
 ### 3.4 R-tree and GiST
 
 **In plain words:** instead of a fixed grid, draw a box around each group of nearby things, then bigger boxes around those boxes. Good for shapes like delivery zones, not just dots.
 
-An **R-tree** groups nearby objects into minimum bounding rectangles, and those rectangles into bigger rectangles, like a B-tree of boxes. It indexes **shapes** (polygons, lines), not just points. PostGIS uses R-tree-style indexing through PostgreSQL's **GiST** framework: `CREATE INDEX ... USING gist (geom)`. The `<->` operator lets GiST return rows in distance order for KNN queries.
+**Step by step:**
+1. Draw the tightest box around each delivery zone (zone A, zone B, ...).
+2. Group nearby boxes, and draw a bigger box around each group.
+3. Keep grouping until one box covers everything. That top box is the root of the tree.
+4. To ask "which zone contains this address?", go down only into boxes that contain the point.
+5. Then do the exact "is it inside the shape?" test on the few zones found.
+
+```mermaid
+flowchart TD
+    R["Root box: whole city"] --> N["North box"]
+    R --> S["South box"]
+    N --> A["Zone A"]
+    N --> B["Zone B"]
+    S --> C["Zone C"]
+```
+
+An **R-tree** groups nearby objects into minimum bounding rectangles, and those rectangles into bigger rectangles, like a B-tree of boxes. It indexes **shapes** (polygons, lines), not just points. PostGIS uses R-tree-style indexing through PostgreSQL's **GiST** framework (a general toolkit for building tree indexes over things that are not simple sorted values): `CREATE INDEX ... USING gist (geom)`. The `<->` operator lets GiST return rows in distance order for KNN queries.
 
 ## 4. Worked example 🟡
 
@@ -606,7 +675,7 @@ Execution Time: 0.311 ms
 
 How to read it: `ST_DWithin` is expanded into an `&&` bounding-box test that the GiST index can answer (the coarse filter), and the exact distance check runs as a `Filter` on the candidates (the exact filter). `Order By` with `<->` makes the index return rows nearest first, so `LIMIT 5` stops early.
 
-A Postgres row per driver works for thousands of updates per second. For 250,000 updates per second, every update is an MVCC row version plus a GiST index entry and WAL, so ride-hailing systems keep **live** locations in memory (Redis or an in-process index sharded by cell) and use PostGIS for stored geometry: zones, geofences, addresses.
+A Postgres row per driver works for thousands of updates per second. For 250,000 updates per second, every update is an MVCC row version (Postgres writes a new copy of the row on each update) plus a GiST index entry and WAL (the database's write-ahead log on disk), so ride-hailing systems keep **live** locations in memory (Redis or an in-process index sharded by cell) and use PostGIS for stored geometry: zones, geofences, addresses.
 
 ### How a location update and a search flow through a sharded index
 
@@ -638,7 +707,7 @@ sequenceDiagram
 | S2 | Cube faces + quadtree + Hilbert curve; 64-bit cell IDs | Covering circles and polygons with few cell ranges; global data | More complex library; square-ish cells of varying shape |
 | H3 | Hierarchical hexagons, 16 resolutions | Aggregating supply and demand, surge pricing zones, smoothing over neighbours | Inexact parent-child nesting; 12 pentagons per resolution |
 | R-tree / GiST (PostGIS) | Nested bounding boxes of shapes | Polygons and lines (geofences, delivery zones), SQL joins on geometry | Write cost per update; one database node |
-| k-d tree / BKD tree | Alternate splitting on x and y | Read-mostly point data; Elasticsearch `geo_point` uses BKD trees | Rebuilds or merges on heavy updates |
+| k-d tree / BKD tree (a disk-friendly k-d tree) | Alternate splitting on x and y | Read-mostly point data; Elasticsearch `geo_point` uses BKD trees | Rebuilds or merges on heavy updates |
 
 > [!warning] Interview trap
 > "Same geohash prefix" means "same cell", not "close together", and "close together" does not mean "same prefix". A query that only scans the rider's own cell misses nearby drivers across the edge. Always scan the cell **and its 8 neighbours** (or a ring in H3, or a covering in S2), then filter by true distance.
@@ -655,9 +724,11 @@ flowchart LR
 - **Hotspots follow people.** Cells over an airport or a stadium after a match hold far more drivers and queries than the median cell. Sharding by cell turns them into hot partitions; split dense cells to a finer precision or shard by finer prefixes there. See [[Hot Keys and Hot Partitions]].
 - **Distance is not travel time.** 500 m across a river can be a 6 km drive. The index produces candidates; an ETA or routing service ranks them.
 - **When not to use a spatial index:** a few thousand points (a store locator for 300 branches) fit in one array; scan it. Data that is only ever filtered by city or postcode needs a normal B-tree index on that column.
-- **Spherical vs planar maths.** PostGIS `geometry` in SRID 4326 measures in **degrees**, not metres; use `geography` (or a projected SRID) for metre distances. Redis assumes a sphere, with up to 0.5% error.
+- **Spherical vs planar maths.** PostGIS `geometry` in SRID 4326 (the code for plain GPS latitude/longitude) measures in **degrees**, not metres; use `geography` (or a projected SRID) for metre distances. Redis assumes a sphere, with up to 0.5% error.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** how each index works and how to pick the cell size. **Next comes the senior view**: which real systems use which index, how live-location indexes break (edges, stale drivers, stadium hotspots), and the maths behind the neighbour rule.
 
 - **Real systems:**
 	- Redis GEO (`GEOADD`, `GEOSEARCH`) for live locations in many delivery and ride apps.
@@ -713,6 +784,26 @@ flowchart LR
 - PostGIS: `geography` + GiST, `ST_DWithin` for radius, `<->` for KNN; longitude first everywhere.
 - Redis GEO = sorted set with 52-bit geohash scores; `GEOSEARCH` since 6.2.
 - Live locations (250k updates/s): in memory, sharded by coarse cell; dense cells become hot partitions.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) Why not measure the distance to every driver?
+> With a million drivers that is about 50 ms of CPU per search, far too slow at thousands of searches a second.
+
+> [!question]- (easy) What are the two steps of a proximity query?
+> A coarse filter (read your cell plus neighbours) and an exact filter (true distance on those candidates).
+
+> [!question]- (easy) Why must you also search the 8 neighbouring cells?
+> A point just across the edge sits in another cell even if it is very close.
+
+> [!question]- (medium) Two points share a geohash prefix. Are they close? And the reverse?
+> Yes, they are in the same parent cell. But two close points can have totally different prefixes across an edge.
+
+> [!question]- (medium) How do you pick geohash precision for a 500 m search?
+> Pick the precision whose smallest cell side is at least 500 m: precision 6 (about 1.2 km × 0.6 km).
+
+> [!question]- (medium) Why keep live driver locations in memory, not in PostGIS?
+> 250,000 updates a second is too many disk writes (row version, index entry, log) for one database; memory handles it.
 
 ## Links
 

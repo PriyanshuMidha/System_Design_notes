@@ -32,6 +32,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (TTLs, invalidation and the stale-set race), 4 (the Go code), 5 and 6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Caching Fundamentals]]: a cache keeps a copy of database data, and a copy can go stale when the real data changes.
+> - [[Caching Patterns]]: in cache-aside your code fills the cache on a miss, and on a write it updates the database, then deletes the key.
+
 **From zero, in 60 seconds** 🟢
 
 A cache keeps a saved copy of data so you do not ask the database every time.
@@ -80,6 +84,9 @@ Deciding when and how to remove that copy is cache invalidation.
 | Commit | The moment a DB write becomes permanent | `COMMIT;` in a transaction |
 | Jitter | A small random amount added to a time | TTL 300 s ± 30 s |
 | CDC (change data capture) | Reading the DB's change log to react to writes | Debezium streaming row updates |
+| Lease token | A ticket the cache gives one reader on a miss; only that ticket may fill the key | Token 41 for `product:7` |
+| Row version | A number on a row that goes up by 1 on every update | Version 4 → 5 after a price change |
+| Read replica | A copy of the database that only answers reads and may lag a little | A replica 200 ms behind the primary |
 
 **Picture it**
 
@@ -114,6 +121,13 @@ Two separate problems hide in that story:
 - **Policy:** was 30 seconds of staleness acceptable for *this* screen right after *this* user's write? (Probably not for the user who just paid; fine for everyone else.)
 - **Mechanism:** even if the payment handler deletes the cache key, can the old summary come back? Yes, through the race in section 3.
 
+### Real-life example: changing your name on WhatsApp 🟢
+
+You change your WhatsApp display name, and for a short while some friends still see the old one.
+Their app, or a server between you and them, is showing a saved copy made before your change.
+The copy goes away either when a "name changed" signal reaches it (invalidation) or when its timer runs out (TTL).
+For a name, a few seconds of the old value is harmless. For a payment status it would not be, which is why each screen needs its own freshness rule.
+
 ## 2. Mental model 🟢
 
 A cached value is a **photograph** of the database. The TTL is the **date stamp** after which you throw the photo away. Invalidation is **someone shouting "that photo is old"** when the scene changes.
@@ -131,11 +145,28 @@ flowchart TD
     C --> B["both:<br/>fixed fast, timer catches misses"]
 ```
 
+## Common beginner mistakes 🟢
+
+- **Deleting the cache key before writing the database** → a reader can refill the old value before your write lands, and it then lives for a full TTL → commit first, then delete.
+- **Refreshing a value with a plain `SET`** → Redis quietly removes the timer, so the key never expires → always pass `EX`/`PX`, or `KEEPTTL`.
+- **Relying only on deletes, with no TTL** → one lost delete leaves wrong data up forever → keep a TTL on every cache key as the safety net.
+- **Giving every key the same TTL** → keys written together all expire together and hit the database at once → add a small random jitter, about ±10%.
+- **Expecting memory pressure to clean up stale data** → eviction removes keys when memory is full, not when they are wrong → invalidate on change and use TTLs.
+
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that a cached copy goes stale, and that timers and deletes are the two ways to clear it. **Next we open the box**: how to pick how stale each screen may be, how Redis timers really behave, the ways to invalidate, and the sneaky race that can put an old value back.
 
 ### Pick a freshness model per feature
 
 **In plain words:** decide per screen how old the data may be. A bank balance after you pay must be fresh; a "top products" list can be a minute old.
+
+**Step by step:**
+1. List the screens that read cached data: say the payment confirmation, the dashboard and the client list.
+2. For each one ask: "if this shows data 30 seconds old, does anyone get hurt?"
+3. Payment confirmation: yes, the user may pay twice. Mark it **strong**: do not cache it.
+4. Dashboard: a little old is fine, but the user who just paid should see their payment. Mark it **bounded** (30 s) plus **read-your-writes** for that user.
+5. Only now pick mechanisms (TTL, deletes, versions) to meet each promise.
 
 | Model | Meaning | InvoiceOps example | How to get it |
 | --- | --- | --- | --- |
@@ -149,6 +180,13 @@ State the model before choosing a mechanism. The general theory is in [[Consiste
 ### TTLs in Redis (measured on Redis 8.2)
 
 **In plain words:** how Redis timers really behave, including the trap where a plain `SET` quietly removes the timer and the key lives forever.
+
+**Step by step:**
+1. `SET a 1 EX 100` saves key `a` with a 100-second timer. `TTL a` shows 100.
+2. Later the code runs `SET a 2` with no `EX`. The value changes, and the timer is silently removed.
+3. `TTL a` now shows -1, which means "exists, never expires". The cache entry has become permanent.
+4. `SET b 3 KEEPTTL` is the safe way to change a value and keep its old timer.
+5. `TTL` on a key that does not exist returns -2.
 
 ```text
 127.0.0.1:6391> SET a 1 EX 100
@@ -176,11 +214,17 @@ The first trap is real: code that refreshes a value with a plain `SET` turns a c
 - **Lazy (passive) expiry:** a key is checked when it is accessed; if it has expired, it is deleted and the read sees a miss.
 - **Active expiry:** a background cycle, run `hz` times per second (default 10), samples keys that have a TTL and deletes expired ones, repeating while many sampled keys turn out to be expired.
 
-Measured on Redis 8.2: 100,000 keys written with `PX 500`. One second later, without any reads, `DBSIZE` was 0 and `INFO stats` showed `expired_keys:100000`. Active expiry had removed them all. Expired keys are never returned to readers either way; the mechanisms only differ in when the memory is freed.
+Measured on Redis 8.2: 100,000 keys written with `PX 500`. One second later, without any reads, `DBSIZE` (the number of keys in the database) was 0 and `INFO stats` showed `expired_keys:100000`. Active expiry had removed them all. Expired keys are never returned to readers either way; the mechanisms only differ in when the memory is freed.
 
 ### Choosing a TTL and adding jitter
 
 **In plain words:** the timer is the longest a user can see old data. Shorter means fresher but more database work; add a little randomness so keys do not all expire together.
+
+**Step by step:**
+1. The dashboard may be up to 30 seconds old, so start with a TTL of 30 s.
+2. The key gets 300 reads a second. With 30 s, that is one database rebuild every 30 s. With 1 s it would be 30 rebuilds in the same time.
+3. A warm-up script writes 10,000 keys in the same second. Without jitter they would all expire in the same second too.
+4. Add a random ±3 s to each TTL. Now those keys expire spread over 6 seconds, so the database sees a gentle trickle instead of a burst.
 
 - Start from the freshness model: the TTL is the **maximum** staleness if every invalidation is lost.
 - Shorter TTLs cost more misses. With 300 reads per second on one key and a 30 s TTL, there is one rebuild per 30 s (9,000 reads per rebuild). With a 1 s TTL there are 30 rebuilds in the same time.
@@ -189,6 +233,13 @@ Measured on Redis 8.2: 100,000 keys written with `PX 500`. One second later, wit
 ### Invalidation strategies
 
 **In plain words:** the different ways to remove a stale copy (delete, overwrite, bump a version, listen to the database log) and what each costs.
+
+**Step by step:**
+1. Simplest: do nothing and let the TTL expire the copy. Staleness = up to the TTL.
+2. Better: the code that saves a change also deletes the matching key, so most changes show up in milliseconds.
+3. When one change affects thousands of keys, put a version number in the key names and bump it once.
+4. When many services write the same tables, let one listener read the database's change log and delete keys for everyone.
+5. Whatever you pick, keep the TTL as the safety net for the delete that gets lost.
 
 | Strategy | How | Staleness bound | Cost |
 | --- | --- | --- | --- |
@@ -202,6 +253,13 @@ Measured on Redis 8.2: 100,000 keys written with `PX 500`. One second later, wit
 ### The stale-set race
 
 **In plain words:** a slow reader fetched old data before your change, and puts it back in the cache just after you deleted it.
+
+**Step by step:**
+1. Reader A asks the cache for product 7: miss. A reads the database and gets price 499.
+2. A pauses for a moment, for example during **GC** (Go's garbage collector briefly pausing the program) or a slow network.
+3. Writer B changes the price to 399, commits, and deletes the cache key. So far, so good.
+4. A wakes up and saves what it read, 499, into the cache.
+5. The cache now says 499 while the database says 399, and it stays wrong until the TTL ends.
 
 Delete-on-write (as in [[Caching Patterns]]) still has a window:
 
@@ -225,6 +283,13 @@ The window needs a miss, then a write, then the slow fill, in that order, so it 
 ### The lease fix
 
 **In plain words:** give the reader a ticket when it misses. Deleting the key cancels the ticket, so a late reader with a cancelled ticket is not allowed to save.
+
+**Step by step:**
+1. Reader A misses on product 7. The cache answers "miss, and here is ticket 41".
+2. A reads 499 from the database.
+3. Writer B commits 399 and deletes the key. The delete also cancels ticket 41.
+4. A tries to save 499 with ticket 41. The cache refuses: that ticket is no longer valid.
+5. The next reader gets a new ticket, reads 399, and saves it. The race is closed.
 
 ```mermaid
 sequenceDiagram
@@ -391,9 +456,9 @@ func Jitter(ttl time.Duration, frac float64, r *rand.Rand) time.Duration {
 }
 ```
 
-Why the version guard works: the version comes from the database row (for example, an `updated_version bigint` column incremented by every `UPDATE`, or the commit LSN from the change stream).
+Why the version guard works: the version comes from the database row (for example, an `updated_version bigint` column incremented by every `UPDATE`, or the commit **LSN** (log sequence number: the position of a change in the database's log, which only grows) from the change stream).
 
-A slow reader carries the version it read. Redis runs a Lua script atomically, so the compare and the write cannot interleave with another client's write. A late fill of version 4 cannot overwrite version 5.
+A slow reader carries the version it read. Redis runs a **Lua script** (a small program sent to Redis and run there) atomically, as one step, so the compare and the write cannot interleave with another client's write. A late fill of version 4 cannot overwrite version 5.
 
 The guard needs the newer value to be **written** (update-on-write or CDC), not just deleted: after a plain `DEL` there is nothing left to compare against.
 
@@ -551,6 +616,13 @@ flowchart LR
 
 **In plain words:** instead of your code remembering to delete, a listener reads the database's own change log and deletes the right cache keys.
 
+**Step by step:**
+1. The app runs `UPDATE products SET price = 399 WHERE id = 7` and commits.
+2. PostgreSQL has already written that change into its own log on disk.
+3. Debezium (a tool that reads database logs) turns the change into an event and puts it on a Kafka topic (a durable message log many readers can follow).
+4. A small invalidator service reads the event "product 7 changed" and deletes `product:7:v1` in Redis.
+5. A rolled-back change never reaches the log, so it never touches the cache.
+
 ```mermaid
 flowchart LR
     APP["App: UPDATE products ... COMMIT"] --> WAL[("PostgreSQL WAL")]
@@ -560,7 +632,7 @@ flowchart LR
     INV -- "DEL product:{id}:v1 or SetIfNewer(lsn)" --> R[("Redis")]
 ```
 
-The database's write-ahead log already records every committed change in commit order. A connector such as Debezium reads it through PostgreSQL logical decoding and publishes change events; a consumer deletes or version-sets the affected keys.
+The database's **write-ahead log** (WAL: the file where every change is recorded before the tables are updated) already records every committed change in commit order. A connector such as Debezium reads it through PostgreSQL **logical decoding** (a feature that turns the WAL into readable row changes) and publishes change events; a consumer deletes or version-sets the affected keys.
 
 No application code path can forget to invalidate, rollbacks never reach the cache (only commits are in the log), and the commit position (LSN) is a natural version.
 
@@ -578,6 +650,16 @@ The cost is a pipeline to run and a lag of typically well under a second to a fe
 | Versioned keys | Yes for the bumped group | A namespace counter | Bulk changes, schema changes |
 | CDC-driven invalidation | Removes "forgot to invalidate"; combine with versions for the race | Debezium or similar, a consumer | Many writers, many services sharing a cache |
 
+### Invalidation vs expiry vs eviction 🟡
+
+All three make a key disappear, so they are easy to mix up.
+
+| | Invalidation | Expiry (TTL) | Eviction |
+| --- | --- | --- | --- |
+| Why the key goes | The data changed | Its timer ran out | Memory is full |
+| Who triggers it | Your code or a CDC listener | Redis, on its own | Redis, on its own |
+| Fixes staleness? | Yes, quickly | Yes, within the TTL | No, by accident only |
+
 ## 6. Trade-offs and when not to use 🟡
 
 - Every invalidation mechanism is an extra moving part. If the feature can live with a 30 s TTL, a TTL alone is often the right answer.
@@ -588,12 +670,14 @@ The cost is a pipeline to run and a lag of typically well under a second to a fe
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how to pick a freshness level, set TTLs with jitter, invalidate on write, and close the stale-set race with leases or version checks. **Next is the advanced part**: how Facebook did it at huge scale, which failures show up in production, and the finer points such as delayed double delete, cross-region caches and atomic check-and-set in Redis.
+
 - **Real systems:** Facebook's memcache leases and its use of MySQL's commit log to broadcast deletes across regions (the "mcsqueal" daemons in the NSDI 2013 paper) are the reference design. Debezium-to-Kafka invalidators are a common open-source version of the same idea.
 - **Failure modes → fixes:**
 	- Plain `SET` drops the TTL and the key lives forever → always write with `EX`/`PX` or `KEEPTTL`; alert on keys without TTL in a cache keyspace (`INFO keyspace` shows `keys` vs `expires`).
 	- Delete fails after commit (Redis timeout) → retry with backoff; rely on the TTL; or move invalidation to CDC.
 	- Invalidation consumer lags or stops → alert on consumer lag; the TTL still bounds staleness.
-	- Read replica lag refills the cache with old data (cache miss reads a replica that has not applied the write yet) → fill the cache from the primary right after writes, or use version guards. See [[Replication]].
+	- **Read replica lag** (the delay before a copy of the database receives a write) refills the cache with old data (cache miss reads a replica that has not applied the write yet) → fill the cache from the primary right after writes, or use version guards. See [[Replication]].
 	- Mass expiry after a warm-up job → jitter TTLs.
 - **What to monitor:** keys without TTL; `expired_keys` rate; invalidation errors and retries; CDC lag; a sampled **staleness check** (read a key from the cache and the database, compare versions, export the mismatch rate).
 
@@ -601,7 +685,7 @@ The cost is a pipeline to run and a lag of typically well under a second to a fe
 
 - **Delayed double delete.** Delete, then delete again about a second later (longer than a typical read-to-fill). Late fills that land in between are removed by the second delete. It shrinks the window but cannot close it: a fill delayed longer than the gap still wins.
 - **Why a version guard needs the newer value written.** After `DEL`, a late fill with version 4 finds no stored version and succeeds. Pair the guard with update-on-write (set version 5 after commit) or with CDC that sets the new version, or keep a short-lived "tombstone with version" instead of deleting.
-- **`WATCH`/`MULTI` vs Lua.** Both give atomic check-and-set in Redis. `WATCH` is optimistic: the `EXEC` fails if the key changed, and the client retries. Lua runs the whole script atomically on the server in one round trip. In Redis Cluster both work only on keys in the same hash slot.
+- **`WATCH`/`MULTI` vs Lua.** Both give atomic check-and-set in Redis. `WATCH` is optimistic: the `EXEC` fails if the key changed, and the client retries. Lua runs the whole script atomically on the server in one round trip. In Redis Cluster both work only on keys in the same **hash slot** (one of the 16,384 buckets Redis Cluster splits keys into).
 - **Invalidation across regions.** Each region usually has its own cache. Deletes must reach every region; driving them from each region's replicated commit log means a region invalidates only after its own database replica has the change, which avoids refilling from a lagging replica.
 - **Leases and stampedes are the same problem from two sides.** Both are "who is allowed to fill this key". The lease answers it for correctness (no stale fill); with a token rate limit it also answers it for load (one filler). Load-side techniques are in [[Cache Failure Modes - Stampede, Avalanche, Penetration, Hot and Big Keys]].
 - **Eviction is not invalidation.** Eviction removes a key because memory is full ([[Cache Eviction Policies - LRU, LFU, TTL]]); invalidation removes it because it is wrong. A system that relies on eviction to clear stale data has no staleness bound.
@@ -635,6 +719,30 @@ The cost is a pipeline to run and a lag of typically well under a second to a fe
 - Commit first, then delete. The stale-set race still exists.
 - Race fixes: leases, version-guarded set (Lua), versioned keys, CDC-driven invalidation.
 - Eviction is not invalidation.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does "stale" mean for a cached value?
+> The cached copy is older than what the database now holds.
+
+> [!question]- Why keep a TTL even when you delete keys on every write?
+> If a delete is ever lost, the TTL still removes the wrong value after a set time.
+
+> [!question]- What does `TTL key` return for a key with no expiry?
+> -1. A missing key returns -2.
+
+🟡 Medium
+
+> [!question]- Should you delete the cache key before or after the database commit?
+> After. Deleting first lets a reader refill the old value before your write lands.
+
+> [!question]- How does a lease stop the stale-set race?
+> The delete cancels the slow reader's ticket, so its late save of the old value is refused.
+
+> [!question]- Why does a version-guarded set need the new value written, not just deleted?
+> After a plain delete there is no stored version to compare, so a late old fill would still succeed.
 
 ## Links 🟢
 

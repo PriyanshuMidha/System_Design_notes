@@ -29,6 +29,11 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add 3 (how it works), 4 (worked example), 5 (variants and comparison) and 6 (trade-offs).
 > - 🔴 **Interview / SDE-3 prep?** Add 7 (in production), 8 (deep dive) and 9 (interview questions). Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Interfaces]]: a subscriber is anything with a `Handle(ctx, Event) error` method.
+> - [[Goroutines and Channels]]: `go f()` runs work alongside other work, and a buffered channel is a small queue between goroutines.
+> - [[sync Primitives and Atomics]]: a `sync.RWMutex` lets many readers in together but only one writer at a time.
+
 **From zero, in 60 seconds** 🟢
 
 When something happens, like "order placed", several other parts may care: email, stock, analytics. With the **observer** pattern, those parts subscribe, and the order code just announces the event without knowing who listens. An **event bus** is a shared hub for this. If the listeners are in other services, you save the event in an **outbox** table in the same database transaction, so it is never lost. Read the plain-words line above each code block first.
@@ -51,6 +56,9 @@ Instead, the order code shouts "order created!" once, and whoever cares is liste
 | Synchronous / async | Wait for handlers vs let them run later | Async: handlers run in other goroutines |
 | Transaction / commit | A DB change that becomes final only at commit | Rollback means the order never existed |
 | Outbox | A table row saved with the order and sent later | Relay reads `outbox` and publishes |
+| Back-pressure | A full queue makes the sender wait instead of piling up work | The publisher waits for buffer room |
+| Idempotent consumer | A handler that ignores an event it has already processed | Analytics counts order 42 once, even if delivered twice |
+| At-least-once | Every event arrives, but some may arrive twice | The outbox relay retries after a crash |
 
 **Picture it**
 
@@ -85,9 +93,13 @@ With an event bus, `CreateOrder` publishes one `order.created` event. Email, SMS
 
 The obvious first version, a plain map from topic to handlers with `Subscribe` and `Publish`, has three bugs, all fixed below:
 
-- **An unguarded handler map.** `Subscribe` running during `Publish` is a data race, and two concurrent `Subscribe` calls can crash the process with `fatal error: concurrent map writes`.
+- **An unguarded handler map.** `Subscribe` running during `Publish` is a data race (two goroutines touching the same map with no lock), and two concurrent `Subscribe` calls can crash the process with `fatal error: concurrent map writes`.
 - **`Publish` returns on the first error.** When SMS fails, analytics never hears about the order.
 - **No unsubscribe, no async delivery.** A handler can never be removed, and one slow handler slows every publisher.
+
+### Real-life example 🟢
+
+Picture placing an order on Swiggy. A moment later you get a push notification, an SMS, and an email receipt, and the restaurant's tablet lights up. The code that saved your order did not call each of those one by one; it announced "order created", and each interested part reacted on its own. If the SMS service is slow or down, your order still goes through. That "announce once, let listeners react" idea is the Observer pattern, and a shared announcement board is an event bus.
 
 ## 2. Mental model 🟢
 
@@ -100,6 +112,8 @@ The roles:
 - **Event:** a fact that already happened, named in the past tense (`order.created`), with an ID so consumers can spot duplicates.
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** the idea: the order code announces an event once, and any number of listeners react without the order code knowing them. **Next we open the box**: how a safe bus publishes without holding its lock, how unsubscribe works, how slow listeners get their own queue, and why events go out only after the database commits.
 
 **In plain words: listeners sign up; the subject calls each one when the event happens.**
 
@@ -144,7 +158,7 @@ classDiagram
 2. Call each handler in subscription order on the publisher's goroutine, through `safeCall`, which turns a panic into an error.
 3. Collect every error and return `errors.Join(errs...)`: `nil` if all succeeded, otherwise all failures, each still matchable with `errors.Is`.
 
-**Subscribing:** `Subscribe` appends a new `*subscription` under the write lock and returns an `unsubscribe` function wrapped in `sync.OnceFunc`, so calling it twice is harmless. Each subscription is a distinct pointer, which matters because a `HandlerFunc` value cannot be compared with `==`.
+**Subscribing:** `Subscribe` appends a new `*subscription` under the write lock and returns an `unsubscribe` function wrapped in `sync.OnceFunc` (a wrapper that makes a function run at most once), so calling it twice is harmless. Each subscription is a distinct pointer, which matters because a `HandlerFunc` value cannot be compared with `==`.
 
 **Asynchronous delivery:** wrap a slow handler in an `AsyncSubscriber`. It is itself a `Handler`, so it plugs into the same bus. `Handle` only puts the event on a buffered channel; one goroutine per subscriber drains it in order.
 
@@ -152,7 +166,7 @@ When the buffer is full, the policy decides: **Block** (the publisher waits: bac
 
 A blocked publisher waits **without holding any lock**, so `Close` can always stop intake: it wakes every blocked sender with `ErrClosed`, drains what was already accepted, and returns once the handler has finished those events.
 
-**Publish after commit.** An in-process bus forgets everything when the process dies, and publishing inside a database transaction announces orders that may roll back. The fix is the transactional outbox: write the event row in the **same transaction** as the order, and let a relay publish committed rows.
+**Publish after commit.** An in-process bus forgets everything when the process dies, and publishing inside a database transaction announces orders that may roll back. The fix is the transactional outbox: write the event row in the **same transaction** as the order, and let a relay (a background worker that reads the outbox table) publish committed rows.
 
 ```mermaid
 sequenceDiagram
@@ -229,6 +243,15 @@ func main() {
 **In plain words: an in-process event bus and an outbox, with tests.**
 
 One `package main`: the bus with a guarded subscription map, error and panic isolation, unsubscribe, an async subscriber with Block and DropNewest policies, and an idempotent-consumer wrapper. It compiles with Go 1.24 and passes `go vet` and `go test -race`, using only the standard library.
+
+**Step by step:**
+
+1. An `Event` has a name and an ID. A `Handler` reacts to it; `HandlerFunc` lets a plain function be a handler.
+2. `Bus` keeps a map from topic to subscribers, guarded by a lock. `Subscribe` adds one and returns a function that removes it (safe to call twice).
+3. `Bus.Publish` copies the subscriber list, unlocks, and calls each handler through `safeCall`, which turns a panic into an error. All errors come back joined.
+4. `AsyncSubscriber` puts events on a buffered channel for its own goroutine. With `Block` the publisher waits for room; with `DropNewest` the event is dropped and counted. `Close` stops it cleanly.
+5. `Idempotent` wraps a handler so the same event ID runs only once.
+6. `main` subscribes an email handler, a failing SMS handler and an async analytics handler to `order.created`, publishes the same event twice, and shows that analytics counted it only once.
 
 ```go
 // Command events shows an in-process event bus (the Observer pattern):
@@ -703,7 +726,15 @@ UPDATE outbox SET published_at = now() WHERE id = ANY ($1);
 COMMIT;
 ```
 
-The row locks taken by `FOR UPDATE SKIP LOCKED` last only until the transaction ends, so the claim, the publishing and the `UPDATE` must share one transaction; in autocommit mode another relay could claim the same rows at once. `$1` is the array of ids whose `Publish` returned `nil`; the rest stay unpublished and are retried.
+The row locks taken by `FOR UPDATE SKIP LOCKED` (lock these rows, and skip rows another relay already locked) last only until the transaction ends, so the claim, the publishing and the `UPDATE` must share one transaction; in autocommit mode (each statement saved on its own) another relay could claim the same rows at once. `$1` is the array of ids whose `Publish` returned `nil`; the rest stay unpublished and are retried.
+
+## Common beginner mistakes 🟢
+
+- **Mistake:** stopping at the first handler that fails. → **Why it's wrong:** when SMS fails, analytics and email never hear about the order. → **Do this instead:** call every handler and join the errors, as `Bus.Publish` does with `errors.Join`.
+- **Mistake:** calling handlers while holding the bus lock. → **Why it's wrong:** a handler that calls `Subscribe` or its unsubscribe function freezes the program (a deadlock). → **Do this instead:** copy the list under the lock, unlock, then call, as `Publish` does with `slices.Clone`.
+- **Mistake:** letting one handler's panic crash the publisher. → **Why it's wrong:** a bug in analytics code would fail the whole order. → **Do this instead:** wrap each call with `recover`, as `safeCall` does.
+- **Mistake:** running a slow handler on the publisher's goroutine. → **Why it's wrong:** every order waits for the slowest listener. → **Do this instead:** give slow listeners their own queue and goroutine, like `AsyncSubscriber`, and choose `Block` or `DropNewest` when the queue is full.
+- **Mistake:** assuming each event arrives exactly once. → **Why it's wrong:** retries and queues can deliver the same event twice, so a user gets two emails. → **Do this instead:** wrap the handler with `Idempotent`, which skips an event ID it has already handled.
 
 ## 5. Variants and comparison 🟡
 
@@ -712,8 +743,8 @@ The row locks taken by `FOR UPDATE SKIP LOCKED` last only until the transaction 
 | Synchronous (this bus's `Publish`) | Handlers run one after another on the publisher's goroutine | Subscription order, publish order | Handlers are fast and the caller should see their errors | The publisher waits for the slowest handler |
 | Goroutine per handler per event | `go h.Handle(ctx, e)` for each | None | Rarely; quick fire-and-forget | Unbounded goroutines, no back-pressure, errors lost |
 | Buffered channel per subscriber (`AsyncSubscriber`) | One queue and one worker per subscriber | Per subscriber, in publish order | A handler is slow or calls the network | A policy for full buffers; events in the buffer are lost on crash |
-| Outbox + relay | Event row committed with the data; a relay publishes it | Per relay, by `created_at` | The event must not be lost or announced before commit | Extra table, polling or CDC, at-least-once delivery |
-| Message broker (Kafka, Redis Streams) | Events leave the process | Per partition or stream | Other services subscribe | Operations, schemas, consumer groups |
+| Outbox + relay | Event row committed with the data; a relay publishes it | Per relay, by `created_at` | The event must not be lost or announced before commit | Extra table, polling or CDC (change data capture: reading the database's change log), at-least-once delivery |
+| Message broker (a separate server that stores and delivers messages: Kafka, Redis Streams) | Events leave the process | Per partition or stream | Other services subscribe | Operations, schemas, consumer groups |
 
 **Slow-subscriber policies:**
 
@@ -745,6 +776,8 @@ The row locks taken by `FOR UPDATE SKIP LOCKED` last only until the transaction 
 - **Leaking subscribers.** A request-scoped object that subscribes and never unsubscribes stays reachable from the bus forever, along with everything it references. Call `unsubscribe` with `defer`, or tie it to a context with `context.AfterFunc`.
 - **Goroutine per event.** It looks asynchronous and free, but it has no ordering, no limit and no place for errors to go.
 
+> 🟡 → 🔴 **You now know** how to build a safe in-process bus with async subscribers, test it under the race detector, and pair it with an outbox. **Next comes the production view**: observers in Go's own library, the crashes and lost events seen in real services, and exact guarantees about order, snapshots and shutdown.
+
 ## 7. In production 🔴
 
 - **Real systems:**
@@ -762,9 +795,9 @@ The row locks taken by `FOR UPDATE SKIP LOCKED` last only until the transaction 
 
 ## 8. Deep dive 🔴
 
-- **Why copy the slice, not just read it.** `slices.DeleteFunc` shifts elements inside the same backing array (and, since Go 1.22, zeroes the tail). If `Publish` ranged over the shared slice after unlocking, an unsubscribe could rewrite it mid-loop. `slices.Clone` under the read lock gives `Publish` a private snapshot. The cost is one small allocation per publish; copy-on-write (build a new slice on every subscribe or unsubscribe and swap it) moves that cost to the rare writes.
+- **Why copy the slice, not just read it.** `slices.DeleteFunc` shifts elements inside the same backing array (the hidden array a slice points into) (and, since Go 1.22, zeroes the tail). If `Publish` ranged over the shared slice after unlocking, an unsubscribe could rewrite it mid-loop. `slices.Clone` under the read lock gives `Publish` a private snapshot. The cost is one small allocation per publish; copy-on-write (build a new slice on every subscribe or unsubscribe and swap it) moves that cost to the rare writes.
 - **Snapshot semantics.** A handler that unsubscribes during a publish still receives the event in flight, because the snapshot was taken before. A handler subscribed during a publish receives only later events. State this guarantee; tests rely on it.
-- **Ordering guarantees.** The synchronous bus gives subscription order per event and publish order per publishing goroutine. Two goroutines publishing at once have no defined order between their events. `AsyncSubscriber` keeps publish order per subscriber because one goroutine drains one FIFO channel. There is no order across subscribers.
+- **Ordering guarantees.** The synchronous bus gives subscription order per event and publish order per publishing goroutine. Two goroutines publishing at once have no defined order between their events. `AsyncSubscriber` keeps publish order per subscriber because one goroutine drains one FIFO (first in, first out) channel. There is no order across subscribers.
 - **Close without a panic, and without a hang.** Sending on a closed channel panics, so `Close` must never close `ch` under a sender. The tempting fix, holding a read lock for the whole send and taking the write lock to close, hangs: a Block-policy sender waiting for room keeps the read lock, `Close` waits for the write lock forever if the handler is stuck and the sender's context never ends, and because Go's `RWMutex` makes new readers queue behind a waiting writer, every new `Handle` blocks too. Instead, `Handle` holds the read lock only to check `closed` and register itself in a `sync.WaitGroup`, then sends with `select` on `ch`, a `stopping` channel and `ctx.Done()`. `Close` sets `closed` under the write lock (so no new sender can register), closes `stopping` (every blocked sender returns `ErrClosed`), waits for the registered senders, and only then closes `ch`. An event that wins the race into the buffer just before `stopping` fires is still handled, because the worker drains `ch` until it is closed. `Close` itself still waits for the worker to finish the accepted events; a handler that never returns needs its own timeout.
 - **Idempotency belongs to the consumer.** The outbox guarantees at-least-once delivery, not exactly-once. The `Idempotent` wrapper keeps the seen set in memory; in production it is a `processed_events` table with a unique key, written in the same transaction as the handler's side effect. See [[Idempotency and Idempotency Keys]].
 - **Typed events.** Topics as strings are flexible but unchecked. A generic `Bus[T any]` per event type catches a handler of the wrong event type at compile time. A `switch e := ev.(type)` over event structs is the weaker option: it replaces string topics with types, but a mismatch shows up only at run time. Generics are covered in [[Generics and Iterators]].
@@ -801,6 +834,26 @@ The row locks taken by `FOR UPDATE SKIP LOCKED` last only until the transaction 
 - Slow handlers: buffered channel per subscriber + policy (block, drop newest, drop oldest) + drop counter; a blocked send selects on the channel, `ctx.Done()` and a stop channel, outside any lock.
 - Order: per subscriber at best; never across goroutines or subscribers.
 - Publish after commit through the transactional outbox; consumers de-duplicate on event ID.
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What does the publisher know about its subscribers?
+> Nothing beyond the topic: it announces `order.created` and the bus calls whoever subscribed.
+
+> [!question]- 🟢 Why should one failing handler not stop the others?
+> The SMS gateway being down must not stop email and analytics from hearing about the order; call all and join the errors.
+
+> [!question]- 🟢 Why are events named in the past tense, like `order.created`?
+> They describe a fact that already happened, not a request to do something.
+
+> [!question]- 🟡 Why does `Publish` copy the handler slice and release the lock before calling handlers?
+> So a handler can subscribe or unsubscribe without deadlocking, and a slow handler never blocks `Subscribe`.
+
+> [!question]- 🟡 Why publish through an outbox instead of straight from inside the transaction?
+> Listeners could act on an order that later rolls back, and an in-process bus loses events if the process crashes.
+
+> [!question]- 🟡 The outbox delivers an event twice. How do consumers stay correct?
+> They are idempotent: they remember processed event IDs and skip repeats.
 
 ## Links 🟢
 

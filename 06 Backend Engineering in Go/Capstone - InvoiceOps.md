@@ -41,7 +41,7 @@ flowchart LR
 
 A client calls the API over REST (or gRPC internally); every write that changes money state goes into Postgres and an outbox row in the *same* transaction; a worker drains the outbox to push WebSocket updates and send reminders; Redis only ever caches what Postgres already committed, never the source of truth.
 
-If you read nothing else: **the invoice is the aggregate, the outbox is the only way anything leaves that aggregate's transaction, and workspace_id is non-negotiable on every row.**
+If you read nothing else: **the invoice is the aggregate** (the one main record that owns its line items and payments, and is always changed as a whole), **the outbox is the only way anything leaves that aggregate's transaction, and workspace_id is non-negotiable on every row.**
 
 ## Start here: the basics 🟢
 
@@ -49,6 +49,12 @@ If you read nothing else: **the invoice is the aggregate, the outbox is the only
 > - 🟢 **New to this?** Read "From zero" below, then sections 1, 2 and the cheat sheet (10). Stop there, that is a full first pass.
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
+
+> [!note] Before this note
+> - [[Backend Request Lifecycle and Layering]]: a request goes router → middleware → handler → service → repository, and each layer has one job.
+> - [[Service Project Layout and Wiring]]: code lives in `cmd/` (programs) and `internal/` (private packages), and `main` builds every piece and passes it in.
+> - [[Database Access (database-sql, pgx, sqlc)]]: how Go opens a pool of database connections and runs SQL queries safely.
+> - [[Transactions and the Repository Pattern]]: several writes can be grouped so they all succeed or all fail, behind a repository interface.
 
 **From zero, in 60 seconds** 🟢
 
@@ -91,6 +97,12 @@ InvoiceOps is that app, and every note in this folder builds one part of it.
 | Minor units | Money as whole smallest units, not decimals | 1,500.00 INR stored as `150000` |
 | Transaction | Group of database writes that all succeed or all fail | Invoice update plus outbox row together |
 
+| Aggregate | The main record that owns related rows and is changed as one unit | an invoice with its line items |
+| Row-level security (RLS) | A Postgres rule that hides rows from other tenants, even if a query forgets the filter | policy `workspace_id = current workspace` |
+| Basis points | Hundredths of a percent, kept as whole numbers | 1800 = 18% GST |
+| Terminal state | A state with no moves out of it | `paid`, `void`, `cancelled`, `refunded` |
+| HMAC signature | A code made from the body and a shared secret, proving who sent it | provider's signature header on a webhook |
+
 **Picture it**
 
 ```mermaid
@@ -126,23 +138,38 @@ InvoiceOps is the one system every `06` note writes code against. Concretely: a 
 
 That one paragraph already touches nine of the `06` notes.
 
+### A real-life example 🟢
+
+Think of how Zoho Invoice or the Razorpay dashboard works for a small shop. The shop owner creates an invoice and sends a payment link. The customer pays by UPI; Razorpay then calls the shop's app with a "payment captured" webhook, sometimes more than once. The app marks the invoice paid exactly once, updates the dashboard total, and stops the reminder emails. InvoiceOps is a small copy of exactly this product.
+
 ## 2. Mental model 🟢
 
-Think of InvoiceOps as **one ledger with three doors in**: the REST API (a human or a frontend), the payment webhook (the outside world telling you something happened), and the scheduler (time itself telling you something happened — a due date passed). All three doors write through the same rule: **one database transaction updates the invoice and appends exactly one outbox row**, and nothing downstream (a WebSocket push, an email, a metric) is allowed to be the thing that decides whether the money state changed.
+Think of InvoiceOps as **one ledger** (a running record of money events) **with three doors in**: the REST API (a human or a frontend), the payment webhook (the outside world telling you something happened), and the scheduler (time itself telling you something happened — a due date passed). All three doors write through the same rule: **one database transaction updates the invoice and appends exactly one outbox row**, and nothing downstream (a WebSocket push, an email, a metric) is allowed to be the thing that decides whether the money state changed.
 
 If the outbox write commits, the event *will* eventually be delivered, even across a crash; if it doesn't commit, nothing happened, full stop.
 
 ## 3. How it works 🟡
 
+🟢 → 🟡 You now know what InvoiceOps is: invoices that move through fixed states, payments that arrive by webhook, and an outbox that carries news out of each transaction. Next we open the box: what is in scope, the tables, the tenancy and money rules, the state machine, and the payment flow step by step.
+
 ### 3.1 Scope and non-goals
 
 **In scope (MVP):** workspaces, members, clients, invoices with line items, a payment webhook (one provider, Razorpay-shaped), reminders, a dashboard, REST + OpenAPI, one internal gRPC call, one WebSocket stream, auth with workspace-scoped RBAC, Docker, tests.
 
-**Explicit non-goals:** multi-currency conversion (store the invoice's currency, don't convert it), multiple payment providers (the webhook handler is written so a second provider is "one more handler, same core", but only one ships), a public GraphQL API (the capstone marks it optional; see [[REST and HTTP API Design]] for why REST is the default here), partial refunds split across multiple payments (a refund voids the whole payment in this scope).
+**Explicit non-goals:** multi-currency conversion (store the invoice's currency, don't convert it), multiple payment providers (the webhook handler is written so a second provider is "one more handler, same core", but only one ships), a public GraphQL API (a different style of API where the client writes a query for exactly the fields it wants; the capstone marks it optional; see [[REST and HTTP API Design]] for why REST is the default here), partial refunds split across multiple payments (a refund voids the whole payment in this scope).
 
 ### 3.2 Data model (ERD)
 
 **In plain words:** the handful of tables and how they point at each other — every workspace owns clients, invoices and payments.
+
+**Step by step:**
+1. A `workspace` is one customer company, for example "Asha Design Studio".
+2. It has `members` (people who log in) and `clients` (the people it bills).
+3. Each `invoice` belongs to one client and has `line_items`, like "Logo design, ₹10,000".
+4. Each `payment` row records money received for one invoice.
+5. `webhook_events`, `outbox`, `jobs` and `idempotency_keys` are helper tables for safe retries and background work.
+
+The ERD (entity-relationship diagram: boxes are tables, lines show which table points at which):
 
 ```mermaid
 erDiagram
@@ -239,11 +266,24 @@ Every table except `workspaces` itself carries `workspace_id` (directly, or via 
 
 ### 3.3 Tenancy
 
+**Step by step:**
+1. Asha logs in; her token says `workspace_id = ws_1`.
+2. She asks for `GET /invoices/inv_42`.
+3. The repository runs `WHERE workspace_id = 'ws_1' AND id = 'inv_42'`; the workspace comes from her token, not from the URL.
+4. If `inv_42` belongs to `ws_2`, no row is found and she gets 404.
+5. Optionally, row-level security in Postgres blocks the row again, in case a query forgot step 3.
+
 - Every query that touches a tenant-owned table includes `WHERE workspace_id = $1`, where `$1` comes from the authenticated session, never from a path parameter alone (a path parameter says which invoice; the session says which workspace is allowed to ask).
 - Composite indexes lead with `workspace_id`: `(workspace_id, status)`, `(workspace_id, due_date)`, `(workspace_id, client_id)`. A query that filters on workspace plus one more column should never do a full-table scan.
-- Optional second layer: Postgres **row-level security** (`CREATE POLICY ... USING (workspace_id = current_setting('app.workspace_id')::uuid)`) set per-connection at the start of each request. This is defense in depth for the day a repository method forgets the `WHERE` clause — RLS still blocks the cross-tenant read. It is not a substitute for the application-level filter, because RLS alone gives you no helpful 403, only an empty result set.
+- Optional second layer: Postgres **row-level security** (`CREATE POLICY ... USING (workspace_id = current_setting('app.workspace_id')::uuid)`) set per-connection at the start of each request. This is defense in depth (a second safety layer behind the first one) for the day a repository method forgets the `WHERE` clause — RLS still blocks the cross-tenant read. It is not a substitute for the application-level filter, because RLS alone gives you no helpful 403, only an empty result set.
 
 ### 3.4 Money rules
+
+**Step by step:**
+1. ₹1,500.00 is stored as `150000` paise plus `currency = "INR"`.
+2. A line item of `100000` paise with 18% GST (`1800` basis points) adds tax `18000`.
+3. If tax comes out to a half paisa, it rounds up.
+4. `amount_due` = all line items plus tax; `amount_paid` = sum of payments. Never use `float64` for any of these.
 
 - Amounts are `int64` minor units (paise for INR, cents for USD) plus a `currency` column; see the `Money` type in the worked example. An invoice's currency never changes after creation — converting currency mid-invoice is out of scope (3.1).
 - Tax per line item uses a rate in basis points (1800 = 18% GST) and rounds half up to the nearest minor unit, because that is how GST/VAT invoices round in practice; the exact function is in the worked example and its test table.
@@ -252,6 +292,13 @@ Every table except `workspaces` itself carries `workspace_id` (directly, or via 
 ### 3.5 Invoice state machine
 
 **In plain words:** an invoice is only ever in one state, and only certain moves are legal — the code refuses every other move.
+
+**Step by step:**
+1. A new invoice starts as `draft`. Sending it moves it to `sent`.
+2. A payment of ₹500 on a ₹1,500 invoice moves `sent` to `partially_paid`.
+3. Another ₹1,000 makes paid ≥ due, so it moves to `paid`.
+4. If the due date passes before full payment, the scheduler moves it to `overdue`; a payment can still move it on.
+5. `paid`, `void`, `cancelled` and `refunded` are terminal: any other event there is refused with an error.
 
 ```mermaid
 stateDiagram-v2
@@ -279,6 +326,13 @@ The exact guarded transition function, tested against every arrow above (includi
 ### 3.6 Payment webhook flow
 
 **In plain words:** the provider tells us "this invoice got paid"; we must record it exactly once even if they tell us three times.
+
+**Step by step:**
+1. Razorpay sends `POST /payments/webhooks/razorpay` with a body and a signature header.
+2. The API recomputes the HMAC signature with the shared secret. Wrong → 400, ignore.
+3. In one transaction, insert `(provider, event_id)` into `webhook_events`. If it is already there, this is a repeat: commit, answer 200, change nothing.
+4. If new: add the amount to the invoice, update its status, and insert an outbox row "payment received", then commit and answer 200.
+5. Later, the outbox worker sends the update to the dashboard and marks the outbox row as sent.
 
 ```mermaid
 sequenceDiagram
@@ -313,9 +367,15 @@ sequenceDiagram
 
 This is the same signature-then-dedupe-then-transaction-then-outbox shape that [[Receiving Webhooks Idempotently]] derives in general; InvoiceOps is where it gets a concrete invoice, a concrete `webhook_events` unique key, and a concrete outbox row shape.
 
-A separate **reconciliation job** (a [[Scheduled Jobs]] task) re-pulls the provider's payment list for any invoice last-updated more than N minutes ago with no matching webhook, for the case where the webhook itself never arrives — polling as the backstop for push.
+A separate **reconciliation job** (a check that compares our records with the provider's list and fixes any gaps) (a [[Scheduled Jobs]] task) re-pulls the provider's payment list for any invoice last-updated more than N minutes ago with no matching webhook, for the case where the webhook itself never arrives — polling as the backstop for push.
 
 ### 3.7 Component view
+
+**Step by step:**
+1. `cmd/api` runs the HTTP handlers, the internal gRPC server and the webhook handler.
+2. `cmd/worker` runs the outbox worker, the reminder worker and the overdue scanner.
+3. Both call the same service in `internal/invoice`, which calls a repository interface.
+4. The real repository talks to Postgres, Redis and object storage; the service never imports them directly.
 
 ```mermaid
 flowchart TB
@@ -341,13 +401,20 @@ Nothing in `internal/invoice` imports `net/http`, `database/sql` concrete types,
 
 ### 3.8 Idempotent writes, reminders and the dashboard cache
 
+**Step by step:**
+1. A client creates an invoice with `Idempotency-Key: k1`. The key and the reply are saved in the same transaction as the invoice; a retry with `k1` gets the saved reply.
+2. Sending an invoice also inserts a `reminder` job with `run_at` = 3 days before the due date. Workers claim due jobs with `SKIP LOCKED`, so only one sends each reminder.
+3. The dashboard reads totals from Redis. When a payment lands, the outbox worker deletes that workspace's Redis key, so the next read rebuilds fresh totals.
+
 - **`POST /invoices` idempotency.** A client retry after a timed-out request must not create two invoices. The client sends an `Idempotency-Key` header; the handler does `INSERT INTO idempotency_keys(workspace_id, key, response_body) ... ON CONFLICT (workspace_id, key) DO NOTHING` in the same transaction as the invoice insert, and on a conflict replays the stored `response_body` instead of creating a second invoice. This is the same unique-key-inside-one-transaction shape as the webhook's `webhook_events` table in 3.6, applied to a client-initiated write instead of a provider-initiated one.
 - **Reminders via scheduler + `SKIP LOCKED` workers.** A `jobs` row of kind `reminder` is inserted with `run_at` set to some offset before `due_date`. A worker polls `SELECT ... FROM jobs WHERE run_at <= now() AND locked_at IS NULL FOR UPDATE SKIP LOCKED LIMIT 20`, which lets N worker replicas share the queue with no double-send: a row another replica already locked is invisible to this `SELECT`, not merely slower to reach. See [[Scheduled Jobs]] for the general pattern this reuses.
-- **Dashboard cache invalidated by payment events.** `GET /dashboard/summary` (counts and totals per status) reads through a Redis key keyed by `workspace_id` with a short TTL as a backstop; the outbox worker that handles `invoice.payment_received` (3.6) also issues a `DEL` on that workspace's dashboard key, so a payment is reflected on the next dashboard read rather than waiting out the TTL. Redis is never the write path for money — it only ever caches a read already committed in Postgres. See [[Redis in Go]] for the cache-aside mechanics this relies on.
+- **Dashboard cache invalidated by payment events.** `GET /dashboard/summary` (counts and totals per status) reads through a Redis key (on a cache miss it loads from Postgres and saves the result in Redis) keyed by `workspace_id` with a short TTL (expiry time) as a backstop; the outbox worker that handles `invoice.payment_received` (3.6) also issues a `DEL` on that workspace's dashboard key, so a payment is reflected on the next dashboard read rather than waiting out the TTL. Redis is never the write path for money — it only ever caches a read already committed in Postgres. See [[Redis in Go]] for the cache-aside mechanics this relies on.
 
 ## 4. Worked example 🟡
 
 The transition table and the webhook's signature-verify-dedupe-apply-outbox shape are small enough to unit test completely without a real Postgres instance (which this environment cannot run), so that is exactly what ships here: a `Money` type, the guarded `Transition` function for every arrow in 3.5, and `HandlePaymentWebhook` tested against an in-memory fake store standing in for the pgx repository.
+
+**What this code does, in plain words:** it defines `Money` (whole paise plus a currency, with add and subtract that refuse to mix currencies) and `TaxMinorUnits`, which works out tax from a rate in basis points and rounds half up.
 
 ```go
 // Package invoiceops holds the small, independently testable pieces of the
@@ -402,6 +469,8 @@ func TaxMinorUnits(amount, rateBps int64) int64 {
 	return q
 }
 ```
+
+**What this code does, in plain words:** it lists every invoice state and event, and `Transition` takes the current invoice facts plus one event and returns the next state, or an error if that move is not allowed.
 
 ```go
 package invoiceops
@@ -521,6 +590,8 @@ func Transition(s Snapshot, e Event) (InvoiceStatus, error) {
 	}
 }
 ```
+
+**What this code does, in plain words:** `VerifySignature` checks the webhook really came from the provider. `HandlePaymentWebhook` then marks the event as seen, applies the payment and writes an outbox row, and does nothing more if the event was already seen.
 
 ```go
 package invoiceops
@@ -649,6 +720,8 @@ func TestTaxMinorUnits(t *testing.T) {
 }
 ```
 
+**What this code does, in plain words:** a table of test cases, one per arrow in the state diagram plus the refused moves, each checking that `Transition` returns the expected state or error.
+
 ```go
 package invoiceops
 
@@ -726,6 +799,8 @@ func TestTransitionTable(t *testing.T) {
 	}
 }
 ```
+
+**What this code does, in plain words:** an in-memory fake store stands in for Postgres. The tests send a signed webhook once, then the same one three times, then one with a bad signature, and check the paid total is right each time.
 
 ```go
 package invoiceops
@@ -868,7 +943,17 @@ Every note that ships code should do it against this project: if a `06` note has
 - **JWT + refresh rotation vs server-side sessions.** InvoiceOps picks JWT + refresh rotation so the internal gRPC call and a future mobile client can reuse the same token without a shared session store; a single server-rendered app with no other client would be simpler with sessions (see [[Authentication and Authorization in Go]] for the full comparison).
 - **Row-level security is optional, not required.** It adds a real operational cost (every connection must set `app.workspace_id`, and a forgotten `SET` fails closed with confusing empty results, not an error) for a benefit that is pure defense-in-depth on top of an already-correct `WHERE` clause. Skip it if the team isn't ready to debug that failure mode.
 
+### Common beginner mistakes 🟢
+
+- Storing money as `float64` → `0.1 + 0.2` is not exactly `0.3`, so totals drift by a paisa → store `int64` minor units plus a currency.
+- Reading `workspace_id` from the URL → a user can type another company's ID → take it from the logged-in session only.
+- Updating the invoice and then sending the dashboard push in a separate step → a crash in between loses the push → write an outbox row in the same transaction.
+- Applying every webhook that arrives → the provider retries, so one payment counts three times → dedupe on `(provider, event_id)` first.
+- Letting any status change to any other → a `void` invoice could become `paid` → route every change through the guarded `Transition` function.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You now have the full plan: tables, rules, state machine, flows and build order. The advanced part covers what breaks in a running system (early webhooks, crashed workers, clock differences), the big design choices you must defend (outbox vs CDC, JWT vs sessions), and the story to tell in an interview.
 
 - **Real systems:** this shape (tenant-scoped ledger + webhook + outbox + worker) matches how billing systems at Stripe-style payment platforms and B2B SaaS invoicing products are built; the specific choice of Postgres-as-queue over a broker is also how small-to-mid-size services commonly start before traffic justifies a broker.
 - **Failure modes → fixes:**
@@ -881,11 +966,13 @@ Every note that ships code should do it against this project: if a `06` note has
 
 ### Why the outbox pattern and not a Kafka/Debezium CDC pipeline for this scope
 
-Change Data Capture (reading Postgres's write-ahead log to emit events) removes the outbox table entirely and guarantees the event reflects exactly what committed, but it adds an operational piece (Debezium + a broker) this capstone's volume does not need yet.
+Change Data Capture (reading Postgres's write-ahead log, its internal diary of every change, to emit events) removes the outbox table entirely and guarantees the event reflects exactly what committed, but it adds an operational piece (Debezium + a broker) this capstone's volume does not need yet.
 
 The polling outbox is strictly simpler to run and test, at the cost of a small polling delay (bounded by the worker's poll interval) instead of near-zero CDC latency. Either is "correct"; the choice here is about scope, not correctness — see [[Transactional Outbox and CDC]] for the full comparison.
 
 ### ADRs
+
+**In plain words:** an ADR (architecture decision record) is a short note that says what was decided, why, and when to look at it again.
 
 - **Postgres-as-queue vs a message broker for reminders/outbox** (decided: Postgres-as-queue). Revisit if job volume grows past what a single Postgres instance's `jobs`/`outbox` tables can poll without adding latency, or if a second service needs to consume the same events.
 - **JWT + refresh rotation vs server-side sessions** (decided: JWT + refresh rotation). Revisit if the only client ever becomes a single server-rendered app with no API consumers, where sessions remove the token-revocation complexity for free.
@@ -897,7 +984,7 @@ The polling outbox is strictly simpler to run and test, at the cost of a small p
 ### Test and load-test plan
 
 - Unit: `Money`, `Transition`, webhook core (shown above) — no I/O, run on every commit.
-- Integration (`testcontainers-go`, see [[Testing Go Services]]): repository tests against a real, disposable Postgres; a round-trip through `MarkProcessed`'s `ON CONFLICT DO NOTHING` against the real unique index, not a mock.
+- Integration (`testcontainers-go`, a library that starts a real Postgres in a throwaway Docker container for the test; see [[Testing Go Services]]): repository tests against a real, disposable Postgres; a round-trip through `MarkProcessed`'s `ON CONFLICT DO NOTHING` against the real unique index, not a mock.
 - Handler tests (`httptest`): REST endpoints against a fake repository.
 - Load test target (an estimate, not measured in this environment): the payment webhook path should sustain 50 requests/second with p99 under 300ms on modest hardware (4 vCPU, Postgres with a 20-connection pool) before the connection pool, not the handler logic, becomes the bottleneck — verify with `wrk` or `ghz` for the gRPC path per [[Testing Go Services]].
 
@@ -941,6 +1028,26 @@ The polling outbox is strictly simpler to run and test, at the cost of a small p
 - The outbox is the only path anything (WebSocket push, email, metric) takes out of that transaction — nothing downstream decides whether the money state changed.
 - Build order: setup → REST core → database/tx → auth/tenancy → async (jobs + webhook) → realtime + advanced APIs → production hardening.
 - ADRs you should be able to defend out loud: Postgres-as-queue vs a broker; JWT+refresh vs sessions.
+
+## Self-check 🟢🟡
+
+> [!question]- Why is money stored as `int64` paise and not `float64` rupees?
+> Floats cannot hold most decimal amounts exactly, so sums drift; whole paise never do.
+
+> [!question]- Which column must every tenant-owned table carry?
+> `workspace_id`, and every query filters on it.
+
+> [!question]- Name the four terminal invoice states.
+> `paid`, `cancelled`, `void` and `refunded`.
+
+> [!question]- How does InvoiceOps make a repeated payment webhook harmless?
+> A unique `(provider, event_id)` row in `webhook_events` is inserted first in the same transaction; a repeat inserts nothing and changes nothing.
+
+> [!question]- Why must the dashboard push go through the outbox and not straight from the handler?
+> The outbox row commits with the invoice change, so the push happens if and only if the money change happened, even across a crash.
+
+> [!question]- Two webhooks for the same invoice arrive at once. What stops both writing `paid` from stale data?
+> The guard runs inside the transaction and the `UPDATE ... WHERE status = $expected` matches zero rows for the second one.
 
 ## Links 🟢
 

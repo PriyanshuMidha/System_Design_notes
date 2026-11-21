@@ -25,6 +25,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code steps in full, then Tests and Running it.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[TCP - Handshake, Reliability, Flow and Congestion Control]]: a connection is set up once and then carries bytes in order.
+> - [[HTTP Fundamentals - Methods, Status Codes, Headers, Cookies]]: a client sends `GET`, a server answers with a status and body.
+> - [[UDP and QUIC]]: only needed for the HTTP/3 remarks; the code itself stays on TCP.
+> - [[HTTP-1.1 vs HTTP-2 vs HTTP-3]] (theory twin): HTTP/1.1 answers one request at a time per connection; HTTP/2 runs many at once on one connection.
+
 **From zero** 🟢: this file is one small Go test that proves the theory note's big claim with a stopwatch. Six slow requests sent over old-style HTTP/1.1 on one connection take about 6x as long as the same six sent over HTTP/2, because HTTP/2 lets them all travel at once. Read the Concept line above each code block first; the code just acts it out.
 
 ## Before the code 🟢
@@ -65,7 +71,11 @@ go test -race -v ./...
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** the experiment: same slow handler, 6 requests, one connection, HTTP/1.1 vs HTTP/2, with a stopwatch. **Next we read the code** in three steps: the timing helper, the two servers and clients, and the checks on the result.
+
 ### Step 0: package and imports
+
+**What this code does, in plain words:** it names the package and lists the standard library pieces the test uses: HTTP client and server, a test server helper, a wait-group for goroutines, and time.
 
 **Concept.** The whole demo lives in one file, one package, with no external dependencies — everything it needs (`net/http`, `net/http/httptest`, `sync`) ships in the Go standard library, which is itself a small piece of evidence for the theory note's claim that HTTP/2 support needed no new application-level API.
 
@@ -202,7 +212,7 @@ func TestH1SingleConnVsH2Multiplexing(t *testing.T) {
 
 | Test | Property it proves | Why it matters |
 | --- | --- | --- |
-| `TestH1SingleConnVsH2Multiplexing` | A single HTTP/2 connection runs 6 concurrent requests in roughly one handler-delay's worth of wall time; a single-connection HTTP/1.1 client runs them in roughly six delays' worth | This is the entire reason HTTP/2 exists — without this gap, multiplexing would be a red herring |
+| `TestH1SingleConnVsH2Multiplexing` | A single HTTP/2 connection runs 6 concurrent requests in roughly one handler-delay's worth of wall time; a single-connection HTTP/1.1 client runs them in roughly six delays' worth | This is the entire reason HTTP/2 exists — without this gap, multiplexing would be a red herring (something that looks important but isn't) |
 
 | Input | Expected output |
 | --- | --- |
@@ -226,11 +236,13 @@ If this test failed, the most likely cause is not a code bug but an environment 
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** how the test is built and what the measured numbers mean. **Next, the advanced part**: why each choice (capped connections, threshold checks, no HTTP/3) was made, the classic Go testing traps, and exercises that change the inputs.
+
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
-| Use `httptest` servers instead of a real TLS cert and public host | Point the test at a real HTTPS endpoint | `httptest` is hermetic and fast (no network, no flaky external dependency) but only proves the claim against Go's own client/server; it says nothing about other languages' HTTP/2 stacks |
+| Use `httptest` servers instead of a real TLS cert and public host | Point the test at a real HTTPS endpoint | `httptest` is hermetic (fully self-contained) and fast (no network, no flaky external dependency) but only proves the claim against Go's own client/server; it says nothing about other languages' HTTP/2 stacks |
 | Cap HTTP/1.1 to one connection via `MaxConnsPerHost: 1` | Let the default transport open several connections and compare *that* to HTTP/2 | The capped version isolates the one-connection comparison the theory note makes; the uncapped version would show a smaller, more confusing gap because Go's default HTTP/1.1 behavior already works around the same limitation by opening more sockets |
-| Assert a threshold (`< n*delay/2`, `≥ n*delay*7/10`) rather than an exact number | Assert against the literal measured milliseconds | Wall-clock timings vary run to run and machine to machine; a threshold proves the *qualitative* claim (multiplexed is much faster) robustly, without the test becoming flaky on a slower CI box |
+| Assert a threshold (`< n*delay/2`, `≥ n*delay*7/10`) rather than an exact number | Assert against the literal measured milliseconds | Wall-clock timings vary run to run and machine to machine; a threshold proves the *qualitative* claim (multiplexed is much faster) robustly, without the test becoming flaky (passing some runs, failing others) on a slower CI box (the shared machine that runs tests on every push) |
 | Standard library only, no QUIC/HTTP-3 test | Add `golang.org/x/net/http3` or `quic-go` and test HTTP/3 too | Keeps this scratch module dependency-free and fast to verify; HTTP/3 behavior is covered conceptually in the theory note's deep dive instead, since Go's standard library doesn't speak QUIC as of 1.24 |
 
 ## Running it 🟡
@@ -344,6 +356,26 @@ Reading it line by line:
 > 	}
 > }
 > ```
+
+## Self-check 🟢🟡
+
+> [!question]- 🟢 What does the test measure?
+> The total time for 6 requests sent at once, over one HTTP/1.1 connection and over one HTTP/2 connection.
+
+> [!question]- 🟢 Roughly how long did each take, and why?
+> About 300 ms for HTTP/1.1 (6 × 50 ms, one after another) and about 60 ms for HTTP/2 (all at once).
+
+> [!question]- 🟢 Which line forces HTTP/1.1 onto a single connection?
+> `&http.Transport{MaxConnsPerHost: 1}`.
+
+> [!question]- 🟡 Why does the test check thresholds instead of exact milliseconds?
+> Timings vary between runs and machines; a threshold proves "much faster" without flaky failures.
+
+> [!question]- 🟡 Why must `t.Fatalf` not be called inside the goroutines?
+> It must run on the test's own goroutine; inside a spawned one it does not stop the test correctly.
+
+> [!question]- 🟡 Why does the HTTP/2 server need `StartTLS()`?
+> HTTP/2 is negotiated through ALPN in the TLS handshake; a plain server can only speak HTTP/1.1.
 
 ## Links
 

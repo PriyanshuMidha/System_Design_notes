@@ -23,6 +23,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Read the Code, Design decisions and Tests sections, then run it yourself.
 > - 🔴 **Interview / SDE-3 prep?** Add the Pitfalls and Exercises sections. Headings are tagged 🟢🟡🔴.
 
+> [!note] Before this note
+> - [[ROM, Flash, Firmware and the Boot Process]]: the theory twin. Know the boot relay (POST → find boot device → bootloader → kernel → init) and that a failed stage stops everything after it.
+> - [[How a Computer Runs a Program]]: background only.
+
 **From zero** 🟢: this file is the hands-on side of [[ROM, Flash, Firmware and the Boot Process]]. It is a small Go model of a boot chain — stages that verify and hand off to the next, like firmware to bootloader to OS. The code is a simulation to make the ideas concrete, not real firmware. Read each step with its notes.
 
 ## Before the code 🟢
@@ -30,6 +34,8 @@ updated: 2026-11-13
 - **Structs** (`Stage`, `Result`): a named bundle of fields, like one row of a boot log.
 - **Function values** (`Run func() error`): a function stored in a field, so each boot stage carries its own "do the work" step.
 - **Errors as values** (`error`, `errors.New`): a stage reports failure by returning a non-nil `error`, not by crashing.
+- **Error wrapping** (`fmt.Errorf("...: %w", err)`): adds context to an error while keeping the original inside, so `errors.Is` can still find it.
+- **POST**: power-on self-test, the firmware's hardware check; here it is just the first stage's name.
 - **Slices** (`[]Stage`): an ordered, growable list; the boot chain is just a slice walked front to back.
 - **Table-style tests** (`testing`, `reflect.DeepEqual`): tests build stages, run `Sequence`, and compare the result to what they expect.
 - **What to run:** `go vet ./boot/... && go test -race ./boot/...` inside the module. No goroutines, interfaces or generics are needed here.
@@ -60,7 +66,11 @@ go test -race ./boot/...
 
 ## Code 🟡
 
+> 🟢 → 🟡 **You now know** what the model is for: proving that boot stages run in order and stop at the first failure. **Next we read the code:** two small types and one loop.
+
 ### Step 1: the `Stage` type
+
+**What this code does, in plain words:** it defines one boot step as a name plus a function that either works or returns an error.
 
 **Concept.** A `Stage` is one link in the boot chain: it has a name (for reporting, like a POST code) and a `Run` function that either succeeds or returns an error. This mirrors real firmware, where POST is "a self-test that either passes or halts with a code," not a value-returning computation — the design deliberately keeps `Run` to a bare `func() error` rather than something richer, because every real boot stage reduces to exactly that binary outcome.
 
@@ -85,6 +95,8 @@ type Stage struct {
 
 ### Step 2: the `Result` type
 
+**What this code does, in plain words:** it records which steps finished, in order, and the name and error of the step that failed, if any.
+
 **Concept.** `Result` is what you'd read off a server's boot log or a BMC's POST-code history: which stages got through, and exactly where things stopped. Keeping `Completed` as a slice (not just a count) preserves the order, which is the detail that actually matters for diagnosis — "failed at bootloader" means something different from "failed at POST."
 
 ```go
@@ -101,6 +113,8 @@ type Result struct {
 2. `FailedAt` and `Err` stay zero-valued (`""`, `nil`) on a clean boot; a caller checks `FailedAt != ""` the same way a boot log is read for the first error entry.
 
 ### Step 3: `Sequence`, the hand-off loop
+
+**What this code does, in plain words:** it runs the steps one by one; the first one that fails stops the loop, and the result says where it stopped.
 
 **Concept.** This is [[ROM, Flash, Firmware and the Boot Process#3 How it works|the boot flowchart]] as code: a plain `for` loop over an ordered slice, returning the instant something fails. The alternative design — collecting every stage's result and returning them all — was rejected deliberately: a real boot never runs the bootloader after POST has failed, so the code shouldn't either.
 
@@ -214,6 +228,8 @@ $ go test -race ./boot/...
 ok  	cs1scratch/boot	0.311s
 ```
 
+> 🟡 → 🔴 **You now know** the code and the two scenarios its tests prove. **Next comes the advanced part:** the small edits that would silently break the "halt on first failure" rule or lose information about what failed.
+
 ## Pitfalls in the code 🔴
 
 - **Forgetting `return r` after a failure.** If the early return were dropped, the loop would keep calling later stages' `Run` even after one failed — silently turning "halt on failure" into "best effort," which is exactly the bug `TestSequenceStopsAtFirstFailure` exists to catch.
@@ -225,6 +241,30 @@ ok  	cs1scratch/boot	0.311s
 1. Add a `Retries int` field to `Stage` so a stage is re-run up to `Retries` times before the whole sequence halts (mirroring a recoverable POST warning). Predict which existing test still passes unchanged.
 2. Change `Sequence` to continue past a failure, collecting every error that occurred, and work out why this would misrepresent a real boot (hint: what should "failed at bootloader" even mean, if the bootloader ran after POST failed?).
 3. Add a `Timeout` per stage and make `Run` get called with a context; predict what `Result` should contain if a stage times out rather than returning an explicit error.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- What does `Sequence` do when a stage returns an error?
+> It stops immediately and records that stage as `FailedAt`; later stages never run.
+
+> [!question]- On a clean boot, what are `FailedAt` and `Err`?
+> Empty string and `nil`.
+
+> [!question]- Why is `Completed` a slice?
+> To keep the order, so you can see exactly how far the boot got.
+
+🟡 Medium
+
+> [!question]- How does the failure test prove the bootloader never ran?
+> The bootloader's `Run` sets a flag; the test checks the flag is still `false`.
+
+> [!question]- Why wrap errors with `%w` instead of `%v`?
+> `%w` keeps the original error reachable by `errors.Is`/`errors.Unwrap`; `%v` turns it into plain text.
+
+> [!question]- Why is there no goroutine in `Sequence`?
+> Real boot stages are strictly one after another; running them in parallel would break the hand-off rule.
 
 ## Links
 

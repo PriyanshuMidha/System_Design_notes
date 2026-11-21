@@ -31,6 +31,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (time budget and steps), 4 (URL shortener in 45 minutes) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 (common mistakes) and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[System Design Fundamentals]]: a design starts from features plus numbers (speed, uptime, load), and is built from standard blocks like load balancer, cache, database and queue.
+> - [[Back-of-the-Envelope Estimation]]: you can turn "100 million a day" into "about 1,200 per second" with quick rounded maths.
+
 **From zero, in 60 seconds** 🟢
 
 In a system design interview you get a vague task like "design a URL shortener" and about 45 minutes.
@@ -73,6 +77,12 @@ A system design interview works the same way.
 | Deep dive | Zooming into one risky part | How short codes avoid collisions |
 | Trade-off | Getting X by giving up Y | Speed over strong consistency |
 | Bottleneck | The part that breaks first under load | The database on the read path |
+| NFR | Non-functional requirement: how well, with a number | "99.99% of redirects work" |
+| QPS | Queries (requests) per second | 116k reads per second |
+| HLD | High-level design: the main boxes and arrows | LB → API → cache → database |
+| Partition key | The field used to decide which machine stores a row | `code` for a short link |
+| Hot set | The small part of the data that gets most of the traffic | the 10 GB of popular links |
+| Cache-aside | App checks the cache, on a miss reads the DB and fills the cache | Redis in front of the links table |
 
 **Picture it**
 
@@ -119,9 +129,35 @@ Think of an architect meeting a client. The architect does not start with the ro
 
 The interviewer is the client and a colleague at the same time: they want to see how you decide, not just the final drawing.
 
+### Real-life example: "Design BookMyShow" 🟢
+
+Say the interviewer asks you to design a movie ticket app like BookMyShow.
+A weak start is "Kafka plus microservices". A strong start is questions: how many users, how many shows, what happens when a big film opens?
+From the answers you learn the hard part: thousands of people trying to grab the same few seats in one minute.
+So you draw a simple design first (browse shows, pick seats, pay), then spend your deep dive on "how do we never sell seat D7 twice?"
+That is the whole framework in one story: questions, numbers, simple design, then the risky part.
+
+## Common beginner mistakes 🟢
+
+- **Drawing tools in minute two** → the basic flow is never designed and you run out of time → spend the first 5 minutes on features and numbers.
+- **Estimating everything** → you burn 10 minutes on numbers that change nothing → estimate only what picks a component (reads per second, storage).
+- **Staying silent while drawing** → the interviewer scores what they can hear → say each decision and the reason out loud.
+- **Picking an easy deep dive** → it shows nothing new → pick the part where the numbers are hardest (seat contention, payment safety).
+- **Skipping failures at the end** → the design looks untested → keep the last 5 minutes for "what breaks, how we notice, how we recover".
+
 ## 3. How it works 🟡
 
+> 🟢 → 🟡 **You now know** the order: questions, numbers, simple design, deep dive. **Next we open the box**: how to split the minutes, what to leave on the board at each step, how the back-and-forth goes, and how to pick the deep dive. Each subsection starts with a plain step-by-step walk.
+
 ### The time budget
+
+**Step by step (45-minute round):**
+1. Minutes 0-5: ask questions, write features, numbers and what is out of scope.
+2. Minutes 5-9: a few quick estimates, each with "so this means ...".
+3. Minutes 9-14: the main things (entities) and the API calls.
+4. Minutes 14-24: a simple design that makes every feature work.
+5. Minutes 24-41: one or two deep dives on the riskiest parts.
+6. Minutes 41-45: failures, monitoring, trade-offs, what you would build next.
 
 ```mermaid
 flowchart LR
@@ -139,6 +175,13 @@ For a 60-minute slot, give the extra time to deep dives. For a 35-40 minute slot
 
 **In plain words:** ten small steps, grouped into six phases. Each phase leaves something on the board, so the interviewer can see your progress.
 
+**Step by step:**
+1. Requirements leave a short list: "shorten a URL, redirect, optional expiry; p99 under 50 ms".
+2. Estimates leave 3-6 numbers: "1,200 writes/s, 116k reads/s".
+3. The interface leaves the API calls and table keys.
+4. The high-level design leaves boxes and arrows that work end to end.
+5. Deep dives, failures and wrap-up leave options, a choice and a reason next to the risky boxes.
+
 | Phase | Steps | What you produce |
 | --- | --- | --- |
 | Requirements | 1. Clarify functional requirements (3-5 core features). 2. Non-functional requirements with numbers. Say what is out of scope. | A short list on the board |
@@ -152,6 +195,13 @@ For a 60-minute slot, give the extra time to deep dives. For a 35-40 minute slot
 ### How the conversation flows
 
 **In plain words:** it is a back-and-forth, not a speech. You propose, the interviewer pushes, you adjust.
+
+**Step by step:**
+1. You ask questions; the interviewer answers or says "you decide".
+2. You read back the scope and numbers: "Does this work for you?"
+3. You walk one request through your simple design.
+4. The interviewer pushes: "What happens at 100 times the traffic?"
+5. You name the riskiest part, give two options, pick one and say why.
 
 ```mermaid
 sequenceDiagram
@@ -176,19 +226,31 @@ Check in at each phase boundary ("Does this scope work for you?"), but do not wa
 
 **In plain words:** go deep where the numbers make life hardest, for example huge read traffic or "never lose a payment". Show two or three ways, then pick one and say why.
 
+**Step by step:**
+1. Look at your numbers. Which one is scariest? Say 231k reads per second.
+2. Find the box that number hits first: the database on the read path.
+3. List 2-3 fixes with their cost: a cache (stale data), replicas (lag), more shards (complexity).
+4. Pick one: "cache-aside in Redis, because the hot set is only 10 GB".
+5. Say what would make you change your mind later.
+
+```mermaid
+flowchart LR
+    N["Scariest number"] --> B["Box it hits first"] --> O["2-3 options + cost"] --> P["Pick one, say why"]
+```
+
 Pick the component where the non-functional requirements are hardest to meet, then present two or three options with their costs.
 
 | Problem | Main lesson | Typical deep dive |
 | --- | --- | --- |
 | [[Case Study - URL Shortener]] | Key generation, redirects, caching | Collision-free short codes; hot links |
-| [[Case Study - Notification System]] | Async jobs, retries, DLQ | Delivery guarantees and deduplication |
-| [[Case Study - Key-Value Store]] | Partitioning, replication, quorums | Consistency vs availability per request |
+| [[Case Study - Notification System]] | Async jobs, retries, DLQ (dead-letter queue: a parking spot for messages that keep failing) | Delivery guarantees and deduplication |
+| [[Case Study - Key-Value Store]] | Partitioning, replication, quorums (a write or read counts once a majority of copies agree) | Consistency vs availability per request |
 | [[Case Study - Search Autocomplete]] | Tries, precomputed top-k | Freshness vs latency of suggestions |
 | [[Case Study - News Feed]] | Fan-out on write vs read | Celebrity users and freshness |
 | [[Case Study - Chat System]] | WebSockets, ordering, presence | Fan-out and offline delivery |
 | [[Case Study - Ticket Booking]] | Contention on a scarce resource | Seat holds without overselling |
 | [[Case Study - Leaderboard and Top-K]] | Sorted sets, approximate counting | Top-k at scale with sharded counters |
-| [[Case Study - Payment System]] | Idempotency, ledgers, reconciliation | Unknown PSP outcomes and duplicate webhooks |
+| [[Case Study - Payment System]] | Idempotency (doing the same request twice has the effect of once), ledgers, reconciliation | Unknown PSP (payment provider, like Razorpay) outcomes and duplicate webhooks |
 | [[Case Study - File Storage and Sync]] | Object storage, metadata, chunking | Large uploads and sync conflicts |
 | [[Case Study - Web Crawler]] | Frontier, politeness, dedup | URL deduplication at billions of pages |
 | [[Case Study - Ride Sharing and Proximity]] | Geospatial indexing, matching | Nearby-driver queries with moving points |
@@ -217,6 +279,8 @@ WRAP  302 vs 301 trade-off, failure of cache, metrics: hit rate, p99, 404 rate
 ### The URL shortener in 45 minutes
 
 **In plain words:** the full framework run once on a real problem, minute by minute.
+
+Two terms used below: **302** is a "temporary redirect" that the browser asks about every time, while **301** is "moved forever", which browsers remember and stop asking. **Base 62** writes a number using 0-9, a-z and A-Z, so 7 characters cover about 3.5 trillion codes.
 
 **Minutes 0-5, requirements.** Functional: create a short link for a long URL; redirect a short code to the long URL; optional expiry. Out of scope: user accounts, analytics dashboards, custom domains. Non-functional: 100 M new links/day, 100 reads per write, p99 redirect under 50 ms, redirects 99.99% available, links never lost, codes not guessable in sequence (a nice-to-have).
 
@@ -286,6 +350,8 @@ As a personal heuristic (not an interviewer's scale), 12 or more of 16 is a soli
 - **Do not chase completeness.** Two deep dives done well beat six components named.
 
 ## 7. In production 🔴
+
+> 🟡 → 🔴 **You now know** the steps and have seen a full 45-minute run. **Next comes the senior view**: how this maps to real design documents, the common ways candidates fail, and what interviewers look for at SDE-3 level.
 
 The interview is a compressed version of real design work, and the same habits show up in design docs:
 
@@ -361,6 +427,26 @@ The interview is a compressed version of real design work, and the same habits s
 - Always cover failure modes, monitoring and the evolution path.
 - SDE-3 signals: drive, quantify, operate, keep it simple.
 - No buzzwords without a requirement behind them.
+
+## Self-check 🟢🟡
+
+> [!question]- (easy) What do you do in the first 5 minutes?
+> Ask questions and write down the features, the numbers (NFRs) and what is out of scope.
+
+> [!question]- (easy) Why draw a simple design before the deep dive?
+> It proves every feature works end to end; the deep dive then fixes scale on top of it.
+
+> [!question]- (easy) What should every box on the board be tied to?
+> A requirement or a number that needs it.
+
+> [!question]- (medium) 100 million new links a day is about how many writes per second?
+> 100,000,000 ÷ 86,400 ≈ 1,200 writes per second.
+
+> [!question]- (medium) Why use 302 instead of 301 for a URL shortener?
+> Browsers remember 301 forever, so you could not change, expire or count clicks on the link.
+
+> [!question]- (medium) How do you pick the deep dive?
+> Take the hardest number, find the box it hits first, give 2-3 options with costs, and pick one with a reason.
 
 ## Links
 

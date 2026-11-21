@@ -30,6 +30,9 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how each construct works) and 4 (worked example).
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Go Toolchain, Tooling and Debugging]]: you can create a file, run it with `go run`, and run tests with `go test`. No other Go knowledge is needed.
+
 **From zero, in 60 seconds** 🟢
 
 A program is just boxes of values plus decisions about what to do next. In Go, every box is a **variable** with a fixed label saying what kind of thing it holds — a number, text, true/false. That label is its **type**, and it never changes.
@@ -72,6 +75,12 @@ That strictness, plus a small set of statements (`if`, `for`, `switch`), is the 
 | Zero value | The value a variable has before you set it | `0`, `""`, `false`, `nil` |
 | Scope | The block where a name is visible | a variable made inside `if {}` is gone after `}` |
 | Loop | Repeating code | `for i := 0; i < 3; i++ {}` |
+| Package | A folder of Go files that share one name; every file starts with `package x` | `package main` |
+| Import | Using another package's code in your file | `import "fmt"` |
+| Shadowing | A new variable with the same name in an inner block hides the outer one | `err :=` inside an `if` |
+| Untyped constant | A constant with no fixed type until you use it somewhere | `const Pi = 3.14159` |
+| Overflow | A number grows past what its type can hold and wraps around | `int8(127) + 1` becomes `-128` |
+| Exported | Visible to other packages because the name starts with a capital letter | `Parse` yes, `parse` no |
 
 **Picture it**
 
@@ -118,11 +127,13 @@ That extra line is not boilerplate — it is the exact point where a malformed `
 
 ## 2. Mental model 🟢
 
-Go's type system is **static and explicit**: a variable's type never changes after declaration, and the compiler never silently reinterprets one type as another. Think of every value as living in a labelled box — moving a value between differently-labelled boxes (`int` to `float64`, `string` to `[]byte`) always needs an explicit relabelling step, spelled as a conversion.
+Go's type system is **static (checked when you compile, not while running) and explicit**: a variable's type never changes after declaration, and the compiler never silently reinterprets one type as another. Think of every value as living in a labelled box — moving a value between differently-labelled boxes (`int` to `float64`, `string` to `[]byte`) always needs an explicit relabelling step, spelled as a conversion.
 
-Control flow is deliberately small: three keywords (`if`, `for`, `switch`) cover everything a C-family programmer reaches for `while`, `do-while`, `for`, `switch-with-fallthrough`, and `goto`-as-labelled-break to do. Fewer keywords means fewer ways the same idea gets written, which is also why `gofmt` can reformat any Go file into one canonical layout.
+Control flow is deliberately small: three keywords (`if`, `for`, `switch`) cover everything a C-family programmer reaches for `while`, `do-while`, `for`, `switch-with-fallthrough`, and `goto`-as-labelled-break to do. Fewer keywords means fewer ways the same idea gets written, which is also why `gofmt` (Go's built-in code formatter) can reformat any Go file into one canonical (single, standard) layout.
 
 ## 3. How it works 🟡
+
+> 🟢 → 🟡 **You now know** that every variable has a fixed type, conversions are always written out, and `if`, `for` and `switch` are the only control words. **Next we open the box**: imports, the `:=` shadowing trap, constants and conversions, integer maths rules, each control-flow form, the Go 1.22 loop change, zero values, and printing with `fmt`.
 
 ### Imports
 
@@ -136,7 +147,7 @@ import (
 )
 ```
 
-A blank import (`_ "net/http/pprof"`) runs the package's `init()` functions — here, registering pprof's HTTP handlers on `http.DefaultServeMux` — without giving you any name to call; it exists purely for that side effect.
+A blank import (`_ "net/http/pprof"`) runs the package's `init()` functions (setup code a package runs automatically when the program starts) — here, registering pprof's (Go's profiler) HTTP handlers on `http.DefaultServeMux` (Go's default URL router) — without giving you any name to call; it exists purely for that side effect.
 
 An aliased import renames the package's identifier in this file only, commonly to avoid a clash between two packages that would otherwise both be called `rand`, or to shorten a long default name.
 
@@ -155,7 +166,7 @@ func ShadowBug(id string) error {
 	return err // BUG: always nil — the shadowed err above was never seen out here
 }
 ```
-*(verified: Go 1.24.4 — `ShadowBug` returns `nil` even when `lookup` fails, and `go vet ./...` reports nothing, because shadowing isn't one of vet's default analyzers)*
+*(verified: Go 1.24.4 — `ShadowBug` returns `nil` even when `lookup` fails, and `go vet ./...` reports nothing, because shadowing isn't one of vet's default analyzers, the individual checks vet runs)*
 
 The fix is to stop redeclaring `err` in the inner scope — move the call above the `if` so there is only one `err` to begin with:
 
@@ -190,7 +201,7 @@ flowchart TD
 
 **In plain words:** whole-number math in Go has house rules — division throws away the remainder, `%` copies the sign of the left number, and a number that grows too big quietly wraps around like a car odometer.
 
-Integer division truncates toward zero, and the sign of `%` follows the sign of the **dividend**, not the divisor — the opposite of Python, where `%` follows the divisor's sign:
+Integer division truncates toward zero, and the sign of `%` follows the sign of the **dividend** (the number being divided, `a` in `a % b`), not the divisor — the opposite of Python, where `%` follows the divisor's sign:
 
 ```go
 func DivMod(a, b int) (q, r int) {
@@ -204,7 +215,7 @@ func DivMod(a, b int) (q, r int) {
 | -7 | 2 | -3 | -1 |
 | 7 | -2 | -3 | 1 |
 
-Integer overflow is **silent**: no panic, no compiler error, the value simply wraps around using two's-complement arithmetic.
+Integer overflow is **silent**: no panic, no compiler error, the value simply wraps around using two's-complement arithmetic (the standard way computers store negative whole numbers, where going past the top lands at the bottom).
 
 ```go
 func OverflowInt8(x int8, delta int8) int8 {
@@ -308,7 +319,7 @@ func ExplicitFallthrough(n int) []string {
 
 ### The Go 1.22 loop variable change
 
-Before Go 1.22, a `for` loop reused the **same** loop variable across every iteration, so capturing `&v` or `v` in a goroutine or closure inside the loop body captured a reference that later iterations overwrote — the single most common Go concurrency bug in code written before 2024:
+Before Go 1.22, a `for` loop reused the **same** loop variable across every iteration, so capturing `&v` or `v` in a goroutine (a task running at the same time) or closure (a function that uses variables from outside it) inside the loop body captured a reference that later iterations overwrote — the single most common Go concurrency bug in code written before 2024:
 
 ```mermaid
 sequenceDiagram
@@ -417,6 +428,8 @@ func DivMod(a, b int) (q, r int) {
 ```
 
 The full set, as a single tested file:
+
+**What this code does, in plain words:** an `InvoiceStatus` enum built with `iota` (Draft = 0, Sent = 1, Paid = 2, Void = 3) and a `String()` method so it prints as words; `DivMod` and `OverflowInt8` showing the integer rules; and `ParseAmountCents`, which turns text like `"4999"` into a number and returns an error if it does not fit in an `int32`. The second block tests the enum names, the `%` sign rule and the overflow wrap.
 
 ```go
 package syntaxdemo
@@ -532,6 +545,9 @@ ok  	syntaxdemo	1.154s
 
 ## 7. In production 🔴
 
+> 🟡 → 🔴 **You now know** how declarations, conversions, integer maths, `if`/`for`/`switch`, the 1.22 loop change, zero values and `fmt` verbs behave, with tests. **Next is the advanced part**: how these rules show up in real services (enums, missing JSON fields, overflow), and the design reasons behind untyped constants, the loop change and Go's single loop keyword.
+
+
 - **Real systems:** `iota`-based enums with a hand-written or `stringer`-generated `String()` method are the standard way Go APIs represent a small fixed set of states (order status, job state, log level).
 - **Failure modes → fixes:**
 	- A JSON request with a missing field silently becomes that field's zero value instead of erroring → validate presence explicitly, or use a pointer field (see [[Request Decoding, Validation and DTOs]]).
@@ -584,6 +600,30 @@ ok  	syntaxdemo	1.154s
 - Since Go 1.22, each loop iteration gets its own copy of the range variable — captured closures/goroutines are now safe by default, but the variable is still a copy of the element.
 - Zero values exist for every type (`0`, `""`, `false`, `nil`); an absent JSON field and an explicit zero are indistinguishable without a pointer field.
 - `min`, `max`, `clear` (1.21) are built-ins, not package functions.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- Can you write `x := 5` outside a function?
+> No. At package level use `var x = 5`.
+
+> [!question]- `price` is `float64` and `qty` is `int`. How do you multiply them?
+> `price * float64(qty)`. Go never converts for you.
+
+> [!question]- What is the zero value of a `string`, a `bool` and a slice?
+> `""`, `false` and `nil`.
+
+🟡 Medium
+
+> [!question]- What do `-7 / 2` and `-7 % 2` give in Go?
+> `-3` and `-1`. Division truncates toward zero, and `%` takes the sign of the left number.
+
+> [!question]- `var err error` at the top, then `if v, err := lookup(id); err == nil {...}`, then `return err`. Why does the function return `nil` even when `lookup` fails?
+> `:=` inside the `if` made a new `err` that shadows the outer one; the outer `err` was never set.
+
+> [!question]- A `switch` case matches. Does the next case run too?
+> No. Go stops after the matched case unless you write `fallthrough`, which then runs the next case's body without checking its condition.
 
 ## Links 🟢
 

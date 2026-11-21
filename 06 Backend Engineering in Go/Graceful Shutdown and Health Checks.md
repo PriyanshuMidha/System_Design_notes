@@ -30,6 +30,10 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[HTTP Server Fundamentals (net-http)]]: a Go `http.Server` listens for connections and runs a handler for each request.
+> - [[Context Package]]: a `ctx` can be cancelled, and code that watches `ctx.Done()` stops when that happens.
+
 **From zero, in 60 seconds** 🟢
 
 Servers get restarted all the time — deploys, scaling, moving pods. A **graceful shutdown** means: when told to stop, finish the requests you are holding before you exit, instead of dropping them mid-way.
@@ -66,6 +70,12 @@ A graceful shutdown stops new traffic first, finishes current work, then exits.
 | Liveness | "Is the process stuck? Restart it if so." | Deadlocked server fails it |
 | Readiness | "Should this copy get traffic right now?" | False during shutdown |
 | Pod | Kubernetes' unit that runs your container | `invoice-api-7f9c` |
+
+| Grace period | Time Kubernetes waits after `SIGTERM` before sending `SIGKILL` | `terminationGracePeriodSeconds: 30` |
+| In-flight | Already started, not finished yet | a request halfway through its DB query |
+| Rolling deploy | Replacing copies of a service one at a time | 6 pods, swapped one by one |
+| Startup probe | "Have you finished booting?" asked before the other two checks begin | blocks liveness for a slow start |
+| `drainDelay` | A short pause after readiness goes false, so the load balancer notices | sleep 3 s |
 
 **Picture it**
 
@@ -115,17 +125,23 @@ The rest of this note fills in why each of those five lines exists, what breaks 
 
 ## 1. Why it exists 🟢
 
+🟢 **Plain version:** Every deploy stops old copies of your service. When Kubernetes stops a copy, it sends a "please stop" signal and waits 30 seconds before force-killing it. During those seconds, traffic is still being moved away from the copy, and the copy is still busy with requests. If it quits at once, users see errors; if it ignores the signal, it gets killed hard after 30 seconds. Graceful shutdown uses that window well: stop taking new work, finish current work, exit on its own.
+
 A rolling deploy replaces pods constantly. Without graceful shutdown, every deploy drops whatever requests and jobs were in flight at that instant.
 
 Concretely: InvoiceOps runs 6 replicas behind a Kubernetes Service. A deploy rolls one pod at a time. Kubernetes sends the old pod SIGTERM, and by default gives it `terminationGracePeriodSeconds: 30` before SIGKILL. In that window, three things are racing:
 
-1. The **endpoint controller** removing the pod's IP from the Service's endpoint list, so kube-proxy stops sending it new connections — this is asynchronous and typically lands within a second or two, but is not instant.
+1. The **endpoint controller** removing the pod's IP from the Service's endpoint list, so kube-proxy (the Kubernetes part on each machine that routes Service traffic to pods) stops sending it new connections — this is asynchronous and typically lands within a second or two, but is not instant.
 2. The **process** itself, which gets SIGTERM at the same moment the termination sequence starts, not after step 1 finishes.
 3. Whatever the process is doing right now: serving an HTTP request, running a background job, holding a websocket.
 
 If the process exits immediately on SIGTERM, every request that was in flight gets a connection reset, and every job that was running gets abandoned mid-write. If it ignores SIGTERM entirely, it gets SIGKILL after 30 seconds with no chance to finish anything, and the kubelet logs a forced termination.
 
 Graceful shutdown is the process cooperating with that race: stop taking new work immediately, keep doing old work for a bounded amount of time, then exit cleanly on its own before the kill signal arrives.
+
+### A real-life example 🟢
+
+Zomato deploys new code many times a day, even during lunch rush. If each old server copy just died, a few people placing orders at that exact moment would see "something went wrong". Instead, each old copy first marks itself "not ready", the load balancer stops sending it new orders, it finishes the orders it is already handling, and then it exits. Users never notice the deploy.
 
 ## 2. Mental model 🟢
 
@@ -139,9 +155,17 @@ The crash case is different: it is the building catching fire. There is no grace
 
 ## 3. How it works 🟡
 
+🟢 → 🟡 You now know the shape: stop new work, finish old work within a deadline, then exit, and answer the three health questions honestly. Next we open the box: which signals exist, the exact shutdown order, a common ordering bug, the connections `Shutdown` cannot see, and gRPC's version.
+
 ### Signals, and what each one means
 
 **In plain words:** signals are the operating system's knock on the door — one means 'please finish up', one means 'you are gone right now' and cannot be caught.
+
+**Step by step:**
+1. A deploy starts; Kubernetes sends `SIGTERM` to the process.
+2. Go's `signal.NotifyContext` catches it and cancels a context, so your code knows to start stopping.
+3. If the process is still running 30 seconds later, Kubernetes sends `SIGKILL`.
+4. `SIGKILL` cannot be caught: the process ends instantly, so only idempotent, retry-safe work survives that case.
 
 | Signal | Who sends it | Catchable? | Meaning |
 | --- | --- | --- | --- |
@@ -156,6 +180,16 @@ Surviving the third row is a different problem, solved by making every unit of w
 ### The shutdown sequence
 
 **In plain words:** the fixed checklist a pod walks through between 'please stop' and exiting, and why readiness flips first.
+
+**Step by step (plain version):**
+1. `SIGTERM` arrives at 10:00:00.
+2. Readiness turns false at once, so `/healthz/ready` now says "not ready".
+3. Wait about 3 seconds while Kubernetes takes the pod out of the traffic list.
+4. Call `srv.Shutdown(ctx)`: no new connections; wait for the 4 requests still running.
+5. Let the background workers finish their current jobs, within the same deadline.
+6. Close the database and Redis pools last, then exit with code 0, well before 10:00:30.
+
+The same order, in full detail:
 
 ```mermaid
 stateDiagram-v2
@@ -179,7 +213,13 @@ Step by step, in the order it must happen:
 
 ### The ListenAndServe / Shutdown ordering bug
 
-**In plain words:** a tiny race: if you call stop before the server fully started listening, the stop does nothing — the fix is in how the two are ordered.
+**In plain words:** `ListenAndServe` returns the moment `Shutdown` is called, so if `main` exits right then, the program ends before in-flight requests finish. The fix: make `main` wait until `Shutdown` itself has returned.
+
+**Step by step:**
+1. The bug: `main` runs `ListenAndServe` and waits for it to return.
+2. `Shutdown` is called. `ListenAndServe` returns `http.ErrServerClosed` right away, while 4 requests are still running.
+3. `main` sees the return and exits, killing those 4 requests.
+4. The fix: `main` waits for `Shutdown` itself to return, because `Shutdown` only returns once the requests are done or the deadline hits.
 
 The error that the old note's audit called out by name: `ListenAndServe` returns the instant `Shutdown` is called, with `http.ErrServerClosed`, not when the drain finishes. A `main` that does
 
@@ -195,6 +235,12 @@ Worked example](#4-worked-example) does exactly this: `ListenAndServe` runs in i
 
 ### Hijacked connections Shutdown does not drain
 
+**Step by step:**
+1. A WebSocket handler hijacks its connection (takes the raw network link away from the HTTP server).
+2. `Shutdown` no longer tracks that connection, so it will not wait for it or close it.
+3. Register a function with `srv.RegisterOnShutdown`; it runs when shutdown starts.
+4. That function tells each WebSocket to send a "going away" close message (code 1001) and close.
+
 `Server.Shutdown` only tracks connections it manages as ordinary HTTP state. Three things slip past it:
 
 - **Hijacked connections** (`http.Hijacker`, raw TCP taken over by a handler) are invisible to `Shutdown` once hijacked. Use `Server.RegisterOnShutdown` to register a callback that signals those connections to close themselves.
@@ -204,6 +250,11 @@ Worked example](#4-worked-example) does exactly this: `ListenAndServe` runs in i
 (Scaling these further than one process is [[Scaling WebSockets]]'s job; this note only covers shutting one process down cleanly.)
 
 ### gRPC's equivalent
+
+**Step by step:**
+1. Call `grpcServer.GracefulStop()` in a goroutine; it stops new calls and waits for running ones.
+2. At the same time, start a timer of, say, 25 seconds.
+3. If `GracefulStop` finishes first, done. If the timer fires first, call `Stop()` to cut the remaining calls.
 
 A gRPC server has its own two-step version of the same idea: `GracefulStop()` stops accepting new RPCs and waits for existing ones to finish, with no deadline of its own — so wrap it in a `context.WithTimeout` and call the blunt `Stop()` if the deadline passes. (Full gRPC server setup is [[gRPC Services in Go]]'s job.)
 
@@ -225,6 +276,8 @@ shutdownCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 defer cancel()
 srv.Shutdown(shutdownCtx)
 ```
+
+**What this code does, in plain words (for the big block below):** `Run` starts the HTTP server in a goroutine, serves the three probe endpoints, and runs a small worker pool. When the context is cancelled, it flips readiness off, sleeps `drainDelay`, calls `Shutdown` with a deadline, waits for the workers, and only then returns.
 
 The full version below adds what production needs: the `ListenAndServeTLS`/`ErrServerClosed` handling `main` must get right, a worker pool that drains instead of being killed mid-job, and the three probe endpoints. It compiles and passes `go vet` and `go test -race` on Go 1.24.4.
 
@@ -427,6 +480,8 @@ func (s *Server) Run(ctx context.Context, drainDelay, shutdownTimeout time.Durat
 }
 ```
 
+**What this code does, in plain words:** `main` creates a context that is cancelled on `SIGTERM` or `SIGINT`, calls `Run`, and exits with code 1 only if `Run` reports an error.
+
 `main` wires it to real signals — this part is illustrative, since a `main` package cannot be unit-tested the way the package above is:
 
 ```go
@@ -454,6 +509,8 @@ func main() {
 	logger.Info("shutdown complete")
 }
 ```
+
+**What this code does, in plain words:** the tests cancel the server's context while work is running and check three things: readiness flips to false before `Shutdown` returns, an in-flight job finishes before the drain returns, and a job slower than the drain deadline is abandoned instead of blocking exit.
 
 Three tests that prove the behaviour that matters, not just that the code runs (`go test -race`, all pass):
 
@@ -587,7 +644,17 @@ func TestDrainDeadlineAbandonsSlowJob(t *testing.T) {
 - `drainDelay` is pure latency added to every deploy and every restart. Too short and it does nothing useful; too long and rollouts get slower for no benefit. 1-5 seconds is typical; measure your own endpoint-propagation time rather than guessing.
 - None of this helps with a crash or OOM kill. If idempotency and safe retries aren't already in place, graceful shutdown is solving the easy 95% of the problem and leaving the dangerous 5% untouched.
 
+### Common beginner mistakes 🟢
+
+- Exiting as soon as `ListenAndServe` returns → in-flight requests are cut off → wait for `Shutdown` to return.
+- Calling `Shutdown` before flipping readiness → the load balancer still sends traffic to a server that refuses it → flip readiness first, then wait `drainDelay`.
+- Checking the database in the liveness probe → a short DB outage restarts every pod at once → liveness checks only "is this process stuck"; dependencies go in readiness.
+- A shutdown deadline longer than the grace period → `SIGKILL` arrives first → keep `drainDelay + shutdownTimeout` under `terminationGracePeriodSeconds`.
+- Calling `log.Fatal` deep in the code → deferred cleanups never run → return errors up to `main` and exit only there.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now write a service that stops cleanly and answers all three probes correctly. The advanced part covers why real deploys still drop requests, how grace periods and delays must add up, and the Go details (second signals, `os.Exit`, hijacked connections) that catch experienced engineers.
 
 - **Real systems:** every rolling Kubernetes deployment depends on this; Kubernetes' own docs explicitly describe the readiness-then-SIGTERM race this note's `drainDelay` closes. AWS ALB/ECS and Google Cloud Run have the equivalent "deregistration delay" / Cloud Run's own SIGTERM-then-grace-period contract.
 - **Failure modes → fixes:**
@@ -636,6 +703,26 @@ func TestDrainDeadlineAbandonsSlowJob(t *testing.T) {
 - `RegisterOnShutdown` closes what `Shutdown` can't see: hijacked connections, WebSockets.
 - gRPC: `GracefulStop()` has no deadline of its own; wrap it with your own timeout and a `Stop()` fallback.
 - Keep `shutdownTimeout` comfortably under the pod's `terminationGracePeriodSeconds`.
+
+## Self-check 🟢🟡
+
+> [!question]- What is the difference between `SIGTERM` and `SIGKILL`?
+> `SIGTERM` asks the process to stop and can be caught; `SIGKILL` ends it at once and cannot be caught.
+
+> [!question]- What is the first thing to do when `SIGTERM` arrives?
+> Flip readiness to false so no new traffic is sent.
+
+> [!question]- Should a liveness probe check the database?
+> No. Liveness asks only "is this process stuck?"; a down database is a readiness problem.
+
+> [!question]- Why does `main` wait for `Shutdown` and not for `ListenAndServe`?
+> `ListenAndServe` returns the moment `Shutdown` is called, before requests have finished.
+
+> [!question]- What is `drainDelay` for?
+> To give Kubernetes a few seconds to stop routing traffic before the server stops accepting connections.
+
+> [!question]- Grace period is 30 s, `drainDelay` 5 s, `shutdownTimeout` 30 s. What goes wrong?
+> 5 + 30 = 35 s is longer than 30 s, so `SIGKILL` arrives before the drain can finish.
 
 ## Links 🟢
 

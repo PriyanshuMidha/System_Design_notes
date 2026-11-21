@@ -25,6 +25,12 @@ updated: 2026-11-13
 > - 🟡 **Know the basics?** Add Steps 1 to 5 and the Tests.
 > - 🔴 **Interview / SDE-3 prep?** Add Design decisions, Pitfalls and the Exercises. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Partitioning and Sharding]]: the theory half. Partitions split a table inside one database; shards spread data over machines.
+> - [[Replication]]: each shard is itself a primary with replicas, so this note only decides *which* primary.
+> - [[Indexing Fundamentals]]: each partition has its own small index.
+> - [[Query Plans and EXPLAIN]]: you will read plans to check that PostgreSQL skipped the partitions it should.
+
 **From zero, in 60 seconds** 🟢
 
 This file is the hands-on twin of [[Partitioning and Sharding]]. It has two halves. The first half is SQL: one big Postgres table split into smaller pieces called **partitions**, all still inside one database. The second half is Go: once data lives on several databases, your own code must pick the right database for each key, and that picker is called a **router**. Each key is hashed into one of 1,024 fixed buckets, and a small table says which database owns each bucket. Moving a bucket means: copy it, pause writes for a moment, then change one line in that table. Read it top to bottom: each step is a short Concept, the code, then a walkthrough. If you only want the idea, the Whiteboard version is the whole thing in a few lines.
@@ -41,8 +47,8 @@ flowchart LR
 
 ## Before the code 🟢
 
-- **Hashing**: `hash/fnv` (whiteboard) and `crypto/sha256` (full version) turn a workspace ID into a logical shard number.
-- **`sync.RWMutex`**: many routers read the shard map at once; a move takes the write lock briefly.
+- **Hashing**: `hash/fnv` (whiteboard) and `crypto/sha256` (full version) are hash functions, which scramble any input into a well-spread number; here they turn a workspace ID into a logical shard number.
+- **`sync.RWMutex`** (a lock that lets many readers in together but only one writer): many routers read the shard map at once; a move takes the write lock briefly.
 - **Sentinel errors**: `ErrMoving` tells a writer the shard is frozen, checked with `errors.Is`.
 - **Version counter**: one integer tells a router its cached map is stale.
 - **Goroutines**: a concurrency test routes from many goroutines while shards are frozen and flipped.
@@ -79,6 +85,8 @@ The note has two halves. The SQL half (steps 1 to 3) shows what PostgreSQL does 
 - The SQL needs PostgreSQL 17 (not run here; representative).
 
 ## Code 🟡
+
+> 🟢 → 🟡 **You now know** what the two halves are for. **Next we open the box**: the SQL that creates and prunes partitions, then the Go router with 1,024 logical shards, a freeze flag and a versioned map.
 
 ### Step 1: partitioned tables in SQL
 
@@ -464,6 +472,8 @@ flowchart LR
 
 ## Design decisions 🔴
 
+> 🟡 → 🔴 **You now know** how the router routes, freezes and flips. **Next is the senior view**: why each design choice was made, what the tests prove under concurrency, and the gaps (a freeze alone does not stop in-flight writes).
+
 | Decision | Alternative | Trade-off |
 | --- | --- | --- |
 | 1,024 fixed logical shards | `hash % numberOfDatabases` | A move changes one map entry instead of rehashing almost every key. The cost is a map to store and a ceiling of 1,024 units of movement. |
@@ -688,6 +698,30 @@ ok  	shard	1.655s
 1. Change `LogicalShards` to 8 and `NewMap` to 3 databases. Predict the distribution of the newest 100,000 IDs, then run `TestSequentialIDsSpreadEvenly` and see whether the 31,000 to 35,700 bound still passes.
 2. In `TestMoveTouchesOneLogicalShard`, call `Flip` twice in a row on the same shard. Predict the error from the second call, and the final `version`.
 3. Add a `Move` step that calls `Freeze`, a copy function, then `Flip`. Predict what a concurrent writer sees for workspace 42 during the copy.
+
+## Self-check 🟢🟡
+
+🟢 Easy
+
+> [!question]- How many logical shards does the router use, and does that number ever change?
+> 1,024, and it never changes; only the owner of each shard changes.
+
+> [!question]- What does `Route` return for a frozen shard on a write?
+> `ErrMoving`, so the caller retries after the move.
+
+> [!question]- Why must the partition key be part of the primary key in PostgreSQL?
+> PostgreSQL has no global index, so it can only check uniqueness inside each partition.
+
+🟡 Medium
+
+> [!question]- Why does `Flip` refuse an unfrozen shard?
+> Writes still arriving during the copy could be lost if the owner changed under them.
+
+> [!question]- Why use SHA-256 instead of FNV in the full version?
+> It spreads even sequential IDs evenly and its output never changes between Go versions.
+
+> [!question]- What does `TestMoveTouchesOneLogicalShard` prove?
+> Moving one logical shard changes the database only for workspaces in that shard, so a move is small and local.
 
 ## Links 🟢
 

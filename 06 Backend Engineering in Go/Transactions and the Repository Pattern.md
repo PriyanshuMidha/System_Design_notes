@@ -34,6 +34,11 @@ status: reviewed
 > - 🟡 **Know the basics?** Add section 3 (how it works), 4 (worked example) and 5-6.
 > - 🔴 **Interview / SDE-3 prep?** Add 7, 8 and 9. Headings are tagged 🟢🟡🔴 so you always know where you are.
 
+> [!note] Before this note
+> - [[Database Access (database-sql, pgx, sqlc)]]: `*sql.DB` is a pool of connections, and each query borrows one.
+> - [[Transactions and ACID]]: a transaction is a group of writes that all happen or none happen (`BEGIN` … `COMMIT` / `ROLLBACK`).
+> - [[Error Handling]]: Go errors are values; you check them, wrap them and compare them with `errors.Is`.
+
 **From zero, in 60 seconds** 🟢
 
 Some changes only make sense together. Move money: subtract here, add there. If the power dies between the two, the money vanishes.
@@ -73,6 +78,12 @@ The repository pattern keeps that SQL tidy behind small Go types.
 | Interface | A list of methods any type can satisfy | `DBTX` fits both `*sql.DB` and `*sql.Tx` |
 | Lock | A rule that stops two writers changing the same row at once | `SELECT ... FOR UPDATE` |
 | Outbox | A table of "messages to send later", written in the same transaction | Row: "invoice 42 paid" |
+
+| `DBTX` | A small interface that both `*sql.DB` and `*sql.Tx` satisfy | repos accept either |
+| Optimistic locking | Write only if a `version` number is unchanged; otherwise retry | `WHERE id = ? AND version = 7` |
+| Dual write | Writing to two systems (DB and queue) with no shared transaction | commit, then publish fails |
+| Serialization failure | Postgres aborting a transaction because of a clash with another one (code `40001`) | retry the whole transaction |
+| Unit of work | One object holding all repositories for a use case, built over one `DBTX` | `NewStore(tx)` |
 
 **Picture it**
 
@@ -114,6 +125,10 @@ The repository pattern solves a separate but related problem: without it, the we
 
 A repository hides the SQL behind `repo.ApplyPayment(ctx, id, amount)`; the question this note answers is how several repositories agree to share one transaction instead of each opening its own.
 
+### A real-life example 🟢
+
+When a UPI payment for your Swiggy order succeeds, Swiggy's server must do several things together: record the payment, mark the order paid, and note that a "payment received" notification should go out. If it marked the order paid but crashed before saving the payment record, support would see a paid order with no money trail. So all three writes go in one transaction. The notification itself is sent only after the commit, from an outbox row, so a crash can never send "paid" for an order that was rolled back.
+
 ## 2. Mental model 🟢
 
 A transaction is a **tab you open at a bar**: everything ordered against that tab is provisional until you either `COMMIT` (pay and keep it) or `ROLLBACK` (walk away, nothing happened).
@@ -124,9 +139,17 @@ The repository pattern is a **job ticket that doesn't care which tab it's billed
 
 ## 3. How it works 🟡
 
+🟢 → 🟡 You now know the idea: one transaction, one connection, handed to every repository, committed once. Next we open the box: the begin/rollback/commit lifecycle, how repositories share the transaction through `DBTX`, the hazards, locking choices, the outbox, and retries.
+
 ### The transaction lifecycle
 
 **In plain words:** begin, do the writes, commit — with a deferred rollback as the safety net that undoes everything if the function bails out early.
+
+**Step by step:**
+1. `tx, err := db.BeginTx(ctx, nil)`; if this fails, return the error.
+2. `defer tx.Rollback()` right away.
+3. Run the writes through `tx`; if any returns an error, `return err`, and the deferred rollback undoes everything.
+4. If all succeed, `return tx.Commit()`. The deferred `Rollback` then does nothing, because the transaction is already done.
 
 ```mermaid
 stateDiagram-v2
@@ -147,6 +170,13 @@ stateDiagram-v2
 ### Sharing one transaction across repositories
 
 **In plain words:** the service opens the transaction and hands the same handle to every repository call, like one shopping basket passed between aisles.
+
+**Step by step:**
+1. The webhook handler begins one transaction.
+2. `EventRepo.Insert(tx, ...)` records the event; if it was already seen, commit and stop.
+3. `InvoiceRepo.ApplyPayment(tx, ...)` updates the invoice if its version still matches.
+4. `PaymentRepo.Insert(tx, ...)` adds the payment row, and `OutboxRepo.Enqueue(tx, ...)` adds a "payment_applied" row.
+5. One `Commit` saves all four writes together.
 
 ```mermaid
 sequenceDiagram
@@ -180,6 +210,8 @@ sequenceDiagram
 Every repository in this diagram is handed the **same** `*sql.Tx` value, cast through the shared `DBTX` interface. None of them opens its own transaction or its own connection.
 
 ### Who depends on whom
+
+**In plain words:** the service knows the `Store`; the repositories only know the small `DBTX` interface, never the concrete pool or transaction type.
 
 ```mermaid
 classDiagram
@@ -219,6 +251,12 @@ Neither `InvoiceRepo` nor `PaymentRepo` imports `*sql.DB` or `*sql.Tx` directly 
 ### `DBTX` and the `WithTx` helper
 
 **In plain words:** one small interface that both the pool and a transaction satisfy, so the same repository code runs in either without knowing which.
+
+**Step by step:**
+1. Define `DBTX` with `ExecContext`, `QueryContext`, `QueryRowContext`.
+2. Each repository holds a `DBTX`, not a `*sql.DB`.
+3. For a simple read: `NewStore(db).Invoices.Get(...)`.
+4. For a group of writes: `WithTx(ctx, db, nil, func(tx *sql.Tx) error { s := NewStore(tx); ... })`; `WithTx` begins, commits on `nil`, and rolls back on an error.
 
 ```go
 // DBTX is satisfied by both *sql.DB and *sql.Tx. Every repository is
@@ -267,6 +305,12 @@ Three hazards `BeginTx` and `*sql.Tx` carry that are easy to miss:
 
 **In plain words:** two ways to stop two writers trampling each other: lock the row while you work, or let both try and reject the one holding stale data.
 
+**Step by step:**
+1. Row lock: `SELECT ... FROM invoices WHERE id = 42 FOR UPDATE`. Anyone else wanting to change invoice 42 waits until you commit.
+2. Optimistic: read invoice 42 with `version = 7`.
+3. Write `UPDATE ... SET paid = ..., version = 8 WHERE id = 42 AND version = 7`.
+4. If someone changed it first, 0 rows change; you re-read and try again.
+
 ```mermaid
 flowchart TD
     C[Concurrent writers touching one row] --> Q{Expected contention?}
@@ -286,6 +330,12 @@ flowchart TD
 
 **In plain words:** a queue cannot join a database transaction, so you write the message into an outbox table inside the transaction and ship it afterwards.
 
+**Step by step:**
+1. Inside the transaction, insert `outbox_events` row "payment_applied, invoice 42".
+2. Commit: the invoice change and the outbox row are saved together, or neither is.
+3. After commit, a relay reads unpublished rows and publishes them to the queue.
+4. Only when the publish succeeds does it mark the row published; a crash just means it tries again later.
+
 The old note's webhook steps put "enqueue follow-up job or outbox event" inside the transaction, as if a queue publish and an outbox insert were interchangeable.
 
 They are not: publishing to Kafka, SQS, or Redis from inside a database transaction is a **dual write** — the message can go out and then the transaction rolls back, or the transaction can commit and the publish call can fail or the process can crash before it runs.
@@ -294,9 +344,15 @@ Either way, the queue and the database disagree about what happened, and no retr
 
 The fix is to never call the queue from inside the transaction at all: insert a plain row into an `outbox_events` table, in the same transaction and therefore the same commit, as the business data.
 
-A separate relay — a poller, or Postgres logical replication reading the WAL (CDC) — reads unpublished rows after commit and publishes them, marking each row published only once the publish call itself succeeds.
+A separate relay — a poller, or Postgres logical replication reading the WAL (the write-ahead log, Postgres’s diary of every change; reading it is called CDC, change data capture) — reads unpublished rows after commit and publishes them, marking each row published only once the publish call itself succeeds.
 
 ### Retrying on serialization failure
+
+**Step by step:**
+1. Two transactions touch the same rows under `SERIALIZABLE`; Postgres aborts one with `40001`.
+2. `RetryTx` sees that code and waits a short time that grows with each attempt (5 ms, 10 ms, 15 ms...).
+3. It runs the whole transaction function again from the start.
+4. Any other error, like a duplicate key or `ErrVersionConflict`, is returned at once without retrying.
 
 Under `SERIALIZABLE` or `REPEATABLE READ` isolation, Postgres can abort a transaction at commit time with SQLSTATE `40001` (serialization failure) purely because of a conflict with a concurrent transaction — not because anything was wrong with the SQL.
 
@@ -318,6 +374,8 @@ err := WithTx(ctx, db, nil, func(tx *sql.Tx) error {
     return payments.Insert(ctx, tx, id, amount)
 })
 ```
+
+**What this code does, in plain words (for the big block below):** it defines `DBTX`, the four repositories (`EventRepo`, `InvoiceRepo` with `ApplyPayment` and `CurrentVersion`, `PaymentRepo`, `OutboxRepo` with `Enqueue` and `PublishPending`), `NewStore`, `WithTx`, `RetryTx` and `ProcessPaymentWebhook`, which ties them together inside one transaction.
 
 The full version below is the tested InvoiceOps payment webhook: idempotent via a unique `(provider, event_id)` constraint, applies payment with optimistic locking, and enqueues an outbox row instead of publishing directly.
 
@@ -616,7 +674,26 @@ Tests (`go test -race`, all passing on Go 1.24 against in-memory SQLite):
   - For a system that can tolerate an at-least-once publish with no ordering guarantee and doesn't need the commit and the publish to be atomic, publishing directly after commit (accepting the small window where the publish can fail and nothing retries it) is sometimes an acceptable, simpler trade.
 - A single-statement write never needs a transaction at all — `*sql.DB` already runs one statement atomically. Wrapping it in `BeginTx`/`Commit` only adds overhead.
 
+### Row lock vs optimistic locking 🟡
+
+| | `SELECT ... FOR UPDATE` | Version column |
+| --- | --- | --- |
+| How | lock the row, others wait | no lock; reject a stale write |
+| On conflict | the second writer waits, then proceeds | the second writer gets 0 rows and retries |
+| Best when | a hot row with many writers | conflicts are rare |
+| Risk | long waits, deadlocks | many retries under heavy contention |
+
+### Common beginner mistakes 🟢
+
+- Calling `db.Exec` instead of `tx.Exec` for one step → that step runs outside the transaction and is not rolled back → pass the same `tx` (as a `DBTX`) to every repository.
+- Forgetting `defer tx.Rollback()` → an early `return` leaves the transaction open and the connection stuck → defer it right after `BeginTx`.
+- Publishing to Kafka or calling an API inside the transaction → a rollback cannot undo it → write an outbox row, publish after commit.
+- Retrying every error → a duplicate-key error loops forever → retry only `40001` and `40P01`.
+- Using one `*sql.Tx` from two goroutines → a data race on one connection → keep each transaction in one goroutine.
+
 ## 7. In production 🔴
+
+🟡 → 🔴 You can now share one transaction across repositories, choose a locking style, and hand events off through an outbox. The advanced part covers what goes wrong at scale: goroutines outliving a transaction, network calls inside one, long-held locks, bad retry loops, and the details of isolation levels and savepoints.
 
 - **Real systems:** the outbox pattern is the standard fix for the dual-write problem in event-driven services (documented extensively by Chris Richardson's microservices.io patterns and implemented via Debezium-style CDC in production Kafka pipelines); sqlc's generated `WithTx` method is the same `DBTX`-interface idea shipped as codegen; payment processors (Stripe's own webhook-handling guidance) specifically recommend a unique event-id constraint for webhook idempotency.
 - **Failure modes → fixes:**
@@ -684,6 +761,26 @@ Tests (`go test -race`, all passing on Go 1.24 against in-memory SQLite):
 - `SELECT ... FOR UPDATE` locks rows until commit; `... SKIP LOCKED` turns that into a job-queue pattern; `... NOWAIT` fails fast instead of blocking.
 - Retry only SQLSTATE `40001` (serialization failure) and `40P01` (deadlock) — never retry a business error like a conflict or a constraint violation.
 - A unique constraint on `(provider, event_id)` with `ON CONFLICT DO NOTHING` is the simplest correct webhook idempotency check.
+
+## Self-check 🟢🟡
+
+> [!question]- What does a transaction guarantee?
+> All its writes are saved together on commit, or none of them on rollback.
+
+> [!question]- Is `defer tx.Rollback()` safe after a successful commit?
+> Yes; it returns `sql.ErrTxDone` and changes nothing.
+
+> [!question]- Why do repositories take `DBTX` instead of `*sql.DB`?
+> So the same repository code works with the pool or inside a shared `*sql.Tx`.
+
+> [!question]- Why must a queue publish not happen inside the transaction?
+> The publish cannot be rolled back, so the queue and the database could disagree; use an outbox row instead.
+
+> [!question]- With optimistic locking, what does `RowsAffected() == 0` mean?
+> Someone else changed the row since you read it; re-read and retry.
+
+> [!question]- Which Postgres errors should a retry loop retry?
+> Only `40001` (serialization failure) and `40P01` (deadlock).
 
 ## Links 🟢
 
